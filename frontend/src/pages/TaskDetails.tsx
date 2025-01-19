@@ -15,7 +15,8 @@ import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
 
 interface Task {
-  id: string;
+  taskId: string;
+  userId: string;
   name: string;
   prompt: string;
   status: string;
@@ -37,8 +38,9 @@ export default function TaskDetails() {
           headers: { Authorization: `Bearer ${token}` },
         });
         setTask(response.data);
-      } catch (error) {
-        setError('Failed to fetch task details');
+      } catch (error: any) {
+        console.error('Error fetching task:', error);
+        setError(error.response?.data?.message || 'Failed to fetch task details');
       } finally {
         setLoading(false);
       }
@@ -53,8 +55,9 @@ export default function TaskDetails() {
         headers: { Authorization: `Bearer ${token}` },
       });
       navigate('/dashboard');
-    } catch (error) {
-      setError('Failed to delete task');
+    } catch (error: any) {
+      console.error('Error deleting task:', error);
+      setError(error.response?.data?.message || 'Failed to delete task');
     }
   };
 

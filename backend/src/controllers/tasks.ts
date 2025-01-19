@@ -1,13 +1,11 @@
 import { Request, Response } from 'express';
-
-// In-memory task storage for MVP (replace with database in production)
-const tasks: { [key: string]: any[] } = {};
+import { taskDb } from '../services/db';
 
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
 }
 
-export const createTask = (req: AuthRequest, res: Response) => {
+export const createTask = async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.user?.userId;
     if (!userId) {
@@ -21,40 +19,38 @@ export const createTask = (req: AuthRequest, res: Response) => {
     }
 
     const task = {
-      id: Date.now().toString(),
+      taskId: Date.now().toString(),
+      userId,
       name,
       prompt,
       status: 'pending',
-      createdAt: new Date().toISOString(),
-      userId
+      createdAt: new Date().toISOString()
     };
 
-    if (!tasks[userId]) {
-      tasks[userId] = [];
-    }
-    tasks[userId].push(task);
-
-    res.status(201).json(task);
+    const createdTask = await taskDb.createTask(task);
+    res.status(201).json(createdTask);
   } catch (error) {
+    console.error('Error in createTask:', error);
     res.status(500).json({ message: 'Error creating task' });
   }
 };
 
-export const getTasks = (req: AuthRequest, res: Response) => {
+export const getTasks = async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.user?.userId;
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const userTasks = tasks[userId] || [];
-    res.json(userTasks);
+    const tasks = await taskDb.getTasksByUserId(userId);
+    res.json(tasks);
   } catch (error) {
+    console.error('Error in getTasks:', error);
     res.status(500).json({ message: 'Error fetching tasks' });
   }
 };
 
-export const getTask = (req: AuthRequest, res: Response) => {
+export const getTask = async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.user?.userId;
     if (!userId) {
@@ -62,20 +58,25 @@ export const getTask = (req: AuthRequest, res: Response) => {
     }
 
     const taskId = req.params.id;
-    const userTasks = tasks[userId] || [];
-    const task = userTasks.find(t => t.id === taskId);
+    const task = await taskDb.getTaskById(taskId);
 
     if (!task) {
       return res.status(404).json({ message: 'Task not found' });
     }
 
+    // Verify task belongs to user
+    if (task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
     res.json(task);
   } catch (error) {
+    console.error('Error in getTask:', error);
     res.status(500).json({ message: 'Error fetching task' });
   }
 };
 
-export const updateTask = (req: AuthRequest, res: Response) => {
+export const updateTask = async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.user?.userId;
     if (!userId) {
@@ -83,30 +84,32 @@ export const updateTask = (req: AuthRequest, res: Response) => {
     }
 
     const taskId = req.params.id;
-    const userTasks = tasks[userId] || [];
-    const taskIndex = userTasks.findIndex(t => t.id === taskId);
+    const task = await taskDb.getTaskById(taskId);
 
-    if (taskIndex === -1) {
+    if (!task) {
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    const updatedTask = {
-      ...userTasks[taskIndex],
+    // Verify task belongs to user
+    if (task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const updates = {
       ...req.body,
-      id: taskId,
-      userId
+      taskId, // Ensure taskId cannot be changed
+      userId  // Ensure userId cannot be changed
     };
 
-    userTasks[taskIndex] = updatedTask;
-    tasks[userId] = userTasks;
-
+    const updatedTask = await taskDb.updateTask(taskId, updates);
     res.json(updatedTask);
   } catch (error) {
+    console.error('Error in updateTask:', error);
     res.status(500).json({ message: 'Error updating task' });
   }
 };
 
-export const deleteTask = (req: AuthRequest, res: Response) => {
+export const deleteTask = async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.user?.userId;
     if (!userId) {
@@ -114,16 +117,21 @@ export const deleteTask = (req: AuthRequest, res: Response) => {
     }
 
     const taskId = req.params.id;
-    const userTasks = tasks[userId] || [];
-    const taskIndex = userTasks.findIndex(t => t.id === taskId);
+    const task = await taskDb.getTaskById(taskId);
 
-    if (taskIndex === -1) {
+    if (!task) {
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    tasks[userId] = userTasks.filter(t => t.id !== taskId);
+    // Verify task belongs to user
+    if (task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    await taskDb.deleteTask(taskId);
     res.status(204).send();
   } catch (error) {
+    console.error('Error in deleteTask:', error);
     res.status(500).json({ message: 'Error deleting task' });
   }
 }; 

@@ -17,7 +17,8 @@ import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
 
 interface Task {
-  id: string;
+  taskId: string;
+  userId: string;
   name: string;
   prompt: string;
   status: string;
@@ -26,6 +27,7 @@ interface Task {
 
 export default function Dashboard() {
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [error, setError] = useState('');
   const { token } = useAuth();
   const navigate = useNavigate();
 
@@ -36,8 +38,9 @@ export default function Dashboard() {
           headers: { Authorization: `Bearer ${token}` },
         });
         setTasks(response.data);
-      } catch (error) {
+      } catch (error: any) {
         console.error('Error fetching tasks:', error);
+        setError(error.response?.data?.message || 'Failed to fetch tasks');
       }
     };
 
@@ -119,7 +122,7 @@ export default function Dashboard() {
 
       <Grid container spacing={3}>
         {tasks.map((task) => (
-          <Grid item xs={12} sm={6} md={4} key={task.id}>
+          <Grid item xs={12} sm={6} md={4} key={task.taskId}>
             <Card sx={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
               <CardContent sx={{ flexGrow: 1 }}>
                 <Typography 
@@ -175,7 +178,7 @@ export default function Dashboard() {
                   fullWidth
                   variant="outlined"
                   size="large"
-                  onClick={() => navigate(`/tasks/${task.id}`)}
+                  onClick={() => navigate(`/tasks/${task.taskId}`)}
                   sx={{ mt: 1 }}
                 >
                   View Details
