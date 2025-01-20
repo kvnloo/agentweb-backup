@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { taskDb } from '../services/db';
+import { webAgent } from '../services/webAgent';
 
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
@@ -28,6 +29,12 @@ export const createTask = async (req: AuthRequest, res: Response) => {
     };
 
     const createdTask = await taskDb.createTask(task);
+
+    // Execute the task asynchronously
+    webAgent.executeTask(task.taskId).catch(error => {
+      console.error('Error executing task:', error);
+    });
+
     res.status(201).json(createdTask);
   } catch (error) {
     console.error('Error in createTask:', error);
