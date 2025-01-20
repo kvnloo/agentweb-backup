@@ -1,0 +1,8 @@
+# Agent history files
+agent_history.gif
+
+# Log files
+task_monitor.log
+
+# Environment variables
+.env 
