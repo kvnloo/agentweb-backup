@@ -340,7 +340,71 @@ async def execute_task(task):
         await update_task_status(task_id, 'failed', error=error)
         await update_task_execution(execution_id, 'failed', error=error)
 
+async def scan_pending_tasks():
+    """Periodically scan for pending tasks"""
+    while True:
+        try:
+            logger.info("Scanning for pending tasks...")
+            response = dynamodb.scan(
+                TableName='AW-Tasks',
+                FilterExpression='attribute_not_exists(#status) OR #status = :status',
+                ExpressionAttributeNames={'#status': 'status'},
+                ExpressionAttributeValues={':status': {'S': 'pending'}}
+            )
+            
+            tasks = response.get('Items', [])
+            logger.info(f"Found {len(tasks)} pending tasks")
+            
+            for task in tasks:
+                task_id = task.get('taskId', {}).get('S', 'unknown')
+                try:
+                    # Try to atomically update status from pending to running
+                    dynamodb.update_item(
+                        TableName='AW-Tasks',
+                        Key={'taskId': {'S': task_id}},
+                        UpdateExpression='SET #status = :new_status, updatedAt = :updatedAt',
+                        ConditionExpression='attribute_not_exists(#status) OR #status = :old_status',
+                        ExpressionAttributeNames={
+                            '#status': 'status'
+                        },
+                        ExpressionAttributeValues={
+                            ':old_status': {'S': 'pending'},
+                            ':new_status': {'S': 'running'},
+                            ':updatedAt': {'S': datetime.now(timezone.utc).isoformat()}
+                        }
+                    )
+                    # Execute the task
+                    await execute_task(task)
+                except ClientError as e:
+                    if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                        logger.info(f"Task {task_id} is being processed by another worker")
+                    else:
+                        logger.error(f"Error processing task {task_id}: {str(e)}", exc_info=True)
+                except Exception as e:
+                    logger.error(f"Error processing task {task_id}: {str(e)}", exc_info=True)
+            
+            # Wait for 5 minutes before next scan
+            await asyncio.sleep(300)
+            
+        except Exception as e:
+            logger.error(f"Error in scan_pending_tasks: {str(e)}", exc_info=True)
+            # Wait for 5 minutes before retry on error
+            await asyncio.sleep(300)
+
+async def main():
+    """Run both stream monitor and periodic scan"""
+    try:
+        # Create tasks for both stream monitoring and periodic scanning
+        stream_task = asyncio.create_task(monitor_stream())
+        scan_task = asyncio.create_task(scan_pending_tasks())
+        
+        # Wait for both tasks
+        await asyncio.gather(stream_task, scan_task)
+    except Exception as e:
+        logger.error(f"Error in main: {str(e)}", exc_info=True)
+        raise
+
 if __name__ == "__main__":
     logger.info("=== Task Monitor Starting ===")
     logger.info(f"Region: {os.getenv('AWS_REGION', 'us-west-2')}")
-    asyncio.run(monitor_stream()) 
+    asyncio.run(main()) 
