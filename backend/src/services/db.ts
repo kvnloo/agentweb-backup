@@ -111,6 +111,13 @@ export const taskDb = {
         KeyConditionExpression: 'userId = :userId',
         ExpressionAttributeValues: {
           ':userId': userId
+        },
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum',
+        ExpressionAttributeNames: {
+          '#n': 'name',
+          '#s': 'status',
+          '#e': 'error',
+          '#sum': 'summary'
         }
       };
 
@@ -127,6 +134,13 @@ export const taskDb = {
         TableName: 'AW-Tasks',
         Key: {
           taskId
+        },
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum',
+        ExpressionAttributeNames: {
+          '#n': 'name',
+          '#s': 'status',
+          '#e': 'error',
+          '#sum': 'summary'
         }
       };
 
@@ -141,6 +155,8 @@ export const taskDb = {
     name: string;
     prompt: string;
     status: string;
+    error: string;
+    summary: string;
   }>) {
     try {
       const updateExpressions: string[] = [];

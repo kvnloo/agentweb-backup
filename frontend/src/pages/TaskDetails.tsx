@@ -21,6 +21,8 @@ interface Task {
   prompt: string;
   status: string;
   createdAt: string;
+  summary?: string;
+  error?: string;
 }
 
 export default function TaskDetails() {
@@ -130,6 +132,28 @@ export default function TaskDetails() {
               {task.prompt}
             </Typography>
           </Grid>
+
+          {task.summary && (
+            <Grid item xs={12}>
+              <Typography variant="h6" gutterBottom>
+                Task Summary
+              </Typography>
+              <Typography variant="body1" paragraph>
+                {task.summary}
+              </Typography>
+            </Grid>
+          )}
+
+          {task.error && (
+            <Grid item xs={12}>
+              <Typography variant="h6" gutterBottom color="error">
+                Error
+              </Typography>
+              <Typography variant="body1" paragraph color="error">
+                {task.error}
+              </Typography>
+            </Grid>
+          )}
 
           <Grid item xs={12}>
             <Typography variant="h6" gutterBottom>
