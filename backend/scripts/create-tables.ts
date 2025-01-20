@@ -14,6 +14,29 @@ const dynamodb = new DynamoDB({
   }
 });
 
+// Function to enable streams on existing table
+async function enableStreamsOnTasksTable() {
+  try {
+    console.log('Enabling streams on AW-Tasks table...');
+    await dynamodb.updateTable({
+      TableName: 'AW-Tasks',
+      StreamSpecification: {
+        StreamEnabled: true,
+        StreamViewType: 'NEW_AND_OLD_IMAGES'
+      }
+    }).promise();
+    console.log('Successfully enabled streams on AW-Tasks table');
+    process.exit(0);
+  } catch (error) {
+    if (error instanceof Error) {
+      console.error('Error enabling streams:', error.message);
+    } else {
+      console.error('Unknown error occurred:', error);
+    }
+    process.exit(1);
+  }
+}
+
 async function createTables() {
   // Users table
   const userTableParams: DynamoDB.CreateTableInput = {
@@ -62,7 +85,11 @@ async function createTables() {
         }
       }
     ],
-    BillingMode: 'PAY_PER_REQUEST'
+    BillingMode: 'PAY_PER_REQUEST',
+    StreamSpecification: {
+      StreamEnabled: true,
+      StreamViewType: 'NEW_AND_OLD_IMAGES'
+    }
   };
 
   try {
@@ -91,13 +118,25 @@ async function createTables() {
   }
 }
 
-// Run the table creation
-createTables()
+// Main function to handle script execution
+async function main() {
+  // Check if this script was run with --enable-streams flag
+  if (process.argv.includes('--enable-streams')) {
+    await enableStreamsOnTasksTable();
+    return;
+  }
+
+  // Otherwise, create tables
+  await createTables();
+}
+
+// Run the main function
+main()
   .then(() => {
-    console.log('All tables created successfully');
+    console.log('Operation completed successfully');
     process.exit(0);
   })
   .catch(error => {
-    console.error('Failed to create tables:', error);
+    console.error('Operation failed:', error);
     process.exit(1);
   }); 
