@@ -1,6 +1,8 @@
 import { DynamoDB } from 'aws-sdk';
 import dotenv from 'dotenv';
 import path from 'path';
+import AWS from 'aws-sdk';
+import { DocumentClient } from 'aws-sdk/clients/dynamodb';
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
@@ -45,41 +47,51 @@ const handleDynamoDbError = (error: any, operation: string) => {
   throw error;
 };
 
-export const userDb = {
-  async createUser(email: string, userId: string, hashedPassword: string) {
-    try {
-      const params = {
-        TableName: 'AW-Users',
-        Item: {
-          email,
-          userId,
-          password: hashedPassword,
-          createdAt: new Date().toISOString()
-        }
-      };
+class UserDB {
+  private docClient: DocumentClient;
+  private tableName = 'AW-Users';
 
-      await dynamodb.put(params).promise();
-    } catch (error) {
-      handleDynamoDbError(error, 'createUser');
-    }
-  },
+  constructor() {
+    this.docClient = new AWS.DynamoDB.DocumentClient({
+      region: process.env.AWS_REGION || 'us-west-2',
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || ''
+      }
+    });
+  }
+
+  async createUser(email: string, userId: string, password: string, isOAuthUser: boolean = false) {
+    const params = {
+      TableName: this.tableName,
+      Item: {
+        userId,
+        email,
+        password,
+        isOAuthUser,
+        createdAt: new Date().toISOString()
+      }
+    };
+
+    await this.docClient.put(params).promise();
+  }
 
   async getUserByEmail(email: string) {
-    try {
-      const params = {
-        TableName: 'AW-Users',
-        Key: {
-          email
-        }
-      };
+    const params = {
+      TableName: this.tableName,
+      IndexName: 'EmailIndex',
+      KeyConditionExpression: 'email = :email',
+      ExpressionAttributeValues: {
+        ':email': email
+      }
+    };
 
-      const result = await dynamodb.get(params).promise();
-      return result.Item;
-    } catch (error) {
-      handleDynamoDbError(error, 'getUserByEmail');
-    }
+    const result = await this.docClient.query(params).promise();
+    return result.Items?.[0];
   }
-};
+}
+
+export const userDb = new UserDB();
 
 export const taskDb = {
   async createTask(task: {

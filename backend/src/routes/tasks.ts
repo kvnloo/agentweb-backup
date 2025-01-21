@@ -1,11 +1,11 @@
 import express from 'express';
 import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions } from '../controllers/tasks';
-import { authMiddleware } from '../middleware/auth';
+import { authenticateToken } from '../middleware/auth';
 
 const router = express.Router();
 
 // All task routes require authentication
-router.use(authMiddleware);
+router.use(authenticateToken);
 
 router.post('/', createTask);
 router.get('/', getTasks);

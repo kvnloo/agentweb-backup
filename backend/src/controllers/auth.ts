@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { userDb } from '../services/db';
+import { Profile } from 'passport-google-oauth20';
 
 export const register = async (req: Request, res: Response) => {
   try {
@@ -62,5 +63,41 @@ export const login = async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Error in login:', error);
     res.status(500).json({ message: 'Error logging in' });
+  }
+};
+
+export const googleCallback = async (
+  accessToken: string,
+  refreshToken: string,
+  profile: Profile,
+  done: (error: any, user?: any) => void
+) => {
+  try {
+    const email = profile.emails?.[0]?.value;
+    if (!email) {
+      return done(new Error('No email found in Google profile'));
+    }
+
+    // Check if user exists
+    let user = await userDb.getUserByEmail(email);
+    
+    if (!user) {
+      // Create new user if doesn't exist
+      const userId = Date.now().toString();
+      await userDb.createUser(email, userId, '', true); // No password for OAuth users
+      user = { userId, email };
+    }
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId: user.userId, email: user.email },
+      process.env.JWT_SECRET || 'your-secret-key'
+    );
+
+    // Pass token to callback
+    done(null, { token });
+  } catch (error) {
+    console.error('Error in Google callback:', error);
+    done(error);
   }
 }; 

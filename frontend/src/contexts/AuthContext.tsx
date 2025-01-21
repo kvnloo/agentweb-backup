@@ -5,6 +5,8 @@ interface AuthContextType {
   token: string | null;
   login: (email: string, password: string) => Promise<void>;
   register: (email: string, password: string) => Promise<void>;
+  loginWithGoogle: () => Promise<void>;
+  setToken: (token: string | null) => void;
   logout: () => void;
   isAuthenticated: boolean;
 }
@@ -37,6 +39,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   };
 
+  const loginWithGoogle = async () => {
+    try {
+      // Redirect to Google OAuth endpoint
+      window.location.href = 'http://localhost:3001/api/auth/google';
+    } catch (error) {
+      throw new Error('Google sign in failed');
+    }
+  };
+
   const register = async (email: string, password: string) => {
     try {
       const response = await axios.post('http://localhost:3001/api/auth/register', {
@@ -54,7 +65,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   return (
-    <AuthContext.Provider value={{ token, login, register, logout, isAuthenticated }}>
+    <AuthContext.Provider value={{ token, login, register, loginWithGoogle, setToken, logout, isAuthenticated }}>
       {children}
     </AuthContext.Provider>
   );
