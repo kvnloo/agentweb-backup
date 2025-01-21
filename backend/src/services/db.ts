@@ -200,6 +200,117 @@ export const taskDb = {
     } catch (error) {
       handleDynamoDbError(error, 'deleteTask');
     }
+  },
+
+  async createTaskExecution(execution: {
+    executionId: string;
+    taskId: string;
+    userId: string;
+    status: string;
+    startTime: string;
+  }) {
+    try {
+      const params = {
+        TableName: 'AW-TaskExecutions',
+        Item: execution
+      };
+
+      await dynamodb.put(params).promise();
+      return execution;
+    } catch (error) {
+      handleDynamoDbError(error, 'createTaskExecution');
+    }
+  },
+
+  async getTaskExecutionById(executionId: string) {
+    try {
+      const params = {
+        TableName: 'AW-TaskExecutions',
+        Key: {
+          executionId
+        }
+      };
+
+      const result = await dynamodb.get(params).promise();
+      return result.Item;
+    } catch (error) {
+      handleDynamoDbError(error, 'getTaskExecutionById');
+    }
+  },
+
+  async updateTaskExecution(executionId: string, updates: Partial<{
+    status: string;
+    error: string;
+    result: string;
+    completedAt: string;
+  }>) {
+    try {
+      const updateExpressions: string[] = [];
+      const expressionAttributeNames: { [key: string]: string } = {};
+      const expressionAttributeValues: { [key: string]: any } = {};
+
+      Object.entries(updates).forEach(([key, value]) => {
+        updateExpressions.push(`#${key} = :${key}`);
+        expressionAttributeNames[`#${key}`] = key;
+        expressionAttributeValues[`:${key}`] = value;
+      });
+
+      const params = {
+        TableName: 'AW-TaskExecutions',
+        Key: {
+          executionId
+        },
+        UpdateExpression: `SET ${updateExpressions.join(', ')}`,
+        ExpressionAttributeNames: expressionAttributeNames,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: 'ALL_NEW'
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, 'updateTaskExecution');
+    }
+  },
+
+  async getPendingTaskExecutions() {
+    try {
+      const params = {
+        TableName: 'AW-TaskExecutions',
+        IndexName: 'StatusCreatedAtIndex',
+        KeyConditionExpression: '#status = :status',
+        ExpressionAttributeNames: {
+          '#status': 'status'
+        },
+        ExpressionAttributeValues: {
+          ':status': 'pending'
+        }
+      };
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items;
+    } catch (error) {
+      handleDynamoDbError(error, 'getPendingTaskExecutions');
+    }
+  },
+
+  async getTaskExecutions(taskId: string) {
+    try {
+      const params = {
+        TableName: 'AW-TaskExecutions',
+        IndexName: 'TaskIdIndex',
+        KeyConditionExpression: 'taskId = :taskId',
+        ExpressionAttributeValues: {
+          ':taskId': taskId
+        },
+        ScanIndexForward: false  // Get latest executions first
+      };
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, 'getTaskExecutions');
+    }
   }
 };
 

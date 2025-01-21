@@ -23,7 +23,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       userId,
       name,
       prompt,
-      status: 'pending',  // task_monitor.py will pick this up
+      status: 'active',  // Changed from 'pending'
       createdAt: new Date().toISOString()
     };
 
@@ -133,5 +133,68 @@ export const deleteTask = async (req: AuthRequest, res: Response) => {
   } catch (error) {
     console.error('Error in deleteTask:', error);
     res.status(500).json({ message: 'Error deleting task' });
+  }
+};
+
+export const executeTask = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const taskId = req.params.id;
+    const task = await taskDb.getTaskById(taskId);
+
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Verify task belongs to user
+    if (task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Create a new task execution record
+    const execution = {
+      executionId: Date.now().toString(),
+      taskId,
+      userId,
+      status: 'pending',
+      startTime: new Date().toISOString()
+    };
+
+    await taskDb.createTaskExecution(execution);
+    res.status(201).json(execution);
+  } catch (error) {
+    console.error('Error in executeTask:', error);
+    res.status(500).json({ message: 'Error executing task' });
+  }
+};
+
+export const getTaskExecutions = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const taskId = req.params.id;
+    const task = await taskDb.getTaskById(taskId);
+
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Verify task belongs to user
+    if (task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const executions = await taskDb.getTaskExecutions(taskId);
+    res.json(executions);
+  } catch (error) {
+    console.error('Error in getTaskExecutions:', error);
+    res.status(500).json({ message: 'Error fetching task executions' });
   }
 }; 
