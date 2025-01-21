@@ -1,5 +1,5 @@
 import { BrowserRouter as Router, Routes, Route, Navigate, useLocation } from 'react-router-dom';
-import { Box, AppBar, Toolbar, Button, Typography, ThemeProvider, CssBaseline } from '@mui/material';
+import { Box, AppBar, Toolbar, Button, Typography, ThemeProvider, CssBaseline, Container } from '@mui/material';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import theme from './theme';
 import Home from './pages/Home';
@@ -8,6 +8,7 @@ import Register from './pages/Register';
 import Dashboard from './pages/Dashboard';
 import CreateTask from './pages/CreateTask';
 import TaskDetails from './pages/TaskDetails';
+import Layout from './components/Layout';
 
 function Header() {
   const { isAuthenticated, logout } = useAuth();
@@ -50,14 +51,48 @@ function RequireAuth({ children }: { children: JSX.Element }) {
   return children;
 }
 
+function Footer() {
+  return (
+    <Box
+      component="footer"
+      sx={{
+        py: 3,
+        px: 2,
+        mt: 'auto',
+        backgroundColor: 'white',
+        borderTop: 1,
+        borderColor: 'grey.200'
+      }}
+    >
+      <Container maxWidth="lg">
+        <Typography 
+          variant="body2" 
+          color="text.secondary" 
+          align="center"
+          sx={{ fontWeight: 500 }}
+        >
+          © {new Date().getFullYear()} AgentWeb. All rights reserved.
+        </Typography>
+      </Container>
+    </Box>
+  );
+}
+
 function App() {
+  const location = useLocation();
+  const isHomePage = location.pathname === '/';
+
   return (
     <ThemeProvider theme={theme}>
       <CssBaseline />
-      <Router>
-        <AuthProvider>
-          <Box sx={{ minHeight: '100vh', bgcolor: 'background.default' }}>
-            <Header />
+      <AuthProvider>
+        <Box sx={{ 
+          display: 'flex', 
+          flexDirection: 'column', 
+          minHeight: '100vh',
+          bgcolor: 'grey.50'
+        }}>
+          <Box sx={{ flexGrow: 1 }}>
             <Routes>
               <Route path="/" element={<Home />} />
               <Route path="/login" element={<Login />} />
@@ -79,10 +114,17 @@ function App() {
               } />
             </Routes>
           </Box>
-        </AuthProvider>
-      </Router>
+          <Footer />
+        </Box>
+      </AuthProvider>
     </ThemeProvider>
   );
 }
 
-export default App;
+export default function AppWrapper() {
+  return (
+    <Router>
+      <App />
+    </Router>
+  );
+}

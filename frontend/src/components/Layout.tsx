@@ -35,7 +35,7 @@ export default function Layout({ children }: LayoutProps) {
       minHeight: '100vh',
       bgcolor: 'grey.50'
     }}>
-      <AppBar position="fixed" elevation={1} sx={{ bgcolor: 'white' }}>
+      <AppBar position="static" elevation={1} sx={{ bgcolor: 'white' }}>
         <Container maxWidth="lg">
           <Toolbar sx={{ px: { xs: 0 } }}>
             <Typography 
@@ -123,19 +123,10 @@ export default function Layout({ children }: LayoutProps) {
           </Toolbar>
         </Container>
       </AppBar>
-      <Toolbar /> {/* Spacer for fixed AppBar */}
       
-      <Container 
-        component="main" 
-        maxWidth="lg" 
-        sx={{ 
-          flexGrow: 1,
-          py: { xs: 3, sm: 4 },
-          px: { xs: 2, sm: 3 }
-        }}
-      >
+      <Box component="main" sx={{ flexGrow: 1 }}>
         {children}
-      </Container>
+      </Box>
 
       <Box
         component="footer"
