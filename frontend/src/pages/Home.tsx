@@ -14,7 +14,11 @@ import {
   ListItemIcon,
   ListItemText,
   Divider,
+  Stack,
+  Link,
+  Toolbar,
 } from '@mui/material';
+import { Link as RouterLink } from 'react-router-dom';
 import {
   AutoAwesome as AutoAwesomeIcon,
   Speed as SpeedIcon,
@@ -45,10 +49,92 @@ export default function Home() {
     }
   };
 
+  const scrollToSection = (id: string) => {
+    const element = document.getElementById(id);
+    if (element) {
+      element.scrollIntoView({ behavior: 'smooth' });
+    }
+  };
+
   return (
     <Box sx={{ bgcolor: 'background.default' }}>
-      {/* Hero Section */}
+      {/* Navigation Menu */}
       <Box sx={{ 
+        position: 'fixed',
+        top: 0,
+        left: 0,
+        right: 0,
+        bgcolor: 'rgba(255, 255, 255, 0.9)',
+        backdropFilter: 'blur(8px)',
+        borderBottom: '1px solid',
+        borderColor: 'divider',
+        zIndex: 1000,
+      }}>
+        <Container maxWidth="lg">
+          <Toolbar sx={{ px: { xs: 0 } }}>
+            <Typography 
+              variant="h6" 
+              component="div" 
+              sx={{ 
+                flexGrow: 0,
+                color: 'primary.main',
+                fontWeight: 600,
+                fontSize: { xs: '1.25rem', sm: '1.5rem' },
+                mr: 4
+              }}
+            >
+              <Link
+                component={RouterLink}
+                to="/"
+                color="inherit"
+                underline="none"
+              >
+                AgentWeb
+              </Link>
+            </Typography>
+            <Stack
+              direction="row"
+              spacing={3}
+              alignItems="center"
+            >
+              <Button
+                color="primary"
+                onClick={() => scrollToSection('benefits')}
+              >
+                Benefits
+              </Button>
+              <Button
+                color="primary"
+                onClick={() => scrollToSection('features')}
+              >
+                Features
+              </Button>
+              <Button
+                color="primary"
+                onClick={() => scrollToSection('use-cases')}
+              >
+                Use Cases
+              </Button>
+              <Button
+                variant="contained"
+                onClick={() => scrollToSection('join')}
+                sx={{ 
+                  boxShadow: 'none',
+                  '&:hover': { boxShadow: 'none' }
+                }}
+              >
+                Join Waitlist
+              </Button>
+            </Stack>
+          </Toolbar>
+        </Container>
+      </Box>
+
+      {/* Spacer for fixed navigation */}
+      <Box sx={{ height: '64px' }} />
+
+      {/* Hero Section */}
+      <Box id="hero" sx={{ 
         background: 'linear-gradient(45deg, #1a237e 30%, #0d47a1 90%)',
         color: 'white',
         pt: { xs: 8, sm: 12 },
@@ -145,7 +231,7 @@ export default function Home() {
       </Box>
 
       {/* Benefits Section */}
-      <Container maxWidth="lg" sx={{ py: { xs: 8, sm: 12 } }}>
+      <Container id="benefits" maxWidth="lg" sx={{ py: { xs: 8, sm: 12 } }}>
         <Typography
           variant="h3"
           align="center"
@@ -220,7 +306,7 @@ export default function Home() {
       </Container>
 
       {/* Features Section */}
-      <Box sx={{ bgcolor: 'grey.50', py: { xs: 8, sm: 12 } }}>
+      <Box id="features" sx={{ bgcolor: 'grey.50', py: { xs: 8, sm: 12 } }}>
         <Container maxWidth="lg">
           <Typography
             variant="h3"
@@ -298,7 +384,7 @@ export default function Home() {
       </Box>
 
       {/* Use Cases Section */}
-      <Container maxWidth="lg" sx={{ py: { xs: 8, sm: 12 } }}>
+      <Container id="use-cases" maxWidth="lg" sx={{ py: { xs: 8, sm: 12 } }}>
         <Typography
           variant="h3"
           align="center"
@@ -371,7 +457,7 @@ export default function Home() {
       </Container>
 
       {/* Final CTA Section */}
-      <Box sx={{ 
+      <Box id="join" sx={{ 
         bgcolor: 'primary.main',
         color: 'white',
         py: { xs: 8, sm: 12 },
