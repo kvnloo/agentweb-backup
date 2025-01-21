@@ -463,6 +463,7 @@ export default function Home() {
         </Grid>
       </Container>
 
+      {/* Final CTA Section */}
       <Box id="join" sx={{ 
         bgcolor: 'primary.main',
         color: 'white',
@@ -481,9 +482,16 @@ export default function Home() {
             variant="contained"
             size="large"
             onClick={() => {
-              const form = document.querySelector('form');
-              if (form) {
-                form.scrollIntoView({ behavior: 'smooth' });
+              const heroSection = document.getElementById('hero');
+              if (heroSection) {
+                heroSection.scrollIntoView({ behavior: 'smooth' });
+                // Focus the email input after scrolling
+                setTimeout(() => {
+                  const emailInput = document.querySelector('input[type="email"]') as HTMLInputElement;
+                  if (emailInput) {
+                    emailInput.focus();
+                  }
+                }, 800); // Wait for scroll animation
               }
             }}
             sx={{ 
