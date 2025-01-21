@@ -68,7 +68,7 @@ export default function Dashboard() {
   };
 
   return (
-    <Box>
+    <Container maxWidth="lg" sx={{ py: { xs: 3, sm: 4 }, px: { xs: 2, sm: 3 } }}>
       <Paper 
         elevation={0} 
         sx={{ 
@@ -233,6 +233,6 @@ export default function Dashboard() {
           </Grid>
         )}
       </Grid>
-    </Box>
+    </Container>
   );
 } 
