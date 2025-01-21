@@ -55,7 +55,7 @@ export default function Home() {
         pb: { xs: 8, sm: 12 },
       }}>
         <Container maxWidth="lg">
-          <Grid container spacing={4} alignItems="center">
+          <Grid container spacing={4} alignItems="center" justifyContent="center">
             <Grid item xs={12} md={7}>
               <Typography
                 variant="h1"
@@ -77,20 +77,6 @@ export default function Home() {
               >
                 Let our intelligent agents handle your web automation needs with simple natural language instructions.
               </Typography>
-              <Box sx={{ mb: 4, display: 'flex', gap: 1, flexWrap: 'wrap' }}>
-                <Chip 
-                  label="Invitation Only Beta" 
-                  color="primary" 
-                  icon={<LockIcon />}
-                  sx={{ bgcolor: 'white', color: 'primary.dark' }}
-                />
-                <Chip 
-                  label="Limited Spots Available" 
-                  color="primary"
-                  icon={<TimerIcon />}
-                  sx={{ bgcolor: 'white', color: 'primary.dark' }}
-                />
-              </Box>
 
               {/* Waitlist Form */}
               <Paper 
@@ -114,7 +100,7 @@ export default function Home() {
                       </Alert>
                     )}
                     <Typography variant="h6" gutterBottom color="text.primary">
-                      Join the Exclusive Beta
+                      Join Waitlist
                     </Typography>
                     <Box sx={{ display: 'flex', gap: 1 }}>
                       <TextField
@@ -131,7 +117,8 @@ export default function Home() {
                         variant="contained"
                         size="large"
                         sx={{ 
-                          px: 4,
+                          px: 3,
+                          whiteSpace: 'nowrap',
                           bgcolor: 'primary.main',
                           '&:hover': {
                             bgcolor: 'primary.dark'
@@ -166,7 +153,7 @@ export default function Home() {
         >
           Why Choose AgentWeb?
         </Typography>
-        <Grid container spacing={4}>
+        <Grid container spacing={4} justifyContent="center">
           <Grid item xs={12} md={6}>
             <List>
               <ListItem>
@@ -242,7 +229,7 @@ export default function Home() {
           >
             Powerful Features
           </Typography>
-          <Grid container spacing={4}>
+          <Grid container spacing={4} justifyContent="center">
             <Grid item xs={12} md={4}>
               <Paper 
                 sx={{ 
@@ -281,7 +268,7 @@ export default function Home() {
                   Lightning Fast
                 </Typography>
                 <Typography variant="body1" color="text.secondary">
-                  Execute tasks in seconds that would take hours to do manually.
+                  Execute tasks in minutes that would take hours to do manually.
                 </Typography>
               </Paper>
             </Grid>
@@ -319,7 +306,7 @@ export default function Home() {
         >
           What You Can Automate
         </Typography>
-        <Grid container spacing={4}>
+        <Grid container spacing={4} justifyContent="center">
           <Grid item xs={12} md={6} lg={4}>
             <Paper sx={{ p: 3 }}>
               <Typography variant="h6" gutterBottom color="primary">
