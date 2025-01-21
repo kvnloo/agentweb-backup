@@ -11,9 +11,14 @@ from langchain_aws import ChatBedrock
 import boto3
 from botocore.config import Config
 from dotenv import load_dotenv
+import logging
 
 # Load environment variables
 load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Configure AWS client with no retries
 aws_config = Config(
@@ -52,6 +57,7 @@ class WebAgent:
         self.agent = None
         self.llm = get_llm()
         self.task = None
+        self.action_history = []
 
     async def setup(self):
         """Initialize the browser instance"""
@@ -72,6 +78,12 @@ class WebAgent:
         if self.browser:
             await self.browser.close()
 
+    def get_action_history(self):
+        """Get the list of actions performed by the agent"""
+        if not self.agent:
+            return []
+        return self.agent.action_history
+
     async def execute_task(self, prompt: str) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
         try:
@@ -80,12 +92,38 @@ class WebAgent:
             
             # Run the agent
             await self.agent.run(max_steps=25)
-
+            
+            # Get the last message from the agent's history
+            last_message = None
+            if hasattr(self.agent, 'history'):
+                logger.info("Agent has history attribute")
+                history = self.agent.history.history
+                if history:
+                    logger.info(f"History length: {len(history)}")
+                    if history[-1].result:
+                        logger.info("Last history entry has result")
+                        # Get the extracted content from the last action result
+                        action_result = history[-1].result[0]  # First result from the last action
+                        logger.info(f"Action result: {action_result}")
+                        if hasattr(action_result, 'is_done') and action_result.is_done:
+                            last_message = action_result.extracted_content
+                            logger.info(f"Extracted summary: {last_message}")
+                        else:
+                            logger.warning(f"Last action result is not done: {action_result}")
+                    else:
+                        logger.warning("Last history entry has no result")
+                else:
+                    logger.warning("History is empty")
+            else:
+                logger.warning("Agent has no history attribute")
+            
             return {
                 "success": True,
-                "message": "Task completed successfully"
+                "message": "Task completed successfully",
+                "summary": last_message if last_message else "Task completed but no summary available"
             }
         except Exception as e:
+            logger.error(f"Error in execute_task: {e}")
             return {
                 "success": False,
                 "error": str(e),

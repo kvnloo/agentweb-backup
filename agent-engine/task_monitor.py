@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from web_agent import WebAgent
 from botocore.exceptions import ClientError
+import time
+from decimal import Decimal
 
 # Custom JSON encoder to handle datetime objects
 class DateTimeEncoder(json.JSONEncoder):
@@ -55,237 +57,124 @@ logger = logging.getLogger(__name__)
 os.environ['BROWSER_USE_LOGGING_LEVEL'] = 'info'
 
 # Initialize DynamoDB client
-dynamodb = boto3.client('dynamodb',
+dynamodb = boto3.resource('dynamodb',
     region_name=os.getenv('AWS_REGION', 'us-west-2'),
     aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
     aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
 )
+executions_table = dynamodb.Table('AW-TaskExecutions')
+tasks_table = dynamodb.Table('AW-Tasks')
 
-async def update_task_status(task_id: str, status: str, error: str = None, summary: str = None):
-    """Update task status in AW-Tasks table"""
+def get_pending_executions():
     try:
-        logger.info(f"Updating task {task_id} status to {status}")
-        update_expr = "SET #status = :status, updatedAt = :updatedAt"
-        expr_values = {
-            ':status': {'S': status},
-            ':updatedAt': {'S': datetime.now(timezone.utc).isoformat()}
-        }
-        
-        expr_names = {
-            '#status': 'status'
-        }
-        
-        if error:
-            update_expr += ", #error = :error"
-            expr_values[':error'] = {'S': error}
-            expr_names['#error'] = 'error'
-            logger.error(f"Task {task_id} error: {error}")
-            
-        if summary:
-            update_expr += ", #summary = :summary"
-            expr_values[':summary'] = {'S': summary}
-            expr_names['#summary'] = 'summary'
-            logger.info(f"Task {task_id} summary: {summary}")
-        
-        dynamodb.update_item(
-            TableName='AW-Tasks',
-            Key={'taskId': {'S': task_id}},
-            UpdateExpression=update_expr,
-            ExpressionAttributeNames=expr_names,
-            ExpressionAttributeValues=expr_values
-        )
-        logger.info(f"Successfully updated task {task_id} status")
-    except Exception as e:
-        logger.error(f"Error updating task {task_id} status: {str(e)}", exc_info=True)
-
-async def create_task_execution(task_id: str, task: dict):
-    """Create a new task execution record"""
-    execution_id = str(uuid.uuid4())
-    start_time = datetime.now(timezone.utc).isoformat()
-    
-    try:
-        logger.info(f"Creating execution record for task {task_id}")
-        user_id = task.get('userId', {}).get('S', 'unknown')
-        prompt = task.get('prompt', {}).get('S', '')
-        logger.info(f"Task details - User: {user_id}, Prompt: {prompt}")
-        
-        dynamodb.put_item(
-            TableName='AW-TaskExecutions',
-            Item={
-                'executionId': {'S': execution_id},
-                'taskId': {'S': task_id},
-                'startTime': {'S': start_time},
-                'status': {'S': 'running'},
-                'userId': {'S': user_id},
-                'prompt': {'S': prompt},
-                'createdAt': {'S': datetime.now(timezone.utc).isoformat()},
-                'updatedAt': {'S': datetime.now(timezone.utc).isoformat()}
+        logger.info("Querying for pending executions...")
+        response = executions_table.query(
+            IndexName='StatusStartTimeIndex',  # We'll need to create this GSI
+            KeyConditionExpression='#status = :status',
+            ExpressionAttributeNames={
+                '#status': 'status'
+            },
+            ExpressionAttributeValues={
+                ':status': 'pending'
             }
         )
-        logger.info(f"Successfully created execution record {execution_id}")
-        return execution_id
-    except Exception as e:
-        logger.error(f"Error creating execution record for task {task_id}: {str(e)}", exc_info=True)
-        return None
+        items = response.get('Items', [])
+        logger.info(f"Found {len(items)} pending executions: {json_dumps(items)}")
+        return items
+    except ClientError as e:
+        logger.error(f"Error querying pending executions: {e}")
+        return []
 
-async def update_task_execution(execution_id: str, status: str, error: str = None, result: dict = None):
-    """Update task execution status"""
+def update_execution_status(execution_id, status, result=None, error=None):
     try:
-        logger.info(f"Updating execution {execution_id} status to {status}")
-        update_expr = "SET #status = :status, endTime = :endTime, updatedAt = :updatedAt"
-        expr_values = {
-            ':status': {'S': status},
-            ':endTime': {'S': datetime.now(timezone.utc).isoformat()},
-            ':updatedAt': {'S': datetime.now(timezone.utc).isoformat()}
+        update_expression = "SET #status = :status"
+        expression_values = {
+            ':status': status
         }
-        
-        expr_names = {
+        expression_names = {
             '#status': 'status'
         }
-        
-        if error:
-            update_expr += ", #error = :error"
-            expr_values[':error'] = {'S': error}
-            expr_names['#error'] = 'error'
-            logger.error(f"Execution {execution_id} error: {error}")
-            
-        if result:
-            update_expr += ", #result = :result"
-            expr_values[':result'] = {'S': json.dumps(result)}
-            expr_names['#result'] = 'result'
-            logger.info(f"Execution {execution_id} result: {json.dumps(result)}")
-            
-        dynamodb.update_item(
-            TableName='AW-TaskExecutions',
-            Key={'executionId': {'S': execution_id}},
-            UpdateExpression=update_expr,
-            ExpressionAttributeNames=expr_names,
-            ExpressionAttributeValues=expr_values
-        )
-        logger.info(f"Successfully updated execution {execution_id}")
-    except Exception as e:
-        logger.error(f"Error updating execution {execution_id}: {str(e)}", exc_info=True)
 
-async def execute_task(task):
-    """Execute a task using WebAgent directly"""
-    task_id = task['taskId']['S']
-    prompt = task['prompt']['S']
-    
-    logger.info(f"Starting execution for task {task_id}")
-    logger.info(f"Task prompt: {prompt}")
-    
-    # Create execution record
-    execution_id = await create_task_execution(task_id, task)
-    if not execution_id:
-        logger.error(f"Failed to create execution record for task {task_id}")
-        await update_task_status(task_id, 'failed', 'Failed to create execution record')
-        return
+        if status in ['completed', 'failed']:
+            update_expression += ", completedAt = :completedAt"
+            expression_values[':completedAt'] = datetime.now(timezone.utc).isoformat()
+
+        if result is not None:
+            update_expression += ", #result = :result"
+            expression_values[':result'] = result
+            expression_names['#result'] = 'result'
+
+        if error is not None:
+            update_expression += ", #error = :error"
+            expression_values[':error'] = error
+            expression_names['#error'] = 'error'
+
+        executions_table.update_item(
+            Key={'executionId': execution_id},
+            UpdateExpression=update_expression,
+            ExpressionAttributeNames=expression_names,
+            ExpressionAttributeValues=expression_values
+        )
+    except ClientError as e:
+        logger.error(f"Error updating execution status: {e}")
+
+async def execute_task(execution):
+    execution_id = execution['executionId']
+    task_id = execution['taskId']
     
     try:
-        # Create and run WebAgent
-        logger.info(f"Initializing WebAgent for task {task_id}")
-        agent = WebAgent()
+        # Get task details
+        task_response = tasks_table.get_item(Key={'taskId': task_id})
+        task = task_response.get('Item')
         
-        try:
-            result = await agent.execute_task(prompt)
-            logger.info(f"WebAgent execution completed: {json.dumps(result)}")
-            
-            # Get the last message from the agent's history
-            last_message = None
-            if hasattr(agent, 'agent') and hasattr(agent.agent, 'history'):
-                history = agent.agent.history.history
-                if history and history[-1].result:
-                    # Get the extracted content from the last action result
-                    action_result = history[-1].result[0]  # First result from the last action
-                    if hasattr(action_result, 'is_done') and action_result.is_done:
-                        last_message = action_result.extracted_content
-                        logger.info(f"Agent final message: {last_message}")
-                    else:
-                        logger.warning(f"Last action result is not done: {action_result}")
-            
-            # Add summary to result
-            if last_message:
-                result['summary'] = last_message
-                logger.info(f"Execution summary: {last_message}")
-            
-            if result.get('success', False):
-                logger.info(f"Task {task_id} completed successfully")
-                await update_task_status(task_id, 'completed', summary=last_message)
-                await update_task_execution(execution_id, 'completed', result=result)
-            else:
-                error = result.get('error', 'Unknown error')
-                logger.error(f"Task {task_id} failed: {error}")
-                await update_task_status(task_id, 'failed', error=error, summary=last_message)
-                await update_task_execution(execution_id, 'failed', error=error, result=result)
-                
-        finally:
-            # Always cleanup browser resources
-            await agent.cleanup()
-            
-    except Exception as e:
-        error = str(e)
-        logger.error(f"Error executing task {task_id}: {error}", exc_info=True)
-        await update_task_status(task_id, 'failed', error=error)
-        await update_task_execution(execution_id, 'failed', error=error)
+        if not task:
+            raise Exception(f"Task {task_id} not found")
 
-async def monitor_tasks():
-    """Monitor for new tasks using simple polling"""
-    last_timestamp = datetime.now(timezone.utc).isoformat()
+        # Update execution status to running
+        update_execution_status(execution_id, 'running')
+        
+        # Initialize and run web agent
+        agent = WebAgent()
+        try:
+            result = await agent.execute_task(task['prompt'])
+            
+            if result['success']:
+                update_execution_status(
+                    execution_id, 
+                    'completed', 
+                    result=result.get('summary', 'No summary available')
+                )
+            else:
+                update_execution_status(
+                    execution_id, 
+                    'failed', 
+                    error=result.get('error', 'Unknown error')
+                )
+        finally:
+            await agent.cleanup()
+        
+    except Exception as e:
+        logger.error(f"Error executing task: {e}")
+        update_execution_status(execution_id, 'failed', error=str(e))
+
+async def monitor_executions():
+    logger.info("Starting execution monitor...")
     
     while True:
         try:
-            # Scan for new pending tasks
-            response = dynamodb.scan(
-                TableName='AW-Tasks',
-                FilterExpression='#status = :status AND createdAt > :timestamp',
-                ExpressionAttributeNames={
-                    '#status': 'status'
-                },
-                ExpressionAttributeValues={
-                    ':status': {'S': 'pending'},
-                    ':timestamp': {'S': last_timestamp}
-                }
-            )
+            logger.info("Checking for pending executions...")
+            pending_executions = get_pending_executions()
             
-            tasks = response.get('Items', [])
-            if tasks:
-                logger.info(f"Found {len(tasks)} new tasks")
-                for task in tasks:
-                    task_id = task['taskId']['S']
-                    try:
-                        # Try to claim the task
-                        dynamodb.update_item(
-                            TableName='AW-Tasks',
-                            Key={'taskId': {'S': task_id}},
-                            UpdateExpression='SET #status = :new_status, updatedAt = :updatedAt',
-                            ConditionExpression='#status = :old_status',
-                            ExpressionAttributeNames={
-                                '#status': 'status'
-                            },
-                            ExpressionAttributeValues={
-                                ':old_status': {'S': 'pending'},
-                                ':new_status': {'S': 'running'},
-                                ':updatedAt': {'S': datetime.now(timezone.utc).isoformat()}
-                            }
-                        )
-                        # Execute the task
-                        await execute_task(task)
-                    except ClientError as e:
-                        if e.response['Error']['Code'] != 'ConditionalCheckFailedException':
-                            logger.error(f"Error claiming task {task_id}: {str(e)}")
-                    except Exception as e:
-                        logger.error(f"Error processing task {task_id}: {str(e)}")
-                
-                # Update timestamp to the latest task's createdAt
-                last_timestamp = max(task['createdAt']['S'] for task in tasks)
+            for execution in pending_executions:
+                logger.info(f"Processing execution {execution['executionId']}")
+                await execute_task(execution)
             
-            # Wait before next poll
-            await asyncio.sleep(5)
+            logger.info("Sleeping for 5 seconds...")
+            await asyncio.sleep(5)  # Use async sleep
             
         except Exception as e:
-            logger.error(f"Error in monitor_tasks: {str(e)}")
-            await asyncio.sleep(5)
+            logger.error(f"Error in monitor loop: {e}")
+            await asyncio.sleep(5)  # Use async sleep
 
 if __name__ == "__main__":
-    logger.info("=== Task Monitor Starting ===")
-    asyncio.run(monitor_tasks()) 
+    asyncio.run(monitor_executions()) 
