@@ -54,124 +54,12 @@ logger = logging.getLogger(__name__)
 # Set environment variable for browser-use logging level
 os.environ['BROWSER_USE_LOGGING_LEVEL'] = 'info'
 
-# Initialize DynamoDB client and resource
+# Initialize DynamoDB client
 dynamodb = boto3.client('dynamodb',
     region_name=os.getenv('AWS_REGION', 'us-west-2'),
     aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
     aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
 )
-dynamodb_resource = boto3.resource('dynamodb',
-    region_name=os.getenv('AWS_REGION', 'us-west-2'),
-    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
-)
-
-async def process_stream_record(record):
-    """Process a single DynamoDB Stream record"""
-    if record['eventName'] != 'INSERT':
-        return
-
-    # Get the new task data
-    new_task = record['dynamodb']['NewImage']
-    task_id = new_task['taskId']['S']
-    
-    # Check if status is pending or not set
-    status = new_task.get('status', {}).get('S', 'pending')
-    if status != 'pending':
-        return
-
-    logger.info(f"Processing new task: {task_id}")
-    
-    try:
-        # Try to atomically update status from pending to running
-        dynamodb.update_item(
-            TableName='AW-Tasks',
-            Key={'taskId': {'S': task_id}},
-            UpdateExpression='SET #status = :new_status, updatedAt = :updatedAt',
-            ConditionExpression='attribute_not_exists(#status) OR #status = :old_status',
-            ExpressionAttributeNames={
-                '#status': 'status'
-            },
-            ExpressionAttributeValues={
-                ':old_status': {'S': 'pending'},
-                ':new_status': {'S': 'running'},
-                ':updatedAt': {'S': datetime.now(timezone.utc).isoformat()}
-            }
-        )
-        # Execute the task
-        await execute_task(new_task)
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
-            logger.info(f"Task {task_id} is being processed by another worker")
-        else:
-            logger.error(f"Error processing task {task_id}: {str(e)}", exc_info=True)
-    except Exception as e:
-        logger.error(f"Error processing task {task_id}: {str(e)}", exc_info=True)
-
-async def monitor_stream():
-    """Monitor DynamoDB Stream for new tasks"""
-    logger.info("Starting DynamoDB Stream monitor...")
-    
-    try:
-        # Get the table
-        table = dynamodb_resource.Table('AW-Tasks')
-        
-        # Get the latest stream ARN
-        stream_arn = table.latest_stream_arn
-        if not stream_arn:
-            raise Exception("Stream not enabled on AW-Tasks table")
-            
-        logger.info(f"Found stream ARN: {stream_arn}")
-            
-        # Create a stream client
-        stream_client = boto3.client('dynamodbstreams',
-            region_name=os.getenv('AWS_REGION', 'us-west-2'),
-            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
-        )
-        
-        # Get stream description
-        stream = stream_client.describe_stream(StreamArn=stream_arn)
-        logger.info(f"Stream description: {json_dumps(stream['StreamDescription'])}")
-        
-        shard_id = stream['StreamDescription']['Shards'][0]['ShardId']
-        logger.info(f"Using shard ID: {shard_id}")
-        
-        # Get shard iterator
-        iterator_response = stream_client.get_shard_iterator(
-            StreamArn=stream_arn,
-            ShardId=shard_id,
-            ShardIteratorType='LATEST'
-        )
-        shard_iterator = iterator_response['ShardIterator']
-        logger.info("Successfully got shard iterator")
-        
-        logger.info(f"Monitoring stream: {stream_arn}")
-        
-        while True:
-            # Get records from stream
-            response = stream_client.get_records(ShardIterator=shard_iterator)
-            
-            # Log record count
-            record_count = len(response.get('Records', []))
-            if record_count > 0:
-                logger.info(f"Received {record_count} records")
-                logger.info(f"Records: {json_dumps(response['Records'])}")
-            
-            # Process records
-            for record in response['Records']:
-                logger.info(f"Processing record: {json_dumps(record)}")
-                await process_stream_record(record)
-            
-            # Update shard iterator
-            shard_iterator = response['NextShardIterator']
-            
-            # Wait before next poll
-            await asyncio.sleep(1)
-            
-    except Exception as e:
-        logger.error(f"Error in stream monitor: {str(e)}", exc_info=True)
-        raise
 
 async def update_task_status(task_id: str, status: str, error: str = None, summary: str = None):
     """Update task status in AW-Tasks table"""
@@ -198,7 +86,7 @@ async def update_task_status(task_id: str, status: str, error: str = None, summa
             expr_values[':summary'] = {'S': summary}
             expr_names['#summary'] = 'summary'
             logger.info(f"Task {task_id} summary: {summary}")
-            
+        
         dynamodb.update_item(
             TableName='AW-Tasks',
             Key={'taskId': {'S': task_id}},
@@ -340,71 +228,64 @@ async def execute_task(task):
         await update_task_status(task_id, 'failed', error=error)
         await update_task_execution(execution_id, 'failed', error=error)
 
-async def scan_pending_tasks():
-    """Periodically scan for pending tasks"""
+async def monitor_tasks():
+    """Monitor for new tasks using simple polling"""
+    last_timestamp = datetime.now(timezone.utc).isoformat()
+    
     while True:
         try:
-            logger.info("Scanning for pending tasks...")
+            # Scan for new pending tasks
             response = dynamodb.scan(
                 TableName='AW-Tasks',
-                FilterExpression='attribute_not_exists(#status) OR #status = :status',
-                ExpressionAttributeNames={'#status': 'status'},
-                ExpressionAttributeValues={':status': {'S': 'pending'}}
+                FilterExpression='#status = :status AND createdAt > :timestamp',
+                ExpressionAttributeNames={
+                    '#status': 'status'
+                },
+                ExpressionAttributeValues={
+                    ':status': {'S': 'pending'},
+                    ':timestamp': {'S': last_timestamp}
+                }
             )
             
             tasks = response.get('Items', [])
-            logger.info(f"Found {len(tasks)} pending tasks")
+            if tasks:
+                logger.info(f"Found {len(tasks)} new tasks")
+                for task in tasks:
+                    task_id = task['taskId']['S']
+                    try:
+                        # Try to claim the task
+                        dynamodb.update_item(
+                            TableName='AW-Tasks',
+                            Key={'taskId': {'S': task_id}},
+                            UpdateExpression='SET #status = :new_status, updatedAt = :updatedAt',
+                            ConditionExpression='#status = :old_status',
+                            ExpressionAttributeNames={
+                                '#status': 'status'
+                            },
+                            ExpressionAttributeValues={
+                                ':old_status': {'S': 'pending'},
+                                ':new_status': {'S': 'running'},
+                                ':updatedAt': {'S': datetime.now(timezone.utc).isoformat()}
+                            }
+                        )
+                        # Execute the task
+                        await execute_task(task)
+                    except ClientError as e:
+                        if e.response['Error']['Code'] != 'ConditionalCheckFailedException':
+                            logger.error(f"Error claiming task {task_id}: {str(e)}")
+                    except Exception as e:
+                        logger.error(f"Error processing task {task_id}: {str(e)}")
+                
+                # Update timestamp to the latest task's createdAt
+                last_timestamp = max(task['createdAt']['S'] for task in tasks)
             
-            for task in tasks:
-                task_id = task.get('taskId', {}).get('S', 'unknown')
-                try:
-                    # Try to atomically update status from pending to running
-                    dynamodb.update_item(
-                        TableName='AW-Tasks',
-                        Key={'taskId': {'S': task_id}},
-                        UpdateExpression='SET #status = :new_status, updatedAt = :updatedAt',
-                        ConditionExpression='attribute_not_exists(#status) OR #status = :old_status',
-                        ExpressionAttributeNames={
-                            '#status': 'status'
-                        },
-                        ExpressionAttributeValues={
-                            ':old_status': {'S': 'pending'},
-                            ':new_status': {'S': 'running'},
-                            ':updatedAt': {'S': datetime.now(timezone.utc).isoformat()}
-                        }
-                    )
-                    # Execute the task
-                    await execute_task(task)
-                except ClientError as e:
-                    if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
-                        logger.info(f"Task {task_id} is being processed by another worker")
-                    else:
-                        logger.error(f"Error processing task {task_id}: {str(e)}", exc_info=True)
-                except Exception as e:
-                    logger.error(f"Error processing task {task_id}: {str(e)}", exc_info=True)
-            
-            # Wait for 5 minutes before next scan
-            await asyncio.sleep(300)
+            # Wait before next poll
+            await asyncio.sleep(5)
             
         except Exception as e:
-            logger.error(f"Error in scan_pending_tasks: {str(e)}", exc_info=True)
-            # Wait for 5 minutes before retry on error
-            await asyncio.sleep(300)
-
-async def main():
-    """Run both stream monitor and periodic scan"""
-    try:
-        # Create tasks for both stream monitoring and periodic scanning
-        stream_task = asyncio.create_task(monitor_stream())
-        scan_task = asyncio.create_task(scan_pending_tasks())
-        
-        # Wait for both tasks
-        await asyncio.gather(stream_task, scan_task)
-    except Exception as e:
-        logger.error(f"Error in main: {str(e)}", exc_info=True)
-        raise
+            logger.error(f"Error in monitor_tasks: {str(e)}")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
     logger.info("=== Task Monitor Starting ===")
-    logger.info(f"Region: {os.getenv('AWS_REGION', 'us-west-2')}")
-    asyncio.run(main()) 
+    asyncio.run(monitor_tasks()) 

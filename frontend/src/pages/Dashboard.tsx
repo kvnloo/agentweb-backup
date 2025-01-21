@@ -31,20 +31,27 @@ export default function Dashboard() {
   const { token } = useAuth();
   const navigate = useNavigate();
 
-  useEffect(() => {
-    const fetchTasks = async () => {
-      try {
-        const response = await axios.get('http://localhost:3001/api/tasks', {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        setTasks(response.data);
-      } catch (error: any) {
-        console.error('Error fetching tasks:', error);
-        setError(error.response?.data?.message || 'Failed to fetch tasks');
-      }
-    };
+  const fetchTasks = async () => {
+    try {
+      const response = await axios.get('http://localhost:3001/api/tasks', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setTasks(response.data);
+    } catch (error: any) {
+      console.error('Error fetching tasks:', error);
+      setError(error.response?.data?.message || 'Failed to fetch tasks');
+    }
+  };
 
+  useEffect(() => {
+    // Initial fetch
     fetchTasks();
+
+    // Set up polling interval (every 5 seconds)
+    const intervalId = setInterval(fetchTasks, 5000);
+
+    // Cleanup interval on component unmount
+    return () => clearInterval(intervalId);
   }, [token]);
 
   const getStatusColor = (status: string) => {

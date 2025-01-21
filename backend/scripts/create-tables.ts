@@ -37,6 +37,43 @@ async function enableStreamsOnTasksTable() {
   }
 }
 
+// Function to update existing table
+async function updateTasksTable() {
+  try {
+    console.log('Updating AW-Tasks table with StatusCreatedAtIndex...');
+    await dynamodb.updateTable({
+      TableName: 'AW-Tasks',
+      AttributeDefinitions: [
+        { AttributeName: 'status', AttributeType: 'S' },
+        { AttributeName: 'createdAt', AttributeType: 'S' }
+      ],
+      GlobalSecondaryIndexUpdates: [
+        {
+          Create: {
+            IndexName: 'StatusCreatedAtIndex',
+            KeySchema: [
+              { AttributeName: 'status', KeyType: 'HASH' },
+              { AttributeName: 'createdAt', KeyType: 'RANGE' }
+            ],
+            Projection: {
+              ProjectionType: 'ALL'
+            }
+          }
+        }
+      ]
+    }).promise();
+    console.log('Successfully added StatusCreatedAtIndex to AW-Tasks table');
+    process.exit(0);
+  } catch (error) {
+    if (error instanceof Error) {
+      console.error('Error updating table:', error.message);
+    } else {
+      console.error('Unknown error occurred:', error);
+    }
+    process.exit(1);
+  }
+}
+
 async function createTables() {
   // Users table
   const userTableParams: DynamoDB.CreateTableInput = {
@@ -120,6 +157,12 @@ async function createTables() {
 
 // Main function to handle script execution
 async function main() {
+  // Check if this script was run with --update-index flag
+  if (process.argv.includes('--update-index')) {
+    await updateTasksTable();
+    return;
+  }
+
   // Check if this script was run with --enable-streams flag
   if (process.argv.includes('--enable-streams')) {
     await enableStreamsOnTasksTable();
