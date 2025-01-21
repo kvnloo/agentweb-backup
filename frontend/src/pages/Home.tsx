@@ -58,7 +58,6 @@ export default function Home() {
 
   return (
     <Box sx={{ bgcolor: 'background.default' }}>
-      {/* Navigation Menu */}
       <Box sx={{ 
         position: 'fixed',
         top: 0,
@@ -71,16 +70,18 @@ export default function Home() {
         zIndex: 1000,
       }}>
         <Container maxWidth="lg">
-          <Toolbar sx={{ px: { xs: 0 } }}>
+          <Toolbar sx={{ 
+            px: { xs: 0 },
+            display: 'flex',
+            justifyContent: 'space-between'
+          }}>
             <Typography 
               variant="h6" 
               component="div" 
               sx={{ 
-                flexGrow: 0,
                 color: 'primary.main',
                 fontWeight: 600,
-                fontSize: { xs: '1.25rem', sm: '1.5rem' },
-                mr: 4
+                fontSize: { xs: '1.25rem', sm: '1.5rem' }
               }}
             >
               <Link
@@ -130,17 +131,16 @@ export default function Home() {
         </Container>
       </Box>
 
-      {/* Spacer for fixed navigation */}
       <Box sx={{ height: '64px' }} />
 
-      {/* Hero Section */}
       <Box id="hero" sx={{ 
         background: 'linear-gradient(45deg, #1a237e 30%, #0d47a1 90%)',
         color: 'white',
         pt: { xs: 8, sm: 12 },
         pb: { xs: 8, sm: 12 },
+        width: '100%'
       }}>
-        <Container maxWidth="lg">
+        <Container maxWidth="lg" sx={{ px: { xs: 2, sm: 3 } }}>
           <Grid container spacing={4} alignItems="center" justifyContent="center">
             <Grid item xs={12} md={7}>
               <Typography
@@ -230,8 +230,10 @@ export default function Home() {
         </Container>
       </Box>
 
-      {/* Benefits Section */}
-      <Container id="benefits" maxWidth="lg" sx={{ py: { xs: 8, sm: 12 } }}>
+      <Container id="benefits" maxWidth="lg" sx={{ 
+        py: { xs: 8, sm: 12 },
+        px: { xs: 2, sm: 3 }
+      }}>
         <Typography
           variant="h3"
           align="center"
@@ -305,9 +307,12 @@ export default function Home() {
         </Grid>
       </Container>
 
-      {/* Features Section */}
-      <Box id="features" sx={{ bgcolor: 'grey.50', py: { xs: 8, sm: 12 } }}>
-        <Container maxWidth="lg">
+      <Box id="features" sx={{ 
+        bgcolor: 'grey.50', 
+        py: { xs: 8, sm: 12 },
+        width: '100%'
+      }}>
+        <Container maxWidth="lg" sx={{ px: { xs: 2, sm: 3 } }}>
           <Typography
             variant="h3"
             align="center"
@@ -383,8 +388,10 @@ export default function Home() {
         </Container>
       </Box>
 
-      {/* Use Cases Section */}
-      <Container id="use-cases" maxWidth="lg" sx={{ py: { xs: 8, sm: 12 } }}>
+      <Container id="use-cases" maxWidth="lg" sx={{ 
+        py: { xs: 8, sm: 12 },
+        px: { xs: 2, sm: 3 }
+      }}>
         <Typography
           variant="h3"
           align="center"
@@ -456,14 +463,14 @@ export default function Home() {
         </Grid>
       </Container>
 
-      {/* Final CTA Section */}
       <Box id="join" sx={{ 
         bgcolor: 'primary.main',
         color: 'white',
         py: { xs: 8, sm: 12 },
-        textAlign: 'center'
+        textAlign: 'center',
+        width: '100%'
       }}>
-        <Container maxWidth="md">
+        <Container maxWidth="md" sx={{ px: { xs: 2, sm: 3 } }}>
           <Typography variant="h3" gutterBottom fontWeight={700}>
             Ready to Transform Your Workflow?
           </Typography>
