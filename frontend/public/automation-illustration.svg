@@ -1,122 +1,135 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg width="600" height="400" viewBox="0 0 600 400" fill="none" xmlns="http://www.w3.org/2000/svg">
-    <!-- Gradient Definitions -->
-    <defs>
-        <linearGradient id="bgGradient" x1="0" y1="0" x2="600" y2="400" gradientUnits="userSpaceOnUse">
-            <stop offset="0%" stop-color="#EFF6FF"/>
-            <stop offset="100%" stop-color="#F8FAFC"/>
-        </linearGradient>
-        <linearGradient id="glowGradient" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stop-color="#60A5FA" stop-opacity="0.5"/>
-            <stop offset="100%" stop-color="#3B82F6" stop-opacity="0"/>
-        </linearGradient>
-    </defs>
-
     <!-- Background -->
-    <rect width="600" height="400" fill="url(#bgGradient)"/>
+    <rect width="600" height="400" fill="#F8FAFC"/>
     
-    <!-- User Node (Start and End) -->
-    <g transform="translate(50,150)">
-        <circle cx="30" cy="30" r="40" fill="white" stroke="#3B82F6" stroke-width="2"/>
-        <text x="30" y="40" text-anchor="middle" font-family="Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji" font-size="24">👨‍💻</text>
-        <text x="30" y="85" text-anchor="middle" fill="#1E40AF" font-size="14">User</text>
+    <!-- User Node -->
+    <g transform="translate(80,160)">
+        <!-- Text moved to top -->
+        <text x="30" y="-10" text-anchor="middle" fill="#1E40AF" font-size="14">User</text>
+        
+        <circle cx="30" cy="30" r="35" fill="white" stroke="#3B82F6" stroke-width="2"/>
+        <!-- Improved user icon -->
+        <g transform="translate(12,12)">
+            <!-- Head -->
+            <circle cx="18" cy="18" r="9" fill="#3B82F6"/>
+            <!-- Shoulders -->
+            <path d="M18,29 L18,38" stroke="#3B82F6" stroke-width="4" stroke-linecap="round"/>
+            <!-- Arms -->
+            <path d="M8,33 L28,33" stroke="#3B82F6" stroke-width="4" stroke-linecap="round"/>
+            <!-- Body -->
+            <path d="M18,38 L18,45" stroke="#3B82F6" stroke-width="4" stroke-linecap="round"/>
+        </g>
     </g>
 
-    <!-- AI Agents Hub -->
-    <g transform="translate(200,50)">
-        <rect width="200" height="160" rx="12" fill="white" stroke="#3B82F6" stroke-width="2"/>
-        <text x="100" y="35" text-anchor="middle" fill="#1E40AF" font-size="16" font-weight="bold">AI Agents</text>
+    <!-- AI Agents Box -->
+    <g transform="translate(200,120)">
+        <rect width="200" height="120" rx="12" fill="white" stroke="#3B82F6" stroke-width="2"/>
+        <text x="100" y="35" text-anchor="middle" fill="#1E40AF" font-size="16">AI Agents</text>
         
-        <!-- Individual Agents -->
-        <g transform="translate(20,50)">
-            <!-- Agent 1 -->
-            <circle cx="30" cy="30" r="25" fill="#EFF6FF" stroke="#3B82F6" stroke-width="2"/>
-            <text x="30" y="38" text-anchor="middle" font-family="Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji" font-size="20">🤖</text>
+        <!-- Agent Circles with Icons -->
+        <g transform="translate(30,60)">
+            <!-- Agent 1 - Brain -->
+            <circle cx="20" cy="20" r="15" fill="#EFF6FF" stroke="#3B82F6" stroke-width="2"/>
+            <path d="M13,20 C13,16 17,13 20,13 C23,13 27,16 27,20 C27,24 23,27 20,27 C17,27 13,24 13,20" 
+                  stroke="#3B82F6" stroke-width="1.5" fill="none"/>
+            <path d="M20,13 L20,27 M13,20 L27,20" stroke="#3B82F6" stroke-width="1.5"/>
             
-            <!-- Agent 2 -->
-            <circle cx="100" cy="30" r="25" fill="#EFF6FF" stroke="#3B82F6" stroke-width="2"/>
-            <text x="100" y="38" text-anchor="middle" font-family="Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji" font-size="20">🔍</text>
+            <!-- Agent 2 - Gear -->
+            <circle cx="70" cy="20" r="15" fill="#EFF6FF" stroke="#3B82F6" stroke-width="2"/>
+            <path d="M70,12 L70,28 M62,20 L78,20 M64,14 L76,26 M76,14 L64,26" 
+                  stroke="#3B82F6" stroke-width="1.5"/>
+            <circle cx="70" cy="20" r="4" fill="#3B82F6"/>
             
-            <!-- Agent 3 -->
-            <circle cx="160" cy="30" r="25" fill="#EFF6FF" stroke="#3B82F6" stroke-width="2"/>
-            <text x="160" y="38" text-anchor="middle" font-family="Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji" font-size="20">⚡</text>
+            <!-- Agent 3 - Lightning -->
+            <circle cx="120" cy="20" r="15" fill="#EFF6FF" stroke="#3B82F6" stroke-width="2"/>
+            <path d="M120,12 L116,20 L124,20 L120,28" 
+                  stroke="#3B82F6" stroke-width="1.5" fill="none"/>
             
-            <!-- Agent Connection Lines -->
-            <path d="M55,30 H75" stroke="#3B82F6" stroke-width="2"/>
-            <path d="M125,30 H135" stroke="#3B82F6" stroke-width="2"/>
+            <!-- Connection Lines -->
+            <path d="M35,20 L55,20" stroke="#3B82F6" stroke-width="2"/>
+            <path d="M85,20 L105,20" stroke="#3B82F6" stroke-width="2"/>
             
-            <!-- Processing Indicators -->
-            <circle cx="30" cy="70" r="3" fill="#3B82F6">
-                <animate attributeName="opacity" values="1;0.2;1" dur="1s" repeatCount="indefinite"/>
+            <!-- Processing Dots -->
+            <circle cx="20" cy="45" r="2" fill="#3B82F6">
+                <animate attributeName="opacity" values="1;0.2;1" dur="1.5s" repeatCount="indefinite"/>
             </circle>
-            <circle cx="100" cy="70" r="3" fill="#3B82F6">
-                <animate attributeName="opacity" values="1;0.2;1" dur="1s" repeatCount="indefinite" begin="0.3s"/>
+            <circle cx="70" cy="45" r="2" fill="#3B82F6">
+                <animate attributeName="opacity" values="1;0.2;1" dur="1.5s" repeatCount="indefinite" begin="0.5s"/>
             </circle>
-            <circle cx="160" cy="70" r="3" fill="#3B82F6">
-                <animate attributeName="opacity" values="1;0.2;1" dur="1s" repeatCount="indefinite" begin="0.6s"/>
+            <circle cx="120" cy="45" r="2" fill="#3B82F6">
+                <animate attributeName="opacity" values="1;0.2;1" dur="1.5s" repeatCount="indefinite" begin="1s"/>
             </circle>
         </g>
     </g>
 
-    <!-- Task Execution Area -->
-    <g transform="translate(450,100)">
-        <rect width="100" height="120" rx="8" fill="white" stroke="#3B82F6" stroke-width="2"/>
-        <text x="50" y="35" text-anchor="middle" font-family="Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji" font-size="24">🌐</text>
-        <text x="50" y="65" text-anchor="middle" fill="#1E40AF" font-size="12">Web Tasks</text>
+    <!-- Web Tasks Box -->
+    <g transform="translate(450,120)">
+        <rect width="100" height="120" rx="12" fill="white" stroke="#3B82F6" stroke-width="2"/>
+        <text x="50" y="35" text-anchor="middle" fill="#1E40AF" font-size="14">Web Tasks</text>
         
-        <!-- Animated Task Lines -->
-        <g>
-            <rect x="20" y="80" width="60" height="6" rx="3" fill="#EFF6FF"/>
-            <rect x="20" y="80" width="0" height="6" rx="3" fill="#3B82F6">
+        <!-- Browser Icon -->
+        <g transform="translate(35,45)">
+            <rect width="30" height="25" rx="2" fill="#3B82F6" stroke="#3B82F6" stroke-width="1.5"/>
+            <rect y="6" width="30" height="19" fill="#EFF6FF" stroke="#3B82F6" stroke-width="1.5"/>
+            <circle cx="4" cy="3" r="1" fill="#EFF6FF"/>
+            <circle cx="8" cy="3" r="1" fill="#EFF6FF"/>
+            <circle cx="12" cy="3" r="1" fill="#EFF6FF"/>
+        </g>
+        
+        <!-- Task Lines -->
+        <g transform="translate(20,80)">
+            <rect width="60" height="4" rx="2" fill="#EFF6FF"/>
+            <rect width="0" height="4" rx="2" fill="#3B82F6">
                 <animate attributeName="width" values="0;60" dur="2s" repeatCount="indefinite"/>
             </rect>
             
-            <rect x="20" y="95" width="60" height="6" rx="3" fill="#EFF6FF"/>
-            <rect x="20" y="95" width="0" height="6" rx="3" fill="#3B82F6">
+            <rect y="12" width="60" height="4" rx="2" fill="#EFF6FF"/>
+            <rect y="12" width="0" height="4" rx="2" fill="#3B82F6">
                 <animate attributeName="width" values="0;60" dur="2s" repeatCount="indefinite" begin="0.5s"/>
             </rect>
         </g>
     </g>
 
-    <!-- Results Flow -->
-    <g transform="translate(200,250)">
-        <rect width="200" height="100" rx="8" fill="white" stroke="#3B82F6" stroke-width="2"/>
-        <text x="100" y="35" text-anchor="middle" font-family="Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji" font-size="24">📊</text>
-        <text x="100" y="65" text-anchor="middle" fill="#1E40AF" font-size="14">Task Results</text>
+    <!-- Task Results Box -->
+    <g transform="translate(200,280)">
+        <rect width="200" height="80" rx="12" fill="white" stroke="#3B82F6" stroke-width="2"/>
+        <text x="100" y="35" text-anchor="middle" fill="#1E40AF" font-size="14">Task Results</text>
         
-        <!-- Result Indicators -->
-        <g transform="translate(30,75)">
-            <circle cx="0" cy="0" r="5" fill="#22C55E"/>
-            <text x="15" y="5" fill="#1E40AF" font-size="12">Success</text>
-            <circle cx="80" cy="0" r="5" fill="#3B82F6"/>
-            <text x="95" y="5" fill="#1E40AF" font-size="12">Progress</text>
+        <!-- Status Indicators -->
+        <g transform="translate(40,50)">
+            <circle cx="0" cy="0" r="4" fill="#22C55E"/>
+            <text x="15" y="4" fill="#1E40AF" font-size="12">Success</text>
+            
+            <circle cx="80" cy="0" r="4" fill="#3B82F6"/>
+            <text x="95" y="4" fill="#1E40AF" font-size="12">Progress</text>
         </g>
     </g>
 
-    <!-- Flow Arrows -->
+    <!-- Connection Lines with Animated Dots -->
     <g>
         <!-- User to AI -->
-        <path d="M120,180 Q180,180 200,130" stroke="#3B82F6" stroke-width="2" fill="none"/>
-        <circle cx="0" cy="0" r="3" fill="#60A5FA">
-            <animateMotion path="M120,180 Q180,180 200,130" dur="1.5s" repeatCount="indefinite"/>
+        <path d="M145,190 C170,190 180,180 200,180" stroke="#3B82F6" stroke-width="2" fill="none"/>
+        <circle cx="0" cy="0" r="3" fill="#3B82F6">
+            <animateMotion path="M145,190 C170,190 180,180 200,180" dur="1.5s" repeatCount="indefinite"/>
         </circle>
 
         <!-- AI to Tasks -->
-        <path d="M400,130 H450" stroke="#3B82F6" stroke-width="2"/>
-        <circle cx="0" cy="0" r="3" fill="#60A5FA">
-            <animateMotion path="M400,130 H450" dur="1s" repeatCount="indefinite"/>
+        <path d="M400,180 C420,180 430,180 450,180" stroke="#3B82F6" stroke-width="2"/>
+        <circle cx="0" cy="0" r="3" fill="#3B82F6">
+            <animateMotion path="M400,180 C420,180 430,180 450,180" dur="1.5s" repeatCount="indefinite"/>
         </circle>
 
         <!-- Tasks to Results -->
-        <path d="M450,220 Q400,250 400,300" stroke="#3B82F6" stroke-width="2" fill="none"/>
-        <circle cx="0" cy="0" r="3" fill="#60A5FA">
-            <animateMotion path="M450,220 Q400,250 400,300" dur="1.5s" repeatCount="indefinite"/>
+        <path d="M450,240 C450,280 400,320 400,320" stroke="#3B82F6" stroke-width="2" fill="none"/>
+        <circle cx="0" cy="0" r="3" fill="#3B82F6">
+            <animateMotion path="M450,240 C450,280 400,320 400,320" dur="1.5s" repeatCount="indefinite"/>
         </circle>
 
         <!-- Results to User -->
-        <path d="M200,300 Q120,300 80,220" stroke="#3B82F6" stroke-width="2" fill="none"/>
-        <circle cx="0" cy="0" r="3" fill="#60A5FA">
-            <animateMotion path="M200,300 Q120,300 80,220" dur="1.5s" repeatCount="indefinite"/>
+        <path d="M200,320 C150,320 120,280 110,225" stroke="#3B82F6" stroke-width="2" fill="none"/>
+        <circle cx="0" cy="0" r="3" fill="#3B82F6">
+            <animateMotion path="M200,320 C150,320 120,280 110,225" dur="1.5s" repeatCount="indefinite"/>
         </circle>
     </g>
 </svg> 
