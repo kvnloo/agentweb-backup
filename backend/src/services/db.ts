@@ -201,4 +201,36 @@ export const taskDb = {
       handleDynamoDbError(error, 'deleteTask');
     }
   }
+};
+
+export const waitlistDb = {
+  async add(entry: { email: string; joinedAt: string }) {
+    try {
+      const params = {
+        TableName: 'AW-Waitlist',
+        Item: entry
+      };
+
+      await dynamodb.put(params).promise();
+      return entry;
+    } catch (error) {
+      handleDynamoDbError(error, 'addToWaitlist');
+    }
+  },
+
+  async getByEmail(email: string) {
+    try {
+      const params = {
+        TableName: 'AW-Waitlist',
+        Key: {
+          email
+        }
+      };
+
+      const result = await dynamodb.get(params).promise();
+      return result.Item;
+    } catch (error) {
+      handleDynamoDbError(error, 'getWaitlistByEmail');
+    }
+  }
 }; 

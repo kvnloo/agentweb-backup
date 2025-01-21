@@ -9,6 +9,7 @@ import Dashboard from './pages/Dashboard';
 import CreateTask from './pages/CreateTask';
 import TaskDetails from './pages/TaskDetails';
 import PrivateRoute from './components/PrivateRoute';
+import Home from './pages/Home';
 
 function App() {
   return (
@@ -44,7 +45,7 @@ function App() {
                   </PrivateRoute>
                 }
               />
-              <Route path="/" element={<Navigate to="/dashboard" replace />} />
+              <Route path="/" element={<Home />} />
             </Routes>
           </Layout>
         </Router>
