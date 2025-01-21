@@ -74,6 +74,50 @@ async function updateTasksTable() {
   }
 }
 
+// Create Waitlist table
+const createWaitlistTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: 'AW-Waitlist',
+    AttributeDefinitions: [
+      { AttributeName: 'email', AttributeType: 'S' },
+      { AttributeName: 'joinedAt', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'email', KeyType: 'HASH' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'JoinedAtIndex',
+        KeySchema: [
+          { AttributeName: 'joinedAt', KeyType: 'HASH' },
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5
+        }
+      }
+    ],
+    ProvisionedThroughput: {
+      ReadCapacityUnits: 5,
+      WriteCapacityUnits: 5
+    }
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log('Created Waitlist table:', result);
+  } catch (error) {
+    if (error.code === 'ResourceInUseException') {
+      console.log('Waitlist table already exists');
+    } else {
+      throw error;
+    }
+  }
+};
+
 async function createTables() {
   // Users table
   const userTableParams: DynamoDB.CreateTableInput = {
@@ -144,6 +188,10 @@ async function createTables() {
     console.log('Creating AW-Tasks table...');
     await dynamodb.createTable(taskTableParams).promise();
     console.log('AW-Tasks table created successfully');
+
+    // Create Waitlist table
+    await createWaitlistTable();
+    console.log('Waitlist table created successfully');
 
   } catch (error) {
     if (error instanceof Error) {

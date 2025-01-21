@@ -83,3 +83,100 @@ For support, please open an issue in the GitHub repository or contact the mainta
 ## Roadmap
 
 See our [Design Document](./design.md) for detailed development roadmap and future considerations.
+
+## Setup
+
+### Prerequisites
+- Node.js (v18 or later)
+- AWS Account with DynamoDB access
+
+### Backend Setup
+
+1. Install dependencies:
+```bash
+cd backend
+npm install
+```
+
+2. Configure environment variables:
+- Create a `.env` file in the `backend` directory:
+```
+PORT=3001
+JWT_SECRET=your_jwt_secret
+AWS_REGION=your_aws_region
+AWS_ACCESS_KEY_ID=your_aws_access_key_id
+AWS_SECRET_ACCESS_KEY=your_aws_secret_access_key
+```
+
+3. Create DynamoDB tables:
+```bash
+cd backend
+npm run build
+node dist/scripts/create-tables.js
+```
+This will create all required tables in DynamoDB:
+- AW-Users: User accounts
+- AW-Tasks: Task definitions
+- AW-TaskExecutions: Task execution records
+- AW-Waitlist: Waitlist entries
+
+4. Start the backend server:
+```bash
+npm run dev
+```
+
+### Frontend Setup
+
+1. Install dependencies:
+```bash
+cd frontend
+npm install
+```
+
+2. Configure environment variables:
+- Create a `.env` file in the `frontend` directory:
+```
+VITE_API_URL=http://localhost:3001
+```
+
+3. Start the development server:
+```bash
+npm run dev
+```
+
+The application will be available at http://localhost:5173
+
+## Development
+
+### Project Structure
+
+```
+.
+├── backend/
+│   ├── src/
+│   │   ├── routes/      # API routes
+│   │   ├── services/    # Database and business logic
+│   │   └── utils/       # Utility functions
+│   └── scripts/         # Database setup scripts
+└── frontend/
+    └── src/
+        ├── components/  # React components
+        ├── contexts/    # React contexts
+        └── pages/       # Page components
+```
+
+### Environment Variables
+
+Backend:
+- Create a `.env` file in the `backend` directory:
+```
+PORT=3001
+JWT_SECRET=your_jwt_secret
+AWS_REGION=your_aws_region
+```
+
+Frontend:
+- Create a `.env` file in the `frontend` directory:
+```
+VITE_API_URL=http://localhost:3001
+```
