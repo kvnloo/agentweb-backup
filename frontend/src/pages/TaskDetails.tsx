@@ -29,14 +29,14 @@ export default function TaskDetails() {
   const [task, setTask] = useState<Task | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const { id } = useParams<{ id: string }>();
+  const { taskId } = useParams<{ taskId: string }>();
   const { token } = useAuth();
   const navigate = useNavigate();
 
   useEffect(() => {
     const fetchTask = async () => {
       try {
-        const response = await axios.get(`http://localhost:3001/api/tasks/${id}`, {
+        const response = await axios.get(`http://localhost:3001/api/tasks/${taskId}`, {
           headers: { Authorization: `Bearer ${token}` },
         });
         setTask(response.data);
@@ -49,11 +49,11 @@ export default function TaskDetails() {
     };
 
     fetchTask();
-  }, [id, token]);
+  }, [taskId, token]);
 
   const handleDelete = async () => {
     try {
-      await axios.delete(`http://localhost:3001/api/tasks/${id}`, {
+      await axios.delete(`http://localhost:3001/api/tasks/${taskId}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       navigate('/dashboard');
