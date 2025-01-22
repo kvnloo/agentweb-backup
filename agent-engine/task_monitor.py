@@ -32,7 +32,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('task_monitor.log')
+        logging.FileHandler('log/task_monitor.log')
     ]
 )
 
