@@ -356,4 +356,139 @@ export const waitlistDb = {
       handleDynamoDbError(error, 'getWaitlistByEmail');
     }
   }
+};
+
+export const scheduleDb = {
+  async createSchedule(schedule: {
+    scheduleId: string;
+    taskId: string;
+    userId: string;
+    frequency: string;  // 'daily', 'weekly', 'monthly', or cron expression
+    nextRunTime: string;
+    status: string;  // 'active' or 'inactive'
+    createdAt: string;
+    lastRunTime?: string;
+    timezone?: string;
+  }) {
+    try {
+      const params = {
+        TableName: 'AW-TaskSchedules',
+        Item: schedule
+      };
+
+      await dynamodb.put(params).promise();
+      return schedule;
+    } catch (error) {
+      handleDynamoDbError(error, 'createSchedule');
+    }
+  },
+
+  async getSchedulesByTaskId(taskId: string) {
+    try {
+      const params = {
+        TableName: 'AW-TaskSchedules',
+        IndexName: 'TaskIdIndex',
+        KeyConditionExpression: 'taskId = :taskId',
+        ExpressionAttributeValues: {
+          ':taskId': taskId
+        }
+      };
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, 'getSchedulesByTaskId');
+    }
+  },
+
+  async getScheduleById(scheduleId: string) {
+    try {
+      const params = {
+        TableName: 'AW-TaskSchedules',
+        Key: {
+          scheduleId
+        }
+      };
+
+      const result = await dynamodb.get(params).promise();
+      return result.Item;
+    } catch (error) {
+      handleDynamoDbError(error, 'getScheduleById');
+    }
+  },
+
+  async updateSchedule(scheduleId: string, updates: Partial<{
+    frequency: string;
+    nextRunTime: string;
+    status: string;
+    lastRunTime: string;
+    timezone: string;
+  }>) {
+    try {
+      const updateExpressions: string[] = [];
+      const expressionAttributeNames: { [key: string]: string } = {};
+      const expressionAttributeValues: { [key: string]: any } = {};
+
+      Object.entries(updates).forEach(([key, value]) => {
+        updateExpressions.push(`#${key} = :${key}`);
+        expressionAttributeNames[`#${key}`] = key;
+        expressionAttributeValues[`:${key}`] = value;
+      });
+
+      const params = {
+        TableName: 'AW-TaskSchedules',
+        Key: {
+          scheduleId
+        },
+        UpdateExpression: `SET ${updateExpressions.join(', ')}`,
+        ExpressionAttributeNames: expressionAttributeNames,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: 'ALL_NEW'
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, 'updateSchedule');
+    }
+  },
+
+  async deleteSchedule(scheduleId: string) {
+    try {
+      const params = {
+        TableName: 'AW-TaskSchedules',
+        Key: {
+          scheduleId
+        }
+      };
+
+      await dynamodb.delete(params).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'deleteSchedule');
+    }
+  },
+
+  async getPendingSchedules() {
+    try {
+      const now = new Date().toISOString();
+      const params = {
+        TableName: 'AW-TaskSchedules',
+        IndexName: 'StatusNextRunTimeIndex',
+        KeyConditionExpression: '#status = :status AND #nextRunTime <= :now',
+        ExpressionAttributeNames: {
+          '#status': 'status',
+          '#nextRunTime': 'nextRunTime'
+        },
+        ExpressionAttributeValues: {
+          ':status': 'active',
+          ':now': now
+        }
+      };
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, 'getPendingSchedules');
+    }
+  }
 }; 

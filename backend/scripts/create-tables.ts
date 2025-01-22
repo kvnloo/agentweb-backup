@@ -167,11 +167,60 @@ async function createTaskExecutionsTable() {
   }
 }
 
+async function createTaskSchedulesTable() {
+  try {
+    const params = {
+      TableName: 'AW-TaskSchedules',
+      AttributeDefinitions: [
+        { AttributeName: 'scheduleId', AttributeType: 'S' },
+        { AttributeName: 'taskId', AttributeType: 'S' },
+        { AttributeName: 'status', AttributeType: 'S' },
+        { AttributeName: 'nextRunTime', AttributeType: 'S' }
+      ],
+      KeySchema: [
+        { AttributeName: 'scheduleId', KeyType: 'HASH' }
+      ],
+      GlobalSecondaryIndexes: [
+        {
+          IndexName: 'TaskIdIndex',
+          KeySchema: [
+            { AttributeName: 'taskId', KeyType: 'HASH' }
+          ],
+          Projection: {
+            ProjectionType: 'ALL'
+          }
+        },
+        {
+          IndexName: 'StatusStartTimeIndex',
+          KeySchema: [
+            { AttributeName: 'status', KeyType: 'HASH' },
+            { AttributeName: 'nextRunTime', KeyType: 'RANGE' }
+          ],
+          Projection: {
+            ProjectionType: 'ALL'
+          }
+        }
+      ],
+      BillingMode: 'PAY_PER_REQUEST'
+    };
+
+    await dynamodb.createTable(params).promise();
+    console.log('Created AW-TaskSchedules table');
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log('AW-TaskSchedules table already exists');
+    } else {
+      throw error;
+    }
+  }
+}
+
 async function main() {
   try {
     await createUsersTable();
     await createTasksTable();
     await createTaskExecutionsTable();
+    await createTaskSchedulesTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);

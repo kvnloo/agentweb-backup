@@ -4,6 +4,7 @@ import passport from 'passport';
 import authRoutes from './routes/auth';
 import taskRoutes from './routes/tasks';
 import waitlistRoutes from './routes/waitlist';
+import scheduleRoutes from './routes/schedules';
 
 const app = express();
 
@@ -16,6 +17,7 @@ app.use(passport.initialize());
 app.use('/api/auth', authRoutes);
 app.use('/api/tasks', taskRoutes);
 app.use('/api/waitlist', waitlistRoutes);
+app.use('/api/schedules', scheduleRoutes);
 
 // Health check endpoint
 app.get('/health', (req, res) => {

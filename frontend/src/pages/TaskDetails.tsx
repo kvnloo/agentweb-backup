@@ -19,6 +19,8 @@ import {
 } from '@mui/material';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
+import ScheduleForm from '../components/ScheduleForm';
+import ScheduleList from '../components/ScheduleList';
 
 interface Task {
   taskId: string;
@@ -51,26 +53,31 @@ export default function TaskDetails() {
   const { token } = useAuth();
   const navigate = useNavigate();
 
+  const fetchTask = async () => {
+    if (!taskId) return;
+    try {
+      const [taskResponse, executionsResponse] = await Promise.all([
+        axios.get(`http://localhost:3001/api/tasks/${taskId}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+        axios.get(`http://localhost:3001/api/tasks/${taskId}/executions`, {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+      ]);
+      
+      setTask(taskResponse.data);
+      setExecutions(executionsResponse.data);
+    } catch (error: any) {
+      console.error('Error fetching task details:', error);
+      setError(error.response?.data?.message || 'Failed to fetch task details');
+    }
+  };
+
   useEffect(() => {
     const fetchTaskAndExecutions = async () => {
-      try {
-        const [taskResponse, executionsResponse] = await Promise.all([
-          axios.get(`http://localhost:3001/api/tasks/${taskId}`, {
-            headers: { Authorization: `Bearer ${token}` },
-          }),
-          axios.get(`http://localhost:3001/api/tasks/${taskId}/executions`, {
-            headers: { Authorization: `Bearer ${token}` },
-          })
-        ]);
-        
-        setTask(taskResponse.data);
-        setExecutions(executionsResponse.data);
-      } catch (error: any) {
-        console.error('Error fetching task details:', error);
-        setError(error.response?.data?.message || 'Failed to fetch task details');
-      } finally {
-        setLoading(false);
-      }
+      setLoading(true);
+      await fetchTask();
+      setLoading(false);
     };
 
     fetchTaskAndExecutions();
@@ -170,6 +177,16 @@ export default function TaskDetails() {
       <Container maxWidth="md">
         <Alert severity="info" sx={{ mt: 4 }}>
           Task not found
+        </Alert>
+      </Container>
+    );
+  }
+
+  if (!taskId) {
+    return (
+      <Container maxWidth="md">
+        <Alert severity="error" sx={{ mt: 4 }}>
+          No task ID provided
         </Alert>
       </Container>
     );
@@ -304,6 +321,14 @@ export default function TaskDetails() {
             </TableContainer>
           </Grid>
         </Grid>
+
+        <Box sx={{ mt: 4 }}>
+          <Typography variant="h5" gutterBottom>
+            Task Scheduling
+          </Typography>
+          <ScheduleForm taskId={taskId} onScheduleCreated={fetchTask} />
+          <ScheduleList taskId={taskId} onScheduleUpdated={fetchTask} />
+        </Box>
       </Paper>
     </Container>
   );
