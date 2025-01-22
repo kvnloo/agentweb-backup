@@ -147,12 +147,13 @@ export const taskDb = {
         Key: {
           taskId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
           '#e': 'error',
-          '#sum': 'summary'
+          '#sum': 'summary',
+          '#en': 'emailNotification'
         }
       };
 
@@ -169,6 +170,7 @@ export const taskDb = {
     status: string;
     error: string;
     summary: string;
+    emailNotification: boolean;
   }>) {
     try {
       const updateExpressions: string[] = [];

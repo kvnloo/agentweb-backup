@@ -23,7 +23,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       userId,
       name,
       prompt,
-      status: 'active',  // Changed from 'pending'
+      status: 'active',
+      emailNotification: false,  // Initialize to false
       createdAt: new Date().toISOString()
     };
 
@@ -84,7 +85,12 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
     }
 
     const taskId = req.params.id;
+    console.log('Updating task:', taskId);
+    console.log('Request body:', req.body);
+    console.log('emailNotification in request:', req.body.emailNotification, typeof req.body.emailNotification);
+
     const task = await taskDb.getTaskById(taskId);
+    console.log('Current task:', task);
 
     if (!task) {
       return res.status(404).json({ message: 'Task not found' });
@@ -95,13 +101,19 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
+    // Only send emailNotification field
     const updates = {
-      ...req.body,
-      taskId, // Ensure taskId cannot be changed
-      userId  // Ensure userId cannot be changed
+      emailNotification: Boolean(req.body.emailNotification)
     };
+    console.log('Updates to apply:', updates);
 
-    const updatedTask = await taskDb.updateTask(taskId, updates);
+    await taskDb.updateTask(taskId, updates);
+    
+    // Get and return the updated task
+    const updatedTask = await taskDb.getTaskById(taskId);
+    console.log('Updated task:', updatedTask);
+    console.log('emailNotification in updated task:', updatedTask.emailNotification, typeof updatedTask.emailNotification);
+    
     res.json(updatedTask);
   } catch (error) {
     console.error('Error in updateTask:', error);

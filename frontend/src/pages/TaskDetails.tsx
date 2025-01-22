@@ -16,6 +16,8 @@ import {
   TableContainer,
   TableHead,
   TableRow,
+  Switch,
+  FormControlLabel,
 } from '@mui/material';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
@@ -31,6 +33,7 @@ interface Task {
   createdAt: string;
   summary?: string;
   error?: string;
+  emailNotification?: boolean;
 }
 
 interface TaskExecution {
@@ -65,11 +68,15 @@ export default function TaskDetails() {
         })
       ]);
       
-      setTask(taskResponse.data);
+      const updatedTask = taskResponse.data;
+      console.log('Setting task to:', updatedTask);
+      setTask(updatedTask);
       setExecutions(executionsResponse.data);
+      return updatedTask;
     } catch (error: any) {
       console.error('Error fetching task details:', error);
       setError(error.response?.data?.message || 'Failed to fetch task details');
+      return null;
     }
   };
 
@@ -125,6 +132,44 @@ export default function TaskDetails() {
     } catch (error: any) {
       console.error('Error running task:', error);
       setError(error.response?.data?.message || 'Failed to run task');
+    }
+  };
+
+  const handleEmailToggle = async () => {
+    if (!task) return;
+    
+    try {
+      console.log('Current task:', task);
+      console.log('Current emailNotification:', task.emailNotification, typeof task.emailNotification);
+      
+      const newEmailNotification = !task.emailNotification;
+      console.log('New emailNotification:', newEmailNotification, typeof newEmailNotification);
+      
+      const updateResponse = await axios.put(
+        `http://localhost:3001/api/tasks/${taskId}`,
+        {
+          emailNotification: newEmailNotification
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+      console.log('Update response:', updateResponse.data);
+
+      // Update the task state with the response
+      const taskResponse = await axios.get(
+        `http://localhost:3001/api/tasks/${taskId}`,
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+      console.log('Get task response:', taskResponse.data);
+      console.log('emailNotification in response:', taskResponse.data.emailNotification, typeof taskResponse.data.emailNotification);
+      
+      setTask(taskResponse.data);
+    } catch (error: any) {
+      console.error('Error updating email notification:', error);
+      setError(error.response?.data?.message || 'Failed to update email notification');
     }
   };
 
@@ -212,6 +257,16 @@ export default function TaskDetails() {
                 />
               )}
             </Box>
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={Boolean(task.emailNotification)}
+                  onChange={handleEmailToggle}
+                  color="primary"
+                />
+              }
+              label="Email Me Latest Run"
+            />
           </Box>
           <Box sx={{ display: 'flex', gap: 2 }}>
             <Button
