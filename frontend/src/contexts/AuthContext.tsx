@@ -1,8 +1,10 @@
 import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
 import axios from 'axios';
+import { jwtDecode } from 'jwt-decode';
 
 interface AuthContextType {
   token: string | null;
+  userEmail: string | null;
   login: (email: string, password: string) => Promise<void>;
   register: (email: string, password: string) => Promise<void>;
   loginWithGoogle: () => Promise<void>;
@@ -11,19 +13,35 @@ interface AuthContextType {
   isAuthenticated: boolean;
 }
 
+interface JwtPayload {
+  email: string;
+  userId: string;
+}
+
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [token, setToken] = useState<string | null>(localStorage.getItem('token'));
+  const [userEmail, setUserEmail] = useState<string | null>(null);
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(!!token);
 
   useEffect(() => {
     if (token) {
       localStorage.setItem('token', token);
       setIsAuthenticated(true);
+      // Decode token to get user email
+      try {
+        console.log('Token:', token);
+        const decoded = jwtDecode<JwtPayload>(token);
+        console.log('Decoded token:', decoded);
+        setUserEmail(decoded.email);
+      } catch (error) {
+        console.error('Error decoding token:', error);
+      }
     } else {
       localStorage.removeItem('token');
       setIsAuthenticated(false);
+      setUserEmail(null);
     }
   }, [token]);
 
@@ -65,7 +83,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   return (
-    <AuthContext.Provider value={{ token, login, register, loginWithGoogle, setToken, logout, isAuthenticated }}>
+    <AuthContext.Provider value={{ token, userEmail, login, register, loginWithGoogle, setToken, logout, isAuthenticated }}>
       {children}
     </AuthContext.Provider>
   );

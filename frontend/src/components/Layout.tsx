@@ -18,7 +18,7 @@ interface LayoutProps {
 }
 
 export default function Layout({ children }: LayoutProps) {
-  const { isAuthenticated, logout } = useAuth();
+  const { isAuthenticated, userEmail, logout } = useAuth();
   const navigate = useNavigate();
   const theme = useTheme();
   const isMobile = useMediaQuery(theme.breakpoints.down('sm'));
@@ -60,6 +60,7 @@ export default function Layout({ children }: LayoutProps) {
             <Box sx={{ 
               display: 'flex', 
               gap: { xs: 1, sm: 2 },
+              alignItems: 'center',
               '& .MuiButton-root': {
                 minWidth: isMobile ? 'auto' : undefined,
                 px: isMobile ? 2 : 3
@@ -87,6 +88,15 @@ export default function Layout({ children }: LayoutProps) {
                   >
                     Create Task
                   </Button>
+                  <Typography 
+                    variant="body2" 
+                    sx={{ 
+                      color: 'text.secondary',
+                      display: { xs: 'none', sm: 'block' }
+                    }}
+                  >
+                    {userEmail}
+                  </Typography>
                   <Button 
                     color="primary" 
                     onClick={handleLogout}
