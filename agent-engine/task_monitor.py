@@ -5,7 +5,7 @@ import os
 import json
 import uuid
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from web_agent import WebAgent
 from botocore.exceptions import ClientError
@@ -64,26 +64,136 @@ dynamodb = boto3.resource('dynamodb',
 )
 executions_table = dynamodb.Table('AW-TaskExecutions')
 tasks_table = dynamodb.Table('AW-Tasks')
+schedules_table = dynamodb.Table('AW-TaskSchedules')
+
+# Add last_execution_time as a module-level variable
+last_execution_time = None
 
 def get_pending_executions():
+    global last_execution_time
     try:
         logger.info("Querying for pending executions...")
-        response = executions_table.query(
-            IndexName='StatusStartTimeIndex',  # We'll need to create this GSI
-            KeyConditionExpression='#status = :status',
-            ExpressionAttributeNames={
+        query_params = {
+            'IndexName': 'StatusStartTimeIndex',
+            'KeyConditionExpression': '#status = :status',
+            'ExpressionAttributeNames': {
                 '#status': 'status'
             },
-            ExpressionAttributeValues={
+            'ExpressionAttributeValues': {
                 ':status': 'pending'
             }
-        )
+        }
+
+        # Add startTime condition if we have a last timestamp
+        if last_execution_time:
+            query_params['KeyConditionExpression'] += ' AND #startTime > :startTime'
+            query_params['ExpressionAttributeNames']['#startTime'] = 'startTime'
+            query_params['ExpressionAttributeValues'][':startTime'] = last_execution_time
+
+        response = executions_table.query(**query_params)
         items = response.get('Items', [])
+
+        # Update last_execution_time if we got any items
+        if items:
+            last_execution_time = max(item['startTime'] for item in items)
+
         logger.info(f"Found {len(items)} pending executions: {json_dumps(items)}")
         return items
     except ClientError as e:
         logger.error(f"Error querying pending executions: {e}")
         return []
+
+def get_due_schedules():
+    try:
+        logger.info("Querying for due schedules...")
+        now = datetime.now(timezone.utc).isoformat()
+        response = schedules_table.query(
+            IndexName='StatusStartTimeIndex',
+            KeyConditionExpression='#status = :status AND #nextRunTime <= :now',
+            ExpressionAttributeNames={
+                '#status': 'status',
+                '#nextRunTime': 'nextRunTime'
+            },
+            ExpressionAttributeValues={
+                ':status': 'active',
+                ':now': now
+            }
+        )
+        items = response.get('Items', [])
+        logger.info(f"Found {len(items)} due schedules: {json_dumps(items)}")
+        return items
+    except ClientError as e:
+        logger.error(f"Error querying due schedules: {e}")
+        return []
+
+def create_execution(task_id, user_id):
+    try:
+        execution_id = str(int(time.time() * 1000))  # Use timestamp as ID
+        execution = {
+            'executionId': execution_id,
+            'taskId': task_id,
+            'userId': user_id,
+            'status': 'pending',
+            'startTime': datetime.now(timezone.utc).isoformat()
+        }
+        executions_table.put_item(Item=execution)
+        logger.info(f"Created execution {execution_id} for task {task_id}")
+        return execution_id
+    except ClientError as e:
+        logger.error(f"Error creating execution: {e}")
+        return None
+
+def update_schedule_next_run_time(schedule):
+    try:
+        now = datetime.now(timezone.utc)
+        next_run = now
+
+        # Calculate next run time based on frequency
+        if schedule['frequency'] == 'daily':
+            next_run = next_run + timedelta(days=1)
+        elif schedule['frequency'] == 'weekly':
+            next_run = next_run + timedelta(weeks=1)
+        elif schedule['frequency'] == 'monthly':
+            # Add one month (approximately)
+            if next_run.month == 12:
+                next_run = next_run.replace(year=next_run.year + 1, month=1)
+            else:
+                next_run = next_run.replace(month=next_run.month + 1)
+
+        # Set to 9:00 AM
+        next_run = next_run.replace(hour=9, minute=0, second=0, microsecond=0)
+
+        # Update the schedule
+        schedules_table.update_item(
+            Key={'scheduleId': schedule['scheduleId']},
+            UpdateExpression='SET nextRunTime = :nextRunTime',
+            ExpressionAttributeValues={
+                ':nextRunTime': next_run.isoformat()
+            }
+        )
+        logger.info(f"Updated next run time for schedule {schedule['scheduleId']} to {next_run.isoformat()}")
+    except ClientError as e:
+        logger.error(f"Error updating schedule next run time: {e}")
+
+async def process_schedules():
+    try:
+        logger.info("Processing schedules...")
+        due_schedules = get_due_schedules()
+        
+        for schedule in due_schedules:
+            try:
+                # Create execution for the scheduled task
+                execution_id = create_execution(schedule['taskId'], schedule['userId'])
+                if execution_id:
+                    logger.info(f"Created execution {execution_id} for scheduled task {schedule['taskId']}")
+                    
+                    # Update the schedule's next run time
+                    update_schedule_next_run_time(schedule)
+            except Exception as e:
+                logger.error(f"Error processing schedule {schedule['scheduleId']}: {e}")
+                
+    except Exception as e:
+        logger.error(f"Error in process_schedules: {e}")
 
 def update_execution_status(execution_id, status, result=None, error=None):
     try:
@@ -162,6 +272,10 @@ async def monitor_executions():
     
     while True:
         try:
+            # First, process schedules to create new executions
+            await process_schedules()
+            
+            # Then process pending executions
             logger.info("Checking for pending executions...")
             pending_executions = get_pending_executions()
             
@@ -170,11 +284,11 @@ async def monitor_executions():
                 await execute_task(execution)
             
             logger.info("Sleeping for 5 seconds...")
-            await asyncio.sleep(5)  # Use async sleep
+            await asyncio.sleep(5)  # Check every 5 seconds
             
         except Exception as e:
             logger.error(f"Error in monitor loop: {e}")
-            await asyncio.sleep(5)  # Use async sleep
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
     asyncio.run(monitor_executions()) 
