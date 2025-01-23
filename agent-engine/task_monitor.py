@@ -11,6 +11,7 @@ from web_agent import WebAgent
 from botocore.exceptions import ClientError
 import time
 from decimal import Decimal
+from email_utils import send_task_notification
 
 # Custom JSON encoder to handle datetime objects
 class DateTimeEncoder(json.JSONEncoder):
@@ -65,6 +66,7 @@ dynamodb = boto3.resource('dynamodb',
 executions_table = dynamodb.Table('AW-TaskExecutions')
 tasks_table = dynamodb.Table('AW-Tasks')
 schedules_table = dynamodb.Table('AW-TaskSchedules')
+users_table = dynamodb.Table('AW-Users')
 
 # Add last_execution_time as a module-level variable
 last_execution_time = None
@@ -219,12 +221,48 @@ def update_execution_status(execution_id, status, result=None, error=None):
             expression_values[':error'] = error
             expression_names['#error'] = 'error'
 
-        executions_table.update_item(
-            Key={'executionId': execution_id},
-            UpdateExpression=update_expression,
-            ExpressionAttributeNames=expression_names,
-            ExpressionAttributeValues=expression_values
-        )
+        # Get the execution to get the taskId
+        execution = executions_table.get_item(Key={'executionId': execution_id}).get('Item')
+        if execution:
+            # Update the execution
+            executions_table.update_item(
+                Key={'executionId': execution_id},
+                UpdateExpression=update_expression,
+                ExpressionAttributeNames=expression_names,
+                ExpressionAttributeValues=expression_values
+            )
+
+            # Send email notification if task is completed or failed
+            if status in ['completed', 'failed']:
+                # Get task details
+                task = tasks_table.get_item(
+                    Key={'taskId': execution['taskId']},
+                    ProjectionExpression='userId, #n, emailNotification',
+                    ExpressionAttributeNames={'#n': 'name'}
+                ).get('Item')
+                
+                if task and task.get('emailNotification'):
+                    # Get user's email from AW-Users table using UserIdIndex
+                    user_response = users_table.query(
+                        IndexName='UserIdIndex',
+                        KeyConditionExpression='userId = :userId',
+                        ExpressionAttributeValues={
+                            ':userId': task['userId']
+                        }
+                    )
+                    user = user_response.get('Items', [])[0] if user_response.get('Items') else None
+                    
+                    if user and user.get('email'):
+                        send_task_notification(
+                            to_email=user['email'],
+                            task_name=task['name'],
+                            task_id=execution['taskId'],
+                            execution_status=status,
+                            result=result,
+                            error=error
+                        )
+                    else:
+                        logger.error(f"User email not found for userId: {task['userId']}")
     except ClientError as e:
         logger.error(f"Error updating execution status: {e}")
 

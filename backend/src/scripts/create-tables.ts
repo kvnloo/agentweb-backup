@@ -20,10 +20,26 @@ const createUsersTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
     TableName: 'AW-Users',
     AttributeDefinitions: [
-      { AttributeName: 'email', AttributeType: 'S' }
+      { AttributeName: 'email', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' }
     ],
     KeySchema: [
       { AttributeName: 'email', KeyType: 'HASH' }
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'UserIdIndex',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5
+        }
+      }
     ],
     ProvisionedThroughput: {
       ReadCapacityUnits: 5,
