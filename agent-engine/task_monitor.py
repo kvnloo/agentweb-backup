@@ -278,13 +278,64 @@ async def execute_task(execution):
         if not task:
             raise Exception(f"Task {task_id} not found")
 
+        # Get both accepted and rejected executions
+        accepted_executions = executions_table.query(
+            IndexName='TaskFeedbackIndex',
+            KeyConditionExpression='taskId = :taskId AND feedback = :feedback',
+            ExpressionAttributeValues={
+                ':taskId': task_id,
+                ':feedback': 'accepted'
+            },
+            ScanIndexForward=False,  # Get latest first
+            Limit=1
+        ).get('Items', [])
+
+        rejected_executions = executions_table.query(
+            IndexName='TaskFeedbackIndex',
+            KeyConditionExpression='taskId = :taskId AND feedback = :feedback',
+            ExpressionAttributeValues={
+                ':taskId': task_id,
+                ':feedback': 'rejected'
+            },
+            ScanIndexForward=False,  # Get latest first
+            Limit=1
+        ).get('Items', [])
+        
+        # Compare timestamps to find the most recent feedback
+        previous_feedback = None
+        accepted = accepted_executions[0] if accepted_executions else None
+        rejected = rejected_executions[0] if rejected_executions else None
+        
+        if accepted and rejected:
+            # Use the more recent one
+            prev_execution = accepted if accepted['startTime'] > rejected['startTime'] else rejected
+            previous_feedback = {
+                'feedback': prev_execution['feedback'],
+                'result': prev_execution.get('result', '')
+            }
+        elif accepted:
+            previous_feedback = {
+                'feedback': accepted['feedback'],
+                'result': accepted.get('result', '')
+            }
+        elif rejected:
+            previous_feedback = {
+                'feedback': rejected['feedback'],
+                'result': rejected.get('result', '')
+            }
+
         # Update execution status to running
         update_execution_status(execution_id, 'running')
         
         # Initialize and run web agent
         agent = WebAgent()
         try:
-            result = await agent.execute_task(task['prompt'])
+            # Include previous feedback in prompt if available
+            prompt = task['prompt']
+            if previous_feedback:
+                prompt = f"{prompt}\n\nPrevious attempt was {previous_feedback['feedback']}. Previous result: {previous_feedback['result']}"
+            
+            result = await agent.execute_task(prompt)
             
             if result['success']:
                 update_execution_status(

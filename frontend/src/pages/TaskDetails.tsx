@@ -141,7 +141,6 @@ export default function TaskDetails() {
     
     try {
       console.log('Current task:', task);
-      console.log('Current emailNotification:', task.emailNotification, typeof task.emailNotification);
       
       const newEmailNotification = !task.emailNotification;
       console.log('New emailNotification:', newEmailNotification, typeof newEmailNotification);
