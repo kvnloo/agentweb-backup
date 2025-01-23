@@ -385,10 +385,13 @@ export default function TaskDetails() {
                       <TableCell>
                         <select
                           value={execution.feedback || ''}
-                          onChange={(e) => handleFeedbackChange(
-                            execution.executionId,
-                            e.target.value as '' | 'accepted' | 'rejected'
-                          )}
+                          onChange={(e) => {
+                            const value = e.target.value;
+                            handleFeedbackChange(
+                              execution.executionId,
+                              value === '' ? null : value as 'accepted' | 'rejected'
+                            );
+                          }}
                           style={{
                             padding: '8px',
                             borderRadius: '4px',

@@ -8,27 +8,20 @@ import {
   Paper,
   Grid,
   Alert,
-  Chip,
   List,
   ListItem,
   ListItemIcon,
   ListItemText,
-  Divider,
   Stack,
   Link,
   Toolbar,
 } from '@mui/material';
 import { Link as RouterLink } from 'react-router-dom';
 import {
-  AutoAwesome as AutoAwesomeIcon,
-  Speed as SpeedIcon,
-  Lock as LockIcon,
   Check as CheckIcon,
-  Code as CodeIcon,
   Psychology as PsychologyIcon,
-  Timer as TimerIcon,
   Bolt as BoltIcon,
-  Security as SecurityIcon,
+  Security as SecurityIcon
 } from '@mui/icons-material';
 import axios from 'axios';
 

@@ -27,7 +27,6 @@ interface Task {
 
 export default function Dashboard() {
   const [tasks, setTasks] = useState<Task[]>([]);
-  const [error, setError] = useState('');
   const { token } = useAuth();
   const navigate = useNavigate();
 
@@ -39,7 +38,6 @@ export default function Dashboard() {
       setTasks(response.data);
     } catch (error: any) {
       console.error('Error fetching tasks:', error);
-      setError(error.response?.data?.message || 'Failed to fetch tasks');
     }
   };
 

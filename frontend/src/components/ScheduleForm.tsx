@@ -36,18 +36,14 @@ export default function ScheduleForm({ taskId, onScheduleCreated }: ScheduleForm
     setIsSubmitting(true);
 
     try {
-      const response = await axios.post(
-        'http://localhost:3001/api/schedules',
-        {
-          taskId,
-          frequency
-        },
-        {
-          headers: {
-            'Authorization': `Bearer ${localStorage.getItem('token')}`
-          }
+      await axios.post('/api/schedules', {
+        taskId,
+        frequency
+      }, {
+        headers: {
+          'Authorization': `Bearer ${localStorage.getItem('token')}`
         }
-      );
+      });
 
       setSuccess('Schedule created successfully');
       setFrequency('');
