@@ -1,5 +1,5 @@
 import express from 'express';
-import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions } from '../controllers/tasks';
+import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution } from '../controllers/tasks';
 import { authenticateToken } from '../middleware/auth';
 
 const router = express.Router();
@@ -14,5 +14,6 @@ router.get('/:id/executions', getTaskExecutions);
 router.put('/:id', updateTask);
 router.delete('/:id', deleteTask);
 router.post('/:id/execute', executeTask);
+router.put('/:id/executions/:executionId', updateTaskExecution);
 
 export default router; 

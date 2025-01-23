@@ -257,6 +257,7 @@ export const taskDb = {
     error: string;
     result: string;
     completedAt: string;
+    feedback: 'accepted' | 'rejected' | null;
   }>) {
     try {
       const updateExpressions: string[] = [];

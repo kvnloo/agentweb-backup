@@ -45,6 +45,7 @@ interface TaskExecution {
   completedAt?: string;
   result?: string;
   error?: string;
+  feedback?: 'accepted' | 'rejected';
 }
 
 export default function TaskDetails() {
@@ -170,6 +171,27 @@ export default function TaskDetails() {
     } catch (error: any) {
       console.error('Error updating email notification:', error);
       setError(error.response?.data?.message || 'Failed to update email notification');
+    }
+  };
+
+  const handleFeedbackChange = async (executionId: string, feedback: 'accepted' | 'rejected' | null) => {
+    try {
+      await axios.put(
+        `http://localhost:3001/api/tasks/${taskId}/executions/${executionId}`,
+        { feedback },
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+      
+      // Refresh executions list
+      const response = await axios.get(`http://localhost:3001/api/tasks/${taskId}/executions`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setExecutions(response.data);
+    } catch (error: any) {
+      console.error('Error updating feedback:', error);
+      setError(error.response?.data?.message || 'Failed to update feedback');
     }
   };
 
@@ -331,6 +353,7 @@ export default function TaskDetails() {
                     <TableCell>Started</TableCell>
                     <TableCell>Completed</TableCell>
                     <TableCell>Result</TableCell>
+                    <TableCell>Feedback</TableCell>
                   </TableRow>
                 </TableHead>
                 <TableBody>
@@ -360,11 +383,29 @@ export default function TaskDetails() {
                           </Typography>
                         ) : '-'}
                       </TableCell>
+                      <TableCell>
+                        <select
+                          value={execution.feedback || ''}
+                          onChange={(e) => handleFeedbackChange(
+                            execution.executionId,
+                            e.target.value as '' | 'accepted' | 'rejected'
+                          )}
+                          style={{
+                            padding: '8px',
+                            borderRadius: '4px',
+                            border: '1px solid #ccc'
+                          }}
+                        >
+                          <option value="">Select feedback</option>
+                          <option value="accepted">Accepted</option>
+                          <option value="rejected">Rejected</option>
+                        </select>
+                      </TableCell>
                     </TableRow>
                   ))}
                   {executions.length === 0 && (
                     <TableRow>
-                      <TableCell colSpan={4} align="center">
+                      <TableCell colSpan={5} align="center">
                         <Typography variant="body2" color="text.secondary">
                           No executions yet
                         </Typography>

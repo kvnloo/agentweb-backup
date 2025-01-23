@@ -209,4 +209,33 @@ export const getTaskExecutions = async (req: AuthRequest, res: Response) => {
     console.error('Error in getTaskExecutions:', error);
     res.status(500).json({ message: 'Error fetching task executions' });
   }
+};
+
+export const updateTaskExecution = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const taskId = req.params.id;
+    const executionId = req.params.executionId;
+    const { feedback } = req.body;
+
+    // Verify task exists and belongs to user
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+    if (task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Update execution feedback
+    const updatedExecution = await taskDb.updateTaskExecution(executionId, { feedback });
+    res.json(updatedExecution);
+  } catch (error) {
+    console.error('Error in updateTaskExecution:', error);
+    res.status(500).json({ message: 'Error updating task execution' });
+  }
 }; 
