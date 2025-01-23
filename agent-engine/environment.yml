@@ -5,6 +5,9 @@ channels:
 dependencies:
   - python=3.12
   - pip
+  - boto3
+  - playwright
+  - pytest
   - pip:
     - browser-use
     - aiohttp>=3.8.0
@@ -12,4 +15,5 @@ dependencies:
     - python-dotenv>=0.19.0
     - langchain>=0.1.0
     - langchain-openai>=0.0.5
-    - langchain-anthropic>=0.1.1 
+    - langchain-anthropic>=0.1.1
+    - humanize 

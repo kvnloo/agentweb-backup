@@ -12,6 +12,7 @@ from botocore.exceptions import ClientError
 import time
 from decimal import Decimal
 from email_utils import send_task_notification
+import humanize  # Add this import at the top of the file
 
 # Custom JSON encoder to handle datetime objects
 class DateTimeEncoder(json.JSONEncoder):
@@ -301,27 +302,24 @@ async def execute_task(execution):
             Limit=1
         ).get('Items', [])
         
-        # Compare timestamps to find the most recent feedback
+        # Find the most recent feedback
         previous_feedback = None
-        accepted = accepted_executions[0] if accepted_executions else None
-        rejected = rejected_executions[0] if rejected_executions else None
+        prev_execution = None
         
-        if accepted and rejected:
-            # Use the more recent one
-            prev_execution = accepted if accepted['startTime'] > rejected['startTime'] else rejected
+        if accepted_executions and rejected_executions:
+            prev_execution = accepted_executions[0] if accepted_executions[0]['startTime'] > rejected_executions[0]['startTime'] else rejected_executions[0]
+        elif accepted_executions:
+            prev_execution = accepted_executions[0]
+        elif rejected_executions:
+            prev_execution = rejected_executions[0]
+            
+        if prev_execution:
+            prev_time = datetime.fromisoformat(prev_execution['startTime'].replace('Z', '+00:00'))
+            time_ago = humanize.naturaltime(datetime.now(timezone.utc) - prev_time)
             previous_feedback = {
                 'feedback': prev_execution['feedback'],
-                'result': prev_execution.get('result', '')
-            }
-        elif accepted:
-            previous_feedback = {
-                'feedback': accepted['feedback'],
-                'result': accepted.get('result', '')
-            }
-        elif rejected:
-            previous_feedback = {
-                'feedback': rejected['feedback'],
-                'result': rejected.get('result', '')
+                'result': prev_execution.get('result', ''),
+                'time_ago': time_ago
             }
 
         # Update execution status to running
@@ -333,7 +331,7 @@ async def execute_task(execution):
             # Include previous feedback in prompt if available
             prompt = task['prompt']
             if previous_feedback:
-                prompt = f"{prompt}\n\nPrevious attempt was {previous_feedback['feedback']}. Previous result: {previous_feedback['result']}"
+                prompt = f"{prompt}\n\nNote: Previous attempt {previous_feedback['time_ago']} was {previous_feedback['feedback']}. Previous result: {previous_feedback['result']}"
             
             result = await agent.execute_task(prompt)
             
