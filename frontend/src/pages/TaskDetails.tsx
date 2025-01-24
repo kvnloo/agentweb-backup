@@ -53,6 +53,7 @@ export default function TaskDetails() {
   const [executions, setExecutions] = useState<TaskExecution[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [scheduleRefreshTrigger, setScheduleRefreshTrigger] = useState(0);
   const { taskId } = useParams<{ taskId: string }>();
   const { token } = useAuth();
   const navigate = useNavigate();
@@ -70,7 +71,7 @@ export default function TaskDetails() {
       ]);
       
       const updatedTask = taskResponse.data;
-      console.log('Setting task to:', updatedTask);
+      console.log('Task data fetched:', updatedTask);
       setTask(updatedTask);
       setExecutions(executionsResponse.data);
       return updatedTask;
@@ -218,6 +219,12 @@ export default function TaskDetails() {
       default:
         return 'default';
     }
+  };
+
+  const handleScheduleCreated = async () => {
+    console.log('Schedule created, refreshing data');
+    await fetchTask();
+    setScheduleRefreshTrigger(prev => prev + 1);
   };
 
   if (loading) {
@@ -424,8 +431,8 @@ export default function TaskDetails() {
           <Typography variant="h5" gutterBottom>
             Task Scheduling
           </Typography>
-          <ScheduleForm taskId={taskId} onScheduleCreated={fetchTask} />
-          <ScheduleList taskId={taskId} onScheduleUpdated={fetchTask} />
+          <ScheduleForm taskId={taskId} onScheduleCreated={handleScheduleCreated} />
+          <ScheduleList taskId={taskId} onScheduleUpdated={handleScheduleCreated} key={scheduleRefreshTrigger} />
         </Box>
       </Paper>
     </Container>

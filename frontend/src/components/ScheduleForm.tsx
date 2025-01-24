@@ -36,7 +36,7 @@ export default function ScheduleForm({ taskId, onScheduleCreated }: ScheduleForm
     setIsSubmitting(true);
 
     try {
-      await axios.post('/api/schedules', {
+      await axios.post('http://localhost:3001/api/schedules', {
         taskId,
         frequency
       }, {
@@ -47,6 +47,7 @@ export default function ScheduleForm({ taskId, onScheduleCreated }: ScheduleForm
 
       setSuccess('Schedule created successfully');
       setFrequency('');
+      console.log('Schedule created, calling onScheduleCreated callback');
       onScheduleCreated?.();
     } catch (err: any) {
       console.error('Error creating schedule:', err);
