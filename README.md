@@ -197,11 +197,15 @@ npm run build
 
 2. Create deployment package:
 ```bash
+# Create builds directory if it doesn't exist
+mkdir -p builds
+
 # Install serve for static file hosting
 npm install serve
 
-# Create zip file including all necessary files
-zip -r deploy.zip dist Procfile package.json package-lock.json
+# Create versioned zip file in builds directory
+VERSION="0.1"  # Increment this for each new deployment
+zip -r "builds/deploy_v${VERSION}.zip" dist Procfile package.json package-lock.json
 ```
 
 3. Create a new application in Elastic Beanstalk:
@@ -209,14 +213,14 @@ zip -r deploy.zip dist Procfile package.json package-lock.json
    - Click "Create application"
    - Enter application name (e.g., "agentweb-frontend")
    - Choose "Node.js" as platform
-   - Upload the `deploy.zip` file you created
+   - Upload the versioned zip file from `builds/deploy_v${VERSION}.zip`
    - Click "Create application"
 
 4. Configure environment variables:
    - In your environment, go to Configuration > Software
    - Click "Edit"
    - Add environment variable:
-     - REACT_APP_API_URL = <your-backend-url>
+     - VITE_API_URL = <your-backend-url>
    - Click "Apply"
 
 ### Backend Deployment
@@ -229,8 +233,12 @@ npm run build
 
 2. Create deployment package:
 ```bash
-# Create zip file including all necessary files
-zip -r deploy.zip dist package.json package-lock.json .env.example
+# Create builds directory if it doesn't exist
+mkdir -p builds
+
+# Create versioned zip file in builds directory
+VERSION="0.1"  # Increment this for each new deployment
+zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json .env.example
 ```
 
 3. Create a new application in Elastic Beanstalk:
@@ -238,7 +246,7 @@ zip -r deploy.zip dist package.json package-lock.json .env.example
    - Click "Create application"
    - Enter application name (e.g., "agentweb-backend")
    - Choose "Node.js" as platform
-   - Upload your `deploy.zip` file
+   - Upload your versioned zip file from `builds/deploy_v${VERSION}.zip`
    - Click "Create application"
 
 3. Configure environment variables:
