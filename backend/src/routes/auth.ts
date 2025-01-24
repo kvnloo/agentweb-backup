@@ -2,6 +2,7 @@ import express from 'express';
 import { register, login, googleCallback } from '../controllers/auth';
 import passport from 'passport';
 import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
+import { AuthRequest } from '../types/express';
 
 const router = express.Router();
 
@@ -24,9 +25,12 @@ router.get('/google', passport.authenticate('google', {
 
 router.get('/google/callback',
   passport.authenticate('google', { session: false }),
-  (req, res) => {
+  (req: AuthRequest, res) => {
     // Redirect to frontend with token
-    const token = req.user?.token;
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication failed' });
+    }
+    const token = req.user.accessToken || req.user.token;  // Try both possible token locations
     res.redirect(`http://localhost:5173/oauth-callback?token=${token}`);
   }
 );
