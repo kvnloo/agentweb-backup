@@ -180,3 +180,113 @@ Frontend:
 ```
 VITE_API_URL=http://localhost:3001
 ```
+
+## Deployment to AWS Elastic Beanstalk
+
+### Prerequisites
+- AWS Account with Elastic Beanstalk permissions
+- AWS Management Console access
+
+### Frontend Deployment
+
+1. Build the production version:
+```bash
+cd frontend
+npm run build
+```
+
+2. Create deployment package:
+```bash
+# Install serve for static file hosting
+npm install serve
+
+# Create zip file including all necessary files
+zip -r deploy.zip dist Procfile package.json package-lock.json
+```
+
+3. Create a new application in Elastic Beanstalk:
+   - Go to AWS Management Console > Elastic Beanstalk
+   - Click "Create application"
+   - Enter application name (e.g., "agentweb-frontend")
+   - Choose "Node.js" as platform
+   - Upload the `deploy.zip` file you created
+   - Click "Create application"
+
+4. Configure environment variables:
+   - In your environment, go to Configuration > Software
+   - Click "Edit"
+   - Add environment variable:
+     - REACT_APP_API_URL = <your-backend-url>
+   - Click "Apply"
+
+### Backend Deployment
+
+1. Prepare the backend code:
+```bash
+cd backend
+npm run build
+```
+
+2. Create deployment package:
+```bash
+# Create zip file including all necessary files
+zip -r deploy.zip dist package.json package-lock.json .env.example
+```
+
+3. Create a new application in Elastic Beanstalk:
+   - Go to AWS Management Console > Elastic Beanstalk
+   - Click "Create application"
+   - Enter application name (e.g., "agentweb-backend")
+   - Choose "Node.js" as platform
+   - Upload your `deploy.zip` file
+   - Click "Create application"
+
+3. Configure environment variables:
+   - In your environment, go to Configuration > Software
+   - Click "Edit"
+   - Add environment variables:
+     - AWS_REGION = us-west-2
+     - JWT_SECRET = <your-jwt-secret>
+     - SMTP_HOST = <your-smtp-host>
+     - SMTP_PORT = <your-smtp-port>
+     - SMTP_USER = <your-smtp-user>
+     - SMTP_PASS = <your-smtp-password>
+     - FROM_EMAIL = <your-from-email>
+     - SITE_DOMAIN = <your-frontend-url>
+   - Click "Apply"
+
+### Agent Engine Deployment
+
+The agent engine should be deployed as a separate service using AWS ECS (Elastic Container Service) due to its Python dependencies and browser automation requirements. See the agent-engine directory for specific deployment instructions.
+
+### Important Notes
+
+1. CORS Configuration:
+   - Update the CORS settings in the backend to allow requests from your frontend domain
+   - Update the API URL in the frontend to point to your backend domain
+
+2. Database:
+   - Ensure your DynamoDB tables are created in the same region
+   - Configure proper IAM roles for Elastic Beanstalk to access DynamoDB
+     - Go to IAM > Roles
+     - Find your Elastic Beanstalk role
+     - Attach the necessary DynamoDB policies
+
+3. Security:
+   - Use environment variables for all sensitive information
+   - Enable HTTPS:
+     - In your environment, go to Configuration > Load balancer
+     - Add a listener for port 443
+     - Configure SSL certificate
+   - Configure security groups through the Elastic Beanstalk environment settings
+
+4. Monitoring:
+   - Set up CloudWatch alarms through the Elastic Beanstalk monitoring page
+   - Configure proper logging in the environment's configuration panel
+
+5. Cost Management:
+   - Choose t3.micro instances for development in the capacity settings
+   - Configure auto-scaling rules in the capacity section
+   - Monitor costs through AWS Cost Explorer
+
+For detailed troubleshooting and advanced configuration options, refer to the [AWS Elastic Beanstalk documentation](https://docs.aws.amazon.com/elasticbeanstalk/latest/dg/Welcome.html).

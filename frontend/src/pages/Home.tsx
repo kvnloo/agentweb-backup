@@ -24,6 +24,7 @@ import {
   Security as SecurityIcon
 } from '@mui/icons-material';
 import axios from 'axios';
+import { buildApiUrl } from '../config';
 
 export default function Home() {
   const [email, setEmail] = useState('');
@@ -35,7 +36,7 @@ export default function Home() {
     setError('');
     
     try {
-      await axios.post('http://localhost:3001/api/waitlist', { email });
+      await axios.post(buildApiUrl('/api/waitlist'), { email });
       setSubmitted(true);
     } catch (err) {
       setError('Failed to join waitlist. Please try again.');
