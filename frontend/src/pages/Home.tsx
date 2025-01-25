@@ -8,29 +8,23 @@ import {
   Paper,
   Grid,
   Alert,
-  Chip,
   List,
   ListItem,
   ListItemIcon,
   ListItemText,
-  Divider,
   Stack,
   Link,
   Toolbar,
 } from '@mui/material';
 import { Link as RouterLink } from 'react-router-dom';
 import {
-  AutoAwesome as AutoAwesomeIcon,
-  Speed as SpeedIcon,
-  Lock as LockIcon,
   Check as CheckIcon,
-  Code as CodeIcon,
   Psychology as PsychologyIcon,
-  Timer as TimerIcon,
   Bolt as BoltIcon,
-  Security as SecurityIcon,
+  Security as SecurityIcon
 } from '@mui/icons-material';
 import axios from 'axios';
+import { buildApiUrl } from '../config';
 
 export default function Home() {
   const [email, setEmail] = useState('');
@@ -42,7 +36,7 @@ export default function Home() {
     setError('');
     
     try {
-      await axios.post('http://localhost:3001/api/waitlist', { email });
+      await axios.post(buildApiUrl('/api/waitlist'), { email });
       setSubmitted(true);
     } catch (err) {
       setError('Failed to join waitlist. Please try again.');

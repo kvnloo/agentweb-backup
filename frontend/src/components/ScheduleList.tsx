@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import {
   Box,
   Typography,
@@ -16,6 +16,8 @@ import {
 } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import axios from 'axios';
+import { useAuth } from '../contexts/AuthContext';
+import { API_URL } from '../config';
 
 interface Schedule {
   scheduleId: string;
@@ -35,14 +37,15 @@ export default function ScheduleList({ taskId, onScheduleUpdated }: ScheduleList
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
+  const { token } = useAuth();
 
   const fetchSchedules = async () => {
     try {
       const response = await axios.get(
-        `http://localhost:3001/api/schedules/task/${taskId}`,
+        `${API_URL}/api/schedules/task/${taskId}`,
         {
           headers: {
-            'Authorization': `Bearer ${localStorage.getItem('token')}`
+            Authorization: `Bearer ${token}`
           }
         }
       );
@@ -58,18 +61,18 @@ export default function ScheduleList({ taskId, onScheduleUpdated }: ScheduleList
 
   useEffect(() => {
     fetchSchedules();
-  }, [taskId]);
+  }, [taskId, token]);
 
   const handleStatusToggle = async (scheduleId: string, currentStatus: string) => {
     try {
       await axios.put(
-        `http://localhost:3001/api/schedules/${scheduleId}`,
+        `${API_URL}/api/schedules/${scheduleId}`,
         {
           status: currentStatus === 'active' ? 'paused' : 'active'
         },
         {
           headers: {
-            'Authorization': `Bearer ${localStorage.getItem('token')}`
+            Authorization: `Bearer ${token}`
           }
         }
       );
@@ -85,10 +88,10 @@ export default function ScheduleList({ taskId, onScheduleUpdated }: ScheduleList
   const handleDelete = async (scheduleId: string) => {
     try {
       await axios.delete(
-        `http://localhost:3001/api/schedules/${scheduleId}`,
+        `${API_URL}/api/schedules/${scheduleId}`,
         {
           headers: {
-            'Authorization': `Bearer ${localStorage.getItem('token')}`
+            Authorization: `Bearer ${token}`
           }
         }
       );

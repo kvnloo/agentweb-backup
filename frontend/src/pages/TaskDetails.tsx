@@ -23,6 +23,7 @@ import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
 import ScheduleForm from '../components/ScheduleForm';
 import ScheduleList from '../components/ScheduleList';
+import { buildApiUrl } from '../config';
 
 interface Task {
   taskId: string;
@@ -53,6 +54,7 @@ export default function TaskDetails() {
   const [executions, setExecutions] = useState<TaskExecution[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [scheduleRefreshTrigger, setScheduleRefreshTrigger] = useState(0);
   const { taskId } = useParams<{ taskId: string }>();
   const { token } = useAuth();
   const navigate = useNavigate();
@@ -61,16 +63,16 @@ export default function TaskDetails() {
     if (!taskId) return;
     try {
       const [taskResponse, executionsResponse] = await Promise.all([
-        axios.get(`http://localhost:3001/api/tasks/${taskId}`, {
+        axios.get(buildApiUrl(`/api/tasks/${taskId}`), {
           headers: { Authorization: `Bearer ${token}` },
         }),
-        axios.get(`http://localhost:3001/api/tasks/${taskId}/executions`, {
+        axios.get(buildApiUrl(`/api/tasks/${taskId}/executions`), {
           headers: { Authorization: `Bearer ${token}` },
         })
       ]);
       
       const updatedTask = taskResponse.data;
-      console.log('Setting task to:', updatedTask);
+      console.log('Task data fetched:', updatedTask);
       setTask(updatedTask);
       setExecutions(executionsResponse.data);
       return updatedTask;
@@ -93,7 +95,7 @@ export default function TaskDetails() {
     // Set up polling for executions
     const intervalId = setInterval(() => {
       if (taskId) {
-        axios.get(`http://localhost:3001/api/tasks/${taskId}/executions`, {
+        axios.get(buildApiUrl(`/api/tasks/${taskId}/executions`), {
           headers: { Authorization: `Bearer ${token}` },
         })
         .then(response => setExecutions(response.data))
@@ -106,7 +108,7 @@ export default function TaskDetails() {
 
   const handleDelete = async () => {
     try {
-      await axios.delete(`http://localhost:3001/api/tasks/${taskId}`, {
+      await axios.delete(buildApiUrl(`/api/tasks/${taskId}`), {
         headers: { Authorization: `Bearer ${token}` },
       });
       navigate('/dashboard');
@@ -119,14 +121,14 @@ export default function TaskDetails() {
   const handleRun = async () => {
     try {
       await axios.post(
-        `http://localhost:3001/api/tasks/${taskId}/execute`,
+        buildApiUrl(`/api/tasks/${taskId}/execute`),
         {},
         {
           headers: { Authorization: `Bearer ${token}` },
         }
       );
       // Refresh executions list
-      const response = await axios.get(`http://localhost:3001/api/tasks/${taskId}/executions`, {
+      const response = await axios.get(buildApiUrl(`/api/tasks/${taskId}/executions`), {
         headers: { Authorization: `Bearer ${token}` },
       });
       setExecutions(response.data);
@@ -146,7 +148,7 @@ export default function TaskDetails() {
       console.log('New emailNotification:', newEmailNotification, typeof newEmailNotification);
       
       const updateResponse = await axios.put(
-        `http://localhost:3001/api/tasks/${taskId}`,
+        buildApiUrl(`/api/tasks/${taskId}`),
         {
           emailNotification: newEmailNotification
         },
@@ -158,7 +160,7 @@ export default function TaskDetails() {
 
       // Update the task state with the response
       const taskResponse = await axios.get(
-        `http://localhost:3001/api/tasks/${taskId}`,
+        buildApiUrl(`/api/tasks/${taskId}`),
         {
           headers: { Authorization: `Bearer ${token}` }
         }
@@ -176,7 +178,7 @@ export default function TaskDetails() {
   const handleFeedbackChange = async (executionId: string, feedback: 'accepted' | 'rejected' | null) => {
     try {
       await axios.put(
-        `http://localhost:3001/api/tasks/${taskId}/executions/${executionId}`,
+        buildApiUrl(`/api/tasks/${taskId}/executions/${executionId}`),
         { feedback },
         {
           headers: { Authorization: `Bearer ${token}` }
@@ -184,7 +186,7 @@ export default function TaskDetails() {
       );
       
       // Refresh executions list
-      const response = await axios.get(`http://localhost:3001/api/tasks/${taskId}/executions`, {
+      const response = await axios.get(buildApiUrl(`/api/tasks/${taskId}/executions`), {
         headers: { Authorization: `Bearer ${token}` },
       });
       setExecutions(response.data);
@@ -218,6 +220,12 @@ export default function TaskDetails() {
       default:
         return 'default';
     }
+  };
+
+  const handleScheduleCreated = async () => {
+    console.log('Schedule created, refreshing data');
+    await fetchTask();
+    setScheduleRefreshTrigger(prev => prev + 1);
   };
 
   if (loading) {
@@ -385,10 +393,13 @@ export default function TaskDetails() {
                       <TableCell>
                         <select
                           value={execution.feedback || ''}
-                          onChange={(e) => handleFeedbackChange(
-                            execution.executionId,
-                            e.target.value as '' | 'accepted' | 'rejected'
-                          )}
+                          onChange={(e) => {
+                            const value = e.target.value;
+                            handleFeedbackChange(
+                              execution.executionId,
+                              value === '' ? null : value as 'accepted' | 'rejected'
+                            );
+                          }}
                           style={{
                             padding: '8px',
                             borderRadius: '4px',
@@ -421,8 +432,8 @@ export default function TaskDetails() {
           <Typography variant="h5" gutterBottom>
             Task Scheduling
           </Typography>
-          <ScheduleForm taskId={taskId} onScheduleCreated={fetchTask} />
-          <ScheduleList taskId={taskId} onScheduleUpdated={fetchTask} />
+          <ScheduleForm taskId={taskId} onScheduleCreated={handleScheduleCreated} />
+          <ScheduleList taskId={taskId} onScheduleUpdated={handleScheduleCreated} key={scheduleRefreshTrigger} />
         </Box>
       </Paper>
     </Container>

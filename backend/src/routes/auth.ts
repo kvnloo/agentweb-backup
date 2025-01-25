@@ -2,14 +2,20 @@ import express from 'express';
 import { register, login, googleCallback } from '../controllers/auth';
 import passport from 'passport';
 import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
+import { AuthRequest } from '../types/express';
 
 const router = express.Router();
 
 // Initialize Google strategy
+console.log('OAuth Configuration:', {
+  backendUrl: process.env.BACKEND_URL || 'http://localhost:3001',
+  frontendUrl: process.env.FRONTEND_URL || 'http://localhost:5173'
+});
+
 passport.use(new GoogleStrategy({
   clientID: process.env.GOOGLE_CLIENT_ID!,
   clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
-  callbackURL: 'http://localhost:3001/api/auth/google/callback'
+  callbackURL: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/auth/google/callback`
 }, googleCallback));
 
 // Regular auth routes
@@ -24,10 +30,17 @@ router.get('/google', passport.authenticate('google', {
 
 router.get('/google/callback',
   passport.authenticate('google', { session: false }),
-  (req, res) => {
+  (req: AuthRequest, res) => {
     // Redirect to frontend with token
-    const token = req.user?.token;
-    res.redirect(`http://localhost:5173/oauth-callback?token=${token}`);
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication failed' });
+    }
+    console.log('OAuth Callback - Redirecting to frontend:', {
+      frontendUrl: process.env.FRONTEND_URL || 'http://localhost:5173',
+      token: !!req.user.token || !!req.user.accessToken
+    });
+    const token = req.user.accessToken || req.user.token;  // Try both possible token locations
+    res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/oauth-callback?token=${token}`);
   }
 );
 

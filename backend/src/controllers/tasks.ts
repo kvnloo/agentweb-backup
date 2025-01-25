@@ -112,7 +112,9 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
     // Get and return the updated task
     const updatedTask = await taskDb.getTaskById(taskId);
     console.log('Updated task:', updatedTask);
-    console.log('emailNotification in updated task:', updatedTask.emailNotification, typeof updatedTask.emailNotification);
+    if (updatedTask) {
+      console.log('emailNotification in updated task:', updatedTask.emailNotification, typeof updatedTask.emailNotification);
+    }
     
     res.json(updatedTask);
   } catch (error) {

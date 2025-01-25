@@ -1,26 +1,23 @@
+import React from 'react';
 import { Button } from '@mui/material';
 import { useAuth } from '../contexts/AuthContext';
 
-export default function LoginButton() {
-  const { loginWithLogin } = useAuth();
+const LoginButton: React.FC = () => {
+  const { loginWithGoogle } = useAuth();
 
   const handleLogin = async () => {
     try {
-      await loginWithLogin();
+      await loginWithGoogle();
     } catch (error) {
       console.error('Login failed:', error);
     }
   };
 
   return (
-    <Button
-      onClick={handleLogin}
-      fullWidth
-      variant="contained"
-      color="primary"
-      sx={{ mt: 1, mb: 1 }}
-    >
-      Sign in with Login
+    <Button variant="contained" onClick={handleLogin}>
+      Login with Google
     </Button>
   );
-} 
+};
+
+export default LoginButton; 

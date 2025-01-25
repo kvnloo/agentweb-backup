@@ -15,6 +15,7 @@ import {
 import { Add as AddIcon } from '@mui/icons-material';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
+import { API_URL } from '../config';
 
 interface Task {
   taskId: string;
@@ -27,19 +28,17 @@ interface Task {
 
 export default function Dashboard() {
   const [tasks, setTasks] = useState<Task[]>([]);
-  const [error, setError] = useState('');
   const { token } = useAuth();
   const navigate = useNavigate();
 
   const fetchTasks = async () => {
     try {
-      const response = await axios.get('http://localhost:3001/api/tasks', {
+      const response = await axios.get(`${API_URL}/api/tasks`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       setTasks(response.data);
     } catch (error: any) {
       console.error('Error fetching tasks:', error);
-      setError(error.response?.data?.message || 'Failed to fetch tasks');
     }
   };
 

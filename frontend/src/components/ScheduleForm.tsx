@@ -11,6 +11,7 @@ import {
   Alert
 } from '@mui/material';
 import axios from 'axios';
+import { buildApiUrl } from '../config';
 
 interface ScheduleFormProps {
   taskId: string;
@@ -36,18 +37,14 @@ export default function ScheduleForm({ taskId, onScheduleCreated }: ScheduleForm
     setIsSubmitting(true);
 
     try {
-      const response = await axios.post(
-        'http://localhost:3001/api/schedules',
-        {
-          taskId,
-          frequency
-        },
-        {
-          headers: {
-            'Authorization': `Bearer ${localStorage.getItem('token')}`
-          }
+      await axios.post(buildApiUrl('/api/schedules'), {
+        taskId,
+        frequency
+      }, {
+        headers: {
+          'Authorization': `Bearer ${localStorage.getItem('token')}`
         }
-      );
+      });
 
       setSuccess('Schedule created successfully');
       setFrequency('');

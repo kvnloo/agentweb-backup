@@ -11,6 +11,7 @@ import {
 } from '@mui/material';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
+import { buildApiUrl } from '../config';
 
 export default function CreateTask() {
   const [name, setName] = useState('');
@@ -25,7 +26,7 @@ export default function CreateTask() {
 
     try {
       await axios.post(
-        'http://localhost:3001/api/tasks',
+        buildApiUrl('/api/tasks'),
         {
           name,
           prompt,
