@@ -189,27 +189,18 @@ VITE_API_URL=http://localhost:3001
 
 ### Frontend Deployment
 
-1. Build the production version with environment variables:
+1. Build the production version and create deployment package:
 ```bash
-cd frontend
-
-# Set environment variables during build time
+cd frontend && \
 VITE_API_URL=http://agentweb-backend.us-west-2.elasticbeanstalk.com \
 VITE_DEBUG=true \
-npm run build
-```
-
-2. Create deployment package:
-```bash
-# Create builds directory if it doesn't exist
-mkdir -p builds
-
-# Create versioned zip file in builds directory
-VERSION="0.1"  # Increment this for each new deployment
+npm run build && \
+VERSION="0.5" && \
+mkdir -p builds && \
 zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json
 ```
 
-3. Create a new application in Elastic Beanstalk:
+2. Create a new application in Elastic Beanstalk:
    - Go to AWS Management Console > Elastic Beanstalk
    - Click "Create application"
    - Enter application name (e.g., "agentweb-frontend")
@@ -221,23 +212,16 @@ Note: Environment variables must be set during build time for the frontend, as V
 
 ### Backend Deployment
 
-1. Prepare the backend code:
+1. Build the backend and create deployment package:
 ```bash
-cd backend
-npm run build
-```
-
-2. Create deployment package:
-```bash
-# Create builds directory if it doesn't exist
-mkdir -p builds
-
-# Create versioned zip file in builds directory
-VERSION="0.1"  # Increment this for each new deployment
+cd backend && \
+npm run build && \
+VERSION="0.5" && \
+mkdir -p builds && \
 zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json .env.example
 ```
 
-3. Create a new application in Elastic Beanstalk:
+2. Create a new application in Elastic Beanstalk:
    - Go to AWS Management Console > Elastic Beanstalk
    - Click "Create application"
    - Enter application name (e.g., "agentweb-backend")
@@ -251,6 +235,8 @@ zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json .env.
    - Add environment variables:
      - AWS_REGION = us-west-2
      - JWT_SECRET = <your-jwt-secret>
+     - FRONTEND_URL = http://agentweb-frontend.us-west-2.elasticbeanstalk.com  # Important for OAuth redirect
+     - BACKEND_URL = http://agentweb-backend.us-west-2.elasticbeanstalk.com  # Important for OAuth callback
      - SMTP_HOST = <your-smtp-host>
      - SMTP_PORT = <your-smtp-port>
      - SMTP_USER = <your-smtp-user>
@@ -258,6 +244,7 @@ zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json .env.
      - FROM_EMAIL = <your-from-email>
      - SITE_DOMAIN = <your-frontend-url>
    - Click "Apply"
+   - Wait for the environment update to complete
 
 ### Agent Engine Deployment
 

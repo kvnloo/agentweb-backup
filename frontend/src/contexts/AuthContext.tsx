@@ -47,7 +47,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const login = async (email: string, password: string) => {
     try {
-      const response = await axios.post('http://localhost:3001/api/auth/login', {
+      const response = await axios.post(`${import.meta.env.VITE_API_URL}/api/auth/login`, {
         email,
         password,
       });
@@ -60,7 +60,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const loginWithGoogle = async () => {
     try {
       // Redirect to Google OAuth endpoint
-      window.location.href = 'http://localhost:3001/api/auth/google';
+      const googleAuthUrl = `${import.meta.env.VITE_API_URL}/api/auth/google`;
+      console.log('Redirecting to Google OAuth:', {
+        apiUrl: import.meta.env.VITE_API_URL,
+        fullUrl: googleAuthUrl
+      });
+      window.location.href = googleAuthUrl;
     } catch (error) {
       throw new Error('Google sign in failed');
     }
@@ -68,7 +73,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const register = async (email: string, password: string) => {
     try {
-      const response = await axios.post('http://localhost:3001/api/auth/register', {
+      const response = await axios.post(`${import.meta.env.VITE_API_URL}/api/auth/register`, {
         email,
         password,
       });

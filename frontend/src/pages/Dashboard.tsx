@@ -15,6 +15,7 @@ import {
 import { Add as AddIcon } from '@mui/icons-material';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
+import { API_URL } from '../config';
 
 interface Task {
   taskId: string;
@@ -32,7 +33,7 @@ export default function Dashboard() {
 
   const fetchTasks = async () => {
     try {
-      const response = await axios.get('http://localhost:3001/api/tasks', {
+      const response = await axios.get(`${API_URL}/api/tasks`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       setTasks(response.data);
