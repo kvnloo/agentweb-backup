@@ -189,9 +189,13 @@ VITE_API_URL=http://localhost:3001
 
 ### Frontend Deployment
 
-1. Build the production version:
+1. Build the production version with environment variables:
 ```bash
 cd frontend
+
+# Set environment variables during build time
+VITE_API_URL=http://agentweb-backend.us-west-2.elasticbeanstalk.com \
+VITE_DEBUG=true \
 npm run build
 ```
 
@@ -200,12 +204,9 @@ npm run build
 # Create builds directory if it doesn't exist
 mkdir -p builds
 
-# Install serve for static file hosting
-npm install serve
-
 # Create versioned zip file in builds directory
 VERSION="0.1"  # Increment this for each new deployment
-zip -r "builds/deploy_v${VERSION}.zip" dist Procfile package.json package-lock.json
+zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json
 ```
 
 3. Create a new application in Elastic Beanstalk:
@@ -216,12 +217,7 @@ zip -r "builds/deploy_v${VERSION}.zip" dist Procfile package.json package-lock.j
    - Upload the versioned zip file from `builds/deploy_v${VERSION}.zip`
    - Click "Create application"
 
-4. Configure environment variables:
-   - In your environment, go to Configuration > Software
-   - Click "Edit"
-   - Add environment variable:
-     - VITE_API_URL = <your-backend-url>
-   - Click "Apply"
+Note: Environment variables must be set during build time for the frontend, as Vite replaces them at build time. Runtime environment variables in Elastic Beanstalk are not used by the frontend application.
 
 ### Backend Deployment
 
