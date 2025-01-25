@@ -25,6 +25,7 @@ import {
 } from '@mui/icons-material';
 import axios from 'axios';
 import { buildApiUrl } from '../config';
+import logo from '../assets/logo.svg';
 
 export default function Home() {
   const [email, setEmail] = useState('');
@@ -75,7 +76,10 @@ export default function Home() {
               sx={{ 
                 color: 'primary.main',
                 fontWeight: 600,
-                fontSize: { xs: '1.25rem', sm: '1.5rem' }
+                fontSize: { xs: '1.25rem', sm: '1.5rem' },
+                display: 'flex',
+                alignItems: 'center',
+                gap: 1
               }}
             >
               <Link
@@ -83,7 +87,13 @@ export default function Home() {
                 to="/"
                 color="inherit"
                 underline="none"
+                sx={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 1
+                }}
               >
+                <img src={logo} alt="AgentWeb Logo" style={{ height: 32, width: 32 }} />
                 AgentWeb
               </Link>
             </Typography>
@@ -137,12 +147,24 @@ export default function Home() {
         <Container maxWidth="lg" sx={{ px: { xs: 2, sm: 3 } }}>
           <Grid container spacing={4} alignItems="center" justifyContent="center">
             <Grid item xs={12} md={7}>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 4 }}>
+                <img src={logo} alt="AgentWeb Logo" style={{ height: 64, width: 64 }} />
+                <Typography
+                  variant="h1"
+                  sx={{
+                    fontWeight: 800,
+                    fontSize: { xs: '2.5rem', sm: '3.5rem', md: '4rem' },
+                  }}
+                >
+                  AgentWeb
+                </Typography>
+              </Box>
               <Typography
-                variant="h1"
+                variant="h2"
                 sx={{
                   mb: 3,
                   fontWeight: 800,
-                  fontSize: { xs: '2.5rem', sm: '3.5rem', md: '4rem' },
+                  fontSize: { xs: '2rem', sm: '2.5rem', md: '3rem' },
                 }}
               >
                 Transform Your Web Tasks with AI

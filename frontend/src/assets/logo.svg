@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="200" height="200" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <!-- Web Circle Background -->
+  <circle cx="100" cy="100" r="90" fill="none" stroke="#2563eb" stroke-width="4"/>
+  
+  <!-- Web Lines -->
+  <path d="M30,100 C30,60 100,60 100,60 C100,60 170,60 170,100 C170,140 100,140 100,140 C100,140 30,140 30,100" 
+        fill="none" stroke="#2563eb" stroke-width="3"/>
+  <line x1="100" y1="20" x2="100" y2="180" stroke="#2563eb" stroke-width="3"/>
+  <line x1="20" y1="100" x2="180" y2="100" stroke="#2563eb" stroke-width="3"/>
+  
+  <!-- Robot Head -->
+  <rect x="70" y="70" width="60" height="60" rx="10" fill="#2563eb"/>
+  
+  <!-- Robot Eyes -->
+  <circle cx="85" cy="90" r="5" fill="white"/>
+  <circle cx="115" cy="90" r="5" fill="white"/>
+  
+  <!-- Robot Antenna -->
+  <line x1="100" y1="70" x2="100" y2="50" stroke="#2563eb" stroke-width="3"/>
+  <circle cx="100" cy="45" r="5" fill="#2563eb"/>
+</svg> 
