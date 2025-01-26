@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="200" height="200" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <!-- Outer Circle with Gradient -->
+  <defs>
+    <linearGradient id="circleGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#3b82f6;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#2563eb;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  
+  <!-- Background Circle -->
+  <circle cx="100" cy="100" r="90" fill="none" stroke="url(#circleGradient)" stroke-width="8" stroke-linecap="round"/>
+  
+  <!-- Decorative Web Lines with Animation -->
+  <g opacity="0.6">
+    <path d="M45,100 C45,70 100,70 100,70 C100,70 155,70 155,100 C155,130 100,130 100,130 C100,130 45,130 45,100" 
+          fill="none" stroke="#60a5fa" stroke-width="3" stroke-linecap="round"/>
+    <path d="M50,85 C50,70 100,60 100,60 C100,60 150,70 150,85" 
+          fill="none" stroke="#60a5fa" stroke-width="2" stroke-linecap="round"/>
+  </g>
+  
+  <!-- Robot Head - Rounded Rectangle -->
+  <rect x="55" y="60" width="90" height="85" rx="25" fill="url(#circleGradient)"/>
+  
+  <!-- Friendly Eyes -->
+  <g>
+    <!-- Left Eye -->
+    <circle cx="82" cy="95" r="12" fill="white"/>
+    <circle cx="82" cy="95" r="6" fill="#111827"/>
+    <circle cx="80" cy="93" r="2.5" fill="white"/>
+    
+    <!-- Right Eye -->
+    <circle cx="118" cy="95" r="12" fill="white"/>
+    <circle cx="118" cy="95" r="6" fill="#111827"/>
+    <circle cx="116" cy="93" r="2.5" fill="white"/>
+  </g>
+  
+  <!-- Cute Smile -->
+  <path d="M82,120 Q100,132 118,120" 
+        fill="none" 
+        stroke="white" 
+        stroke-width="5" 
+        stroke-linecap="round"/>
+  
+  <!-- Antenna with Glow -->
+  <g>
+    <circle cx="100" cy="40" r="7" fill="#60a5fa">
+      <animate attributeName="opacity" values="0.5;1;0.5" dur="2s" repeatCount="indefinite"/>
+    </circle>
+    <line x1="100" y1="60" x2="100" y2="47" stroke="#60a5fa" stroke-width="5" stroke-linecap="round"/>
+  </g>
+  
+  <!-- Subtle Glow Effect -->
+  <circle cx="100" cy="100" r="95" fill="url(#circleGradient)" opacity="0.1"/>
+</svg> 

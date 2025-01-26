@@ -8,8 +8,20 @@ import scheduleRoutes from './routes/schedules';
 
 const app = express();
 
+// CORS configuration
+const corsOptions = {
+  origin: [
+    'https://agentweb.pro',
+    'http://localhost:5173', // Keep local development
+    process.env.FRONTEND_URL || 'http://localhost:5173'
+  ],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true
+};
+
 // Middleware
-app.use(cors());
+app.use(cors(corsOptions));
 app.use(express.json());
 app.use(passport.initialize());
 

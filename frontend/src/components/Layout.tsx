@@ -12,6 +12,7 @@ import {
   useMediaQuery,
 } from '@mui/material';
 import { useAuth } from '../contexts/AuthContext';
+import logo from '../assets/logo.svg';
 
 interface LayoutProps {
   children: ReactNode;
@@ -45,7 +46,10 @@ export default function Layout({ children }: LayoutProps) {
                 flexGrow: 1,
                 color: 'primary.main',
                 fontWeight: 600,
-                fontSize: { xs: '1.25rem', sm: '1.5rem' }
+                fontSize: { xs: '1.25rem', sm: '1.5rem' },
+                display: 'flex',
+                alignItems: 'center',
+                gap: 1
               }}
             >
               <Link
@@ -53,7 +57,13 @@ export default function Layout({ children }: LayoutProps) {
                 to="/"
                 color="inherit"
                 underline="none"
+                sx={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 1
+                }}
               >
+                <img src={logo} alt="AgentWeb Logo" style={{ height: 32, width: 32 }} />
                 AgentWeb
               </Link>
             </Typography>
