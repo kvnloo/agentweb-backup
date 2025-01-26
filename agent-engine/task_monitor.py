@@ -28,6 +28,9 @@ def json_dumps(obj):
 # Load environment variables
 load_dotenv()
 
+# Create log directory if it doesn't exist
+os.makedirs('log', exist_ok=True)
+
 # Configure root logger
 logging.basicConfig(
     level=logging.INFO,
