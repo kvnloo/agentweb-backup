@@ -10,6 +10,7 @@ import {
   Link,
   useTheme,
   useMediaQuery,
+  Chip,
 } from '@mui/material';
 import { useAuth } from '../contexts/AuthContext';
 import logo from '../assets/logo.svg';
@@ -65,6 +66,17 @@ export default function Layout({ children }: LayoutProps) {
               >
                 <img src={logo} alt="AgentWeb Logo" style={{ height: 32, width: 32 }} />
                 AgentWeb
+                <Chip
+                  label="BETA"
+                  size="small"
+                  sx={{
+                    bgcolor: 'rgba(0, 0, 0, 0.08)',
+                    color: 'primary.main',
+                    fontSize: '0.75rem',
+                    height: '20px',
+                    fontWeight: 600
+                  }}
+                />
               </Link>
             </Typography>
             <Box sx={{ 

@@ -15,6 +15,7 @@ import {
   Stack,
   Link,
   Toolbar,
+  Chip,
 } from '@mui/material';
 import { Link as RouterLink } from 'react-router-dom';
 import {
@@ -154,9 +155,24 @@ export default function Home() {
                   sx={{
                     fontWeight: 800,
                     fontSize: { xs: '2.5rem', sm: '3.5rem', md: '4rem' },
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 2
                   }}
                 >
                   AgentWeb
+                  <Chip
+                    label="BETA"
+                    sx={{
+                      bgcolor: 'rgba(255, 255, 255, 0.15)',
+                      color: 'white',
+                      fontSize: { xs: '1rem', sm: '1.25rem' },
+                      height: 'auto',
+                      py: 0.5,
+                      px: 1,
+                      fontWeight: 600
+                    }}
+                  />
                 </Typography>
               </Box>
               <Typography

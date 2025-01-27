@@ -53,4 +53,12 @@ agent-engine/agent_history.gif
 *.pyc
 __pycache__/
 *.py[cod]
-*$py.class 
+*$py.class
+
+# Log files and directories
+logs/
+*/logs/
+*.log
+backend/logs/
+frontend/logs/
+agent-engine/logs/ 

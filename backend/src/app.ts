@@ -32,6 +32,10 @@ app.use('/api/waitlist', waitlistRoutes);
 app.use('/api/schedules', scheduleRoutes);
 
 // Health check endpoint
+app.get('/', (req, res) => {
+  res.status(200).json({ status: 'healthy' });
+});
+
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'healthy' });
 });
