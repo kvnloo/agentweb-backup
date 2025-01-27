@@ -1,183 +1,199 @@
-import { ReactNode } from 'react';
-import { useNavigate, Link as RouterLink } from 'react-router-dom';
+import React from 'react';
+import { Link as RouterLink, Outlet, useLocation } from 'react-router-dom';
 import {
   AppBar,
   Box,
-  Toolbar,
-  Typography,
   Button,
   Container,
-  Link,
-  useTheme,
-  useMediaQuery,
-  Chip,
+  IconButton,
+  Menu,
+  MenuItem,
+  Toolbar,
+  Typography,
+  Chip
 } from '@mui/material';
+import AccountCircle from '@mui/icons-material/AccountCircle';
 import { useAuth } from '../contexts/AuthContext';
+import { Theme } from '@mui/material/styles';
 import logo from '../assets/logo.svg';
 
-interface LayoutProps {
-  children: ReactNode;
-}
+export default function Layout() {
+  const { user, logout } = useAuth();
+  const [anchorEl, setAnchorEl] = React.useState<null | HTMLElement>(null);
+  const location = useLocation();
 
-export default function Layout({ children }: LayoutProps) {
-  const { isAuthenticated, userEmail, logout } = useAuth();
-  const navigate = useNavigate();
-  const theme = useTheme();
-  const isMobile = useMediaQuery(theme.breakpoints.down('sm'));
+  const handleMenu = (event: React.MouseEvent<HTMLElement>) => {
+    setAnchorEl(event.currentTarget);
+  };
+
+  const handleClose = () => {
+    setAnchorEl(null);
+  };
 
   const handleLogout = () => {
+    handleClose();
     logout();
-    navigate('/login');
+  };
+
+  const isActivePath = (path: string) => {
+    if (path === '/') {
+      return location.pathname === '/';
+    }
+    return location.pathname.startsWith(path);
   };
 
   return (
-    <Box sx={{ 
-      display: 'flex', 
-      flexDirection: 'column', 
-      minHeight: '100vh',
-      bgcolor: 'grey.50'
-    }}>
-      <AppBar position="static" elevation={1} sx={{ bgcolor: 'white' }}>
-        <Container maxWidth="lg">
-          <Toolbar sx={{ px: { xs: 0 } }}>
+    <Box sx={{ display: 'flex', flexDirection: 'column', minHeight: '100vh' }}>
+      <AppBar 
+        position="static" 
+        sx={{ 
+          bgcolor: 'background.paper',
+          borderBottom: '1px solid',
+          borderColor: 'divider',
+          boxShadow: 'none'
+        }}
+      >
+        <Toolbar>
+          <Box
+            component={RouterLink}
+            to="/"
+            sx={{
+              display: 'flex',
+              alignItems: 'center',
+              textDecoration: 'none',
+              color: 'primary.main'
+            }}
+          >
+            <img src={logo} alt="AgentWeb Logo" style={{ height: 32, width: 32, marginRight: 8 }} />
             <Typography 
               variant="h6" 
               component="div" 
               sx={{ 
-                flexGrow: 1,
-                color: 'primary.main',
+                flexGrow: 0, 
+                mr: 1,
                 fontWeight: 600,
-                fontSize: { xs: '1.25rem', sm: '1.5rem' },
-                display: 'flex',
-                alignItems: 'center',
-                gap: 1
+                fontSize: { xs: '1.25rem', sm: '1.5rem' }
               }}
             >
-              <Link
-                component={RouterLink}
-                to="/"
-                color="inherit"
-                underline="none"
-                sx={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 1
-                }}
-              >
-                <img src={logo} alt="AgentWeb Logo" style={{ height: 32, width: 32 }} />
-                AgentWeb
-                <Chip
-                  label="BETA"
-                  size="small"
-                  sx={{
-                    bgcolor: 'rgba(0, 0, 0, 0.08)',
-                    color: 'primary.main',
-                    fontSize: '0.75rem',
-                    height: '20px',
-                    fontWeight: 600
-                  }}
-                />
-              </Link>
+              AgentWeb
             </Typography>
-            <Box sx={{ 
-              display: 'flex', 
-              gap: { xs: 1, sm: 2 },
-              alignItems: 'center',
-              '& .MuiButton-root': {
-                minWidth: isMobile ? 'auto' : undefined,
-                px: isMobile ? 2 : 3
-              }
-            }}>
-              {isAuthenticated ? (
-                <>
-                  <Button
-                    color="primary"
-                    component={RouterLink}
-                    to="/dashboard"
-                    variant="text"
-                  >
-                    Dashboard
-                  </Button>
-                  <Button
-                    color="primary"
-                    component={RouterLink}
-                    to="/tasks/create"
-                    variant="contained"
-                    sx={{ 
-                      boxShadow: 'none',
-                      '&:hover': { boxShadow: 'none' }
-                    }}
-                  >
-                    Create Task
-                  </Button>
-                  <Typography 
-                    variant="body2" 
-                    sx={{ 
-                      color: 'text.secondary',
-                      display: { xs: 'none', sm: 'block' }
-                    }}
-                  >
-                    {userEmail}
-                  </Typography>
+            <Chip
+              label="BETA"
+              sx={{
+                bgcolor: 'rgba(25, 118, 210, 0.08)',
+                color: 'primary.main',
+                fontWeight: 600,
+                height: 'auto',
+                py: 0.5,
+                px: 1
+              }}
+            />
+          </Box>
+          <Box sx={{ flexGrow: 1, ml: 3 }}>
+            <Button 
+              color="primary" 
+              component={RouterLink} 
+              to="/"
+              variant={isActivePath('/') ? 'contained' : 'text'}
+              sx={{ 
+                '&.Mui-disabled': { 
+                  color: 'white',
+                  bgcolor: 'primary.main' 
+                }
+              }}
+            >
+              Home
+            </Button>
+            {user && (
+              <>
+                <Button 
+                  color="primary" 
+                  component={RouterLink} 
+                  to="/dashboard"
+                  variant={isActivePath('/dashboard') ? 'contained' : 'text'}
+                >
+                  Dashboard
+                </Button>
+                {user.isAdmin && (
                   <Button 
                     color="primary" 
-                    onClick={handleLogout}
-                    variant="outlined"
+                    component={RouterLink} 
+                    to="/admin"
+                    variant={isActivePath('/admin') ? 'contained' : 'text'}
                   >
-                    Logout
+                    Admin
                   </Button>
-                </>
-              ) : (
-                <>
-                  <Button
-                    color="primary"
-                    component={RouterLink}
-                    to="/login"
-                    variant="outlined"
-                  >
-                    Login
-                  </Button>
-                  <Button
-                    color="primary"
-                    component={RouterLink}
-                    to="/register"
-                    variant="contained"
-                    sx={{ 
-                      boxShadow: 'none',
-                      '&:hover': { boxShadow: 'none' }
-                    }}
-                  >
-                    Register
-                  </Button>
-                </>
-              )}
-            </Box>
-          </Toolbar>
-        </Container>
+                )}
+              </>
+            )}
+          </Box>
+          {user ? (
+            <div>
+              <IconButton
+                size="large"
+                aria-label="account of current user"
+                aria-controls="menu-appbar"
+                aria-haspopup="true"
+                onClick={handleMenu}
+                color="primary"
+              >
+                <AccountCircle />
+              </IconButton>
+              <Menu
+                id="menu-appbar"
+                anchorEl={anchorEl}
+                anchorOrigin={{
+                  vertical: 'top',
+                  horizontal: 'right',
+                }}
+                keepMounted
+                transformOrigin={{
+                  vertical: 'top',
+                  horizontal: 'right',
+                }}
+                open={Boolean(anchorEl)}
+                onClose={handleClose}
+              >
+                <MenuItem 
+                  component={RouterLink} 
+                  to="/profile" 
+                  onClick={handleClose}
+                  selected={isActivePath('/profile')}
+                >
+                  Profile
+                </MenuItem>
+                <MenuItem onClick={handleLogout}>Logout</MenuItem>
+              </Menu>
+            </div>
+          ) : (
+            <Button 
+              color="primary" 
+              component={RouterLink} 
+              to="/login"
+              variant={isActivePath('/login') ? 'contained' : 'text'}
+            >
+              Login
+            </Button>
+          )}
+        </Toolbar>
       </AppBar>
-      
-      <Box component="main" sx={{ flexGrow: 1 }}>
-        {children}
-      </Box>
-
+      <Container component="main" sx={{ mt: 4, mb: 4, flexGrow: 1 }}>
+        <Outlet />
+      </Container>
       <Box
         component="footer"
         sx={{
           py: 3,
           px: 2,
           mt: 'auto',
-          backgroundColor: 'white',
-          borderTop: 1,
-          borderColor: 'grey.200'
+          backgroundColor: (theme: Theme) =>
+            theme.palette.mode === 'light'
+              ? theme.palette.grey[200]
+              : theme.palette.grey[800],
         }}
       >
-        <Container maxWidth="lg">
-          <Typography 
-            variant="body2" 
-            color="text.secondary" 
-            align="center"
-            sx={{ fontWeight: 500 }}
-          >
+        <Container maxWidth="sm">
+          <Typography variant="body2" color="text.secondary" align="center">
             © {new Date().getFullYear()} AgentWeb. All rights reserved.
           </Typography>
         </Container>

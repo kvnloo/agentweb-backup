@@ -45,22 +45,22 @@ export const waitlistDb = {
     }
   },
 
-  async list(lastEvaluatedKey?: AWS.DynamoDB.DocumentClient.Key) {
-    const params = {
-      TableName: 'AW-Waitlist',
-      IndexName: 'JoinedAtIndex',
-      Limit: 50,
-      ExclusiveStartKey: lastEvaluatedKey
-    };
-
+  async list(lastEvaluatedKey?: any) {
     try {
+      const params = {
+        TableName: 'AW-Waitlist',
+        Limit: 50,
+        ...(lastEvaluatedKey && { ExclusiveStartKey: lastEvaluatedKey })
+      };
+
       const result = await dynamodb.scan(params).promise();
       return {
-        items: result.Items as WaitlistEntry[],
+        items: result.Items || [],
         lastEvaluatedKey: result.LastEvaluatedKey
       };
     } catch (error) {
-      return handleDynamoError(error);
+      console.error('Error listing waitlist:', error);
+      throw error;
     }
   },
 
