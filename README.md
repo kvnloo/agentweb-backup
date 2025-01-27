@@ -10,6 +10,10 @@ AgentWeb is a powerful web automation platform that allows users to create and m
 - ⏱️ Support for both single and recurring tasks
 - 📊 Real-time task monitoring and alerts
 - 🔐 MFA for AgentWeb account security
+- 👥 Admin dashboard for user management and analytics
+  - User overview and management
+  - Waitlist management with email invitations
+  - Task analytics and monitoring
 
 ## Prerequisites
 
@@ -44,11 +48,10 @@ npm run dev
 
 ## Usage
 
-1. Create and secure your AgentWeb account with MFA
-2. Create a new task using natural language
-3. Input target website credentials when executing the task
-4. Monitor task execution and results
-5. Set up alerts for task completion or failures
+1. Create a new task using natural language
+2. Input target website credentials when executing the task
+3. Monitor task execution and results
+4. Set up alerts for task completion or failures
 
 For detailed documentation, please refer to our [Design Document](./design.md).
 
@@ -106,6 +109,13 @@ JWT_SECRET=your_jwt_secret
 AWS_REGION=your_aws_region
 AWS_ACCESS_KEY_ID=your_aws_access_key_id
 AWS_SECRET_ACCESS_KEY=your_aws_secret_access_key
+SMTP_HOST=your_smtp_host
+SMTP_PORT=your_smtp_port
+SMTP_USER=your_smtp_user
+SMTP_PASS=your_smtp_password
+FROM_EMAIL=your_from_email
+ADMIN_EMAIL=your_admin_email
+ADMIN_PASSWORD=your_admin_password
 ```
 
 3. Create DynamoDB tables:
@@ -125,7 +135,7 @@ This will create all required tables in DynamoDB:
 npm run dev
 ```
 
-### Frontend Setup
+### Frontend Setup for Development
 
 1. Install dependencies:
 ```bash
@@ -145,6 +155,29 @@ npm run dev
 ```
 
 The application will be available at http://localhost:5173
+
+### Admin Setup
+
+1. Configure admin credentials in backend `.env`:
+```
+ADMIN_EMAIL=your_admin_email
+ADMIN_PASSWORD=your_admin_password
+```
+
+2. Create admin account:
+```bash
+cd backend
+npm run create-admin
+```
+
+3. Access admin dashboard:
+- Log in with your admin credentials
+- Navigate to /admin in the application
+- Features available:
+  - User management
+  - Waitlist management with email invitations
+  - Task analytics
+  - System performance monitoring
 
 ## Development
 
@@ -176,6 +209,13 @@ AWS_REGION=your_aws_region
 FRONTEND_URL=https://agentweb.pro
 BACKEND_URL=https://api.agentweb.pro
 SITE_DOMAIN=https://agentweb.pro
+SMTP_HOST=your_smtp_host
+SMTP_PORT=your_smtp_port
+SMTP_USER=your_smtp_user
+SMTP_PASS=your_smtp_password
+FROM_EMAIL=your_from_email
+ADMIN_EMAIL=your_admin_email
+ADMIN_PASSWORD=your_admin_password
 ```
 
 Frontend Production:
@@ -246,6 +286,8 @@ zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json .env.
      - SMTP_PASS = <your-smtp-password>
      - FROM_EMAIL = <your-from-email>
      - SITE_DOMAIN = https://agentweb.pro
+     - ADMIN_EMAIL = <your-admin-email>
+     - ADMIN_PASSWORD = <your-admin-password>
    - Click "Apply"
    - Wait for the environment update to complete
 
