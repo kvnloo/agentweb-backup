@@ -173,12 +173,15 @@ Backend:
 PORT=3001
 JWT_SECRET=your_jwt_secret
 AWS_REGION=your_aws_region
+FRONTEND_URL=https://agentweb.pro
+BACKEND_URL=https://api.agentweb.pro
+SITE_DOMAIN=https://agentweb.pro
 ```
 
-Frontend:
+Frontend Production:
 - Create a `.env` file in the `frontend` directory:
 ```
-VITE_API_URL=http://localhost:3001
+VITE_API_URL=https://agentweb.pro
 ```
 
 ## Deployment to AWS Elastic Beanstalk
@@ -192,10 +195,10 @@ VITE_API_URL=http://localhost:3001
 1. Build the production version and create deployment package:
 ```bash
 cd frontend && \
-VITE_API_URL=http://agentweb-backend.us-west-2.elasticbeanstalk.com \
+VITE_API_URL=https://api.agentweb.pro \
 VITE_DEBUG=true \
 npm run build && \
-VERSION="0.5" && \
+VERSION="0.21" && \
 mkdir -p builds && \
 zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json
 ```
@@ -216,7 +219,7 @@ Note: Environment variables must be set during build time for the frontend, as V
 ```bash
 cd backend && \
 npm run build && \
-VERSION="0.5" && \
+VERSION="0.21" && \
 mkdir -p builds && \
 zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json .env.example
 ```
@@ -235,14 +238,14 @@ zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json .env.
    - Add environment variables:
      - AWS_REGION = us-west-2
      - JWT_SECRET = <your-jwt-secret>
-     - FRONTEND_URL = http://agentweb-frontend.us-west-2.elasticbeanstalk.com  # Important for OAuth redirect
-     - BACKEND_URL = http://agentweb-backend.us-west-2.elasticbeanstalk.com  # Important for OAuth callback
+     - FRONTEND_URL = https://agentweb.pro
+     - BACKEND_URL = https://api.agentweb.pro
      - SMTP_HOST = <your-smtp-host>
      - SMTP_PORT = <your-smtp-port>
      - SMTP_USER = <your-smtp-user>
      - SMTP_PASS = <your-smtp-password>
      - FROM_EMAIL = <your-from-email>
-     - SITE_DOMAIN = <your-frontend-url>
+     - SITE_DOMAIN = https://agentweb.pro
    - Click "Apply"
    - Wait for the environment update to complete
 
