@@ -1,36 +1,37 @@
 import { Button } from '@mui/material';
-import GoogleIcon from '@mui/icons-material/Google';
 import { useAuth } from '../contexts/AuthContext';
+import { useNavigate } from 'react-router-dom';
 
 export default function GoogleSignInButton() {
   const { loginWithGoogle } = useAuth();
+  const navigate = useNavigate();
 
   const handleGoogleSignIn = async () => {
     try {
       await loginWithGoogle();
+      navigate('/dashboard');
     } catch (error) {
-      console.error('Google sign in failed:', error);
+      console.error('Google sign-in failed:', error);
     }
   };
 
   return (
     <Button
-      onClick={handleGoogleSignIn}
       fullWidth
       variant="outlined"
-      startIcon={<GoogleIcon />}
+      onClick={handleGoogleSignIn}
       sx={{
-        mt: 1,
-        mb: 1,
+        mt: 3,
+        mb: 2,
         borderColor: '#4285f4',
         color: '#4285f4',
         '&:hover': {
-          borderColor: '#2b6cd4',
-          backgroundColor: 'rgba(66, 133, 244, 0.04)'
-        }
+          borderColor: '#357ABD',
+          backgroundColor: 'rgba(66, 133, 244, 0.04)',
+        },
       }}
     >
-      Sign in with Google
+      Continue with Google
     </Button>
   );
 } 

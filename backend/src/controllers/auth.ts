@@ -59,7 +59,9 @@ export const login = async (req: Request, res: Response) => {
       process.env.JWT_SECRET || 'your-secret-key'
     );
 
-    res.json({ token });
+    // Don't send sensitive information
+    const { password: _, ...userWithoutPassword } = user;
+    res.json({ token, user: userWithoutPassword });
   } catch (error) {
     console.error('Error in login:', error);
     res.status(500).json({ message: 'Error logging in' });

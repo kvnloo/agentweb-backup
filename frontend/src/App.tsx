@@ -1,6 +1,9 @@
-import { BrowserRouter as Router, Routes, Route, useNavigate, useLocation } from 'react-router-dom';
+import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import { Box, ThemeProvider, CssBaseline } from '@mui/material';
-import { AuthProvider, useAuth } from './contexts/AuthContext';
+import { LocalizationProvider } from '@mui/x-date-pickers';
+import { AdapterDateFns } from '@mui/x-date-pickers/AdapterDateFns';
+import { AuthProvider } from './contexts/AuthContext';
+import { AdminProvider } from './contexts/AdminContext';
 import theme from './theme';
 import Home from './pages/Home';
 import Login from './pages/Login';
@@ -10,72 +13,73 @@ import CreateTask from './pages/CreateTask';
 import TaskDetails from './pages/TaskDetails';
 import Layout from './components/Layout';
 import OAuthCallback from './pages/OAuthCallback';
-
-function RequireAuth({ children }: { children: JSX.Element }) {
-  const { isAuthenticated } = useAuth();
-  const navigate = useNavigate();
-  const location = useLocation();
-
-  if (!isAuthenticated) {
-    navigate('/login', { state: { from: location } });
-    return null;
-  }
-
-  return children;
-}
-
-function AppRoutes() {
-  return (
-    <Routes>
-      <Route path="/" element={<Home />} />
-      <Route path="/login" element={<Login />} />
-      <Route path="/register" element={<Register />} />
-      <Route path="/oauth-callback" element={<OAuthCallback />} />
-      <Route
-        path="/dashboard"
-        element={
-          <RequireAuth>
-            <Layout>
-              <Dashboard />
-            </Layout>
-          </RequireAuth>
-        }
-      />
-      <Route
-        path="/tasks/create"
-        element={
-          <RequireAuth>
-            <Layout>
-              <CreateTask />
-            </Layout>
-          </RequireAuth>
-        }
-      />
-      <Route
-        path="/tasks/:taskId"
-        element={
-          <RequireAuth>
-            <Layout>
-              <TaskDetails />
-            </Layout>
-          </RequireAuth>
-        }
-      />
-    </Routes>
-  );
-}
+import AdminDashboard from './pages/AdminDashboard';
+import PrivateRoute from './components/PrivateRoute';
+import AdminRoute from './components/AdminRoute';
+import Profile from './pages/Profile';
 
 export default function App() {
   return (
     <ThemeProvider theme={theme}>
       <CssBaseline />
-      <AuthProvider>
-        <Router>
-          <Box sx={{ display: 'flex', flexDirection: 'column', minHeight: '100vh' }}>
-            <AppRoutes />
-          </Box>
-        </Router>
-      </AuthProvider>
+      <LocalizationProvider dateAdapter={AdapterDateFns}>
+        <AuthProvider>
+          <AdminProvider>
+            <Router>
+              <Box sx={{ display: 'flex', flexDirection: 'column', minHeight: '100vh' }}>
+                <Routes>
+                  <Route path="/" element={<Layout />}>
+                    <Route index element={<Home />} />
+                    <Route path="login" element={<Login />} />
+                    <Route path="register" element={<Register />} />
+                    <Route path="oauth-callback" element={<OAuthCallback />} />
+                    <Route
+                      path="dashboard"
+                      element={
+                        <PrivateRoute>
+                          <Dashboard />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="admin"
+                      element={
+                        <AdminRoute>
+                          <AdminDashboard />
+                        </AdminRoute>
+                      }
+                    />
+                    <Route
+                      path="tasks/create"
+                      element={
+                        <PrivateRoute>
+                          <CreateTask />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="tasks/:taskId"
+                      element={
+                        <PrivateRoute>
+                          <TaskDetails />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="profile"
+                      element={
+                        <PrivateRoute>
+                          <Profile />
+                        </PrivateRoute>
+                      }
+                    />
+                  </Route>
+                </Routes>
+              </Box>
+            </Router>
+          </AdminProvider>
+        </AuthProvider>
+      </LocalizationProvider>
     </ThemeProvider>
   );
 }

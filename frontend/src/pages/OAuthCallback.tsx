@@ -1,21 +1,34 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { Box, CircularProgress, Typography } from '@mui/material';
+import { Box, CircularProgress, Typography, Alert } from '@mui/material';
 
 export default function OAuthCallback() {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const { setToken } = useAuth();
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    const token = searchParams.get('token');
-    if (token) {
-      setToken(token);
-      navigate('/dashboard');
-    } else {
-      navigate('/login');
-    }
+    const handleOAuthCallback = async () => {
+      const token = searchParams.get('token');
+      if (!token) {
+        setError('No authentication token received');
+        setTimeout(() => navigate('/login'), 3000);
+        return;
+      }
+
+      try {
+        await setToken(token);
+        navigate('/dashboard');
+      } catch (error) {
+        console.error('Error in OAuth callback:', error);
+        setError('Failed to complete authentication');
+        setTimeout(() => navigate('/login'), 3000);
+      }
+    };
+
+    handleOAuthCallback();
   }, [searchParams, navigate, setToken]);
 
   return (
@@ -26,10 +39,19 @@ export default function OAuthCallback() {
         alignItems: 'center',
         justifyContent: 'center',
         height: '100vh',
+        gap: 2
       }}
     >
-      <CircularProgress />
-      <Typography sx={{ mt: 2 }}>Completing sign in...</Typography>
+      {error ? (
+        <Alert severity="error" sx={{ mb: 2 }}>
+          {error}
+        </Alert>
+      ) : (
+        <>
+          <CircularProgress />
+          <Typography>Completing sign in...</Typography>
+        </>
+      )}
     </Box>
   );
 } 

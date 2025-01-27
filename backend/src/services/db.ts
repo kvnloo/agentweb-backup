@@ -1,24 +1,9 @@
-import { DynamoDB } from 'aws-sdk';
+import AWS from 'aws-sdk';
 import dotenv from 'dotenv';
 import path from 'path';
-import AWS from 'aws-sdk';
-import { DocumentClient } from 'aws-sdk/clients/dynamodb';
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
-
-// Validate AWS credentials
-const validateAwsCredentials = () => {
-  const { AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION } = process.env;
-  
-  if (!AWS_ACCESS_KEY_ID || !AWS_SECRET_ACCESS_KEY) {
-    throw new Error('AWS credentials are missing. Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in your .env file');
-  }
-
-  if (!AWS_REGION) {
-    throw new Error('AWS region is missing. Please set AWS_REGION in your .env file');
-  }
-};
 
 // For debugging
 console.log('Environment variables loaded:', {
@@ -27,16 +12,16 @@ console.log('Environment variables loaded:', {
   region: process.env.AWS_REGION
 });
 
-// Validate credentials before creating DynamoDB client
-validateAwsCredentials();
-
-const dynamodb = new DynamoDB.DocumentClient({
-  region: process.env.AWS_REGION,
+// Configure AWS SDK
+AWS.config.update({
+  region: process.env.AWS_REGION || 'us-west-2',
   credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || ''
   }
 });
+
+const dynamodb = new AWS.DynamoDB.DocumentClient();
 
 // Helper function to handle DynamoDB errors
 const handleDynamoDbError = (error: any, operation: string) => {
@@ -47,21 +32,38 @@ const handleDynamoDbError = (error: any, operation: string) => {
   throw error;
 };
 
+interface User {
+  userId: string;
+  email: string;
+  password: string;
+  isOAuthUser: boolean;
+  isAdmin: boolean;
+  createdAt: string;
+}
+
 class UserDB {
-  private docClient: DocumentClient;
+  private docClient: AWS.DynamoDB.DocumentClient;
   private tableName = 'AW-Users';
 
   constructor() {
-    this.docClient = new AWS.DynamoDB.DocumentClient({
-      region: process.env.AWS_REGION || 'us-west-2',
-      credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || ''
-      }
-    });
+    console.log('Initializing DynamoDB with region:', process.env.AWS_REGION || 'us-west-2');
+    this.docClient = dynamodb;
   }
 
-  async createUser(email: string, userId: string, password: string, isOAuthUser: boolean = false) {
+  private handleError(error: any, operation: string) {
+    console.error(`DynamoDB ${operation} error:`, error);
+    if (error.code === 'ValidationException') {
+      throw new Error(`Validation error during ${operation}: ${error.message}`);
+    } else if (error.code === 'ResourceNotFoundException') {
+      throw new Error(`Table not found during ${operation}: ${error.message}`);
+    } else if (error.code === 'AccessDeniedException') {
+      throw new Error(`Access denied during ${operation}: ${error.message}`);
+    } else {
+      throw new Error(`Error during ${operation}: ${error.message}`);
+    }
+  }
+
+  async createUser(email: string, userId: string, password: string, isOAuthUser: boolean = false, isAdmin: boolean = false) {
     const params = {
       TableName: this.tableName,
       Item: {
@@ -69,6 +71,7 @@ class UserDB {
         email,
         password,
         isOAuthUser,
+        isAdmin,
         createdAt: new Date().toISOString()
       }
     };
@@ -88,6 +91,68 @@ class UserDB {
 
     const result = await this.docClient.query(params).promise();
     return result.Items?.[0];
+  }
+
+  async getUserById(userId: string) {
+    try {
+      console.log('Getting user by ID:', userId);
+      const params = {
+        TableName: this.tableName,
+        IndexName: 'UserIdIndex',
+        KeyConditionExpression: 'userId = :userId',
+        ExpressionAttributeValues: {
+          ':userId': userId
+        }
+      };
+
+      const result = await this.docClient.query(params).promise();
+      console.log('User lookup result:', result);
+      return result.Items?.[0];
+    } catch (error) {
+      console.error('Error in getUserById:', error);
+      throw error;
+    }
+  }
+
+  async getAllUsers() {
+    try {
+      const params = {
+        TableName: this.tableName,
+        Limit: 50
+      };
+
+      const result = await this.docClient.scan(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      console.error('Error in getAllUsers:', error);
+      throw error;
+    }
+  }
+
+  async getUserAnalytics(startDate: string, endDate: string) {
+    try {
+      const params = {
+        TableName: this.tableName,
+        FilterExpression: 'createdAt BETWEEN :startDate AND :endDate',
+        ExpressionAttributeValues: {
+          ':startDate': startDate,
+          ':endDate': endDate
+        }
+      };
+
+      const result = await this.docClient.scan(params).promise();
+      const users = result.Items || [];
+
+      return {
+        totalUsers: users.length,
+        newUsers: users.filter(u => u.createdAt >= startDate && u.createdAt <= endDate).length,
+        oauthUsers: users.filter(u => u.isOAuthUser).length,
+        adminUsers: users.filter(u => u.isAdmin).length
+      };
+    } catch (error) {
+      console.error('Error in getUserAnalytics:', error);
+      throw error;
+    }
   }
 }
 
@@ -326,6 +391,53 @@ export const taskDb = {
     } catch (error) {
       handleDynamoDbError(error, 'getTaskExecutions');
     }
+  },
+
+  async getTaskAnalytics(startDate: string, endDate: string) {
+    try {
+      // Get tasks for the period
+      const taskParams = {
+        TableName: 'AW-Tasks',
+        FilterExpression: 'createdAt BETWEEN :startDate AND :endDate',
+        ExpressionAttributeValues: {
+          ':startDate': startDate,
+          ':endDate': endDate
+        }
+      };
+
+      const taskResult = await dynamodb.scan(taskParams).promise();
+      const tasks = taskResult.Items || [];
+
+      // Get executions for the period
+      const executionParams = {
+        TableName: 'AW-TaskExecutions',
+        FilterExpression: 'startTime BETWEEN :startDate AND :endDate',
+        ExpressionAttributeValues: {
+          ':startDate': startDate,
+          ':endDate': endDate
+        }
+      };
+
+      const executionResult = await dynamodb.scan(executionParams).promise();
+      const executions = executionResult.Items || [];
+
+      return {
+        totalTasks: tasks.length,
+        newTasks: tasks.filter(t => t.createdAt >= startDate && t.createdAt <= endDate).length,
+        totalExecutions: executions.length,
+        successfulExecutions: executions.filter(e => e.status === 'completed').length,
+        failedExecutions: executions.filter(e => e.status === 'failed').length,
+        averageExecutionTime: executions.reduce((acc, e) => {
+          if (e.endTime && e.startTime) {
+            return acc + (new Date(e.endTime).getTime() - new Date(e.startTime).getTime());
+          }
+          return acc;
+        }, 0) / (executions.length || 1)  // Avoid division by zero
+      };
+    } catch (error) {
+      console.error('Error in getTaskAnalytics:', error);
+      throw error;
+    }
   }
 };
 
@@ -357,6 +469,25 @@ export const waitlistDb = {
       return result.Item;
     } catch (error) {
       handleDynamoDbError(error, 'getWaitlistByEmail');
+    }
+  },
+
+  async list(lastEvaluatedKey?: any) {
+    try {
+      const params = {
+        TableName: 'AW-Waitlist',
+        Limit: 50,
+        ...(lastEvaluatedKey && { ExclusiveStartKey: lastEvaluatedKey })
+      };
+
+      const result = await dynamodb.scan(params).promise();
+      return {
+        items: result.Items || [],
+        lastEvaluatedKey: result.LastEvaluatedKey
+      };
+    } catch (error) {
+      console.error('Error listing waitlist:', error);
+      throw error;
     }
   }
 };

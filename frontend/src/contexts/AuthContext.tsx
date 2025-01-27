@@ -1,59 +1,58 @@
-import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useCallback } from 'react';
 import axios from 'axios';
-import { jwtDecode } from 'jwt-decode';
+
+interface User {
+  userId: string;
+  email: string;
+  isAdmin: boolean;
+  isOAuthUser: boolean;
+  createdAt: string;
+}
 
 interface AuthContextType {
   token: string | null;
-  userEmail: string | null;
+  user: User | null;
+  loading: boolean;
   login: (email: string, password: string) => Promise<void>;
   register: (email: string, password: string) => Promise<void>;
   loginWithGoogle: () => Promise<void>;
   setToken: (token: string | null) => void;
   logout: () => void;
-  isAuthenticated: boolean;
-}
-
-interface JwtPayload {
-  email: string;
-  userId: string;
+  isAuthenticated: () => boolean;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
-export function AuthProvider({ children }: { children: ReactNode }) {
-  const [token, setToken] = useState<string | null>(localStorage.getItem('token'));
-  const [userEmail, setUserEmail] = useState<string | null>(null);
-  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(!!token);
+// Export the hook as a named function declaration
+export function useAuth() {
+  const context = useContext(AuthContext);
+  if (!context) {
+    throw new Error('useAuth must be used within an AuthProvider');
+  }
+  return context;
+}
 
-  useEffect(() => {
-    if (token) {
-      localStorage.setItem('token', token);
-      setIsAuthenticated(true);
-      // Decode token to get user email
-      try {
-        console.log('Token:', token);
-        const decoded = jwtDecode<JwtPayload>(token);
-        console.log('Decoded token:', decoded);
-        setUserEmail(decoded.email);
-      } catch (error) {
-        console.error('Error decoding token:', error);
-      }
-    } else {
-      localStorage.removeItem('token');
-      setIsAuthenticated(false);
-      setUserEmail(null);
-    }
-  }, [token]);
+export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const [token, setTokenState] = useState<string | null>(localStorage.getItem('token'));
+  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(false);
 
   const login = async (email: string, password: string) => {
     try {
+      setLoading(true);
       const response = await axios.post(`${import.meta.env.VITE_API_URL}/api/auth/login`, {
         email,
-        password,
+        password
       });
-      setToken(response.data.token);
+      const { token: newToken, user: userData } = response.data;
+      setTokenState(newToken);
+      setUser(userData);
+      localStorage.setItem('token', newToken);
     } catch (error) {
-      throw new Error('Login failed');
+      console.error('Login error:', error);
+      throw error;
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -73,31 +72,70 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const register = async (email: string, password: string) => {
     try {
+      setLoading(true);
       const response = await axios.post(`${import.meta.env.VITE_API_URL}/api/auth/register`, {
         email,
         password,
       });
-      setToken(response.data.token);
+      const { token: newToken, user: userData } = response.data;
+      setTokenState(newToken);
+      setUser(userData);
+      localStorage.setItem('token', newToken);
     } catch (error) {
       throw new Error('Registration failed');
+    } finally {
+      setLoading(false);
     }
   };
 
   const logout = () => {
-    setToken(null);
+    setTokenState(null);
+    setUser(null);
+    localStorage.removeItem('token');
   };
 
-  return (
-    <AuthContext.Provider value={{ token, userEmail, login, register, loginWithGoogle, setToken, logout, isAuthenticated }}>
-      {children}
-    </AuthContext.Provider>
-  );
-}
+  const isAuthenticated = () => !!token;
 
-export function useAuth() {
-  const context = useContext(AuthContext);
-  if (context === undefined) {
-    throw new Error('useAuth must be used within an AuthProvider');
-  }
-  return context;
-} 
+  const setToken = useCallback(async (newToken: string | null) => {
+    try {
+      if (newToken) {
+        // Get user data using the token
+        const response = await axios.get(`${import.meta.env.VITE_API_URL}/api/auth/me`, {
+          headers: {
+            Authorization: `Bearer ${newToken}`
+          }
+        });
+        
+        // Set both user data and token
+        setUser(response.data);
+        setTokenState(newToken);
+        localStorage.setItem('token', newToken);
+      } else {
+        setUser(null);
+        setTokenState(null);
+        localStorage.removeItem('token');
+      }
+    } catch (error) {
+      console.error('Error fetching user data:', error);
+      // On error, clear everything
+      setUser(null);
+      setTokenState(null);
+      localStorage.removeItem('token');
+      throw error; // Re-throw to handle in the component
+    }
+  }, []);
+
+  const value = {
+    token,
+    user,
+    loading,
+    login,
+    register,
+    loginWithGoogle,
+    setToken,
+    logout,
+    isAuthenticated
+  };
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}; 

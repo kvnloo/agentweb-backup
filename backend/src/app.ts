@@ -5,6 +5,7 @@ import authRoutes from './routes/auth';
 import taskRoutes from './routes/tasks';
 import waitlistRoutes from './routes/waitlist';
 import scheduleRoutes from './routes/schedules';
+import adminRoutes from './routes/admin';
 
 const app = express();
 
@@ -30,6 +31,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/tasks', taskRoutes);
 app.use('/api/waitlist', waitlistRoutes);
 app.use('/api/schedules', scheduleRoutes);
+app.use('/api/admin', adminRoutes);
 
 // Health check endpoint
 app.get('/', (req, res) => {
