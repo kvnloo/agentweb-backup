@@ -66,6 +66,14 @@ export default function App() {
                       }
                     />
                     <Route
+                      path="admin/tasks/:taskId"
+                      element={
+                        <AdminRoute>
+                          <TaskDetails />
+                        </AdminRoute>
+                      }
+                    />
+                    <Route
                       path="profile"
                       element={
                         <PrivateRoute>

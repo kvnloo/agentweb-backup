@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { taskDb } from '../services/db';
+import { userDb } from '../services/db';
 
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
@@ -65,8 +66,13 @@ export const getTask = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    // Verify task belongs to user
-    if (task.userId !== userId) {
+    // Check if user is admin or task owner
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    if (!user.isAdmin && task.userId !== userId) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -200,8 +206,13 @@ export const getTaskExecutions = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    // Verify task belongs to user
-    if (task.userId !== userId) {
+    // Check if user is admin or task owner
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    if (!user.isAdmin && task.userId !== userId) {
       return res.status(403).json({ message: 'Access denied' });
     }
 

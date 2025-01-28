@@ -13,6 +13,7 @@ interface AdminContextType {
   updateWaitlistStatus: (email: string, status: string) => Promise<void>;
   loading: boolean;
   error: string | null;
+  isAdmin: boolean;
 }
 
 const AdminContext = createContext<AdminContextType | undefined>(undefined);
@@ -33,7 +34,7 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const [userAnalytics, setUserAnalytics] = useState<any>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const { token } = useAuth();
+  const { token, user } = useAuth();
 
   const api = axios.create({
     baseURL: import.meta.env.VITE_API_URL,
@@ -43,7 +44,6 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   });
 
   const loadUsers = useCallback(async () => {
-    if (loading) return;
     try {
       setLoading(true);
       const response = await api.get('/api/admin/users');
@@ -54,10 +54,9 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     } finally {
       setLoading(false);
     }
-  }, [api, loading]);
+  }, [api]);
 
   const loadWaitlist = useCallback(async () => {
-    if (loading) return;
     try {
       setLoading(true);
       const response = await api.get('/api/admin/waitlist');
@@ -68,10 +67,9 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     } finally {
       setLoading(false);
     }
-  }, [api, loading]);
+  }, [api]);
 
   const loadAnalytics = useCallback(async (startDate: string, endDate: string) => {
-    if (loading) return;
     try {
       setLoading(true);
       const [taskResponse, userResponse] = await Promise.all([
@@ -90,10 +88,9 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     } finally {
       setLoading(false);
     }
-  }, [api, loading]);
+  }, [api]);
 
   const updateWaitlistStatus = useCallback(async (email: string, status: string) => {
-    if (loading) return;
     try {
       setLoading(true);
       await api.put(`/api/admin/waitlist/${email}/status`, { status });
@@ -104,7 +101,7 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     } finally {
       setLoading(false);
     }
-  }, [api, loading, loadWaitlist]);
+  }, [api, loadWaitlist]);
 
   const value = {
     users,
@@ -116,7 +113,8 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     loadAnalytics,
     updateWaitlistStatus,
     loading,
-    error
+    error,
+    isAdmin: user?.isAdmin || false
   };
 
   return <AdminContext.Provider value={value}>{children}</AdminContext.Provider>;

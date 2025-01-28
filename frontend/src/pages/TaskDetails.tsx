@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import {
   Container,
   Typography,
@@ -56,8 +56,12 @@ export default function TaskDetails() {
   const [error, setError] = useState('');
   const [scheduleRefreshTrigger, setScheduleRefreshTrigger] = useState(0);
   const { taskId } = useParams<{ taskId: string }>();
-  const { token } = useAuth();
+  const { token, user } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
+
+  const isAdminRoute = location.pathname.startsWith('/admin/');
+  const showActions = !isAdminRoute || (task && user && task.userId === user.userId);
 
   const fetchTask = async () => {
     if (!taskId) return;
@@ -267,7 +271,7 @@ export default function TaskDetails() {
   }
 
   return (
-    <Container maxWidth="md">
+    <Container maxWidth="lg" sx={{ mt: 4, mb: 4 }}>
       <Paper sx={{ p: 4, mt: 4 }}>
         <Box sx={{ mb: 4, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
           <Box>
@@ -286,34 +290,38 @@ export default function TaskDetails() {
                 />
               )}
             </Box>
-            <FormControlLabel
-              control={
-                <Switch
-                  checked={Boolean(task.emailNotification)}
-                  onChange={handleEmailToggle}
-                  color="primary"
-                />
-              }
-              label="Email Me Latest Run"
-            />
+            {showActions && (
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={Boolean(task.emailNotification)}
+                    onChange={handleEmailToggle}
+                    color="primary"
+                  />
+                }
+                label="Email Me Latest Run"
+              />
+            )}
           </Box>
-          <Box sx={{ display: 'flex', gap: 2 }}>
-            <Button
-              variant="contained"
-              color="primary"
-              onClick={handleRun}
-              disabled={getLatestExecution()?.status === 'running'}
-            >
-              Run Task
-            </Button>
-            <Button
-              variant="outlined"
-              color="error"
-              onClick={handleDelete}
-            >
-              Delete Task
-            </Button>
-          </Box>
+          {showActions && (
+            <Box sx={{ display: 'flex', gap: 2 }}>
+              <Button
+                variant="contained"
+                color="primary"
+                onClick={handleRun}
+                disabled={getLatestExecution()?.status === 'running'}
+              >
+                Run Task
+              </Button>
+              <Button
+                variant="outlined"
+                color="error"
+                onClick={handleDelete}
+              >
+                Delete Task
+              </Button>
+            </Box>
+          )}
         </Box>
 
         <Grid container spacing={3}>
