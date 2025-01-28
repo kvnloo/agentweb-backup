@@ -21,7 +21,6 @@ import {
 } from '@mui/material';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
-import { useAdmin } from '../contexts/AdminContext';
 import ScheduleForm from '../components/ScheduleForm';
 import ScheduleList from '../components/ScheduleList';
 import { buildApiUrl } from '../config';
@@ -58,7 +57,6 @@ export default function TaskDetails() {
   const [scheduleRefreshTrigger, setScheduleRefreshTrigger] = useState(0);
   const { taskId } = useParams<{ taskId: string }>();
   const { token, user } = useAuth();
-  const { isAdmin } = useAdmin();
   const navigate = useNavigate();
   const location = useLocation();
 
