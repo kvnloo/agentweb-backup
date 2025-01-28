@@ -348,9 +348,14 @@ export const taskDb = {
       const expressionAttributeValues: { [key: string]: any } = {};
 
       Object.entries(updates).forEach(([key, value]) => {
-        updateExpressions.push(`#${key} = :${key}`);
-        expressionAttributeNames[`#${key}`] = key;
-        expressionAttributeValues[`:${key}`] = value;
+        if (value === null) {
+          updateExpressions.push(`REMOVE #${key}`);
+          expressionAttributeNames[`#${key}`] = key;
+        } else {
+          updateExpressions.push(`SET #${key} = :${key}`);
+          expressionAttributeNames[`#${key}`] = key;
+          expressionAttributeValues[`:${key}`] = value;
+        }
       });
 
       const params = {
@@ -358,9 +363,11 @@ export const taskDb = {
         Key: {
           executionId
         },
-        UpdateExpression: `SET ${updateExpressions.join(', ')}`,
+        UpdateExpression: updateExpressions.join(', '),
         ExpressionAttributeNames: expressionAttributeNames,
-        ExpressionAttributeValues: expressionAttributeValues,
+        ...(Object.keys(expressionAttributeValues).length > 0 && {
+          ExpressionAttributeValues: expressionAttributeValues
+        }),
         ReturnValues: 'ALL_NEW'
       };
 
