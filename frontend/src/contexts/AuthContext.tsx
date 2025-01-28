@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useCallback } from 'react';
+import React, { createContext, useContext, useState, useCallback, useEffect } from 'react';
 import axios from 'axios';
 
 interface User {
@@ -35,7 +35,32 @@ export function useAuth() {
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [token, setTokenState] = useState<string | null>(localStorage.getItem('token'));
   const [user, setUser] = useState<User | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const initializeAuth = async () => {
+      const storedToken = localStorage.getItem('token');
+      if (storedToken) {
+        try {
+          const response = await axios.get(`${import.meta.env.VITE_API_URL}/api/auth/me`, {
+            headers: {
+              Authorization: `Bearer ${storedToken}`
+            }
+          });
+          setUser(response.data);
+          setTokenState(storedToken);
+        } catch (error) {
+          console.error('Error initializing auth:', error);
+          localStorage.removeItem('token');
+          setTokenState(null);
+          setUser(null);
+        }
+      }
+      setLoading(false);
+    };
+
+    initializeAuth();
+  }, []);
 
   const login = async (email: string, password: string) => {
     try {

@@ -180,6 +180,24 @@ export const taskDb = {
     }
   },
 
+  async getAllTasks() {
+    try {
+      const params = {
+        TableName: 'AW-Tasks',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt',
+        ExpressionAttributeNames: {
+          '#n': 'name',
+          '#s': 'status'
+        }
+      };
+
+      const result = await dynamodb.scan(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, 'getAllTasks');
+    }
+  },
+
   async getTasksByUserId(userId: string) {
     try {
       const params = {

@@ -14,6 +14,11 @@ AgentWeb is a powerful web automation platform that allows users to create and m
   - User overview and management
   - Waitlist management with email invitations
   - Task analytics and monitoring
+  - Tasks management with detailed view
+    - View all tasks with task ID, name, prompt, and owner
+    - Track task creation dates
+    - Direct links to task details pages
+    - Monitor task status and progress
 
 ## Prerequisites
 
@@ -178,6 +183,11 @@ npm run create-admin
   - Waitlist management with email invitations
   - Task analytics
   - System performance monitoring
+  - Tasks overview
+    - View comprehensive task list with details
+    - Access task information: ID, name, prompt, owner
+    - Click on task IDs to view detailed task pages (/tasks/{taskId})
+    - Monitor task creation and execution history
 
 ## Development
 

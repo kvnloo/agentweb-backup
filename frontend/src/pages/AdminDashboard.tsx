@@ -22,6 +22,9 @@ import {
   Chip
 } from '@mui/material';
 import { format } from 'date-fns';
+import { Link } from 'react-router-dom';
+import axios from 'axios';
+import { useAuth } from '../contexts/AuthContext';
 
 interface TabPanelProps {
   children?: React.ReactNode;
@@ -49,6 +52,10 @@ export default function AdminDashboard() {
   const [tabValue, setTabValue] = useState(0);
   const [startDate, setStartDate] = useState<Date | null>(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000));
   const [endDate, setEndDate] = useState<Date | null>(new Date());
+  const [tasks, setTasks] = useState<any[]>([]);
+  const [orderBy, setOrderBy] = useState<keyof any>('createdAt');
+  const [order, setOrder] = useState<'asc' | 'desc'>('desc');
+  const { token } = useAuth();
   
   const {
     users,
@@ -80,6 +87,25 @@ export default function AdminDashboard() {
     }
   }, [startDate, endDate, tabValue]);
 
+  useEffect(() => {
+    const loadTasks = async () => {
+      try {
+        const response = await axios.get(`${import.meta.env.VITE_API_URL}/api/admin/tasks`, {
+          headers: {
+            Authorization: `Bearer ${token}`
+          }
+        });
+        setTasks(response.data);
+      } catch (error) {
+        console.error('Error loading tasks:', error);
+      }
+    };
+
+    if (tabValue === 3) {
+      loadTasks();
+    }
+  }, [tabValue, token]);
+
   const handleTabChange = (_: React.SyntheticEvent, newValue: number) => {
     setTabValue(newValue);
   };
@@ -87,6 +113,51 @@ export default function AdminDashboard() {
   const handleWaitlistAction = async (email: string, status: string) => {
     await updateWaitlistStatus(email, status);
   };
+
+  const handleSort = (property: keyof any) => {
+    const isAsc = orderBy === property && order === 'asc';
+    setOrder(isAsc ? 'desc' : 'asc');
+    setOrderBy(property);
+  };
+
+  const sortedTasks = React.useMemo(() => {
+    return [...tasks].sort((a, b) => {
+      if (orderBy === 'createdAt') {
+        return order === 'asc' 
+          ? new Date(a[orderBy]).getTime() - new Date(b[orderBy]).getTime()
+          : new Date(b[orderBy]).getTime() - new Date(a[orderBy]).getTime();
+      }
+      
+      const aValue = a[orderBy]?.toString().toLowerCase() ?? '';
+      const bValue = b[orderBy]?.toString().toLowerCase() ?? '';
+      
+      return order === 'asc'
+        ? aValue.localeCompare(bValue)
+        : bValue.localeCompare(aValue);
+    });
+  }, [tasks, order, orderBy]);
+
+  const SortLabel = ({ property, label }: { property: keyof any; label: string }) => (
+    <Box
+      component="span"
+      onClick={() => handleSort(property)}
+      sx={{
+        cursor: 'pointer',
+        display: 'inline-flex',
+        alignItems: 'center',
+        '&:hover': {
+          color: 'primary.main',
+        }
+      }}
+    >
+      {label}
+      {orderBy === property && (
+        <Typography component="span" sx={{ ml: 0.5, fontSize: '0.75rem' }}>
+          {order === 'asc' ? '↑' : '↓'}
+        </Typography>
+      )}
+    </Box>
+  );
 
   if (error) {
     return <Alert severity="error">{error}</Alert>;
@@ -99,6 +170,7 @@ export default function AdminDashboard() {
           <Tab label="Analytics" />
           <Tab label="Users" />
           <Tab label="Waitlist" />
+          <Tab label="Tasks" />
         </Tabs>
       </Box>
 
@@ -266,6 +338,69 @@ export default function AdminDashboard() {
                     </TableRow>
                   );
                 })
+              )}
+            </TableBody>
+          </Table>
+        </TableContainer>
+      </TabPanel>
+
+      <TabPanel value={tabValue} index={3}>
+        <TableContainer component={Paper}>
+          <Table>
+            <TableHead>
+              <TableRow>
+                <TableCell>
+                  <SortLabel property="taskId" label="Task ID" />
+                </TableCell>
+                <TableCell>
+                  <SortLabel property="name" label="Name" />
+                </TableCell>
+                <TableCell>
+                  <SortLabel property="prompt" label="Prompt" />
+                </TableCell>
+                <TableCell>
+                  <SortLabel property="userId" label="Owner" />
+                </TableCell>
+                <TableCell>
+                  <SortLabel property="createdAt" label="Created At" />
+                </TableCell>
+                <TableCell>Details</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {loading ? (
+                <TableRow>
+                  <TableCell colSpan={6} align="center">
+                    <CircularProgress />
+                  </TableCell>
+                </TableRow>
+              ) : (
+                sortedTasks.map((task) => (
+                  <TableRow key={task.taskId}>
+                    <TableCell>{task.taskId}</TableCell>
+                    <TableCell>{task.name}</TableCell>
+                    <TableCell>
+                      {task.prompt.length > 100 
+                        ? `${task.prompt.substring(0, 100)}...` 
+                        : task.prompt}
+                    </TableCell>
+                    <TableCell>{task.userId}</TableCell>
+                    <TableCell>{new Date(task.createdAt).toLocaleDateString()}</TableCell>
+                    <TableCell>
+                      <Link 
+                        to={`/admin/tasks/${task.taskId}`}
+                        style={{ 
+                          color: '#1976d2',
+                          textDecoration: 'none'
+                        }}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        View Details
+                      </Link>
+                    </TableCell>
+                  </TableRow>
+                ))
               )}
             </TableBody>
           </Table>

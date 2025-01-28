@@ -75,6 +75,17 @@ router.put('/waitlist/:email/status', async (req, res) => {
   }
 });
 
+// Get all tasks
+router.get('/tasks', async (req, res) => {
+  try {
+    const tasks = await taskDb.getAllTasks();
+    res.json(tasks);
+  } catch (error) {
+    console.error('Error getting tasks:', error);
+    res.status(500).json({ message: 'Error fetching tasks' });
+  }
+});
+
 // Get task analytics
 router.get('/analytics/tasks', async (req, res) => {
   try {
@@ -102,6 +113,41 @@ router.get('/analytics/users', async (req, res) => {
   } catch (error) {
     console.error('Error getting user analytics:', error);
     res.status(500).json({ message: 'Error fetching user analytics' });
+  }
+});
+
+// Get single task details
+router.get('/tasks/:id', async (req, res) => {
+  try {
+    const taskId = req.params.id;
+    const task = await taskDb.getTaskById(taskId);
+    
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    res.json(task);
+  } catch (error) {
+    console.error('Error getting task:', error);
+    res.status(500).json({ message: 'Error fetching task' });
+  }
+});
+
+// Get task executions
+router.get('/tasks/:id/executions', async (req, res) => {
+  try {
+    const taskId = req.params.id;
+    const task = await taskDb.getTaskById(taskId);
+    
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    const executions = await taskDb.getTaskExecutions(taskId);
+    res.json(executions);
+  } catch (error) {
+    console.error('Error getting task executions:', error);
+    res.status(500).json({ message: 'Error fetching task executions' });
   }
 });
 
