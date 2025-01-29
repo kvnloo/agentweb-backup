@@ -18,7 +18,14 @@ import {
   TableRow,
   Switch,
   FormControlLabel,
+  TextField,
+  IconButton,
+  List,
+  ListItem,
+  ListItemText,
+  ListItemSecondaryAction,
 } from '@mui/material';
+import DeleteIcon from '@mui/icons-material/Delete';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
 import ScheduleForm from '../components/ScheduleForm';
@@ -49,6 +56,11 @@ interface TaskExecution {
   feedback?: 'accepted' | 'rejected';
 }
 
+interface Subscriber {
+  email: string;
+  subscribedAt: string;
+}
+
 export default function TaskDetails() {
   const [task, setTask] = useState<Task | null>(null);
   const [executions, setExecutions] = useState<TaskExecution[]>([]);
@@ -59,6 +71,9 @@ export default function TaskDetails() {
   const { token, user } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+  const [subscribers, setSubscribers] = useState<Subscriber[]>([]);
+  const [newSubscriberEmail, setNewSubscriberEmail] = useState('');
+  const [subscriberError, setSubscriberError] = useState('');
 
   const isAdminRoute = location.pathname.startsWith('/admin/');
   const showActions = !isAdminRoute || (task && user && task.userId === user.userId);
@@ -108,6 +123,23 @@ export default function TaskDetails() {
     }, 5000);
 
     return () => clearInterval(intervalId);
+  }, [taskId, token]);
+
+  useEffect(() => {
+    const fetchSubscribers = async () => {
+      if (!taskId) return;
+      try {
+        const response = await axios.get(buildApiUrl(`/api/tasks/${taskId}/subscribers`), {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        setSubscribers(response.data);
+      } catch (error: any) {
+        console.error('Error fetching subscribers:', error);
+        setSubscriberError(error.response?.data?.message || 'Failed to fetch subscribers');
+      }
+    };
+
+    fetchSubscribers();
   }, [taskId, token]);
 
   const handleDelete = async () => {
@@ -230,6 +262,50 @@ export default function TaskDetails() {
     console.log('Schedule created, refreshing data');
     await fetchTask();
     setScheduleRefreshTrigger(prev => prev + 1);
+  };
+
+  const handleAddSubscriber = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newSubscriberEmail.trim()) return;
+
+    try {
+      const response = await axios.post(
+        buildApiUrl(`/api/tasks/${taskId}/subscribers`),
+        { email: newSubscriberEmail },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      
+      // Ensure the subscriber object has all required fields
+      const newSubscriber: Subscriber = {
+        email: response.data.email,
+        subscribedAt: response.data.subscribedAt || new Date().toISOString()
+      };
+      
+      setSubscribers([...subscribers, newSubscriber]);
+      setNewSubscriberEmail('');
+      setSubscriberError('');
+    } catch (error: any) {
+      console.error('Error adding subscriber:', error);
+      // Use the server's error message if available, otherwise show a generic message
+      const errorMessage = error.response?.data?.message || 
+        (error.response?.status === 400 ? 'Invalid email address' : 'Failed to add subscriber');
+      setSubscriberError(errorMessage);
+      // Don't clear the email input if there was an error
+    }
+  };
+
+  const handleRemoveSubscriber = async (email: string) => {
+    try {
+      await axios.delete(
+        buildApiUrl(`/api/tasks/${taskId}/subscribers/${encodeURIComponent(email)}`),
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setSubscribers(subscribers.filter(s => s.email !== email));
+      setSubscriberError('');
+    } catch (error: any) {
+      console.error('Error removing subscriber:', error);
+      setSubscriberError(error.response?.data?.message || 'Failed to remove subscriber');
+    }
   };
 
   if (loading) {
@@ -443,6 +519,62 @@ export default function TaskDetails() {
           <ScheduleForm taskId={taskId} onScheduleCreated={handleScheduleCreated} />
           <ScheduleList taskId={taskId} onScheduleUpdated={handleScheduleCreated} key={scheduleRefreshTrigger} />
         </Box>
+      </Paper>
+
+      {/* Subscriber Management Section */}
+      <Paper sx={{ p: 3, mt: 3 }}>
+        <Typography variant="h6" gutterBottom>
+          Subscribers
+        </Typography>
+        
+        <Box component="form" onSubmit={handleAddSubscriber} sx={{ mb: 3, display: 'flex', gap: 2 }}>
+          <TextField
+            label="Email"
+            variant="outlined"
+            size="small"
+            value={newSubscriberEmail}
+            onChange={(e) => setNewSubscriberEmail(e.target.value)}
+            error={!!subscriberError}
+            helperText={subscriberError}
+            sx={{ flexGrow: 1 }}
+            type="email"
+            placeholder="Enter email address"
+          />
+          <Button 
+            type="submit" 
+            variant="contained" 
+            color="primary"
+            disabled={!newSubscriberEmail.trim()}
+          >
+            Add Subscriber
+          </Button>
+        </Box>
+
+        <List>
+          {subscribers.map((subscriber) => (
+            <ListItem key={subscriber.email}>
+              <ListItemText
+                primary={subscriber.email}
+                secondary={`Subscribed on ${new Date(subscriber.subscribedAt).toLocaleDateString()}`}
+              />
+              <ListItemSecondaryAction>
+                <IconButton
+                  edge="end"
+                  aria-label="delete"
+                  onClick={() => handleRemoveSubscriber(subscriber.email)}
+                >
+                  <DeleteIcon />
+                </IconButton>
+              </ListItemSecondaryAction>
+            </ListItem>
+          ))}
+        </List>
+        
+        {subscribers.length === 0 && (
+          <Typography color="textSecondary" align="center">
+            No subscribers yet
+          </Typography>
+        )}
       </Paper>
     </Container>
   );
