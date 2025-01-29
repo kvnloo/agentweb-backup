@@ -1,11 +1,40 @@
 #!/usr/bin/env python3
 import os
 import smtplib
+import boto3
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import logging
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+# Initialize DynamoDB client with credentials
+dynamodb = boto3.resource('dynamodb',
+    region_name=os.getenv('AWS_REGION', 'us-west-2'),
+    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
+)
+subscribers_table = dynamodb.Table('AW-Subscribers')
+
+def get_task_subscribers(task_id):
+    """
+    Get all subscribers for a given task.
+    """
+    try:
+        response = subscribers_table.query(
+            KeyConditionExpression='taskId = :taskId',
+            ExpressionAttributeValues={
+                ':taskId': task_id
+            }
+        )
+        return [item['email'] for item in response.get('Items', [])]
+    except Exception as e:
+        logger.error(f"Failed to get task subscribers: {e}")
+        return []
 
 def send_task_notification(to_email, task_name, task_id, execution_status, result=None, error=None):
     """
@@ -52,4 +81,25 @@ def send_task_notification(to_email, task_name, task_id, execution_status, resul
 
     except Exception as e:
         logger.error(f"Failed to send email notification: {e}")
-        return False 
+        return False
+
+def notify_task_subscribers(task_id, task_name, execution_status, result=None, error=None):
+    """
+    Notify all subscribers about task completion.
+    """
+    subscribers = get_task_subscribers(task_id)
+    logger.info(f"Found {len(subscribers)} subscribers for task {task_id}")
+    
+    for subscriber_email in subscribers:
+        success = send_task_notification(
+            subscriber_email,
+            task_name,
+            task_id,
+            execution_status,
+            result,
+            error
+        )
+        if success:
+            logger.info(f"Successfully notified subscriber: {subscriber_email}")
+        else:
+            logger.error(f"Failed to notify subscriber: {subscriber_email}") 
