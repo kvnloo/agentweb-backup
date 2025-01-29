@@ -212,8 +212,9 @@ def update_execution_status(execution_id, status, result=None, error=None):
         }
 
         if status in ['completed', 'failed']:
+            end_time = datetime.now(timezone.utc)
             update_expression += ", completedAt = :completedAt"
-            expression_values[':completedAt'] = datetime.now(timezone.utc).isoformat()
+            expression_values[':completedAt'] = end_time.isoformat()
 
         if result is not None:
             update_expression += ", #result = :result"
@@ -225,7 +226,7 @@ def update_execution_status(execution_id, status, result=None, error=None):
             expression_values[':error'] = error
             expression_names['#error'] = 'error'
 
-        # Get the execution to get the taskId
+        # Get the execution to get the taskId and startTime
         execution = executions_table.get_item(Key={'executionId': execution_id}).get('Item')
         if execution:
             # Update the execution
@@ -246,7 +247,11 @@ def update_execution_status(execution_id, status, result=None, error=None):
                 ).get('Item')
                 
                 if task:
-                    # Send notification to task owner if emailNotification is enabled
+                    # Parse timestamps
+                    start_time = datetime.fromisoformat(execution['startTime'].replace('Z', '+00:00'))
+                    end_time = datetime.fromisoformat(expression_values[':completedAt'].replace('Z', '+00:00'))
+
+                    # Send simple notification to task owner if emailNotification is enabled
                     if task.get('emailNotification'):
                         # Get user's email from AW-Users table using UserIdIndex
                         user_response = users_table.query(
@@ -259,6 +264,7 @@ def update_execution_status(execution_id, status, result=None, error=None):
                         user = user_response.get('Items', [])[0] if user_response.get('Items') else None
                         
                         if user and user.get('email'):
+                            # Send simple notification to owner
                             send_task_notification(
                                 to_email=user['email'],
                                 task_name=task['name'],
@@ -270,13 +276,15 @@ def update_execution_status(execution_id, status, result=None, error=None):
                         else:
                             logger.error(f"User email not found for userId: {task['userId']}")
                     
-                    # Notify all subscribers regardless of emailNotification setting
+                    # Send detailed results to all subscribers
                     notify_task_subscribers(
                         task_id=execution['taskId'],
                         task_name=task['name'],
                         execution_status=status,
                         result=result,
-                        error=error
+                        error=error,
+                        start_time=start_time,
+                        end_time=end_time
                     )
     except ClientError as e:
         logger.error(f"Error updating execution status: {e}")
