@@ -1,7 +1,7 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { isAdmin } from '../middleware/admin';
-import { userDb, taskDb } from '../services/db';
+import { userDb, taskDb, subscriberDb } from '../services/db';
 import { waitlistDb } from '../services/waitlistDb';
 import { emailService } from '../services/emailService';
 
@@ -148,6 +148,48 @@ router.get('/tasks/:id/executions', async (req, res) => {
   } catch (error) {
     console.error('Error getting task executions:', error);
     res.status(500).json({ message: 'Error fetching task executions' });
+  }
+});
+
+// Get task subscribers
+router.get('/tasks/:taskId/subscribers', async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const subscribers = await subscriberDb.getTaskSubscribers(taskId);
+    res.json(subscribers);
+  } catch (error: any) {
+    console.error('Error getting task subscribers:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Add subscriber to task
+router.post('/tasks/:taskId/subscribers', async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ message: 'Email is required' });
+    }
+
+    const subscriber = await subscriberDb.addSubscriber(taskId, email);
+    res.status(201).json(subscriber);
+  } catch (error: any) {
+    console.error('Error adding subscriber:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Remove subscriber from task
+router.delete('/tasks/:taskId/subscribers/:email', async (req, res) => {
+  try {
+    const { taskId, email } = req.params;
+    await subscriberDb.removeSubscriber(taskId, email);
+    res.status(204).send();
+  } catch (error: any) {
+    console.error('Error removing subscriber:', error);
+    res.status(500).json({ message: error.message });
   }
 });
 

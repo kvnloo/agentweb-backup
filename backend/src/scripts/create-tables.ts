@@ -210,12 +210,43 @@ const createWaitlistTable = async () => {
   }
 };
 
+// Create Subscribers table
+const createSubscribersTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: 'AW-Subscribers',
+    KeySchema: [
+      { AttributeName: 'taskId', KeyType: 'HASH' },
+      { AttributeName: 'email', KeyType: 'RANGE' }
+    ],
+    AttributeDefinitions: [
+      { AttributeName: 'taskId', AttributeType: 'S' },
+      { AttributeName: 'email', AttributeType: 'S' }
+    ],
+    ProvisionedThroughput: {
+      ReadCapacityUnits: 5,
+      WriteCapacityUnits: 5
+    }
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log('Created Subscribers table:', result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log('Subscribers table already exists');
+    } else {
+      throw error;
+    }
+  }
+};
+
 const main = async () => {
   try {
     await createUsersTable();
     await createTasksTable();
     await createTaskExecutionsTable();
     await createWaitlistTable();
+    await createSubscribersTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);

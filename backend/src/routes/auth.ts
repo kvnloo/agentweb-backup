@@ -1,7 +1,7 @@
 import express from 'express';
 import { register, login, googleCallback } from '../controllers/auth';
 import { authenticateToken } from '../middleware/auth';
-import { userDb } from '../services/db';
+import { userDb, taskDb, subscriberDb } from '../services/db';
 import passport from 'passport';
 import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 import { AuthRequest } from '../types/express';
@@ -67,5 +67,47 @@ router.get('/google/callback',
     res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/oauth-callback?token=${token}`);
   }
 );
+
+// Get task subscribers
+router.get('/tasks/:taskId/subscribers', authenticateToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const subscribers = await subscriberDb.getTaskSubscribers(taskId);
+    res.json(subscribers);
+  } catch (error: any) {
+    console.error('Error getting task subscribers:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Add subscriber to task
+router.post('/tasks/:taskId/subscribers', authenticateToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ message: 'Email is required' });
+    }
+
+    const subscriber = await subscriberDb.addSubscriber(taskId, email);
+    res.status(201).json(subscriber);
+  } catch (error: any) {
+    console.error('Error adding subscriber:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Remove subscriber from task
+router.delete('/tasks/:taskId/subscribers/:email', authenticateToken, async (req, res) => {
+  try {
+    const { taskId, email } = req.params;
+    await subscriberDb.removeSubscriber(taskId, email);
+    res.status(204).send();
+  } catch (error: any) {
+    console.error('Error removing subscriber:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
 
 export default router; 

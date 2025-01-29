@@ -11,7 +11,7 @@ from web_agent import WebAgent
 from botocore.exceptions import ClientError
 import time
 from decimal import Decimal
-from email_utils import send_task_notification
+from email_utils import send_task_notification, notify_task_subscribers
 import humanize  # Add this import at the top of the file
 
 # Custom JSON encoder to handle datetime objects
@@ -212,8 +212,9 @@ def update_execution_status(execution_id, status, result=None, error=None):
         }
 
         if status in ['completed', 'failed']:
+            end_time = datetime.now(timezone.utc)
             update_expression += ", completedAt = :completedAt"
-            expression_values[':completedAt'] = datetime.now(timezone.utc).isoformat()
+            expression_values[':completedAt'] = end_time.isoformat()
 
         if result is not None:
             update_expression += ", #result = :result"
@@ -225,7 +226,7 @@ def update_execution_status(execution_id, status, result=None, error=None):
             expression_values[':error'] = error
             expression_names['#error'] = 'error'
 
-        # Get the execution to get the taskId
+        # Get the execution to get the taskId and startTime
         execution = executions_table.get_item(Key={'executionId': execution_id}).get('Item')
         if execution:
             # Update the execution
@@ -236,7 +237,7 @@ def update_execution_status(execution_id, status, result=None, error=None):
                 ExpressionAttributeValues=expression_values
             )
 
-            # Send email notification if task is completed or failed
+            # Send notifications if task is completed or failed
             if status in ['completed', 'failed']:
                 # Get task details
                 task = tasks_table.get_item(
@@ -245,28 +246,46 @@ def update_execution_status(execution_id, status, result=None, error=None):
                     ExpressionAttributeNames={'#n': 'name'}
                 ).get('Item')
                 
-                if task and task.get('emailNotification'):
-                    # Get user's email from AW-Users table using UserIdIndex
-                    user_response = users_table.query(
-                        IndexName='UserIdIndex',
-                        KeyConditionExpression='userId = :userId',
-                        ExpressionAttributeValues={
-                            ':userId': task['userId']
-                        }
-                    )
-                    user = user_response.get('Items', [])[0] if user_response.get('Items') else None
-                    
-                    if user and user.get('email'):
-                        send_task_notification(
-                            to_email=user['email'],
-                            task_name=task['name'],
-                            task_id=execution['taskId'],
-                            execution_status=status,
-                            result=result,
-                            error=error
+                if task:
+                    # Parse timestamps
+                    start_time = datetime.fromisoformat(execution['startTime'].replace('Z', '+00:00'))
+                    end_time = datetime.fromisoformat(expression_values[':completedAt'].replace('Z', '+00:00'))
+
+                    # Send simple notification to task owner if emailNotification is enabled
+                    if task.get('emailNotification'):
+                        # Get user's email from AW-Users table using UserIdIndex
+                        user_response = users_table.query(
+                            IndexName='UserIdIndex',
+                            KeyConditionExpression='userId = :userId',
+                            ExpressionAttributeValues={
+                                ':userId': task['userId']
+                            }
                         )
-                    else:
-                        logger.error(f"User email not found for userId: {task['userId']}")
+                        user = user_response.get('Items', [])[0] if user_response.get('Items') else None
+                        
+                        if user and user.get('email'):
+                            # Send simple notification to owner
+                            send_task_notification(
+                                to_email=user['email'],
+                                task_name=task['name'],
+                                task_id=execution['taskId'],
+                                execution_status=status,
+                                result=result,
+                                error=error
+                            )
+                        else:
+                            logger.error(f"User email not found for userId: {task['userId']}")
+                    
+                    # Send detailed results to all subscribers
+                    notify_task_subscribers(
+                        task_id=execution['taskId'],
+                        task_name=task['name'],
+                        execution_status=status,
+                        result=result,
+                        error=error,
+                        start_time=start_time,
+                        end_time=end_time
+                    )
     except ClientError as e:
         logger.error(f"Error updating execution status: {e}")
 

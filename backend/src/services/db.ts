@@ -650,4 +650,62 @@ export const scheduleDb = {
       handleDynamoDbError(error, 'getPendingSchedules');
     }
   }
+};
+
+export const subscriberDb = {
+  async addSubscriber(taskId: string, email: string) {
+    try {
+      const subscribedAt = new Date().toISOString();
+      const params = {
+        TableName: 'AW-Subscribers',
+        Item: {
+          taskId,
+          email,
+          subscribedAt
+        },
+        ConditionExpression: 'attribute_not_exists(taskId) AND attribute_not_exists(email)'
+      };
+
+      await dynamodb.put(params).promise();
+      return { taskId, email, subscribedAt };
+    } catch (error: any) {
+      if (error.code === 'ConditionalCheckFailedException') {
+        throw new Error(`Email ${email} is already subscribed to this task`);
+      }
+      handleDynamoDbError(error, 'addSubscriber');
+    }
+  },
+
+  async removeSubscriber(taskId: string, email: string) {
+    try {
+      const params = {
+        TableName: 'AW-Subscribers',
+        Key: {
+          taskId,
+          email
+        }
+      };
+
+      await dynamodb.delete(params).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'removeSubscriber');
+    }
+  },
+
+  async getTaskSubscribers(taskId: string) {
+    try {
+      const params = {
+        TableName: 'AW-Subscribers',
+        KeyConditionExpression: 'taskId = :taskId',
+        ExpressionAttributeValues: {
+          ':taskId': taskId
+        }
+      };
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, 'getTaskSubscribers');
+    }
+  }
 }; 
