@@ -8,7 +8,8 @@ import browser_use
 from browser_use import Agent
 from browser_use.browser.browser import Browser, BrowserConfig
 from langchain_aws import ChatBedrock
-from langchain_openai import AzureChatOpenAI
+from langchain_openai import AzureChatOpenAI, ChatOpenAI
+from pydantic import SecretStr
 import boto3
 from botocore.config import Config
 from dotenv import load_dotenv
@@ -67,6 +68,24 @@ def get_azure_openai_llm():
         logger.error("Please ensure all Azure OpenAI environment variables are set correctly.")
         sys.exit(1)
 
+def get_deepseek_llm():
+    """Initialize DeepSeek language model"""
+    try:
+        api_key = os.getenv('DEEPSEEK_API_KEY')
+        if not api_key:
+            raise ValueError('DEEPSEEK_API_KEY is not set')
+            
+        return ChatOpenAI(
+            base_url='https://api.deepseek.com/v1',
+            model='deepseek-reasoner',
+            api_key=SecretStr(api_key),
+            temperature=0.0
+        )
+    except Exception as e:
+        logger.error(f"Error initializing DeepSeek: {e}")
+        logger.error("Please ensure DEEPSEEK_API_KEY environment variable is set correctly.")
+        sys.exit(1)
+
 def get_llm():
     """Get the appropriate language model based on environment configuration"""
     # Define valid platform-provider combinations with their initialization functions
@@ -76,6 +95,9 @@ def get_llm():
         },
         "azure": {
             "openai": get_azure_openai_llm
+        },
+        "deepseek": {
+            "deepseek": get_deepseek_llm
         }
     }
 
