@@ -89,17 +89,19 @@ const createTasksTable = async () => {
         ],
         Projection: {
           ProjectionType: 'ALL'
-        },
-        ProvisionedThroughput: {
-          ReadCapacityUnits: 5,
-          WriteCapacityUnits: 5
+        }
+      },
+      {
+        IndexName: 'UserTasksIndex',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
         }
       }
     ],
-    ProvisionedThroughput: {
-      ReadCapacityUnits: 5,
-      WriteCapacityUnits: 5
-    }
+    BillingMode: 'PAY_PER_REQUEST'
   };
 
   try {
@@ -122,7 +124,8 @@ const createTaskExecutionsTable = async () => {
       { AttributeName: 'executionId', AttributeType: 'S' },
       { AttributeName: 'taskId', AttributeType: 'S' },
       { AttributeName: 'startTime', AttributeType: 'S' },
-      { AttributeName: 'status', AttributeType: 'S' }
+      { AttributeName: 'status', AttributeType: 'S' },
+      { AttributeName: 'feedback', AttributeType: 'S' }
     ],
     KeySchema: [
       { AttributeName: 'executionId', KeyType: 'HASH' }
@@ -143,6 +146,16 @@ const createTaskExecutionsTable = async () => {
         KeySchema: [
           { AttributeName: 'status', KeyType: 'HASH' },
           { AttributeName: 'startTime', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      },
+      {
+        IndexName: 'TaskFeedbackIndex',
+        KeySchema: [
+          { AttributeName: 'taskId', KeyType: 'HASH' },
+          { AttributeName: 'feedback', KeyType: 'RANGE' }
         ],
         Projection: {
           ProjectionType: 'ALL'
@@ -238,6 +251,55 @@ const createSubscribersTable = async () => {
   }
 };
 
+// Create Task Schedules table
+const createTaskSchedulesTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+    AttributeDefinitions: [
+      { AttributeName: 'scheduleId', AttributeType: 'S' },
+      { AttributeName: 'taskId', AttributeType: 'S' },
+      { AttributeName: 'status', AttributeType: 'S' },
+      { AttributeName: 'nextRunTime', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'scheduleId', KeyType: 'HASH' }
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'TaskIdIndex',
+        KeySchema: [
+          { AttributeName: 'taskId', KeyType: 'HASH' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      },
+      {
+        IndexName: 'StatusStartTimeIndex',
+        KeySchema: [
+          { AttributeName: 'status', KeyType: 'HASH' },
+          { AttributeName: 'nextRunTime', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 const main = async () => {
   try {
     console.log(`Creating tables for environment: ${process.env.NODE_ENV || 'production'}`);
@@ -246,6 +308,7 @@ const main = async () => {
     await createTaskExecutionsTable();
     await createWaitlistTable();
     await createSubscribersTable();
+    await createTaskSchedulesTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
