@@ -54,6 +54,7 @@ interface TaskExecution {
   result?: string;
   error?: string;
   feedback?: 'accepted' | 'rejected';
+  details_gif?: string;
 }
 
 interface Subscriber {
@@ -444,6 +445,7 @@ export default function TaskDetails() {
                     <TableCell>Started</TableCell>
                     <TableCell>Completed</TableCell>
                     <TableCell>Result</TableCell>
+                    <TableCell>Details</TableCell>
                     <TableCell>Feedback</TableCell>
                   </TableRow>
                 </TableHead>
@@ -475,6 +477,22 @@ export default function TaskDetails() {
                         ) : '-'}
                       </TableCell>
                       <TableCell>
+                        {execution.details_gif ? (
+                          <a href={execution.details_gif} target="_blank" rel="noopener noreferrer">
+                            <img 
+                              src={execution.details_gif} 
+                              alt="Execution Details" 
+                              style={{ 
+                                maxWidth: '250px', 
+                                cursor: 'pointer',
+                                border: '1px solid #eee',
+                                borderRadius: '4px'
+                              }} 
+                            />
+                          </a>
+                        ) : '-'}
+                      </TableCell>
+                      <TableCell>
                         <select
                           value={execution.feedback || ''}
                           onChange={(e) => {
@@ -499,7 +517,7 @@ export default function TaskDetails() {
                   ))}
                   {executions.length === 0 && (
                     <TableRow>
-                      <TableCell colSpan={5} align="center">
+                      <TableCell colSpan={6} align="center">
                         <Typography variant="body2" color="text.secondary">
                           No executions yet
                         </Typography>
