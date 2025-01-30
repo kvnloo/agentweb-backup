@@ -6,9 +6,13 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import logging
 from dotenv import load_dotenv
+from datetime import datetime
 
 # Load environment variables
 load_dotenv()
+
+# Get table prefix based on NODE_ENV
+TABLE_PREFIX = 'Dev-' if os.getenv('NODE_ENV') == 'development' else ''
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +22,10 @@ dynamodb = boto3.resource('dynamodb',
     aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
     aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
 )
-subscribers_table = dynamodb.Table('AW-Subscribers')
+
+# Initialize tables with environment-specific prefixes
+subscribers_table = dynamodb.Table(f'{TABLE_PREFIX}AW-Subscribers')
+users_table = dynamodb.Table(f'{TABLE_PREFIX}AW-Users')
 
 def get_task_subscribers(task_id):
     """

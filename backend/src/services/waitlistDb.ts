@@ -1,5 +1,24 @@
-import { dynamodb } from '../config/aws';
+import AWS from 'aws-sdk';
+import dotenv from 'dotenv';
+import path from 'path';
 import { handleDynamoError } from '../utils/errorHandler';
+
+// Load environment variables from .env file
+dotenv.config({ path: path.resolve(__dirname, '../../.env') });
+
+// Get table prefix based on NODE_ENV (defaults to empty string for production)
+const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+
+// Configure AWS SDK
+AWS.config.update({
+  region: process.env.AWS_REGION || 'us-west-2',
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || ''
+  }
+});
+
+const dynamodb = new AWS.DynamoDB.DocumentClient();
 
 interface WaitlistEntry {
   email: string;
@@ -8,10 +27,19 @@ interface WaitlistEntry {
   invitedAt?: string;
 }
 
+// Helper function to handle DynamoDB errors
+const handleDynamoDbError = (error: any, operation: string) => {
+  console.error(`DynamoDB ${operation} error:`, error);
+  if (error.code === 'CredentialsError') {
+    throw new Error('AWS credentials are invalid or missing. Please check your .env file');
+  }
+  throw error;
+};
+
 export const waitlistDb = {
   async add(entry: WaitlistEntry) {
     const params = {
-      TableName: 'AW-Waitlist',
+      TableName: `${TABLE_PREFIX}AW-Waitlist`,
       Item: {
         email: entry.email.toLowerCase(),
         joinedAt: entry.joinedAt,
@@ -25,13 +53,13 @@ export const waitlistDb = {
       await dynamodb.put(params).promise();
       return params.Item;
     } catch (error) {
-      return handleDynamoError(error);
+      handleDynamoDbError(error, 'addToWaitlist');
     }
   },
 
   async getByEmail(email: string) {
     const params = {
-      TableName: 'AW-Waitlist',
+      TableName: `${TABLE_PREFIX}AW-Waitlist`,
       Key: {
         email: email.toLowerCase()
       }
@@ -41,14 +69,14 @@ export const waitlistDb = {
       const result = await dynamodb.get(params).promise();
       return result.Item as WaitlistEntry | undefined;
     } catch (error) {
-      return handleDynamoError(error);
+      handleDynamoDbError(error, 'getWaitlistByEmail');
     }
   },
 
   async list(lastEvaluatedKey?: any) {
     try {
       const params = {
-        TableName: 'AW-Waitlist',
+        TableName: `${TABLE_PREFIX}AW-Waitlist`,
         Limit: 50,
         ...(lastEvaluatedKey && { ExclusiveStartKey: lastEvaluatedKey })
       };
@@ -66,7 +94,7 @@ export const waitlistDb = {
 
   async updateStatus(email: string, status: string, invitedAt?: string) {
     const params = {
-      TableName: 'AW-Waitlist',
+      TableName: `${TABLE_PREFIX}AW-Waitlist`,
       Key: {
         email: email.toLowerCase()
       },

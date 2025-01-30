@@ -6,6 +6,9 @@ import '../config/aws';  // Just import for side effects
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
 
+// Get table prefix based on NODE_ENV (defaults to empty string for production)
+const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+
 // Configure AWS
 AWS.config.update({
   region: process.env.AWS_REGION,
@@ -15,22 +18,28 @@ AWS.config.update({
 
 const dynamodb = new AWS.DynamoDB();
 
+console.log('Creating tables with configuration:', {
+  environment: process.env.NODE_ENV || 'production',
+  region: process.env.AWS_REGION,
+  tablePrefix: TABLE_PREFIX
+});
+
 // Create Users table
 const createUsersTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
-    TableName: 'AW-Users',
+    TableName: `${TABLE_PREFIX}AW-Users`,
     AttributeDefinitions: [
-      { AttributeName: 'email', AttributeType: 'S' },
-      { AttributeName: 'userId', AttributeType: 'S' }
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'email', AttributeType: 'S' }
     ],
     KeySchema: [
-      { AttributeName: 'email', KeyType: 'HASH' }
+      { AttributeName: 'userId', KeyType: 'HASH' }
     ],
     GlobalSecondaryIndexes: [
       {
-        IndexName: 'UserIdIndex',
+        IndexName: 'EmailIndex',
         KeySchema: [
-          { AttributeName: 'userId', KeyType: 'HASH' }
+          { AttributeName: 'email', KeyType: 'HASH' }
         ],
         Projection: {
           ProjectionType: 'ALL'
@@ -49,10 +58,10 @@ const createUsersTable = async () => {
 
   try {
     const result = await dynamodb.createTable(params).promise();
-    console.log('Created Users table:', result);
+    console.log(`Created ${params.TableName} table:`, result);
   } catch (error: any) {
     if (error.code === 'ResourceInUseException') {
-      console.log('Users table already exists');
+      console.log(`${params.TableName} table already exists`);
     } else {
       throw error;
     }
@@ -62,7 +71,7 @@ const createUsersTable = async () => {
 // Create Tasks table
 const createTasksTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
-    TableName: 'AW-Tasks',
+    TableName: `${TABLE_PREFIX}AW-Tasks`,
     AttributeDefinitions: [
       { AttributeName: 'taskId', AttributeType: 'S' },
       { AttributeName: 'userId', AttributeType: 'S' },
@@ -80,25 +89,27 @@ const createTasksTable = async () => {
         ],
         Projection: {
           ProjectionType: 'ALL'
-        },
-        ProvisionedThroughput: {
-          ReadCapacityUnits: 5,
-          WriteCapacityUnits: 5
+        }
+      },
+      {
+        IndexName: 'UserTasksIndex',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
         }
       }
     ],
-    ProvisionedThroughput: {
-      ReadCapacityUnits: 5,
-      WriteCapacityUnits: 5
-    }
+    BillingMode: 'PAY_PER_REQUEST'
   };
 
   try {
     const result = await dynamodb.createTable(params).promise();
-    console.log('Created Tasks table:', result);
+    console.log(`Created ${params.TableName} table:`, result);
   } catch (error: any) {
     if (error.code === 'ResourceInUseException') {
-      console.log('Tasks table already exists');
+      console.log(`${params.TableName} table already exists`);
     } else {
       throw error;
     }
@@ -108,12 +119,13 @@ const createTasksTable = async () => {
 // Create Task Executions table
 const createTaskExecutionsTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
-    TableName: 'AW-TaskExecutions',
+    TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
     AttributeDefinitions: [
       { AttributeName: 'executionId', AttributeType: 'S' },
       { AttributeName: 'taskId', AttributeType: 'S' },
       { AttributeName: 'startTime', AttributeType: 'S' },
-      { AttributeName: 'status', AttributeType: 'S' }
+      { AttributeName: 'status', AttributeType: 'S' },
+      { AttributeName: 'feedback', AttributeType: 'S' }
     ],
     KeySchema: [
       { AttributeName: 'executionId', KeyType: 'HASH' }
@@ -127,10 +139,6 @@ const createTaskExecutionsTable = async () => {
         ],
         Projection: {
           ProjectionType: 'ALL'
-        },
-        ProvisionedThroughput: {
-          ReadCapacityUnits: 5,
-          WriteCapacityUnits: 5
         }
       },
       {
@@ -141,25 +149,28 @@ const createTaskExecutionsTable = async () => {
         ],
         Projection: {
           ProjectionType: 'ALL'
-        },
-        ProvisionedThroughput: {
-          ReadCapacityUnits: 5,
-          WriteCapacityUnits: 5
+        }
+      },
+      {
+        IndexName: 'TaskFeedbackIndex',
+        KeySchema: [
+          { AttributeName: 'taskId', KeyType: 'HASH' },
+          { AttributeName: 'feedback', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
         }
       }
     ],
-    ProvisionedThroughput: {
-      ReadCapacityUnits: 5,
-      WriteCapacityUnits: 5
-    }
+    BillingMode: 'PAY_PER_REQUEST'
   };
 
   try {
     const result = await dynamodb.createTable(params).promise();
-    console.log('Created Task Executions table:', result);
+    console.log(`Created ${params.TableName} table:`, result);
   } catch (error: any) {
     if (error.code === 'ResourceInUseException') {
-      console.log('Task Executions table already exists');
+      console.log(`${params.TableName} table already exists`);
     } else {
       throw error;
     }
@@ -169,7 +180,7 @@ const createTaskExecutionsTable = async () => {
 // Create Waitlist table
 const createWaitlistTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
-    TableName: 'AW-Waitlist',
+    TableName: `${TABLE_PREFIX}AW-Waitlist`,
     AttributeDefinitions: [
       { AttributeName: 'email', AttributeType: 'S' },
       { AttributeName: 'joinedAt', AttributeType: 'S' }
@@ -200,10 +211,10 @@ const createWaitlistTable = async () => {
 
   try {
     const result = await dynamodb.createTable(params).promise();
-    console.log('Created Waitlist table:', result);
+    console.log(`Created ${params.TableName} table:`, result);
   } catch (error: any) {
     if (error.code === 'ResourceInUseException') {
-      console.log('Waitlist table already exists');
+      console.log(`${params.TableName} table already exists`);
     } else {
       throw error;
     }
@@ -213,7 +224,7 @@ const createWaitlistTable = async () => {
 // Create Subscribers table
 const createSubscribersTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
-    TableName: 'AW-Subscribers',
+    TableName: `${TABLE_PREFIX}AW-Subscribers`,
     KeySchema: [
       { AttributeName: 'taskId', KeyType: 'HASH' },
       { AttributeName: 'email', KeyType: 'RANGE' }
@@ -230,10 +241,59 @@ const createSubscribersTable = async () => {
 
   try {
     const result = await dynamodb.createTable(params).promise();
-    console.log('Created Subscribers table:', result);
+    console.log(`Created ${params.TableName} table:`, result);
   } catch (error: any) {
     if (error.code === 'ResourceInUseException') {
-      console.log('Subscribers table already exists');
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// Create Task Schedules table
+const createTaskSchedulesTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+    AttributeDefinitions: [
+      { AttributeName: 'scheduleId', AttributeType: 'S' },
+      { AttributeName: 'taskId', AttributeType: 'S' },
+      { AttributeName: 'status', AttributeType: 'S' },
+      { AttributeName: 'nextRunTime', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'scheduleId', KeyType: 'HASH' }
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'TaskIdIndex',
+        KeySchema: [
+          { AttributeName: 'taskId', KeyType: 'HASH' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      },
+      {
+        IndexName: 'StatusStartTimeIndex',
+        KeySchema: [
+          { AttributeName: 'status', KeyType: 'HASH' },
+          { AttributeName: 'nextRunTime', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
     } else {
       throw error;
     }
@@ -242,11 +302,13 @@ const createSubscribersTable = async () => {
 
 const main = async () => {
   try {
+    console.log(`Creating tables for environment: ${process.env.NODE_ENV || 'production'}`);
     await createUsersTable();
     await createTasksTable();
     await createTaskExecutionsTable();
     await createWaitlistTable();
     await createSubscribersTable();
+    await createTaskSchedulesTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
@@ -254,4 +316,7 @@ const main = async () => {
   }
 };
 
-main(); 
+// Run if this script is called directly
+if (require.main === module) {
+  main();
+} 

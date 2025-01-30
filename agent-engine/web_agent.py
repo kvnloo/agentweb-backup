@@ -8,6 +8,8 @@ import browser_use
 from browser_use import Agent
 from browser_use.browser.browser import Browser, BrowserConfig
 from langchain_aws import ChatBedrock
+from langchain_openai import AzureChatOpenAI, ChatOpenAI
+from pydantic import SecretStr
 import boto3
 from botocore.config import Config
 from dotenv import load_dotenv
@@ -20,25 +22,25 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configure AWS client with no retries
-aws_config = Config(
-    retries = dict(
-        max_attempts = 1  # Disable AWS's internal retries
-    )
-)
-
-# Initialize AWS Bedrock client
-bedrock = boto3.client(
-    service_name='bedrock-runtime',
-    region_name=os.getenv('AWS_REGION', 'us-west-2'),  # Changed default to us-west-2
-    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
-    config=aws_config
-)
-
-def get_llm():
-    """Initialize the language model using AWS Bedrock"""
+def get_aws_bedrock_llm():
+    """Initialize AWS Bedrock language model"""
     try:
+        # Configure AWS client with no retries
+        aws_config = Config(
+            retries = dict(
+                max_attempts = 1  # Disable AWS's internal retries
+            )
+        )
+
+        # Initialize AWS Bedrock client
+        bedrock = boto3.client(
+            service_name='bedrock-runtime',
+            region_name=os.getenv('AWS_REGION', 'us-west-2'),
+            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+            config=aws_config
+        )
+
         return ChatBedrock(
             client=bedrock,
             model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",
@@ -46,10 +48,80 @@ def get_llm():
         )
     except Exception as e:
         if "AccessDeniedException" in str(e):
-            print("Error: The AWS user lacks permission to invoke Claude model in Bedrock.")
-            print("Please ensure the user has the necessary permissions and the model exists.")
+            logger.error("Error: The AWS user lacks permission to invoke Claude model in Bedrock.")
+            logger.error("Please ensure the user has the necessary permissions and the model exists.")
             sys.exit(1)
         raise
+
+def get_azure_openai_llm():
+    """Initialize Azure OpenAI language model"""
+    try:
+        return AzureChatOpenAI(
+            azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT'),
+            azure_deployment=os.getenv('AZURE_OPENAI_DEPLOYMENT'),
+            api_key=os.getenv('AZURE_OPENAI_API_KEY'),
+            api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-05-01-preview'),
+            temperature=0.0
+        )
+    except Exception as e:
+        logger.error(f"Error initializing Azure OpenAI: {e}")
+        logger.error("Please ensure all Azure OpenAI environment variables are set correctly.")
+        sys.exit(1)
+
+def get_deepseek_llm():
+    """Initialize DeepSeek language model"""
+    try:
+        api_key = os.getenv('DEEPSEEK_API_KEY')
+        if not api_key:
+            raise ValueError('DEEPSEEK_API_KEY is not set')
+            
+        return ChatOpenAI(
+            base_url='https://api.deepseek.com/v1',
+            model='deepseek-reasoner',
+            api_key=SecretStr(api_key),
+            temperature=0.0
+        )
+    except Exception as e:
+        logger.error(f"Error initializing DeepSeek: {e}")
+        logger.error("Please ensure DEEPSEEK_API_KEY environment variable is set correctly.")
+        sys.exit(1)
+
+def get_llm():
+    """Get the appropriate language model based on environment configuration"""
+    # Define valid platform-provider combinations with their initialization functions
+    VALID_CONFIGURATIONS = {
+        "aws": {
+            "anthropic": get_aws_bedrock_llm
+        },
+        "azure": {
+            "openai": get_azure_openai_llm
+        },
+        "deepseek": {
+            "deepseek": get_deepseek_llm
+        }
+    }
+
+    llm_platform = os.getenv('LLM_Deployment_Platform', 'aws').lower()
+    llm_provider = os.getenv('LLM_Provider', 'anthropic').lower()
+    
+    logger.info(f"Requested LLM configuration - Platform: {llm_platform}, Provider: {llm_provider}")
+
+    # Get the provider-function mapping for the platform
+    platform_config = VALID_CONFIGURATIONS.get(llm_platform, {})
+    if not platform_config:
+        logger.error(f"Unsupported platform: {llm_platform}")
+        logger.error(f"Valid platforms are: {list(VALID_CONFIGURATIONS.keys())}")
+        sys.exit(1)
+
+    # Get the initialization function for the provider
+    init_func = platform_config.get(llm_provider)
+    if not init_func:
+        logger.error(f"Invalid provider '{llm_provider}' for platform '{llm_platform}'")
+        logger.error(f"Valid providers for {llm_platform} are: {list(platform_config.keys())}")
+        sys.exit(1)
+
+    # Initialize the LLM using the mapped function
+    return init_func()
 
 class WebAgent:
     def __init__(self):
