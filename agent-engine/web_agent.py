@@ -69,13 +69,37 @@ def get_azure_openai_llm():
 
 def get_llm():
     """Get the appropriate language model based on environment configuration"""
-    llm_provider = os.getenv('LLM_PROVIDER', 'aws').lower()
-    logger.info(f"Using LLM provider: {llm_provider}")
+    # Define valid platform-provider combinations with their initialization functions
+    VALID_CONFIGURATIONS = {
+        "aws": {
+            "anthropic": get_aws_bedrock_llm
+        },
+        "azure": {
+            "openai": get_azure_openai_llm
+        }
+    }
 
-    if llm_provider == 'azure':
-        return get_azure_openai_llm()
-    else:  # default to AWS
-        return get_aws_bedrock_llm()
+    llm_platform = os.getenv('LLM_Deployment_Platform', 'aws').lower()
+    llm_provider = os.getenv('LLM_Provider', 'anthropic').lower()
+    
+    logger.info(f"Requested LLM configuration - Platform: {llm_platform}, Provider: {llm_provider}")
+
+    # Get the provider-function mapping for the platform
+    platform_config = VALID_CONFIGURATIONS.get(llm_platform, {})
+    if not platform_config:
+        logger.error(f"Unsupported platform: {llm_platform}")
+        logger.error(f"Valid platforms are: {list(VALID_CONFIGURATIONS.keys())}")
+        sys.exit(1)
+
+    # Get the initialization function for the provider
+    init_func = platform_config.get(llm_provider)
+    if not init_func:
+        logger.error(f"Invalid provider '{llm_provider}' for platform '{llm_platform}'")
+        logger.error(f"Valid providers for {llm_platform} are: {list(platform_config.keys())}")
+        sys.exit(1)
+
+    # Initialize the LLM using the mapped function
+    return init_func()
 
 class WebAgent:
     def __init__(self):
