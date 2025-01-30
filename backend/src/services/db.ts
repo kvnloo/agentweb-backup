@@ -5,11 +5,16 @@ import path from 'path';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
 
+// Get table prefix based on NODE_ENV (defaults to empty string for production)
+const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+
 // For debugging
 console.log('Environment variables loaded:', {
+  environment: process.env.NODE_ENV || 'production',
   hasAccessKey: !!process.env.AWS_ACCESS_KEY_ID,
   hasSecretKey: !!process.env.AWS_SECRET_ACCESS_KEY,
-  region: process.env.AWS_REGION
+  region: process.env.AWS_REGION,
+  tablePrefix: TABLE_PREFIX
 });
 
 // Configure AWS SDK
@@ -43,11 +48,12 @@ interface User {
 
 class UserDB {
   private docClient: AWS.DynamoDB.DocumentClient;
-  private tableName = 'AW-Users';
+  private tableName: string;
 
   constructor() {
     console.log('Initializing DynamoDB with region:', process.env.AWS_REGION || 'us-west-2');
     this.docClient = dynamodb;
+    this.tableName = `${TABLE_PREFIX}AW-Users`;
   }
 
   private handleError(error: any, operation: string) {
@@ -169,7 +175,7 @@ export const taskDb = {
   }) {
     try {
       const params = {
-        TableName: 'AW-Tasks',
+        TableName: `${TABLE_PREFIX}AW-Tasks`,
         Item: task
       };
 
@@ -183,7 +189,7 @@ export const taskDb = {
   async getAllTasks() {
     try {
       const params = {
-        TableName: 'AW-Tasks',
+        TableName: `${TABLE_PREFIX}AW-Tasks`,
         ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt',
         ExpressionAttributeNames: {
           '#n': 'name',
@@ -201,7 +207,7 @@ export const taskDb = {
   async getTasksByUserId(userId: string) {
     try {
       const params = {
-        TableName: 'AW-Tasks',
+        TableName: `${TABLE_PREFIX}AW-Tasks`,
         IndexName: 'UserTasksIndex',
         KeyConditionExpression: 'userId = :userId',
         ExpressionAttributeValues: {
@@ -226,7 +232,7 @@ export const taskDb = {
   async getTaskById(taskId: string) {
     try {
       const params = {
-        TableName: 'AW-Tasks',
+        TableName: `${TABLE_PREFIX}AW-Tasks`,
         Key: {
           taskId
         },
@@ -267,7 +273,7 @@ export const taskDb = {
       });
 
       const params = {
-        TableName: 'AW-Tasks',
+        TableName: `${TABLE_PREFIX}AW-Tasks`,
         Key: {
           taskId
         },
@@ -287,7 +293,7 @@ export const taskDb = {
   async deleteTask(taskId: string) {
     try {
       const params = {
-        TableName: 'AW-Tasks',
+        TableName: `${TABLE_PREFIX}AW-Tasks`,
         Key: {
           taskId
         }
@@ -308,7 +314,7 @@ export const taskDb = {
   }) {
     try {
       const params = {
-        TableName: 'AW-TaskExecutions',
+        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
         Item: execution
       };
 
@@ -322,7 +328,7 @@ export const taskDb = {
   async getTaskExecutionById(executionId: string) {
     try {
       const params = {
-        TableName: 'AW-TaskExecutions',
+        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
         Key: {
           executionId
         }
@@ -359,7 +365,7 @@ export const taskDb = {
       });
 
       const params = {
-        TableName: 'AW-TaskExecutions',
+        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
         Key: {
           executionId
         },
@@ -381,7 +387,7 @@ export const taskDb = {
   async getPendingTaskExecutions() {
     try {
       const params = {
-        TableName: 'AW-TaskExecutions',
+        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
         IndexName: 'StatusCreatedAtIndex',
         KeyConditionExpression: '#status = :status',
         ExpressionAttributeNames: {
@@ -402,7 +408,7 @@ export const taskDb = {
   async getTaskExecutions(taskId: string) {
     try {
       const params = {
-        TableName: 'AW-TaskExecutions',
+        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
         IndexName: 'TaskIdIndex',
         KeyConditionExpression: 'taskId = :taskId',
         ExpressionAttributeValues: {
@@ -422,7 +428,7 @@ export const taskDb = {
     try {
       // Get tasks for the period
       const taskParams = {
-        TableName: 'AW-Tasks',
+        TableName: `${TABLE_PREFIX}AW-Tasks`,
         FilterExpression: 'createdAt BETWEEN :startDate AND :endDate',
         ExpressionAttributeValues: {
           ':startDate': startDate,
@@ -435,7 +441,7 @@ export const taskDb = {
 
       // Get executions for the period
       const executionParams = {
-        TableName: 'AW-TaskExecutions',
+        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
         FilterExpression: 'startTime BETWEEN :startDate AND :endDate',
         ExpressionAttributeValues: {
           ':startDate': startDate,
@@ -470,7 +476,7 @@ export const waitlistDb = {
   async add(entry: { email: string; joinedAt: string }) {
     try {
       const params = {
-        TableName: 'AW-Waitlist',
+        TableName: `${TABLE_PREFIX}AW-Waitlist`,
         Item: entry
       };
 
@@ -484,7 +490,7 @@ export const waitlistDb = {
   async getByEmail(email: string) {
     try {
       const params = {
-        TableName: 'AW-Waitlist',
+        TableName: `${TABLE_PREFIX}AW-Waitlist`,
         Key: {
           email
         }
@@ -500,7 +506,7 @@ export const waitlistDb = {
   async list(lastEvaluatedKey?: any) {
     try {
       const params = {
-        TableName: 'AW-Waitlist',
+        TableName: `${TABLE_PREFIX}AW-Waitlist`,
         Limit: 50,
         ...(lastEvaluatedKey && { ExclusiveStartKey: lastEvaluatedKey })
       };
@@ -531,7 +537,7 @@ export const scheduleDb = {
   }) {
     try {
       const params = {
-        TableName: 'AW-TaskSchedules',
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Item: schedule
       };
 
@@ -545,7 +551,7 @@ export const scheduleDb = {
   async getSchedulesByTaskId(taskId: string) {
     try {
       const params = {
-        TableName: 'AW-TaskSchedules',
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         IndexName: 'TaskIdIndex',
         KeyConditionExpression: 'taskId = :taskId',
         ExpressionAttributeValues: {
@@ -563,7 +569,7 @@ export const scheduleDb = {
   async getScheduleById(scheduleId: string) {
     try {
       const params = {
-        TableName: 'AW-TaskSchedules',
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: {
           scheduleId
         }
@@ -595,7 +601,7 @@ export const scheduleDb = {
       });
 
       const params = {
-        TableName: 'AW-TaskSchedules',
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: {
           scheduleId
         },
@@ -615,7 +621,7 @@ export const scheduleDb = {
   async deleteSchedule(scheduleId: string) {
     try {
       const params = {
-        TableName: 'AW-TaskSchedules',
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: {
           scheduleId
         }
@@ -631,7 +637,7 @@ export const scheduleDb = {
     try {
       const now = new Date().toISOString();
       const params = {
-        TableName: 'AW-TaskSchedules',
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         IndexName: 'StatusNextRunTimeIndex',
         KeyConditionExpression: '#status = :status AND #nextRunTime <= :now',
         ExpressionAttributeNames: {
