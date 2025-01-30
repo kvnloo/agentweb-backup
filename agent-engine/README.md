@@ -86,12 +86,16 @@ The task monitor is responsible for:
 1. Monitoring pending task executions
 2. Processing scheduled tasks
 3. Managing task execution lifecycle
+4. Sending notifications to task owners and subscribers
 
 Key features:
 - Queries for pending executions using timestamp optimization
 - Handles scheduled tasks (daily, weekly, monthly)
 - Updates execution statuses and results
 - Comprehensive error handling and logging
+- Sends different types of notifications:
+  - Simple completion notifications to task owners
+  - Detailed run results to task subscribers
 
 Example usage:
 ```python
@@ -99,6 +103,42 @@ Example usage:
 # 1. Due schedules to create new executions
 # 2. Pending executions to process
 python task_monitor.py
+```
+
+### Email Notifications (`email_utils.py`)
+
+The email utilities handle different types of notifications:
+
+1. Task Owner Notifications
+   - Simple completion notifications
+   - Sent when emailNotification is enabled for the task
+   - Includes basic status and link to task details
+
+2. Subscriber Notifications
+   - Detailed task run results
+   - Sent to all task subscribers
+   - Includes:
+     - Task execution timestamps
+     - Run duration
+     - Detailed results or error messages
+     - Link to task details
+
+Example subscriber email:
+```
+Task Run Results for "Your Task Name"
+===================================
+
+Status: COMPLETED
+Started: January 15, 2024 at 02:30 PM UTC
+Completed: January 15, 2024 at 02:35 PM UTC
+Duration: 5 minutes
+
+Results Summary:
+---------------
+[Detailed task results]
+
+View complete task details and history:
+http://localhost:3000/tasks/123456
 ```
 
 ## Database Schema
@@ -115,6 +155,13 @@ python task_monitor.py
   - `result` (String, optional)
   - `error` (String, optional)
   - `completedAt` (String, optional)
+
+### AW-Subscribers
+- Primary Key: Composite key of `taskId` (Hash) and `email` (Range)
+- Attributes:
+  - `taskId` (String)
+  - `email` (String)
+  - `subscribedAt` (String)
 
 ### AW-TaskSchedules
 - Primary Key: `scheduleId` (String)
@@ -176,4 +223,4 @@ def test_new_feature(self, mock_table):
     # Verify behavior
     self.assertEqual(result, expected_result)
     mock_table.query.assert_called_once_with(...)
-``` 
+```
