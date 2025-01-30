@@ -13,6 +13,7 @@ import time
 from decimal import Decimal
 from email_utils import send_task_notification, notify_task_subscribers
 import humanize  # Add this import at the top of the file
+from pathlib import Path
 
 # Custom JSON encoder to handle datetime objects
 class DateTimeEncoder(json.JSONEncoder):
@@ -86,7 +87,6 @@ last_execution_time = None
 def get_pending_executions():
     global last_execution_time
     try:
-        logger.info("Querying for pending executions...")
         query_params = {
             'IndexName': 'StatusStartTimeIndex',
             'KeyConditionExpression': '#status = :status',
@@ -111,7 +111,8 @@ def get_pending_executions():
         if items:
             last_execution_time = max(item['startTime'] for item in items)
 
-        logger.info(f"Found {len(items)} pending executions: {json_dumps(items)}")
+        if len(items) > 0:
+            logger.info(f"Found {len(items)} pending executions: {json_dumps(items)}")
         return items
     except ClientError as e:
         logger.error(f"Error querying pending executions: {e}")
@@ -119,7 +120,6 @@ def get_pending_executions():
 
 def get_due_schedules():
     try:
-        logger.info("Querying for due schedules...")
         now = datetime.now(timezone.utc).isoformat()
         response = schedules_table.query(
             IndexName='StatusStartTimeIndex',
@@ -134,7 +134,8 @@ def get_due_schedules():
             }
         )
         items = response.get('Items', [])
-        logger.info(f"Found {len(items)} due schedules: {json_dumps(items)}")
+        if len(items) > 0:
+            logger.info(f"Found {len(items)} due schedules: {json_dumps(items)}")
         return items
     except ClientError as e:
         logger.error(f"Error querying due schedules: {e}")
@@ -191,7 +192,6 @@ def update_schedule_next_run_time(schedule):
 
 async def process_schedules():
     try:
-        logger.info("Processing schedules...")
         due_schedules = get_due_schedules()
         
         for schedule in due_schedules:
@@ -209,7 +209,7 @@ async def process_schedules():
     except Exception as e:
         logger.error(f"Error in process_schedules: {e}")
 
-def update_execution_status(execution_id, status, result=None, error=None):
+def update_execution_status(execution_id, status, result=None, error=None, details_gif=None):
     try:
         update_expression = "SET #status = :status"
         expression_values = {
@@ -233,6 +233,10 @@ def update_execution_status(execution_id, status, result=None, error=None):
             update_expression += ", #error = :error"
             expression_values[':error'] = error
             expression_names['#error'] = 'error'
+
+        if details_gif is not None:
+            update_expression += ", details_gif = :detailsGif"
+            expression_values[':detailsGif'] = details_gif
 
         # Get the execution to get the taskId and startTime
         execution = executions_table.get_item(Key={'executionId': execution_id}).get('Item')
@@ -363,19 +367,35 @@ async def execute_task(execution):
             if previous_feedback:
                 prompt = f"{prompt}\n\nNote: Previous attempt {previous_feedback['time_ago']} was {previous_feedback['feedback']}. Previous result: {previous_feedback['result']}"
             
+            # Remove existing GIF file if it exists
+            gif_path = Path("agent_history.gif")
+            if gif_path.exists():
+                gif_path.unlink()
+            
             result = await agent.execute_task(prompt)
+            
+            # Check for agent_history.gif and upload if exists
+            details_gif = None
+            if Path("agent_history.gif").exists():
+                s3_client = boto3.client('s3')
+                random_suffix = ''.join(str(uuid.uuid4())[:6])
+                filename = f"agent_history_{execution_id}_{random_suffix}.gif"
+                s3_client.upload_file("agent_history.gif", os.getenv('AWS_S3_BUCKET'), f"execution_gifs/{filename}", ExtraArgs={'ContentType': 'image/gif'})
+                details_gif=f"https://{os.getenv('AWS_S3_BUCKET')}.s3.amazonaws.com/execution_gifs/{filename}"
             
             if result['success']:
                 update_execution_status(
                     execution_id, 
                     'completed', 
-                    result=result.get('summary', 'No summary available')
+                    result=result.get('summary', 'No summary available'),
+                    details_gif=details_gif
                 )
             else:
                 update_execution_status(
                     execution_id, 
                     'failed', 
-                    error=result.get('error', 'Unknown error')
+                    error=result.get('error', 'Unknown error'),
+                    details_gif=details_gif
                 )
         finally:
             await agent.cleanup()
@@ -385,7 +405,8 @@ async def execute_task(execution):
         update_execution_status(execution_id, 'failed', error=str(e))
 
 async def monitor_executions():
-    logger.info("Starting execution monitor...")
+    INTERVAL = 5
+    logger.info(f"Starting execution monitor with interval of {INTERVAL} seconds...")
     
     while True:
         try:
@@ -393,19 +414,17 @@ async def monitor_executions():
             await process_schedules()
             
             # Then process pending executions
-            logger.info("Checking for pending executions...")
             pending_executions = get_pending_executions()
             
             for execution in pending_executions:
                 logger.info(f"Processing execution {execution['executionId']}")
                 await execute_task(execution)
             
-            logger.info("Sleeping for 5 seconds...")
-            await asyncio.sleep(5)  # Check every 5 seconds
-            
+            await asyncio.sleep(INTERVAL)  # Check every INTERVAL seconds
+
         except Exception as e:
             logger.error(f"Error in monitor loop: {e}")
-            await asyncio.sleep(5)
+            await asyncio.sleep(INTERVAL)
 
 if __name__ == "__main__":
     asyncio.run(monitor_executions()) 
