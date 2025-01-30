@@ -7,7 +7,10 @@ from typing import Dict, Any
 import browser_use
 from browser_use import Agent
 from browser_use.browser.browser import Browser, BrowserConfig
+from langchain_aws import ChatBedrock
 from langchain_openai import AzureChatOpenAI
+import boto3
+from botocore.config import Config
 from dotenv import load_dotenv
 import logging
 
@@ -18,23 +21,61 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def get_llm():
-    """Initialize the language model using Azure OpenAI"""
+def get_aws_bedrock_llm():
+    """Initialize AWS Bedrock language model"""
+    try:
+        # Configure AWS client with no retries
+        aws_config = Config(
+            retries = dict(
+                max_attempts = 1  # Disable AWS's internal retries
+            )
+        )
+
+        # Initialize AWS Bedrock client
+        bedrock = boto3.client(
+            service_name='bedrock-runtime',
+            region_name=os.getenv('AWS_REGION', 'us-west-2'),
+            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+            config=aws_config
+        )
+
+        return ChatBedrock(
+            client=bedrock,
+            model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",
+            model_kwargs={"temperature": 0.0}
+        )
+    except Exception as e:
+        if "AccessDeniedException" in str(e):
+            logger.error("Error: The AWS user lacks permission to invoke Claude model in Bedrock.")
+            logger.error("Please ensure the user has the necessary permissions and the model exists.")
+            sys.exit(1)
+        raise
+
+def get_azure_openai_llm():
+    """Initialize Azure OpenAI language model"""
     try:
         return AzureChatOpenAI(
-            model="gpt-4o",
             azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT'),
             azure_deployment=os.getenv('AZURE_OPENAI_DEPLOYMENT'),
             api_key=os.getenv('AZURE_OPENAI_API_KEY'),
-            openai_api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-02-15-preview'),
-            temperature=0.0,
-            max_retries=2,  # Add retries for transient errors
-            request_timeout=60  # Add timeout
+            api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-05-01-preview'),
+            temperature=0.0
         )
     except Exception as e:
-        print("Error: Failed to initialize Azure OpenAI.")
-        print(f"Please ensure you have set the correct Azure OpenAI environment variables: {str(e)}")
+        logger.error(f"Error initializing Azure OpenAI: {e}")
+        logger.error("Please ensure all Azure OpenAI environment variables are set correctly.")
         sys.exit(1)
+
+def get_llm():
+    """Get the appropriate language model based on environment configuration"""
+    llm_provider = os.getenv('LLM_PROVIDER', 'aws').lower()
+    logger.info(f"Using LLM provider: {llm_provider}")
+
+    if llm_provider == 'azure':
+        return get_azure_openai_llm()
+    else:  # default to AWS
+        return get_aws_bedrock_llm()
 
 class WebAgent:
     def __init__(self):
