@@ -483,7 +483,7 @@ export default function TaskDetails() {
                               src={execution.details_gif} 
                               alt="Execution Details" 
                               style={{ 
-                                maxWidth: '100px', 
+                                maxWidth: '250px', 
                                 cursor: 'pointer',
                                 border: '1px solid #eee',
                                 borderRadius: '4px'
