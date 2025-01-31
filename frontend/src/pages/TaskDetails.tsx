@@ -55,6 +55,7 @@ interface TaskExecution {
   error?: string;
   feedback?: 'accepted' | 'rejected';
   details_gif?: string;
+  prompt?: string;
 }
 
 interface Subscriber {
@@ -444,6 +445,7 @@ export default function TaskDetails() {
                     <TableCell>Status</TableCell>
                     <TableCell>Started</TableCell>
                     <TableCell>Completed</TableCell>
+                    <TableCell>Prompt</TableCell>
                     <TableCell>Result</TableCell>
                     <TableCell>Details</TableCell>
                     <TableCell>Feedback</TableCell>
@@ -464,6 +466,22 @@ export default function TaskDetails() {
                       </TableCell>
                       <TableCell>
                         {execution.completedAt ? new Date(execution.completedAt).toLocaleString() : '-'}
+                      </TableCell>
+                      <TableCell>
+                        {execution.prompt ? (
+                          <Typography 
+                            variant="body2" 
+                            sx={{ 
+                              maxWidth: '300px', 
+                              whiteSpace: 'pre-wrap',
+                              overflow: 'hidden',
+                              textOverflow: 'ellipsis',
+                              maxHeight: '100px'
+                            }}
+                          >
+                            {execution.prompt}
+                          </Typography>
+                        ) : '-'}
                       </TableCell>
                       <TableCell>
                         {execution.error ? (
