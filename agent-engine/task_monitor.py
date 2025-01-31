@@ -14,6 +14,7 @@ from decimal import Decimal
 from email_utils import send_task_notification, notify_task_subscribers
 import humanize  # Add this import at the top of the file
 from pathlib import Path
+from aws_utils import get_dynamodb_resource, get_s3_client
 
 # Custom JSON encoder to handle datetime objects
 class DateTimeEncoder(json.JSONEncoder):
@@ -66,11 +67,7 @@ logger = logging.getLogger(__name__)
 os.environ['BROWSER_USE_LOGGING_LEVEL'] = 'info'
 
 # Initialize DynamoDB client
-dynamodb = boto3.resource('dynamodb',
-    region_name=os.getenv('AWS_REGION', 'us-west-2'),
-    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
-)
+dynamodb = get_dynamodb_resource()
 
 # Initialize tables with environment-specific prefixes
 executions_table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskExecutions')
@@ -381,7 +378,7 @@ async def execute_task(execution):
             # Check for agent_history.gif and upload if exists
             details_gif = None
             if Path("agent_history.gif").exists():
-                s3_client = boto3.client('s3')
+                s3_client = get_s3_client()
                 random_suffix = ''.join(str(uuid.uuid4())[:6])
                 filename = f"agent_history_{execution_id}_{random_suffix}.gif"
                 s3_client.upload_file("agent_history.gif", os.getenv('AWS_S3_BUCKET'), f"execution_gifs/{filename}", ExtraArgs={'ContentType': 'image/gif'})
