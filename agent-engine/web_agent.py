@@ -7,6 +7,7 @@ from typing import Dict, Any
 import browser_use
 from browser_use import Agent
 from browser_use.browser.browser import Browser, BrowserConfig
+from browser_use.browser.context import BrowserContextConfig
 from langchain_aws import ChatBedrock
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from pydantic import SecretStr
@@ -14,6 +15,7 @@ import boto3
 from botocore.config import Config
 from dotenv import load_dotenv
 import logging
+from pathlib import Path
 
 # Load environment variables
 load_dotenv()
@@ -124,21 +126,39 @@ def get_llm():
     return init_func()
 
 class WebAgent:
-    def __init__(self):
+    def __init__(self, user_id=None):
         self.browser = None
         self.agent = None
         self.llm = get_llm()
         self.task = None
         self.action_history = []
+        self.user_id = user_id
+        self.context_dir = Path('context')
+        self.context_dir.mkdir(exist_ok=True)
+
+    def _get_cookies_path(self):
+        """Get the path to the user's cookies file"""
+        if not self.user_id:
+            return None
+        return str(self.context_dir / f"{self.user_id}_cookies.json")
 
     async def setup(self):
         """Initialize the browser instance"""
         if not self.task:
             raise ValueError("Task must be set before setup")
-            
-        self.browser = Browser(config=BrowserConfig())
+        
+        # Create browser context config with user-specific cookies file
+        cookies_path = self._get_cookies_path()
+        context_config = BrowserContextConfig(
+            cookies_file=cookies_path if cookies_path else None
+        )
+        if cookies_path:
+            logger.info(f"Using cookies file for user {self.user_id}: {cookies_path}")
+
+        browser_config = BrowserConfig(new_context_config=context_config)
+        self.browser = Browser(config=browser_config)
         self.agent = Agent(
-            task=self.task,  # Use the stored task
+            task=self.task,
             llm=self.llm,
             browser=self.browser,
             use_vision=True,
