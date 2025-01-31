@@ -5,6 +5,10 @@ from pathlib import Path
 from typing import Optional, Dict
 import logging
 from aws_utils import get_s3_client
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -18,6 +22,9 @@ class CookieSync:
         if not self.bucket_name:
             raise ValueError("AWS_S3_BUCKET_INTERNAL environment variable must be set")
         self._cookie_hashes: Dict[str, str] = {}
+        # Get environment prefix for S3 paths
+        self.env_prefix = 'dev/' if os.getenv('NODE_ENV') == 'development' else 'prod/'
+        logger.info(f"Initialized CookieSync with environment prefix: {self.env_prefix}")
 
     def _calculate_file_hash(self, file_path: str) -> str:
         """Calculate SHA-256 hash of a file"""
@@ -29,7 +36,11 @@ class CookieSync:
 
     def _get_hash_key(self, user_id: str, cookie_path: Path) -> str:
         """Get the hash key for a user's cookie file"""
-        return f"{user_id}:{cookie_path.name}"
+        return f"{self.env_prefix}{user_id}:{cookie_path.name}"
+
+    def _get_s3_key(self, user_id: str, cookie_path: Path) -> str:
+        """Get the S3 key with environment prefix"""
+        return f"{self.env_prefix}cookies/{user_id}/{cookie_path.name}"
 
     def upload_cookies(self, user_id: str, cookie_file_path: str) -> bool:
         """
@@ -57,7 +68,7 @@ class CookieSync:
                 logger.info(f"Cookie file unchanged for user {user_id}, skipping upload")
                 return True
 
-            s3_key = f"cookies/{user_id}/{cookie_path.name}"
+            s3_key = self._get_s3_key(user_id, cookie_path)
             
             # Upload file to S3
             self.s3.upload_file(
@@ -88,7 +99,7 @@ class CookieSync:
         """
         try:
             cookie_path = Path(cookie_file_path)
-            s3_key = f"cookies/{user_id}/{cookie_path.name}"
+            s3_key = self._get_s3_key(user_id, cookie_path)
             
             # Create directory if it doesn't exist
             cookie_path.parent.mkdir(parents=True, exist_ok=True)
@@ -124,7 +135,8 @@ class CookieSync:
             bool: True if successful, False otherwise
         """
         try:
-            s3_key = f"cookies/{user_id}/{cookie_file_name}"
+            cookie_path = Path(cookie_file_name)
+            s3_key = self._get_s3_key(user_id, cookie_path)
             
             # Delete file from S3
             self.s3.delete_object(
@@ -133,7 +145,7 @@ class CookieSync:
             )
             
             # Remove hash record
-            hash_key = self._get_hash_key(user_id, Path(cookie_file_name))
+            hash_key = self._get_hash_key(user_id, cookie_path)
             self._cookie_hashes.pop(hash_key, None)
             
             logger.info(f"Successfully deleted cookies from S3: {s3_key}")
