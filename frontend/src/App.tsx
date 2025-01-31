@@ -1,4 +1,4 @@
-import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
+import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import { Box, ThemeProvider, CssBaseline } from '@mui/material';
 import { LocalizationProvider } from '@mui/x-date-pickers';
 import { AdapterDateFns } from '@mui/x-date-pickers/AdapterDateFns';
@@ -17,6 +17,7 @@ import AdminDashboard from './pages/AdminDashboard';
 import PrivateRoute from './components/PrivateRoute';
 import AdminRoute from './components/AdminRoute';
 import Profile from './pages/Profile';
+import Config from './pages/Config';
 
 export default function App() {
   return (
@@ -81,6 +82,7 @@ export default function App() {
                         </PrivateRoute>
                       }
                     />
+                    <Route path="/config" element={<Config />} />
                   </Route>
                 </Routes>
               </Box>

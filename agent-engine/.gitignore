@@ -5,4 +5,8 @@ agent_history.gif
 task_monitor.log
 
 # Environment variables
-.env 
+.env
+
+# Browser context files
+context/
+*.cookies.json 

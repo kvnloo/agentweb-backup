@@ -114,6 +114,14 @@ export default function Layout() {
                 >
                   Dashboard
                 </Button>
+                <Button 
+                  color="primary" 
+                  component={RouterLink} 
+                  to="/config"
+                  variant={isActivePath('/config') ? 'contained' : 'text'}
+                >
+                  Config
+                </Button>
                 {user.isAdmin && (
                   <Button 
                     color="primary" 

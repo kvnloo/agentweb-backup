@@ -1,6 +1,7 @@
-browser-use>=0.2.0
+browser-use
 aiohttp>=3.8.0
 beautifulsoup4>=4.9.3
 python-dotenv>=0.21.1
 boto3>=1.26.137
-humanize>=4.11.0 
+humanize>=4.11.0
+PyJWT>=2.8.0 

@@ -5,8 +5,9 @@ import sys
 import os
 from typing import Dict, Any
 import browser_use
-from browser_use import Agent
+from browser_use import Agent, Controller
 from browser_use.browser.browser import Browser, BrowserConfig
+from browser_use.browser.context import BrowserContextConfig
 from langchain_aws import ChatBedrock
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from pydantic import SecretStr
@@ -14,13 +15,39 @@ import boto3
 from botocore.config import Config
 from dotenv import load_dotenv
 import logging
+from pathlib import Path
+from browser_use.agent.views import ActionResult
 
 # Load environment variables
 load_dotenv()
 
+# Get table prefix based on NODE_ENV
+TABLE_PREFIX = 'Dev-' if os.getenv('NODE_ENV') == 'development' else ''
+
+# Initialize DynamoDB client
+dynamodb = boto3.resource('dynamodb',
+    region_name=os.getenv('AWS_REGION', 'us-west-2'),
+    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
+)
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+controller = Controller()
+
+def decrypt_password(encrypted_password: str, user_id: str) -> str:
+    """Decrypt password using JWT_SECRET"""
+    try:
+        import jwt
+        decoded = jwt.decode(encrypted_password, os.getenv('JWT_SECRET'), algorithms=['HS256'])
+        if decoded['userId'] != user_id:
+            raise Exception("Invalid user ID in encrypted password")
+        return decoded['password']
+    except Exception as e:
+        logger.error(f"Error decrypting password: {e}")
+        raise Exception("Failed to decrypt password")
 
 def get_aws_bedrock_llm():
     """Initialize AWS Bedrock language model"""
@@ -123,26 +150,76 @@ def get_llm():
     # Initialize the LLM using the mapped function
     return init_func()
 
+global_user_id = None
+@controller.action('Get login credentials by domain')
+def get_login_credentials(domain: str):
+    """Get login credentials for a domain from the database"""
+    global global_user_id
+    if not global_user_id:
+        raise Exception("User ID not provided")
+    if not domain:
+        return ActionResult(error=f"Please provide a domain")
+        
+    table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
+    response = table.query(
+        KeyConditionExpression='userId = :userId',
+        FilterExpression='website = :website',
+        ExpressionAttributeValues={
+            ':userId': global_user_id,
+            ':website': domain
+        }
+    )
+
+    items = response.get('Items', [])
+    if not items:
+        return ActionResult(error=f"No credentials found for domain: {domain}")
+
+    config = items[0]
+    try:
+        decrypted_password = decrypt_password(config['password'], global_user_id)
+        return ActionResult(extracted_content=f"username: {config['username']}, password: {decrypted_password}")
+    except Exception as e:
+        return ActionResult(error=f"Error getting credentials: {str(e)}")
+
 class WebAgent:
-    def __init__(self):
+    def __init__(self, user_id=None):
+        global global_user_id
+        global_user_id = user_id
         self.browser = None
         self.agent = None
         self.llm = get_llm()
         self.task = None
         self.action_history = []
+        self.user_id = user_id
+        self.context_dir = Path('context')
+        self.context_dir.mkdir(exist_ok=True)
+
+    def _get_cookies_path(self):
+        """Get the path to the user's cookies file"""
+        if not self.user_id:
+            return None
+        return str(self.context_dir / f"{self.user_id}_cookies.json")
 
     async def setup(self):
         """Initialize the browser instance"""
         if not self.task:
             raise ValueError("Task must be set before setup")
-            
-        self.browser = Browser(config=BrowserConfig())
+        
+        # Create browser context config with user-specific cookies file
+        cookies_path = self._get_cookies_path()
+        context_config = BrowserContextConfig(
+            cookies_file=cookies_path if cookies_path else None
+        )
+        if cookies_path:
+            logger.info(f"Using cookies file for user {self.user_id}: {cookies_path}")
+
+        browser_config = BrowserConfig(new_context_config=context_config)
+        self.browser = Browser(config=browser_config)
         self.agent = Agent(
-            task=self.task,  # Use the stored task
+            task=self.task,
             llm=self.llm,
-            browser=self.browser,
-            use_vision=True,
-            max_actions_per_step=1
+            controller=controller,
+            browser=self.browser
         )
 
     async def cleanup(self):
@@ -206,9 +283,10 @@ async def main():
     parser = argparse.ArgumentParser(description='Web Agent for task automation')
     parser.add_argument('--task_id', required=True, help='Task ID')
     parser.add_argument('--prompt', required=True, help='Task prompt')
+    parser.add_argument('--user_id', required=True, help='User ID')
     args = parser.parse_args()
 
-    agent = WebAgent()
+    agent = WebAgent(args.user_id)
     try:
         result = await agent.execute_task(args.prompt)  # Setup is called inside execute_task now
         print(json.dumps(result))

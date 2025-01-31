@@ -127,13 +127,38 @@ ADMIN_PASSWORD=your_admin_password
 ```bash
 cd backend
 npm run build
-node dist/scripts/create-tables.js
+npx ts-node src/scripts/create-tables.ts
 ```
-This will create all required tables in DynamoDB:
+This will create all required tables in DynamoDB. Table names will be prefixed with "Dev-" in development environment and no prefix in production:
+
+Development Environment:
+- Dev-AW-Users: User accounts
+- Dev-AW-Tasks: Task definitions
+- Dev-AW-TaskExecutions: Task execution records
+- Dev-AW-Waitlist: Waitlist entries
+- Dev-AW-Subscribers: Task subscribers
+- Dev-AW-TaskSchedules: Task schedules
+- Dev-AW-Configs: User website configurations
+
+Production Environment:
 - AW-Users: User accounts
 - AW-Tasks: Task definitions
 - AW-TaskExecutions: Task execution records
 - AW-Waitlist: Waitlist entries
+- AW-Subscribers: Task subscribers
+- AW-TaskSchedules: Task schedules
+- AW-Configs: User website configurations
+
+The environment is determined by the NODE_ENV environment variable:
+```bash
+# For development tables (with "Dev-" prefix)
+NODE_ENV=development npx ts-node src/scripts/create-tables.ts
+
+# For production tables (no prefix)
+NODE_ENV=production npx ts-node src/scripts/create-tables.ts
+# or simply
+npx ts-node src/scripts/create-tables.ts
+```
 
 4. Start the backend server:
 ```bash

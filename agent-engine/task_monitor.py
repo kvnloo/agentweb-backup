@@ -360,7 +360,7 @@ async def execute_task(execution):
         update_execution_status(execution_id, 'running')
         
         # Initialize and run web agent
-        agent = WebAgent()
+        agent = WebAgent(task['userId'])
         try:
             # Include previous feedback in prompt if available
             prompt = task['prompt']
