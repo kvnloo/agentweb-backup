@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 import os
 import smtplib
-import boto3
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import logging
 from dotenv import load_dotenv
 from datetime import datetime
+from aws_utils import get_dynamodb_resource
 
 # Load environment variables
 load_dotenv()
@@ -17,11 +17,7 @@ TABLE_PREFIX = 'Dev-' if os.getenv('NODE_ENV') == 'development' else ''
 logger = logging.getLogger(__name__)
 
 # Initialize DynamoDB client with credentials
-dynamodb = boto3.resource('dynamodb',
-    region_name=os.getenv('AWS_REGION', 'us-west-2'),
-    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
-)
+dynamodb = get_dynamodb_resource()
 
 # Initialize tables with environment-specific prefixes
 subscribers_table = dynamodb.Table(f'{TABLE_PREFIX}AW-Subscribers')

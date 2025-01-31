@@ -11,12 +11,13 @@ from browser_use.browser.context import BrowserContextConfig
 from langchain_aws import ChatBedrock
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from pydantic import SecretStr
-import boto3
 from botocore.config import Config
 from dotenv import load_dotenv
 import logging
 from pathlib import Path
 from browser_use.agent.views import ActionResult
+from cookie_sync import CookieSync
+from aws_utils import get_dynamodb_resource, get_bedrock_client
 
 # Load environment variables
 load_dotenv()
@@ -25,11 +26,7 @@ load_dotenv()
 TABLE_PREFIX = 'Dev-' if os.getenv('NODE_ENV') == 'development' else ''
 
 # Initialize DynamoDB client
-dynamodb = boto3.resource('dynamodb',
-    region_name=os.getenv('AWS_REGION', 'us-west-2'),
-    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
-)
+dynamodb = get_dynamodb_resource()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -52,21 +49,8 @@ def decrypt_password(encrypted_password: str, user_id: str) -> str:
 def get_aws_bedrock_llm():
     """Initialize AWS Bedrock language model"""
     try:
-        # Configure AWS client with no retries
-        aws_config = Config(
-            retries = dict(
-                max_attempts = 1  # Disable AWS's internal retries
-            )
-        )
-
-        # Initialize AWS Bedrock client
-        bedrock = boto3.client(
-            service_name='bedrock-runtime',
-            region_name=os.getenv('AWS_REGION', 'us-west-2'),
-            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
-            config=aws_config
-        )
+        # Get Bedrock client with no retries
+        bedrock = get_bedrock_client()
 
         return ChatBedrock(
             client=bedrock,
@@ -194,6 +178,7 @@ class WebAgent:
         self.user_id = user_id
         self.context_dir = Path('context')
         self.context_dir.mkdir(exist_ok=True)
+        self.cookie_sync = CookieSync() if user_id else None
 
     def _get_cookies_path(self):
         """Get the path to the user's cookies file"""
@@ -208,8 +193,12 @@ class WebAgent:
         
         # Create browser context config with user-specific cookies file
         cookies_path = self._get_cookies_path()
+        if cookies_path and self.cookie_sync:
+            # Try to download cookies from S3 before starting
+            self.cookie_sync.download_cookies(self.user_id, cookies_path)
+            
         context_config = BrowserContextConfig(
-            cookies_file=cookies_path if cookies_path else None
+            cookies_file=cookies_path
         )
         if cookies_path:
             logger.info(f"Using cookies file for user {self.user_id}: {cookies_path}")
@@ -226,9 +215,19 @@ class WebAgent:
         )
 
     async def cleanup(self):
-        """Clean up browser resources"""
-        if self.browser:
-            await self.browser.close()
+        """Clean up browser resources and sync cookies"""
+        try:
+            if self.browser:
+                # Save cookies before closing
+                cookies_path = self._get_cookies_path()
+                if cookies_path and self.cookie_sync:
+                    # Upload cookies to S3 after task completion
+                    self.cookie_sync.upload_cookies(self.user_id, cookies_path)
+                
+                await self.browser.close()
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+            raise
 
     def get_action_history(self):
         """Get the list of actions performed by the agent"""
