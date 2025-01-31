@@ -24,8 +24,14 @@ import {
   ListItem,
   ListItemText,
   ListItemSecondaryAction,
+  Collapse,
+  Tooltip,
 } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
+import ContentCopyIcon from '@mui/icons-material/ContentCopy';
+import ThumbUpIcon from '@mui/icons-material/ThumbUp';
+import ThumbDownIcon from '@mui/icons-material/ThumbDown';
+import ThumbsUpDownIcon from '@mui/icons-material/ThumbsUpDown';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
 import ScheduleForm from '../components/ScheduleForm';
@@ -62,6 +68,50 @@ interface Subscriber {
   email: string;
   subscribedAt: string;
 }
+
+// Add CollapsibleText component
+const CollapsibleText = ({ text, maxLength = 150 }: { text: string, maxLength?: number }) => {
+  const [isExpanded, setIsExpanded] = useState(false);
+  const needsCollapse = text.length > maxLength;
+  
+  const handleCopy = () => {
+    navigator.clipboard.writeText(text);
+  };
+
+  return (
+    <Box>
+      <Typography 
+        variant="body2" 
+        sx={{ 
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-word',
+        }}
+      >
+        {isExpanded ? text : needsCollapse ? `${text.slice(0, maxLength)}...` : text}
+      </Typography>
+      <Box sx={{ mt: 1, display: 'flex', gap: 1 }}>
+        {needsCollapse && (
+          <Button 
+            size="small" 
+            onClick={() => setIsExpanded(!isExpanded)}
+            sx={{ minWidth: 'auto', p: 0 }}
+          >
+            {isExpanded ? 'Show Less' : 'Show More'}
+          </Button>
+        )}
+        <Tooltip title="Copy to clipboard">
+          <IconButton 
+            size="small" 
+            onClick={handleCopy}
+            sx={{ p: 0 }}
+          >
+            <ContentCopyIcon fontSize="small" />
+          </IconButton>
+        </Tooltip>
+      </Box>
+    </Box>
+  );
+};
 
 export default function TaskDetails() {
   const [task, setTask] = useState<Task | null>(null);
@@ -442,13 +492,13 @@ export default function TaskDetails() {
               <Table>
                 <TableHead>
                   <TableRow>
-                    <TableCell>Status</TableCell>
-                    <TableCell>Started</TableCell>
-                    <TableCell>Completed</TableCell>
-                    <TableCell>Prompt</TableCell>
-                    <TableCell>Result</TableCell>
-                    <TableCell>Details</TableCell>
-                    <TableCell>Feedback</TableCell>
+                    <TableCell width="100px">Status</TableCell>
+                    <TableCell width="150px">Started</TableCell>
+                    <TableCell width="150px">Completed</TableCell>
+                    <TableCell width="25%">Prompt</TableCell>
+                    <TableCell width="25%">Result</TableCell>
+                    <TableCell width="250px">Details</TableCell>
+                    <TableCell width="80px" align="center">Feedback</TableCell>
                   </TableRow>
                 </TableHead>
                 <TableBody>
@@ -469,29 +519,16 @@ export default function TaskDetails() {
                       </TableCell>
                       <TableCell>
                         {execution.prompt ? (
-                          <Typography 
-                            variant="body2" 
-                            sx={{ 
-                              maxWidth: '300px', 
-                              whiteSpace: 'pre-wrap',
-                              overflow: 'hidden',
-                              textOverflow: 'ellipsis',
-                              maxHeight: '100px'
-                            }}
-                          >
-                            {execution.prompt}
-                          </Typography>
+                          <CollapsibleText text={execution.prompt} />
                         ) : '-'}
                       </TableCell>
                       <TableCell>
                         {execution.error ? (
                           <Typography color="error" variant="body2">
-                            {execution.error}
+                            <CollapsibleText text={execution.error} />
                           </Typography>
                         ) : execution.result ? (
-                          <Typography variant="body2">
-                            {execution.result}
-                          </Typography>
+                          <CollapsibleText text={execution.result} />
                         ) : '-'}
                       </TableCell>
                       <TableCell>
@@ -510,26 +547,33 @@ export default function TaskDetails() {
                           </a>
                         ) : '-'}
                       </TableCell>
-                      <TableCell>
-                        <select
-                          value={execution.feedback || ''}
-                          onChange={(e) => {
-                            const value = e.target.value;
-                            handleFeedbackChange(
-                              execution.executionId,
-                              value === '' ? null : value as 'accepted' | 'rejected'
-                            );
-                          }}
-                          style={{
-                            padding: '8px',
-                            borderRadius: '4px',
-                            border: '1px solid #ccc'
-                          }}
-                        >
-                          <option value="">Select feedback</option>
-                          <option value="accepted">Accepted</option>
-                          <option value="rejected">Rejected</option>
-                        </select>
+                      <TableCell align="center">
+                        <Box sx={{ display: 'flex', justifyContent: 'center', gap: 0.5 }}>
+                          <Tooltip title={execution.feedback ? `Current: ${execution.feedback}` : 'Set feedback'}>
+                            <IconButton
+                              size="small"
+                              onClick={() => handleFeedbackChange(
+                                execution.executionId,
+                                execution.feedback === 'accepted' ? null : 'accepted'
+                              )}
+                              color={execution.feedback === 'accepted' ? 'success' : 'default'}
+                            >
+                              <ThumbUpIcon fontSize="small" />
+                            </IconButton>
+                          </Tooltip>
+                          <Tooltip title={execution.feedback ? `Current: ${execution.feedback}` : 'Set feedback'}>
+                            <IconButton
+                              size="small"
+                              onClick={() => handleFeedbackChange(
+                                execution.executionId,
+                                execution.feedback === 'rejected' ? null : 'rejected'
+                              )}
+                              color={execution.feedback === 'rejected' ? 'error' : 'default'}
+                            >
+                              <ThumbDownIcon fontSize="small" />
+                            </IconButton>
+                          </Tooltip>
+                        </Box>
                       </TableCell>
                     </TableRow>
                   ))}
