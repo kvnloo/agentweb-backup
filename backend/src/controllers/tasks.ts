@@ -93,7 +93,6 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
     const taskId = req.params.id;
     console.log('Updating task:', taskId);
     console.log('Request body:', req.body);
-    console.log('emailNotification in request:', req.body.emailNotification, typeof req.body.emailNotification);
 
     const task = await taskDb.getTaskById(taskId);
     console.log('Current task:', task);
@@ -107,10 +106,17 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    // Only send emailNotification field
-    const updates = {
-      emailNotification: Boolean(req.body.emailNotification)
-    };
+    // Build updates object based on what's provided
+    const updates: any = {};
+    
+    if (req.body.emailNotification !== undefined) {
+      updates.emailNotification = Boolean(req.body.emailNotification);
+    }
+    
+    if (req.body.prompt !== undefined) {
+      updates.prompt = req.body.prompt;
+    }
+
     console.log('Updates to apply:', updates);
 
     await taskDb.updateTask(taskId, updates);
@@ -118,9 +124,6 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
     // Get and return the updated task
     const updatedTask = await taskDb.getTaskById(taskId);
     console.log('Updated task:', updatedTask);
-    if (updatedTask) {
-      console.log('emailNotification in updated task:', updatedTask.emailNotification, typeof updatedTask.emailNotification);
-    }
     
     res.json(updatedTask);
   } catch (error) {

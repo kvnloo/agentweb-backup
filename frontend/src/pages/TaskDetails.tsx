@@ -24,8 +24,15 @@ import {
   ListItem,
   ListItemText,
   ListItemSecondaryAction,
+  Tooltip,
 } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
+import ContentCopyIcon from '@mui/icons-material/ContentCopy';
+import ThumbUpIcon from '@mui/icons-material/ThumbUp';
+import ThumbDownIcon from '@mui/icons-material/ThumbDown';
+import EditIcon from '@mui/icons-material/Edit';
+import SaveIcon from '@mui/icons-material/Save';
+import CancelIcon from '@mui/icons-material/Cancel';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
 import ScheduleForm from '../components/ScheduleForm';
@@ -55,12 +62,57 @@ interface TaskExecution {
   error?: string;
   feedback?: 'accepted' | 'rejected';
   details_gif?: string;
+  prompt?: string;
 }
 
 interface Subscriber {
   email: string;
   subscribedAt: string;
 }
+
+// Add CollapsibleText component
+const CollapsibleText = ({ text, maxLength = 150 }: { text: string, maxLength?: number }) => {
+  const [isExpanded, setIsExpanded] = useState(false);
+  const needsCollapse = text.length > maxLength;
+  
+  const handleCopy = () => {
+    navigator.clipboard.writeText(text);
+  };
+
+  return (
+    <Box>
+      <Typography 
+        variant="body2" 
+        sx={{ 
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-word',
+        }}
+      >
+        {isExpanded ? text : needsCollapse ? `${text.slice(0, maxLength)}...` : text}
+      </Typography>
+      <Box sx={{ mt: 1, display: 'flex', gap: 1 }}>
+        {needsCollapse && (
+          <Button 
+            size="small" 
+            onClick={() => setIsExpanded(!isExpanded)}
+            sx={{ minWidth: 'auto', p: 0 }}
+          >
+            {isExpanded ? 'Show Less' : 'Show More'}
+          </Button>
+        )}
+        <Tooltip title="Copy to clipboard">
+          <IconButton 
+            size="small" 
+            onClick={handleCopy}
+            sx={{ p: 0 }}
+          >
+            <ContentCopyIcon fontSize="small" />
+          </IconButton>
+        </Tooltip>
+      </Box>
+    </Box>
+  );
+};
 
 export default function TaskDetails() {
   const [task, setTask] = useState<Task | null>(null);
@@ -75,6 +127,8 @@ export default function TaskDetails() {
   const [subscribers, setSubscribers] = useState<Subscriber[]>([]);
   const [newSubscriberEmail, setNewSubscriberEmail] = useState('');
   const [subscriberError, setSubscriberError] = useState('');
+  const [isEditingPrompt, setIsEditingPrompt] = useState(false);
+  const [editedPrompt, setEditedPrompt] = useState('');
 
   const isAdminRoute = location.pathname.startsWith('/admin/');
   const showActions = !isAdminRoute || (task && user && task.userId === user.userId);
@@ -309,6 +363,38 @@ export default function TaskDetails() {
     }
   };
 
+  const handlePromptEdit = async () => {
+    try {
+      await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        { prompt: editedPrompt },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      
+      // Refresh task data
+      const updatedTask = await fetchTask();
+      if (updatedTask) {
+        setTask(updatedTask);
+      }
+      setIsEditingPrompt(false);
+    } catch (error: any) {
+      console.error('Error updating prompt:', error);
+      setError(error.response?.data?.message || 'Failed to update prompt');
+    }
+  };
+
+  const startEditing = () => {
+    if (task) {
+      setEditedPrompt(task.prompt);
+      setIsEditingPrompt(true);
+    }
+  };
+
+  const cancelEditing = () => {
+    setIsEditingPrompt(false);
+    setEditedPrompt('');
+  };
+
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
@@ -403,12 +489,53 @@ export default function TaskDetails() {
 
         <Grid container spacing={3}>
           <Grid item xs={12}>
-            <Typography variant="h6" gutterBottom>
-              Task Prompt
-            </Typography>
-            <Typography variant="body1" paragraph>
-              {task.prompt}
-            </Typography>
+            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+              <Typography variant="h6" gutterBottom>
+                Task Prompt
+              </Typography>
+              {showActions && !isEditingPrompt && (
+                <Tooltip title="Edit prompt">
+                  <IconButton onClick={startEditing} size="small">
+                    <EditIcon />
+                  </IconButton>
+                </Tooltip>
+              )}
+            </Box>
+            {isEditingPrompt ? (
+              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                <TextField
+                  multiline
+                  rows={4}
+                  fullWidth
+                  value={editedPrompt}
+                  onChange={(e) => setEditedPrompt(e.target.value)}
+                  variant="outlined"
+                />
+                <Box sx={{ display: 'flex', gap: 1, justifyContent: 'flex-end' }}>
+                  <Button
+                    startIcon={<CancelIcon />}
+                    onClick={cancelEditing}
+                    variant="outlined"
+                    color="inherit"
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    startIcon={<SaveIcon />}
+                    onClick={handlePromptEdit}
+                    variant="contained"
+                    color="primary"
+                    disabled={!editedPrompt.trim() || editedPrompt === task?.prompt}
+                  >
+                    Save
+                  </Button>
+                </Box>
+              </Box>
+            ) : (
+              <Typography variant="body1" paragraph>
+                {task.prompt}
+              </Typography>
+            )}
           </Grid>
 
           {task.summary && (
@@ -441,12 +568,13 @@ export default function TaskDetails() {
               <Table>
                 <TableHead>
                   <TableRow>
-                    <TableCell>Status</TableCell>
-                    <TableCell>Started</TableCell>
-                    <TableCell>Completed</TableCell>
-                    <TableCell>Result</TableCell>
-                    <TableCell>Details</TableCell>
-                    <TableCell>Feedback</TableCell>
+                    <TableCell width="100px">Status</TableCell>
+                    <TableCell width="150px">Started</TableCell>
+                    <TableCell width="150px">Completed</TableCell>
+                    <TableCell width="25%">Prompt</TableCell>
+                    <TableCell width="25%">Result</TableCell>
+                    <TableCell width="250px">Details</TableCell>
+                    <TableCell width="80px" align="center">Feedback</TableCell>
                   </TableRow>
                 </TableHead>
                 <TableBody>
@@ -466,14 +594,17 @@ export default function TaskDetails() {
                         {execution.completedAt ? new Date(execution.completedAt).toLocaleString() : '-'}
                       </TableCell>
                       <TableCell>
+                        {execution.prompt ? (
+                          <CollapsibleText text={execution.prompt} />
+                        ) : '-'}
+                      </TableCell>
+                      <TableCell>
                         {execution.error ? (
                           <Typography color="error" variant="body2">
-                            {execution.error}
+                            <CollapsibleText text={execution.error} />
                           </Typography>
                         ) : execution.result ? (
-                          <Typography variant="body2">
-                            {execution.result}
-                          </Typography>
+                          <CollapsibleText text={execution.result} />
                         ) : '-'}
                       </TableCell>
                       <TableCell>
@@ -492,26 +623,33 @@ export default function TaskDetails() {
                           </a>
                         ) : '-'}
                       </TableCell>
-                      <TableCell>
-                        <select
-                          value={execution.feedback || ''}
-                          onChange={(e) => {
-                            const value = e.target.value;
-                            handleFeedbackChange(
-                              execution.executionId,
-                              value === '' ? null : value as 'accepted' | 'rejected'
-                            );
-                          }}
-                          style={{
-                            padding: '8px',
-                            borderRadius: '4px',
-                            border: '1px solid #ccc'
-                          }}
-                        >
-                          <option value="">Select feedback</option>
-                          <option value="accepted">Accepted</option>
-                          <option value="rejected">Rejected</option>
-                        </select>
+                      <TableCell align="center">
+                        <Box sx={{ display: 'flex', justifyContent: 'center', gap: 0.5 }}>
+                          <Tooltip title={execution.feedback ? `Current: ${execution.feedback}` : 'Set feedback'}>
+                            <IconButton
+                              size="small"
+                              onClick={() => handleFeedbackChange(
+                                execution.executionId,
+                                execution.feedback === 'accepted' ? null : 'accepted'
+                              )}
+                              color={execution.feedback === 'accepted' ? 'success' : 'default'}
+                            >
+                              <ThumbUpIcon fontSize="small" />
+                            </IconButton>
+                          </Tooltip>
+                          <Tooltip title={execution.feedback ? `Current: ${execution.feedback}` : 'Set feedback'}>
+                            <IconButton
+                              size="small"
+                              onClick={() => handleFeedbackChange(
+                                execution.executionId,
+                                execution.feedback === 'rejected' ? null : 'rejected'
+                              )}
+                              color={execution.feedback === 'rejected' ? 'error' : 'default'}
+                            >
+                              <ThumbDownIcon fontSize="small" />
+                            </IconButton>
+                          </Tooltip>
+                        </Box>
                       </TableCell>
                     </TableRow>
                   ))}

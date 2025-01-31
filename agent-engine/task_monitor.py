@@ -209,7 +209,7 @@ async def process_schedules():
     except Exception as e:
         logger.error(f"Error in process_schedules: {e}")
 
-def update_execution_status(execution_id, status, result=None, error=None, details_gif=None):
+def update_execution_status(execution_id, status, result=None, error=None, details_gif=None, prompt=None):
     try:
         update_expression = "SET #status = :status"
         expression_values = {
@@ -237,6 +237,10 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
         if details_gif is not None:
             update_expression += ", details_gif = :detailsGif"
             expression_values[':detailsGif'] = details_gif
+
+        if prompt is not None:
+            update_expression += ", prompt = :prompt"
+            expression_values[':prompt'] = prompt
 
         # Get the execution to get the taskId and startTime
         execution = executions_table.get_item(Key={'executionId': execution_id}).get('Item')
@@ -356,17 +360,17 @@ async def execute_task(execution):
                 'time_ago': time_ago
             }
 
-        # Update execution status to running
-        update_execution_status(execution_id, 'running')
+        # Prepare the prompt with previous feedback
+        prompt = task['prompt']
+        if previous_feedback:
+            prompt = f"{prompt}\n\nNote: Previous attempt {previous_feedback['time_ago']} was {previous_feedback['feedback']}. Previous result: {previous_feedback['result']}"
+
+        # Update execution status to running and include the prompt
+        update_execution_status(execution_id, 'running', prompt=prompt)
         
         # Initialize and run web agent
         agent = WebAgent(task['userId'])
         try:
-            # Include previous feedback in prompt if available
-            prompt = task['prompt']
-            if previous_feedback:
-                prompt = f"{prompt}\n\nNote: Previous attempt {previous_feedback['time_ago']} was {previous_feedback['feedback']}. Previous result: {previous_feedback['result']}"
-            
             # Remove existing GIF file if it exists
             gif_path = Path("agent_history.gif")
             if gif_path.exists():
