@@ -32,6 +32,9 @@ import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import ThumbUpIcon from '@mui/icons-material/ThumbUp';
 import ThumbDownIcon from '@mui/icons-material/ThumbDown';
 import ThumbsUpDownIcon from '@mui/icons-material/ThumbsUpDown';
+import EditIcon from '@mui/icons-material/Edit';
+import SaveIcon from '@mui/icons-material/Save';
+import CancelIcon from '@mui/icons-material/Cancel';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
 import ScheduleForm from '../components/ScheduleForm';
@@ -126,6 +129,8 @@ export default function TaskDetails() {
   const [subscribers, setSubscribers] = useState<Subscriber[]>([]);
   const [newSubscriberEmail, setNewSubscriberEmail] = useState('');
   const [subscriberError, setSubscriberError] = useState('');
+  const [isEditingPrompt, setIsEditingPrompt] = useState(false);
+  const [editedPrompt, setEditedPrompt] = useState('');
 
   const isAdminRoute = location.pathname.startsWith('/admin/');
   const showActions = !isAdminRoute || (task && user && task.userId === user.userId);
@@ -360,6 +365,38 @@ export default function TaskDetails() {
     }
   };
 
+  const handlePromptEdit = async () => {
+    try {
+      await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        { prompt: editedPrompt },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      
+      // Refresh task data
+      const updatedTask = await fetchTask();
+      if (updatedTask) {
+        setTask(updatedTask);
+      }
+      setIsEditingPrompt(false);
+    } catch (error: any) {
+      console.error('Error updating prompt:', error);
+      setError(error.response?.data?.message || 'Failed to update prompt');
+    }
+  };
+
+  const startEditing = () => {
+    if (task) {
+      setEditedPrompt(task.prompt);
+      setIsEditingPrompt(true);
+    }
+  };
+
+  const cancelEditing = () => {
+    setIsEditingPrompt(false);
+    setEditedPrompt('');
+  };
+
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
@@ -454,12 +491,53 @@ export default function TaskDetails() {
 
         <Grid container spacing={3}>
           <Grid item xs={12}>
-            <Typography variant="h6" gutterBottom>
-              Task Prompt
-            </Typography>
-            <Typography variant="body1" paragraph>
-              {task.prompt}
-            </Typography>
+            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+              <Typography variant="h6" gutterBottom>
+                Task Prompt
+              </Typography>
+              {showActions && !isEditingPrompt && (
+                <Tooltip title="Edit prompt">
+                  <IconButton onClick={startEditing} size="small">
+                    <EditIcon />
+                  </IconButton>
+                </Tooltip>
+              )}
+            </Box>
+            {isEditingPrompt ? (
+              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                <TextField
+                  multiline
+                  rows={4}
+                  fullWidth
+                  value={editedPrompt}
+                  onChange={(e) => setEditedPrompt(e.target.value)}
+                  variant="outlined"
+                />
+                <Box sx={{ display: 'flex', gap: 1, justifyContent: 'flex-end' }}>
+                  <Button
+                    startIcon={<CancelIcon />}
+                    onClick={cancelEditing}
+                    variant="outlined"
+                    color="inherit"
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    startIcon={<SaveIcon />}
+                    onClick={handlePromptEdit}
+                    variant="contained"
+                    color="primary"
+                    disabled={!editedPrompt.trim() || editedPrompt === task?.prompt}
+                  >
+                    Save
+                  </Button>
+                </Box>
+              </Box>
+            ) : (
+              <Typography variant="body1" paragraph>
+                {task.prompt}
+              </Typography>
+            )}
           </Grid>
 
           {task.summary && (
