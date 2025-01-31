@@ -84,10 +84,11 @@ def get_azure_openai_llm():
     """Initialize Azure OpenAI language model"""
     try:
         return AzureChatOpenAI(
+            model_name='gpt-4o',
             azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT'),
             azure_deployment=os.getenv('AZURE_OPENAI_DEPLOYMENT'),
             api_key=os.getenv('AZURE_OPENAI_API_KEY'),
-            api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-05-01-preview'),
+            api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-08-01-preview'),
             temperature=0.0
         )
     except Exception as e:
