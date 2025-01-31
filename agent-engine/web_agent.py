@@ -213,7 +213,9 @@ class WebAgent:
         if cookies_path:
             logger.info(f"Using cookies file for user {self.user_id}: {cookies_path}")
 
-        browser_config = BrowserConfig(new_context_config=context_config)
+        # Get headless mode from environment variable, default to False if not set
+        headless = os.getenv('BROWSER_HEADLESS', 'true').lower() == 'true'
+        browser_config = BrowserConfig(new_context_config=context_config, headless=headless)
         self.browser = Browser(config=browser_config)
         self.agent = Agent(
             task=self.task,
