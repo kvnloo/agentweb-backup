@@ -37,6 +37,18 @@ logger = logging.getLogger(__name__)
 
 controller = Controller()
 
+def decrypt_password(encrypted_password: str, user_id: str) -> str:
+    """Decrypt password using JWT_SECRET"""
+    try:
+        import jwt
+        decoded = jwt.decode(encrypted_password, os.getenv('JWT_SECRET'), algorithms=['HS256'])
+        if decoded['userId'] != user_id:
+            raise Exception("Invalid user ID in encrypted password")
+        return decoded['password']
+    except Exception as e:
+        logger.error(f"Error decrypting password: {e}")
+        raise Exception("Failed to decrypt password")
+
 def get_aws_bedrock_llm():
     """Initialize AWS Bedrock language model"""
     try:
@@ -163,7 +175,11 @@ def get_login_credentials(domain: str):
         return ActionResult(error=f"No credentials found for domain: {domain}")
 
     config = items[0]
-    return ActionResult(extracted_content=f"username: {config['username']}, password: {config['password']}")
+    try:
+        decrypted_password = decrypt_password(config['password'], global_user_id)
+        return ActionResult(extracted_content=f"username: {config['username']}, password: {decrypted_password}")
+    except Exception as e:
+        return ActionResult(error=f"Error getting credentials: {str(e)}")
 
 class WebAgent:
     def __init__(self, user_id=None):

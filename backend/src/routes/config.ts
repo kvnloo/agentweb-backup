@@ -2,12 +2,18 @@ import { Router } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { DynamoDB } from 'aws-sdk';
 import { v4 as uuidv4 } from 'uuid';
+import jwt from 'jsonwebtoken';
 
 const router = Router();
 const dynamodb = new DynamoDB.DocumentClient();
 
 // Get table prefix based on NODE_ENV
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+
+// Function to encrypt password
+function encryptPassword(password: string, userId: string): string {
+  return jwt.sign({ password, userId }, process.env.JWT_SECRET!);
+}
 
 // Get user's saved configurations
 router.get('/', authenticateToken, async (req, res) => {
@@ -44,7 +50,7 @@ router.post('/', authenticateToken, async (req, res) => {
       userId,
       website,
       username,
-      password: password, // Note: In production, consider encrypting this
+      password: encryptPassword(password, userId),
       createdAt: new Date().toISOString()
     };
 
