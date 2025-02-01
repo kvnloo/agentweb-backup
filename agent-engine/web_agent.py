@@ -246,6 +246,8 @@ class WebAgent:
             
             # Get the last message from the agent's history
             last_message = None
+            task_is_done = False  # Initialize task_is_done
+            
             if hasattr(self.agent, 'history'):
                 logger.info("Agent has history attribute")
                 history = self.agent.history.history
@@ -256,11 +258,11 @@ class WebAgent:
                         # Get the extracted content from the last action result
                         action_result = history[-1].result[0]  # First result from the last action
                         logger.info(f"Action result: {action_result}")
-                        if hasattr(action_result, 'is_done') and action_result.is_done:
+                        task_is_done = hasattr(action_result, 'is_done') and action_result.is_done
+                        if task_is_done:
                             last_message = action_result.extracted_content
-                            logger.info(f"Extracted summary: {last_message}")
                         else:
-                            logger.warning(f"Last action result is not done: {action_result}")
+                            last_message = action_result.error
                     else:
                         logger.warning("Last history entry has no result")
                 else:
@@ -269,16 +271,14 @@ class WebAgent:
                 logger.warning("Agent has no history attribute")
             
             return {
-                "success": True,
-                "message": "Task completed successfully",
-                "summary": last_message if last_message else "Task completed but no summary available"
+                "success": task_is_done,
+                "summary" if task_is_done else "error": last_message if last_message else ("Task completed but no summary available" if task_is_done else "No error details available")
             }
         except Exception as e:
             logger.error(f"Error in execute_task: {e}")
             return {
                 "success": False,
-                "error": str(e),
-                "message": "Task execution failed"
+                "error": str(e)
             }
 
 async def main():
