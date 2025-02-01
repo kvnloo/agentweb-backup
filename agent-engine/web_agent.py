@@ -67,10 +67,13 @@ def get_aws_bedrock_llm():
 def get_azure_openai_llm():
     """Initialize Azure OpenAI language model"""
     try:
+        model_name = os.getenv('AZURE_OPENAI_MODEL', 'gpt-4o')
+        deployment_name = os.getenv('AZURE_OPENAI_DEPLOYMENT', 'agentweb')
+        
         return AzureChatOpenAI(
-            model_name='gpt-4o',
+            model_name=model_name,
             azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT'),
-            azure_deployment=os.getenv('AZURE_OPENAI_DEPLOYMENT'),
+            azure_deployment=deployment_name,
             api_key=os.getenv('AZURE_OPENAI_API_KEY'),
             api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-08-01-preview'),
             temperature=0.0
