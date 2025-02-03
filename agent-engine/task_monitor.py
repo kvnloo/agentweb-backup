@@ -80,6 +80,8 @@ logger.info(f"Using table prefix: {TABLE_PREFIX}")
 
 # Add last_execution_time as a module-level variable
 last_execution_time = None
+running_task_count = 0
+running_user_ids = set()
 
 def get_pending_executions():
     global last_execution_time
@@ -303,10 +305,15 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
         logger.error(f"Error updating execution status: {e}")
 
 async def execute_task(execution):
+    global running_task_count, running_user_ids
     execution_id = execution['executionId']
     task_id = execution['taskId']
+    user_id = execution['userId']
     
     try:
+        running_task_count += 1
+        running_user_ids.add(user_id)
+        
         # Get task details
         task_response = tasks_table.get_item(Key={'taskId': task_id})
         task = task_response.get('Item')
@@ -404,10 +411,14 @@ async def execute_task(execution):
     except Exception as e:
         logger.error(f"Error executing task: {e}")
         update_execution_status(execution_id, 'failed', error=str(e))
+    finally:
+        running_task_count -= 1
+        running_user_ids.remove(user_id)
 
 async def monitor_executions():
     INTERVAL = 5
-    logger.info(f"Starting execution monitor with interval of {INTERVAL} seconds...")
+    MAX_CONCURRENT = int(os.getenv('MAX_CONCURRENT_TASKS', '3'))
+    logger.info(f"Starting execution monitor with interval of {INTERVAL} seconds, max concurrent tasks: {MAX_CONCURRENT}...")
     
     while True:
         try:
@@ -417,11 +428,14 @@ async def monitor_executions():
             # Then process pending executions
             pending_executions = get_pending_executions()
             
-            for execution in pending_executions:
-                logger.info(f"Processing execution {execution['executionId']}")
-                await execute_task(execution)
+            # Run up to MAX_CONCURRENT tasks, ensuring no duplicate userIds
+            if pending_executions and running_task_count < MAX_CONCURRENT:
+                for execution in pending_executions:
+                    user_id = execution['userId']
+                    if user_id not in running_user_ids and running_task_count < MAX_CONCURRENT:
+                        asyncio.create_task(execute_task(execution))
             
-            await asyncio.sleep(INTERVAL)  # Check every INTERVAL seconds
+            await asyncio.sleep(INTERVAL)
 
         except Exception as e:
             logger.error(f"Error in monitor loop: {e}")
