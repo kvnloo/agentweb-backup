@@ -101,6 +101,24 @@ def get_deepseek_llm():
         logger.error("Please ensure DEEPSEEK_API_KEY environment variable is set correctly.")
         sys.exit(1)
 
+def get_openai_llm():
+    """Initialize OpenAI language model"""
+    try:
+        api_key = os.getenv('OPENAI_API_KEY')
+        if not api_key:
+            raise ValueError('OPENAI_API_KEY is not set')
+            
+        model = os.getenv('OPENAI_MODEL', 'gpt-4o')
+        return ChatOpenAI(
+            model=model,
+            api_key=SecretStr(api_key),
+            temperature=0.0
+        )
+    except Exception as e:
+        logger.error(f"Error initializing OpenAI: {e}")
+        logger.error("Please ensure OPENAI_API_KEY environment variable is set correctly.")
+        sys.exit(1)
+
 def get_llm():
     """Get the appropriate language model based on environment configuration"""
     # Define valid platform-provider combinations with their initialization functions
@@ -113,6 +131,9 @@ def get_llm():
         },
         "deepseek": {
             "deepseek": get_deepseek_llm
+        },
+        "openai": {
+            "openai": get_openai_llm
         }
     }
 
