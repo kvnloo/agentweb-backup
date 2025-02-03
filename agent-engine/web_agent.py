@@ -32,6 +32,8 @@ dynamodb = get_dynamodb_resource()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+global_use_vision = True
+
 controller = Controller()
 
 def decrypt_password(encrypted_password: str, user_id: str) -> str:
@@ -46,7 +48,7 @@ def decrypt_password(encrypted_password: str, user_id: str) -> str:
         logger.error(f"Error decrypting password: {e}")
         raise Exception("Failed to decrypt password")
 
-def get_aws_bedrock_llm():
+def get_aws_bedrock_llm(model_name: str):
     """Initialize AWS Bedrock language model"""
     try:
         # Get Bedrock client with no retries
@@ -54,7 +56,7 @@ def get_aws_bedrock_llm():
 
         return ChatBedrock(
             client=bedrock,
-            model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",
+            model_id=model_name,
             model_kwargs={"temperature": 0.0}
         )
     except Exception as e:
@@ -64,10 +66,9 @@ def get_aws_bedrock_llm():
             sys.exit(1)
         raise
 
-def get_azure_openai_llm():
+def get_azure_openai_llm(model_name: str):
     """Initialize Azure OpenAI language model"""
     try:
-        model_name = os.getenv('AZURE_OPENAI_MODEL', 'gpt-4o')
         deployment_name = os.getenv('AZURE_OPENAI_DEPLOYMENT', 'agentweb')
         
         return AzureChatOpenAI(
@@ -83,7 +84,7 @@ def get_azure_openai_llm():
         logger.error("Please ensure all Azure OpenAI environment variables are set correctly.")
         sys.exit(1)
 
-def get_deepseek_llm():
+def get_deepseek_llm(model_name: str):
     """Initialize DeepSeek language model"""
     try:
         api_key = os.getenv('DEEPSEEK_API_KEY')
@@ -92,7 +93,7 @@ def get_deepseek_llm():
             
         return ChatOpenAI(
             base_url='https://api.deepseek.com/v1',
-            model='deepseek-reasoner',
+            model=model_name,
             api_key=SecretStr(api_key),
             temperature=0.0
         )
@@ -101,16 +102,15 @@ def get_deepseek_llm():
         logger.error("Please ensure DEEPSEEK_API_KEY environment variable is set correctly.")
         sys.exit(1)
 
-def get_openai_llm():
+def get_openai_llm(model_name: str):
     """Initialize OpenAI language model"""
     try:
         api_key = os.getenv('OPENAI_API_KEY')
         if not api_key:
             raise ValueError('OPENAI_API_KEY is not set')
             
-        model = os.getenv('OPENAI_MODEL', 'gpt-4o')
         return ChatOpenAI(
-            model=model,
+            model=model_name,
             api_key=SecretStr(api_key),
             temperature=0.0
         )
@@ -119,45 +119,88 @@ def get_openai_llm():
         logger.error("Please ensure OPENAI_API_KEY environment variable is set correctly.")
         sys.exit(1)
 
+def get_openai_llm_think(model_name: str):
+    """Initialize OpenAI language model"""
+    global global_use_vision
+    try:
+        api_key = os.getenv('OPENAI_API_KEY')
+        if not api_key:
+            raise ValueError('OPENAI_API_KEY is not set')
+            
+        # For think model such as o3-mini, we disable vision: https://github.com/browser-use/browser-use/issues/283
+        global_use_vision = False
+        logger.warning(f"Vision is disabled for {model_name}. Execution details in gif will not be available.")
+        return ChatOpenAI(
+            model=model_name,
+            api_key=SecretStr(api_key),
+            disabled_params={"parallel_tool_calls": None}
+        )
+    except Exception as e:
+        logger.error(f"Error initializing OpenAI: {e}")
+        logger.error("Please ensure OPENAI_API_KEY environment variable is set correctly.")
+        sys.exit(1)
+
 def get_llm():
     """Get the appropriate language model based on environment configuration"""
-    # Define valid platform-provider combinations with their initialization functions
+    # Define valid platform-provider-model combinations with their initialization functions
     VALID_CONFIGURATIONS = {
         "aws": {
-            "anthropic": get_aws_bedrock_llm
+            "anthropic": {
+                "anthropic.claude-3-5-sonnet-20241022-v2:0": get_aws_bedrock_llm
+            }
         },
         "azure": {
-            "openai": get_azure_openai_llm
+            "openai": {
+                "gpt-4o": get_azure_openai_llm
+            }
         },
         "deepseek": {
-            "deepseek": get_deepseek_llm
+            "deepseek": {
+                "deepseek-reasoner": get_deepseek_llm
+            }
         },
         "openai": {
-            "openai": get_openai_llm
+            "openai": {
+                "gpt-4o": get_openai_llm,
+                "o3-mini": get_openai_llm_think
+            }
         }
     }
 
-    llm_platform = os.getenv('LLM_Deployment_Platform', 'aws').lower()
-    llm_provider = os.getenv('LLM_Provider', 'anthropic').lower()
+    # Get and parse FULL_LLM_NAME
+    full_llm_name = os.getenv('FULL_LLM_NAME', 'aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0')
+    try:
+        platform, provider, model_name = full_llm_name.lower().split('->')
+    except ValueError:
+        logger.error(f"Invalid FULL_LLM_NAME format: {full_llm_name}")
+        logger.error("Format should be <platform>-><provider>-><model>")
+        sys.exit(1)
     
-    logger.info(f"Requested LLM configuration - Platform: {llm_platform}, Provider: {llm_provider}")
+    logger.info(f"Initializing LLM - Platform: {platform}, Provider: {provider}, Model: {model_name}")
 
-    # Get the provider-function mapping for the platform
-    platform_config = VALID_CONFIGURATIONS.get(llm_platform, {})
+    # Get the provider mapping for the platform
+    platform_config = VALID_CONFIGURATIONS.get(platform)
     if not platform_config:
-        logger.error(f"Unsupported platform: {llm_platform}")
+        logger.error(f"Unsupported platform: {platform}")
         logger.error(f"Valid platforms are: {list(VALID_CONFIGURATIONS.keys())}")
         sys.exit(1)
 
-    # Get the initialization function for the provider
-    init_func = platform_config.get(llm_provider)
+    # Get the model mapping for the provider
+    provider_config = platform_config.get(provider)
+    if not provider_config:
+        logger.error(f"Invalid provider '{provider}' for platform '{platform}'")
+        logger.error(f"Valid providers for {platform} are: {list(platform_config.keys())}")
+        sys.exit(1)
+
+    # Get the initialization function for the model
+    init_func = provider_config.get(model_name)
     if not init_func:
-        logger.error(f"Invalid provider '{llm_provider}' for platform '{llm_platform}'")
-        logger.error(f"Valid providers for {llm_platform} are: {list(platform_config.keys())}")
+        logger.error(f"Invalid model '{model_name}' for provider '{provider}' on platform '{platform}'")
+        logger.error(f"Valid models are: {list(provider_config.keys())}")
         sys.exit(1)
 
     # Initialize the LLM using the mapped function
-    return init_func()
+    return init_func(model_name), full_llm_name
 
 global_user_id = None
 @controller.action('Get login credentials by domain')
@@ -196,7 +239,7 @@ class WebAgent:
         global_user_id = user_id
         self.browser = None
         self.agent = None
-        self.llm = get_llm()
+        self.llm, self.llm_name = get_llm()
         self.task = None
         self.action_history = []
         self.user_id = user_id
@@ -235,7 +278,8 @@ class WebAgent:
             task=self.task,
             llm=self.llm,
             controller=controller,
-            browser=self.browser
+            browser=self.browser,
+            use_vision=global_use_vision
         )
 
     async def cleanup(self):
@@ -296,13 +340,15 @@ class WebAgent:
             
             return {
                 "success": task_is_done,
-                "summary" if task_is_done else "error": last_message if last_message else ("Task completed but no summary available" if task_is_done else "No error details available")
+                "summary" if task_is_done else "error": last_message if last_message else ("Task completed but no summary available" if task_is_done else "No error details available"),
+                "llmName": self.llm_name
             }
         except Exception as e:
             logger.error(f"Error in execute_task: {e}")
             return {
                 "success": False,
-                "error": str(e)
+                "error": str(e),
+                "llmName": self.llm_name
             }
 
 async def main():

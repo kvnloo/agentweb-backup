@@ -208,7 +208,7 @@ async def process_schedules():
     except Exception as e:
         logger.error(f"Error in process_schedules: {e}")
 
-def update_execution_status(execution_id, status, result=None, error=None, details_gif=None, prompt=None):
+def update_execution_status(execution_id, status, result=None, error=None, details_gif=None, prompt=None, llm_name=None):
     try:
         update_expression = "SET #status = :status"
         expression_values = {
@@ -240,6 +240,10 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
         if prompt is not None:
             update_expression += ", prompt = :prompt"
             expression_values[':prompt'] = prompt
+
+        if llm_name is not None:
+            update_expression += ", llmName = :llmName"
+            expression_values[':llmName'] = llm_name
 
         # Get the execution to get the taskId and startTime
         execution = executions_table.get_item(Key={'executionId': execution_id}).get('Item')
@@ -396,14 +400,16 @@ async def execute_task(execution):
                     execution_id, 
                     'completed', 
                     result=result.get('summary', 'No summary available'),
-                    details_gif=details_gif
+                    details_gif=details_gif,
+                    llm_name=result.get('llmName')
                 )
             else:
                 update_execution_status(
                     execution_id, 
                     'failed', 
                     error=result.get('error', 'Unknown error'),
-                    details_gif=details_gif
+                    details_gif=details_gif,
+                    llm_name=result.get('llmName')
                 )
         finally:
             await agent.cleanup()
