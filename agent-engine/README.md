@@ -141,6 +141,13 @@ View complete task details and history:
 http://localhost:3000/tasks/123456
 ```
 
+### Azure OpenAI Configuration
+- `AZURE_OPENAI_ENDPOINT`: Your Azure OpenAI service endpoint URL
+- `AZURE_OPENAI_API_KEY`: Your Azure OpenAI API key
+- `AZURE_OPENAI_API_VERSION`: API version (defaults to '2024-08-01-preview')
+- `AZURE_OPENAI_MODEL`: Model to use (defaults to 'gpt-4o')
+- `AZURE_OPENAI_DEPLOYMENT`: Optional deployment name (if not set, uses 'agentweb')
+
 ## Database Schema
 
 ### AW-TaskExecutions
