@@ -202,22 +202,21 @@ def get_llm():
     # Initialize the LLM using the mapped function
     return init_func(model_name), full_llm_name
 
-global_user_id = None
 @controller.action('Get login credentials by domain')
-def get_login_credentials(domain: str):
+def get_login_credentials(domain: str, user_id: str):
     """Get login credentials for a domain from the database"""
-    global global_user_id
-    if not global_user_id:
+    if not user_id:
         raise Exception("User ID not provided")
     if not domain:
         return ActionResult(error=f"Please provide a domain")
+    logger.info(f"Getting login credentials for domain {domain} under user {user_id}")
         
     table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
     response = table.query(
         KeyConditionExpression='userId = :userId',
         FilterExpression='website = :website',
         ExpressionAttributeValues={
-            ':userId': global_user_id,
+            ':userId': user_id,
             ':website': domain
         }
     )
@@ -228,15 +227,14 @@ def get_login_credentials(domain: str):
 
     config = items[0]
     try:
-        decrypted_password = decrypt_password(config['password'], global_user_id)
+        decrypted_password = decrypt_password(config['password'], user_id)
         return ActionResult(extracted_content=f"username: {config['username']}, password: {decrypted_password}")
     except Exception as e:
         return ActionResult(error=f"Error getting credentials: {str(e)}")
 
 class WebAgent:
     def __init__(self, user_id=None):
-        global global_user_id
-        global_user_id = user_id
+        logger.info(f"Initializing WebAgent for user {user_id}")
         self.browser = None
         self.agent = None
         self.llm, self.llm_name = get_llm()
