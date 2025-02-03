@@ -368,23 +368,28 @@ async def execute_task(execution):
                 'time_ago': time_ago
             }
 
-        # Prepare the prompt with previous feedback
-        prompt = task['prompt']
+        # Prepare the prompt with previous feedback and user_id context
+        base_prompt = task['prompt']
+        
         if previous_feedback:
-            prompt = f"{prompt}\n\nNote: Previous attempt {previous_feedback['time_ago']} was {previous_feedback['feedback']}. Previous result: {previous_feedback['result']}"
-
+            prompt = f"Task: {base_prompt}\n\nNote: Previous attempt {previous_feedback['time_ago']} was {previous_feedback['feedback']}. Previous result: {previous_feedback['result']}"
+        else:
+            prompt = f"Task: {base_prompt}"
+        
         # Update execution status to running and include the prompt
         update_execution_status(execution_id, 'running', prompt=prompt)
         
         # Initialize and run web agent
-        agent = WebAgent(task['userId'])
+        agent = WebAgent(user_id)
         try:
             # Remove existing GIF file if it exists
             gif_path = Path("agent_history.gif")
             if gif_path.exists():
                 gif_path.unlink()
             
-            result = await agent.execute_task(prompt)
+            context = f"You are executing this task for user_id: {user_id}. When using get_login_credentials action, you must pass this user_id as a parameter along with the domain."
+            prompt_with_context = f"{prompt}\n\n{context}"
+            result = await agent.execute_task(prompt_with_context)
             
             # Check for agent_history.gif and upload if exists
             details_gif = None
