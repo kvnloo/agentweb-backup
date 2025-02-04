@@ -310,34 +310,20 @@ class WebAgent:
             await self.setup()  # Setup after we have the task
             
             # Run the agent
-            await self.agent.run(max_steps=25)
+            result = await self.agent.run(max_steps=25)
             
-            # Get the last message from the agent's history
-            last_message = None
             task_is_done = False  # Initialize task_is_done
-            
-            if hasattr(self.agent, 'history'):
-                history = self.agent.history.history
-                if history:
-                    if history[-1].result:
-                        # Get the extracted content from the last action result
-                        action_result = history[-1].result[0]  # First result from the last action
-                        logger.info(f"Action result: {action_result}")
-                        task_is_done = hasattr(action_result, 'is_done') and action_result.is_done
-                        if task_is_done:
-                            last_message = action_result.extracted_content
-                        else:
-                            last_message = action_result.error
-                    else:
-                        logger.warning("Last history entry has no result")
-                else:
-                    logger.warning("History is empty")
-            else:
-                logger.warning("Agent has no history attribute")
+            agent_message = None
+            if result.is_done():
+                task_is_done = True
+                agent_message = result.history[-1].result[-1].extracted_content
+
+            if agent_message is None:
+                agent_message = 'Oops! Something went wrong while running AgentWeb.'
             
             return {
                 "success": task_is_done,
-                "summary" if task_is_done else "error": last_message if last_message else ("Task completed but no summary available" if task_is_done else "No error details available"),
+                "summary" if task_is_done else "error": agent_message,
                 "llmName": self.llm_name
             }
         except Exception as e:
