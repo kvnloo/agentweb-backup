@@ -379,48 +379,79 @@ async def execute_task(execution):
         # Update execution status to running and include the prompt
         update_execution_status(execution_id, 'running', prompt=prompt)
         
-        # Get LLM name from task or environment
-        llm_name = task.get('llmName') or os.getenv('FULL_LLM_NAME', 'aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0')
+        # Get LLM names from task or environment
+        llm_names = []
+        if task.get('llmName'):
+            llm_names = [task['llmName']]
+        else:
+            env_llm_names = os.getenv('LIST_FULL_LLM_NAMES', 'aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0')
+            # Add each non-empty name if not already in the list
+            for name in env_llm_names.split(','):
+                name = name.strip()
+                if name and name not in llm_names:
+                    llm_names.append(name)
         
-        # Initialize and run web agent
-        agent = WebAgent(user_id, llm_name)
-        try:
-            # Remove existing GIF file if it exists
-            gif_path = Path("agent_history.gif")
-            if gif_path.exists():
-                gif_path.unlink()
-            
-            context = f"You are executing this task for user_id: {user_id}. When using get_login_credentials action, you must pass this user_id as a parameter along with the domain."
-            prompt_with_context = f"{prompt}\n\n{context}"
-            result = await agent.execute_task(prompt_with_context)
-            
-            # Check for agent_history.gif and upload if exists
-            details_gif = None
-            if Path("agent_history.gif").exists():
-                s3_client = get_s3_client()
-                random_suffix = ''.join(str(uuid.uuid4())[:6])
-                filename = f"agent_history_{execution_id}_{random_suffix}.gif"
-                s3_client.upload_file("agent_history.gif", os.getenv('AWS_S3_BUCKET'), f"execution_gifs/{filename}", ExtraArgs={'ContentType': 'image/gif'})
-                details_gif=f"https://{os.getenv('AWS_S3_BUCKET')}.s3.amazonaws.com/execution_gifs/{filename}"
-            
-            if result['success']:
-                update_execution_status(
-                    execution_id, 
-                    'completed', 
-                    result=result.get('summary', 'No summary available'),
-                    details_gif=details_gif,
-                    llm_name=result.get('llmName')
-                )
-            else:
-                update_execution_status(
-                    execution_id, 
-                    'failed', 
-                    error=result.get('error', 'Unknown error'),
-                    details_gif=details_gif,
-                    llm_name=result.get('llmName')
-                )
-        finally:
-            await agent.cleanup()
+        if not llm_names:
+            raise ValueError("No valid LLM names provided")
+
+        logger.info(f"Will try LLMs in order: {llm_names}")
+        
+        last_error = None
+        success = False
+        
+        context = f"You are executing this task for user_id: {user_id}. When using get_login_credentials action, you must pass this user_id as a parameter along with the domain."
+        prompt_with_context = f"{prompt}\n\n{context}"
+
+        # Try each LLM in sequence until one succeeds
+        for llm_name in llm_names:
+            agent = None
+            try:
+                # Initialize and run web agent
+                agent = WebAgent(user_id, llm_name)
+                
+                # Remove existing GIF file if it exists
+                gif_path = Path("agent_history.gif")
+                if gif_path.exists():
+                    gif_path.unlink()
+                
+                result = await agent.execute_task(prompt_with_context)
+                
+                # Check for agent_history.gif and upload if exists
+                details_gif = None
+                if Path("agent_history.gif").exists():
+                    s3_client = get_s3_client()
+                    random_suffix = ''.join(str(uuid.uuid4())[:6])
+                    filename = f"agent_history_{execution_id}_{random_suffix}.gif"
+                    s3_client.upload_file("agent_history.gif", os.getenv('AWS_S3_BUCKET'), f"execution_gifs/{filename}", ExtraArgs={'ContentType': 'image/gif'})
+                    details_gif=f"https://{os.getenv('AWS_S3_BUCKET')}.s3.amazonaws.com/execution_gifs/{filename}"
+                
+                if result['success']:
+                    update_execution_status(
+                        execution_id, 
+                        'completed', 
+                        result=result.get('summary', 'No summary available'),
+                        details_gif=details_gif,
+                        llm_name=result.get('llmName')
+                    )
+                    success = True
+                    break
+                else:
+                    last_error = result.get('error', 'Unknown error')
+                    logger.warning(f"LLM {llm_name} failed with error: {last_error}")
+            except Exception as e:
+                last_error = str(e)
+                logger.error(f"Error with LLM {llm_name}: {e}")
+            finally:
+                if agent:
+                    await agent.cleanup()
+        
+        if not success:
+            update_execution_status(
+                execution_id, 
+                'failed', 
+                error=f"All LLMs failed. Last error: {last_error}",
+                llm_name=llm_names[-1]  # Record the last attempted LLM
+            )
         
     except Exception as e:
         logger.error(f"Error executing task: {e}")
