@@ -277,7 +277,9 @@ class WebAgent:
             llm=self.llm,
             controller=controller,
             browser=self.browser,
-            use_vision=global_use_vision
+            use_vision=global_use_vision,
+            max_failures=5,  # Increase max retries
+            retry_delay=60    # retry delay in seconds
         )
 
     async def cleanup(self):
