@@ -140,8 +140,8 @@ def get_openai_llm_think(model_name: str):
         logger.error("Please ensure OPENAI_API_KEY environment variable is set correctly.")
         sys.exit(1)
 
-def get_llm():
-    """Get the appropriate language model based on environment configuration"""
+def get_llm(full_llm_name: str):
+    """Get the appropriate language model based on provided configuration"""
     # Define valid platform-provider-model combinations with their initialization functions
     VALID_CONFIGURATIONS = {
         "aws": {
@@ -167,8 +167,6 @@ def get_llm():
         }
     }
 
-    # Get and parse FULL_LLM_NAME
-    full_llm_name = os.getenv('FULL_LLM_NAME', 'aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0')
     try:
         platform, provider, model_name = full_llm_name.lower().split('->')
     except ValueError:
@@ -233,11 +231,13 @@ def get_login_credentials(domain: str, user_id: str):
         return ActionResult(error=f"Error getting credentials: {str(e)}")
 
 class WebAgent:
-    def __init__(self, user_id=None):
+    def __init__(self, user_id=None, full_llm_name=None):
         logger.info(f"Initializing WebAgent for user {user_id}")
         self.browser = None
         self.agent = None
-        self.llm, self.llm_name = get_llm()
+        if not full_llm_name:
+            raise ValueError("full_llm_name must be provided")
+        self.llm, self.llm_name = get_llm(full_llm_name)
         self.task = None
         self.action_history = []
         self.user_id = user_id
@@ -310,37 +310,20 @@ class WebAgent:
             await self.setup()  # Setup after we have the task
             
             # Run the agent
-            await self.agent.run(max_steps=25)
+            result = await self.agent.run(max_steps=25)
             
-            # Get the last message from the agent's history
-            last_message = None
             task_is_done = False  # Initialize task_is_done
-            
-            if hasattr(self.agent, 'history'):
-                logger.info("Agent has history attribute")
-                history = self.agent.history.history
-                if history:
-                    logger.info(f"History length: {len(history)}")
-                    if history[-1].result:
-                        logger.info("Last history entry has result")
-                        # Get the extracted content from the last action result
-                        action_result = history[-1].result[0]  # First result from the last action
-                        logger.info(f"Action result: {action_result}")
-                        task_is_done = hasattr(action_result, 'is_done') and action_result.is_done
-                        if task_is_done:
-                            last_message = action_result.extracted_content
-                        else:
-                            last_message = action_result.error
-                    else:
-                        logger.warning("Last history entry has no result")
-                else:
-                    logger.warning("History is empty")
-            else:
-                logger.warning("Agent has no history attribute")
+            agent_message = None
+            if result.is_done():
+                task_is_done = True
+                agent_message = result.history[-1].result[-1].extracted_content
+
+            if agent_message is None:
+                agent_message = 'Oops! Something went wrong while running AgentWeb.'
             
             return {
                 "success": task_is_done,
-                "summary" if task_is_done else "error": last_message if last_message else ("Task completed but no summary available" if task_is_done else "No error details available"),
+                "summary" if task_is_done else "error": agent_message,
                 "llmName": self.llm_name
             }
         except Exception as e:
@@ -356,9 +339,10 @@ async def main():
     parser.add_argument('--task_id', required=True, help='Task ID')
     parser.add_argument('--prompt', required=True, help='Task prompt')
     parser.add_argument('--user_id', required=True, help='User ID')
+    parser.add_argument('--llm_name', help='Full LLM name in format platform->provider->model')
     args = parser.parse_args()
 
-    agent = WebAgent(args.user_id)
+    agent = WebAgent(args.user_id, args.llm_name)
     try:
         result = await agent.execute_task(args.prompt)  # Setup is called inside execute_task now
         print(json.dumps(result))
