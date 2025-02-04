@@ -379,8 +379,11 @@ async def execute_task(execution):
         # Update execution status to running and include the prompt
         update_execution_status(execution_id, 'running', prompt=prompt)
         
+        # Get LLM name from task or environment
+        llm_name = task.get('llmName') or os.getenv('FULL_LLM_NAME', 'aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0')
+        
         # Initialize and run web agent
-        agent = WebAgent(user_id)
+        agent = WebAgent(user_id, llm_name)
         try:
             # Remove existing GIF file if it exists
             gif_path = Path("agent_history.gif")
