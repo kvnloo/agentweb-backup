@@ -383,13 +383,12 @@ async def execute_task(execution):
         llm_names = []
         if task.get('llmName'):
             llm_names = [task['llmName']]
-        else:
-            env_llm_names = os.getenv('LIST_FULL_LLM_NAMES', 'aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0')
-            # Add each non-empty name if not already in the list
-            for name in env_llm_names.split(','):
-                name = name.strip()
-                if name and name not in llm_names:
-                    llm_names.append(name)
+        env_llm_names = os.getenv('LIST_FULL_LLM_NAMES', 'aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0')
+        # Add each non-empty name if not already in the list
+        for name in env_llm_names.split(','):
+            name = name.strip()
+            if name and name not in llm_names:
+                llm_names.append(name)
         
         if not llm_names:
             raise ValueError("No valid LLM names provided")
@@ -426,13 +425,26 @@ async def execute_task(execution):
                     details_gif=f"https://{os.getenv('AWS_S3_BUCKET')}.s3.amazonaws.com/execution_gifs/{filename}"
                 
                 if result['success']:
+                    # Update execution status
                     update_execution_status(
                         execution_id, 
                         'completed', 
                         result=result.get('summary', 'No summary available'),
                         details_gif=details_gif,
-                        llm_name=result.get('llmName')
+                        llm_name=llm_name
                     )
+                    
+                    # Update task with successful LLM name if it's different
+                    if task.get('llmName') != llm_name:
+                        tasks_table.update_item(
+                            Key={'taskId': task_id},
+                            UpdateExpression='SET llmName = :llm_name',
+                            ExpressionAttributeValues={
+                                ':llm_name': llm_name
+                            }
+                        )
+                        logger.info(f"Updated task {task_id} with successful LLM: {llm_name}")
+                    
                     success = True
                     break
                 else:
@@ -449,8 +461,7 @@ async def execute_task(execution):
             update_execution_status(
                 execution_id, 
                 'failed', 
-                error=f"All LLMs failed. Last error: {last_error}",
-                llm_name=llm_names[-1]  # Record the last attempted LLM
+                error=f"All LLMs failed. Last error: {last_error}"
             )
         
     except Exception as e:
