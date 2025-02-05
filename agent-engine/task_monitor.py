@@ -106,10 +106,6 @@ def get_pending_executions():
         response = executions_table.query(**query_params)
         items = response.get('Items', [])
 
-        # Update last_execution_time if we got any items
-        if items:
-            last_execution_time = max(item['startTime'] for item in items)
-
         if len(items) > 0:
             logger.info(f"Found {len(items)} pending executions: {json_dumps(items)}")
         return items
@@ -132,10 +128,7 @@ def get_due_schedules():
                 ':now': now
             }
         )
-        items = response.get('Items', [])
-        if len(items) > 0:
-            logger.info(f"Found {len(items)} due schedules: {json_dumps(items)}")
-        return items
+        return response.get('Items', [])
     except ClientError as e:
         logger.error(f"Error querying due schedules: {e}")
         return []
@@ -472,6 +465,8 @@ async def execute_task(execution):
         running_user_ids.remove(user_id)
 
 async def monitor_executions():
+    global last_execution_time
+
     INTERVAL = 5
     MAX_CONCURRENT = int(os.getenv('MAX_CONCURRENT_TASKS', '3'))
     logger.info(f"Starting execution monitor with interval of {INTERVAL} seconds, max concurrent tasks: {MAX_CONCURRENT}...")
@@ -485,11 +480,19 @@ async def monitor_executions():
             pending_executions = get_pending_executions()
             
             # Run up to MAX_CONCURRENT tasks, ensuring no duplicate userIds
+            executed_count = 0
             if pending_executions and running_task_count < MAX_CONCURRENT:
                 for execution in pending_executions:
                     user_id = execution['userId']
                     if user_id not in running_user_ids and running_task_count < MAX_CONCURRENT:
                         asyncio.create_task(execute_task(execution))
+                        executed_count += 1
+                
+                # Only update last_execution_time if we executed all pending executions
+                if executed_count == len(pending_executions):
+                    global last_execution_time
+                    last_execution_time = max(item['startTime'] for item in pending_executions)
+                    logger.info(f"Updated last_execution_time to {last_execution_time}")
             
             await asyncio.sleep(INTERVAL)
 
