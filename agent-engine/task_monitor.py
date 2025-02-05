@@ -398,7 +398,7 @@ async def execute_task(execution):
         last_error = None
         success = False
         
-        context = f"You are executing this task for user_id: {user_id}. When using get_login_credentials action, you must pass this user_id as a parameter along with the domain."
+        context = f"You are executing this task at {datetime.now(timezone.utc).isoformat()} for user_id: {user_id}. When using get_login_credentials action, you must pass this user_id as a parameter along with the domain."
         prompt_with_context = f"{prompt}\n\n{context}"
 
         # Try each LLM in sequence until one succeeds
