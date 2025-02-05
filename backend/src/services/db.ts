@@ -204,6 +204,24 @@ export const taskDb = {
     }
   },
 
+  async getTaskSchedules(taskId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+        IndexName: 'TaskIdIndex',
+        KeyConditionExpression: 'taskId = :taskId',
+        ExpressionAttributeValues: {
+          ':taskId': taskId
+        }
+      };
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, 'getTaskSchedules');
+    }
+  },
+
   async getTasksByUserId(userId: string) {
     try {
       const params = {
@@ -223,7 +241,27 @@ export const taskDb = {
       };
 
       const result = await dynamodb.query(params).promise();
-      return result.Items || [];
+      const tasks = result.Items || [];
+
+      // Get latest execution, schedules and subscribers for each task
+      const tasksWithDetails = await Promise.all(tasks.map(async (task) => {
+        const [executions, schedules, subscribers] = await Promise.all([
+          this.getTaskExecutions(task.taskId),
+          this.getTaskSchedules(task.taskId),
+          subscriberDb.getTaskSubscribers(task.taskId)
+        ]);
+        
+        const latestExecution = executions && executions.length > 0 ? executions[0] : null;
+        
+        return {
+          ...task,
+          latestExecution,
+          scheduleCount: schedules ? schedules.length : 0,
+          subscriberCount: subscribers ? subscribers.length : 0
+        };
+      }));
+
+      return tasksWithDetails;
     } catch (error) {
       handleDynamoDbError(error, 'getTasksByUserId');
     }
