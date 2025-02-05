@@ -1,6 +1,9 @@
 import { DynamoDB } from 'aws-sdk';
 import { DocumentClient } from 'aws-sdk/clients/dynamodb';
 
+// Get table prefix based on NODE_ENV (defaults to empty string for production)
+const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+
 const dynamodb = new DynamoDB.DocumentClient({
   region: 'us-west-2',
   credentials: {
@@ -9,7 +12,7 @@ const dynamodb = new DynamoDB.DocumentClient({
   }
 });
 
-const SCHEDULES_TABLE = 'AW-TaskSchedules';
+const SCHEDULES_TABLE = `${TABLE_PREFIX}AW-TaskSchedules`;
 
 export interface Schedule {
   scheduleId: string;

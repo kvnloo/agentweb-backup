@@ -24,6 +24,14 @@ interface Task {
   prompt: string;
   status: string;
   createdAt: string;
+  latestExecution?: {
+    status: string;
+    startTime: string;
+    completedAt?: string;
+    error?: string;
+  };
+  scheduleCount: number;
+  subscriberCount: number;
 }
 
 export default function Dashboard() {
@@ -46,8 +54,8 @@ export default function Dashboard() {
     // Initial fetch
     fetchTasks();
 
-    // Set up polling interval (every 5 seconds)
-    const intervalId = setInterval(fetchTasks, 5000);
+    // Set up polling interval (every 10 seconds)
+    const intervalId = setInterval(fetchTasks, 10000);
 
     // Cleanup interval on component unmount
     return () => clearInterval(intervalId);
@@ -162,21 +170,45 @@ export default function Dashboard() {
                   display: 'flex', 
                   justifyContent: 'space-between', 
                   alignItems: 'center',
-                  mt: 'auto'
+                  mt: 'auto',
+                  flexWrap: 'wrap',
+                  gap: 1
                 }}>
-                  <Chip
-                    label={task.status}
-                    color={getStatusColor(task.status) as any}
-                    size="small"
-                    sx={{ fontWeight: 500 }}
-                  />
-                  <Typography 
-                    variant="caption" 
-                    color="text.secondary"
-                    sx={{ fontWeight: 500 }}
-                  >
-                    {new Date(task.createdAt).toLocaleDateString()}
-                  </Typography>
+                  <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+                    <Chip
+                      label={`Task: ${task.status}`}
+                      color={getStatusColor(task.status) as any}
+                      size="small"
+                      sx={{ fontWeight: 500 }}
+                    />
+                    {task.latestExecution && (
+                      <Chip
+                        label={`Latest Run: ${task.latestExecution.status}`}
+                        color={getStatusColor(task.latestExecution.status) as any}
+                        size="small"
+                        sx={{ fontWeight: 500 }}
+                      />
+                    )}
+                  </Box>
+                  <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
+                    <Chip
+                      label={`${task.scheduleCount} Schedule${task.scheduleCount !== 1 ? 's' : ''}`}
+                      size="small"
+                      variant="outlined"
+                    />
+                    <Chip
+                      label={`${task.subscriberCount} Subscriber${task.subscriberCount !== 1 ? 's' : ''}`}
+                      size="small"
+                      variant="outlined"
+                    />
+                    <Typography 
+                      variant="caption" 
+                      color="text.secondary"
+                      sx={{ fontWeight: 500 }}
+                    >
+                      {new Date(task.createdAt).toLocaleDateString()}
+                    </Typography>
+                  </Box>
                 </Box>
               </CardContent>
               <CardActions sx={{ p: 2, pt: 0 }}>
