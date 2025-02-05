@@ -104,11 +104,7 @@ def get_pending_executions():
             query_params['ExpressionAttributeValues'][':startTime'] = last_execution_time
 
         response = executions_table.query(**query_params)
-        items = response.get('Items', [])
-
-        if len(items) > 0:
-            logger.info(f"Found {len(items)} pending executions: {json_dumps(items)}")
-        return items
+        return response.get('Items', [])
     except ClientError as e:
         logger.error(f"Error querying pending executions: {e}")
         return []
@@ -128,7 +124,10 @@ def get_due_schedules():
                 ':now': now
             }
         )
-        return response.get('Items', [])
+        items = response.get('Items', [])
+        if len(items) > 0:
+            logger.info(f"Found {len(items)} due schedules: {json_dumps(items)}")
+        return items
     except ClientError as e:
         logger.error(f"Error querying due schedules: {e}")
         return []
