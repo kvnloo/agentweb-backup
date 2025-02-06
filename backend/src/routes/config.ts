@@ -30,12 +30,15 @@ router.get('/', authenticateToken, async (req, res) => {
 
     // Process user's own configs and add sharedWith information
     const configs = await Promise.all((result.Items || []).map(async (config) => {
+      // Remove password from config object
+      const { password, ...configWithoutPassword } = config;
+
       if (config.sharedBy) {
         // This is a config shared with the user
         const sharer = await userDb.getUserById(config.sharedBy);
         if (sharer) {
           return {
-            ...config,
+            ...configWithoutPassword,
             sharedBy: sharer.email
           };
         }
@@ -55,7 +58,12 @@ router.get('/', authenticateToken, async (req, res) => {
               ':configId': sharedId
             }
           }).promise();
-          return result.Items?.[0];
+          // Remove password from shared configs as well
+          if (result.Items?.[0]) {
+            const { password, ...sharedConfigWithoutPassword } = result.Items[0];
+            return sharedConfigWithoutPassword;
+          }
+          return null;
         });
 
         const sharedConfigs = (await Promise.all(sharedConfigPromises)).filter(Boolean);
@@ -72,13 +80,13 @@ router.get('/', authenticateToken, async (req, res) => {
         console.log('Shared with users:', sharedWithUsers.map(u => u?.email));
 
         return {
-          ...config,
+          ...configWithoutPassword,
           sharedWith: sharedWithUsers
             .filter((user): user is NonNullable<typeof user> => user !== null)
             .map(user => user.email)
         };
       }
-      return config;
+      return configWithoutPassword;
     }));
 
     res.json(configs);
