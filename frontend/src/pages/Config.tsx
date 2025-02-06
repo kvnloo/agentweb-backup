@@ -15,9 +15,12 @@ import {
   DialogTitle,
   DialogContent,
   DialogActions,
+  Alert,
+  Chip,
 } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import AddIcon from '@mui/icons-material/Add';
+import ShareIcon from '@mui/icons-material/Share';
 import { useAuth } from '../contexts/AuthContext';
 import axios from 'axios';
 import { buildApiUrl } from '../config';
@@ -27,12 +30,24 @@ interface Config {
   website: string;
   username: string;
   createdAt: string;
+  sharedBy?: string;
+  sharedWith?: string[];
 }
+
+// Helper function to mask email
+const maskEmail = (email: string) => {
+  const [username, domain] = email.split('@');
+  const maskedUsername = username.charAt(0) + '*'.repeat(username.length - 2) + username.charAt(username.length - 1);
+  return `${maskedUsername}@${domain}`;
+};
 
 export default function Config() {
   const { token } = useAuth();
   const [configs, setConfigs] = useState<Config[]>([]);
   const [openDialog, setOpenDialog] = useState(false);
+  const [openShareDialog, setOpenShareDialog] = useState(false);
+  const [selectedConfig, setSelectedConfig] = useState<string>('');
+  const [shareEmail, setShareEmail] = useState('');
   const [newConfig, setNewConfig] = useState({
     website: '',
     username: '',
@@ -40,6 +55,8 @@ export default function Config() {
   });
   const [error, setError] = useState('');
   const [fieldError, setFieldError] = useState('');
+  const [shareError, setShareError] = useState('');
+  const [shareSuccess, setShareSuccess] = useState('');
 
   const fetchConfigs = async () => {
     try {
@@ -94,6 +111,36 @@ export default function Config() {
     setFieldError('');
   };
 
+  const handleShare = async () => {
+    try {
+      setShareError('');
+      setShareSuccess('');
+      await axios.post(
+        buildApiUrl(`/api/config/${selectedConfig}/share`),
+        { email: shareEmail },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setShareSuccess('Configuration shared successfully');
+      await fetchConfigs();
+      setTimeout(() => {
+        setOpenShareDialog(false);
+        setShareEmail('');
+        setShareSuccess('');
+        setSelectedConfig('');
+      }, 2000);
+    } catch (err: any) {
+      console.error('Error sharing config:', err);
+      setShareError(err.response?.data?.error || 'Failed to share configuration');
+    }
+  };
+
+  const handleOpenShare = (configId: string) => {
+    setSelectedConfig(configId);
+    setOpenShareDialog(true);
+    setShareError('');
+    setShareSuccess('');
+  };
+
   return (
     <Container maxWidth="md">
       <Box sx={{ mt: 4, mb: 4 }}>
@@ -125,17 +172,51 @@ export default function Config() {
                   key={config.configId}
                   divider
                   secondaryAction={
-                    <IconButton
-                      edge="end"
-                      aria-label="delete"
-                      onClick={() => handleDeleteConfig(config.configId)}
-                    >
-                      <DeleteIcon />
-                    </IconButton>
+                    <Box>
+                      {!config.sharedBy && (
+                        <IconButton
+                          onClick={() => handleOpenShare(config.configId)}
+                          sx={{ mr: 1 }}
+                        >
+                          <ShareIcon />
+                        </IconButton>
+                      )}
+                      <IconButton
+                        edge="end"
+                        aria-label="delete"
+                        onClick={() => handleDeleteConfig(config.configId)}
+                      >
+                        <DeleteIcon />
+                      </IconButton>
+                    </Box>
                   }
                 >
                   <ListItemText
-                    primary={config.website}
+                    primary={
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                        {config.website}
+                        {config.sharedBy && (
+                          <Chip
+                            size="small"
+                            label={`Shared by ${maskEmail(config.sharedBy)}`}
+                            color="info"
+                            sx={{ ml: 1 }}
+                          />
+                        )}
+                        {config.sharedWith && config.sharedWith.length > 0 && (
+                          <Chip
+                            size="small"
+                            label={`Shared with ${config.sharedWith.length} user${config.sharedWith.length > 1 ? 's' : ''}`}
+                            color="success"
+                            sx={{ ml: 1 }}
+                            onClick={() => {
+                              const users = config.sharedWith?.map(maskEmail).join('\n');
+                              alert(`Shared with:\n${users}`);
+                            }}
+                          />
+                        )}
+                      </Box>
+                    }
                     secondary={`Username: ${config.username}`}
                   />
                 </ListItem>
@@ -192,6 +273,61 @@ export default function Config() {
             </Button>
             <Button onClick={handleAddConfig} color="primary">
               Add
+            </Button>
+          </DialogActions>
+        </Dialog>
+
+        <Dialog 
+          open={openShareDialog} 
+          onClose={() => {
+            setOpenShareDialog(false);
+            setShareEmail('');
+            setShareError('');
+            setShareSuccess('');
+          }}
+        >
+          <DialogTitle>Share Configuration</DialogTitle>
+          <DialogContent>
+            {shareSuccess ? (
+              <Alert severity="success" sx={{ mt: 2 }}>
+                {shareSuccess}
+              </Alert>
+            ) : (
+              <>
+                {shareError && (
+                  <Alert severity="error" sx={{ mb: 2 }}>
+                    {shareError}
+                  </Alert>
+                )}
+                <TextField
+                  autoFocus
+                  margin="dense"
+                  label="Recipient Email"
+                  type="email"
+                  fullWidth
+                  value={shareEmail}
+                  onChange={(e) => setShareEmail(e.target.value)}
+                  helperText="Enter the email of the user you want to share with"
+                />
+              </>
+            )}
+          </DialogContent>
+          <DialogActions>
+            <Button 
+              onClick={() => {
+                setOpenShareDialog(false);
+                setShareEmail('');
+                setShareError('');
+              }}
+            >
+              Cancel
+            </Button>
+            <Button 
+              onClick={handleShare} 
+              color="primary"
+              disabled={!shareEmail || !!shareSuccess}
+            >
+              Share
             </Button>
           </DialogActions>
         </Dialog>

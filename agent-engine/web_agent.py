@@ -36,12 +36,16 @@ global_use_vision = True
 
 controller = Controller()
 
-def decrypt_password(encrypted_password: str, user_id: str) -> str:
-    """Decrypt password using JWT_SECRET"""
+def decrypt_password(encrypted_password: str, user_id: str, shared_by: str = None) -> str:
+    """Decrypt password using JWT_SECRET. For shared passwords, use the sharer's userId."""
     try:
         import jwt
         decoded = jwt.decode(encrypted_password, os.getenv('JWT_SECRET'), algorithms=['HS256'])
-        if decoded['userId'] != user_id:
+        # For shared passwords, verify against the original sharer's userId
+        expected_user_id = shared_by if shared_by else user_id
+        if shared_by:
+            logger.info(f"Using shared credentials - decrypting with sharer's userId: {shared_by}")
+        if decoded['userId'] != expected_user_id:
             raise Exception("Invalid user ID in encrypted password")
         return decoded['password']
     except Exception as e:
@@ -225,7 +229,10 @@ def get_login_credentials(domain: str, user_id: str):
 
     config = items[0]
     try:
-        decrypted_password = decrypt_password(config['password'], user_id)
+        if config.get('sharedBy'):
+            logger.info(f"Found shared credentials for {domain} - shared by user: {config['sharedBy']}")
+        # Pass sharedBy to decrypt_password if it exists
+        decrypted_password = decrypt_password(config['password'], user_id, config.get('sharedBy'))
         return ActionResult(extracted_content=f"username: {config['username']}, password: {decrypted_password}")
     except Exception as e:
         return ActionResult(error=f"Error getting credentials: {str(e)}")
