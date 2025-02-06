@@ -3,6 +3,7 @@ import { authenticateToken } from '../middleware/auth';
 import { DynamoDB } from 'aws-sdk';
 import { v4 as uuidv4 } from 'uuid';
 import jwt from 'jsonwebtoken';
+import { userDb } from '../services/db';
 
 const router = Router();
 const dynamodb = new DynamoDB.DocumentClient();
@@ -27,7 +28,60 @@ router.get('/', authenticateToken, async (req, res) => {
       }
     }).promise();
 
-    res.json(result.Items || []);
+    // Process user's own configs and add sharedWith information
+    const configs = await Promise.all((result.Items || []).map(async (config) => {
+      if (config.sharedBy) {
+        // This is a config shared with the user
+        const sharer = await userDb.getUserById(config.sharedBy);
+        if (sharer) {
+          return {
+            ...config,
+            sharedBy: sharer.email
+          };
+        }
+      } else if (config.sharedConfigIds?.length > 0) {
+        console.log('Found config with sharedConfigIds:', {
+          configId: config.configId,
+          sharedConfigIds: config.sharedConfigIds
+        });
+
+        // Get shared configs using the GSI
+        const sharedConfigPromises = config.sharedConfigIds.map(async (sharedId: string) => {
+          const result = await dynamodb.query({
+            TableName: `${TABLE_PREFIX}AW-Configs`,
+            IndexName: 'ConfigIdIndex',
+            KeyConditionExpression: 'configId = :configId',
+            ExpressionAttributeValues: {
+              ':configId': sharedId
+            }
+          }).promise();
+          return result.Items?.[0];
+        });
+
+        const sharedConfigs = (await Promise.all(sharedConfigPromises)).filter(Boolean);
+        console.log('Shared configs:', sharedConfigs.map(c => ({
+          configId: c.configId,
+          userId: c.userId
+        })));
+
+        // Get user emails for shared configs
+        const sharedWithUsers = await Promise.all(
+          sharedConfigs.map(c => userDb.getUserById(c.userId))
+        );
+
+        console.log('Shared with users:', sharedWithUsers.map(u => u?.email));
+
+        return {
+          ...config,
+          sharedWith: sharedWithUsers
+            .filter((user): user is NonNullable<typeof user> => user !== null)
+            .map(user => user.email)
+        };
+      }
+      return config;
+    }));
+
+    res.json(configs);
   } catch (error) {
     console.error('Error fetching configs:', error);
     res.status(500).json({ error: 'Failed to fetch configurations' });
@@ -96,6 +150,75 @@ router.delete('/:configId', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Error deleting config:', error);
     res.status(500).json({ error: 'Failed to delete configuration' });
+  }
+});
+
+// Share a configuration with another user
+router.post('/:configId/share', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user!.userId;
+    const { configId } = req.params;
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+
+    // Verify the config exists and belongs to the user
+    const result = await dynamodb.get({
+      TableName: `${TABLE_PREFIX}AW-Configs`,
+      Key: {
+        userId,
+        configId
+      }
+    }).promise();
+
+    if (!result.Item) {
+      return res.status(404).json({ error: 'Configuration not found' });
+    }
+
+    // Find target user by email
+    const targetUser = await userDb.getUserByEmail(email);
+    if (!targetUser) {
+      return res.status(404).json({ error: 'Target user not found' });
+    }
+
+    // Create a new config for the target user
+    const newConfigId = uuidv4();
+    const sharedConfig = {
+      configId: newConfigId,
+      userId: targetUser.userId,
+      website: result.Item.website,
+      username: result.Item.username,
+      password: result.Item.password,
+      createdAt: new Date().toISOString(),
+      sharedBy: userId
+    };
+
+    // Update original config with the new shared configId
+    const sharedConfigIds = result.Item.sharedConfigIds || [];
+    await dynamodb.update({
+      TableName: `${TABLE_PREFIX}AW-Configs`,
+      Key: {
+        userId,
+        configId
+      },
+      UpdateExpression: 'SET sharedConfigIds = :sharedConfigIds',
+      ExpressionAttributeValues: {
+        ':sharedConfigIds': [...sharedConfigIds, newConfigId]
+      }
+    }).promise();
+
+    // Save the shared config
+    await dynamodb.put({
+      TableName: `${TABLE_PREFIX}AW-Configs`,
+      Item: sharedConfig
+    }).promise();
+
+    res.status(201).json({ message: 'Configuration shared successfully' });
+  } catch (error) {
+    console.error('Error sharing config:', error);
+    res.status(500).json({ error: 'Failed to share configuration' });
   }
 });
 

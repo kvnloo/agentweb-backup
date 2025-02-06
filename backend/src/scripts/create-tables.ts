@@ -312,6 +312,21 @@ const createConfigsTable = async () => {
       { AttributeName: 'userId', AttributeType: 'S' },
       { AttributeName: 'configId', AttributeType: 'S' }
     ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'ConfigIdIndex',
+        KeySchema: [
+          { AttributeName: 'configId', KeyType: 'HASH' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5
+        }
+      }
+    ],
     ProvisionedThroughput: {
       ReadCapacityUnits: 5,
       WriteCapacityUnits: 5
