@@ -101,8 +101,14 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    // Verify task belongs to user
-    if (task.userId !== userId) {
+    // Get user to check if admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    // Verify task belongs to user or user is admin
+    if (!user.isAdmin && task.userId !== userId) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -115,6 +121,10 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
     
     if (req.body.prompt !== undefined) {
       updates.prompt = req.body.prompt;
+    }
+
+    if (req.body.name !== undefined) {
+      updates.name = req.body.name;
     }
 
     console.log('Updates to apply:', updates);
@@ -173,8 +183,14 @@ export const executeTask = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    // Verify task belongs to user
-    if (task.userId !== userId) {
+    // Get user to check if admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    // Verify task belongs to user or user is admin
+    if (!user.isAdmin && task.userId !== userId) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -182,7 +198,7 @@ export const executeTask = async (req: AuthRequest, res: Response) => {
     const execution = {
       executionId: Date.now().toString(),
       taskId,
-      userId,
+      userId: task.userId, // Use the task owner's ID for execution
       status: 'pending',
       startTime: new Date().toISOString()
     };
