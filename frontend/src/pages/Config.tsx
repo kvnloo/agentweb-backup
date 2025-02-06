@@ -39,6 +39,7 @@ export default function Config() {
     password: '',
   });
   const [error, setError] = useState('');
+  const [fieldError, setFieldError] = useState('');
 
   const fetchConfigs = async () => {
     try {
@@ -58,15 +59,20 @@ export default function Config() {
 
   const handleAddConfig = async () => {
     try {
+      setFieldError('');
       await axios.post(buildApiUrl('/api/config'), newConfig, {
         headers: { Authorization: `Bearer ${token}` },
       });
       setOpenDialog(false);
       setNewConfig({ website: '', username: '', password: '' });
       fetchConfigs();
-    } catch (err) {
+    } catch (err: any) {
       console.error('Error adding config:', err);
-      setError('Failed to add configuration');
+      if (err.response?.data?.type === 'INVALID_DOMAIN') {
+        setFieldError(err.response.data.error);
+      } else {
+        setError('Failed to add configuration');
+      }
     }
   };
 
@@ -80,6 +86,12 @@ export default function Config() {
       console.error('Error deleting config:', err);
       setError('Failed to delete configuration');
     }
+  };
+
+  const handleWebsiteChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = e.target.value.toLowerCase();
+    setNewConfig({ ...newConfig, website: value });
+    setFieldError('');
   };
 
   return (
@@ -143,12 +155,13 @@ export default function Config() {
             <TextField
               autoFocus
               margin="dense"
-              label="Website"
+              label="Website Domain"
               fullWidth
               value={newConfig.website}
-              onChange={(e) =>
-                setNewConfig({ ...newConfig, website: e.target.value })
-              }
+              onChange={handleWebsiteChange}
+              error={!!fieldError}
+              helperText={fieldError || "Enter the domain name without 'http://' or 'www' (e.g., example.com)"}
+              placeholder="example.com"
             />
             <TextField
               margin="dense"
@@ -171,7 +184,12 @@ export default function Config() {
             />
           </DialogContent>
           <DialogActions>
-            <Button onClick={() => setOpenDialog(false)}>Cancel</Button>
+            <Button onClick={() => {
+              setOpenDialog(false);
+              setFieldError('');
+            }}>
+              Cancel
+            </Button>
             <Button onClick={handleAddConfig} color="primary">
               Add
             </Button>

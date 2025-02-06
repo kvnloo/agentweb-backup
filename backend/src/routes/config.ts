@@ -38,10 +38,22 @@ router.get('/', authenticateToken, async (req, res) => {
 router.post('/', authenticateToken, async (req, res) => {
   try {
     const userId = req.user!.userId;
-    const { website, username, password } = req.body;
+    let { website, username, password } = req.body;
 
     if (!website || !username || !password) {
       return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    // Convert website to lowercase
+    website = website.toLowerCase();
+
+    // Validate domain name format
+    const domainRegex = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/;
+    if (!domainRegex.test(website)) {
+      return res.status(400).json({ 
+        error: 'Invalid domain name format. Please enter a valid domain (e.g., example.com, sub.example.com)',
+        type: 'INVALID_DOMAIN'
+      });
     }
 
     const configId = uuidv4();
