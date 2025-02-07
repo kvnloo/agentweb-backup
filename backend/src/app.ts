@@ -7,6 +7,7 @@ import waitlistRoutes from './routes/waitlist';
 import scheduleRoutes from './routes/schedules';
 import adminRoutes from './routes/admin';
 import configRouter from './routes/config';
+import workflowRoutes from './routes/workflows';
 
 const app = express();
 
@@ -34,6 +35,7 @@ app.use('/api/waitlist', waitlistRoutes);
 app.use('/api/schedules', scheduleRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/config', configRouter);
+app.use('/api/workflows', workflowRoutes);
 
 // Health check endpoint
 app.get('/', (req, res) => {

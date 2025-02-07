@@ -14,7 +14,11 @@ import {
   DialogTitle,
   DialogContent,
   DialogActions,
-  TextField
+  TextField,
+  CircularProgress,
+  Paper,
+  Alert,
+  Snackbar
 } from '@mui/material';
 import { 
   Add as AddIcon,
@@ -39,27 +43,54 @@ interface Workflow {
 export default function Workflows() {
   const navigate = useNavigate();
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [anchorEl, setAnchorEl] = useState<null | HTMLElement>(null);
   const [selectedWorkflow, setSelectedWorkflow] = useState<Workflow | null>(null);
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
   const [isRenameDialogOpen, setIsRenameDialogOpen] = useState(false);
   const [newName, setNewName] = useState('');
+  const [showSnackbar, setShowSnackbar] = useState(false);
+  const [snackbarMessage, setSnackbarMessage] = useState('');
+  const [snackbarSeverity, setSnackbarSeverity] = useState<'success' | 'error'>('success');
 
   useEffect(() => {
-    // TODO: Fetch workflows from API
-    const mockWorkflows: Workflow[] = [
-      {
-        id: '1',
-        name: 'Daily Report Generation',
-        description: 'Generates and sends daily reports',
-        status: 'active',
-        taskCount: 3,
-        lastRun: '2024-02-06T10:00:00',
-        createdAt: '2024-01-01T00:00:00'
-      },
-      // Add more mock data as needed
-    ];
-    setWorkflows(mockWorkflows);
+    const fetchWorkflows = async () => {
+      try {
+        setLoading(true);
+        setError(null);
+        const baseUrl = import.meta.env.VITE_API_URL || '';
+        const response = await fetch(`${baseUrl}/api/workflows`, {
+          headers: {
+            'Authorization': `Bearer ${localStorage.getItem('token')}`,
+            'Content-Type': 'application/json'
+          },
+          credentials: 'include'
+        });
+
+        if (!response.ok) {
+          throw new Error('Failed to fetch workflows');
+        }
+
+        const data = await response.json();
+        setWorkflows(data.map((workflow: any) => ({
+          id: workflow.workflowId,
+          name: workflow.name,
+          description: workflow.description,
+          status: workflow.status || 'active',
+          taskCount: workflow.nodes?.length || 0,
+          lastRun: workflow.lastRun,
+          createdAt: workflow.createdAt
+        })));
+      } catch (error) {
+        console.error('Error fetching workflows:', error);
+        setError(error instanceof Error ? error.message : 'Failed to fetch workflows');
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchWorkflows();
   }, []);
 
   const handleMenuOpen = (event: React.MouseEvent<HTMLElement>, workflow: Workflow) => {
@@ -87,11 +118,39 @@ export default function Workflows() {
     handleMenuClose();
   };
 
-  const handleDeleteWorkflow = () => {
-    // TODO: Implement workflow deletion
-    console.log('Deleting workflow:', selectedWorkflow?.id);
-    setIsDeleteDialogOpen(false);
-    handleMenuClose();
+  const handleDeleteWorkflow = async () => {
+    try {
+      if (!selectedWorkflow) return;
+
+      const baseUrl = import.meta.env.VITE_API_URL || '';
+      const response = await fetch(`${baseUrl}/api/workflows/${selectedWorkflow.id}`, {
+        method: 'DELETE',
+        headers: {
+          'Authorization': `Bearer ${localStorage.getItem('token')}`,
+          'Content-Type': 'application/json'
+        },
+        credentials: 'include'
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to delete workflow');
+      }
+
+      // Remove the workflow from the local state
+      setWorkflows(workflows.filter(w => w.id !== selectedWorkflow.id));
+      
+      // Show success message
+      setError(null);
+      setSnackbarMessage('Workflow deleted successfully');
+      setSnackbarSeverity('success');
+      setShowSnackbar(true);
+    } catch (error) {
+      console.error('Error deleting workflow:', error);
+      setError(error instanceof Error ? error.message : 'Failed to delete workflow');
+    } finally {
+      setIsDeleteDialogOpen(false);
+      handleMenuClose();
+    }
   };
 
   const handleCloneWorkflow = () => {
@@ -121,43 +180,66 @@ export default function Workflows() {
         </Button>
       </Box>
 
-      <Grid container spacing={3}>
-        {workflows.map((workflow) => (
-          <Grid item xs={12} sm={6} md={4} key={workflow.id}>
-            <Card>
-              <CardContent>
-                <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-                  <Typography variant="h6" component="div" sx={{ mb: 1 }}>
-                    {workflow.name}
+      {loading ? (
+        <Box sx={{ display: 'flex', justifyContent: 'center', my: 4 }}>
+          <CircularProgress />
+        </Box>
+      ) : error ? (
+        <Alert severity="error" sx={{ mb: 3 }}>
+          {error}
+        </Alert>
+      ) : workflows.length === 0 ? (
+        <Paper sx={{ p: 3, textAlign: 'center' }}>
+          <Typography color="text.secondary" sx={{ mb: 2 }}>
+            No workflows found
+          </Typography>
+          <Button
+            variant="outlined"
+            startIcon={<AddIcon />}
+            onClick={handleCreateWorkflow}
+          >
+            Create your first workflow
+          </Button>
+        </Paper>
+      ) : (
+        <Grid container spacing={3}>
+          {workflows.map((workflow) => (
+            <Grid item xs={12} sm={6} md={4} key={workflow.id}>
+              <Card>
+                <CardContent>
+                  <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                    <Typography variant="h6" component="div" sx={{ mb: 1 }}>
+                      {workflow.name}
+                    </Typography>
+                    <IconButton onClick={(e) => handleMenuOpen(e, workflow)}>
+                      <MoreVertIcon />
+                    </IconButton>
+                  </Box>
+                  <Typography color="text.secondary" sx={{ mb: 1 }}>
+                    {workflow.description}
                   </Typography>
-                  <IconButton onClick={(e) => handleMenuOpen(e, workflow)}>
-                    <MoreVertIcon />
-                  </IconButton>
-                </Box>
-                <Typography color="text.secondary" sx={{ mb: 1 }}>
-                  {workflow.description}
-                </Typography>
-                <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
-                  <Chip
-                    label={`${workflow.taskCount} tasks`}
-                    size="small"
-                  />
-                  <Chip
-                    label={workflow.status}
-                    size="small"
-                    color={workflow.status === 'active' ? 'success' : 'default'}
-                  />
-                </Box>
-                {workflow.lastRun && (
-                  <Typography variant="body2" color="text.secondary">
-                    Last run: {new Date(workflow.lastRun).toLocaleString()}
-                  </Typography>
-                )}
-              </CardContent>
-            </Card>
-          </Grid>
-        ))}
-      </Grid>
+                  <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+                    <Chip
+                      label={`${workflow.taskCount} tasks`}
+                      size="small"
+                    />
+                    <Chip
+                      label={workflow.status}
+                      size="small"
+                      color={workflow.status === 'active' ? 'success' : 'default'}
+                    />
+                  </Box>
+                  {workflow.lastRun && (
+                    <Typography variant="body2" color="text.secondary">
+                      Last run: {new Date(workflow.lastRun).toLocaleString()}
+                    </Typography>
+                  )}
+                </CardContent>
+              </Card>
+            </Grid>
+          ))}
+        </Grid>
+      )}
 
       <Menu
         anchorEl={anchorEl}
@@ -181,14 +263,32 @@ export default function Workflows() {
         </MenuItem>
       </Menu>
 
+      <Snackbar
+        open={showSnackbar}
+        autoHideDuration={6000}
+        onClose={() => setShowSnackbar(false)}
+      >
+        <Alert
+          onClose={() => setShowSnackbar(false)}
+          severity={snackbarSeverity}
+          sx={{ width: '100%' }}
+        >
+          {snackbarMessage}
+        </Alert>
+      </Snackbar>
+
       <Dialog open={isDeleteDialogOpen} onClose={() => setIsDeleteDialogOpen(false)}>
         <DialogTitle>Delete Workflow</DialogTitle>
         <DialogContent>
-          Are you sure you want to delete "{selectedWorkflow?.name}"? This action cannot be undone.
+          <Typography>
+            Are you sure you want to delete "{selectedWorkflow?.name}"? This action cannot be undone.
+          </Typography>
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setIsDeleteDialogOpen(false)}>Cancel</Button>
-          <Button onClick={handleDeleteWorkflow} color="error">Delete</Button>
+          <Button onClick={handleDeleteWorkflow} color="error" variant="contained">
+            Delete
+          </Button>
         </DialogActions>
       </Dialog>
 
