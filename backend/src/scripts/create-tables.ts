@@ -352,7 +352,9 @@ const createWorkflowsTable = async () => {
     AttributeDefinitions: [
       { AttributeName: 'workflowId', AttributeType: 'S' },
       { AttributeName: 'userId', AttributeType: 'S' },
-      { AttributeName: 'createdAt', AttributeType: 'S' }
+      { AttributeName: 'createdAt', AttributeType: 'S' },
+      { AttributeName: 'status', AttributeType: 'S' },
+      { AttributeName: 'updatedAt', AttributeType: 'S' }
     ],
     KeySchema: [
       { AttributeName: 'workflowId', KeyType: 'HASH' }
@@ -371,100 +373,12 @@ const createWorkflowsTable = async () => {
           ReadCapacityUnits: 5,
           WriteCapacityUnits: 5
         }
-      }
-    ],
-    ProvisionedThroughput: {
-      ReadCapacityUnits: 5,
-      WriteCapacityUnits: 5
-    }
-  };
-
-  try {
-    const result = await dynamodb.createTable(params).promise();
-    console.log(`Created ${params.TableName} table:`, result);
-  } catch (error: any) {
-    if (error.code === 'ResourceInUseException') {
-      console.log(`${params.TableName} table already exists`);
-    } else {
-      throw error;
-    }
-  }
-};
-
-// Create WorkflowNodes table
-const createWorkflowNodesTable = async () => {
-  const params: AWS.DynamoDB.CreateTableInput = {
-    TableName: `${TABLE_PREFIX}AW-WorkflowNodes`,
-    AttributeDefinitions: [
-      { AttributeName: 'nodeId', AttributeType: 'S' },
-      { AttributeName: 'workflowId', AttributeType: 'S' }
-    ],
-    KeySchema: [
-      { AttributeName: 'nodeId', KeyType: 'HASH' }
-    ],
-    GlobalSecondaryIndexes: [
-      {
-        IndexName: 'WorkflowNodesIndex',
-        KeySchema: [
-          { AttributeName: 'workflowId', KeyType: 'HASH' }
-        ],
-        Projection: {
-          ProjectionType: 'ALL'
-        },
-        ProvisionedThroughput: {
-          ReadCapacityUnits: 5,
-          WriteCapacityUnits: 5
-        }
-      }
-    ],
-    ProvisionedThroughput: {
-      ReadCapacityUnits: 5,
-      WriteCapacityUnits: 5
-    }
-  };
-
-  try {
-    const result = await dynamodb.createTable(params).promise();
-    console.log(`Created ${params.TableName} table:`, result);
-  } catch (error: any) {
-    if (error.code === 'ResourceInUseException') {
-      console.log(`${params.TableName} table already exists`);
-    } else {
-      throw error;
-    }
-  }
-};
-
-// Create WorkflowEdges table
-const createWorkflowEdgesTable = async () => {
-  const params: AWS.DynamoDB.CreateTableInput = {
-    TableName: `${TABLE_PREFIX}AW-WorkflowEdges`,
-    AttributeDefinitions: [
-      { AttributeName: 'edgeId', AttributeType: 'S' },
-      { AttributeName: 'workflowId', AttributeType: 'S' },
-      { AttributeName: 'sourceId', AttributeType: 'S' }
-    ],
-    KeySchema: [
-      { AttributeName: 'edgeId', KeyType: 'HASH' }
-    ],
-    GlobalSecondaryIndexes: [
-      {
-        IndexName: 'WorkflowEdgesIndex',
-        KeySchema: [
-          { AttributeName: 'workflowId', KeyType: 'HASH' }
-        ],
-        Projection: {
-          ProjectionType: 'ALL'
-        },
-        ProvisionedThroughput: {
-          ReadCapacityUnits: 5,
-          WriteCapacityUnits: 5
-        }
       },
       {
-        IndexName: 'SourceEdgesIndex',
+        IndexName: 'StatusUpdatedIndex',
         KeySchema: [
-          { AttributeName: 'sourceId', KeyType: 'HASH' }
+          { AttributeName: 'status', KeyType: 'HASH' },
+          { AttributeName: 'updatedAt', KeyType: 'RANGE' }
         ],
         Projection: {
           ProjectionType: 'ALL'
@@ -550,8 +464,6 @@ const main = async () => {
     await createTaskSchedulesTable();
     await createConfigsTable();
     await createWorkflowsTable();
-    await createWorkflowNodesTable();
-    await createWorkflowEdgesTable();
     await createWorkflowExecutionsTable();
     console.log('All tables created successfully');
   } catch (error) {

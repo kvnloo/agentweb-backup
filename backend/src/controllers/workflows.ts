@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
-import { WorkflowService, Workflow, WorkflowNode, WorkflowEdge } from '../services/workflowDb';
+import { WorkflowService, Workflow } from '../services/workflowDb';
 import { AuthenticatedRequest } from '../middleware/auth';
+import { generateWorkflowFromDescription } from '../services/workflowGenerator';
 
 const workflowService = new WorkflowService();
 
@@ -27,16 +28,9 @@ export async function getWorkflow(req: AuthenticatedRequest, res: Response) {
       return res.status(403).json({ error: 'Not authorized to access this workflow' });
     }
 
-    // Get nodes and edges
-    const [nodes, edges] = await Promise.all([
-      workflowService.getWorkflowNodes(id),
-      workflowService.getWorkflowEdges(id)
-    ]);
-
     res.json({
       ...workflow,
-      nodes,
-      edges
+      messages: workflow.chatHistory
     });
   } catch (error) {
     console.error('Error getting workflow:', error);
@@ -46,23 +40,17 @@ export async function getWorkflow(req: AuthenticatedRequest, res: Response) {
 
 export async function createWorkflow(req: AuthenticatedRequest, res: Response) {
   try {
-    const { name, description, nodes, edges } = req.body;
+    const { name, description, yaml, messages } = req.body;
 
     // Create workflow
     const workflow = await workflowService.createWorkflow({
       userId: req.user.userId,
       name,
       description,
-      status: 'draft'
+      status: 'draft',
+      yaml: yaml || '',
+      chatHistory: messages || []
     });
-
-    // Save nodes and edges if provided
-    if (nodes && edges) {
-      await Promise.all([
-        workflowService.saveWorkflowNodes(workflow.workflowId, nodes),
-        workflowService.saveWorkflowEdges(workflow.workflowId, edges)
-      ]);
-    }
 
     res.status(201).json(workflow);
   } catch (error) {
@@ -74,7 +62,7 @@ export async function createWorkflow(req: AuthenticatedRequest, res: Response) {
 export async function updateWorkflow(req: AuthenticatedRequest, res: Response) {
   try {
     const { id } = req.params;
-    const { name, description, status, nodes, edges } = req.body;
+    const { name, description, status, yaml, messages } = req.body;
 
     // Check workflow exists and user has access
     const workflow = await workflowService.getWorkflow(id);
@@ -90,17 +78,10 @@ export async function updateWorkflow(req: AuthenticatedRequest, res: Response) {
     if (name) updates.name = name;
     if (description) updates.description = description;
     if (status) updates.status = status;
+    if (yaml) updates.yaml = yaml;
+    if (messages) updates.chatHistory = messages;
 
     const updatedWorkflow = await workflowService.updateWorkflow(id, updates);
-
-    // Update nodes and edges if provided
-    if (nodes) {
-      await workflowService.saveWorkflowNodes(id, nodes);
-    }
-    if (edges) {
-      await workflowService.saveWorkflowEdges(id, edges);
-    }
-
     res.json(updatedWorkflow);
   } catch (error) {
     console.error('Error updating workflow:', error);
@@ -174,15 +155,36 @@ export async function runWorkflow(req: AuthenticatedRequest, res: Response) {
 
     // TODO: Implement actual workflow execution logic
     // This should be handled by a separate service that:
-    // 1. Gets workflow nodes and edges
-    // 2. Determines execution order
-    // 3. Executes tasks in sequence/parallel as defined
-    // 4. Updates execution status and task statuses
-    // 5. Handles errors and retries
+    // 1. Parses the YAML to determine execution steps
+    // 2. Executes tasks in sequence/parallel as defined
+    // 3. Updates execution status and task statuses
+    // 4. Handles errors and retries
 
     res.json(execution);
   } catch (error) {
     console.error('Error running workflow:', error);
     res.status(500).json({ error: 'Failed to run workflow' });
+  }
+}
+
+export async function generateWorkflow(req: AuthenticatedRequest, res: Response) {
+  try {
+    const { message, currentYaml } = req.body;
+
+    if (!message) {
+      return res.status(400).json({ error: 'Message is required' });
+    }
+
+    const { yaml, nodes, edges, message: responseMessage } = await generateWorkflowFromDescription(message, currentYaml);
+
+    res.json({
+      yaml,
+      nodes,
+      edges,
+      message: responseMessage
+    });
+  } catch (error) {
+    console.error('Error generating workflow:', error);
+    res.status(500).json({ error: 'Failed to generate workflow' });
   }
 } 

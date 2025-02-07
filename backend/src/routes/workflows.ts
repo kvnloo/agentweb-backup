@@ -7,7 +7,8 @@ import {
   updateWorkflow,
   deleteWorkflow,
   getWorkflowExecutions,
-  runWorkflow
+  runWorkflow,
+  generateWorkflow
 } from '../controllers/workflows';
 
 const router = express.Router();
@@ -21,6 +22,9 @@ router.get('/:id', getWorkflow);
 router.post('/', createWorkflow);
 router.put('/:id', updateWorkflow);
 router.delete('/:id', deleteWorkflow);
+
+// Workflow generation route
+router.post('/generate', generateWorkflow);
 
 // Workflow execution routes
 router.get('/:id/executions', getWorkflowExecutions);

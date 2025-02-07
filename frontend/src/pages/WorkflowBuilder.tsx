@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import ReactFlow, { 
   Node,
@@ -15,6 +15,7 @@ import ReactFlow, {
   NodeProps
 } from 'reactflow';
 import 'reactflow/dist/style.css';
+import yaml from 'js-yaml';
 
 import {
   Box,
@@ -22,37 +23,27 @@ import {
   Typography,
   Button,
   TextField,
-  Drawer,
   IconButton,
-  Divider,
-  List,
-  ListItem,
-  ListItemIcon,
-  ListItemText,
-  ListItemButton,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogActions,
   Snackbar,
-  Alert
+  Alert,
+  CircularProgress
 } from '@mui/material';
 
 import {
   Save as SaveIcon,
   PlayArrow as RunIcon,
-  Close as CloseIcon,
-  Add as AddIcon,
-  Settings as SettingsIcon,
   ArrowBack as ArrowBackIcon,
-  Task as TaskIcon,
-  Loop as LoopIcon,
-  CallSplit as BranchIcon
+  Send as SendIcon
 } from '@mui/icons-material';
 
 import TaskNode from '../components/workflow/nodes/TaskNode';
 import LoopNode from '../components/workflow/nodes/LoopNode';
 import ConditionNode from '../components/workflow/nodes/ConditionNode';
+
+interface Message {
+  role: 'user' | 'assistant';
+  content: string;
+}
 
 type NodeData = {
   label: string;
@@ -68,6 +59,7 @@ interface WorkflowData {
   id: string;
   name: string;
   description: string;
+  yaml: string;
   nodes: CustomNode[];
   edges: Edge[];
 }
@@ -79,12 +71,78 @@ const nodeTypes: Record<string, React.ComponentType<NodeProps<NodeData>>> = {
   condition: ConditionNode
 };
 
-// Define node type icons for the drawer
-const nodeTypeIcons = {
-  task: <TaskIcon />,
-  loop: <LoopIcon />,
-  condition: <BranchIcon />
-};
+// Add this function before the WorkflowBuilder component
+function generateVisualization(workflowData: any): { nodes: Node[], edges: Edge[] } {
+  // Calculate node positions
+  const nodeSpacing = { x: 250, y: 100 };  // Increased spacing
+  const startPosition = { x: 100, y: 50 };  // Starting position
+  
+  // Create a map to track node levels
+  const nodeLevels = new Map<string, number>();
+  const levelCounts = new Map<number, number>();
+  
+  // First pass: determine node levels based on connections
+  workflowData.edges.forEach((edge: any) => {
+    const sourceLevel = nodeLevels.get(edge.source) || 0;
+    nodeLevels.set(edge.target, sourceLevel + 1);
+    
+    // Update count for this level
+    const targetLevel = sourceLevel + 1;
+    levelCounts.set(targetLevel, (levelCounts.get(targetLevel) || 0) + 1);
+  });
+  
+  // Set level 0 for nodes without incoming edges
+  workflowData.nodes.forEach((node: any) => {
+    if (!nodeLevels.has(node.id)) {
+      nodeLevels.set(node.id, 0);
+      levelCounts.set(0, (levelCounts.get(0) || 0) + 1);
+    }
+  });
+
+  // Second pass: assign positions based on levels
+  const levelPositions = new Map<number, number>();  // Track x-position per level
+  
+  const nodes: Node[] = workflowData.nodes.map((node: any) => {
+    const level = nodeLevels.get(node.id) || 0;
+    const nodesInLevel = levelCounts.get(level) || 1;
+    
+    // Get or initialize x-position counter for this level
+    const currentX = levelPositions.get(level) || 0;
+    levelPositions.set(level, currentX + 1);
+    
+    // Calculate position
+    const position = {
+      x: startPosition.x + (currentX * nodeSpacing.x),
+      y: startPosition.y + (level * nodeSpacing.y)
+    };
+
+    return {
+      id: node.id,
+      type: node.type,
+      position,
+      data: {
+        label: node.data.label,
+        prompt: node.data.prompt,
+        loopCount: node.data.loopCount,
+        condition: node.data.condition
+      },
+      draggable: true,
+      selectable: true,
+      connectable: true
+    };
+  });
+
+  // Create edges with consistent styling
+  const edges: Edge[] = workflowData.edges.map((edge: any) => ({
+    id: edge.id || `${edge.source}-${edge.target}`,
+    source: edge.source,
+    target: edge.target,
+    type: 'smoothstep',
+    markerEnd: { type: MarkerType.ArrowClosed }
+  }));
+
+  return { nodes, edges };
+}
 
 export default function WorkflowBuilder() {
   const { id } = useParams();
@@ -93,19 +151,34 @@ export default function WorkflowBuilder() {
     id: id || 'new',
     name: '',
     description: '',
+    yaml: '',
     nodes: [],
     edges: []
   });
   
-  const [nodes, setNodes] = useState<CustomNode[]>([]);
+  const [messages, setMessages] = useState<Message[]>([
+    {
+      role: 'assistant',
+      content: 'Hi! I can help you create a workflow. You can describe what you want to do, and I\'ll help you build it. For example, you could say "Create a workflow that checks email every morning and sends a summary to Slack".'
+    }
+  ]);
+  const [input, setInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [nodes, setNodes] = useState<Node[]>([]);
   const [edges, setEdges] = useState<Edge[]>([]);
-  const [isDrawerOpen, setIsDrawerOpen] = useState(false);
-  const [selectedNode, setSelectedNode] = useState<Node | null>(null);
-  const [isSaveDialogOpen, setIsSaveDialogOpen] = useState(false);
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [showSnackbar, setShowSnackbar] = useState(false);
   const [snackbarMessage, setSnackbarMessage] = useState('');
   const [snackbarSeverity, setSnackbarSeverity] = useState<'success' | 'error'>('success');
+  
+  const messagesEndRef = useRef<null | HTMLDivElement>(null);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
 
   useEffect(() => {
     const fetchWorkflow = async () => {
@@ -127,32 +200,27 @@ export default function WorkflowBuilder() {
           const data = await response.json();
           console.log('Fetched workflow:', data);
 
+          // Set messages first if they exist
+          if (data.messages) {
+            setMessages(data.messages);
+          }
+
+          // Parse YAML to get visualization data
+          const workflowData = yaml.load(data.yaml) as any;
+          const { nodes: generatedNodes, edges: generatedEdges } = generateVisualization(workflowData);
+
           setWorkflow({
             id: data.workflowId,
             name: data.name,
             description: data.description,
-            nodes: [],
-            edges: []
+            yaml: data.yaml || '',
+            nodes: generatedNodes,
+            edges: generatedEdges
           });
 
-          // Set nodes and edges if they exist
-          if (data.nodes) {
-            setNodes(data.nodes.map((node: any) => ({
-              ...node,
-              // Ensure node has all required ReactFlow properties
-              draggable: true,
-              selectable: true,
-              connectable: true
-            })));
-          }
-
-          if (data.edges) {
-            setEdges(data.edges.map((edge: any) => ({
-              ...edge,
-              // Add any default edge properties
-              markerEnd: { type: MarkerType.ArrowClosed }
-            })));
-          }
+          // Set nodes and edges in ReactFlow state
+          setNodes(generatedNodes);
+          setEdges(generatedEdges);
         } catch (error) {
           console.error('Error fetching workflow:', error);
           setShowSnackbar(true);
@@ -164,6 +232,20 @@ export default function WorkflowBuilder() {
 
     fetchWorkflow();
   }, [id]);
+
+  // Add this effect to keep visualization in sync with workflow state
+  useEffect(() => {
+    if (workflow.yaml) {
+      try {
+        const workflowData = yaml.load(workflow.yaml) as any;
+        const { nodes: generatedNodes, edges: generatedEdges } = generateVisualization(workflowData);
+        setNodes(generatedNodes);
+        setEdges(generatedEdges);
+      } catch (error) {
+        console.error('Error parsing workflow YAML:', error);
+      }
+    }
+  }, [workflow.yaml]);
 
   const onNodesChange = (changes: NodeChange[]) => {
     setNodes((nds) => {
@@ -201,59 +283,68 @@ export default function WorkflowBuilder() {
   const onConnect = (connection: Connection) => {
     setEdges((eds) => addEdge({
       ...connection,
+      id: `edge-${Date.now()}`,
       markerEnd: { type: MarkerType.ArrowClosed }
     }, eds));
   };
 
-  const handleAddNode = (type: string) => {
-    console.log('Adding new node of type:', type);
-    
-    // Calculate position based on existing nodes
-    const yOffset = 100;
-    const xOffset = 50;
-    const existingNodes = nodes.length;
-    const position = {
-      x: 250 + (existingNodes * xOffset),
-      y: 100 + (existingNodes * yOffset)
-    };
+  const handleSendMessage = async () => {
+    if (!input.trim()) return;
 
-    const newNode: CustomNode = {
-      id: `${Date.now()}`,
-      type,
-      position,
-      data: { 
-        label: `New ${type}`,
-        ...(type === 'task' && { taskId: '', prompt: '' }),
-        ...(type === 'loop' && { loopCount: 1 }),
-        ...(type === 'condition' && { condition: '' })
-      },
-      draggable: true,
-      selectable: true,
-      connectable: true
-    };
-    console.log('Created new node:', newNode);
-    setNodes((currentNodes) => [...currentNodes, newNode]);
-    setIsDrawerOpen(false);
-  };
+    const userMessage = input;
+    setInput('');
+    setMessages(prev => [...prev, { role: 'user', content: userMessage }]);
+    setLoading(true);
 
-  const handleNodeClick = (event: React.MouseEvent, node: Node) => {
-    console.log('Node clicked:', node);
-    setSelectedNode(node);
-    setIsSettingsOpen(true);
+    try {
+      const baseUrl = import.meta.env.VITE_API_URL || '';
+      const response = await fetch(`${baseUrl}/api/workflows/generate`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${localStorage.getItem('token')}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          message: userMessage,
+          currentYaml: workflow.yaml
+        }),
+        credentials: 'include'
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to generate workflow');
+      }
+
+      const data = await response.json();
+      
+      // Update workflow with new YAML
+      setWorkflow(prev => ({
+        ...prev,
+        yaml: data.yaml
+      }));
+
+      // Add assistant's response
+      setMessages(prev => [...prev, { role: 'assistant', content: data.message }]);
+    } catch (error) {
+      console.error('Error generating workflow:', error);
+      setMessages(prev => [...prev, { 
+        role: 'assistant', 
+        content: 'Sorry, I encountered an error while generating the workflow. Please try again.' 
+      }]);
+    } finally {
+      setLoading(false);
+    }
   };
 
   const handleSave = async () => {
     try {
-      if (!workflow.name.trim()) {
-        setSnackbarMessage('Please enter a workflow name');
-        setSnackbarSeverity('error');
-        setShowSnackbar(true);
-        return;
-      }
-
+      // Parse YAML to get name and description
+      const workflowYaml = yaml.load(workflow.yaml) as any;
       const workflowData = {
-        name: workflow.name,
-        description: workflow.description,
+        name: workflowYaml?.name || 'Untitled Workflow',
+        description: workflowYaml?.description || '',
+        yaml: workflow.yaml,
+        messages: messages,
         nodes: nodes.map(node => ({
           ...node,
           // Remove ReactFlow-specific properties
@@ -311,7 +402,6 @@ export default function WorkflowBuilder() {
       setShowSnackbar(true);
       setSnackbarMessage('Workflow saved successfully');
       setSnackbarSeverity('success');
-      setIsSaveDialogOpen(false);
     } catch (error) {
       console.error('Error saving workflow:', error);
       setShowSnackbar(true);
@@ -365,13 +455,6 @@ export default function WorkflowBuilder() {
         <Box sx={{ display: 'flex', gap: 1 }}>
           <Button
             variant="contained"
-            startIcon={<AddIcon />}
-            onClick={() => setIsDrawerOpen(true)}
-          >
-            Add Node
-          </Button>
-          <Button
-            variant="contained"
             startIcon={<RunIcon />}
             onClick={handleRun}
           >
@@ -380,231 +463,137 @@ export default function WorkflowBuilder() {
           <Button
             variant="contained"
             startIcon={<SaveIcon />}
-            onClick={() => setIsSaveDialogOpen(true)}
+            onClick={handleSave}
           >
             Save
           </Button>
         </Box>
       </Paper>
 
-      {/* Flow Editor */}
-      <Box sx={{ flex: 1, position: 'relative' }}>
-        <ReactFlow
-          nodes={nodes}
-          edges={edges}
-          onNodesChange={onNodesChange}
-          onEdgesChange={onEdgesChange}
-          onConnect={onConnect}
-          onNodeClick={handleNodeClick}
-          nodeTypes={nodeTypes}
-          fitView
-          defaultEdgeOptions={{
-            type: 'smoothstep',
-            markerEnd: { type: MarkerType.ArrowClosed }
-          }}
-        >
-          <Controls />
-          <Background />
-          <MiniMap />
-        </ReactFlow>
-      </Box>
-
-      {/* Add Node Drawer */}
-      <Drawer
-        anchor="right"
-        open={isDrawerOpen}
-        onClose={() => setIsDrawerOpen(false)}
-      >
-        <Box sx={{ width: 300, p: 2 }}>
-          <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
-            <Typography variant="h6">Add Node</Typography>
-            <IconButton onClick={() => setIsDrawerOpen(false)}>
-              <CloseIcon />
-            </IconButton>
-          </Box>
-          <Divider />
-          <List>
-            {Object.entries(nodeTypes).map(([type]) => (
-              <ListItem key={type} disablePadding>
-                <ListItemButton onClick={() => handleAddNode(type)}>
-                  <ListItemIcon>
-                    {nodeTypeIcons[type as keyof typeof nodeTypeIcons]}
-                  </ListItemIcon>
-                  <ListItemText primary={type.charAt(0).toUpperCase() + type.slice(1)} />
-                </ListItemButton>
-              </ListItem>
+      {/* Main Content */}
+      <Box sx={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+        {/* Chat Section */}
+        <Box sx={{ 
+          width: '400px', 
+          borderRight: 1, 
+          borderColor: 'divider',
+          display: 'flex',
+          flexDirection: 'column'
+        }}>
+          {/* Messages */}
+          <Box sx={{ 
+            flex: 1, 
+            overflowY: 'auto', 
+            p: 2,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 2
+          }}>
+            {messages.map((message, index) => (
+              <Paper
+                key={index}
+                sx={{
+                  p: 2,
+                  maxWidth: '90%',
+                  alignSelf: message.role === 'user' ? 'flex-end' : 'flex-start',
+                  bgcolor: message.role === 'user' ? 'primary.main' : 'background.paper'
+                }}
+              >
+                <Typography
+                  sx={{
+                    color: message.role === 'user' ? 'white' : 'text.primary',
+                    whiteSpace: 'pre-wrap'
+                  }}
+                >
+                  {message.content}
+                </Typography>
+              </Paper>
             ))}
-          </List>
-        </Box>
-      </Drawer>
-
-      {/* Node Settings Dialog */}
-      <Dialog
-        open={isSettingsOpen}
-        onClose={() => {
-          console.log('Closing dialog');
-          setIsSettingsOpen(false);
-          setSelectedNode(null);
-        }}
-        maxWidth="sm"
-        fullWidth
-      >
-        <DialogTitle>
-          {selectedNode?.type === 'task' ? 'Edit Task' : 
-           selectedNode?.type ? `${selectedNode.type.charAt(0).toUpperCase()}${selectedNode.type.slice(1)} Settings` : 
-           'Node Settings'}
-        </DialogTitle>
-        <DialogContent>
-          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, mt: 1 }}>
-            {selectedNode?.type === 'task' ? (
-              <>
-                <TextField
-                  label="Task Name"
-                  fullWidth
-                  value={selectedNode?.data?.label || ''}
-                  onChange={(e) => {
-                    if (selectedNode) {
-                      const updatedNode = {
-                        ...selectedNode,
-                        data: { ...selectedNode.data, label: e.target.value }
-                      };
-                      setNodes((nds) =>
-                        nds.map((node) =>
-                          node.id === selectedNode.id ? updatedNode : node
-                        )
-                      );
-                      setSelectedNode(updatedNode);
-                    }
-                  }}
-                />
-                <TextField
-                  label="Task Prompt"
-                  fullWidth
-                  multiline
-                  rows={4}
-                  placeholder="Enter the instructions for this task..."
-                  value={selectedNode?.data?.prompt || ''}
-                  onChange={(e) => {
-                    if (selectedNode) {
-                      const updatedNode = {
-                        ...selectedNode,
-                        data: { ...selectedNode.data, prompt: e.target.value }
-                      };
-                      setNodes((nds) =>
-                        nds.map((node) =>
-                          node.id === selectedNode.id ? updatedNode : node
-                        )
-                      );
-                      setSelectedNode(updatedNode);
-                    }
-                  }}
-                />
-              </>
-            ) : (
-              <>
-                <TextField
-                  label="Label"
-                  fullWidth
-                  value={selectedNode?.data?.label || ''}
-                  onChange={(e) => {
-                    if (selectedNode) {
-                      setNodes((nds) =>
-                        nds.map((node) =>
-                          node.id === selectedNode.id
-                            ? { ...node, data: { ...node.data, label: e.target.value } }
-                            : node
-                        )
-                      );
-                    }
-                  }}
-                />
-
-                {selectedNode?.type === 'loop' && (
-                  <TextField
-                    label="Loop Count"
-                    type="number"
-                    fullWidth
-                    value={selectedNode?.data?.loopCount || 1}
-                    onChange={(e) => {
-                      if (selectedNode) {
-                        setNodes((nds) =>
-                          nds.map((node) =>
-                            node.id === selectedNode.id
-                              ? { ...node, data: { ...node.data, loopCount: parseInt(e.target.value) || 1 } }
-                              : node
-                          )
-                        );
-                      }
-                    }}
-                  />
-                )}
-
-                {selectedNode?.type === 'condition' && (
-                  <TextField
-                    label="Condition"
-                    fullWidth
-                    multiline
-                    rows={2}
-                    value={selectedNode?.data?.condition || ''}
-                    onChange={(e) => {
-                      if (selectedNode) {
-                        setNodes((nds) =>
-                          nds.map((node) =>
-                            node.id === selectedNode.id
-                              ? { ...node, data: { ...node.data, condition: e.target.value } }
-                              : node
-                          )
-                        );
-                      }
-                    }}
-                  />
-                )}
-              </>
-            )}
+            <div ref={messagesEndRef} />
           </Box>
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setIsSettingsOpen(false)}>Cancel</Button>
-          <Button 
-            onClick={() => setIsSettingsOpen(false)} 
-            color="primary"
-            variant="contained"
-          >
-            Apply
-          </Button>
-        </DialogActions>
-      </Dialog>
 
-      {/* Save Dialog */}
-      <Dialog
-        open={isSaveDialogOpen}
-        onClose={() => setIsSaveDialogOpen(false)}
-      >
-        <DialogTitle>Save Workflow</DialogTitle>
-        <DialogContent>
-          <TextField
-            autoFocus
-            margin="dense"
-            label="Workflow Name"
-            fullWidth
-            value={workflow.name}
-            onChange={(e) => setWorkflow({ ...workflow, name: e.target.value })}
-          />
-          <TextField
-            margin="dense"
-            label="Description"
-            fullWidth
-            multiline
-            rows={4}
-            value={workflow.description}
-            onChange={(e) => setWorkflow({ ...workflow, description: e.target.value })}
-          />
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setIsSaveDialogOpen(false)}>Cancel</Button>
-          <Button onClick={handleSave} color="primary">Save</Button>
-        </DialogActions>
-      </Dialog>
+          {/* Input */}
+          <Box sx={{ p: 2, borderTop: 1, borderColor: 'divider' }}>
+            <Box sx={{ display: 'flex', gap: 1 }}>
+              <TextField
+                fullWidth
+                placeholder="Describe your workflow..."
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyPress={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    handleSendMessage();
+                  }
+                }}
+                multiline
+                maxRows={4}
+                disabled={loading}
+              />
+              <IconButton 
+                color="primary" 
+                onClick={handleSendMessage}
+                disabled={loading || !input.trim()}
+              >
+                {loading ? <CircularProgress size={24} /> : <SendIcon />}
+              </IconButton>
+            </Box>
+          </Box>
+        </Box>
+
+        {/* Visualization Section */}
+        <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+          {/* YAML View */}
+          <Paper sx={{ 
+            flex: 0.4, 
+            overflow: 'auto',
+            borderBottom: 1,
+            borderColor: 'divider',
+            p: 2
+          }}>
+            <Typography
+              component="pre"
+              sx={{
+                fontFamily: 'monospace',
+                whiteSpace: 'pre-wrap',
+                margin: 0
+              }}
+            >
+              {workflow.yaml || 'No workflow defined yet. Start chatting to create one!'}
+            </Typography>
+          </Paper>
+
+          {/* Flow View */}
+          <Box sx={{ 
+            flex: 0.6,
+            height: '100%',
+            minHeight: '500px',
+            border: 1,
+            borderColor: 'divider',
+            borderRadius: 1,
+            overflow: 'hidden'
+          }}>
+            <ReactFlow
+              nodes={nodes}
+              edges={edges}
+              onNodesChange={onNodesChange}
+              onEdgesChange={onEdgesChange}
+              onConnect={onConnect}
+              nodeTypes={nodeTypes}
+              fitView
+              defaultEdgeOptions={{
+                type: 'smoothstep',
+                markerEnd: { type: MarkerType.ArrowClosed }
+              }}
+              style={{ background: '#f8f9fa' }}
+              proOptions={{ hideAttribution: true }}
+            >
+              <Controls />
+              <Background />
+            </ReactFlow>
+          </Box>
+        </Box>
+      </Box>
 
       {/* Snackbar */}
       <Snackbar

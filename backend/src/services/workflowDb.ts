@@ -8,34 +8,13 @@ export interface Workflow {
   name: string;
   description: string;
   status: 'active' | 'draft' | 'archived';
+  yaml: string;
+  chatHistory: {
+    role: 'user' | 'assistant';
+    content: string;
+  }[];
   createdAt: string;
   updatedAt: string;
-}
-
-export interface WorkflowNode {
-  nodeId: string;
-  workflowId: string;
-  type: 'task' | 'loop' | 'condition';
-  position: {
-    x: number;
-    y: number;
-  };
-  data: {
-    label: string;
-    taskId?: string;
-    condition?: string;
-    loopCount?: number;
-  };
-}
-
-export interface WorkflowEdge {
-  edgeId: string;
-  workflowId: string;
-  sourceId: string;
-  targetId: string;
-  data?: {
-    condition?: string;
-  };
 }
 
 export interface WorkflowExecution {
@@ -72,7 +51,9 @@ export class WorkflowService {
       ...workflow,
       workflowId,
       createdAt: now,
-      updatedAt: now
+      updatedAt: now,
+      yaml: workflow.yaml || '',
+      chatHistory: workflow.chatHistory || []
     };
 
     await this.dynamodb.put({
@@ -92,17 +73,32 @@ export class WorkflowService {
     return result.Item as Workflow || null;
   }
 
-  async updateWorkflow(workflowId: string, updates: Partial<Workflow>): Promise<Workflow> {
-    const updateExpr = Object.keys(updates).map(key => `#${key} = :${key}`).join(', ');
-    const exprAttrNames = Object.keys(updates).reduce((acc, key) => ({ ...acc, [`#${key}`]: key }), {});
-    const exprAttrValues = Object.entries(updates).reduce((acc, [key, value]) => ({ ...acc, [`:${key}`]: value }), {});
+  async updateWorkflow(
+    workflowId: string, 
+    updates: Partial<Omit<Workflow, 'workflowId' | 'createdAt'>>
+  ): Promise<Workflow> {
+    const now = new Date().toISOString();
+    const updateExpr = Object.keys(updates)
+      .map(key => `#${key} = :${key}`)
+      .concat(['#updatedAt = :updatedAt'])
+      .join(', ');
+
+    const exprAttrNames = Object.keys(updates)
+      .reduce((acc, key) => ({ ...acc, [`#${key}`]: key }), {
+        '#updatedAt': 'updatedAt'
+      });
+
+    const exprAttrValues = Object.entries(updates)
+      .reduce((acc, [key, value]) => ({ ...acc, [`:${key}`]: value }), {
+        ':updatedAt': now
+      });
 
     const result = await this.dynamodb.update({
       TableName: `${TABLE_PREFIX}AW-Workflows`,
       Key: { workflowId },
-      UpdateExpression: `SET ${updateExpr}, #updatedAt = :updatedAt`,
-      ExpressionAttributeNames: { ...exprAttrNames, '#updatedAt': 'updatedAt' },
-      ExpressionAttributeValues: { ...exprAttrValues, ':updatedAt': new Date().toISOString() },
+      UpdateExpression: `SET ${updateExpr}`,
+      ExpressionAttributeNames: exprAttrNames,
+      ExpressionAttributeValues: exprAttrValues,
       ReturnValues: 'ALL_NEW'
     }).promise();
 
@@ -127,78 +123,6 @@ export class WorkflowService {
     }).promise();
 
     return result.Items as Workflow[];
-  }
-
-  // Workflow Nodes operations
-  async saveWorkflowNodes(workflowId: string, nodes: Omit<WorkflowNode, 'nodeId'>[]): Promise<WorkflowNode[]> {
-    const savedNodes: WorkflowNode[] = [];
-
-    for (const node of nodes) {
-      const nodeId = uuidv4();
-      const newNode: WorkflowNode = {
-        ...node,
-        nodeId,
-        workflowId
-      };
-
-      await this.dynamodb.put({
-        TableName: `${TABLE_PREFIX}AW-WorkflowNodes`,
-        Item: newNode
-      }).promise();
-
-      savedNodes.push(newNode);
-    }
-
-    return savedNodes;
-  }
-
-  async getWorkflowNodes(workflowId: string): Promise<WorkflowNode[]> {
-    const result = await this.dynamodb.query({
-      TableName: `${TABLE_PREFIX}AW-WorkflowNodes`,
-      IndexName: 'WorkflowNodesIndex',
-      KeyConditionExpression: 'workflowId = :workflowId',
-      ExpressionAttributeValues: {
-        ':workflowId': workflowId
-      }
-    }).promise();
-
-    return result.Items as WorkflowNode[];
-  }
-
-  // Workflow Edges operations
-  async saveWorkflowEdges(workflowId: string, edges: Omit<WorkflowEdge, 'edgeId'>[]): Promise<WorkflowEdge[]> {
-    const savedEdges: WorkflowEdge[] = [];
-
-    for (const edge of edges) {
-      const edgeId = uuidv4();
-      const newEdge: WorkflowEdge = {
-        ...edge,
-        edgeId,
-        workflowId
-      };
-
-      await this.dynamodb.put({
-        TableName: `${TABLE_PREFIX}AW-WorkflowEdges`,
-        Item: newEdge
-      }).promise();
-
-      savedEdges.push(newEdge);
-    }
-
-    return savedEdges;
-  }
-
-  async getWorkflowEdges(workflowId: string): Promise<WorkflowEdge[]> {
-    const result = await this.dynamodb.query({
-      TableName: `${TABLE_PREFIX}AW-WorkflowEdges`,
-      IndexName: 'WorkflowEdgesIndex',
-      KeyConditionExpression: 'workflowId = :workflowId',
-      ExpressionAttributeValues: {
-        ':workflowId': workflowId
-      }
-    }).promise();
-
-    return result.Items as WorkflowEdge[];
   }
 
   // Workflow Executions operations
