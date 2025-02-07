@@ -73,6 +73,11 @@ const nodeTypes: Record<string, React.ComponentType<NodeProps<NodeData>>> = {
 
 // Add this function before the WorkflowBuilder component
 function generateVisualization(workflowData: any): { nodes: Node[], edges: Edge[] } {
+  if (!workflowData || !workflowData.nodes || !workflowData.edges) {
+    console.error('Invalid workflow data:', workflowData);
+    return { nodes: [], edges: [] };
+  }
+
   // Calculate node positions
   const nodeSpacing = { x: 250, y: 100 };  // Increased spacing
   const startPosition = { x: 100, y: 50 };  // Starting position
@@ -104,7 +109,6 @@ function generateVisualization(workflowData: any): { nodes: Node[], edges: Edge[
   
   const nodes: Node[] = workflowData.nodes.map((node: any) => {
     const level = nodeLevels.get(node.id) || 0;
-    const nodesInLevel = levelCounts.get(level) || 1;
     
     // Get or initialize x-position counter for this level
     const currentX = levelPositions.get(level) || 0;
@@ -118,7 +122,7 @@ function generateVisualization(workflowData: any): { nodes: Node[], edges: Edge[
 
     return {
       id: node.id,
-      type: node.type,
+      type: node.type || 'task',  // Default to task type if not specified
       position,
       data: {
         label: node.data.label,
@@ -132,9 +136,9 @@ function generateVisualization(workflowData: any): { nodes: Node[], edges: Edge[
     };
   });
 
-  // Create edges with consistent styling
+  // Create edges with consistent styling and unique IDs
   const edges: Edge[] = workflowData.edges.map((edge: any) => ({
-    id: edge.id || `${edge.source}-${edge.target}`,
+    id: `edge-${edge.source}-${edge.target}-${Date.now()}`,
     source: edge.source,
     target: edge.target,
     type: 'smoothstep',
@@ -233,14 +237,22 @@ export default function WorkflowBuilder() {
     fetchWorkflow();
   }, [id]);
 
-  // Add this effect to keep visualization in sync with workflow state
+  // Update the useEffect hook that watches workflow.yaml
   useEffect(() => {
     if (workflow.yaml) {
       try {
         const workflowData = yaml.load(workflow.yaml) as any;
-        const { nodes: generatedNodes, edges: generatedEdges } = generateVisualization(workflowData);
-        setNodes(generatedNodes);
-        setEdges(generatedEdges);
+        console.log('Parsed workflow data:', workflowData);  // Add logging
+        
+        if (workflowData && workflowData.nodes && workflowData.edges) {
+          const { nodes: generatedNodes, edges: generatedEdges } = generateVisualization(workflowData);
+          console.log('Generated visualization:', { nodes: generatedNodes, edges: generatedEdges });  // Add logging
+          
+          setNodes(generatedNodes);
+          setEdges(generatedEdges);
+        } else {
+          console.error('Invalid workflow data structure');
+        }
       } catch (error) {
         console.error('Error parsing workflow YAML:', error);
       }
@@ -549,14 +561,25 @@ export default function WorkflowBuilder() {
             overflow: 'auto',
             borderBottom: 1,
             borderColor: 'divider',
+            bgcolor: '#1e1e1e',  // Dark background for code
             p: 2
           }}>
+            <Typography variant="h6" sx={{ color: '#fff', mb: 2 }}>
+              YAML Definition
+            </Typography>
             <Typography
               component="pre"
               sx={{
-                fontFamily: 'monospace',
+                fontFamily: '"Fira Code", "Consolas", monospace',
                 whiteSpace: 'pre-wrap',
-                margin: 0
+                margin: 0,
+                color: '#d4d4d4',  // Light gray text for code
+                fontSize: '0.9rem',
+                lineHeight: 1.5,
+                padding: 2,
+                borderRadius: 1,
+                backgroundColor: '#252525',  // Slightly lighter than the container
+                border: '1px solid #333'
               }}
             >
               {workflow.yaml || 'No workflow defined yet. Start chatting to create one!'}
@@ -566,31 +589,41 @@ export default function WorkflowBuilder() {
           {/* Flow View */}
           <Box sx={{ 
             flex: 0.6,
+            display: 'flex',
+            flexDirection: 'column',
             height: '100%',
             minHeight: '500px',
-            border: 1,
-            borderColor: 'divider',
-            borderRadius: 1,
-            overflow: 'hidden'
+            bgcolor: '#f8f9fa'
           }}>
-            <ReactFlow
-              nodes={nodes}
-              edges={edges}
-              onNodesChange={onNodesChange}
-              onEdgesChange={onEdgesChange}
-              onConnect={onConnect}
-              nodeTypes={nodeTypes}
-              fitView
-              defaultEdgeOptions={{
-                type: 'smoothstep',
-                markerEnd: { type: MarkerType.ArrowClosed }
-              }}
-              style={{ background: '#f8f9fa' }}
-              proOptions={{ hideAttribution: true }}
-            >
-              <Controls />
-              <Background />
-            </ReactFlow>
+            <Typography variant="h6" sx={{ p: 2, borderBottom: 1, borderColor: 'divider' }}>
+              Workflow Visualization
+            </Typography>
+            <Box sx={{ 
+              flex: 1,
+              border: 1,
+              borderColor: 'divider',
+              borderRadius: 1,
+              overflow: 'hidden'
+            }}>
+              <ReactFlow
+                nodes={nodes}
+                edges={edges}
+                onNodesChange={onNodesChange}
+                onEdgesChange={onEdgesChange}
+                onConnect={onConnect}
+                nodeTypes={nodeTypes}
+                fitView
+                defaultEdgeOptions={{
+                  type: 'smoothstep',
+                  markerEnd: { type: MarkerType.ArrowClosed }
+                }}
+                style={{ background: '#f8f9fa' }}
+                proOptions={{ hideAttribution: true }}
+              >
+                <Controls />
+                <Background />
+              </ReactFlow>
+            </Box>
           </Box>
         </Box>
       </Box>
