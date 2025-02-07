@@ -49,6 +49,7 @@ interface Task {
   summary?: string;
   error?: string;
   emailNotification?: boolean;
+  isInteractive?: boolean;
 }
 
 interface TaskExecution {
@@ -266,6 +267,37 @@ export default function TaskDetails() {
     }
   };
 
+  const handleInteractiveModeToggle = async () => {
+    if (!task) return;
+    
+    try {
+      const newIsInteractive = !task.isInteractive;
+      
+      const updateResponse = await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        {
+          isInteractive: newIsInteractive
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+
+      // Update the task state with the response
+      const taskResponse = await axios.get(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+      
+      setTask(taskResponse.data);
+    } catch (error: any) {
+      console.error('Error updating interactive mode:', error);
+      setError(error.response?.data?.message || 'Failed to update interactive mode');
+    }
+  };
+
   const handleFeedbackChange = async (executionId: string, feedback: 'accepted' | 'rejected' | null) => {
     try {
       await axios.put(
@@ -454,16 +486,28 @@ export default function TaskDetails() {
               )}
             </Box>
             {showActions && (
-              <FormControlLabel
-                control={
-                  <Switch
-                    checked={Boolean(task.emailNotification)}
-                    onChange={handleEmailToggle}
-                    color="primary"
-                  />
-                }
-                label="Email Me Latest Run"
-              />
+              <Box sx={{ display: 'flex', gap: 2, alignItems: 'center' }}>
+                <FormControlLabel
+                  control={
+                    <Switch
+                      checked={Boolean(task.emailNotification)}
+                      onChange={handleEmailToggle}
+                      color="primary"
+                    />
+                  }
+                  label="Email Me Latest Run"
+                />
+                <FormControlLabel
+                  control={
+                    <Switch
+                      checked={Boolean(task.isInteractive)}
+                      onChange={handleInteractiveModeToggle}
+                      color="primary"
+                    />
+                  }
+                  label="Interactive Mode"
+                />
+              </Box>
             )}
           </Box>
           {showActions && (

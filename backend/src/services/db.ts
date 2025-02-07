@@ -172,6 +172,8 @@ export const taskDb = {
     prompt: string;
     status: string;
     createdAt: string;
+    isInteractive?: boolean;
+    emailNotification?: boolean;
   }) {
     try {
       const params = {
@@ -274,13 +276,14 @@ export const taskDb = {
         Key: {
           taskId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
           '#e': 'error',
           '#sum': 'summary',
-          '#en': 'emailNotification'
+          '#en': 'emailNotification',
+          '#i': 'isInteractive'
         }
       };
 
@@ -298,6 +301,7 @@ export const taskDb = {
     error: string;
     summary: string;
     emailNotification: boolean;
+    isInteractive: boolean;
   }>) {
     try {
       const updateExpressions: string[] = [];

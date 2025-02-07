@@ -8,4 +8,5 @@ export interface Task {
   updatedAt?: string;
   error?: string;
   summary?: string;  // Summary from the agent's execution
+  isInteractive?: boolean;  // Whether the task allows user interaction during execution
 } 
