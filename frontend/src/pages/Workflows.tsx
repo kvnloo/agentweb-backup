@@ -25,8 +25,7 @@ import {
   MoreVert as MoreVertIcon,
   PlayArrow as PlayIcon,
   Edit as EditIcon,
-  Delete as DeleteIcon,
-  ContentCopy as CloneIcon
+  Delete as DeleteIcon
 } from '@mui/icons-material';
 import { useNavigate } from 'react-router-dom';
 
@@ -48,8 +47,6 @@ export default function Workflows() {
   const [anchorEl, setAnchorEl] = useState<null | HTMLElement>(null);
   const [selectedWorkflow, setSelectedWorkflow] = useState<Workflow | null>(null);
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
-  const [isRenameDialogOpen, setIsRenameDialogOpen] = useState(false);
-  const [newName, setNewName] = useState('');
   const [showSnackbar, setShowSnackbar] = useState(false);
   const [snackbarMessage, setSnackbarMessage] = useState('');
   const [snackbarSeverity, setSnackbarSeverity] = useState<'success' | 'error'>('success');
@@ -153,20 +150,6 @@ export default function Workflows() {
     }
   };
 
-  const handleCloneWorkflow = () => {
-    // TODO: Implement workflow cloning
-    console.log('Cloning workflow:', selectedWorkflow?.id);
-    handleMenuClose();
-  };
-
-  const handleRenameWorkflow = () => {
-    // TODO: Implement workflow renaming
-    console.log('Renaming workflow:', selectedWorkflow?.id, 'to:', newName);
-    setIsRenameDialogOpen(false);
-    setNewName('');
-    handleMenuClose();
-  };
-
   return (
     <Box sx={{ p: 3 }}>
       <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 3 }}>
@@ -252,12 +235,6 @@ export default function Workflows() {
         <MenuItem onClick={() => selectedWorkflow && handleEditWorkflow(selectedWorkflow.id)}>
           <EditIcon sx={{ mr: 1 }} /> Edit
         </MenuItem>
-        <MenuItem onClick={() => setIsRenameDialogOpen(true)}>
-          <EditIcon sx={{ mr: 1 }} /> Rename
-        </MenuItem>
-        <MenuItem onClick={handleCloneWorkflow}>
-          <CloneIcon sx={{ mr: 1 }} /> Clone
-        </MenuItem>
         <MenuItem onClick={() => setIsDeleteDialogOpen(true)} sx={{ color: 'error.main' }}>
           <DeleteIcon sx={{ mr: 1 }} /> Delete
         </MenuItem>
@@ -289,24 +266,6 @@ export default function Workflows() {
           <Button onClick={handleDeleteWorkflow} color="error" variant="contained">
             Delete
           </Button>
-        </DialogActions>
-      </Dialog>
-
-      <Dialog open={isRenameDialogOpen} onClose={() => setIsRenameDialogOpen(false)}>
-        <DialogTitle>Rename Workflow</DialogTitle>
-        <DialogContent>
-          <TextField
-            autoFocus
-            margin="dense"
-            label="New Name"
-            fullWidth
-            value={newName}
-            onChange={(e) => setNewName(e.target.value)}
-          />
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setIsRenameDialogOpen(false)}>Cancel</Button>
-          <Button onClick={handleRenameWorkflow} color="primary">Rename</Button>
         </DialogActions>
       </Dialog>
     </Box>
