@@ -18,6 +18,9 @@ import PrivateRoute from './components/PrivateRoute';
 import AdminRoute from './components/AdminRoute';
 import Profile from './pages/Profile';
 import Config from './pages/Config';
+import Workflows from './pages/Workflows';
+import WorkflowBuilder from './pages/WorkflowBuilder';
+import WorkflowDetails from './pages/WorkflowDetails';
 
 export default function App() {
   return (
@@ -83,6 +86,38 @@ export default function App() {
                       }
                     />
                     <Route path="/config" element={<Config />} />
+                    <Route
+                      path="workflows"
+                      element={
+                        <PrivateRoute>
+                          <Workflows />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="workflows/new"
+                      element={
+                        <PrivateRoute>
+                          <WorkflowBuilder />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="workflows/:id"
+                      element={
+                        <PrivateRoute>
+                          <WorkflowDetails />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="workflows/:id/edit"
+                      element={
+                        <PrivateRoute>
+                          <WorkflowBuilder />
+                        </PrivateRoute>
+                      }
+                    />
                   </Route>
                 </Routes>
               </Box>
