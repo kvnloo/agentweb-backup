@@ -565,25 +565,28 @@ export default function WorkflowBuilder() {
             p: 2
           }}>
             <Typography variant="h6" sx={{ color: '#fff', mb: 2 }}>
-              YAML Definition
+              YAML Definition (Editable)
             </Typography>
-            <Typography
-              component="pre"
+            <TextField
+              multiline
+              fullWidth
+              value={workflow.yaml}
+              onChange={(e) => setWorkflow(prev => ({ ...prev, yaml: e.target.value }))}
               sx={{
-                fontFamily: '"Fira Code", "Consolas", monospace',
-                whiteSpace: 'pre-wrap',
-                margin: 0,
-                color: '#d4d4d4',  // Light gray text for code
-                fontSize: '0.9rem',
-                lineHeight: 1.5,
-                padding: 2,
-                borderRadius: 1,
-                backgroundColor: '#252525',  // Slightly lighter than the container
-                border: '1px solid #333'
+                '& .MuiInputBase-root': {
+                  fontFamily: '"Fira Code", "Consolas", monospace',
+                  fontSize: '0.9rem',
+                  color: '#d4d4d4',
+                  backgroundColor: '#252525',
+                },
+                '& .MuiOutlinedInput-notchedOutline': {
+                  borderColor: '#333',
+                },
+                '& .MuiInputBase-input': {
+                  padding: 2,
+                }
               }}
-            >
-              {workflow.yaml || 'No workflow defined yet. Start chatting to create one!'}
-            </Typography>
+            />
           </Paper>
 
           {/* Flow View */}
