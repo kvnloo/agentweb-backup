@@ -302,6 +302,7 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
 
 async def execute_task(execution):
     global running_task_count, running_user_ids
+    
     execution_id = execution['executionId']
     task_id = execution['taskId']
     user_id = execution['userId']
@@ -390,7 +391,7 @@ async def execute_task(execution):
         last_error = None
         success = False
         
-        context = f"You are executing this task at {datetime.now(timezone.utc).isoformat()} for user_id: {user_id}. When using get_login_credentials action, you must pass this user_id as a parameter along with the domain."
+        context = f"You are executing this task at {datetime.now(timezone.utc).isoformat()}."
         prompt_with_context = f"{prompt}\n\n{context}"
 
         # Try each LLM in sequence until one succeeds
@@ -405,7 +406,11 @@ async def execute_task(execution):
                 if gif_path.exists():
                     gif_path.unlink()
                 
-                result = await agent.execute_task(prompt_with_context)
+                result = await agent.execute_task(
+                    prompt_with_context,
+                    execution_id=execution_id,
+                    is_interactive=bool(task.get('isInteractive', False))
+                )
                 
                 # Check for agent_history.gif and upload if exists
                 details_gif = None

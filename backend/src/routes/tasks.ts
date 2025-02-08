@@ -1,5 +1,5 @@
 import express from 'express';
-import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution } from '../controllers/tasks';
+import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction } from '../controllers/tasks';
 import { authenticateToken } from '../middleware/auth';
 import { taskDb, subscriberDb } from '../services/db';
 
@@ -16,6 +16,7 @@ router.put('/:id', updateTask);
 router.delete('/:id', deleteTask);
 router.post('/:id/execute', executeTask);
 router.put('/:id/executions/:executionId', updateTaskExecution);
+router.put('/:id/executions/:executionId/interactions/:interactionId', respondToInteraction);
 
 // Get task subscribers
 router.get('/:taskId/subscribers', async (req, res) => {

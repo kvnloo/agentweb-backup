@@ -3,7 +3,7 @@ import argparse
 import json
 import sys
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import browser_use
 from browser_use import Agent, Controller
 from browser_use.browser.browser import Browser, BrowserConfig
@@ -18,6 +18,7 @@ from pathlib import Path
 from browser_use.agent.views import ActionResult
 from cookie_sync import CookieSync
 from aws_utils import get_dynamodb_resource, get_bedrock_client
+import time
 
 # Load environment variables
 load_dotenv()
@@ -204,39 +205,6 @@ def get_llm(full_llm_name: str):
     # Initialize the LLM using the mapped function
     return init_func(model_name), full_llm_name
 
-@controller.action('Get login credentials by domain')
-def get_login_credentials(domain: str, user_id: str):
-    """Get login credentials for a domain from the database"""
-    if not user_id:
-        raise Exception("User ID not provided")
-    if not domain:
-        return ActionResult(error=f"Please provide a domain")
-    logger.info(f"Getting login credentials for domain {domain} under user {user_id}")
-        
-    table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
-    response = table.query(
-        KeyConditionExpression='userId = :userId',
-        FilterExpression='website = :website',
-        ExpressionAttributeValues={
-            ':userId': user_id,
-            ':website': domain
-        }
-    )
-
-    items = response.get('Items', [])
-    if not items:
-        return ActionResult(error=f"No credentials found for domain: {domain}")
-
-    config = items[0]
-    try:
-        if config.get('sharedBy'):
-            logger.info(f"Found shared credentials for {domain} - shared by user: {config['sharedBy']}")
-        # Pass sharedBy to decrypt_password if it exists
-        decrypted_password = decrypt_password(config['password'], user_id, config.get('sharedBy'))
-        return ActionResult(extracted_content=f"username: {config['username']}, password: {decrypted_password}")
-    except Exception as e:
-        return ActionResult(error=f"Error getting credentials: {str(e)}")
-
 class WebAgent:
     def __init__(self, user_id=None, full_llm_name=None):
         logger.info(f"Initializing WebAgent for user {user_id}")
@@ -251,6 +219,93 @@ class WebAgent:
         self.context_dir = Path('context')
         self.context_dir.mkdir(exist_ok=True)
         self.cookie_sync = CookieSync() if user_id else None
+        self.is_interactive = False  # Initialize interactive mode flag
+        self.current_execution_id = None
+        self.controller = Controller()
+        self._register_actions()
+
+    def _register_actions(self):
+        @self.controller.registry.action('Get login credentials by domain')
+        def get_login_credentials(domain: str) -> ActionResult:
+            """Get login credentials for a domain from the database"""
+            if not self.user_id:
+                return ActionResult(error="User ID not provided")
+            if not domain:
+                return ActionResult(error=f"Please provide a domain")
+            logger.info(f"Getting login credentials for domain {domain} under user {self.user_id}")
+                
+            table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
+            response = table.query(
+                KeyConditionExpression='userId = :userId',
+                FilterExpression='website = :website',
+                ExpressionAttributeValues={
+                    ':userId': self.user_id,
+                    ':website': domain
+                }
+            )
+
+            items = response.get('Items', [])
+            if not items:
+                return ActionResult(error=f"No credentials found for domain: {domain}")
+
+            config = items[0]
+            try:
+                if config.get('sharedBy'):
+                    logger.info(f"Found shared credentials for {domain} - shared by user: {config['sharedBy']}")
+                # Pass sharedBy to decrypt_password if it exists
+                decrypted_password = decrypt_password(config['password'], self.user_id, config.get('sharedBy'))
+                return ActionResult(extracted_content=f"username: {config['username']}, password: {decrypted_password}")
+            except Exception as e:
+                return ActionResult(error=f"Error getting credentials: {str(e)}")
+
+        @self.controller.registry.action('Ask user for input')
+        def ask_user(question: str) -> ActionResult:
+            """Ask the user a question and wait for their response"""
+            try:
+                if not self.current_execution_id:
+                    return ActionResult(error="No execution ID available")
+                    
+                # Get the task execution table
+                table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskExecutions')
+                
+                # Create a unique interaction ID
+                interaction_id = f"interaction_{int(time.time())}"
+                
+                # Update the execution with the question
+                table.update_item(
+                    Key={'executionId': self.current_execution_id},
+                    UpdateExpression='SET userInteractions = list_append(if_not_exists(userInteractions, :empty_list), :interaction)',
+                    ExpressionAttributeValues={
+                        ':empty_list': [],
+                        ':interaction': [{
+                            'id': interaction_id,
+                            'question': question,
+                            'status': 'pending',
+                            'timestamp': int(time.time())
+                        }]
+                    }
+                )
+                
+                # Wait for user response with timeout
+                max_wait_time = 300  # 5 minutes timeout
+                start_time = time.time()
+                
+                while time.time() - start_time < max_wait_time:
+                    response = table.get_item(Key={'executionId': self.current_execution_id})
+                    execution = response.get('Item', {})
+                    interactions = execution.get('userInteractions', [])
+                    
+                    # Find our interaction
+                    for interaction in interactions:
+                        if interaction['id'] == interaction_id:
+                            if interaction.get('response'):
+                                return ActionResult(extracted_content=interaction['response'])
+                    
+                    time.sleep(2)  # Poll every 2 seconds
+                
+                return ActionResult(error="User did not respond within the timeout period")
+            except Exception as e:
+                return ActionResult(error=f"Error asking user: {str(e)}")
 
     def _get_cookies_path(self):
         """Get the path to the user's cookies file"""
@@ -282,7 +337,7 @@ class WebAgent:
         self.agent = Agent(
             task=self.task,
             llm=self.llm,
-            controller=controller,
+            controller=self.controller,
             browser=self.browser,
             use_vision=global_use_vision,
             max_failures=5,  # Increase max retries
@@ -310,10 +365,17 @@ class WebAgent:
             return []
         return self.agent.action_history
 
-    async def execute_task(self, prompt: str) -> Dict[str, Any]:
+    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
         try:
             self.task = prompt  # Store the task
+            self.is_interactive = is_interactive  # Set interactive mode
+            self.current_execution_id = execution_id  # Store execution ID
+            
+            # Add interactive mode context to the prompt if enabled
+            if self.is_interactive:
+                prompt = f"{prompt}\n\nNote: This task is running in interactive mode. You can ask the user questions using the 'Ask user for input' action when you need additional information."
+            
             await self.setup()  # Setup after we have the task
             
             # Run the agent
@@ -347,11 +409,17 @@ async def main():
     parser.add_argument('--prompt', required=True, help='Task prompt')
     parser.add_argument('--user_id', required=True, help='User ID')
     parser.add_argument('--llm_name', help='Full LLM name in format platform->provider->model')
+    parser.add_argument('--execution_id', required=True, help='Execution ID')
+    parser.add_argument('--interactive', action='store_true', help='Enable interactive mode')
     args = parser.parse_args()
 
     agent = WebAgent(args.user_id, args.llm_name)
     try:
-        result = await agent.execute_task(args.prompt)  # Setup is called inside execute_task now
+        result = await agent.execute_task(
+            args.prompt,
+            execution_id=args.execution_id,
+            is_interactive=args.interactive
+        )
         print(json.dumps(result))
         sys.exit(0 if result["success"] else 1)
     except Exception as e:

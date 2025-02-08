@@ -52,6 +52,14 @@ interface Task {
   isInteractive?: boolean;
 }
 
+interface UserInteraction {
+  id: string;
+  question: string;
+  response?: string;
+  status: 'pending' | 'answered';
+  timestamp: number;
+}
+
 interface TaskExecution {
   executionId: string;
   taskId: string;
@@ -64,6 +72,7 @@ interface TaskExecution {
   feedback?: 'accepted' | 'rejected';
   details_gif?: string;
   prompt?: string;
+  userInteractions?: UserInteraction[];
 }
 
 interface Subscriber {
@@ -111,6 +120,147 @@ const CollapsibleText = ({ text, maxLength = 150 }: { text: string, maxLength?: 
           </IconButton>
         </Tooltip>
       </Box>
+    </Box>
+  );
+};
+
+// Add UserInteractionDialog component
+const UserInteractionDialog = ({ 
+  execution,
+  onRespond
+}: { 
+  execution: TaskExecution;
+  onRespond: (executionId: string, interactionId: string, response: string) => Promise<void>;
+}) => {
+  const [response, setResponse] = useState('');
+  const [selectedInteraction, setSelectedInteraction] = useState<UserInteraction | null>(null);
+  const [error, setError] = useState('');
+
+  const handleRespond = async () => {
+    if (!selectedInteraction || !response.trim()) return;
+    
+    try {
+      await onRespond(execution.executionId, selectedInteraction.id, response.trim());
+      setResponse('');
+      setSelectedInteraction(null);
+      setError('');
+    } catch (err: any) {
+      setError(err.response?.data?.message || 'Failed to send response');
+    }
+  };
+
+  if (!execution.userInteractions?.length || execution.status !== 'running') return null;
+
+  // Count pending questions
+  const pendingCount = execution.userInteractions.filter(i => i.status === 'pending').length;
+
+  return (
+    <Box sx={{ mt: 2, bgcolor: 'background.paper', borderRadius: 1, overflow: 'hidden' }}>
+      <Box sx={{ p: 2, bgcolor: 'primary.main', color: 'primary.contrastText', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <Typography variant="subtitle1" sx={{ fontWeight: 'medium' }}>
+          Agent Questions
+        </Typography>
+        {pendingCount > 0 ? (
+          <Chip 
+            label={`${pendingCount} Pending`}
+            color="warning" 
+            size="small"
+            sx={{ ml: 2 }}
+          />
+        ) : (
+          <Chip 
+            label="All Answered"
+            color="success" 
+            size="small"
+            sx={{ ml: 2 }}
+          />
+        )}
+      </Box>
+      
+      <List sx={{ p: 0 }}>
+        {execution.userInteractions.map((interaction, index) => (
+          <ListItem 
+            key={interaction.id}
+            sx={{ 
+              borderBottom: index < execution.userInteractions!.length - 1 ? '1px solid rgba(0, 0, 0, 0.12)' : 'none',
+              bgcolor: selectedInteraction?.id === interaction.id ? 'action.selected' : 'transparent',
+              transition: 'background-color 0.2s',
+              p: 2
+            }}
+          >
+            <Box sx={{ width: '100%' }}>
+              <Typography variant="body1" sx={{ fontWeight: 'medium', mb: 1 }}>
+                {interaction.question}
+              </Typography>
+              
+              {interaction.response ? (
+                <Box sx={{ 
+                  ml: 2, 
+                  p: 1.5,
+                  bgcolor: 'success.light',
+                  color: 'success.contrastText',
+                  borderRadius: 1,
+                  position: 'relative'
+                }}>
+                  <Typography variant="body2">
+                    {interaction.response}
+                  </Typography>
+                </Box>
+              ) : interaction.status === 'pending' && (
+                <Box sx={{ display: 'flex', gap: 2, alignItems: 'center' }}>
+                  {selectedInteraction?.id === interaction.id ? (
+                    <Box sx={{ width: '100%' }}>
+                      <TextField
+                        fullWidth
+                        multiline
+                        rows={2}
+                        placeholder="Type your response here..."
+                        value={response}
+                        onChange={(e) => setResponse(e.target.value)}
+                        error={!!error}
+                        helperText={error}
+                        sx={{ mb: 1 }}
+                        autoFocus
+                      />
+                      <Box sx={{ display: 'flex', gap: 1, justifyContent: 'flex-end' }}>
+                        <Button
+                          variant="outlined"
+                          size="small"
+                          onClick={() => {
+                            setSelectedInteraction(null);
+                            setResponse('');
+                            setError('');
+                          }}
+                        >
+                          Cancel
+                        </Button>
+                        <Button
+                          variant="contained"
+                          size="small"
+                          onClick={handleRespond}
+                          disabled={!response.trim()}
+                        >
+                          Send Response
+                        </Button>
+                      </Box>
+                    </Box>
+                  ) : (
+                    <Button
+                      variant="outlined"
+                      size="small"
+                      onClick={() => setSelectedInteraction(interaction)}
+                      startIcon={<EditIcon />}
+                      sx={{ ml: 2 }}
+                    >
+                      Respond
+                    </Button>
+                  )}
+                </Box>
+              )}
+            </Box>
+          </ListItem>
+        ))}
+      </List>
     </Box>
   );
 };
@@ -427,6 +577,27 @@ export default function TaskDetails() {
     setEditedPrompt('');
   };
 
+  const handleUserResponse = async (executionId: string, interactionId: string, userResponse: string) => {
+    try {
+      await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}/executions/${executionId}/interactions/${interactionId}`),
+        { response: userResponse },
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+      
+      // Refresh executions list
+      const executionsResponse = await axios.get(buildApiUrl(`/api/tasks/${taskId}/executions`), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setExecutions(executionsResponse.data);
+    } catch (error: any) {
+      console.error('Error responding to interaction:', error);
+      throw error;
+    }
+  };
+
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
@@ -643,13 +814,22 @@ export default function TaskDetails() {
                         ) : '-'}
                       </TableCell>
                       <TableCell>
-                        {execution.error ? (
-                          <Typography color="error" variant="body2">
-                            <CollapsibleText text={execution.error} />
-                          </Typography>
-                        ) : execution.result ? (
-                          <CollapsibleText text={execution.result} />
-                        ) : '-'}
+                        {execution.status === 'running' && execution.userInteractions && execution.userInteractions.length > 0 ? (
+                          <Box>
+                            <UserInteractionDialog
+                              execution={execution}
+                              onRespond={handleUserResponse}
+                            />
+                          </Box>
+                        ) : (
+                          execution.error ? (
+                            <Typography color="error" variant="body2">
+                              <CollapsibleText text={execution.error} />
+                            </Typography>
+                          ) : (
+                            <CollapsibleText text={execution.result || '-'} />
+                          )
+                        )}
                       </TableCell>
                       <TableCell>
                         {execution.details_gif ? (

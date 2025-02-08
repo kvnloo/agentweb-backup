@@ -165,6 +165,18 @@ const createTaskExecutionsTable = async () => {
     BillingMode: 'PAY_PER_REQUEST'
   };
 
+  // Note: userInteractions will be a List attribute that doesn't need to be defined in AttributeDefinitions
+  // It will have the following structure:
+  // userInteractions: [
+  //   {
+  //     id: string,
+  //     question: string,
+  //     response?: string,
+  //     status: 'pending' | 'answered',
+  //     timestamp: number
+  //   }
+  // ]
+
   try {
     const result = await dynamodb.createTable(params).promise();
     console.log(`Created ${params.TableName} table:`, result);

@@ -46,6 +46,14 @@ interface User {
   createdAt: string;
 }
 
+interface UserInteraction {
+  id: string;
+  question: string;
+  response?: string;
+  status: 'pending' | 'answered';
+  timestamp: number;
+}
+
 class UserDB {
   private docClient: AWS.DynamoDB.DocumentClient;
   private tableName: string;
@@ -389,6 +397,7 @@ export const taskDb = {
     result: string;
     completedAt: string;
     feedback: 'accepted' | 'rejected' | null;
+    userInteractions: UserInteraction[];
   }>) {
     try {
       const updateExpressions: string[] = [];
