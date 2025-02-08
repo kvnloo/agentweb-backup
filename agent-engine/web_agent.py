@@ -222,7 +222,48 @@ class WebAgent:
         self.is_interactive = False  # Initialize interactive mode flag
         self.current_execution_id = None
         self.controller = Controller()
-        self._register_actions()
+
+    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False) -> Dict[str, Any]:
+        """Execute a task based on the natural language prompt"""
+        try:
+            self.is_interactive = is_interactive  # Set interactive mode
+            self.current_execution_id = execution_id  # Store execution ID
+            
+            # Register actions after setting is_interactive
+            self._register_actions()
+            
+            # Add interactive mode context to the prompt if enabled
+            if self.is_interactive:
+                prompt = f"{prompt}\n\nNote: This task is running in interactive mode. You can ask the user questions using the 'Ask user for input' action when you need additional information."
+            
+            self.task = prompt  # Store the task after prompt is potentially modified
+            
+            await self.setup()  # Setup after we have the task
+            
+            # Run the agent
+            result = await self.agent.run(max_steps=25)
+            
+            task_is_done = False  # Initialize task_is_done
+            agent_message = None
+            if result.is_done():
+                task_is_done = True
+                agent_message = result.history[-1].result[-1].extracted_content
+
+            if agent_message is None:
+                agent_message = 'Oops! Something went wrong while running AgentWeb.'
+            
+            return {
+                "success": task_is_done,
+                "summary" if task_is_done else "error": agent_message,
+                "llmName": self.llm_name
+            }
+        except Exception as e:
+            logger.error(f"Error in execute_task: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "llmName": self.llm_name
+            }
 
     def _register_actions(self):
         @self.controller.registry.action('Get login credentials by domain')
@@ -258,54 +299,56 @@ class WebAgent:
             except Exception as e:
                 return ActionResult(error=f"Error getting credentials: {str(e)}")
 
-        @self.controller.registry.action('Ask user for input')
-        def ask_user(question: str) -> ActionResult:
-            """Ask the user a question and wait for their response"""
-            try:
-                if not self.current_execution_id:
-                    return ActionResult(error="No execution ID available")
+        # Only register ask_user action if interactive mode is enabled
+        if self.is_interactive:
+            @self.controller.registry.action('Ask user for input')
+            def ask_user(question: str) -> ActionResult:
+                """Ask the user a question and wait for their response"""
+                try:
+                    if not self.current_execution_id:
+                        return ActionResult(error="No execution ID available")
+                        
+                    # Get the task execution table
+                    table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskExecutions')
                     
-                # Get the task execution table
-                table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskExecutions')
-                
-                # Create a unique interaction ID
-                interaction_id = f"interaction_{int(time.time())}"
-                
-                # Update the execution with the question
-                table.update_item(
-                    Key={'executionId': self.current_execution_id},
-                    UpdateExpression='SET userInteractions = list_append(if_not_exists(userInteractions, :empty_list), :interaction)',
-                    ExpressionAttributeValues={
-                        ':empty_list': [],
-                        ':interaction': [{
-                            'id': interaction_id,
-                            'question': question,
-                            'status': 'pending',
-                            'timestamp': int(time.time())
-                        }]
-                    }
-                )
-                
-                # Wait for user response with timeout
-                max_wait_time = 300  # 5 minutes timeout
-                start_time = time.time()
-                
-                while time.time() - start_time < max_wait_time:
-                    response = table.get_item(Key={'executionId': self.current_execution_id})
-                    execution = response.get('Item', {})
-                    interactions = execution.get('userInteractions', [])
+                    # Create a unique interaction ID
+                    interaction_id = f"interaction_{int(time.time())}"
                     
-                    # Find our interaction
-                    for interaction in interactions:
-                        if interaction['id'] == interaction_id:
-                            if interaction.get('response'):
-                                return ActionResult(extracted_content=interaction['response'])
+                    # Update the execution with the question
+                    table.update_item(
+                        Key={'executionId': self.current_execution_id},
+                        UpdateExpression='SET userInteractions = list_append(if_not_exists(userInteractions, :empty_list), :interaction)',
+                        ExpressionAttributeValues={
+                            ':empty_list': [],
+                            ':interaction': [{
+                                'id': interaction_id,
+                                'question': question,
+                                'status': 'pending',
+                                'timestamp': int(time.time())
+                            }]
+                        }
+                    )
                     
-                    time.sleep(2)  # Poll every 2 seconds
-                
-                return ActionResult(error="User did not respond within the timeout period")
-            except Exception as e:
-                return ActionResult(error=f"Error asking user: {str(e)}")
+                    # Wait for user response with timeout
+                    max_wait_time = 300  # 5 minutes timeout
+                    start_time = time.time()
+                    
+                    while time.time() - start_time < max_wait_time:
+                        response = table.get_item(Key={'executionId': self.current_execution_id})
+                        execution = response.get('Item', {})
+                        interactions = execution.get('userInteractions', [])
+                        
+                        # Find our interaction
+                        for interaction in interactions:
+                            if interaction['id'] == interaction_id:
+                                if interaction.get('response'):
+                                    return ActionResult(extracted_content=interaction['response'])
+                        
+                        time.sleep(2)  # Poll every 2 seconds
+                    
+                    return ActionResult(error="User did not respond within the timeout period")
+                except Exception as e:
+                    return ActionResult(error=f"Error asking user: {str(e)}")
 
     def _get_cookies_path(self):
         """Get the path to the user's cookies file"""
@@ -364,44 +407,6 @@ class WebAgent:
         if not self.agent:
             return []
         return self.agent.action_history
-
-    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False) -> Dict[str, Any]:
-        """Execute a task based on the natural language prompt"""
-        try:
-            self.task = prompt  # Store the task
-            self.is_interactive = is_interactive  # Set interactive mode
-            self.current_execution_id = execution_id  # Store execution ID
-            
-            # Add interactive mode context to the prompt if enabled
-            if self.is_interactive:
-                prompt = f"{prompt}\n\nNote: This task is running in interactive mode. You can ask the user questions using the 'Ask user for input' action when you need additional information."
-            
-            await self.setup()  # Setup after we have the task
-            
-            # Run the agent
-            result = await self.agent.run(max_steps=25)
-            
-            task_is_done = False  # Initialize task_is_done
-            agent_message = None
-            if result.is_done():
-                task_is_done = True
-                agent_message = result.history[-1].result[-1].extracted_content
-
-            if agent_message is None:
-                agent_message = 'Oops! Something went wrong while running AgentWeb.'
-            
-            return {
-                "success": task_is_done,
-                "summary" if task_is_done else "error": agent_message,
-                "llmName": self.llm_name
-            }
-        except Exception as e:
-            logger.error(f"Error in execute_task: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "llmName": self.llm_name
-            }
 
 async def main():
     parser = argparse.ArgumentParser(description='Web Agent for task automation')
