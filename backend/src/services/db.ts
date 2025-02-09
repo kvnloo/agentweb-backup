@@ -109,7 +109,6 @@ class UserDB {
 
   async getUserById(userId: string) {
     try {
-      console.log('Getting user by ID:', userId);
       const params = {
         TableName: this.tableName,
         IndexName: 'UserIdIndex',
@@ -120,7 +119,6 @@ class UserDB {
       };
 
       const result = await this.docClient.query(params).promise();
-      console.log('User lookup result:', result);
       return result.Items?.[0];
     } catch (error) {
       console.error('Error in getUserById:', error);

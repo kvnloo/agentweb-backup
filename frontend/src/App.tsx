@@ -21,6 +21,7 @@ import Config from './pages/Config';
 import Workflows from './pages/Workflows';
 import WorkflowBuilder from './pages/WorkflowBuilder';
 import WorkflowDetails from './pages/WorkflowDetails';
+import WorkflowRun from './pages/WorkflowRun';
 
 export default function App() {
   return (
@@ -115,6 +116,14 @@ export default function App() {
                       element={
                         <PrivateRoute>
                           <WorkflowBuilder />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="workflows/:id/run"
+                      element={
+                        <PrivateRoute>
+                          <WorkflowRun />
                         </PrivateRoute>
                       }
                     />

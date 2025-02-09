@@ -426,6 +426,7 @@ const createWorkflowExecutionsTable = async () => {
     AttributeDefinitions: [
       { AttributeName: 'executionId', AttributeType: 'S' },
       { AttributeName: 'workflowId', AttributeType: 'S' },
+      { AttributeName: 'status', AttributeType: 'S' },
       { AttributeName: 'startTime', AttributeType: 'S' }
     ],
     KeySchema: [
@@ -436,6 +437,20 @@ const createWorkflowExecutionsTable = async () => {
         IndexName: 'WorkflowExecutionsIndex',
         KeySchema: [
           { AttributeName: 'workflowId', KeyType: 'HASH' },
+          { AttributeName: 'startTime', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5
+        }
+      },
+      {
+        IndexName: 'StatusStartTimeIndex',
+        KeySchema: [
+          { AttributeName: 'status', KeyType: 'HASH' },
           { AttributeName: 'startTime', KeyType: 'RANGE' }
         ],
         Projection: {

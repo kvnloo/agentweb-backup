@@ -431,11 +431,14 @@ export default function WorkflowBuilder() {
         return;
       }
 
-      const response = await fetch(`/api/workflows/${workflow.id}/run`, {
+      const baseUrl = import.meta.env.VITE_API_URL || '';
+      const response = await fetch(`${baseUrl}/api/workflows/${workflow.id}/run`, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${localStorage.getItem('token')}`
-        }
+          'Authorization': `Bearer ${localStorage.getItem('token')}`,
+          'Content-Type': 'application/json'
+        },
+        credentials: 'include'
       });
 
       if (!response.ok) {
