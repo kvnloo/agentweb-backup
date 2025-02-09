@@ -304,7 +304,7 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
     except ClientError as e:
         logger.error(f"Error updating execution status: {e}")
 
-def update_workflow_execution(workflow_execution_id: str, task_id: str, task_status: str, error: str = None):
+def update_workflow_execution(workflow_execution_id: str, task_id: str, task_status: str, error: str = None, result: str = None):
     """
     Common function to update workflow execution record.
     Args:
@@ -312,6 +312,7 @@ def update_workflow_execution(workflow_execution_id: str, task_id: str, task_sta
         task_id: ID of the task being updated
         task_status: New status for the task ('running', 'completed', 'failed')
         error: Optional error message if task failed
+        result: Optional result summary for completed tasks
     """
     try:
         workflow_table = dynamodb.Table(f'{TABLE_PREFIX}AW-WorkflowExecutions')
@@ -326,7 +327,8 @@ def update_workflow_execution(workflow_execution_id: str, task_id: str, task_sta
                     **t, 
                     'status': task_status, 
                     'completedAt': datetime.now(timezone.utc).isoformat() if task_status in ['completed', 'failed'] else t.get('completedAt'),
-                    **(({'error': error} if error else {}) if task_status == 'failed' else {})
+                    **(({'error': error} if error else {}) if task_status == 'failed' else {}),
+                    **(({'result': result} if result else {}) if task_status == 'completed' else {})
                 }
                 if t['taskId'] == task_id else t 
                 for t in workflow_execution['tasks']
@@ -342,6 +344,7 @@ def update_workflow_execution(workflow_execution_id: str, task_id: str, task_sta
                 all_completed = all(t['status'] == 'completed' for t in workflow_execution['tasks'])
                 if all_completed:
                     workflow_execution['status'] = 'completed'
+                    workflow_execution['result'] = result
                     workflow_execution['completedAt'] = datetime.now(timezone.utc).isoformat()
             
             workflow_table.put_item(Item=workflow_execution)
@@ -485,11 +488,12 @@ async def execute_task(execution):
                     details_gif=f"https://{os.getenv('AWS_S3_BUCKET')}.s3.amazonaws.com/execution_gifs/{filename}"
                 
                 if result['success']:
+                    result_summary = result.get('summary', 'No summary available')
                     # Update execution status
                     update_execution_status(
                         execution_id, 
                         'completed', 
-                        result=result.get('summary', 'No summary available'),
+                        result=result_summary,
                         details_gif=details_gif,
                         llm_name=llm_name
                     )
@@ -508,7 +512,7 @@ async def execute_task(execution):
                     
                     # Update workflow execution if this is a workflow task
                     if 'workflowExecutionId' in execution:
-                        update_workflow_execution(execution['workflowExecutionId'], task_id, 'completed')
+                        update_workflow_execution(execution['workflowExecutionId'], task_id, 'completed', result=result_summary)
                     
                     success = True
                     break
@@ -575,18 +579,29 @@ async def execute_workflow_task(execution_id: str, task: dict):
             return False
 
         # Check if all dependencies are completed
+        dependent_results = []
         if task.get('dependsOn'):
             for dep_task_id in task['dependsOn']:
                 dep_task = next((t for t in execution['tasks'] if t['taskId'] == dep_task_id), None)
                 if not dep_task or dep_task['status'] != 'completed':
                     logger.info(f"Task {task['taskId']} waiting for dependency {dep_task_id}")
                     return False
+                if dep_task.get('result'):
+                    dependent_results.append(f"Result from task {dep_task_id}: {dep_task['result']}")
 
         # Get the task prompt from the workflow task
         task_prompt = task.get('prompt')
         if not task_prompt:
             logger.error(f"Task {task['taskId']} is missing prompt")
             return False
+
+        # Add dependent results to prompt if any exist
+        if dependent_results:
+            task_prompt = f"""Previous task results:
+{chr(10).join(dependent_results)}
+
+Current task:
+{task_prompt}"""
 
         # Create task execution with prompt and workflow execution ID
         task_execution_id = create_execution(

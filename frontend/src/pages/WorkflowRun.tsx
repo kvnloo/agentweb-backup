@@ -16,7 +16,9 @@ import {
   CircularProgress,
   Alert,
   Tooltip,
-  Divider
+  Divider,
+  Collapse,
+  IconButton as MuiIconButton
 } from '@mui/material';
 import {
   Refresh as RefreshIcon,
@@ -26,7 +28,10 @@ import {
   CheckCircle as CheckCircleIcon,
   Error as ErrorIcon,
   Pending as PendingIcon,
-  Timeline as TimelineIcon
+  Timeline as TimelineIcon,
+  KeyboardArrowDown as KeyboardArrowDownIcon,
+  KeyboardArrowUp as KeyboardArrowUpIcon,
+  ContentCopy as ContentCopyIcon
 } from '@mui/icons-material';
 import { useAuth } from '../contexts/AuthContext';
 import { buildApiUrl } from '../config';
@@ -50,6 +55,7 @@ interface WorkflowExecution {
   completedAt?: string;
   tasks: WorkflowTask[];
   error?: string;
+  result?: string;
 }
 
 interface Workflow {
@@ -61,6 +67,54 @@ interface Workflow {
   createdAt: string;
   updatedAt: string;
 }
+
+// Add CollapsibleText component
+const CollapsibleText = ({ text, maxLength = 150 }: { text: string, maxLength?: number }) => {
+  const [isExpanded, setIsExpanded] = useState(false);
+  const [isCopied, setIsCopied] = useState(false);
+
+  const handleCopy = () => {
+    navigator.clipboard.writeText(text);
+    setIsCopied(true);
+    setTimeout(() => setIsCopied(false), 2000);
+  };
+
+  if (!text) return null;
+  if (text.length <= maxLength) {
+    return (
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+        <Typography>{text}</Typography>
+        <Tooltip title={isCopied ? "Copied!" : "Copy to clipboard"}>
+          <IconButton size="small" onClick={handleCopy}>
+            <ContentCopyIcon fontSize="small" />
+          </IconButton>
+        </Tooltip>
+      </Box>
+    );
+  }
+
+  return (
+    <Box>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+        <Typography>
+          {isExpanded ? text : `${text.slice(0, maxLength)}...`}
+        </Typography>
+        <Box sx={{ display: 'flex', gap: 0.5 }}>
+          <Tooltip title={isExpanded ? "Show less" : "Show more"}>
+            <IconButton size="small" onClick={() => setIsExpanded(!isExpanded)}>
+              {isExpanded ? <KeyboardArrowUpIcon /> : <KeyboardArrowDownIcon />}
+            </IconButton>
+          </Tooltip>
+          <Tooltip title={isCopied ? "Copied!" : "Copy to clipboard"}>
+            <IconButton size="small" onClick={handleCopy}>
+              <ContentCopyIcon fontSize="small" />
+            </IconButton>
+          </Tooltip>
+        </Box>
+      </Box>
+    </Box>
+  );
+};
 
 export default function WorkflowRun() {
   const { id } = useParams();
@@ -257,7 +311,7 @@ export default function WorkflowRun() {
               <TableCell>Started</TableCell>
               <TableCell>Duration</TableCell>
               <TableCell>Tasks</TableCell>
-              <TableCell>Error</TableCell>
+              <TableCell>Result</TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
@@ -283,7 +337,14 @@ export default function WorkflowRun() {
                     {execution.tasks.map((task) => (
                       <Tooltip
                         key={task.taskId}
-                        title={`Task ${task.taskId}: ${task.status}`}
+                        title={
+                          <Box>
+                            <Typography>Task {task.taskId}</Typography>
+                            <Typography>Status: {task.status}</Typography>
+                            {task.result && <Typography>Result: {task.result}</Typography>}
+                            {task.error && <Typography>Error: {task.error}</Typography>}
+                          </Box>
+                        }
                       >
                         <Chip
                           size="small"
@@ -295,11 +356,11 @@ export default function WorkflowRun() {
                   </Box>
                 </TableCell>
                 <TableCell>
-                  {execution.error && (
-                    <Tooltip title={execution.error}>
-                      <ErrorIcon color="error" />
-                    </Tooltip>
-                  )}
+                  {execution.status === 'failed' ? (
+                    <CollapsibleText text={execution.error || 'No error details available'} />
+                  ) : execution.status === 'completed' ? (
+                    <CollapsibleText text={execution.result || 'No result available'} />
+                  ) : null}
                 </TableCell>
               </TableRow>
             ))}
