@@ -7,8 +7,9 @@ export interface Workflow {
   userId: string;
   name: string;
   description: string;
-  status: 'active' | 'draft' | 'archived';
+  status: 'active' | 'archived';
   yaml: string;
+  taskCount: number;
   chatHistory: {
     role: 'user' | 'assistant';
     content: string;

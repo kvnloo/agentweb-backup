@@ -71,20 +71,15 @@ export default function Workflows() {
 
         const data = await response.json();
         console.log('Workflow data from API:', data);
-        setWorkflows(data.map((workflow: any) => {
-          console.log('Processing workflow:', workflow);
-          const nodeCount = workflow.nodes?.length ?? 0;
-          console.log('Node count:', nodeCount);
-          return {
-            id: workflow.workflowId,
-            name: workflow.name,
-            description: workflow.description,
-            status: workflow.status === 'archived' ? 'archived' : 'active',
-            taskCount: nodeCount,
-            lastRun: workflow.lastRun,
-            createdAt: workflow.createdAt
-          };
-        }));
+        setWorkflows(data.map((workflow: any) => ({
+          id: workflow.workflowId,
+          name: workflow.name,
+          description: workflow.description,
+          status: workflow.status === 'archived' ? 'archived' : 'active',
+          taskCount: workflow.taskCount || 0,
+          lastRun: workflow.lastRun,
+          createdAt: workflow.createdAt
+        })));
       } catch (error) {
         console.error('Error fetching workflows:', error);
         setError(error instanceof Error ? error.message : 'Failed to fetch workflows');

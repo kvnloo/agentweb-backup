@@ -40,15 +40,16 @@ export async function getWorkflow(req: AuthenticatedRequest, res: Response) {
 
 export async function createWorkflow(req: AuthenticatedRequest, res: Response) {
   try {
-    const { name, description, yaml, messages } = req.body;
+    const { name, description, yaml, messages, taskCount } = req.body;
 
     // Create workflow
     const workflow = await workflowService.createWorkflow({
       userId: req.user.userId,
       name,
       description,
-      status: 'draft',
+      status: 'active',
       yaml: yaml || '',
+      taskCount: taskCount || 0,
       chatHistory: messages || []
     });
 
@@ -62,7 +63,7 @@ export async function createWorkflow(req: AuthenticatedRequest, res: Response) {
 export async function updateWorkflow(req: AuthenticatedRequest, res: Response) {
   try {
     const { id } = req.params;
-    const { name, description, status, yaml, messages } = req.body;
+    const { name, description, status, yaml, messages, taskCount } = req.body;
 
     // Check workflow exists and user has access
     const workflow = await workflowService.getWorkflow(id);
@@ -80,6 +81,7 @@ export async function updateWorkflow(req: AuthenticatedRequest, res: Response) {
     if (status) updates.status = status;
     if (yaml) updates.yaml = yaml;
     if (messages) updates.chatHistory = messages;
+    if (typeof taskCount === 'number') updates.taskCount = taskCount;
 
     const updatedWorkflow = await workflowService.updateWorkflow(id, updates);
     res.json(updatedWorkflow);

@@ -358,6 +358,7 @@ export default function WorkflowBuilder() {
         description: workflowYaml?.description || '',
         yaml: workflow.yaml,
         messages: messages,
+        taskCount: nodes.filter(node => node.type === 'task').length,
         nodes: nodes.map(node => ({
           ...node,
           // Remove ReactFlow-specific properties
