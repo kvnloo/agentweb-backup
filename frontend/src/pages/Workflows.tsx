@@ -152,16 +152,32 @@ export default function Workflows() {
 
   return (
     <Box sx={{ p: 3 }}>
-      <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 3 }}>
-        <Typography variant="h4">Workflows</Typography>
+      <Paper 
+        sx={{ 
+          p: 3, 
+          mb: 3, 
+          bgcolor: 'primary.main', 
+          color: 'primary.contrastText',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'flex-start'
+        }}
+      >
+        <Box sx={{ flex: 1 }}>
+          <Typography variant="h4">My Workflows</Typography>
+          <Typography variant="body1" sx={{ mt: 1, color: 'primary.contrastText', opacity: 0.9 }}>
+            Create and manage your workflows, which are composed of multiple tasks. Our AI agents will execute them to achieve complex goals.
+          </Typography>
+        </Box>
         <Button
           variant="contained"
+          sx={{ bgcolor: 'background.paper', color: 'primary.main', '&:hover': { bgcolor: 'background.paper', opacity: 0.9 } }}
           startIcon={<AddIcon />}
           onClick={handleCreateWorkflow}
         >
           Create Workflow
         </Button>
-      </Box>
+      </Paper>
 
       {loading ? (
         <Box sx={{ display: 'flex', justifyContent: 'center', my: 4 }}>
