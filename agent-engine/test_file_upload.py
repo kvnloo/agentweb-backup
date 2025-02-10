@@ -60,8 +60,14 @@ async def upload_file(index: int, browser: BrowserContext):
         if frame is None:
             return ActionResult(error="Could not access iframe content")
             
-        # Create a non-strict locator in the iframe context
-        file_upload_el = frame.get_by_test_id("file-upload").first
+        # Get the highlight ID from the parent button
+        highlight_id = f'playwright-highlight-{index}'
+        logger.info(f"Looking for file input within element with highlight ID: {highlight_id}")
+        
+        # Find the button with the specific highlight ID and then find its file input
+        button = frame.locator(f'[browser-user-highlight-id="{highlight_id}"]')
+        file_upload_el = button.locator('input[type="file"]')
+        
         await file_upload_el.set_input_files(path)
         msg = f'Successfully uploaded file {TEST_FILE.name} to index {index}'
         logger.info(msg)
