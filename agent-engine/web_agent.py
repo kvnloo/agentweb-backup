@@ -356,6 +356,14 @@ class WebAgent:
             return None
         return str(self.context_dir / f"{self.user_id}_cookies.json")
 
+    def _get_downloads_path(self):
+        """Get the path to the user's downloads directory"""
+        if not self.user_id:
+            return str(Path('downloads/default'))
+        downloads_path = Path('downloads') / self.user_id
+        downloads_path.mkdir(parents=True, exist_ok=True)
+        return str(downloads_path)
+
     async def setup(self):
         """Initialize the browser instance"""
         if not self.task:
@@ -367,11 +375,15 @@ class WebAgent:
             # Try to download cookies from S3 before starting
             self.cookie_sync.download_cookies(self.user_id, cookies_path)
             
+        # Configure downloads path
+        downloads_path = self._get_downloads_path()
         context_config = BrowserContextConfig(
-            cookies_file=cookies_path
+            cookies_file=cookies_path,
+            save_downloads_path=downloads_path
         )
         if cookies_path:
             logger.info(f"Using cookies file for user {self.user_id}: {cookies_path}")
+        logger.info(f"Using downloads path: {downloads_path}")
 
         # Get headless mode from environment variable, default to False if not set
         headless = os.getenv('BROWSER_HEADLESS', 'true').lower() == 'true'
