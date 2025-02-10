@@ -33,7 +33,7 @@ interface Workflow {
   id: string;
   name: string;
   description: string;
-  status: 'active' | 'draft' | 'archived';
+  status: 'active' | 'archived';
   taskCount: number;
   lastRun?: string;
   createdAt: string;
@@ -70,15 +70,21 @@ export default function Workflows() {
         }
 
         const data = await response.json();
-        setWorkflows(data.map((workflow: any) => ({
-          id: workflow.workflowId,
-          name: workflow.name,
-          description: workflow.description,
-          status: workflow.status || 'active',
-          taskCount: workflow.nodes?.length || 0,
-          lastRun: workflow.lastRun,
-          createdAt: workflow.createdAt
-        })));
+        console.log('Workflow data from API:', data);
+        setWorkflows(data.map((workflow: any) => {
+          console.log('Processing workflow:', workflow);
+          const nodeCount = workflow.nodes?.length ?? 0;
+          console.log('Node count:', nodeCount);
+          return {
+            id: workflow.workflowId,
+            name: workflow.name,
+            description: workflow.description,
+            status: workflow.status === 'archived' ? 'archived' : 'active',
+            taskCount: nodeCount,
+            lastRun: workflow.lastRun,
+            createdAt: workflow.createdAt
+          };
+        }));
       } catch (error) {
         console.error('Error fetching workflows:', error);
         setError(error instanceof Error ? error.message : 'Failed to fetch workflows');
@@ -202,13 +208,14 @@ export default function Workflows() {
                   </Typography>
                   <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
                     <Chip
-                      label={`${workflow.taskCount} tasks`}
+                      label={workflow.taskCount > 0 ? `${workflow.taskCount} tasks` : 'No tasks'}
                       size="small"
+                      color={workflow.taskCount > 0 ? 'primary' : 'default'}
                     />
                     <Chip
                       label={workflow.status}
                       size="small"
-                      color={workflow.status === 'active' ? 'success' : 'default'}
+                      color={workflow.status === 'archived' ? 'default' : 'success'}
                     />
                   </Box>
                   {workflow.lastRun && (
