@@ -38,36 +38,35 @@ async def upload_file(index: int, browser: BrowserContext):
     path = str(TEST_FILE.absolute())
     logger.info(f"Attempting to upload file: {path}")
     
-    dom_el = await browser.get_dom_element_by_index(index)
-    if dom_el is None:
-        return ActionResult(error=f'No element found at index {index}')
-
-    logger.info(f"Found element at index {index}: {dom_el}")
-    file_upload_dom_el = dom_el.get_file_upload_element()
-
-    if file_upload_dom_el is None:
-        logger.info(f'No file upload element found at index {index}')
-        return ActionResult(error=f'No file upload element found at index {index}')
-
-    logger.info(f"Found file upload element: {file_upload_dom_el}")
-    
     try:
-        # Get the current page and wait for the iframe
+        # Get the current page
         page = await browser.get_current_page()
-        iframe = await page.wait_for_selector('iframe.space-iframe')
-        frame = await iframe.content_frame()
         
-        if frame is None:
-            return ActionResult(error="Could not access iframe content")
-            
         # Get the highlight ID from the parent button
         highlight_id = f'playwright-highlight-{index}'
         logger.info(f"Looking for file input within element with highlight ID: {highlight_id}")
         
-        # Find the button with the specific highlight ID and then find its file input
-        button = frame.locator(f'[browser-user-highlight-id="{highlight_id}"]')
-        file_upload_el = button.locator('input[type="file"]')
+        # First try to find the element in the main page
+        file_upload_el = None
         
+        # Check if we're in a page with an iframe (like Hugging Face Spaces)
+        iframe = await page.query_selector('iframe')
+        if iframe:
+            frame = await iframe.content_frame()
+            if frame:
+                logger.info("Found iframe, searching for file input in iframe context")
+                # Find the button with the specific highlight ID and then find its file input
+                button = frame.locator(f'[browser-user-highlight-id="{highlight_id}"]')
+                file_upload_el = button.locator('input[type="file"]')
+        else:
+            # If no iframe, search in main page
+            logger.info("No iframe found, searching in main page")
+            button = page.locator(f'[browser-user-highlight-id="{highlight_id}"]')
+            file_upload_el = button.locator('input[type="file"]')
+            
+        if file_upload_el is None:
+            return ActionResult(error=f"Could not find file input element with highlight ID {highlight_id}")
+            
         await file_upload_el.set_input_files(path)
         msg = f'Successfully uploaded file {TEST_FILE.name} to index {index}'
         logger.info(msg)
