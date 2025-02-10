@@ -191,9 +191,9 @@ export default function WorkflowDetails() {
           <Button
             variant="contained"
             startIcon={<RunIcon />}
-            onClick={() => {/* TODO: Implement run workflow */}}
+            onClick={() => navigate(`/workflows/${id}/run`)}
           >
-            Run Now
+            Run
           </Button>
           <Button
             variant="outlined"

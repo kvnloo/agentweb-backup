@@ -110,8 +110,7 @@ export default function Workflows() {
   };
 
   const handleRunWorkflow = (workflowId: string) => {
-    // TODO: Implement workflow execution
-    console.log('Running workflow:', workflowId);
+    navigate(`/workflows/${workflowId}/run`);
     handleMenuClose();
   };
 
@@ -230,7 +229,7 @@ export default function Workflows() {
         onClose={handleMenuClose}
       >
         <MenuItem onClick={() => selectedWorkflow && handleRunWorkflow(selectedWorkflow.id)}>
-          <PlayIcon sx={{ mr: 1 }} /> Run Now
+          <PlayIcon sx={{ mr: 1 }} /> Run
         </MenuItem>
         <MenuItem onClick={() => selectedWorkflow && handleEditWorkflow(selectedWorkflow.id)}>
           <EditIcon sx={{ mr: 1 }} /> Edit

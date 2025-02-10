@@ -39,6 +39,7 @@ import {
 import TaskNode from '../components/workflow/nodes/TaskNode';
 import LoopNode from '../components/workflow/nodes/LoopNode';
 import ConditionNode from '../components/workflow/nodes/ConditionNode';
+import { useAuth } from '../contexts/AuthContext';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -151,6 +152,7 @@ function generateVisualization(workflowData: any): { nodes: Node[], edges: Edge[
 export default function WorkflowBuilder() {
   const { id } = useParams();
   const navigate = useNavigate();
+  const { token } = useAuth();
   const [workflow, setWorkflow] = useState<WorkflowData>({
     id: id || 'new',
     name: '',
@@ -191,10 +193,9 @@ export default function WorkflowBuilder() {
           const baseUrl = import.meta.env.VITE_API_URL || '';
           const response = await fetch(`${baseUrl}/api/workflows/${id}`, {
             headers: {
-              'Authorization': `Bearer ${localStorage.getItem('token')}`,
+              'Authorization': `Bearer ${token}`,
               'Content-Type': 'application/json'
-            },
-            credentials: 'include'
+            }
           });
 
           if (!response.ok) {
@@ -235,7 +236,7 @@ export default function WorkflowBuilder() {
     };
 
     fetchWorkflow();
-  }, [id]);
+  }, [id, token]);
 
   // Update the useEffect hook that watches workflow.yaml
   useEffect(() => {
@@ -313,7 +314,7 @@ export default function WorkflowBuilder() {
       const response = await fetch(`${baseUrl}/api/workflows/generate`, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${localStorage.getItem('token')}`,
+          'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
@@ -384,7 +385,7 @@ export default function WorkflowBuilder() {
         method,
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${localStorage.getItem('token')}`
+          'Authorization': `Bearer ${token}`
         },
         body: JSON.stringify(workflowData),
         credentials: 'include'
@@ -403,12 +404,12 @@ export default function WorkflowBuilder() {
       
       // Update the workflow ID if this was a new workflow
       if (id === 'new') {
-        navigate(`/workflows/${savedWorkflow.id}/edit`, { replace: true });
+        navigate(`/workflows/${savedWorkflow.workflowId}/edit`, { replace: true });
       }
 
       setWorkflow(prevWorkflow => ({
         ...prevWorkflow,
-        id: savedWorkflow.id
+        id: savedWorkflow.workflowId  // Use workflowId instead of id
       }));
 
       setShowSnackbar(true);
@@ -423,38 +424,13 @@ export default function WorkflowBuilder() {
   };
 
   const handleRun = async () => {
-    try {
-      if (!workflow.id || workflow.id === 'new') {
-        setSnackbarMessage('Please save the workflow before running it');
-        setSnackbarSeverity('error');
-        setShowSnackbar(true);
-        return;
-      }
-
-      const baseUrl = import.meta.env.VITE_API_URL || '';
-      const response = await fetch(`${baseUrl}/api/workflows/${workflow.id}/run`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${localStorage.getItem('token')}`,
-          'Content-Type': 'application/json'
-        },
-        credentials: 'include'
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to run workflow');
-      }
-
-      const result = await response.json();
-      setShowSnackbar(true);
-      setSnackbarMessage('Workflow started successfully');
-      setSnackbarSeverity('success');
-    } catch (error) {
-      console.error('Error running workflow:', error);
-      setShowSnackbar(true);
-      setSnackbarMessage('Failed to run workflow');
+    if (!workflow.id || workflow.id === 'new') {
+      setSnackbarMessage('Please save the workflow before running it');
       setSnackbarSeverity('error');
+      setShowSnackbar(true);
+      return;
     }
+    navigate(`/workflows/${workflow.id}/run`);
   };
 
   return (
