@@ -39,41 +39,36 @@ async def upload_file(index: int, browser: BrowserContext):
     logger.info(f"Attempting to upload file: {path}")
     
     try:
-        # Get the current page
         page = await browser.get_current_page()
+        await page.wait_for_load_state('domcontentloaded')
         
-        # Get the highlight ID from the parent button
-        highlight_id = f'playwright-highlight-{index}'
-        logger.info(f"Looking for file input within element with highlight ID: {highlight_id}")
-        
-        # First try to find the element in the main page
-        file_upload_el = None
-        
-        # Check if we're in a page with an iframe (like Hugging Face Spaces)
+        # Try iframe first, then main page
+        contexts = []
         iframe = await page.query_selector('iframe')
-        if iframe:
-            frame = await iframe.content_frame()
-            if frame:
-                logger.info("Found iframe, searching for file input in iframe context")
-                # Find the button with the specific highlight ID and then find its file input
-                button = frame.locator(f'[browser-user-highlight-id="{highlight_id}"]')
-                file_upload_el = button.locator('input[type="file"]')
-        else:
-            # If no iframe, search in main page
-            logger.info("No iframe found, searching in main page")
-            button = page.locator(f'[browser-user-highlight-id="{highlight_id}"]')
-            file_upload_el = button.locator('input[type="file"]')
+        if iframe and (frame := await iframe.content_frame()):
+            contexts.append(frame)
+        contexts.append(page)
+        
+        # Try to find file input in each context
+        for context in contexts:
+            # Try selectors in order of specificity
+            selectors = [
+                f'[browser-user-highlight-id="playwright-highlight-{index}"] input[type="file"]',
+                'input[type="file"]',
+                'input[accept="image/*"]'
+            ]
             
-        if file_upload_el is None:
-            return ActionResult(error=f"Could not find file input element with highlight ID {highlight_id}")
+            for selector in selectors:
+                elements = context.locator(selector)
+                if await elements.count() > 0:
+                    await elements.first.set_input_files(path)
+                    return ActionResult(extracted_content=f'Successfully uploaded {TEST_FILE.name}')
+        
+        return ActionResult(error="Could not find file input element")
             
-        await file_upload_el.set_input_files(path)
-        msg = f'Successfully uploaded file {TEST_FILE.name} to index {index}'
-        logger.info(msg)
-        return ActionResult(extracted_content=msg)
     except Exception as e:
-        logger.error(f'Error in set_input_files: {str(e)}')
-        return ActionResult(error=f'Failed to upload file to index {index}: {str(e)}')
+        logger.error(f'Error in upload_file: {str(e)}')
+        return ActionResult(error=f'Failed to upload file: {str(e)}')
 
 @controller.registry.action('Close file dialog')
 async def close_file_dialog(browser: BrowserContext):
@@ -82,10 +77,11 @@ async def close_file_dialog(browser: BrowserContext):
     return ActionResult(extracted_content='Closed file dialog')
 
 async def main():
-    # You can modify this URL to test with different pages
-    task = (
-        'go to https://huggingface.co/spaces/franciszzj/Leffa and upload an image to the Person Image'
-    )
+    # Define the tasks to test
+    tasks = [
+        'go to https://huggingface.co/spaces/franciszzj/Leffa and upload an image to the Person Image',
+        'Visit https://facetoonshop.com/video-creator.html, upload an image'
+    ]
 
     # Initialize Azure OpenAI model
     model = AzureChatOpenAI(
@@ -98,24 +94,60 @@ async def main():
         temperature=0
     )
 
-    # Create the agent with use_vision enabled
-    agent = Agent(
-        task=task,
-        llm=model,
-        controller=controller,
-        browser=browser
-    )
     try:
-        # Run the agent
-        result = await agent.run(max_steps=5)
-        logger.info(f"Task result: {result}")
+        # Test each task
+        for i, task in enumerate(tasks, 1):
+            logger.info(f"\n=== Testing Task {i} ===")
+            logger.info(f"Task: {task}")
+            
+            # Create a new browser instance for each task
+            browser = Browser(
+                config=BrowserConfig(
+                    headless=False
+                )
+            )
+            
+            # Create the agent with increased max steps
+            agent = Agent(
+                task=task,
+                llm=model,
+                controller=controller,
+                browser=browser
+            )
+            
+            try:
+                # Run the agent with increased max steps for complex tasks
+                result = await agent.run(max_steps=10)  # Increased from 5 to 10
+                logger.info(f"Task {i} result: {result}")
+            except Exception as e:
+                logger.error(f"Error during task {i} execution: {str(e)}")
+                if "net::" in str(e) or "timeout" in str(e).lower():  # Network or timeout error
+                    logger.info("Network/timeout error detected. Retrying...")
+                    try:
+                        # Try again with a fresh browser instance
+                        browser = Browser(
+                            config=BrowserConfig(
+                                headless=False
+                            )
+                        )
+                        agent = Agent(
+                            task=task,
+                            llm=model,
+                            controller=controller,
+                            browser=browser
+                        )
+                        result = await agent.run(max_steps=10)
+                        logger.info(f"Retry successful! Task {i} result: {result}")
+                    except Exception as retry_e:
+                        logger.error(f"Retry also failed: {str(retry_e)}")
+            finally:
+                # Wait for user input before moving to next task
+                input(f'Press Enter to {"continue" if i < len(tasks) else "close"}...')
+                # Clean up
+                await browser.close()
+                
     except Exception as e:
-        logger.error(f"Error during agent execution: {e}")
-    finally:
-        # Wait for user input before closing
-        input('Press Enter to close...')
-        # Clean up
-        await browser.close()
+        logger.error(f"Error in main: {str(e)}")
 
 if __name__ == '__main__':
     asyncio.run(main()) 
