@@ -109,10 +109,10 @@ export default function Layout() {
                 <Button 
                   color="primary" 
                   component={RouterLink} 
-                  to="/dashboard"
-                  variant={isActivePath('/dashboard') ? 'contained' : 'text'}
+                  to="/tasks"
+                  variant={isActivePath('/tasks') ? 'contained' : 'text'}
                 >
-                  Dashboard
+                  Tasks
                 </Button>
                 <Button 
                   color="primary" 

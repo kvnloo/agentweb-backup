@@ -24,7 +24,7 @@ export default function Login() {
     e.preventDefault();
     try {
       await login(email, password);
-      navigate('/dashboard');
+      navigate('/tasks');
     } catch (err) {
       setError('Invalid email or password');
     }

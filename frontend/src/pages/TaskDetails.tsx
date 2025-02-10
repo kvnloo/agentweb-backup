@@ -353,7 +353,7 @@ export default function TaskDetails() {
       await axios.delete(buildApiUrl(`/api/tasks/${taskId}`), {
         headers: { Authorization: `Bearer ${token}` },
       });
-      navigate('/dashboard');
+      navigate('/tasks');
     } catch (error: any) {
       console.error('Error deleting task:', error);
       setError(error.response?.data?.message || 'Failed to delete task');

@@ -8,7 +8,7 @@ import theme from './theme';
 import Home from './pages/Home';
 import Login from './pages/Login';
 import Register from './pages/Register';
-import Dashboard from './pages/Dashboard';
+import Tasks from './pages/Tasks';
 import CreateTask from './pages/CreateTask';
 import TaskDetails from './pages/TaskDetails';
 import Layout from './components/Layout';
@@ -39,10 +39,10 @@ export default function App() {
                     <Route path="register" element={<Register />} />
                     <Route path="oauth-callback" element={<OAuthCallback />} />
                     <Route
-                      path="dashboard"
+                      path="tasks"
                       element={
                         <PrivateRoute>
-                          <Dashboard />
+                          <Tasks />
                         </PrivateRoute>
                       }
                     />

@@ -40,7 +40,7 @@ export default function CreateTask() {
           headers: { Authorization: `Bearer ${token}` },
         }
       );
-      navigate('/dashboard');
+      navigate('/tasks');
     } catch (err) {
       setError('Failed to create task');
     }
@@ -109,7 +109,7 @@ export default function CreateTask() {
             <Button
               variant="outlined"
               size="large"
-              onClick={() => navigate('/dashboard')}
+              onClick={() => navigate('/tasks')}
             >
               Cancel
             </Button>

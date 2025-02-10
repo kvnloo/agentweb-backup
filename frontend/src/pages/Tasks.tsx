@@ -34,7 +34,7 @@ interface Task {
   subscriberCount: number;
 }
 
-export default function Dashboard() {
+export default function Tasks() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const { token } = useAuth();
   const navigate = useNavigate();
