@@ -165,7 +165,7 @@ export default function WorkflowBuilder() {
   const [messages, setMessages] = useState<Message[]>([
     {
       role: 'assistant',
-      content: 'Hi! I can help you create a workflow. You can describe what you want to do, and I\'ll help you build it. For example, you could say "Create a workflow that checks email every morning and sends a summary to Slack".'
+      content: 'Hi! I can help you create a workflow. You can describe what you want to do, and I\'ll help you build it. For example, you could say "Create a workflow that checks my gmail, hotmail, yahoo mail to create a summary".'
     }
   ]);
   const [input, setInput] = useState('');
