@@ -33,6 +33,8 @@ import ThumbDownIcon from '@mui/icons-material/ThumbDown';
 import EditIcon from '@mui/icons-material/Edit';
 import SaveIcon from '@mui/icons-material/Save';
 import CancelIcon from '@mui/icons-material/Cancel';
+import ScreenshotIcon from '@mui/icons-material/Screenshot';
+import { styled } from '@mui/material/styles';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
 import ScheduleForm from '../components/ScheduleForm';
@@ -58,6 +60,7 @@ interface UserInteraction {
   response?: string;
   status: 'pending' | 'answered';
   timestamp: number;
+  screenshot_url?: string;
 }
 
 interface TaskExecution {
@@ -79,6 +82,12 @@ interface Subscriber {
   email: string;
   subscribedAt: string;
 }
+
+const PreviewImage = styled('img')({
+  maxHeight: '500px',
+  maxWidth: '800px',
+  objectFit: 'contain',
+});
 
 // Add CollapsibleText component
 const CollapsibleText = ({ text, maxLength = 150 }: { text: string, maxLength?: number }) => {
@@ -189,9 +198,27 @@ const UserInteractionDialog = ({
             }}
           >
             <Box sx={{ width: '100%' }}>
-              <Typography variant="body1" sx={{ fontWeight: 'medium', mb: 1 }}>
-                {interaction.question}
-              </Typography>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+                <Typography variant="body1" sx={{ fontWeight: 'medium' }}>
+                  {interaction.question}
+                </Typography>
+                {interaction.screenshot_url && (
+                  <Tooltip
+                    title={
+                      <PreviewImage
+                        src={interaction.screenshot_url}
+                        alt="Screenshot"
+                      />
+                    }
+                    placement="right"
+                    arrow
+                  >
+                    <IconButton size="small">
+                      <ScreenshotIcon fontSize="small" />
+                    </IconButton>
+                  </Tooltip>
+                )}
+              </Box>
               
               {interaction.response ? (
                 <Box sx={{ 
