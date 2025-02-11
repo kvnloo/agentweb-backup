@@ -22,6 +22,8 @@ import time
 import asyncio
 import random
 import aiohttp
+import base64  # Add at the top with other imports
+import boto3  # Add at the top with other imports
 
 # Load environment variables
 load_dotenv()
@@ -225,6 +227,9 @@ class WebAgent:
         self.is_interactive = False  # Initialize interactive mode flag
         self.current_execution_id = None
         self.controller = Controller()
+        self.question_count = 0  # Track number of questions asked
+        self.s3_client = boto3.client('s3')
+        self.s3_bucket = os.getenv('S3_BUCKET_NAME')  # Make sure to set this in .env
 
     async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
@@ -267,6 +272,34 @@ class WebAgent:
                 "error": str(e),
                 "llmName": self.llm_name
             }
+
+    async def _upload_screenshot_to_s3(self, screenshot_bytes: bytes, execution_id: str) -> Optional[str]:
+        """Upload screenshot to S3 and return the URL"""
+        try:
+            if not self.s3_bucket:
+                logger.error("S3_BUCKET_NAME not configured")
+                return None
+
+            # Generate a unique filename
+            timestamp = int(time.time())
+            filename = f"screenshots/{execution_id}/{timestamp}.jpeg"
+
+            # Upload to S3
+            self.s3_client.put_object(
+                Bucket=self.s3_bucket,
+                Key=filename,
+                Body=screenshot_bytes,
+                ContentType='image/png'
+            )
+
+            # Generate the URL
+            url = f"https://{self.s3_bucket}.s3.amazonaws.com/{filename}"
+            logger.info(f"Uploaded screenshot to S3: {url}")
+            return url
+
+        except Exception as e:
+            logger.error(f"Failed to upload screenshot to S3: {e}")
+            return None
 
     def _register_actions(self):
         @self.controller.registry.action('Get login credentials by domain')
@@ -433,11 +466,35 @@ class WebAgent:
         # Only register ask_user action if interactive mode is enabled
         if self.is_interactive:
             @self.controller.registry.action('Ask user for input')
-            def ask_user(question: str) -> ActionResult:
-                """Ask the user a question and wait for their response"""
+            async def ask_user(question: str, browser: BrowserContext) -> ActionResult:
+                """Ask the user a question and wait for their response. Limited to 5 questions per task."""
                 try:
                     if not self.current_execution_id:
                         return ActionResult(error="No execution ID available")
+                    
+                    # Check if we've exceeded the question limit
+                    if self.question_count >= 5:
+                        return ActionResult(error="Maximum number of questions (5) has been reached for this task")
+                    
+                    # Increment question counter
+                    self.question_count += 1
+                    logger.info(f"Asking question {self.question_count}/5: {question}")
+                    
+                    # Take a screenshot of the current page
+                    page = await browser.get_current_page()
+                    screenshot_url = None
+                    try:
+                        # Take full page screenshot
+                        screenshot_bytes = await page.screenshot(type='jpeg')
+                        # Upload to S3
+                        screenshot_url = await self._upload_screenshot_to_s3(
+                            screenshot_bytes,
+                            self.current_execution_id
+                        )
+                        if screenshot_url:
+                            logger.info("Successfully captured and uploaded screenshot")
+                    except Exception as e:
+                        logger.error(f"Failed to capture or upload screenshot: {e}")
                         
                     # Get the task execution table
                     table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskExecutions')
@@ -445,18 +502,26 @@ class WebAgent:
                     # Create a unique interaction ID
                     interaction_id = f"interaction_{int(time.time())}"
                     
-                    # Update the execution with the question
+                    # Create interaction data
+                    interaction_data = {
+                        'id': interaction_id,
+                        'question': question,
+                        'status': 'pending',
+                        'timestamp': int(time.time()),
+                        'question_number': self.question_count
+                    }
+                    
+                    # Add screenshot URL if available
+                    if screenshot_url:
+                        interaction_data['screenshot_url'] = screenshot_url
+                    
+                    # Update the execution with the question and screenshot URL
                     table.update_item(
                         Key={'executionId': self.current_execution_id},
                         UpdateExpression='SET userInteractions = list_append(if_not_exists(userInteractions, :empty_list), :interaction)',
                         ExpressionAttributeValues={
                             ':empty_list': [],
-                            ':interaction': [{
-                                'id': interaction_id,
-                                'question': question,
-                                'status': 'pending',
-                                'timestamp': int(time.time())
-                            }]
+                            ':interaction': [interaction_data]
                         }
                     )
                     
@@ -473,12 +538,14 @@ class WebAgent:
                         for interaction in interactions:
                             if interaction['id'] == interaction_id:
                                 if interaction.get('response'):
+                                    logger.info(f"User responded: {interaction['response']}")
                                     return ActionResult(extracted_content=interaction['response'])
                         
                         time.sleep(2)  # Poll every 2 seconds
                     
                     return ActionResult(error="User did not respond within the timeout period")
                 except Exception as e:
+                    logger.error(f"Error asking user: {str(e)}")
                     return ActionResult(error=f"Error asking user: {str(e)}")
 
     def _get_cookies_path(self):
