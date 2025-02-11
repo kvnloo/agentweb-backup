@@ -1,10 +1,10 @@
 import { Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
-import { AuthRequest } from '../middleware/auth';
+import { AuthenticatedRequest } from '../middleware/auth';
 import { scheduleDb, Schedule } from '../services/scheduleDb';
 import { calculateNextRunTime, isValidFrequency, Frequency } from '../utils/scheduleUtils';
 
-export async function createSchedule(req: AuthRequest, res: Response) {
+export async function createSchedule(req: AuthenticatedRequest, res: Response) {
   try {
     const { taskId, frequency } = req.body;
     const userId = req.user?.userId;
@@ -36,7 +36,7 @@ export async function createSchedule(req: AuthRequest, res: Response) {
   }
 }
 
-export async function getSchedulesByTaskId(req: AuthRequest, res: Response) {
+export async function getSchedulesByTaskId(req: AuthenticatedRequest, res: Response) {
   try {
     const { taskId } = req.params;
     const userId = req.user?.userId;
@@ -56,7 +56,7 @@ export async function getSchedulesByTaskId(req: AuthRequest, res: Response) {
   }
 }
 
-export async function updateSchedule(req: AuthRequest, res: Response) {
+export async function updateSchedule(req: AuthenticatedRequest, res: Response) {
   try {
     const { scheduleId } = req.params;
     const { frequency, status } = req.body;
@@ -103,7 +103,7 @@ export async function updateSchedule(req: AuthRequest, res: Response) {
   }
 }
 
-export async function deleteSchedule(req: AuthRequest, res: Response) {
+export async function deleteSchedule(req: AuthenticatedRequest, res: Response) {
   try {
     const { scheduleId } = req.params;
     const userId = req.user?.userId;

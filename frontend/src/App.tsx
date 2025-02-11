@@ -8,7 +8,7 @@ import theme from './theme';
 import Home from './pages/Home';
 import Login from './pages/Login';
 import Register from './pages/Register';
-import Dashboard from './pages/Dashboard';
+import Tasks from './pages/Tasks';
 import CreateTask from './pages/CreateTask';
 import TaskDetails from './pages/TaskDetails';
 import Layout from './components/Layout';
@@ -18,6 +18,10 @@ import PrivateRoute from './components/PrivateRoute';
 import AdminRoute from './components/AdminRoute';
 import Profile from './pages/Profile';
 import Config from './pages/Config';
+import Workflows from './pages/Workflows';
+import WorkflowBuilder from './pages/WorkflowBuilder';
+import WorkflowDetails from './pages/WorkflowDetails';
+import WorkflowRun from './pages/WorkflowRun';
 
 export default function App() {
   return (
@@ -35,10 +39,10 @@ export default function App() {
                     <Route path="register" element={<Register />} />
                     <Route path="oauth-callback" element={<OAuthCallback />} />
                     <Route
-                      path="dashboard"
+                      path="tasks"
                       element={
                         <PrivateRoute>
-                          <Dashboard />
+                          <Tasks />
                         </PrivateRoute>
                       }
                     />
@@ -83,6 +87,46 @@ export default function App() {
                       }
                     />
                     <Route path="/config" element={<Config />} />
+                    <Route
+                      path="workflows"
+                      element={
+                        <PrivateRoute>
+                          <Workflows />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="workflows/new"
+                      element={
+                        <PrivateRoute>
+                          <WorkflowBuilder />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="workflows/:id"
+                      element={
+                        <PrivateRoute>
+                          <WorkflowDetails />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="workflows/:id/edit"
+                      element={
+                        <PrivateRoute>
+                          <WorkflowBuilder />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="workflows/:id/run"
+                      element={
+                        <PrivateRoute>
+                          <WorkflowRun />
+                        </PrivateRoute>
+                      }
+                    />
                   </Route>
                 </Routes>
               </Box>

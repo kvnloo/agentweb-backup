@@ -61,4 +61,8 @@ logs/
 *.log
 backend/logs/
 frontend/logs/
-agent-engine/logs/ 
+agent-engine/logs/
+
+# Agent engine downloads (user data)
+agent-engine/downloads/**/*
+!agent-engine/downloads/.gitkeep 

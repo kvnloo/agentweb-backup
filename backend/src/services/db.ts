@@ -46,6 +46,14 @@ interface User {
   createdAt: string;
 }
 
+interface UserInteraction {
+  id: string;
+  question: string;
+  response?: string;
+  status: 'pending' | 'answered';
+  timestamp: number;
+}
+
 class UserDB {
   private docClient: AWS.DynamoDB.DocumentClient;
   private tableName: string;
@@ -101,7 +109,6 @@ class UserDB {
 
   async getUserById(userId: string) {
     try {
-      console.log('Getting user by ID:', userId);
       const params = {
         TableName: this.tableName,
         IndexName: 'UserIdIndex',
@@ -112,7 +119,6 @@ class UserDB {
       };
 
       const result = await this.docClient.query(params).promise();
-      console.log('User lookup result:', result);
       return result.Items?.[0];
     } catch (error) {
       console.error('Error in getUserById:', error);
@@ -172,6 +178,8 @@ export const taskDb = {
     prompt: string;
     status: string;
     createdAt: string;
+    isInteractive?: boolean;
+    emailNotification?: boolean;
   }) {
     try {
       const params = {
@@ -274,13 +282,14 @@ export const taskDb = {
         Key: {
           taskId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
           '#e': 'error',
           '#sum': 'summary',
-          '#en': 'emailNotification'
+          '#en': 'emailNotification',
+          '#i': 'isInteractive'
         }
       };
 
@@ -298,6 +307,7 @@ export const taskDb = {
     error: string;
     summary: string;
     emailNotification: boolean;
+    isInteractive: boolean;
   }>) {
     try {
       const updateExpressions: string[] = [];
@@ -385,6 +395,7 @@ export const taskDb = {
     result: string;
     completedAt: string;
     feedback: 'accepted' | 'rejected' | null;
+    userInteractions: UserInteraction[];
   }>) {
     try {
       const updateExpressions: string[] = [];

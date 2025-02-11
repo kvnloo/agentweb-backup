@@ -11,12 +11,14 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@mui/lab": "^6.0.0-beta.26",
     "axios": "^1.7.9",
     "date-fns": "^2.30.0",
     "jwt-decode": "^4.0.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^7.1.3",
+    "reactflow": "^11.11.4",
     "serve": "^14.2.4"
   },
   "devDependencies": {
@@ -27,6 +29,7 @@
     "@mui/material": "^6.4.1",
     "@mui/x-date-pickers": "^7.24.1",
     "@types/axios": "^0.14.4",
+    "@types/js-yaml": "^4.0.9",
     "@types/material-ui": "^0.21.18",
     "@types/node": "^22.10.9",
     "@types/react": "^18.3.18",

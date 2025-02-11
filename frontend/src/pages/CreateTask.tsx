@@ -8,6 +8,9 @@ import {
   Box,
   Alert,
   Paper,
+  FormControlLabel,
+  Switch,
+  Tooltip,
 } from '@mui/material';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
@@ -16,6 +19,7 @@ import { buildApiUrl } from '../config';
 export default function CreateTask() {
   const [name, setName] = useState('');
   const [prompt, setPrompt] = useState('');
+  const [isInteractive, setIsInteractive] = useState(false);
   const [error, setError] = useState('');
   const { token } = useAuth();
   const navigate = useNavigate();
@@ -30,12 +34,13 @@ export default function CreateTask() {
         {
           name,
           prompt,
+          isInteractive,
         },
         {
           headers: { Authorization: `Bearer ${token}` },
         }
       );
-      navigate('/dashboard');
+      navigate('/tasks');
     } catch (err) {
       setError('Failed to create task');
     }
@@ -78,6 +83,20 @@ export default function CreateTask() {
             onChange={(e) => setPrompt(e.target.value)}
             helperText="Write your task instructions in natural language. The AI agent will request more information if needed."
           />
+          <Box sx={{ mt: 2 }}>
+            <Tooltip title="When enabled, the AI agent can ask for additional information during task execution">
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={isInteractive}
+                    onChange={(e) => setIsInteractive(e.target.checked)}
+                    color="primary"
+                  />
+                }
+                label="Interactive Mode"
+              />
+            </Tooltip>
+          </Box>
           <Box sx={{ mt: 3, display: 'flex', gap: 2 }}>
             <Button
               type="submit"
@@ -90,7 +109,7 @@ export default function CreateTask() {
             <Button
               variant="outlined"
               size="large"
-              onClick={() => navigate('/dashboard')}
+              onClick={() => navigate('/tasks')}
             >
               Cancel
             </Button>

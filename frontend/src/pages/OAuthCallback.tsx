@@ -20,7 +20,7 @@ export default function OAuthCallback() {
 
       try {
         await setToken(token);
-        navigate('/dashboard');
+        navigate('/tasks');
       } catch (error) {
         console.error('Error in OAuth callback:', error);
         setError('Failed to complete authentication');

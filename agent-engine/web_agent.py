@@ -3,11 +3,11 @@ import argparse
 import json
 import sys
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import browser_use
 from browser_use import Agent, Controller
 from browser_use.browser.browser import Browser, BrowserConfig
-from browser_use.browser.context import BrowserContextConfig
+from browser_use.browser.context import BrowserContextConfig, BrowserContext
 from langchain_aws import ChatBedrock
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from pydantic import SecretStr
@@ -18,6 +18,12 @@ from pathlib import Path
 from browser_use.agent.views import ActionResult
 from cookie_sync import CookieSync
 from aws_utils import get_dynamodb_resource, get_bedrock_client
+import time
+import asyncio
+import random
+import aiohttp
+import base64  # Add at the top with other imports
+import boto3  # Add at the top with other imports
 
 # Load environment variables
 load_dotenv()
@@ -204,39 +210,6 @@ def get_llm(full_llm_name: str):
     # Initialize the LLM using the mapped function
     return init_func(model_name), full_llm_name
 
-@controller.action('Get login credentials by domain')
-def get_login_credentials(domain: str, user_id: str):
-    """Get login credentials for a domain from the database"""
-    if not user_id:
-        raise Exception("User ID not provided")
-    if not domain:
-        return ActionResult(error=f"Please provide a domain")
-    logger.info(f"Getting login credentials for domain {domain} under user {user_id}")
-        
-    table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
-    response = table.query(
-        KeyConditionExpression='userId = :userId',
-        FilterExpression='website = :website',
-        ExpressionAttributeValues={
-            ':userId': user_id,
-            ':website': domain
-        }
-    )
-
-    items = response.get('Items', [])
-    if not items:
-        return ActionResult(error=f"No credentials found for domain: {domain}")
-
-    config = items[0]
-    try:
-        if config.get('sharedBy'):
-            logger.info(f"Found shared credentials for {domain} - shared by user: {config['sharedBy']}")
-        # Pass sharedBy to decrypt_password if it exists
-        decrypted_password = decrypt_password(config['password'], user_id, config.get('sharedBy'))
-        return ActionResult(extracted_content=f"username: {config['username']}, password: {decrypted_password}")
-    except Exception as e:
-        return ActionResult(error=f"Error getting credentials: {str(e)}")
-
 class WebAgent:
     def __init__(self, user_id=None, full_llm_name=None):
         logger.info(f"Initializing WebAgent for user {user_id}")
@@ -251,69 +224,28 @@ class WebAgent:
         self.context_dir = Path('context')
         self.context_dir.mkdir(exist_ok=True)
         self.cookie_sync = CookieSync() if user_id else None
+        self.is_interactive = False  # Initialize interactive mode flag
+        self.current_execution_id = None
+        self.controller = Controller()
+        self.question_count = 0  # Track number of questions asked
+        self.s3_client = boto3.client('s3')
+        self.s3_bucket = os.getenv('S3_BUCKET_NAME')  # Make sure to set this in .env
 
-    def _get_cookies_path(self):
-        """Get the path to the user's cookies file"""
-        if not self.user_id:
-            return None
-        return str(self.context_dir / f"{self.user_id}_cookies.json")
-
-    async def setup(self):
-        """Initialize the browser instance"""
-        if not self.task:
-            raise ValueError("Task must be set before setup")
-        
-        # Create browser context config with user-specific cookies file
-        cookies_path = self._get_cookies_path()
-        if cookies_path and self.cookie_sync:
-            # Try to download cookies from S3 before starting
-            self.cookie_sync.download_cookies(self.user_id, cookies_path)
-            
-        context_config = BrowserContextConfig(
-            cookies_file=cookies_path
-        )
-        if cookies_path:
-            logger.info(f"Using cookies file for user {self.user_id}: {cookies_path}")
-
-        # Get headless mode from environment variable, default to False if not set
-        headless = os.getenv('BROWSER_HEADLESS', 'true').lower() == 'true'
-        browser_config = BrowserConfig(new_context_config=context_config, headless=headless)
-        self.browser = Browser(config=browser_config)
-        self.agent = Agent(
-            task=self.task,
-            llm=self.llm,
-            controller=controller,
-            browser=self.browser,
-            use_vision=global_use_vision,
-            max_failures=5,  # Increase max retries
-            retry_delay=60    # retry delay in seconds
-        )
-
-    async def cleanup(self):
-        """Clean up browser resources and sync cookies"""
-        try:
-            if self.browser:
-                # Save cookies before closing
-                cookies_path = self._get_cookies_path()
-                if cookies_path and self.cookie_sync:
-                    # Upload cookies to S3 after task completion
-                    self.cookie_sync.upload_cookies(self.user_id, cookies_path)
-                
-                await self.browser.close()
-        except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
-            raise
-
-    def get_action_history(self):
-        """Get the list of actions performed by the agent"""
-        if not self.agent:
-            return []
-        return self.agent.action_history
-
-    async def execute_task(self, prompt: str) -> Dict[str, Any]:
+    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
         try:
-            self.task = prompt  # Store the task
+            self.is_interactive = is_interactive  # Set interactive mode
+            self.current_execution_id = execution_id  # Store execution ID
+            
+            # Register actions after setting is_interactive
+            self._register_actions()
+            
+            # Add interactive mode context to the prompt if enabled
+            if self.is_interactive:
+                prompt = f"{prompt}\n\nNote: This task is running in interactive mode. You can ask the user questions using the 'Ask user for input' action when you need additional information."
+            
+            self.task = prompt  # Store the task after prompt is potentially modified
+            
             await self.setup()  # Setup after we have the task
             
             # Run the agent
@@ -341,17 +273,368 @@ class WebAgent:
                 "llmName": self.llm_name
             }
 
+    async def _upload_screenshot_to_s3(self, screenshot_bytes: bytes, execution_id: str) -> Optional[str]:
+        """Upload screenshot to S3 and return the URL"""
+        try:
+            if not self.s3_bucket:
+                logger.error("S3_BUCKET_NAME not configured")
+                return None
+
+            # Generate a unique filename
+            timestamp = int(time.time())
+            filename = f"screenshots/{execution_id}/{timestamp}.jpeg"
+
+            # Upload to S3
+            self.s3_client.put_object(
+                Bucket=self.s3_bucket,
+                Key=filename,
+                Body=screenshot_bytes,
+                ContentType='image/png'
+            )
+
+            # Generate the URL
+            url = f"https://{self.s3_bucket}.s3.amazonaws.com/{filename}"
+            logger.info(f"Uploaded screenshot to S3: {url}")
+            return url
+
+        except Exception as e:
+            logger.error(f"Failed to upload screenshot to S3: {e}")
+            return None
+
+    def _register_actions(self):
+        @self.controller.registry.action('Get login credentials by domain')
+        def get_login_credentials(domain: str) -> ActionResult:
+            """Get login credentials for a domain from the database"""
+            if not self.user_id:
+                return ActionResult(error="User ID not provided")
+            if not domain:
+                return ActionResult(error=f"Please provide a domain")
+            logger.info(f"Getting login credentials for domain {domain} under user {self.user_id}")
+                
+            table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
+            response = table.query(
+                KeyConditionExpression='userId = :userId',
+                FilterExpression='website = :website',
+                ExpressionAttributeValues={
+                    ':userId': self.user_id,
+                    ':website': domain
+                }
+            )
+
+            items = response.get('Items', [])
+            if not items:
+                return ActionResult(error=f"No credentials found for domain: {domain}")
+
+            config = items[0]
+            try:
+                if config.get('sharedBy'):
+                    logger.info(f"Found shared credentials for {domain} - shared by user: {config['sharedBy']}")
+                # Pass sharedBy to decrypt_password if it exists
+                decrypted_password = decrypt_password(config['password'], self.user_id, config.get('sharedBy'))
+                return ActionResult(extracted_content=f"username: {config['username']}, password: {decrypted_password}")
+            except Exception as e:
+                return ActionResult(error=f"Error getting credentials: {str(e)}")
+
+        @self.controller.registry.action('Sleep')
+        async def sleep(seconds: float) -> ActionResult:
+            """Sleep for a specified number of seconds (max 5 minutes)"""
+            try:
+                # Convert to float and limit to 5 minutes max
+                sleep_duration = min(float(seconds), 300)
+                if sleep_duration <= 0:
+                    return ActionResult(error="Sleep duration must be positive")
+                
+                logger.info(f"Sleeping for {sleep_duration} seconds")
+                await asyncio.sleep(sleep_duration)
+                return ActionResult(extracted_content=f"Slept for {sleep_duration} seconds")
+            except ValueError:
+                return ActionResult(error="Invalid sleep duration provided")
+            except Exception as e:
+                logger.error(f"Error in sleep: {str(e)}")
+                return ActionResult(error=f"Failed to sleep: {str(e)}")
+
+        @self.controller.registry.action('Upload file')
+        async def upload_file(file_name: str, index: int, browser: BrowserContext) -> ActionResult:
+            """Upload a file to a file input element on the page"""
+            try:
+                # Get user-specific downloads path
+                downloads_path = Path(self._get_downloads_path())
+                file_path = downloads_path / file_name
+                
+                if not file_path.exists():
+                    return ActionResult(error=f"File {file_name} not found in downloads directory")
+
+                # Get the current page
+                page = await browser.get_current_page()
+                await page.wait_for_load_state('domcontentloaded')
+                
+                # Get current URL to check for special cases
+                current_url = page.url.lower()
+                
+                # Special handling for pixverse.ai
+                if 'pixverse.ai' in current_url:
+                    logger.info("Detected pixverse.ai, using specific file input selector")
+                    element = await page.query_selector('input[name="file"][accept*="image/png"][accept*="video/mp4"]')
+                    if not element:
+                        return ActionResult(error="Could not find the correct file input element")
+                    
+                    await element.set_input_files(str(file_path.absolute()))
+
+                    # Wait for upload processing
+                    await page.wait_for_timeout(5000)
+
+                    msg = f'Successfully uploaded {file_name}'
+                    logger.info(msg)
+                    return ActionResult(extracted_content=msg)
+                
+                # Default handling for other sites
+                # Try iframe first, then main page
+                contexts = []
+                iframe = await page.query_selector('iframe')
+                if iframe and (frame := await iframe.content_frame()):
+                    logger.info("Found iframe, adding to contexts")
+                    contexts.append(frame)
+                contexts.append(page)
+                
+                # Try to find file input in each context
+                for context in contexts:
+                    # Try selectors in order of specificity
+                    selectors = [
+                        f'[browser-user-highlight-id="playwright-highlight-{index}"] input[type="file"]',
+                        'input[type="file"]',
+                        'input[accept="image/*"]'
+                    ]
+                    
+                    for selector in selectors:
+                        elements = context.locator(selector)
+                        if await elements.count() > 0:
+                            await elements.first.set_input_files(str(file_path.absolute()))
+                            msg = f'Successfully uploaded {file_name}'
+                            logger.info(msg)
+                            return ActionResult(extracted_content=msg)
+                
+                return ActionResult(error="Could not find file input element")
+                    
+            except Exception as e:
+                logger.error(f'Error in upload_file: {str(e)}')
+                return ActionResult(error=f'Failed to upload file: {str(e)}')
+
+        @self.controller.registry.action('Close file dialog')
+        async def close_file_dialog(browser: BrowserContext) -> ActionResult:
+            """Close any open file dialog"""
+            try:
+                page = await browser.get_current_page()
+                await page.keyboard.press('Escape')
+                return ActionResult(extracted_content='File dialog closed')
+            except Exception as e:
+                return ActionResult(error=f'Failed to close file dialog: {str(e)}')
+
+        @self.controller.registry.action('Download image when you have the URL')
+        async def download_image(url: str, browser: BrowserContext) -> ActionResult:
+            """Download an image from a URL and save it to the downloads folder."""
+            try:
+                # Get user-specific downloads path
+                downloads_path = Path(self._get_downloads_path())
+                
+                # Generate a random 8-character filename
+                random_name = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=8))
+                
+                # Get extension from URL or default to jpg
+                ext = url.split('.')[-1] if '.' in url.split('/')[-1] else 'jpg'
+                filename = f"{random_name}.{ext}"
+                
+                filepath = downloads_path / filename
+                
+                # Download the image
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url) as response:
+                        if response.status != 200:
+                            raise Exception(f"Failed to download image: HTTP {response.status}")
+                        
+                        # Read and save the image
+                        image_data = await response.read()
+                        filepath.write_bytes(image_data)
+                
+                msg = f"Downloaded image to {filename}"
+                logger.info(msg)
+                return ActionResult(extracted_content=msg)
+                
+            except Exception as e:
+                logger.error(f'Error in download_image: {str(e)}')
+                return ActionResult(error=f'Failed to download image: {str(e)}')
+
+        # Only register ask_user action if interactive mode is enabled
+        if self.is_interactive:
+            @self.controller.registry.action('Ask user for input')
+            async def ask_user(question: str, browser: BrowserContext) -> ActionResult:
+                """Ask the user a question and wait for their response. Limited to 5 questions per task."""
+                try:
+                    if not self.current_execution_id:
+                        return ActionResult(error="No execution ID available")
+                    
+                    # Check if we've exceeded the question limit
+                    if self.question_count >= 5:
+                        return ActionResult(error="Maximum number of questions (5) has been reached for this task")
+                    
+                    # Increment question counter
+                    self.question_count += 1
+                    logger.info(f"Asking question {self.question_count}/5: {question}")
+                    
+                    # Take a screenshot of the current page
+                    page = await browser.get_current_page()
+                    screenshot_url = None
+                    try:
+                        # Take full page screenshot
+                        screenshot_bytes = await page.screenshot(type='jpeg')
+                        # Upload to S3
+                        screenshot_url = await self._upload_screenshot_to_s3(
+                            screenshot_bytes,
+                            self.current_execution_id
+                        )
+                        if screenshot_url:
+                            logger.info("Successfully captured and uploaded screenshot")
+                    except Exception as e:
+                        logger.error(f"Failed to capture or upload screenshot: {e}")
+                        
+                    # Get the task execution table
+                    table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskExecutions')
+                    
+                    # Create a unique interaction ID
+                    interaction_id = f"interaction_{int(time.time())}"
+                    
+                    # Create interaction data
+                    interaction_data = {
+                        'id': interaction_id,
+                        'question': question,
+                        'status': 'pending',
+                        'timestamp': int(time.time()),
+                        'question_number': self.question_count
+                    }
+                    
+                    # Add screenshot URL if available
+                    if screenshot_url:
+                        interaction_data['screenshot_url'] = screenshot_url
+                    
+                    # Update the execution with the question and screenshot URL
+                    table.update_item(
+                        Key={'executionId': self.current_execution_id},
+                        UpdateExpression='SET userInteractions = list_append(if_not_exists(userInteractions, :empty_list), :interaction)',
+                        ExpressionAttributeValues={
+                            ':empty_list': [],
+                            ':interaction': [interaction_data]
+                        }
+                    )
+                    
+                    # Wait for user response with timeout
+                    max_wait_time = 300  # 5 minutes timeout
+                    start_time = time.time()
+                    
+                    while time.time() - start_time < max_wait_time:
+                        response = table.get_item(Key={'executionId': self.current_execution_id})
+                        execution = response.get('Item', {})
+                        interactions = execution.get('userInteractions', [])
+                        
+                        # Find our interaction
+                        for interaction in interactions:
+                            if interaction['id'] == interaction_id:
+                                if interaction.get('response'):
+                                    logger.info(f"User responded: {interaction['response']}")
+                                    return ActionResult(extracted_content=interaction['response'])
+                        
+                        time.sleep(2)  # Poll every 2 seconds
+                    
+                    return ActionResult(error="User did not respond within the timeout period")
+                except Exception as e:
+                    logger.error(f"Error asking user: {str(e)}")
+                    return ActionResult(error=f"Error asking user: {str(e)}")
+
+    def _get_cookies_path(self):
+        """Get the path to the user's cookies file"""
+        if not self.user_id:
+            return None
+        return str(self.context_dir / f"{self.user_id}_cookies.json")
+
+    def _get_downloads_path(self):
+        """Get the path to the user's downloads directory"""
+        if not self.user_id:
+            return str(Path('downloads/default'))
+        downloads_path = Path('downloads') / self.user_id
+        downloads_path.mkdir(parents=True, exist_ok=True)
+        return str(downloads_path)
+
+    async def setup(self):
+        """Initialize the browser instance"""
+        if not self.task:
+            raise ValueError("Task must be set before setup")
+        
+        # Create browser context config with user-specific cookies file
+        cookies_path = self._get_cookies_path()
+        if cookies_path and self.cookie_sync:
+            # Try to download cookies from S3 before starting
+            self.cookie_sync.download_cookies(self.user_id, cookies_path)
+            
+        # Configure downloads path
+        downloads_path = self._get_downloads_path()
+        context_config = BrowserContextConfig(
+            cookies_file=cookies_path,
+            save_downloads_path=downloads_path
+        )
+        if cookies_path:
+            logger.info(f"Using cookies file for user {self.user_id}: {cookies_path}")
+        logger.info(f"Using downloads path: {downloads_path}")
+
+        # Get headless mode from environment variable, default to False if not set
+        headless = os.getenv('BROWSER_HEADLESS', 'true').lower() == 'true'
+        browser_config = BrowserConfig(new_context_config=context_config, headless=headless)
+        self.browser = Browser(config=browser_config)
+        self.agent = Agent(
+            task=self.task,
+            llm=self.llm,
+            controller=self.controller,
+            browser=self.browser,
+            use_vision=global_use_vision,
+            max_failures=5,  # Increase max retries
+            retry_delay=60    # retry delay in seconds
+        )
+
+    async def cleanup(self):
+        """Clean up browser resources and sync cookies"""
+        try:
+            if self.browser:
+                # Save cookies before closing
+                cookies_path = self._get_cookies_path()
+                if cookies_path and self.cookie_sync:
+                    # Upload cookies to S3 after task completion
+                    self.cookie_sync.upload_cookies(self.user_id, cookies_path)
+                
+                await self.browser.close()
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+            raise
+
+    def get_action_history(self):
+        """Get the list of actions performed by the agent"""
+        if not self.agent:
+            return []
+        return self.agent.action_history
+
 async def main():
     parser = argparse.ArgumentParser(description='Web Agent for task automation')
     parser.add_argument('--task_id', required=True, help='Task ID')
     parser.add_argument('--prompt', required=True, help='Task prompt')
     parser.add_argument('--user_id', required=True, help='User ID')
     parser.add_argument('--llm_name', help='Full LLM name in format platform->provider->model')
+    parser.add_argument('--execution_id', required=True, help='Execution ID')
+    parser.add_argument('--interactive', action='store_true', help='Enable interactive mode')
     args = parser.parse_args()
 
     agent = WebAgent(args.user_id, args.llm_name)
     try:
-        result = await agent.execute_task(args.prompt)  # Setup is called inside execute_task now
+        result = await agent.execute_task(
+            args.prompt,
+            execution_id=args.execution_id,
+            is_interactive=args.interactive
+        )
         print(json.dumps(result))
         sys.exit(0 if result["success"] else 1)
     except Exception as e:
@@ -365,5 +648,4 @@ async def main():
         await agent.cleanup()
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main()) 

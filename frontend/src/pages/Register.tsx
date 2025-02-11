@@ -41,7 +41,7 @@ export default function Register() {
 
     try {
       await register(email, password);
-      navigate('/dashboard');
+      navigate('/tasks');
     } catch (err) {
       setError('Failed to create an account');
     }

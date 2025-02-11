@@ -6,6 +6,14 @@ interface AuthRequest extends Request {
   user?: { userId: string; email: string };
 }
 
+interface UserInteraction {
+  id: string;
+  question: string;
+  response?: string;
+  status: 'pending' | 'answered';
+  timestamp: number;
+}
+
 export const createTask = async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.user?.userId;
@@ -13,7 +21,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const { name, prompt } = req.body;
+    const { name, prompt, isInteractive } = req.body;
     
     if (!name || !prompt) {
       return res.status(400).json({ message: 'Name and prompt are required' });
@@ -26,6 +34,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       prompt,
       status: 'active',
       emailNotification: false,  // Initialize to false
+      isInteractive: Boolean(isInteractive),  // Convert to boolean
       createdAt: new Date().toISOString()
     };
 
@@ -125,6 +134,10 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
 
     if (req.body.name !== undefined) {
       updates.name = req.body.name;
+    }
+
+    if (req.body.isInteractive !== undefined) {
+      updates.isInteractive = Boolean(req.body.isInteractive);
     }
 
     console.log('Updates to apply:', updates);
@@ -269,5 +282,67 @@ export const updateTaskExecution = async (req: AuthRequest, res: Response) => {
   } catch (error) {
     console.error('Error in updateTaskExecution:', error);
     res.status(500).json({ message: 'Error updating task execution' });
+  }
+};
+
+export const respondToInteraction = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const taskId = req.params.id;
+    const executionId = req.params.executionId;
+    const interactionId = req.params.interactionId;
+    const { response } = req.body;
+
+    if (!response) {
+      return res.status(400).json({ message: 'Response is required' });
+    }
+
+    // Verify task exists and belongs to user
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+    if (task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Get the execution
+    const execution = await taskDb.getTaskExecutionById(executionId);
+    if (!execution) {
+      return res.status(404).json({ message: 'Execution not found' });
+    }
+
+    // Find and update the interaction
+    const interactions: UserInteraction[] = execution.userInteractions || [];
+    const interactionIndex = interactions.findIndex(i => i.id === interactionId);
+    
+    if (interactionIndex === -1) {
+      return res.status(404).json({ message: 'Interaction not found' });
+    }
+
+    if (interactions[interactionIndex].status !== 'pending') {
+      return res.status(400).json({ message: 'This interaction has already been answered' });
+    }
+
+    // Update the interaction
+    interactions[interactionIndex] = {
+      ...interactions[interactionIndex],
+      response,
+      status: 'answered'
+    };
+
+    // Update the execution with the modified interactions
+    const updatedExecution = await taskDb.updateTaskExecution(executionId, {
+      userInteractions: interactions
+    });
+
+    res.json(updatedExecution);
+  } catch (error) {
+    console.error('Error in respondToInteraction:', error);
+    res.status(500).json({ message: 'Error responding to interaction' });
   }
 }; 
