@@ -1,4 +1,4 @@
-import React, { memo } from 'react';
+import { memo } from 'react';
 import { Handle, Position, NodeProps } from 'reactflow';
 import { Box, Paper, Typography } from '@mui/material';
 import { Task as TaskIcon } from '@mui/icons-material';

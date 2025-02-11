@@ -450,7 +450,7 @@ export default function TaskDetails() {
     try {
       const newIsInteractive = !task.isInteractive;
       
-      const updateResponse = await axios.put(
+      await axios.put(
         buildApiUrl(`/api/tasks/${taskId}`),
         {
           isInteractive: newIsInteractive

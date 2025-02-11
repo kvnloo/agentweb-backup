@@ -1,4 +1,4 @@
-import express, { Request, Response, Router } from 'express';
+import express, { Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import {
   listWorkflows,
@@ -12,31 +12,49 @@ import {
 } from '../controllers/workflows';
 import { workflowDb, WorkflowExecution, WorkflowTask } from '../services/workflow';
 import { v4 as uuidv4 } from 'uuid';
-import { User } from '../types/auth';
 import yaml from 'js-yaml';
 
-interface AuthenticatedRequest extends Request {
-  user?: User;
+interface WorkflowNode {
+  id: string;
+  data: {
+    prompt: string;
+    taskId?: string;
+    order?: number;
+  };
 }
 
-const router: Router = express.Router();
+interface WorkflowEdge {
+  source: string;
+  target: string;
+}
+
+type RequestHandlerAuth = (req: Request, res: Response, next: express.NextFunction) => void;
+
+const router = express.Router();
 
 // All routes require authentication
 router.use(authenticateToken);
 
+// Helper function to wrap async handlers
+const asyncHandler = (fn: (req: Request, res: Response, next: express.NextFunction) => Promise<any>) => {
+  return (req: Request, res: Response, next: express.NextFunction) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+};
+
 // Workflow routes
-router.get('/', listWorkflows);
-router.get('/:id', getWorkflow);
-router.post('/', createWorkflow);
-router.put('/:id', updateWorkflow);
-router.delete('/:id', deleteWorkflow);
+router.get('/', listWorkflows as unknown as RequestHandlerAuth);
+router.get('/:id', getWorkflow as unknown as RequestHandlerAuth);
+router.post('/', createWorkflow as unknown as RequestHandlerAuth);
+router.put('/:id', updateWorkflow as unknown as RequestHandlerAuth);
+router.delete('/:id', deleteWorkflow as unknown as RequestHandlerAuth);
 
 // Workflow generation route
-router.post('/generate', generateWorkflow);
+router.post('/generate', generateWorkflow as unknown as RequestHandlerAuth);
 
 // Workflow execution routes
-router.get('/:id/executions', getWorkflowExecutions);
-router.post('/:id/run', async (req: AuthenticatedRequest, res: Response) => {
+router.get('/:id/executions', getWorkflowExecutions as unknown as RequestHandlerAuth);
+router.post('/:id/run', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const userId = req.user?.userId;
@@ -57,7 +75,7 @@ router.post('/:id/run', async (req: AuthenticatedRequest, res: Response) => {
     console.log('Retrieved workflow:', JSON.stringify(workflow, null, 2));
 
     // Parse YAML to get nodes and edges
-    const workflowData = yaml.load(workflow.yaml) as any;
+    const workflowData = yaml.load(workflow.yaml) as { nodes: WorkflowNode[]; edges: WorkflowEdge[] };
     console.log('Parsed workflow data:', JSON.stringify(workflowData, null, 2));
 
     if (!workflowData?.nodes || !Array.isArray(workflowData.nodes)) {
@@ -73,7 +91,7 @@ router.post('/:id/run', async (req: AuthenticatedRequest, res: Response) => {
       userId,
       status: 'pending',
       startTime: new Date().toISOString(),
-      tasks: workflowData.nodes.map(node => {
+      tasks: workflowData.nodes.map((node: WorkflowNode) => {
         if (!node.data?.prompt) {
           console.error(`Node missing prompt:`, node);
           throw new Error(`Invalid workflow node: missing prompt`);
@@ -87,13 +105,12 @@ router.post('/:id/run', async (req: AuthenticatedRequest, res: Response) => {
 
         const dependsOn = workflowData.edges
           ? workflowData.edges
-              .filter(edge => edge.target === node.id)
-              .map(edge => {
-                const sourceNode = workflowData.nodes.find(n => n.id === edge.source);
-                // Use the source node's taskId directly
+              .filter((edge: WorkflowEdge) => edge.target === node.id)
+              .map((edge: WorkflowEdge) => {
+                const sourceNode = workflowData.nodes.find((n: WorkflowNode) => n.id === edge.source);
                 return sourceNode?.data?.taskId;
               })
-              .filter((taskId): taskId is string => taskId !== undefined)
+              .filter((taskId: string | undefined): taskId is string => taskId !== undefined)
           : [];
 
         const task: WorkflowTask = {

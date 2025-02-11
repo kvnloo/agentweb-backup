@@ -1,4 +1,4 @@
-import React, { memo } from 'react';
+import { memo } from 'react';
 import { Handle, Position, NodeProps } from 'reactflow';
 import { Box, Paper, Typography } from '@mui/material';
 import { Loop as LoopIcon } from '@mui/icons-material';

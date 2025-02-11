@@ -5,13 +5,11 @@ import ReactFlow, {
   Edge,
   Controls,
   Background,
-  MiniMap,
   NodeChange,
   EdgeChange,
   Connection,
   addEdge,
   MarkerType,
-  NodeTypes,
   NodeProps
 } from 'reactflow';
 import 'reactflow/dist/style.css';

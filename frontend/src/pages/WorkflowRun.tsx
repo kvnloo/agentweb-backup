@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
   Box,
@@ -15,16 +15,12 @@ import {
   Chip,
   CircularProgress,
   Alert,
-  Tooltip,
-  Divider,
-  Collapse,
-  IconButton as MuiIconButton
+  Tooltip
 } from '@mui/material';
 import {
   Refresh as RefreshIcon,
   ArrowBack as ArrowBackIcon,
   PlayArrow as PlayArrowIcon,
-  Stop as StopIcon,
   CheckCircle as CheckCircleIcon,
   Error as ErrorIcon,
   Pending as PendingIcon,
@@ -34,7 +30,6 @@ import {
   ContentCopy as ContentCopyIcon
 } from '@mui/icons-material';
 import { useAuth } from '../contexts/AuthContext';
-import { buildApiUrl } from '../config';
 import { formatDistanceToNow, intervalToDuration } from 'date-fns';
 
 interface WorkflowTask {
@@ -44,6 +39,7 @@ interface WorkflowTask {
   dependsOn?: string[];
   error?: string;
   completedAt?: string;
+  result?: string;
 }
 
 interface WorkflowExecution {
