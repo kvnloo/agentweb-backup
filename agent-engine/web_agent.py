@@ -7,7 +7,7 @@ from typing import Dict, Any, Optional
 import browser_use
 from browser_use import Agent, Controller
 from browser_use.browser.browser import Browser, BrowserConfig
-from browser_use.browser.context import BrowserContextConfig
+from browser_use.browser.context import BrowserContextConfig, BrowserContext
 from langchain_aws import ChatBedrock
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from pydantic import SecretStr
@@ -19,6 +19,9 @@ from browser_use.agent.views import ActionResult
 from cookie_sync import CookieSync
 from aws_utils import get_dynamodb_resource, get_bedrock_client
 import time
+import asyncio
+import random
+import aiohttp
 
 # Load environment variables
 load_dotenv()
@@ -299,6 +302,134 @@ class WebAgent:
             except Exception as e:
                 return ActionResult(error=f"Error getting credentials: {str(e)}")
 
+        @self.controller.registry.action('Sleep')
+        async def sleep(seconds: float) -> ActionResult:
+            """Sleep for a specified number of seconds (max 5 minutes)"""
+            try:
+                # Convert to float and limit to 5 minutes max
+                sleep_duration = min(float(seconds), 300)
+                if sleep_duration <= 0:
+                    return ActionResult(error="Sleep duration must be positive")
+                
+                logger.info(f"Sleeping for {sleep_duration} seconds")
+                await asyncio.sleep(sleep_duration)
+                return ActionResult(extracted_content=f"Slept for {sleep_duration} seconds")
+            except ValueError:
+                return ActionResult(error="Invalid sleep duration provided")
+            except Exception as e:
+                logger.error(f"Error in sleep: {str(e)}")
+                return ActionResult(error=f"Failed to sleep: {str(e)}")
+
+        @self.controller.registry.action('Upload file')
+        async def upload_file(file_name: str, index: int, browser: BrowserContext) -> ActionResult:
+            """Upload a file to a file input element on the page"""
+            try:
+                # Get user-specific downloads path
+                downloads_path = Path(self._get_downloads_path())
+                file_path = downloads_path / file_name
+                
+                if not file_path.exists():
+                    return ActionResult(error=f"File {file_name} not found in downloads directory")
+
+                # Get the current page
+                page = await browser.get_current_page()
+                await page.wait_for_load_state('domcontentloaded')
+                
+                # Get current URL to check for special cases
+                current_url = page.url.lower()
+                
+                # Special handling for pixverse.ai
+                if 'pixverse.ai' in current_url:
+                    logger.info("Detected pixverse.ai, using specific file input selector")
+                    element = await page.query_selector('input[name="file"][accept*="image/png"][accept*="video/mp4"]')
+                    if not element:
+                        return ActionResult(error="Could not find the correct file input element")
+                    
+                    await element.set_input_files(str(file_path.absolute()))
+
+                    # Wait for upload processing
+                    await page.wait_for_timeout(5000)
+
+                    msg = f'Successfully uploaded {file_name}'
+                    logger.info(msg)
+                    return ActionResult(extracted_content=msg)
+                
+                # Default handling for other sites
+                # Try iframe first, then main page
+                contexts = []
+                iframe = await page.query_selector('iframe')
+                if iframe and (frame := await iframe.content_frame()):
+                    logger.info("Found iframe, adding to contexts")
+                    contexts.append(frame)
+                contexts.append(page)
+                
+                # Try to find file input in each context
+                for context in contexts:
+                    # Try selectors in order of specificity
+                    selectors = [
+                        f'[browser-user-highlight-id="playwright-highlight-{index}"] input[type="file"]',
+                        'input[type="file"]',
+                        'input[accept="image/*"]'
+                    ]
+                    
+                    for selector in selectors:
+                        elements = context.locator(selector)
+                        if await elements.count() > 0:
+                            await elements.first.set_input_files(str(file_path.absolute()))
+                            msg = f'Successfully uploaded {file_name}'
+                            logger.info(msg)
+                            return ActionResult(extracted_content=msg)
+                
+                return ActionResult(error="Could not find file input element")
+                    
+            except Exception as e:
+                logger.error(f'Error in upload_file: {str(e)}')
+                return ActionResult(error=f'Failed to upload file: {str(e)}')
+
+        @self.controller.registry.action('Close file dialog')
+        async def close_file_dialog(browser: BrowserContext) -> ActionResult:
+            """Close any open file dialog"""
+            try:
+                page = await browser.get_current_page()
+                await page.keyboard.press('Escape')
+                return ActionResult(extracted_content='File dialog closed')
+            except Exception as e:
+                return ActionResult(error=f'Failed to close file dialog: {str(e)}')
+
+        @self.controller.registry.action('Download image when you have the URL')
+        async def download_image(url: str, browser: BrowserContext) -> ActionResult:
+            """Download an image from a URL and save it to the downloads folder."""
+            try:
+                # Get user-specific downloads path
+                downloads_path = Path(self._get_downloads_path())
+                
+                # Generate a random 8-character filename
+                random_name = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=8))
+                
+                # Get extension from URL or default to jpg
+                ext = url.split('.')[-1] if '.' in url.split('/')[-1] else 'jpg'
+                filename = f"{random_name}.{ext}"
+                
+                filepath = downloads_path / filename
+                
+                # Download the image
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url) as response:
+                        if response.status != 200:
+                            raise Exception(f"Failed to download image: HTTP {response.status}")
+                        
+                        # Read and save the image
+                        image_data = await response.read()
+                        filepath.write_bytes(image_data)
+                
+                msg = f"Downloaded image to {filename}"
+                logger.info(msg)
+                return ActionResult(extracted_content=msg)
+                
+            except Exception as e:
+                logger.error(f'Error in download_image: {str(e)}')
+                return ActionResult(error=f'Failed to download image: {str(e)}')
+
         # Only register ask_user action if interactive mode is enabled
         if self.is_interactive:
             @self.controller.registry.action('Ask user for input')
@@ -450,5 +581,4 @@ async def main():
         await agent.cleanup()
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main()) 
