@@ -12,6 +12,7 @@ export interface WorkflowTask {
   dependsOn?: string[];
   error?: string;
   completedAt?: string;
+  prompt: string;
 }
 
 export interface WorkflowExecution {
