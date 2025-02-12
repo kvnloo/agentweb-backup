@@ -134,7 +134,23 @@ class UserDB {
       };
 
       const result = await this.docClient.scan(params).promise();
-      return result.Items || [];
+      const users = result.Items || [];
+
+      // Get task and workflow counts for each user
+      const usersWithCounts = await Promise.all(users.map(async (user) => {
+        const [tasks, workflowCount] = await Promise.all([
+          taskDb.getTasksByUserId(user.userId),
+          workflowDb.getUserWorkflowCount(user.userId)
+        ]);
+        
+        return {
+          ...user,
+          taskCount: tasks ? tasks.length : 0,
+          workflowCount
+        };
+      }));
+
+      return usersWithCounts;
     } catch (error) {
       console.error('Error in getAllUsers:', error);
       throw error;
@@ -761,6 +777,29 @@ export const subscriberDb = {
       return result.Items || [];
     } catch (error) {
       handleDynamoDbError(error, 'getTaskSubscribers');
+    }
+  }
+};
+
+// Add minimal workflow methods for counting
+export const workflowDb = {
+  async getUserWorkflowCount(userId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Workflows`,
+        IndexName: 'UserWorkflowsIndex',
+        KeyConditionExpression: 'userId = :userId',
+        ExpressionAttributeValues: {
+          ':userId': userId
+        },
+        Select: 'COUNT'
+      };
+
+      const result = await dynamodb.query(params).promise();
+      return result.Count || 0;
+    } catch (error) {
+      console.error('Error getting workflow count:', error);
+      return 0;
     }
   }
 }; 
