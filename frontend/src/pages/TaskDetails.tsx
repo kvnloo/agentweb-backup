@@ -111,7 +111,7 @@ const truncateFilename = (filename: string, maxLength: number = 20): string => {
   const nameWithoutExt = filename.substring(0, filename.lastIndexOf('.'));
   
   // Calculate how much of the name we can keep
-  const maxNameLength = maxLength - extension.length - 4; // 4 for "..." and "."
+  const maxNameLength = maxLength - (extension ? extension.length + 1 : 0) - 3; // 3 for "..."
   const truncatedName = nameWithoutExt.substring(0, maxNameLength);
   
   return `${truncatedName}...${extension ? `.${extension}` : ''}`;

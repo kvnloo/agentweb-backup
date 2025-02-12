@@ -1,4 +1,4 @@
-import express, { Request, RequestHandler } from 'express';
+import express, { Request, RequestHandler, Response } from 'express';
 import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction } from '../controllers/tasks';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { taskDb, subscriberDb } from '../services/db';
