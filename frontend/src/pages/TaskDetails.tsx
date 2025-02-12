@@ -665,11 +665,11 @@ export default function TaskDetails() {
       return;
     }
 
-    // Check file sizes (20MB = 20 * 1024 * 1024 bytes)
-    const MAX_SIZE = 20 * 1024 * 1024;
+    // Check file sizes (1MB = 1024 * 1024 bytes)
+    const MAX_SIZE = 1 * 1024 * 1024; // 1MB limit for production
     const oversizedFiles = files.filter(file => file.size > MAX_SIZE);
     if (oversizedFiles.length > 0) {
-      setUploadError(`Following files exceed 20MB limit: ${oversizedFiles.map(f => f.name).join(', ')}`);
+      setUploadError(`Following files exceed 1MB limit: ${oversizedFiles.map(f => f.name).join(', ')}`);
       return;
     }
 
@@ -698,7 +698,11 @@ export default function TaskDetails() {
       }
       await fetchTask(); // Refresh task to get updated attachments
     } catch (error: any) {
-      setUploadError(error.response?.data?.error || 'Failed to upload file(s)');
+      if (error.response?.status === 413) {
+        setUploadError('File size too large. Maximum file size is 1MB.');
+      } else {
+        setUploadError(error.response?.data?.error || 'Failed to upload file(s)');
+      }
     } finally {
       setIsUploading(false);
       // Clear the input value to allow uploading the same file again
