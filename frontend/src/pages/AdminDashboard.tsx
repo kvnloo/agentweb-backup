@@ -256,6 +256,8 @@ export default function AdminDashboard() {
                 <TableCell>User ID</TableCell>
                 <TableCell>Email</TableCell>
                 <TableCell>Created At</TableCell>
+                <TableCell>Tasks</TableCell>
+                <TableCell>Workflows</TableCell>
                 <TableCell>OAuth User</TableCell>
                 <TableCell>Admin</TableCell>
               </TableRow>
@@ -263,7 +265,7 @@ export default function AdminDashboard() {
             <TableBody>
               {loading ? (
                 <TableRow>
-                  <TableCell colSpan={5} align="center">
+                  <TableCell colSpan={7} align="center">
                     <CircularProgress />
                   </TableCell>
                 </TableRow>
@@ -273,6 +275,20 @@ export default function AdminDashboard() {
                     <TableCell>{user.userId}</TableCell>
                     <TableCell>{user.email}</TableCell>
                     <TableCell>{new Date(user.createdAt).toLocaleDateString()}</TableCell>
+                    <TableCell>
+                      <Chip 
+                        label={user.taskCount || 0} 
+                        size="small"
+                        color={user.taskCount > 0 ? 'primary' : 'default'}
+                      />
+                    </TableCell>
+                    <TableCell>
+                      <Chip 
+                        label={user.workflowCount || 0} 
+                        size="small"
+                        color={user.workflowCount > 0 ? 'primary' : 'default'}
+                      />
+                    </TableCell>
                     <TableCell>{user.isOAuthUser ? 'Yes' : 'No'}</TableCell>
                     <TableCell>{user.isAdmin ? 'Yes' : 'No'}</TableCell>
                   </TableRow>
