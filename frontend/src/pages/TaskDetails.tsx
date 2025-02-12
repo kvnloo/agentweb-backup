@@ -25,6 +25,7 @@ import {
   ListItemText,
   ListItemSecondaryAction,
   Tooltip,
+  Link,
 } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
@@ -52,6 +53,14 @@ interface Task {
   error?: string;
   emailNotification?: boolean;
   isInteractive?: boolean;
+  attachments?: TaskAttachment[];
+}
+
+interface TaskAttachment {
+  url: string;
+  key: string;
+  filename: string;
+  uploadedAt: string;
 }
 
 interface UserInteraction {
@@ -307,6 +316,8 @@ export default function TaskDetails() {
   const [subscriberError, setSubscriberError] = useState('');
   const [isEditingPrompt, setIsEditingPrompt] = useState(false);
   const [editedPrompt, setEditedPrompt] = useState('');
+  const [uploadError, setUploadError] = useState<string>('');
+  const [isUploading, setIsUploading] = useState(false);
 
   const isAdminRoute = location.pathname.startsWith('/admin/');
   const showActions = !isAdminRoute || (task && user && task.userId === user.userId);
@@ -625,6 +636,70 @@ export default function TaskDetails() {
     }
   };
 
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || []);
+    if (files.length === 0) return;
+
+    // Check number of files
+    if (files.length > 5) {
+      setUploadError('You can only upload up to 5 files at once');
+      return;
+    }
+
+    // Check file sizes (20MB = 20 * 1024 * 1024 bytes)
+    const MAX_SIZE = 20 * 1024 * 1024;
+    const oversizedFiles = files.filter(file => file.size > MAX_SIZE);
+    if (oversizedFiles.length > 0) {
+      setUploadError(`Following files exceed 20MB limit: ${oversizedFiles.map(f => f.name).join(', ')}`);
+      return;
+    }
+
+    // Check total number of attachments
+    const currentAttachments = task?.attachments?.length || 0;
+    if (currentAttachments + files.length > 5) {
+      setUploadError(`You can only have up to 5 attachments total. You currently have ${currentAttachments} attachments.`);
+      return;
+    }
+
+    setIsUploading(true);
+    setUploadError('');
+
+    try {
+      // Upload files sequentially to avoid overwhelming the server
+      for (const file of files) {
+        const formData = new FormData();
+        formData.append('file', file);
+
+        await axios.post(buildApiUrl(`/api/tasks/${taskId}/attachments`), formData, {
+          headers: {
+            'Content-Type': 'multipart/form-data',
+            Authorization: `Bearer ${token}`
+          }
+        });
+      }
+      await fetchTask(); // Refresh task to get updated attachments
+    } catch (error: any) {
+      setUploadError(error.response?.data?.error || 'Failed to upload file(s)');
+    } finally {
+      setIsUploading(false);
+      // Clear the input value to allow uploading the same file again
+      if (event.target) {
+        event.target.value = '';
+      }
+    }
+  };
+
+  const handleDeleteAttachment = async (key: string) => {
+    try {
+      await axios.delete(buildApiUrl(`/api/tasks/${taskId}/attachments/${encodeURIComponent(key)}`), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      await fetchTask(); // Refresh task to get updated attachments
+    } catch (error: any) {
+      console.error('Failed to delete attachment:', error);
+    }
+  };
+
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
@@ -778,6 +853,75 @@ export default function TaskDetails() {
                 {task.prompt}
               </Typography>
             )}
+          </Grid>
+
+          {/* Attachments Section */}
+          <Grid item xs={12}>
+            <Typography variant="h6" gutterBottom>
+              Attachments
+            </Typography>
+            
+            <Box sx={{ mb: 2 }}>
+              <input
+                accept="*/*"
+                style={{ display: 'none' }}
+                id="file-upload"
+                type="file"
+                onChange={handleFileUpload}
+                multiple
+              />
+              <label htmlFor="file-upload">
+                <Button
+                  variant="contained"
+                  component="span"
+                  disabled={isUploading || (task?.attachments?.length || 0) >= 5}
+                  startIcon={isUploading ? <CircularProgress size={20} /> : undefined}
+                >
+                  {isUploading ? 'Uploading...' : 'Upload Files'}
+                </Button>
+              </label>
+              {(task?.attachments?.length || 0) >= 5 && (
+                <Typography color="error" variant="caption" sx={{ display: 'block', mt: 1 }}>
+                  Maximum number of attachments (5) reached
+                </Typography>
+              )}
+              {uploadError && (
+                <Alert severity="error" sx={{ mt: 1 }}>
+                  {uploadError}
+                </Alert>
+              )}
+            </Box>
+
+            <List>
+              {task?.attachments?.map((attachment) => (
+                <ListItem
+                  key={attachment.key}
+                  secondaryAction={
+                    <IconButton
+                      edge="end"
+                      aria-label="delete"
+                      onClick={() => handleDeleteAttachment(attachment.key)}
+                    >
+                      <DeleteIcon />
+                    </IconButton>
+                  }
+                >
+                  <ListItemText
+                    primary={
+                      <Link href={attachment.url} target="_blank" rel="noopener noreferrer">
+                        {attachment.filename}
+                      </Link>
+                    }
+                    secondary={new Date(attachment.uploadedAt).toLocaleString()}
+                  />
+                </ListItem>
+              ))}
+              {(!task?.attachments || task.attachments.length === 0) && (
+                <Typography color="textSecondary">
+                  No attachments yet
+                </Typography>
+              )}
+            </List>
           </Grid>
 
           {task.summary && (

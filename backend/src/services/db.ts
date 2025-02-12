@@ -1,6 +1,7 @@
 import AWS from 'aws-sdk';
 import dotenv from 'dotenv';
 import path from 'path';
+import { S3 } from 'aws-sdk';
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
@@ -28,6 +29,9 @@ AWS.config.update({
 
 const dynamodb = new AWS.DynamoDB.DocumentClient();
 
+// Initialize S3 client
+const s3 = new S3();
+
 // Helper function to handle DynamoDB errors
 const handleDynamoDbError = (error: any, operation: string) => {
   console.error(`DynamoDB ${operation} error:`, error);
@@ -52,6 +56,13 @@ interface UserInteraction {
   response?: string;
   status: 'pending' | 'answered';
   timestamp: number;
+}
+
+interface TaskAttachment {
+  url: string;
+  key: string;
+  filename: string;
+  uploadedAt: string;
 }
 
 class UserDB {
@@ -196,6 +207,7 @@ export const taskDb = {
     createdAt: string;
     isInteractive?: boolean;
     emailNotification?: boolean;
+    attachments?: TaskAttachment[];
   }) {
     try {
       const params = {
@@ -298,7 +310,7 @@ export const taskDb = {
         Key: {
           taskId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, attachments',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
@@ -324,6 +336,7 @@ export const taskDb = {
     summary: string;
     emailNotification: boolean;
     isInteractive: boolean;
+    attachments: TaskAttachment[];
   }>) {
     try {
       const updateExpressions: string[] = [];
@@ -533,6 +546,78 @@ export const taskDb = {
     } catch (error) {
       console.error('Error in getTaskAnalytics:', error);
       throw error;
+    }
+  },
+
+  async addAttachment(taskId: string, file: {
+    originalname: string;
+    buffer: Buffer;
+    mimetype: string;
+  }) {
+    try {
+      // Get current task to check attachment count
+      const task = await this.getTaskById(taskId);
+      if (!task) throw new Error('Task not found');
+
+      // Check attachment limit
+      const currentAttachments = task.attachments || [];
+      if (currentAttachments.length >= 5) {
+        throw new Error('Maximum number of attachments (5) reached');
+      }
+
+      // Generate a random token (32 characters)
+      const randomToken = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
+
+      const key = `tasks/${taskId}/attachments/${Date.now()}-${randomToken}-${file.originalname}`;
+      
+      // Upload to S3 without ACL setting
+      await s3.putObject({
+        Bucket: process.env.AWS_S3_BUCKET || 'agentweb-user-files',
+        Key: key,
+        Body: file.buffer,
+        ContentType: file.mimetype
+      }).promise();
+
+      // Generate regular S3 URL
+      const url = `https://${process.env.AWS_S3_BUCKET || 'agentweb-user-files'}.s3.${process.env.AWS_REGION || 'us-west-2'}.amazonaws.com/${key}`;
+
+      // Update task with attachment URL
+      const attachments = [...currentAttachments, {
+        url,
+        key,
+        filename: file.originalname,
+        uploadedAt: new Date().toISOString()
+      }];
+
+      await this.updateTask(taskId, { attachments });
+
+      return { url, key, filename: file.originalname };
+    } catch (error) {
+      if (error instanceof Error) {
+        throw error; // Re-throw the attachment limit error
+      }
+      handleDynamoDbError(error, 'addAttachment');
+    }
+  },
+
+  async deleteAttachment(taskId: string, key: string) {
+    try {
+      // Delete from S3
+      await s3.deleteObject({
+        Bucket: process.env.AWS_S3_BUCKET || 'agentweb-user-files',
+        Key: key
+      }).promise();
+
+      // Update task to remove attachment
+      const task = await this.getTaskById(taskId);
+      if (!task) throw new Error('Task not found');
+
+      const attachments = (task.attachments || []).filter((a: TaskAttachment) => a.key !== key);
+      await this.updateTask(taskId, { attachments });
+    } catch (error) {
+      handleDynamoDbError(error, 'deleteAttachment');
     }
   }
 };

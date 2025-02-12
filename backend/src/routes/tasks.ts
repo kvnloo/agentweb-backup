@@ -1,9 +1,16 @@
-import express from 'express';
+import express, { Request, RequestHandler } from 'express';
 import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction } from '../controllers/tasks';
-import { authenticateToken } from '../middleware/auth';
+import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { taskDb, subscriberDb } from '../services/db';
+import multer from 'multer';
+import { RequestHandler as ExpressRequestHandler } from 'express-serve-static-core';
 
 const router = express.Router();
+const upload = multer({ storage: multer.memoryStorage() });
+
+type FileRequest = AuthenticatedRequest & {
+  file?: Express.Multer.File;
+};
 
 // All task routes require authentication
 router.use(authenticateToken);
@@ -59,5 +66,54 @@ router.delete('/:taskId/subscribers/:email', async (req, res) => {
     res.status(500).json({ message: error.message });
   }
 });
+
+// Upload attachment
+router.post('/:taskId/attachments', upload.single('file'), (async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const file = (req as FileRequest).file;
+
+    if (!file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    // Check if user has access to task
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+    if (task.userId !== (req as AuthenticatedRequest).user.userId) {
+      return res.status(403).json({ error: 'Not authorized to modify this task' });
+    }
+
+    const attachment = await taskDb.addAttachment(taskId, file);
+    res.json(attachment);
+  } catch (error) {
+    console.error('Error uploading attachment:', error);
+    res.status(500).json({ error: 'Failed to upload attachment' });
+  }
+}) as ExpressRequestHandler);
+
+// Delete attachment
+router.delete('/:taskId/attachments/:key', authenticateToken, (async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { taskId, key } = req.params;
+
+    // Check if user has access to task
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+    if (task.userId !== req.user.userId) {
+      return res.status(403).json({ error: 'Not authorized to modify this task' });
+    }
+
+    await taskDb.deleteAttachment(taskId, key);
+    res.status(204).send();
+  } catch (error) {
+    console.error('Error deleting attachment:', error);
+    res.status(500).json({ error: 'Failed to delete attachment' });
+  }
+}) as unknown as RequestHandler);
 
 export default router; 
