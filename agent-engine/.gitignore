@@ -9,4 +9,8 @@ task_monitor.log
 
 # Browser context files
 context/
-*.cookies.json 
+*.cookies.json
+
+# User files
+attachments/
+downloads/ 

@@ -24,6 +24,7 @@ import random
 import aiohttp
 import base64  # Add at the top with other imports
 import boto3  # Add at the top with other imports
+from urllib.parse import quote
 
 # Load environment variables
 load_dotenv()
@@ -223,19 +224,23 @@ class WebAgent:
         self.user_id = user_id
         self.context_dir = Path('context')
         self.context_dir.mkdir(exist_ok=True)
+        self.attachments_dir = Path('attachments')
+        self.attachments_dir.mkdir(exist_ok=True)
         self.cookie_sync = CookieSync() if user_id else None
         self.is_interactive = False  # Initialize interactive mode flag
         self.current_execution_id = None
+        self.current_task_id = None
         self.controller = Controller()
         self.question_count = 0  # Track number of questions asked
         self.s3_client = boto3.client('s3')
         self.s3_bucket = os.getenv('S3_BUCKET_NAME')  # Make sure to set this in .env
 
-    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False) -> Dict[str, Any]:
+    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
         try:
             self.is_interactive = is_interactive  # Set interactive mode
             self.current_execution_id = execution_id  # Store execution ID
+            self.current_task_id = task_id  # Store task ID
             
             # Register actions after setting is_interactive
             self._register_actions()
@@ -260,10 +265,57 @@ class WebAgent:
             if agent_message is None:
                 agent_message = 'Oops! Something went wrong while running AgentWeb.'
             
+            # If task completed successfully, check for downloaded files
+            result_files = []
+            if task_is_done and self.current_execution_id:
+                downloads_path = Path(self._get_downloads_path())
+                if downloads_path.exists():
+                    # Generate a random token for this batch of files
+                    random_token = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=20))
+                    
+                    for file_path in downloads_path.glob('*'):
+                        if file_path.is_file():
+                            try:
+                                # Upload file to S3 with random token in path
+                                s3_key = f"task_results/{self.current_execution_id}/{random_token}/{file_path.name}"
+                                self.s3_client.upload_file(
+                                    str(file_path),
+                                    self.s3_bucket,
+                                    s3_key,
+                                    ExtraArgs={'ContentDisposition': f'attachment; filename="{file_path.name}"'}
+                                )
+                                # Generate URL with proper encoding
+                                encoded_key = quote(s3_key)
+                                url = f"https://{self.s3_bucket}.s3.amazonaws.com/{encoded_key}"
+                                result_files.append({
+                                    'url': url,
+                                    'filename': file_path.name,
+                                    'token': random_token  # Store token for potential future validation
+                                })
+                                logger.info(f"Uploaded result file to S3: {url}")
+                            except Exception as e:
+                                logger.error(f"Error uploading file {file_path} to S3: {e}")
+
+                # Update execution record with result files if any were uploaded
+                if result_files:
+                    try:
+                        table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskExecutions')
+                        table.update_item(
+                            Key={'executionId': self.current_execution_id},
+                            UpdateExpression='SET result_files = :files',
+                            ExpressionAttributeValues={
+                                ':files': result_files
+                            }
+                        )
+                        logger.info(f"Updated execution record with {len(result_files)} result files")
+                    except Exception as e:
+                        logger.error(f"Error updating execution record with result files: {e}")
+            
             return {
                 "success": task_is_done,
                 "summary" if task_is_done else "error": agent_message,
-                "llmName": self.llm_name
+                "llmName": self.llm_name,
+                "result_files": result_files if result_files else None
             }
         except Exception as e:
             logger.error(f"Error in execute_task: {e}")
@@ -299,6 +351,47 @@ class WebAgent:
 
         except Exception as e:
             logger.error(f"Failed to upload screenshot to S3: {e}")
+            return None
+
+    async def _get_attachment_path(self, file_name: str) -> Optional[str]:
+        """Get the local path for an attachment, downloading it from S3 if needed"""
+        try:
+            if not self.current_task_id:
+                logger.error("No task ID available")
+                return None
+
+            # Get task details from DynamoDB
+            tasks_table = dynamodb.Table(f'{TABLE_PREFIX}AW-Tasks')
+            task = tasks_table.get_item(Key={'taskId': self.current_task_id}).get('Item')
+            if not task or 'attachments' not in task:
+                logger.error("No attachments found for this task")
+                return None
+
+            # Find the attachment with matching filename
+            attachment = next((a for a in task['attachments'] if a['filename'] == file_name), None)
+            if not attachment:
+                logger.error(f"No attachment found with filename: {file_name}")
+                return None
+
+            # Create task-specific directory
+            task_dir = self.attachments_dir / self.current_task_id
+            task_dir.mkdir(exist_ok=True)
+            local_path = task_dir / file_name
+
+            # Download if not already present
+            if not local_path.exists():
+                logger.info(f"Downloading attachment {file_name} from URL")
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(attachment['url']) as response:
+                        if response.status != 200:
+                            logger.error(f"Failed to download file: HTTP {response.status}")
+                            return None
+                        content = await response.read()
+                        local_path.write_bytes(content)
+
+            return str(local_path)
+        except Exception as e:
+            logger.error(f"Error getting attachment path: {e}")
             return None
 
     def _register_actions(self):
@@ -357,28 +450,24 @@ class WebAgent:
         async def upload_file(file_name: str, index: int, browser: BrowserContext) -> ActionResult:
             """Upload a file to a file input element on the page"""
             try:
-                # Get user-specific downloads path
-                downloads_path = Path(self._get_downloads_path())
-                file_path = downloads_path / file_name
-                
-                if not file_path.exists():
-                    return ActionResult(error=f"File {file_name} not found in downloads directory")
+                # Get attachment path
+                file_path = await self._get_attachment_path(file_name)
+                if not file_path:
+                    return ActionResult(error=f"File {file_name} not found in task attachments")
 
                 # Get the current page
                 page = await browser.get_current_page()
                 await page.wait_for_load_state('domcontentloaded')
                 
-                # Get current URL to check for special cases
-                current_url = page.url.lower()
-                
                 # Special handling for pixverse.ai
+                current_url = page.url.lower()
                 if 'pixverse.ai' in current_url:
                     logger.info("Detected pixverse.ai, using specific file input selector")
                     element = await page.query_selector('input[name="file"][accept*="image/png"][accept*="video/mp4"]')
                     if not element:
                         return ActionResult(error="Could not find the correct file input element")
                     
-                    await element.set_input_files(str(file_path.absolute()))
+                    await element.set_input_files(file_path)
 
                     # Wait for upload processing
                     await page.wait_for_timeout(5000)
@@ -408,7 +497,7 @@ class WebAgent:
                     for selector in selectors:
                         elements = context.locator(selector)
                         if await elements.count() > 0:
-                            await elements.first.set_input_files(str(file_path.absolute()))
+                            await elements.first.set_input_files(file_path)
                             msg = f'Successfully uploaded {file_name}'
                             logger.info(msg)
                             return ActionResult(extracted_content=msg)
@@ -555,12 +644,16 @@ class WebAgent:
         return str(self.context_dir / f"{self.user_id}_cookies.json")
 
     def _get_downloads_path(self):
-        """Get the path to the user's downloads directory"""
-        if not self.user_id:
-            return str(Path('downloads/default'))
-        downloads_path = Path('downloads') / self.user_id
-        downloads_path.mkdir(parents=True, exist_ok=True)
-        return str(downloads_path)
+        """Get the path to the downloads directory for the current execution"""
+        if not self.current_execution_id:
+            # Fallback to user directory if no execution ID
+            base_path = Path('downloads') / (self.user_id or 'default')
+        else:
+            # Create execution-specific directory
+            base_path = Path('downloads') / (self.user_id or 'default') / self.current_execution_id
+        
+        base_path.mkdir(parents=True, exist_ok=True)
+        return str(base_path)
 
     async def setup(self):
         """Initialize the browser instance"""
@@ -633,7 +726,8 @@ async def main():
         result = await agent.execute_task(
             args.prompt,
             execution_id=args.execution_id,
-            is_interactive=args.interactive
+            is_interactive=args.interactive,
+            task_id=args.task_id
         )
         print(json.dumps(result))
         sys.exit(0 if result["success"] else 1)

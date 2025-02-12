@@ -85,6 +85,11 @@ interface TaskExecution {
   details_gif?: string;
   prompt?: string;
   userInteractions?: UserInteraction[];
+  result_files?: {
+    url: string;
+    filename: string;
+    token: string;
+  }[];
 }
 
 interface Subscriber {
@@ -97,6 +102,20 @@ const PreviewImage = styled('img')({
   maxWidth: '800px',
   objectFit: 'contain',
 });
+
+// Add this helper function before the CollapsibleText component
+const truncateFilename = (filename: string, maxLength: number = 20): string => {
+  if (filename.length <= maxLength) return filename;
+  
+  const extension = filename.includes('.') ? filename.split('.').pop() : '';
+  const nameWithoutExt = filename.substring(0, filename.lastIndexOf('.'));
+  
+  // Calculate how much of the name we can keep
+  const maxNameLength = maxLength - extension.length - 4; // 4 for "..." and "."
+  const truncatedName = nameWithoutExt.substring(0, maxNameLength);
+  
+  return `${truncatedName}...${extension ? `.${extension}` : ''}`;
+};
 
 // Add CollapsibleText component
 const CollapsibleText = ({ text, maxLength = 150 }: { text: string, maxLength?: number }) => {
@@ -993,13 +1012,41 @@ export default function TaskDetails() {
                             />
                           </Box>
                         ) : (
-                          execution.error ? (
-                            <Typography color="error" variant="body2">
-                              <CollapsibleText text={execution.error} />
-                            </Typography>
-                          ) : (
-                            <CollapsibleText text={execution.result || '-'} />
-                          )
+                          <Box>
+                            {execution.error ? (
+                              <Typography color="error" variant="body2">
+                                <CollapsibleText text={execution.error} />
+                              </Typography>
+                            ) : (
+                              <>
+                                <CollapsibleText text={execution.result || '-'} />
+                                {execution.result_files && execution.result_files.length > 0 && (
+                                  <Box mt={1}>
+                                    <Typography variant="subtitle2" color="textSecondary">
+                                      Result Files:
+                                    </Typography>
+                                    <Box display="flex" gap={1} flexWrap="wrap">
+                                      {execution.result_files.map((file, index) => (
+                                        <Chip
+                                          key={index}
+                                          label={truncateFilename(file.filename)}
+                                          component="a"
+                                          href={file.url}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          clickable
+                                          color="primary"
+                                          variant="outlined"
+                                          size="small"
+                                          sx={{ mt: 1 }}
+                                        />
+                                      ))}
+                                    </Box>
+                                  </Box>
+                                )}
+                              </>
+                            )}
+                          </Box>
                         )}
                       </TableCell>
                       <TableCell>

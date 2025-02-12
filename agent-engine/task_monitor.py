@@ -434,6 +434,11 @@ async def execute_task(execution):
                 prompt = f"Task: {base_prompt}\n\nNote: Previous attempt {previous_feedback['time_ago']} was {previous_feedback['feedback']}. Previous result: {previous_feedback['result']}"
             else:
                 prompt = f"Task: {base_prompt}"
+
+            # Add attachment information if present
+            if task.get('attachments'):
+                attachment_list = "\n".join([f"- {attachment['filename']}" for attachment in task['attachments']])
+                prompt += f"\n\nThe following files are attached to this task:\n{attachment_list}"
             
             # Update execution status to running and include the prompt
             update_execution_status(execution_id, 'running', prompt=prompt)
@@ -475,7 +480,8 @@ async def execute_task(execution):
                 result = await agent.execute_task(
                     prompt_with_context,
                     execution_id=execution_id,
-                    is_interactive=bool(task.get('isInteractive', False)) if task else False
+                    is_interactive=bool(task.get('isInteractive', False)) if task else False,
+                    task_id=task_id
                 )
                 
                 # Check for agent_history.gif and upload if exists
