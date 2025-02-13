@@ -387,6 +387,7 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
             cmd.append('--interactive')
             
         # Run command with output redirection
+        logger.info(f"Running command: {' '.join(cmd)}")
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -597,6 +598,37 @@ async def execute_task(execution):
                     details_gif=f"https://{os.getenv('AWS_S3_BUCKET')}.s3.amazonaws.com/execution_gifs/{gif_path}"
                     # Clean up local GIF file
                     Path(gif_path).unlink()
+                
+                # Upload browser-use log to S3 if it exists
+                browser_use_log = f'logs/execution_{execution_id}_browser_use.log'
+                if Path(browser_use_log).exists():
+                    try:
+                        s3_client = get_s3_client()
+                        # Generate a random token for this upload
+                        random_token = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=20))
+                        s3_key = f"execution_logs/{user_id}/browser_use_{execution_id}_{random_token}.log"
+                        s3_client.upload_file(
+                            browser_use_log,
+                            os.getenv('AWS_S3_BUCKET'),
+                            s3_key,
+                            ExtraArgs={'ContentType': 'text/plain'}
+                        )
+                        logger.info(f"Uploaded browser-use log to S3: {s3_key}")
+                        
+                        # Store the log URL in the execution record
+                        executions_table.update_item(
+                            Key={'executionId': execution_id},
+                            UpdateExpression='SET browser_use_log = :log_url',
+                            ExpressionAttributeValues={
+                                ':log_url': f"https://{os.getenv('AWS_S3_BUCKET')}.s3.amazonaws.com/{s3_key}"
+                            }
+                        )
+                        
+                        # Remove the local log file after successful upload
+                        Path(browser_use_log).unlink()
+                        logger.info(f"Removed local browser-use log file: {browser_use_log}")
+                    except Exception as e:
+                        logger.error(f"Error uploading browser-use log to S3: {e}")
                 
                 if result['success']:
                     result_summary = result.get('summary', 'No summary available')
