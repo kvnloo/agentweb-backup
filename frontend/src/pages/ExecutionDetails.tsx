@@ -56,9 +56,6 @@ export default function ExecutionDetails() {
   const [execution, setExecution] = useState<TaskExecution | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [logContent, setLogContent] = useState<string>('');
-  const [logLoading, setLogLoading] = useState(false);
-  const [logError, setLogError] = useState('');
   const { executionId, taskId } = useParams<{ executionId: string; taskId: string }>();
   const { token } = useAuth();
   const navigate = useNavigate();
