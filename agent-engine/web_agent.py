@@ -234,13 +234,44 @@ class WebAgent:
         self.question_count = 0  # Track number of questions asked
         self.s3_client = boto3.client('s3')
         self.s3_bucket = os.getenv('S3_BUCKET_NAME')  # Make sure to set this in .env
+        self._log_handlers = []  # Store log handlers for cleanup
+
+    def setup_execution_logging(self, execution_id: str):
+        """Setup logging for the current execution"""
+        # Create logs directory if it doesn't exist
+        os.makedirs('logs', exist_ok=True)
+        
+        # Create a file handler
+        log_file = f'logs/web_agent_{execution_id}.log'
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        
+        # Add the file handler to browser_use logger only
+        browser_use_logger = logging.getLogger('browser_use')
+        browser_use_logger.addHandler(file_handler)
+        self._log_handlers.append((browser_use_logger, file_handler))
+        
+        return log_file
+
+    def cleanup_logging(self):
+        """Remove the execution-specific log handlers"""
+        for log, handler in self._log_handlers:
+            log.removeHandler(handler)
+            handler.close()
+        self._log_handlers.clear()
 
     async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
+        log_file = None
         try:
             self.is_interactive = is_interactive  # Set interactive mode
             self.current_execution_id = execution_id  # Store execution ID
             self.current_task_id = task_id  # Store task ID
+            
+            # Setup logging for this execution
+            if execution_id:
+                log_file = self.setup_execution_logging(execution_id)
+                logger.info(f"Logging setup complete. Logs will be written to {log_file}")
             
             # Register actions after setting is_interactive
             self._register_actions()
@@ -395,39 +426,6 @@ class WebAgent:
             return None
 
     def _register_actions(self):
-        @self.controller.registry.action('Get login credentials by domain')
-        def get_login_credentials(domain: str) -> ActionResult:
-            """Get login credentials for a domain from the database"""
-            if not self.user_id:
-                return ActionResult(error="User ID not provided")
-            if not domain:
-                return ActionResult(error=f"Please provide a domain")
-            logger.info(f"Getting login credentials for domain {domain} under user {self.user_id}")
-                
-            table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
-            response = table.query(
-                KeyConditionExpression='userId = :userId',
-                FilterExpression='website = :website',
-                ExpressionAttributeValues={
-                    ':userId': self.user_id,
-                    ':website': domain
-                }
-            )
-
-            items = response.get('Items', [])
-            if not items:
-                return ActionResult(error=f"No credentials found for domain: {domain}")
-
-            config = items[0]
-            try:
-                if config.get('sharedBy'):
-                    logger.info(f"Found shared credentials for {domain} - shared by user: {config['sharedBy']}")
-                # Pass sharedBy to decrypt_password if it exists
-                decrypted_password = decrypt_password(config['password'], self.user_id, config.get('sharedBy'))
-                return ActionResult(extracted_content=f"username: {config['username']}, password: {decrypted_password}")
-            except Exception as e:
-                return ActionResult(error=f"Error getting credentials: {str(e)}")
-
         @self.controller.registry.action('Sleep')
         async def sleep(seconds: float) -> ActionResult:
             """Sleep for a specified number of seconds (max 5 minutes)"""
@@ -680,6 +678,28 @@ class WebAgent:
         headless = os.getenv('BROWSER_HEADLESS', 'true').lower() == 'true'
         browser_config = BrowserConfig(new_context_config=context_config, headless=headless)
         self.browser = Browser(config=browser_config)
+
+        # Get credentials from AW-Configs
+        sensitive_data = {}
+        if self.user_id:
+            try:
+                table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
+                response = table.scan(
+                    FilterExpression='userId = :userId',
+                    ExpressionAttributeValues={':userId': self.user_id}
+                )
+                for config in response.get('Items', []):
+                    try:
+                        decrypted_password = decrypt_password(config['password'], self.user_id, config.get('sharedBy'))
+                        domain = config['website']
+                        sensitive_data[f"{domain}_username"] = config['username']
+                        sensitive_data[f"{domain}_password"] = decrypted_password
+                    except Exception as e:
+                        logger.error(f"Error decrypting password for {config.get('website')}: {e}")
+            except Exception as e:
+                logger.error(f"Error fetching credentials from AW-Configs: {e}")
+        logger.info(f"Sensitive data: {sensitive_data.keys()}")
+
         self.agent = Agent(
             task=self.task,
             llm=self.llm,
@@ -687,7 +707,8 @@ class WebAgent:
             browser=self.browser,
             use_vision=global_use_vision,
             max_failures=5,  # Increase max retries
-            retry_delay=60    # retry delay in seconds
+            retry_delay=60,   # retry delay in seconds
+            sensitive_data=sensitive_data  # Pass all decrypted credentials
         )
 
     async def cleanup(self):
@@ -701,6 +722,8 @@ class WebAgent:
                     self.cookie_sync.upload_cookies(self.user_id, cookies_path)
                 
                 await self.browser.close()
+            # Clean up logging handlers
+            self.cleanup_logging()
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
             raise
