@@ -243,7 +243,7 @@ class WebAgent:
         os.makedirs('logs', exist_ok=True)
         
         # Create a file handler
-        log_file = f'logs/web_agent_{execution_id}.log'
+        log_file = f'logs/execution_{execution_id}_browser_use.log'
         file_handler = logging.FileHandler(log_file)
         file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
         
@@ -747,20 +747,34 @@ class WebAgent:
 async def main():
     parser = argparse.ArgumentParser(description='Web Agent for task automation')
     parser.add_argument('--task_id', required=True, help='Task ID')
-    parser.add_argument('--prompt', required=True, help='Task prompt')
+    parser.add_argument('--prompt_file', required=True, help='File containing the task prompt')
     parser.add_argument('--user_id', required=True, help='User ID')
-    parser.add_argument('--llm_name', help='Full LLM name in format platform->provider->model')
+    parser.add_argument('--llm_name', required=True, help='Full LLM name in format platform->provider->model')
     parser.add_argument('--execution_id', required=True, help='Execution ID')
+    parser.add_argument('--gif_path', required=True, help='Path for the GIF output')
     parser.add_argument('--interactive', action='store_true', help='Enable interactive mode')
     args = parser.parse_args()
+
+    # Read prompt from file
+    try:
+        with open(args.prompt_file, 'r') as f:
+            prompt = f.read()
+    except Exception as e:
+        print(json.dumps({
+            "success": False,
+            "error": f"Failed to read prompt file: {str(e)}",
+            "llmName": args.llm_name
+        }))
+        sys.exit(1)
 
     agent = WebAgent(args.user_id, args.llm_name)
     try:
         result = await agent.execute_task(
-            args.prompt,
+            prompt,
             execution_id=args.execution_id,
             is_interactive=args.interactive,
-            task_id=args.task_id
+            task_id=args.task_id,
+            generate_gif=args.gif_path
         )
         print(json.dumps(result))
         sys.exit(0 if result["success"] else 1)
@@ -768,11 +782,11 @@ async def main():
         print(json.dumps({
             "success": False,
             "error": str(e),
-            "message": "Unexpected error occurred"
+            "llmName": args.llm_name
         }))
         sys.exit(1)
     finally:
         await agent.cleanup()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main()) 
