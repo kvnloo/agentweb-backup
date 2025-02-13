@@ -607,8 +607,36 @@ async def execute_task(execution):
                         # Generate a random token for this upload
                         random_token = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=20))
                         s3_key = f"execution_logs/{user_id}/browser_use_{execution_id}_{random_token}.log"
+
+                        # Read the log file and wrap it in HTML with pre-formatting
+                        with open(filtered_log, 'r') as f:
+                            log_content = f.read()
+                        html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <style>
+        pre {{
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            font-family: monospace;
+            padding: 20px;
+            margin: 0;
+        }}
+    </style>
+</head>
+<body>
+    <pre>{log_content}</pre>
+</body>
+</html>"""
+
+                        # Create a temporary file for the HTML content
+                        html_file = filtered_log + '.html'
+                        with open(html_file, 'w') as f:
+                            f.write(html_content)
+
                         s3_client.upload_file(
-                            filtered_log,
+                            html_file,
                             os.getenv('AWS_S3_BUCKET'),
                             s3_key,
                             ExtraArgs={
@@ -627,7 +655,8 @@ async def execute_task(execution):
                             }
                         )
                         
-                        # Remove the filtered log files after successful upload
+                        # Remove the temporary HTML file and filtered log file
+                        Path(html_file).unlink()
                         Path(filtered_log).unlink()
                         logger.info(f"Removed log files after successful upload")
                     except Exception as e:
