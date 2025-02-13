@@ -234,13 +234,47 @@ class WebAgent:
         self.question_count = 0  # Track number of questions asked
         self.s3_client = boto3.client('s3')
         self.s3_bucket = os.getenv('S3_BUCKET_NAME')  # Make sure to set this in .env
+        self._log_handlers = []  # Store log handlers for cleanup
+        self.generate_gif = None
+        self.sensitive_data = {}
 
-    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None) -> Dict[str, Any]:
+    def setup_execution_logging(self, execution_id: str):
+        """Setup logging for the current execution"""
+        # Create logs directory if it doesn't exist
+        os.makedirs('logs', exist_ok=True)
+        
+        # Create a file handler
+        log_file = f'logs/execution_{execution_id}_browser_use.log'
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        
+        # Add the file handler to browser_use logger only
+        browser_use_logger = logging.getLogger('browser_use')
+        browser_use_logger.addHandler(file_handler)
+        self._log_handlers.append((browser_use_logger, file_handler))
+        
+        return log_file
+
+    def cleanup_logging(self):
+        """Remove the execution-specific log handlers"""
+        for log, handler in self._log_handlers:
+            log.removeHandler(handler)
+            handler.close()
+        self._log_handlers.clear()
+
+    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
+        log_file = None
         try:
             self.is_interactive = is_interactive  # Set interactive mode
             self.current_execution_id = execution_id  # Store execution ID
             self.current_task_id = task_id  # Store task ID
+            self.generate_gif = generate_gif  # Store GIF path
+            
+            # Setup logging for this execution
+            if execution_id:
+                log_file = self.setup_execution_logging(execution_id)
+                logger.info(f"Logging setup complete. Logs will be written to {log_file}")
             
             # Register actions after setting is_interactive
             self._register_actions()
@@ -395,39 +429,6 @@ class WebAgent:
             return None
 
     def _register_actions(self):
-        @self.controller.registry.action('Get login credentials by domain')
-        def get_login_credentials(domain: str) -> ActionResult:
-            """Get login credentials for a domain from the database"""
-            if not self.user_id:
-                return ActionResult(error="User ID not provided")
-            if not domain:
-                return ActionResult(error=f"Please provide a domain")
-            logger.info(f"Getting login credentials for domain {domain} under user {self.user_id}")
-                
-            table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
-            response = table.query(
-                KeyConditionExpression='userId = :userId',
-                FilterExpression='website = :website',
-                ExpressionAttributeValues={
-                    ':userId': self.user_id,
-                    ':website': domain
-                }
-            )
-
-            items = response.get('Items', [])
-            if not items:
-                return ActionResult(error=f"No credentials found for domain: {domain}")
-
-            config = items[0]
-            try:
-                if config.get('sharedBy'):
-                    logger.info(f"Found shared credentials for {domain} - shared by user: {config['sharedBy']}")
-                # Pass sharedBy to decrypt_password if it exists
-                decrypted_password = decrypt_password(config['password'], self.user_id, config.get('sharedBy'))
-                return ActionResult(extracted_content=f"username: {config['username']}, password: {decrypted_password}")
-            except Exception as e:
-                return ActionResult(error=f"Error getting credentials: {str(e)}")
-
         @self.controller.registry.action('Sleep')
         async def sleep(seconds: float) -> ActionResult:
             """Sleep for a specified number of seconds (max 5 minutes)"""
@@ -680,6 +681,34 @@ class WebAgent:
         headless = os.getenv('BROWSER_HEADLESS', 'true').lower() == 'true'
         browser_config = BrowserConfig(new_context_config=context_config, headless=headless)
         self.browser = Browser(config=browser_config)
+
+        # Get credentials from AW-Configs
+        if self.user_id:
+            try:
+                table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
+                response = table.scan(
+                    FilterExpression='userId = :userId',
+                    ExpressionAttributeValues={':userId': self.user_id}
+                )
+                for config in response.get('Items', []):
+                    try:
+                        decrypted_password = decrypt_password(config['password'], self.user_id, config.get('sharedBy'))
+                        domain = config['website']
+                        self.sensitive_data[f"{domain}_username"] = config['username']
+                        self.sensitive_data[f"{domain}_password"] = decrypted_password
+                    except Exception as e:
+                        logger.error(f"Error decrypting password for {config.get('website')}: {e}")
+            except Exception as e:
+                logger.error(f"Error fetching credentials from AW-Configs: {e}")
+        logger.info(f"Sensitive data: {self.sensitive_data.keys()}")
+
+        # Remove existing GIF file if it exists and generate_gif is provided
+        if self.generate_gif:
+            gif_path = Path(self.generate_gif)
+            if gif_path.exists():
+                gif_path.unlink()
+            logger.info(f"GIF will be generated at: {self.generate_gif}")
+
         self.agent = Agent(
             task=self.task,
             llm=self.llm,
@@ -687,7 +716,9 @@ class WebAgent:
             browser=self.browser,
             use_vision=global_use_vision,
             max_failures=5,  # Increase max retries
-            retry_delay=60    # retry delay in seconds
+            retry_delay=60,   # retry delay in seconds
+            sensitive_data=self.sensitive_data,  # Pass sensitive data
+            generate_gif=self.generate_gif  # Pass GIF path from task_monitor
         )
 
     async def cleanup(self):
@@ -701,6 +732,40 @@ class WebAgent:
                     self.cookie_sync.upload_cookies(self.user_id, cookies_path)
                 
                 await self.browser.close()
+            # Clean up logging handlers
+            self.cleanup_logging()
+
+            # Filter and save browser-use log if it exists
+            browser_use_log = f'logs/execution_{self.current_execution_id}_browser_use.log'
+            filtered_log = f'logs/execution_{self.current_execution_id}_browser_use.filtered.log'
+            if Path(browser_use_log).exists():
+                try:
+                    # Read and filter the log file
+                    filtered_lines = []
+                    with open(browser_use_log, 'r') as f:
+                        for line in f:
+                            filtered_line = line
+                            for key, val in self.sensitive_data.items():
+                                if val:  # Only replace if value is not empty
+                                    filtered_line = filtered_line.replace(val, f'<secret>{key}</secret>')
+                            filtered_lines.append(filtered_line)
+
+                    # Write filtered content to filtered log file
+                    with open(filtered_log, 'w') as f:
+                        f.writelines(filtered_lines)
+                    logger.info("Created filtered log file")
+
+                    # Remove the original unfiltered log file
+                    Path(browser_use_log).unlink()
+                    logger.info(f"Removed original unfiltered log file: {browser_use_log}")
+                except Exception as e:
+                    logger.error(f"Error filtering browser-use log: {e}")
+                    # If anything goes wrong, ensure both files are deleted
+                    if Path(browser_use_log).exists():
+                        Path(browser_use_log).unlink()
+                    if Path(filtered_log).exists():
+                        Path(filtered_log).unlink()
+                    logger.info("Removed log files after error")
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
             raise
@@ -714,20 +779,34 @@ class WebAgent:
 async def main():
     parser = argparse.ArgumentParser(description='Web Agent for task automation')
     parser.add_argument('--task_id', required=True, help='Task ID')
-    parser.add_argument('--prompt', required=True, help='Task prompt')
+    parser.add_argument('--prompt_file', required=True, help='File containing the task prompt')
     parser.add_argument('--user_id', required=True, help='User ID')
-    parser.add_argument('--llm_name', help='Full LLM name in format platform->provider->model')
+    parser.add_argument('--llm_name', required=True, help='Full LLM name in format platform->provider->model')
     parser.add_argument('--execution_id', required=True, help='Execution ID')
+    parser.add_argument('--gif_path', required=True, help='Path for the GIF output')
     parser.add_argument('--interactive', action='store_true', help='Enable interactive mode')
     args = parser.parse_args()
+
+    # Read prompt from file
+    try:
+        with open(args.prompt_file, 'r') as f:
+            prompt = f.read()
+    except Exception as e:
+        print(json.dumps({
+            "success": False,
+            "error": f"Failed to read prompt file: {str(e)}",
+            "llmName": args.llm_name
+        }))
+        sys.exit(1)
 
     agent = WebAgent(args.user_id, args.llm_name)
     try:
         result = await agent.execute_task(
-            args.prompt,
+            prompt,
             execution_id=args.execution_id,
             is_interactive=args.interactive,
-            task_id=args.task_id
+            task_id=args.task_id,
+            generate_gif=args.gif_path
         )
         print(json.dumps(result))
         sys.exit(0 if result["success"] else 1)
@@ -735,11 +814,11 @@ async def main():
         print(json.dumps({
             "success": False,
             "error": str(e),
-            "message": "Unexpected error occurred"
+            "llmName": args.llm_name
         }))
         sys.exit(1)
     finally:
         await agent.cleanup()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main()) 

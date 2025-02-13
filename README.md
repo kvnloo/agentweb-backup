@@ -271,7 +271,7 @@ VITE_API_URL=https://agentweb.pro
 ```bash
 cd frontend && \
 VITE_API_URL=https://api.agentweb.pro \
-VITE_DEBUG=true \
+VITE_DEBUG=false \
 npm run build && \
 VERSION="0.21" && \
 mkdir -p builds && \

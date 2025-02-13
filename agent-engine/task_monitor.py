@@ -16,6 +16,8 @@ import humanize  # Add this import at the top of the file
 from pathlib import Path
 from aws_utils import get_dynamodb_resource, get_s3_client
 import yaml
+import random
+from typing import Dict, Any
 
 # Custom JSON encoder to handle datetime objects
 class DateTimeEncoder(json.JSONEncoder):
@@ -355,6 +357,111 @@ def update_workflow_execution(workflow_execution_id: str, task_id: str, task_sta
         logger.error(f"Error updating workflow execution: {e}")
         return False
 
+async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str) -> Dict[str, Any]:
+    """Run WebAgent via CLI command"""
+    try:
+        # Create necessary directories
+        os.makedirs('prompts', exist_ok=True)
+        os.makedirs('logs', exist_ok=True)
+        
+        # Save prompt to a file
+        prompt_file = f'prompts/prompt_{execution_id}.txt'
+        with open(prompt_file, 'w') as f:
+            f.write(prompt)
+        
+        # Set up log file for this execution
+        log_file = f'logs/execution_{execution_id}_web_agent.log'
+        
+        # Build command with logging redirection
+        cmd = [
+            'python3', '-u',  # -u for unbuffered output
+            'web_agent.py',
+            '--user_id', user_id,
+            '--llm_name', llm_name,
+            '--execution_id', execution_id,
+            '--task_id', task_id,
+            '--prompt_file', prompt_file,
+            '--gif_path', gif_path
+        ]
+        if is_interactive:
+            cmd.append('--interactive')
+            
+        # Run command with output redirection
+        logger.info(f"Running command: {' '.join(cmd)}")
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, 'PYTHONUNBUFFERED': '1'}  # Ensure unbuffered output
+        )
+        
+        stdout, stderr = await process.communicate()
+        
+        # Clean up prompt file
+        os.unlink(prompt_file)
+        
+        # Write both stdout and stderr to log file for debugging
+        with open(log_file, 'w') as f:
+            f.write("=== COMMAND ===\n")
+            f.write(" ".join(cmd) + "\n\n")
+            if stdout:
+                f.write("=== STDOUT ===\n")
+                f.write(stdout.decode())
+                f.write("\n")
+            if stderr:
+                f.write("=== STDERR ===\n")
+                f.write(stderr.decode())
+                f.write("\n")
+        
+        if process.returncode == 0:
+            try:
+                # Try to find the JSON output in stdout
+                output = stdout.decode()
+                # Split into lines and reverse to find the last JSON object
+                lines = output.split('\n')
+                for line in reversed(lines):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        result = json.loads(line)
+                        if isinstance(result, dict) and 'success' in result:
+                            logger.info(f"Successfully parsed result from web_agent.py")
+                            return result
+                    except json.JSONDecodeError:
+                        continue
+                
+                # If we get here, no valid JSON was found
+                logger.error(f"No valid JSON found in output. Full output written to {log_file}")
+                return {
+                    "success": False,
+                    "error": f"No valid JSON output found. Check {log_file} for details.",
+                    "llmName": llm_name
+                }
+            except Exception as e:
+                logger.error(f"Error parsing output: {e}")
+                return {
+                    "success": False,
+                    "error": f"Failed to parse output: {str(e)}. Check {log_file} for details.",
+                    "llmName": llm_name
+                }
+        else:
+            error_msg = stderr.decode() if stderr else "Unknown error"
+            logger.error(f"Process failed with error: {error_msg}")
+            return {
+                "success": False,
+                "error": f"Process error: {error_msg}. Check {log_file} for details.",
+                "llmName": llm_name
+            }
+            
+    except Exception as e:
+        logger.error(f"Error in run_web_agent_cli: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "llmName": llm_name
+        }
+
 async def execute_task(execution):
     global running_task_count, running_user_ids
     
@@ -467,31 +574,93 @@ async def execute_task(execution):
 
         # Try each LLM in sequence until one succeeds
         for llm_name in llm_names:
-            agent = None
             try:
-                # Initialize and run web agent
-                agent = WebAgent(user_id, llm_name)
+                # Generate unique GIF path
+                random_suffix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=20))
+                gif_path = f"agent_history_{execution_id}_{random_suffix}.gif"
                 
-                # Remove existing GIF file if it exists
-                gif_path = Path("agent_history.gif")
-                if gif_path.exists():
-                    gif_path.unlink()
-                
-                result = await agent.execute_task(
+                # Run WebAgent via CLI
+                result = await run_web_agent_cli(
+                    user_id,
+                    llm_name,
                     prompt_with_context,
-                    execution_id=execution_id,
-                    is_interactive=bool(task.get('isInteractive', False)) if task else False,
-                    task_id=task_id
+                    execution_id,
+                    bool(task.get('isInteractive', False)) if task else False,
+                    task_id,
+                    gif_path
                 )
                 
-                # Check for agent_history.gif and upload if exists
+                # Check for GIF and upload if exists
                 details_gif = None
-                if Path("agent_history.gif").exists():
+                if Path(gif_path).exists():
                     s3_client = get_s3_client()
-                    random_suffix = ''.join(str(uuid.uuid4())[:6])
-                    filename = f"agent_history_{execution_id}_{random_suffix}.gif"
-                    s3_client.upload_file("agent_history.gif", os.getenv('AWS_S3_BUCKET'), f"execution_gifs/{filename}", ExtraArgs={'ContentType': 'image/gif'})
-                    details_gif=f"https://{os.getenv('AWS_S3_BUCKET')}.s3.amazonaws.com/execution_gifs/{filename}"
+                    s3_client.upload_file(gif_path, os.getenv('AWS_S3_BUCKET'), f"execution_gifs/{gif_path}", ExtraArgs={'ContentType': 'image/gif'})
+                    details_gif=f"https://{os.getenv('AWS_S3_BUCKET')}.s3.amazonaws.com/execution_gifs/{gif_path}"
+                    # Clean up local GIF file
+                    Path(gif_path).unlink()
+                
+                # Upload browser-use log to S3 if it exists
+                filtered_log = f'logs/execution_{execution_id}_browser_use.filtered.log'
+                if Path(filtered_log).exists():
+                    try:
+                        s3_client = get_s3_client()
+                        # Generate a random token for this upload
+                        random_token = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=20))
+                        s3_key = f"execution_logs/{user_id}/browser_use_{execution_id}_{random_token}.log"
+
+                        # Read the log file and wrap it in HTML with pre-formatting
+                        with open(filtered_log, 'r') as f:
+                            log_content = f.read()
+                        html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <style>
+        pre {{
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            font-family: monospace;
+            padding: 20px;
+            margin: 0;
+        }}
+    </style>
+</head>
+<body>
+    <pre>{log_content}</pre>
+</body>
+</html>"""
+
+                        # Create a temporary file for the HTML content
+                        html_file = filtered_log + '.html'
+                        with open(html_file, 'w') as f:
+                            f.write(html_content)
+
+                        s3_client.upload_file(
+                            html_file,
+                            os.getenv('AWS_S3_BUCKET'),
+                            s3_key,
+                            ExtraArgs={
+                                'ContentType': 'text/html; charset=utf-8',
+                                'ContentDisposition': 'inline'
+                            }
+                        )
+                        logger.info(f"Uploaded browser-use log to S3: {s3_key}")
+                        
+                        # Store the log URL in the execution record
+                        executions_table.update_item(
+                            Key={'executionId': execution_id},
+                            UpdateExpression='SET browser_use_log = :log_url',
+                            ExpressionAttributeValues={
+                                ':log_url': f"https://{os.getenv('AWS_S3_BUCKET')}.s3.amazonaws.com/{s3_key}"
+                            }
+                        )
+                        
+                        # Remove the temporary HTML file and filtered log file
+                        Path(html_file).unlink()
+                        Path(filtered_log).unlink()
+                        logger.info(f"Removed log files after successful upload")
+                    except Exception as e:
+                        logger.error(f"Error uploading browser-use log to S3: {e}")
                 
                 if result['success']:
                     result_summary = result.get('summary', 'No summary available')
@@ -505,7 +674,6 @@ async def execute_task(execution):
                     )
                     
                     # Update task with successful LLM name if it's not a workflow task
-                    # TODO: support successful LLM name for workflow tasks
                     if not execution.get('workflowExecutionId') and task and task.get('llmName') != llm_name:
                         tasks_table.update_item(
                             Key={'taskId': task_id},
@@ -528,9 +696,6 @@ async def execute_task(execution):
             except Exception as e:
                 last_error = str(e)
                 logger.error(f"Error with LLM {llm_name}: {e}")
-            finally:
-                if agent:
-                    await agent.cleanup()
         
         if not success:
             error_message = f"All LLMs failed. Last error: {last_error}"
