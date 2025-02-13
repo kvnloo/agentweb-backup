@@ -600,15 +600,15 @@ async def execute_task(execution):
                     Path(gif_path).unlink()
                 
                 # Upload browser-use log to S3 if it exists
-                browser_use_log = f'logs/execution_{execution_id}_browser_use.log'
-                if Path(browser_use_log).exists():
+                filtered_log = f'logs/execution_{execution_id}_browser_use.filtered.log'
+                if Path(filtered_log).exists():
                     try:
                         s3_client = get_s3_client()
                         # Generate a random token for this upload
                         random_token = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=20))
                         s3_key = f"execution_logs/{user_id}/browser_use_{execution_id}_{random_token}.log"
                         s3_client.upload_file(
-                            browser_use_log,
+                            filtered_log,
                             os.getenv('AWS_S3_BUCKET'),
                             s3_key,
                             ExtraArgs={'ContentType': 'text/plain'}
@@ -624,9 +624,9 @@ async def execute_task(execution):
                             }
                         )
                         
-                        # Remove the local log file after successful upload
-                        Path(browser_use_log).unlink()
-                        logger.info(f"Removed local browser-use log file: {browser_use_log}")
+                        # Remove the filtered log files after successful upload
+                        Path(filtered_log).unlink()
+                        logger.info(f"Removed log files after successful upload")
                     except Exception as e:
                         logger.error(f"Error uploading browser-use log to S3: {e}")
                 

@@ -236,6 +236,7 @@ class WebAgent:
         self.s3_bucket = os.getenv('S3_BUCKET_NAME')  # Make sure to set this in .env
         self._log_handlers = []  # Store log handlers for cleanup
         self.generate_gif = None
+        self.sensitive_data = {}
 
     def setup_execution_logging(self, execution_id: str):
         """Setup logging for the current execution"""
@@ -682,7 +683,6 @@ class WebAgent:
         self.browser = Browser(config=browser_config)
 
         # Get credentials from AW-Configs
-        sensitive_data = {}
         if self.user_id:
             try:
                 table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
@@ -694,13 +694,13 @@ class WebAgent:
                     try:
                         decrypted_password = decrypt_password(config['password'], self.user_id, config.get('sharedBy'))
                         domain = config['website']
-                        sensitive_data[f"{domain}_username"] = config['username']
-                        sensitive_data[f"{domain}_password"] = decrypted_password
+                        self.sensitive_data[f"{domain}_username"] = config['username']
+                        self.sensitive_data[f"{domain}_password"] = decrypted_password
                     except Exception as e:
                         logger.error(f"Error decrypting password for {config.get('website')}: {e}")
             except Exception as e:
                 logger.error(f"Error fetching credentials from AW-Configs: {e}")
-        logger.info(f"Sensitive data: {sensitive_data.keys()}")
+        logger.info(f"Sensitive data: {self.sensitive_data.keys()}")
 
         # Remove existing GIF file if it exists and generate_gif is provided
         if self.generate_gif:
@@ -717,7 +717,7 @@ class WebAgent:
             use_vision=global_use_vision,
             max_failures=5,  # Increase max retries
             retry_delay=60,   # retry delay in seconds
-            sensitive_data=sensitive_data,  # Pass all decrypted credentials
+            sensitive_data=self.sensitive_data,  # Pass sensitive data
             generate_gif=self.generate_gif  # Pass GIF path from task_monitor
         )
 
@@ -734,6 +734,38 @@ class WebAgent:
                 await self.browser.close()
             # Clean up logging handlers
             self.cleanup_logging()
+
+            # Filter and save browser-use log if it exists
+            browser_use_log = f'logs/execution_{self.current_execution_id}_browser_use.log'
+            filtered_log = f'logs/execution_{self.current_execution_id}_browser_use.filtered.log'
+            if Path(browser_use_log).exists():
+                try:
+                    # Read and filter the log file
+                    filtered_lines = []
+                    with open(browser_use_log, 'r') as f:
+                        for line in f:
+                            filtered_line = line
+                            for key, val in self.sensitive_data.items():
+                                if val:  # Only replace if value is not empty
+                                    filtered_line = filtered_line.replace(val, f'<secret>{key}</secret>')
+                            filtered_lines.append(filtered_line)
+
+                    # Write filtered content to filtered log file
+                    with open(filtered_log, 'w') as f:
+                        f.writelines(filtered_lines)
+                    logger.info("Created filtered log file")
+
+                    # Remove the original unfiltered log file
+                    Path(browser_use_log).unlink()
+                    logger.info(f"Removed original unfiltered log file: {browser_use_log}")
+                except Exception as e:
+                    logger.error(f"Error filtering browser-use log: {e}")
+                    # If anything goes wrong, ensure both files are deleted
+                    if Path(browser_use_log).exists():
+                        Path(browser_use_log).unlink()
+                    if Path(filtered_log).exists():
+                        Path(filtered_log).unlink()
+                    logger.info("Removed log files after error")
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
             raise
