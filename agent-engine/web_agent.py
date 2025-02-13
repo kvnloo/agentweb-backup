@@ -235,6 +235,7 @@ class WebAgent:
         self.s3_client = boto3.client('s3')
         self.s3_bucket = os.getenv('S3_BUCKET_NAME')  # Make sure to set this in .env
         self._log_handlers = []  # Store log handlers for cleanup
+        self.generate_gif = None
 
     def setup_execution_logging(self, execution_id: str):
         """Setup logging for the current execution"""
@@ -260,13 +261,14 @@ class WebAgent:
             handler.close()
         self._log_handlers.clear()
 
-    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None) -> Dict[str, Any]:
+    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
         log_file = None
         try:
             self.is_interactive = is_interactive  # Set interactive mode
             self.current_execution_id = execution_id  # Store execution ID
             self.current_task_id = task_id  # Store task ID
+            self.generate_gif = generate_gif  # Store GIF path
             
             # Setup logging for this execution
             if execution_id:
@@ -700,6 +702,13 @@ class WebAgent:
                 logger.error(f"Error fetching credentials from AW-Configs: {e}")
         logger.info(f"Sensitive data: {sensitive_data.keys()}")
 
+        # Remove existing GIF file if it exists and generate_gif is provided
+        if self.generate_gif:
+            gif_path = Path(self.generate_gif)
+            if gif_path.exists():
+                gif_path.unlink()
+            logger.info(f"GIF will be generated at: {self.generate_gif}")
+
         self.agent = Agent(
             task=self.task,
             llm=self.llm,
@@ -708,7 +717,8 @@ class WebAgent:
             use_vision=global_use_vision,
             max_failures=5,  # Increase max retries
             retry_delay=60,   # retry delay in seconds
-            sensitive_data=sensitive_data  # Pass all decrypted credentials
+            sensitive_data=sensitive_data,  # Pass all decrypted credentials
+            generate_gif=self.generate_gif  # Pass GIF path from task_monitor
         )
 
     async def cleanup(self):

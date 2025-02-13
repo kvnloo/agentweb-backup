@@ -16,7 +16,7 @@ import humanize  # Add this import at the top of the file
 from pathlib import Path
 from aws_utils import get_dynamodb_resource, get_s3_client
 import yaml
-
+import random
 # Custom JSON encoder to handle datetime objects
 class DateTimeEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -472,26 +472,26 @@ async def execute_task(execution):
                 # Initialize and run web agent
                 agent = WebAgent(user_id, llm_name)
                 
-                # Remove existing GIF file if it exists
-                gif_path = Path("agent_history.gif")
-                if gif_path.exists():
-                    gif_path.unlink()
+                # Generate unique GIF path
+                random_suffix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=20))
+                gif_path = f"agent_history_{execution_id}_{random_suffix}.gif"
                 
                 result = await agent.execute_task(
                     prompt_with_context,
                     execution_id=execution_id,
                     is_interactive=bool(task.get('isInteractive', False)) if task else False,
-                    task_id=task_id
+                    task_id=task_id,
+                    generate_gif=gif_path
                 )
                 
-                # Check for agent_history.gif and upload if exists
+                # Check for GIF and upload if exists
                 details_gif = None
-                if Path("agent_history.gif").exists():
+                if Path(gif_path).exists():
                     s3_client = get_s3_client()
-                    random_suffix = ''.join(str(uuid.uuid4())[:6])
-                    filename = f"agent_history_{execution_id}_{random_suffix}.gif"
-                    s3_client.upload_file("agent_history.gif", os.getenv('AWS_S3_BUCKET'), f"execution_gifs/{filename}", ExtraArgs={'ContentType': 'image/gif'})
-                    details_gif=f"https://{os.getenv('AWS_S3_BUCKET')}.s3.amazonaws.com/execution_gifs/{filename}"
+                    s3_client.upload_file(gif_path, os.getenv('AWS_S3_BUCKET'), f"execution_gifs/{gif_path}", ExtraArgs={'ContentType': 'image/gif'})
+                    details_gif=f"https://{os.getenv('AWS_S3_BUCKET')}.s3.amazonaws.com/execution_gifs/{gif_path}"
+                    # Clean up local GIF file
+                    Path(gif_path).unlink()
                 
                 if result['success']:
                     result_summary = result.get('summary', 'No summary available')
