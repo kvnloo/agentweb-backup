@@ -269,7 +269,7 @@ export default function ExecutionDetails() {
           {execution?.browser_use_log && (
             <Grid item xs={12}>
               <Typography variant="h6" gutterBottom>
-                Browser Use Log
+                Execution Log
               </Typography>
               <Box sx={{ position: 'relative' }}>
                 <Paper 
