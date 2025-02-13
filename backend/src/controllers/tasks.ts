@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { taskDb } from '../services/db';
 import { userDb } from '../services/db';
+import AWS from 'aws-sdk';
 
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
@@ -344,5 +345,110 @@ export const respondToInteraction = async (req: AuthRequest, res: Response) => {
   } catch (error) {
     console.error('Error in respondToInteraction:', error);
     res.status(500).json({ message: 'Error responding to interaction' });
+  }
+};
+
+export const getTaskExecution = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const taskId = req.params.id;
+    const executionId = req.params.executionId;
+    
+    // Get the task to check permissions
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Check if user is admin or task owner
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Get the execution
+    const execution = await taskDb.getTaskExecutionById(executionId);
+    if (!execution) {
+      return res.status(404).json({ message: 'Execution not found' });
+    }
+
+    // Verify the execution belongs to the task
+    if (execution.taskId !== taskId) {
+      return res.status(404).json({ message: 'Execution not found for this task' });
+    }
+
+    res.json(execution);
+  } catch (error) {
+    console.error('Error in getTaskExecution:', error);
+    res.status(500).json({ message: 'Error fetching task execution' });
+  }
+};
+
+export const getExecutionLog = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const taskId = req.params.id;
+    const executionId = req.params.executionId;
+    
+    // Get the task to check permissions
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Check if user is admin or task owner
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Get the execution
+    const execution = await taskDb.getTaskExecutionById(executionId);
+    if (!execution) {
+      return res.status(404).json({ message: 'Execution not found' });
+    }
+
+    // Verify the execution belongs to the task
+    if (execution.taskId !== taskId) {
+      return res.status(404).json({ message: 'Execution not found for this task' });
+    }
+
+    if (!execution.browser_use_log) {
+      return res.status(404).json({ message: 'Log file not found' });
+    }
+
+    // Extract the S3 key from the URL
+    const url = new URL(execution.browser_use_log);
+    const s3Key = decodeURIComponent(url.pathname.substring(1)); // Remove leading slash
+
+    // Get the file from S3
+    const s3 = new AWS.S3();
+    const s3Object = await s3.getObject({
+      Bucket: process.env.AWS_S3_BUCKET_NAME || '',
+      Key: s3Key
+    }).promise();
+
+    // Set content type and send the file content
+    res.setHeader('Content-Type', 'text/plain');
+    res.send(s3Object.Body);
+  } catch (error) {
+    console.error('Error fetching execution log:', error);
+    res.status(500).json({ message: 'Error fetching execution log' });
   }
 }; 

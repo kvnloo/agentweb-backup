@@ -611,7 +611,10 @@ async def execute_task(execution):
                             filtered_log,
                             os.getenv('AWS_S3_BUCKET'),
                             s3_key,
-                            ExtraArgs={'ContentType': 'text/plain'}
+                            ExtraArgs={
+                                'ContentType': 'text/html; charset=utf-8',
+                                'ContentDisposition': 'inline'
+                            }
                         )
                         logger.info(f"Uploaded browser-use log to S3: {s3_key}")
                         

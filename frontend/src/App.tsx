@@ -11,6 +11,7 @@ import Register from './pages/Register';
 import Tasks from './pages/Tasks';
 import CreateTask from './pages/CreateTask';
 import TaskDetails from './pages/TaskDetails';
+import ExecutionDetails from './pages/ExecutionDetails';
 import Layout from './components/Layout';
 import OAuthCallback from './pages/OAuthCallback';
 import AdminDashboard from './pages/AdminDashboard';
@@ -67,6 +68,14 @@ export default function App() {
                       element={
                         <PrivateRoute>
                           <TaskDetails />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="tasks/:taskId/executions/:executionId"
+                      element={
+                        <PrivateRoute>
+                          <ExecutionDetails />
                         </PrivateRoute>
                       }
                     />

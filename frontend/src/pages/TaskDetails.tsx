@@ -1048,6 +1048,14 @@ export default function TaskDetails() {
                                     </Box>
                                   </Box>
                                 )}
+                                <Link
+                                  component="button"
+                                  variant="body2"
+                                  onClick={() => navigate(`/tasks/${taskId}/executions/${execution.executionId}`)}
+                                  sx={{ mt: 1, display: 'block' }}
+                                >
+                                  View Full Details
+                                </Link>
                               </>
                             )}
                           </Box>
