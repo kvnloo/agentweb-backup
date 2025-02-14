@@ -105,23 +105,26 @@ export default function AdminDashboard() {
   useEffect(() => {
     const loadTasks = async () => {
       try {
-        const response = await axios.get(`${import.meta.env.VITE_API_URL}/api/admin/tasks`, {
-          headers: {
-            Authorization: `Bearer ${token}`
+        const response = await axios.get(
+          buildApiUrl('/api/admin/tasks'),
+          {
+            headers: {
+              Authorization: `Bearer ${token}`
+            }
           }
-        });
+        );
         setTasks(response.data);
       } catch (error) {
         console.error('Error loading tasks:', error);
       }
     };
 
-    if (tabValue === 3) {
+    if (tabValue === 4) {
       loadTasks();
     }
   }, [tabValue, token]);
 
-  const handleTabChange = (event: React.SyntheticEvent, newValue: number) => {
+  const handleTabChange = (_event: React.SyntheticEvent, newValue: number) => {
     setTabValue(newValue);
   };
 
