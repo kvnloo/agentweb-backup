@@ -65,6 +65,11 @@ interface TaskAttachment {
   uploadedAt: string;
 }
 
+interface UserWithCounts extends User {
+  taskCount: number;
+  workflowCount: number;
+}
+
 class UserDB {
   private docClient: AWS.DynamoDB.DocumentClient;
   private tableName: string;
@@ -137,7 +142,7 @@ class UserDB {
     }
   }
 
-  async getAllUsers() {
+  async getAllUsers(): Promise<UserWithCounts[]> {
     try {
       const params = {
         TableName: this.tableName,
@@ -149,16 +154,17 @@ class UserDB {
 
       // Get task and workflow counts for each user
       const usersWithCounts = await Promise.all(users.map(async (user) => {
-        const [tasks, workflowCount] = await Promise.all([
-          taskDb.getTasksByUserId(user.userId),
-          workflowDb.getUserWorkflowCount(user.userId)
-        ]);
+        // Get user's tasks
+        const tasks = await taskDb.getTasksByUserId(user.userId);
+        
+        // Get user's workflow count
+        const workflowCount = await workflowDb.getUserWorkflowCount(user.userId);
         
         return {
           ...user,
           taskCount: tasks ? tasks.length : 0,
           workflowCount
-        };
+        } as UserWithCounts;
       }));
 
       return usersWithCounts;
@@ -536,12 +542,11 @@ export const taskDb = {
         totalExecutions: executions.length,
         successfulExecutions: executions.filter(e => e.status === 'completed').length,
         failedExecutions: executions.filter(e => e.status === 'failed').length,
-        averageExecutionTime: executions.reduce((acc, e) => {
-          if (e.endTime && e.startTime) {
-            return acc + (new Date(e.endTime).getTime() - new Date(e.startTime).getTime());
-          }
-          return acc;
-        }, 0) / (executions.length || 1)  // Avoid division by zero
+        averageExecutionTime: executions
+          .filter(e => e.status === 'completed' && e.completedAt)
+          .reduce((acc, e) => {
+            return acc + (new Date(e.completedAt!).getTime() - new Date(e.startTime).getTime());
+          }, 0) / (executions.filter(e => e.status === 'completed' && e.completedAt).length || 1)
       };
     } catch (error) {
       console.error('Error in getTaskAnalytics:', error);
