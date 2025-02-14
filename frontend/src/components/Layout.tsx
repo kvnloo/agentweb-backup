@@ -16,6 +16,11 @@ import AccountCircle from '@mui/icons-material/AccountCircle';
 import { useAuth } from '../contexts/AuthContext';
 import { Theme } from '@mui/material/styles';
 import logo from '../assets/logo.svg';
+import HomeIcon from '@mui/icons-material/Home';
+import TaskIcon from '@mui/icons-material/Task';
+import AccountTreeIcon from '@mui/icons-material/AccountTree';
+import NewReleasesIcon from '@mui/icons-material/NewReleases';
+import SettingsIcon from '@mui/icons-material/Settings';
 
 export default function Layout() {
   const { user, logout } = useAuth();
@@ -41,6 +46,14 @@ export default function Layout() {
     }
     return location.pathname.startsWith(path);
   };
+
+  const drawerItems = [
+    { text: 'Home', path: '/', icon: <HomeIcon /> },
+    { text: 'Tasks', path: '/tasks', icon: <TaskIcon />, requireAuth: true },
+    { text: 'Workflows', path: '/workflows', icon: <AccountTreeIcon />, requireAuth: true },
+    { text: 'Release', path: '/release', icon: <NewReleasesIcon /> },
+    { text: 'Config', path: '/config', icon: <SettingsIcon /> },
+  ];
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', minHeight: '100vh' }}>
