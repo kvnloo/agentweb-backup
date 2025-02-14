@@ -542,12 +542,11 @@ export const taskDb = {
         totalExecutions: executions.length,
         successfulExecutions: executions.filter(e => e.status === 'completed').length,
         failedExecutions: executions.filter(e => e.status === 'failed').length,
-        averageExecutionTime: executions.reduce((acc, e) => {
-          if (e.endTime && e.startTime) {
-            return acc + (new Date(e.endTime).getTime() - new Date(e.startTime).getTime());
-          }
-          return acc;
-        }, 0) / (executions.length || 1)  // Avoid division by zero
+        averageExecutionTime: executions
+          .filter(e => e.status === 'completed' && e.completedAt)
+          .reduce((acc, e) => {
+            return acc + (new Date(e.completedAt!).getTime() - new Date(e.startTime).getTime());
+          }, 0) / (executions.filter(e => e.status === 'completed' && e.completedAt).length || 1)
       };
     } catch (error) {
       console.error('Error in getTaskAnalytics:', error);

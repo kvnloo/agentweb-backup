@@ -301,7 +301,11 @@ export default function AdminDashboard() {
                         <Typography>Successful Executions: {taskAnalytics.successfulExecutions}</Typography>
                         <Typography>Failed Executions: {taskAnalytics.failedExecutions}</Typography>
                         <Typography>
-                          Average Execution Time: {Math.round(taskAnalytics.averageExecutionTime / 1000)}s
+                          Average Execution Time: {
+                            taskAnalytics.averageExecutionTime != null 
+                              ? `${(taskAnalytics.averageExecutionTime / 1000).toFixed(1)}s`
+                              : 'N/A'
+                          }
                         </Typography>
                       </>
                     )}
