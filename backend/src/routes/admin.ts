@@ -193,4 +193,95 @@ router.delete('/tasks/:taskId/subscribers/:email', async (req, res) => {
   }
 });
 
+// Send announcement to all users
+router.post('/announcements/send', async (req, res) => {
+  try {
+    const { title, message } = req.body;
+    if (!message || !title) {
+      return res.status(400).json({ message: 'Title and message are required' });
+    }
+
+    // Get all users
+    const users = await userDb.getAllUsers();
+    const emails = users.map(user => user.email).filter(Boolean);
+
+    // Send announcement email to all users
+    await Promise.all(
+      emails.map(email => 
+        emailService.sendEmail(
+          email,
+          title,
+          // Plain text version - strip HTML tags and decode entities
+          message.replace(/<[^>]*>/g, '')
+            .replace(/&nbsp;/g, ' ')
+            .replace(/&amp;/g, '&')
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>')
+            .replace(/&quot;/g, '"')
+            .trim(),
+          // HTML version with improved formatting
+          `<!DOCTYPE html>
+          <html>
+            <head>
+              <meta charset="utf-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <style>
+                body {
+                  font-family: Arial, sans-serif;
+                  line-height: 1.6;
+                  color: #333;
+                  max-width: 600px;
+                  margin: 0 auto;
+                  padding: 20px;
+                }
+                .header {
+                  background-color: #1976d2;
+                  color: white;
+                  padding: 20px;
+                  text-align: center;
+                  border-radius: 4px 4px 0 0;
+                }
+                .content {
+                  padding: 20px;
+                  background: #fff;
+                  border: 1px solid #ddd;
+                  border-radius: 0 0 4px 4px;
+                }
+                .content p {
+                  margin: 0 0 1em 0;
+                }
+                .content p:last-child {
+                  margin-bottom: 0;
+                }
+                .footer {
+                  text-align: center;
+                  margin-top: 20px;
+                  color: #666;
+                  font-size: 0.9em;
+                }
+              </style>
+            </head>
+            <body>
+              <div class="header">
+                <h2 style="margin:0;padding:0;font-size:24px;">${title}</h2>
+              </div>
+              <div class="content">
+                ${message}
+              </div>
+              <div class="footer">
+                <p>This is an official announcement from AgentWeb</p>
+              </div>
+            </body>
+          </html>`
+        )
+      )
+    );
+
+    res.json({ message: `Announcement sent to ${emails.length} users` });
+  } catch (error) {
+    console.error('Error sending announcement:', error);
+    res.status(500).json({ message: 'Error sending announcement' });
+  }
+});
+
 export default router; 
