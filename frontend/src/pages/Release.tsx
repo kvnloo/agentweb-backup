@@ -1,14 +1,12 @@
 import { Container, Typography, Paper, Box, Divider } from '@mui/material';
 
 interface Release {
-  version: string;
   date: string;
   changes: string[];
 }
 
 const releases: Release[] = [
   {
-    version: "0.8",
     date: "2025-02-13",
     changes: [
       "Added execution log display for better task debugging visibility",
@@ -17,7 +15,6 @@ const releases: Release[] = [
     ]
   },
   {
-    version: "0.7",
     date: "2025-02-12",
     changes: [
       "Added support for file attachments in tasks",
@@ -26,7 +23,6 @@ const releases: Release[] = [
     ]
   },
   {
-    version: "0.6",
     date: "2025-02-11",
     changes: [
       "Major upgrade: Introduced Workflows feature",
@@ -37,7 +33,6 @@ const releases: Release[] = [
     ]
   },
   {
-    version: "0.5",
     date: "2025-02-02",
     changes: [
       "Implemented parallel task execution",
@@ -46,7 +41,6 @@ const releases: Release[] = [
     ]
   },
   {
-    version: "0.4",
     date: "2025-01-31",
     changes: [
       "Added support for editable task prompts",
@@ -56,7 +50,6 @@ const releases: Release[] = [
     ]
   },
   {
-    version: "0.3",
     date: "2025-01-30",
     changes: [
       "Added support for multiple LLM providers:",
@@ -67,7 +60,6 @@ const releases: Release[] = [
     ]
   },
   {
-    version: "0.2",
     date: "2025-01-29",
     changes: [
       "Implemented task subscription system via email",
@@ -77,7 +69,6 @@ const releases: Release[] = [
     ]
   },
   {
-    version: "0.1",
     date: "2025-01-27",
     changes: [
       "Beta launch of AgentWeb",
@@ -99,12 +90,14 @@ export default function Release() {
       <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
         {releases.map((release, index) => (
           <Paper key={index} sx={{ p: 3 }}>
-            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', mb: 2 }}>
-              <Typography variant="h5" component="h2">
-                Version {release.version}
-              </Typography>
+            <Box sx={{ display: 'flex', justifyContent: 'flex-end', mb: 2 }}>
               <Typography variant="subtitle1" color="text.secondary">
-                {release.date}
+                {new Date(`${release.date}T12:00:00Z`).toLocaleDateString('en-US', {
+                  year: 'numeric',
+                  month: 'long',
+                  day: 'numeric',
+                  timeZone: 'UTC'
+                })}
               </Typography>
             </Box>
             
