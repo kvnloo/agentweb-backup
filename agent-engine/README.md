@@ -27,6 +27,94 @@ If you prefer not to use Conda, you can install dependencies directly with pip:
 pip install -r requirements.txt
 ```
 
+### Production Deployment on EC2
+
+For deploying on an Amazon Linux 2 EC2 instance:
+
+1. Launch an EC2 instance:
+   - Recommended: t2.medium or larger
+   - Amazon Linux 2 AMI
+   - Security Group: Allow inbound SSH (port 22)
+
+2. Install system dependencies:
+```bash
+# Update system packages
+sudo yum update -y
+
+# Install required system packages
+sudo yum install -y git python3-pip python3-devel gcc make chromium chromium-headless chromedriver
+
+# Install Conda
+curl -O https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash Miniconda3-latest-Linux-x86_64.sh -b
+echo 'export PATH=$HOME/miniconda3/bin:$PATH' >> ~/.bashrc
+source ~/.bashrc
+```
+
+3. Clone and setup the repository:
+```bash
+# Clone the repository
+git clone https://github.com/yourusername/agentweb.git
+cd agentweb/agent-engine
+
+# Create and activate Conda environment
+conda env create -f environment.yml
+conda activate agent-engine
+```
+
+4. Configure environment variables:
+```bash
+# Copy example env file
+cp .env.example .env
+
+# Edit the .env file with your production credentials
+nano .env
+```
+
+5. Setup systemd service for automatic startup:
+```bash
+# Create systemd service file
+sudo tee /etc/systemd/system/agent-engine.service << EOF
+[Unit]
+Description=Agent Engine Service
+After=network.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/agentweb/agent-engine
+Environment=PATH=/home/ec2-user/miniconda3/envs/agent-engine/bin:/home/ec2-user/miniconda3/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/ec2-user/miniconda3/envs/agent-engine/bin/python task_monitor.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Start and enable the service
+sudo systemctl daemon-reload
+sudo systemctl start agent-engine
+sudo systemctl enable agent-engine
+```
+
+6. Monitor the service:
+```bash
+# Check service status
+sudo systemctl status agent-engine
+
+# View logs
+sudo journalctl -u agent-engine -f
+```
+
+7. Additional Production Considerations:
+   - Set up CloudWatch monitoring for the EC2 instance
+   - Configure automated backups
+   - Set up alerts for service failures
+   - Use AWS Secrets Manager for sensitive credentials
+   - Consider using an Elastic IP for stable addressing
+   - Set up log rotation for service logs
+
 ## Architecture
 
 The agent engine consists of:
