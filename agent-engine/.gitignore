@@ -13,4 +13,10 @@ context/
 
 # User files
 attachments/
-downloads/ 
+downloads/
+
+# Service account files
+agentweb-*.json
+
+# SSH Keys
+*.pem 
