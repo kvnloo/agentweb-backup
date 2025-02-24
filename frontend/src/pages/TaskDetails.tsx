@@ -53,6 +53,7 @@ interface Task {
   error?: string;
   emailNotification?: boolean;
   isInteractive?: boolean;
+  isDeepResearch?: boolean;
   attachments?: TaskAttachment[];
 }
 
@@ -505,6 +506,37 @@ export default function TaskDetails() {
     }
   };
 
+  const handleDeepResearchToggle = async () => {
+    if (!task) return;
+    
+    try {
+      const newIsDeepResearch = !task.isDeepResearch;
+      
+      await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        {
+          isDeepResearch: newIsDeepResearch
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+
+      // Update the task state with the response
+      const taskResponse = await axios.get(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+      
+      setTask(taskResponse.data);
+    } catch (error: any) {
+      console.error('Error updating deep research mode:', error);
+      setError(error.response?.data?.message || 'Failed to update deep research mode');
+    }
+  };
+
   const handleFeedbackChange = async (executionId: string, feedback: 'accepted' | 'rejected' | null) => {
     try {
       await axios.put(
@@ -793,16 +825,30 @@ export default function TaskDetails() {
                   }
                   label="Email Me Latest Run"
                 />
-                <FormControlLabel
-                  control={
-                    <Switch
-                      checked={Boolean(task.isInteractive)}
-                      onChange={handleInteractiveModeToggle}
-                      color="primary"
-                    />
-                  }
-                  label="Interactive Mode"
-                />
+                <Tooltip title="When enabled, the agent can pause execution to request additional information from you">
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        checked={Boolean(task.isInteractive)}
+                        onChange={handleInteractiveModeToggle}
+                        color="primary"
+                      />
+                    }
+                    label="Interactive Mode"
+                  />
+                </Tooltip>
+                <Tooltip title="When enabled, the task will use advanced AI to perform comprehensive research on your topic without interacting with websites">
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        checked={Boolean(task.isDeepResearch)}
+                        onChange={handleDeepResearchToggle}
+                        color="primary"
+                      />
+                    }
+                    label="Perform Deep Research"
+                  />
+                </Tooltip>
               </Box>
             )}
           </Box>
@@ -826,6 +872,12 @@ export default function TaskDetails() {
             </Box>
           )}
         </Box>
+
+        {task.isDeepResearch && (
+          <Alert severity="info" sx={{ mt: 1, mb: 3 }}>
+            Deep Research Mode is enabled. When you run this task, it will use advanced AI to perform comprehensive research on your topic. This mode is ideal for gathering in-depth information and analysis.
+          </Alert>
+        )}
 
         <Grid container spacing={3}>
           <Grid item xs={12}>

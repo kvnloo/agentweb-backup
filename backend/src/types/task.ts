@@ -9,4 +9,5 @@ export interface Task {
   error?: string;
   summary?: string;  // Summary from the agent's execution
   isInteractive?: boolean;  // Whether the task allows user interaction during execution
+  isDeepResearch?: boolean;  // Whether the task should use the deep research agent
 } 

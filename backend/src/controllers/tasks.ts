@@ -22,7 +22,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const { name, prompt, isInteractive } = req.body;
+    const { name, prompt, isInteractive, isDeepResearch } = req.body;
     
     if (!name || !prompt) {
       return res.status(400).json({ message: 'Name and prompt are required' });
@@ -36,6 +36,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       status: 'active',
       emailNotification: false,  // Initialize to false
       isInteractive: Boolean(isInteractive),  // Convert to boolean
+      isDeepResearch: Boolean(isDeepResearch),  // Convert to boolean
       createdAt: new Date().toISOString()
     };
 
@@ -139,6 +140,10 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
 
     if (req.body.isInteractive !== undefined) {
       updates.isInteractive = Boolean(req.body.isInteractive);
+    }
+
+    if (req.body.isDeepResearch !== undefined) {
+      updates.isDeepResearch = Boolean(req.body.isDeepResearch);
     }
 
     console.log('Updates to apply:', updates);
