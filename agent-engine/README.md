@@ -29,40 +29,60 @@ pip install -r requirements.txt
 
 ### Production Deployment on EC2
 
-For deploying on an Amazon Linux 2 EC2 instance:
-
 1. Launch an EC2 instance:
    - Recommended: t2.medium or larger
-   - Amazon Linux 2 AMI
+   - Ubuntu Server AMI
    - Security Group: Allow inbound SSH (port 22)
 
 2. Install system dependencies:
 ```bash
+# Access the instance using SSH
+ssh -i agent-engine/agent-engine-keypair.pem ubuntu@54.201.66.162
+
 # Update system packages
-sudo yum update -y
+sudo apt-get update -y
+sudo apt-get upgrade -y
 
-# Install required system packages
-sudo yum install -y git python3-pip python3-devel gcc make chromium chromium-headless chromedriver
+# Install Python and development tools
+sudo apt-get install -y python3.12-venv python3-pip git
 
-# Install Conda
-curl -O https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
-bash Miniconda3-latest-Linux-x86_64.sh -b
-echo 'export PATH=$HOME/miniconda3/bin:$PATH' >> ~/.bashrc
-source ~/.bashrc
+# Install Playwright system dependencies
+sudo apt-get install -y libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libxcomposite1 \
+    libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 \
+    libasound2t64 libatspi2.0-0t64 libxcursor1 libgtk-3-0t64 libpangocairo-1.0-0 \
+    libcairo-gobject2 libgdk-pixbuf-2.0-0 libgtk-4-1 libvulkan1 libgraphene-1.0-0 \
+    libwoff1 libvpx9 libevent-2.1-7t64 libopus0 gstreamer1.0-alsa gstreamer1.0-gl \
+    gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly flite1-dev libwebp7 libavif16 libharfbuzz-icu0 \
+    libwebpmux3 libenchant-2-2 libsecret-1-0 libhyphen0 libmanette-0.2-0 libgles2
 ```
 
-3. Clone and setup the repository:
+3. Set up Python environment and install Playwright:
+```bash
+# Create and activate virtual environment
+python3 -m venv ~/venv
+source ~/venv/bin/activate
+
+# Install Playwright
+pip install playwright
+playwright install
+```
+
+4. Clone and setup the repository:
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/agentweb.git
+git clone https://github.com/john-the-dev/agentweb.git
 cd agentweb/agent-engine
 
-# Create and activate Conda environment
-conda env create -f environment.yml
-conda activate agent-engine
+# Create and activate virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
 ```
 
-4. Configure environment variables:
+5. Configure environment variables:
 ```bash
 # Copy example env file
 cp .env.example .env
@@ -71,7 +91,7 @@ cp .env.example .env
 nano .env
 ```
 
-5. Setup systemd service for automatic startup:
+6. Setup systemd service for automatic startup:
 ```bash
 # Create systemd service file
 sudo tee /etc/systemd/system/agent-engine.service << EOF
@@ -81,12 +101,21 @@ After=network.target
 
 [Service]
 Type=simple
-User=ec2-user
-WorkingDirectory=/home/ec2-user/agentweb/agent-engine
-Environment=PATH=/home/ec2-user/miniconda3/envs/agent-engine/bin:/home/ec2-user/miniconda3/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/home/ec2-user/miniconda3/envs/agent-engine/bin/python task_monitor.py
+User=ubuntu
+WorkingDirectory=/home/ubuntu/agentweb/agent-engine
+Environment=PATH=/home/ubuntu/venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/ubuntu/venv/bin/python task_monitor.py
 Restart=always
 RestartSec=10
+
+# Resource controls
+CPUQuota=80%
+CPUWeight=50
+MemoryLimit=1G
+TasksMax=100
+
+# Nice value to lower CPU priority (higher number = lower priority)
+Nice=10
 
 [Install]
 WantedBy=multi-user.target
@@ -98,16 +127,30 @@ sudo systemctl start agent-engine
 sudo systemctl enable agent-engine
 ```
 
-6. Monitor the service:
+7. Monitor the service:
 ```bash
 # Check service status
 sudo systemctl status agent-engine
 
 # View logs
 sudo journalctl -u agent-engine -f
+
+# Monitor CPU usage
+top -p $(pgrep -f "task_monitor.py")
 ```
 
-7. Additional Production Considerations:
+8. Performance Tuning:
+   - Monitor CPU usage with `top` or `htop`
+   - Adjust CPUQuota in the service file if needed (50% to 80% recommended)
+   - Use `nice` command to lower process priority if running manually:
+     ```bash
+     nice -n 10 python3 task_monitor.py
+     ```
+   - Consider using process pools for parallel task execution
+   - Implement rate limiting for task processing
+   - Add appropriate sleep intervals between task checks
+
+9. Additional Production Considerations:
    - Set up CloudWatch monitoring for the EC2 instance
    - Configure automated backups
    - Set up alerts for service failures
@@ -191,6 +234,80 @@ Example usage:
 # 1. Due schedules to create new executions
 # 2. Pending executions to process
 python task_monitor.py
+```
+
+### Performance Optimization
+
+To manage CPU usage and system resources:
+
+1. **Sleep Intervals**
+```python
+# Add appropriate sleep intervals between checks
+import time
+
+TASK_CHECK_INTERVAL = 5  # seconds
+SCHEDULE_CHECK_INTERVAL = 60  # seconds
+
+def monitor_tasks():
+    while True:
+        process_pending_tasks()
+        time.sleep(TASK_CHECK_INTERVAL)
+
+def monitor_schedules():
+    while True:
+        process_due_schedules()
+        time.sleep(SCHEDULE_CHECK_INTERVAL)
+```
+
+2. **Resource Management**
+```python
+# Limit concurrent tasks
+MAX_CONCURRENT_TASKS = 3
+TASK_TIMEOUT = 300  # seconds
+
+# Use a process pool for parallel execution
+from multiprocessing import Pool
+
+def process_tasks(tasks):
+    with Pool(MAX_CONCURRENT_TASKS) as pool:
+        results = pool.map_async(execute_task, tasks)
+        results.wait(timeout=TASK_TIMEOUT)
+```
+
+3. **Rate Limiting**
+```python
+# Implement rate limiting for API calls
+from ratelimit import limits, sleep_and_retry
+
+CALLS = 30
+RATE_LIMIT_PERIOD = 60
+
+@sleep_and_retry
+@limits(calls=CALLS, period=RATE_LIMIT_PERIOD)
+def rate_limited_api_call():
+    # Your API call here
+    pass
+```
+
+4. **Memory Management**
+```python
+# Clear memory periodically
+import gc
+
+def cleanup_resources():
+    gc.collect()
+```
+
+5. **Monitoring**
+```python
+# Add resource usage logging
+import psutil
+import logging
+
+def log_resource_usage():
+    process = psutil.Process()
+    logging.info(f"CPU Usage: {process.cpu_percent()}%")
+    logging.info(f"Memory Usage: {process.memory_info().rss / 1024 / 1024} MB")
 ```
 
 ### Email Notifications (`email_utils.py`)
