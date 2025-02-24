@@ -65,4 +65,8 @@ agent-engine/logs/
 
 # Agent engine downloads (user data)
 agent-engine/downloads/**/*
-!agent-engine/downloads/.gitkeep 
+!agent-engine/downloads/.gitkeep
+
+# Security files
+*.pem
+agentweb-*.json 
