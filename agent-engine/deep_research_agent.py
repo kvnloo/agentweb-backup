@@ -15,36 +15,7 @@ import sys
 import traceback
 import tempfile
 import time
-
-# Patch Python's traceback module to avoid 'compact' parameter errors
-original_TracebackException = traceback.TracebackException
-
-class PatchedTracebackException(original_TracebackException):
-    def __init__(self, *args, **kwargs):
-        if 'compact' in kwargs:
-            del kwargs['compact']
-        super().__init__(*args, **kwargs)
-
-# Apply the patch
-traceback.TracebackException = PatchedTracebackException
-
-# Disable asyncio error logging
-asyncio_logger = logging.getLogger('asyncio')
-asyncio_logger.setLevel(logging.CRITICAL)
-
-# Completely disable traceback formatting in trio
-try:
-    import trio._core._multierror
-    trio._core._multierror.traceback_exception_format = lambda self, chain=True: []
-except (ImportError, AttributeError):
-    pass
-
-# Filter pydantic warnings about underscore fields
-warnings.filterwarnings("ignore", message="fields may not start with an underscore")
-# Filter warnings about function overrides
-warnings.filterwarnings("ignore", message="Function .* is being overridden")
-# Filter traceback warnings
-warnings.filterwarnings("ignore", category=DeprecationWarning)
+import argparse
 
 # Load environment variables
 load_dotenv()
@@ -68,12 +39,6 @@ try:
 except ImportError:
     logger.warning("nest_asyncio not installed. If running in Jupyter, install with: pip install nest_asyncio")
 
-# Disable asyncio's Task.__del__ method to avoid errors
-try:
-    asyncio.tasks.Task.__del__ = lambda self: None
-except (AttributeError, TypeError):
-    pass
-
 class DeepResearchAgentWrapper:
     """Wrapper for the DeepResearchAgent from AG2"""
     
@@ -84,22 +49,7 @@ class DeepResearchAgentWrapper:
             config_path: Path to the OpenAI config list file
         """
         self.config_path = config_path
-        self._ensure_config_exists()
-        
-    def _ensure_config_exists(self):
-        """Ensure the OAI_CONFIG_LIST file exists, create if not"""
-        if not os.path.exists(self.config_path):
-            # Create a default config using environment variables
-            config = [{
-                "api_type": "openai",
-                "model": os.getenv("OPENAI_MODEL", "gpt-4o"),
-                "api_key": os.getenv("OPENAI_API_KEY", "")
-            }]
-            
-            with open(self.config_path, "w") as f:
-                json.dump(config, f, indent=2)
-            
-            logger.info(f"Created default OAI_CONFIG_LIST at {self.config_path}")
+        self.llm_name = "azure->openai->gpt-4o" # TODO: support other LLMs
     
     def run_research(self, query: str, max_turns: int = 2, user_input: bool = False) -> Dict[str, Any]:
         """Run deep research on the given query
@@ -113,11 +63,17 @@ class DeepResearchAgentWrapper:
             Dict containing the research results
         """
         # Create logs directory if it doesn't exist
-        logs_dir = os.path.join(tempfile.gettempdir(), "logs")
-        os.makedirs(logs_dir, exist_ok=True)
+        os.makedirs('logs', exist_ok=True)
+
+        # Assert that we run with azure openai LLM
+        assert self.llm_name == "azure->openai->gpt-4o", "This script only supports azure openai LLM"
+        # Use a timestamp as a fallback if execution_id is not available
+        timestamp = int(time.time())
+        # The execution_id will be set in the main function
+        execution_id = getattr(self, 'execution_id', f"{timestamp}")
         
-        # Create a temporary file for stdout redirection
-        output_file = os.path.join(logs_dir, f"deep_research_{int(time.time())}.txt")
+        # Create a file for stdout redirection using the requested format
+        output_file = f"logs/execution_{execution_id}_deep_activities.log"
         
         try:
             # Load config
@@ -128,12 +84,6 @@ class DeepResearchAgentWrapper:
                 name="DeepResearchAgent",
                 llm_config={"config_list": config_list}
             )
-            
-            # Configure browser settings directly on the agent's browser_use instance
-            if hasattr(agent, 'browser_use'):
-                agent.browser_use.timeout = 120000  # 2 minutes timeout
-                agent.browser_use.headless = True
-                agent.browser_use.slow_mo = 100  # Slow down operations slightly for stability
             
             logger.info(f"Starting deep research on query: {query}")
             logger.info(f"Redirecting output to file: {output_file}")
@@ -155,25 +105,17 @@ class DeepResearchAgentWrapper:
                         logger.error(f"Error during agent.run: {str(e)}")
                         raise
             
-            # Read the captured output from the file
-            with open(output_file, 'r') as f:
-                captured_output = f.read()
-            
             # Format the result
             research_result = {
                 "summary": result.summary if hasattr(result, 'summary') else "Research completed but no summary was generated.",
                 "cost": result.cost if hasattr(result, "cost") else None,
-                "captured_output": captured_output,
                 "success": True,
                 "query": query,
                 "max_turns": max_turns,
+                "llm_name": self.llm_name,
                 "timestamp": result.timestamp if hasattr(result, "timestamp") else None,
                 "output_file": output_file  # Include the path to the output file
             }
-            
-            # Add any additional attributes from the result that might be useful
-            if hasattr(result, "messages") and result.messages:
-                research_result["message_count"] = len(result.messages)
             
             logger.info(f"Deep research completed successfully. Summary length: {len(research_result['summary'])}")
             logger.info(f"Full output saved to: {output_file}")
@@ -192,8 +134,78 @@ class DeepResearchAgentWrapper:
             # Don't try to clean up asyncio tasks - this causes more problems than it solves
             pass
 
-# Example usage
+def main():
+    """
+    CLI entry point for deep research agent.
+    This script is designed to be called from task_monitor.py in a similar way to web_agent.py.
+    """
+    parser = argparse.ArgumentParser(description='Run deep research on a query')
+    parser.add_argument('--user_id', required=True, help='User ID')
+    parser.add_argument('--execution_id', required=True, help='Execution ID')
+    parser.add_argument('--task_id', required=True, help='Task ID')
+    parser.add_argument('--prompt_file', required=True, help='File containing the prompt')
+    parser.add_argument('--max_turns', type=int, default=2, help='Maximum number of turns for the agent')
+    
+    args = parser.parse_args()
+    
+    try:
+        logger.info(f"Starting deep research for execution {args.execution_id}")
+        
+        # Read prompt from file
+        with open(args.prompt_file, 'r') as f:
+            prompt = f.read()
+        
+        logger.info(f"Running deep research for user {args.user_id}, task {args.task_id}")
+        logger.info(f"Prompt: {prompt[:100]}...")
+        
+        # Initialize the deep research agent
+        agent = DeepResearchAgentWrapper()
+        
+        # Set the execution_id on the agent instance
+        agent.execution_id = args.execution_id
+        
+        # Run the research
+        research_result = agent.run_research(
+            query=prompt,
+            max_turns=args.max_turns,
+            user_input=False
+        )
+        
+        # Print the result as JSON to stdout (will be captured by task_monitor.py)
+        print(json.dumps(research_result))
+        logger.info("Deep research completed successfully")
+        
+        # Return success
+        return 0
+    
+    except Exception as e:
+        # Simple error logging without traceback formatting
+        error_msg = str(e)
+        logger.error(f"Error in deep research: {error_msg}")
+        
+        # Get simple traceback as string
+        tb_str = traceback.format_exc()
+        logger.error(f"Traceback: {tb_str}")
+        
+        # Print error as JSON to stdout
+        error_result = {
+            "success": False,
+            "error": f"{error_msg}\n\nTraceback: {tb_str}",
+            "execution_id": args.execution_id if 'args' in locals() else None,
+            "task_id": args.task_id if 'args' in locals() else None,
+            "user_id": args.user_id if 'args' in locals() else None
+        }
+        print(json.dumps(error_result))
+        return 1
+    finally:
+        # No cleanup needed - handlers will be automatically closed when the process exits
+        pass
+
+# Example usage as a script
 if __name__ == "__main__":
-    agent = DeepResearchAgentWrapper()
-    result = agent.run_research("What are the latest developments in quantum computing?")
-    print(json.dumps(result, indent=2)) 
+    # If arguments are provided, run as CLI
+    if len(sys.argv) > 1:
+        sys.exit(main())
+    # Otherwise, print the help message
+    else:
+        print("Usage: deep_research_agent.py --user_id=<user_id> --execution_id=<execution_id> --task_id=<task_id> --prompt_file=<prompt_file> --max_turns=<max_turns>")
