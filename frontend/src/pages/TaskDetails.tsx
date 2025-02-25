@@ -336,6 +336,8 @@ export default function TaskDetails() {
   const [subscriberError, setSubscriberError] = useState('');
   const [isEditingPrompt, setIsEditingPrompt] = useState(false);
   const [editedPrompt, setEditedPrompt] = useState('');
+  const [isEditingName, setIsEditingName] = useState(false);
+  const [editedName, setEditedName] = useState('');
   const [uploadError, setUploadError] = useState<string>('');
   const [isUploading, setIsUploading] = useState(false);
 
@@ -674,6 +676,38 @@ export default function TaskDetails() {
     setEditedPrompt('');
   };
 
+  const handleNameEdit = async () => {
+    try {
+      await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        { name: editedName },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      
+      // Refresh task data
+      const updatedTask = await fetchTask();
+      if (updatedTask) {
+        setTask(updatedTask);
+      }
+      setIsEditingName(false);
+    } catch (error: any) {
+      console.error('Error updating name:', error);
+      setError(error.response?.data?.message || 'Failed to update name');
+    }
+  };
+
+  const startEditingName = () => {
+    if (task) {
+      setEditedName(task.name);
+      setIsEditingName(true);
+    }
+  };
+
+  const cancelEditingName = () => {
+    setIsEditingName(false);
+    setEditedName('');
+  };
+
   const handleUserResponse = async (executionId: string, interactionId: string, userResponse: string) => {
     try {
       await axios.put(
@@ -806,9 +840,47 @@ export default function TaskDetails() {
       <Paper sx={{ p: 4, mt: 4 }}>
         <Box sx={{ mb: 4, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
           <Box>
-            <Typography variant="h4" component="h1" gutterBottom>
-              {task.name}
-            </Typography>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+              {isEditingName ? (
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                  <TextField
+                    value={editedName}
+                    onChange={(e) => setEditedName(e.target.value)}
+                    variant="outlined"
+                    size="small"
+                    autoFocus
+                    sx={{ minWidth: '300px' }}
+                  />
+                  <IconButton
+                    onClick={handleNameEdit}
+                    size="small"
+                    color="primary"
+                    disabled={!editedName.trim() || editedName === task?.name}
+                  >
+                    <SaveIcon />
+                  </IconButton>
+                  <IconButton
+                    onClick={cancelEditingName}
+                    size="small"
+                  >
+                    <CancelIcon />
+                  </IconButton>
+                </Box>
+              ) : (
+                <>
+                  <Typography variant="h4" component="h1">
+                    {task.name}
+                  </Typography>
+                  {showActions && (
+                    <Tooltip title="Edit name">
+                      <IconButton onClick={startEditingName} size="small">
+                        <EditIcon />
+                      </IconButton>
+                    </Tooltip>
+                  )}
+                </>
+              )}
+            </Box>
             <Box sx={{ display: 'flex', gap: 1, mb: 2 }}>
               <Chip
                 label={`Task: ${task.status}`}
