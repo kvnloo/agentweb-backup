@@ -512,11 +512,19 @@ export default function TaskDetails() {
     try {
       const newIsDeepResearch = !task.isDeepResearch;
       
+      // If enabling deep research, also enable email notifications
+      const updateData: any = {
+        isDeepResearch: newIsDeepResearch
+      };
+      
+      // If enabling deep research, also enable email notifications
+      if (newIsDeepResearch && !task.emailNotification) {
+        updateData.emailNotification = true;
+      }
+      
       await axios.put(
         buildApiUrl(`/api/tasks/${taskId}`),
-        {
-          isDeepResearch: newIsDeepResearch
-        },
+        updateData,
         {
           headers: { Authorization: `Bearer ${token}` }
         }
@@ -875,7 +883,7 @@ export default function TaskDetails() {
 
         {task.isDeepResearch && (
           <Alert severity="info" sx={{ mt: 1, mb: 3 }}>
-            Deep Research Mode is enabled. When you run this task, it will use advanced AI to perform comprehensive research on your topic using public web data only. Currently does not use your uploads or web accounts (Config), but will support these in the future.
+            Deep Research Mode is enabled. When you run this task, it will use advanced AI to perform comprehensive research on your topic using public web data only. Currently does not use your uploads or web accounts (Config), but will support these in the future. Email notifications are automatically enabled for Deep Research tasks.
           </Alert>
         )}
 
