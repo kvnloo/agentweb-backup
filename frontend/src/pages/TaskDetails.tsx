@@ -837,7 +837,7 @@ export default function TaskDetails() {
                     label="Interactive Mode"
                   />
                 </Tooltip>
-                <Tooltip title="When enabled, the task will use advanced AI to perform comprehensive research on your topic without interacting with websites">
+                <Tooltip title="When enabled, the task will use advanced AI to perform comprehensive research on your topic using public web data only. Currently does not use your uploads or web accounts (Config), but will support these in the future.">
                   <FormControlLabel
                     control={
                       <Switch
@@ -875,7 +875,7 @@ export default function TaskDetails() {
 
         {task.isDeepResearch && (
           <Alert severity="info" sx={{ mt: 1, mb: 3 }}>
-            Deep Research Mode is enabled. When you run this task, it will use advanced AI to perform comprehensive research on your topic. This mode is ideal for gathering in-depth information and analysis.
+            Deep Research Mode is enabled. When you run this task, it will use advanced AI to perform comprehensive research on your topic using public web data only. Currently does not use your uploads or web accounts (Config), but will support these in the future.
           </Alert>
         )}
 
