@@ -25,7 +25,7 @@ import aiohttp
 import base64  # Add at the top with other imports
 import boto3  # Add at the top with other imports
 from urllib.parse import quote
-
+from task_utils import get_downloads_path, upload_task_result_files, get_llm
 # Load environment variables
 load_dotenv()
 
@@ -58,158 +58,6 @@ def decrypt_password(encrypted_password: str, user_id: str, shared_by: str = Non
     except Exception as e:
         logger.error(f"Error decrypting password: {e}")
         raise Exception("Failed to decrypt password")
-
-def get_aws_bedrock_llm(model_name: str):
-    """Initialize AWS Bedrock language model"""
-    try:
-        # Get Bedrock client with no retries
-        bedrock = get_bedrock_client()
-
-        return ChatBedrock(
-            client=bedrock,
-            model_id=model_name,
-            model_kwargs={"temperature": 0.0}
-        )
-    except Exception as e:
-        if "AccessDeniedException" in str(e):
-            logger.error("Error: The AWS user lacks permission to invoke Claude model in Bedrock.")
-            logger.error("Please ensure the user has the necessary permissions and the model exists.")
-            sys.exit(1)
-        raise
-
-def get_azure_openai_llm(model_name: str):
-    """Initialize Azure OpenAI language model"""
-    try:
-        deployment_name = os.getenv('AZURE_OPENAI_DEPLOYMENT', 'agentweb')
-        
-        return AzureChatOpenAI(
-            model_name=model_name,
-            azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT'),
-            azure_deployment=deployment_name,
-            api_key=os.getenv('AZURE_OPENAI_API_KEY'),
-            api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-08-01-preview'),
-            temperature=0.0
-        )
-    except Exception as e:
-        logger.error(f"Error initializing Azure OpenAI: {e}")
-        logger.error("Please ensure all Azure OpenAI environment variables are set correctly.")
-        sys.exit(1)
-
-def get_deepseek_llm(model_name: str):
-    """Initialize DeepSeek language model"""
-    try:
-        api_key = os.getenv('DEEPSEEK_API_KEY')
-        if not api_key:
-            raise ValueError('DEEPSEEK_API_KEY is not set')
-            
-        return ChatOpenAI(
-            base_url='https://api.deepseek.com/v1',
-            model=model_name,
-            api_key=SecretStr(api_key),
-            temperature=0.0
-        )
-    except Exception as e:
-        logger.error(f"Error initializing DeepSeek: {e}")
-        logger.error("Please ensure DEEPSEEK_API_KEY environment variable is set correctly.")
-        sys.exit(1)
-
-def get_openai_llm(model_name: str):
-    """Initialize OpenAI language model"""
-    try:
-        api_key = os.getenv('OPENAI_API_KEY')
-        if not api_key:
-            raise ValueError('OPENAI_API_KEY is not set')
-            
-        return ChatOpenAI(
-            model=model_name,
-            api_key=SecretStr(api_key),
-            temperature=0.0
-        )
-    except Exception as e:
-        logger.error(f"Error initializing OpenAI: {e}")
-        logger.error("Please ensure OPENAI_API_KEY environment variable is set correctly.")
-        sys.exit(1)
-
-def get_openai_llm_think(model_name: str):
-    """Initialize OpenAI language model"""
-    global global_use_vision
-    try:
-        api_key = os.getenv('OPENAI_API_KEY')
-        if not api_key:
-            raise ValueError('OPENAI_API_KEY is not set')
-            
-        # For think model such as o3-mini, we disable vision: https://github.com/browser-use/browser-use/issues/283
-        global_use_vision = False
-        logger.warning(f"Vision is disabled for {model_name}. Execution details in gif will not be available.")
-        return ChatOpenAI(
-            model=model_name,
-            api_key=SecretStr(api_key),
-            disabled_params={"parallel_tool_calls": None}
-        )
-    except Exception as e:
-        logger.error(f"Error initializing OpenAI: {e}")
-        logger.error("Please ensure OPENAI_API_KEY environment variable is set correctly.")
-        sys.exit(1)
-
-def get_llm(full_llm_name: str):
-    """Get the appropriate language model based on provided configuration"""
-    # Define valid platform-provider-model combinations with their initialization functions
-    VALID_CONFIGURATIONS = {
-        "aws": {
-            "anthropic": {
-                "anthropic.claude-3-5-sonnet-20241022-v2:0": get_aws_bedrock_llm
-            }
-        },
-        "azure": {
-            "openai": {
-                "gpt-4o": get_azure_openai_llm
-            }
-        },
-        "deepseek": {
-            "deepseek": {
-                "deepseek-reasoner": get_deepseek_llm
-            }
-        },
-        "openai": {
-            "openai": {
-                "gpt-4o": get_openai_llm,
-                "o3-mini": get_openai_llm_think
-            }
-        }
-    }
-
-    try:
-        platform, provider, model_name = full_llm_name.lower().split('->')
-    except ValueError:
-        logger.error(f"Invalid FULL_LLM_NAME format: {full_llm_name}")
-        logger.error("Format should be <platform>-><provider>-><model>")
-        sys.exit(1)
-    
-    logger.info(f"Initializing LLM - Platform: {platform}, Provider: {provider}, Model: {model_name}")
-
-    # Get the provider mapping for the platform
-    platform_config = VALID_CONFIGURATIONS.get(platform)
-    if not platform_config:
-        logger.error(f"Unsupported platform: {platform}")
-        logger.error(f"Valid platforms are: {list(VALID_CONFIGURATIONS.keys())}")
-        sys.exit(1)
-
-    # Get the model mapping for the provider
-    provider_config = platform_config.get(provider)
-    if not provider_config:
-        logger.error(f"Invalid provider '{provider}' for platform '{platform}'")
-        logger.error(f"Valid providers for {platform} are: {list(platform_config.keys())}")
-        sys.exit(1)
-
-    # Get the initialization function for the model
-    init_func = provider_config.get(model_name)
-    if not init_func:
-        logger.error(f"Invalid model '{model_name}' for provider '{provider}' on platform '{platform}'")
-        logger.error(f"Valid models are: {list(provider_config.keys())}")
-        sys.exit(1)
-
-    # Initialize the LLM using the mapped function
-    return init_func(model_name), full_llm_name
 
 class WebAgent:
     def __init__(self, user_id=None, full_llm_name=None):
@@ -302,48 +150,8 @@ class WebAgent:
             # If task completed successfully, check for downloaded files
             result_files = []
             if task_is_done and self.current_execution_id:
-                downloads_path = Path(self._get_downloads_path())
-                if downloads_path.exists():
-                    # Generate a random token for this batch of files
-                    random_token = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=20))
-                    
-                    for file_path in downloads_path.glob('*'):
-                        if file_path.is_file():
-                            try:
-                                # Upload file to S3 with random token in path
-                                s3_key = f"task_results/{self.current_execution_id}/{random_token}/{file_path.name}"
-                                self.s3_client.upload_file(
-                                    str(file_path),
-                                    self.s3_bucket,
-                                    s3_key,
-                                    ExtraArgs={'ContentDisposition': f'attachment; filename="{file_path.name}"'}
-                                )
-                                # Generate URL with proper encoding
-                                encoded_key = quote(s3_key)
-                                url = f"https://{self.s3_bucket}.s3.amazonaws.com/{encoded_key}"
-                                result_files.append({
-                                    'url': url,
-                                    'filename': file_path.name,
-                                    'token': random_token  # Store token for potential future validation
-                                })
-                                logger.info(f"Uploaded result file to S3: {url}")
-                            except Exception as e:
-                                logger.error(f"Error uploading file {file_path} to S3: {e}")
-
-                # Update execution record with result files if any were uploaded
-                if result_files:
-                    try:
-                        table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskExecutions')
-                        table.update_item(
-                            Key={'executionId': self.current_execution_id},
-                            UpdateExpression='SET result_files = :files',
-                            ExpressionAttributeValues={
-                                ':files': result_files
-                            }
-                        )
-                        logger.info(f"Updated execution record with {len(result_files)} result files")
-                    except Exception as e:
-                        logger.error(f"Error updating execution record with result files: {e}")
+                downloads_path = get_downloads_path(user_id=self.user_id, execution_id=self.current_execution_id)
+                result_files = upload_task_result_files(downloads_path, self.current_execution_id)
             
             return {
                 "success": task_is_done,
@@ -646,15 +454,10 @@ class WebAgent:
 
     def _get_downloads_path(self):
         """Get the path to the downloads directory for the current execution"""
-        if not self.current_execution_id:
-            # Fallback to user directory if no execution ID
-            base_path = Path('downloads') / (self.user_id or 'default')
-        else:
-            # Create execution-specific directory
-            base_path = Path('downloads') / (self.user_id or 'default') / self.current_execution_id
-        
-        base_path.mkdir(parents=True, exist_ok=True)
-        return str(base_path)
+        return get_downloads_path(
+            user_id=self.user_id,
+            execution_id=self.current_execution_id
+        )
 
     async def setup(self):
         """Initialize the browser instance"""
@@ -750,10 +553,18 @@ class WebAgent:
                                     filtered_line = filtered_line.replace(val, f'<secret>{key}</secret>')
                             filtered_lines.append(filtered_line)
 
-                    # Write filtered content to filtered log file
-                    with open(filtered_log, 'w') as f:
-                        f.writelines(filtered_lines)
-                    logger.info("Created filtered log file")
+                    # Only write to filtered log if we have content to write
+                    if filtered_lines:
+                        file_exists = Path(filtered_log).exists()
+                        with open(filtered_log, 'a' if file_exists else 'w') as f:
+                            # Add separator if appending to existing file
+                            if file_exists:
+                                f.write("\n\n")
+                                f.write("="*80 + "\n")
+                                f.write(f"New execution log at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                                f.write("="*80 + "\n\n")
+                            f.writelines(filtered_lines)
+                        logger.info("Created filtered log file")
 
                     # Remove the original unfiltered log file
                     Path(browser_use_log).unlink()

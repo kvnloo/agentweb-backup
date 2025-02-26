@@ -26,6 +26,10 @@ import {
   ListItemSecondaryAction,
   Tooltip,
   Link,
+  Select,
+  MenuItem,
+  FormControl,
+  InputLabel,
 } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
@@ -40,7 +44,7 @@ import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
 import ScheduleForm from '../components/ScheduleForm';
 import ScheduleList from '../components/ScheduleList';
-import { buildApiUrl } from '../config';
+import { buildApiUrl, AVAILABLE_LLMS } from '../config';
 
 interface Task {
   taskId: string;
@@ -53,6 +57,8 @@ interface Task {
   error?: string;
   emailNotification?: boolean;
   isInteractive?: boolean;
+  isDeepResearch?: boolean;
+  llmName?: string;
   attachments?: TaskAttachment[];
 }
 
@@ -89,6 +95,7 @@ interface TaskExecution {
     url: string;
     filename: string;
     token: string;
+    is_html?: boolean;
   }[];
 }
 
@@ -335,6 +342,8 @@ export default function TaskDetails() {
   const [subscriberError, setSubscriberError] = useState('');
   const [isEditingPrompt, setIsEditingPrompt] = useState(false);
   const [editedPrompt, setEditedPrompt] = useState('');
+  const [isEditingName, setIsEditingName] = useState(false);
+  const [editedName, setEditedName] = useState('');
   const [uploadError, setUploadError] = useState<string>('');
   const [isUploading, setIsUploading] = useState(false);
 
@@ -505,6 +514,48 @@ export default function TaskDetails() {
     }
   };
 
+  const handleDeepResearchToggle = async () => {
+    if (!task) return;
+    
+    try {
+      const newIsDeepResearch = !task.isDeepResearch;
+      
+      // If enabling deep research, also enable email notifications and set LLM
+      const updateData: any = {
+        isDeepResearch: newIsDeepResearch
+      };
+      
+      // If enabling deep research, also enable email notifications and set LLM
+      if (newIsDeepResearch) {
+        if (!task.emailNotification) {
+          updateData.emailNotification = true;
+        }
+        updateData.llmName = 'azure->openai->gpt-4o';
+      }
+      
+      await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        updateData,
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+
+      // Update the task state with the response
+      const taskResponse = await axios.get(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+      
+      setTask(taskResponse.data);
+    } catch (error: any) {
+      console.error('Error updating deep research mode:', error);
+      setError(error.response?.data?.message || 'Failed to update deep research mode');
+    }
+  };
+
   const handleFeedbackChange = async (executionId: string, feedback: 'accepted' | 'rejected' | null) => {
     try {
       await axios.put(
@@ -634,6 +685,38 @@ export default function TaskDetails() {
     setEditedPrompt('');
   };
 
+  const handleNameEdit = async () => {
+    try {
+      await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        { name: editedName },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      
+      // Refresh task data
+      const updatedTask = await fetchTask();
+      if (updatedTask) {
+        setTask(updatedTask);
+      }
+      setIsEditingName(false);
+    } catch (error: any) {
+      console.error('Error updating name:', error);
+      setError(error.response?.data?.message || 'Failed to update name');
+    }
+  };
+
+  const startEditingName = () => {
+    if (task) {
+      setEditedName(task.name);
+      setIsEditingName(true);
+    }
+  };
+
+  const cancelEditingName = () => {
+    setIsEditingName(false);
+    setEditedName('');
+  };
+
   const handleUserResponse = async (executionId: string, interactionId: string, userResponse: string) => {
     try {
       await axios.put(
@@ -723,6 +806,35 @@ export default function TaskDetails() {
     }
   };
 
+  const handleLLMChange = async (newLLMName: string) => {
+    if (!task || task.isDeepResearch) return;
+    
+    try {
+      await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        {
+          llmName: newLLMName || null // Send null to clear the preference
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+
+      // Update the task state with the response
+      const taskResponse = await axios.get(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+      
+      setTask(taskResponse.data);
+    } catch (error: any) {
+      console.error('Error updating LLM preference:', error);
+      setError(error.response?.data?.message || 'Failed to update LLM preference');
+    }
+  };
+
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
@@ -766,9 +878,47 @@ export default function TaskDetails() {
       <Paper sx={{ p: 4, mt: 4 }}>
         <Box sx={{ mb: 4, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
           <Box>
-            <Typography variant="h4" component="h1" gutterBottom>
-              {task.name}
-            </Typography>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+              {isEditingName ? (
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                  <TextField
+                    value={editedName}
+                    onChange={(e) => setEditedName(e.target.value)}
+                    variant="outlined"
+                    size="small"
+                    autoFocus
+                    sx={{ minWidth: '300px' }}
+                  />
+                  <IconButton
+                    onClick={handleNameEdit}
+                    size="small"
+                    color="primary"
+                    disabled={!editedName.trim() || editedName === task?.name}
+                  >
+                    <SaveIcon />
+                  </IconButton>
+                  <IconButton
+                    onClick={cancelEditingName}
+                    size="small"
+                  >
+                    <CancelIcon />
+                  </IconButton>
+                </Box>
+              ) : (
+                <>
+                  <Typography variant="h4" component="h1">
+                    {task.name}
+                  </Typography>
+                  {showActions && (
+                    <Tooltip title="Edit name">
+                      <IconButton onClick={startEditingName} size="small">
+                        <EditIcon />
+                      </IconButton>
+                    </Tooltip>
+                  )}
+                </>
+              )}
+            </Box>
             <Box sx={{ display: 'flex', gap: 1, mb: 2 }}>
               <Chip
                 label={`Task: ${task.status}`}
@@ -793,16 +943,58 @@ export default function TaskDetails() {
                   }
                   label="Email Me Latest Run"
                 />
-                <FormControlLabel
-                  control={
-                    <Switch
-                      checked={Boolean(task.isInteractive)}
-                      onChange={handleInteractiveModeToggle}
-                      color="primary"
-                    />
-                  }
-                  label="Interactive Mode"
-                />
+                <Tooltip title="When enabled, the agent can pause execution to request additional information from you">
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        checked={Boolean(task.isInteractive)}
+                        onChange={handleInteractiveModeToggle}
+                        color="primary"
+                      />
+                    }
+                    label="Interactive Mode"
+                  />
+                </Tooltip>
+                <Tooltip title="When enabled, the task will use advanced AI to perform comprehensive research on your topic using public web data only. Currently does not use your uploads or web accounts (Config), but will support these in the future.">
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        checked={Boolean(task.isDeepResearch)}
+                        onChange={handleDeepResearchToggle}
+                        color="primary"
+                      />
+                    }
+                    label="Perform Deep Research"
+                  />
+                </Tooltip>
+                <Tooltip title={
+                  <div>
+                    <p>If selected, this LLM will be used first to run the task. If it fails, other LLMs will be tried as backup.</p>
+                    <p>LLM format: {`<deployment>${'>'}<provider>${'>'}<version>`}</p>
+                    <p>Example: "azure-{'>'}-openai-{'>'}-gpt-4o" means GPT-4 model deployed on Azure, provided by OpenAI</p>
+                    {task.isDeepResearch && <p>Deep Research mode requires using azure-{'>'}-openai-{'>'}-gpt-4o</p>}
+                  </div>
+                } placement="right">
+                  <FormControl sx={{ width: 400 }}>
+                    <InputLabel id="llm-select-label">Preferred LLM</InputLabel>
+                    <Select
+                      labelId="llm-select-label"
+                      value={task.isDeepResearch ? 'azure->openai->gpt-4o' : (task.llmName !== undefined && task.llmName !== null ? task.llmName : '')}
+                      onChange={(e) => handleLLMChange(e.target.value)}
+                      label="Preferred LLM"
+                      disabled={task.isDeepResearch}
+                    >
+                      <MenuItem value="">
+                        <em>System Default Order</em>
+                      </MenuItem>
+                      {AVAILABLE_LLMS.map((llm: string) => (
+                        <MenuItem key={llm} value={llm}>
+                          {llm}
+                        </MenuItem>
+                      ))}
+                    </Select>
+                  </FormControl>
+                </Tooltip>
               </Box>
             )}
           </Box>
@@ -826,6 +1018,12 @@ export default function TaskDetails() {
             </Box>
           )}
         </Box>
+
+        {task.isDeepResearch && (
+          <Alert severity="info" sx={{ mt: 1, mb: 3 }}>
+            Deep Research Mode is enabled. When you run this task, it will use advanced AI to perform comprehensive research on your topic using public web data only. Currently does not use your uploads or web accounts (Config), but will support these in the future. Email notifications are automatically enabled for Deep Research tasks.
+          </Alert>
+        )}
 
         <Grid container spacing={3}>
           <Grid item xs={12}>
@@ -1043,6 +1241,7 @@ export default function TaskDetails() {
                                           variant="outlined"
                                           size="small"
                                           sx={{ mt: 1 }}
+                                          icon={file.is_html ? <ScreenshotIcon fontSize="small" /> : undefined}
                                         />
                                       ))}
                                     </Box>

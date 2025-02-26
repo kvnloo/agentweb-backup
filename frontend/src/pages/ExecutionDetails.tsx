@@ -20,6 +20,7 @@ import ArrowBackIcon from '@mui/icons-material/ArrowBack';
 import { useAuth } from '../contexts/AuthContext';
 import axios from 'axios';
 import { buildApiUrl } from '../config';
+import ScreenshotIcon from '@mui/icons-material/Screenshot';
 
 interface TaskExecution {
   executionId: string;
@@ -39,6 +40,7 @@ interface TaskExecution {
     url: string;
     filename: string;
     token: string;
+    is_html?: boolean;
   }[];
   llmName?: string;
 }
@@ -255,7 +257,14 @@ export default function ExecutionDetails() {
                     rel="noopener noreferrer"
                     sx={{ display: 'flex', alignItems: 'center' }}
                   >
-                    {file.filename}
+                    {file.is_html ? (
+                      <>
+                        <ScreenshotIcon sx={{ mr: 1, fontSize: '1.2rem' }} />
+                        {file.filename} <Typography variant="caption" sx={{ ml: 1, color: 'text.secondary' }}>(View in browser)</Typography>
+                      </>
+                    ) : (
+                      file.filename
+                    )}
                   </Link>
                 ))}
               </Box>

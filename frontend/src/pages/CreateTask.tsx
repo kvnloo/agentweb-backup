@@ -20,6 +20,7 @@ export default function CreateTask() {
   const [name, setName] = useState('');
   const [prompt, setPrompt] = useState('');
   const [isInteractive, setIsInteractive] = useState(false);
+  const [isDeepResearch, setIsDeepResearch] = useState(false);
   const [error, setError] = useState('');
   const { token } = useAuth();
   const navigate = useNavigate();
@@ -29,12 +30,16 @@ export default function CreateTask() {
     setError('');
 
     try {
+      const emailNotification = isDeepResearch;
+
       await axios.post(
         buildApiUrl('/api/tasks'),
         {
           name,
           prompt,
           isInteractive,
+          isDeepResearch,
+          emailNotification
         },
         {
           headers: { Authorization: `Bearer ${token}` },
@@ -83,7 +88,7 @@ export default function CreateTask() {
             onChange={(e) => setPrompt(e.target.value)}
             helperText="Write your task instructions in natural language. The AI agent will request more information if needed."
           />
-          <Box sx={{ mt: 2 }}>
+          <Box sx={{ mt: 2, display: 'flex', flexDirection: 'column', gap: 1 }}>
             <Tooltip title="When enabled, the AI agent can ask for additional information during task execution">
               <FormControlLabel
                 control={
@@ -96,7 +101,27 @@ export default function CreateTask() {
                 label="Interactive Mode"
               />
             </Tooltip>
+            <Tooltip title="When enabled, the task will use advanced AI to perform comprehensive research on your topic using public web data only. Currently does not use your uploads or web accounts (Config), but will support these in the future. Email notifications are automatically enabled for Deep Research tasks.">
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={isDeepResearch}
+                    onChange={(e) => setIsDeepResearch(e.target.checked)}
+                    color="primary"
+                  />
+                }
+                label="Perform Deep Research"
+              />
+            </Tooltip>
           </Box>
+          {isDeepResearch && (
+            <Alert severity="info" sx={{ mt: 2 }}>
+              Deep Research Mode is enabled. When you run this task, it will use advanced AI to perform comprehensive research on your topic using public web data only. Currently does not use your uploads or web accounts (Config), but will support these in the future. Email notifications are automatically enabled for Deep Research tasks.
+            </Alert>
+          )}
+          <Alert severity="info" sx={{ mt: 2, mb: 2 }}>
+            All settings including task name, prompt, and modes can be modified later in the Task Details page.
+          </Alert>
           <Box sx={{ mt: 3, display: 'flex', gap: 2 }}>
             <Button
               type="submit"

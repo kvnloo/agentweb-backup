@@ -316,14 +316,16 @@ export const taskDb = {
         Key: {
           taskId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, attachments',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
           '#e': 'error',
           '#sum': 'summary',
           '#en': 'emailNotification',
-          '#i': 'isInteractive'
+          '#i': 'isInteractive',
+          '#dr': 'isDeepResearch',
+          '#llm': 'llmName'
         }
       };
 
@@ -342,6 +344,7 @@ export const taskDb = {
     summary: string;
     emailNotification: boolean;
     isInteractive: boolean;
+    isDeepResearch: boolean;
     attachments: TaskAttachment[];
   }>) {
     try {

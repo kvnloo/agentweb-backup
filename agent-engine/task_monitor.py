@@ -18,6 +18,8 @@ from aws_utils import get_dynamodb_resource, get_s3_client
 import yaml
 import random
 from typing import Dict, Any
+from deep_research_agent import DeepResearchAgentWrapper  # Import the wrapper class
+from task_utils import upload_activity_log, upload_gif  # Import new utility functions
 
 # Custom JSON encoder to handle datetime objects
 class DateTimeEncoder(json.JSONEncoder):
@@ -401,7 +403,8 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
         os.unlink(prompt_file)
         
         # Write both stdout and stderr to log file for debugging
-        with open(log_file, 'w') as f:
+        with open(log_file, 'a') as f:
+            f.write("\n\n=== NEW EXECUTION AT " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " ===\n")
             f.write("=== COMMAND ===\n")
             f.write(" ".join(cmd) + "\n\n")
             if stdout:
@@ -412,6 +415,7 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
                 f.write("=== STDERR ===\n")
                 f.write(stderr.decode())
                 f.write("\n")
+            f.write("=" * 80 + "\n")
         
         if process.returncode == 0:
             try:
@@ -572,6 +576,12 @@ async def execute_task(execution):
         context = f"You are executing this task at {datetime.now(timezone.utc).isoformat()}."
         prompt_with_context = f"{prompt}\n\n{context}"
 
+        # Check if this is a deep research task
+        is_deep_research = task and task.get('isDeepResearch', False)
+        logger.info(f"Task {task_id} isDeepResearch: {is_deep_research}")
+
+        filtered_activity_log = None
+
         # Try each LLM in sequence until one succeeds
         for llm_name in llm_names:
             try:
@@ -579,114 +589,101 @@ async def execute_task(execution):
                 random_suffix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=20))
                 gif_path = f"agent_history_{execution_id}_{random_suffix}.gif"
                 
-                # Run WebAgent via CLI
-                result = await run_web_agent_cli(
-                    user_id,
-                    llm_name,
-                    prompt_with_context,
-                    execution_id,
-                    bool(task.get('isInteractive', False)) if task else False,
-                    task_id,
-                    gif_path
-                )
-                
-                # Check for GIF and upload if exists
+                # Run appropriate agent based on task type
+                if is_deep_research:
+                    # Use DeepResearchAgentWrapper directly instead of CLI
+                    try:
+                        logger.info(f"Running deep research directly with LLM: {llm_name}")
+                        
+                        # Initialize the deep research agent with user_id and execution_id
+                        agent = DeepResearchAgentWrapper(
+                            user_id=user_id,
+                            execution_id=execution_id
+                        )
+                        
+                        # Set the LLM name
+                        agent.llm_name = llm_name
+                        
+                        # Run the research
+                        result = agent.run_research(
+                            query=prompt_with_context,
+                            max_turns=int(os.getenv('DEEP_RESEARCH_MAX_TURNS', '2')),
+                            user_input=False
+                        )
+                        
+                        logger.info(f"Successfully completed deep research with {llm_name}")
+                        
+                        # Get the output file path from the result
+                        filtered_activity_log = result.get('output_file', None)
+                        if filtered_activity_log and os.path.exists(filtered_activity_log):
+                            logger.info(f"Found output file: {filtered_activity_log}")
+                        else:
+                            logger.warning(f"Output file not found or not specified in result")
+                            filtered_activity_log = None
+                            
+                    except Exception as e:
+                        logger.error(f"Error running deep research directly: {str(e)}")
+                        result = {
+                            "success": False,
+                            "error": f"Deep research error: {str(e)}",
+                            "llm_name": llm_name
+                        }
+                else:
+                    # Run WebAgent via CLI for non-deep-research tasks
+                    result = await run_web_agent_cli(
+                        user_id,
+                        llm_name,
+                        prompt_with_context,
+                        execution_id,
+                        bool(task.get('isInteractive', False)) if task else False,
+                        task_id,
+                        gif_path
+                    )
+                    # Upload browser-use log to S3 if it exists
+                    filtered_activity_log = f'logs/execution_{execution_id}_browser_use.filtered.log'
+
+                # Upload GIF if it exists
                 details_gif = None
                 if Path(gif_path).exists():
-                    s3_client = get_s3_client()
-                    s3_client.upload_file(gif_path, os.getenv('AWS_S3_BUCKET'), f"execution_gifs/{gif_path}", ExtraArgs={'ContentType': 'image/gif'})
-                    details_gif=f"https://{os.getenv('AWS_S3_BUCKET')}.s3.amazonaws.com/execution_gifs/{gif_path}"
-                    # Clean up local GIF file
-                    Path(gif_path).unlink()
-                
-                # Upload browser-use log to S3 if it exists
-                filtered_log = f'logs/execution_{execution_id}_browser_use.filtered.log'
-                if Path(filtered_log).exists():
-                    try:
-                        s3_client = get_s3_client()
-                        # Generate a random token for this upload
-                        random_token = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=20))
-                        s3_key = f"execution_logs/{user_id}/browser_use_{execution_id}_{random_token}.log"
-
-                        # Read the log file and wrap it in HTML with pre-formatting
-                        with open(filtered_log, 'r') as f:
-                            log_content = f.read()
-                        html_content = f"""<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <style>
-        pre {{
-            white-space: pre-wrap;
-            word-wrap: break-word;
-            font-family: monospace;
-            padding: 20px;
-            margin: 0;
-        }}
-    </style>
-</head>
-<body>
-    <pre>{log_content}</pre>
-</body>
-</html>"""
-
-                        # Create a temporary file for the HTML content
-                        html_file = filtered_log + '.html'
-                        with open(html_file, 'w') as f:
-                            f.write(html_content)
-
-                        s3_client.upload_file(
-                            html_file,
-                            os.getenv('AWS_S3_BUCKET'),
-                            s3_key,
-                            ExtraArgs={
-                                'ContentType': 'text/html; charset=utf-8',
-                                'ContentDisposition': 'inline'
-                            }
-                        )
-                        logger.info(f"Uploaded browser-use log to S3: {s3_key}")
-                        
-                        # Store the log URL in the execution record
-                        executions_table.update_item(
-                            Key={'executionId': execution_id},
-                            UpdateExpression='SET browser_use_log = :log_url',
-                            ExpressionAttributeValues={
-                                ':log_url': f"https://{os.getenv('AWS_S3_BUCKET')}.s3.amazonaws.com/{s3_key}"
-                            }
-                        )
-                        
-                        # Remove the temporary HTML file and filtered log file
-                        Path(html_file).unlink()
-                        Path(filtered_log).unlink()
-                        logger.info(f"Removed log files after successful upload")
-                    except Exception as e:
-                        logger.error(f"Error uploading browser-use log to S3: {e}")
+                    details_gif = upload_gif(gif_path)
                 
                 if result['success']:
                     result_summary = result.get('summary', 'No summary available')
+
                     # Update execution status
-                    update_execution_status(
-                        execution_id, 
-                        'completed', 
-                        result=result_summary,
-                        details_gif=details_gif,
-                        llm_name=llm_name
-                    )
+                    try:
+                        update_execution_status(
+                            execution_id, 
+                            'completed', 
+                            result=result_summary,
+                            details_gif=details_gif,
+                            llm_name=llm_name
+                        )
+                        logger.info(f"Updated execution status to completed for {execution_id}")
+                    except Exception as e:
+                        logger.error(f"Error updating execution status: {e}", exc_info=True)
                     
                     # Update task with successful LLM name if it's not a workflow task
                     if not execution.get('workflowExecutionId') and task and task.get('llmName') != llm_name:
-                        tasks_table.update_item(
-                            Key={'taskId': task_id},
-                            UpdateExpression='SET llmName = :llm_name',
-                            ExpressionAttributeValues={
-                                ':llm_name': llm_name
-                            }
-                        )
-                        logger.info(f"Updated task {task_id} with successful LLM: {llm_name}")
+                        try:
+                            tasks_table.update_item(
+                                Key={'taskId': task_id},
+                                UpdateExpression='SET llmName = :llm_name',
+                                ExpressionAttributeValues={
+                                    ':llm_name': llm_name
+                                }
+                            )
+                            logger.info(f"Updated task {task_id} with successful LLM: {llm_name}")
+                        except Exception as e:
+                            logger.error(f"Error updating task LLM name: {e}", exc_info=True)
                     
                     # Update workflow execution if this is a workflow task
                     if 'workflowExecutionId' in execution:
-                        update_workflow_execution(execution['workflowExecutionId'], task_id, 'completed', result=result_summary)
+                        try:
+                            update_workflow_execution(execution['workflowExecutionId'], task_id, 'completed', result=result_summary)
+                            logger.info(f"Updated workflow execution for task {task_id}")
+                        except Exception as e:
+                            logger.error(f"Error updating workflow execution: {e}", exc_info=True)
                     
                     success = True
                     break
@@ -696,26 +693,46 @@ async def execute_task(execution):
             except Exception as e:
                 last_error = str(e)
                 logger.error(f"Error with LLM {llm_name}: {e}")
+
+        # Upload activity log if it exists
+        if filtered_activity_log and Path(filtered_activity_log).exists():
+            upload_activity_log(filtered_activity_log, user_id, execution_id)
         
         if not success:
             error_message = f"All LLMs failed. Last error: {last_error}"
-            update_execution_status(
-                execution_id, 
-                'failed', 
-                error=error_message
-            )
+            try:
+                update_execution_status(
+                    execution_id, 
+                    'failed', 
+                    error=error_message
+                )
+                logger.info(f"Updated execution status to failed for {execution_id}")
+            except Exception as e:
+                logger.error(f"Error updating execution status to failed: {e}", exc_info=True)
             
             # Update workflow execution if this is a workflow task
             if 'workflowExecutionId' in execution:
-                update_workflow_execution(execution['workflowExecutionId'], task_id, 'failed', error=error_message)
+                try:
+                    update_workflow_execution(execution['workflowExecutionId'], task_id, 'failed', error=error_message)
+                    logger.info(f"Updated workflow execution status to failed for task {task_id}")
+                except Exception as e:
+                    logger.error(f"Error updating workflow execution status to failed: {e}", exc_info=True)
         
     except Exception as e:
-        logger.error(f"Error executing task: {e}")
-        update_execution_status(execution_id, 'failed', error=str(e))
+        logger.error(f"Error executing task: {e}", exc_info=True)
+        try:
+            update_execution_status(execution_id, 'failed', error=str(e))
+            logger.info(f"Updated execution status to failed for {execution_id} due to error")
+        except Exception as update_error:
+            logger.error(f"Error updating execution status after task error: {update_error}", exc_info=True)
         
         # Update workflow execution if this is a workflow task
         if 'workflowExecutionId' in execution:
-            update_workflow_execution(execution['workflowExecutionId'], task_id, 'failed', error=str(e))
+            try:
+                update_workflow_execution(execution['workflowExecutionId'], task_id, 'failed', error=str(e))
+                logger.info(f"Updated workflow execution status to failed for task {task_id} due to error")
+            except Exception as workflow_error:
+                logger.error(f"Error updating workflow execution after task error: {workflow_error}", exc_info=True)
     finally:
         running_task_count -= 1
         running_user_ids.remove(user_id)

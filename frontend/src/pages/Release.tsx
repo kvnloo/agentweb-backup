@@ -7,6 +7,21 @@ interface Release {
 
 const releases: Release[] = [
   {
+    date: "2025-02-26",
+    changes: [
+      "Added Deep Research mode powered by AG2 multi-agent framework",
+      "- Users can enable Deep Research mode on Task Details page",
+      "- Advanced AI performs comprehensive research on topics",
+      "- Generates detailed research reports with findings",
+      "- Special thanks to Chi Wang@Google Deepmind for AG2 framework support",
+      "Added task name editing functionality",
+      "- Users can edit task name on Task Details page",
+      "Implemented preferred LLM selection for tasks",
+      "- Users can choose specific LLM for task execution",
+      "- Automatic fallback to other LLMs if preferred one fails"
+    ]
+  },
+  {
     date: "2025-02-13",
     changes: [
       "Added execution log display for better task debugging visibility",
@@ -104,16 +119,32 @@ export default function Release() {
             <Divider sx={{ mb: 2 }} />
             
             <Box component="ul" sx={{ m: 0, pl: 3 }}>
-              {release.changes.map((change, changeIndex) => (
-                <Typography 
-                  key={changeIndex} 
-                  component="li" 
-                  variant="body1" 
-                  sx={{ mb: 1 }}
-                >
-                  {change}
-                </Typography>
-              ))}
+              {release.changes.map((change, changeIndex) => {
+                const isSubItem = change.startsWith('- ');
+                return (
+                  <Typography 
+                    key={changeIndex} 
+                    component="li" 
+                    variant="body1" 
+                    sx={{ 
+                      mb: 1,
+                      ...(isSubItem && {
+                        listStyleType: 'none',
+                        pl: 2,
+                        position: 'relative',
+                        '&::before': {
+                          content: '"•"',
+                          position: 'absolute',
+                          left: 0,
+                          color: 'text.secondary'
+                        }
+                      })
+                    }}
+                  >
+                    {isSubItem ? change.substring(2) : change}
+                  </Typography>
+                );
+              })}
             </Box>
           </Paper>
         ))}
