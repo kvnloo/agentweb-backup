@@ -27,6 +27,7 @@ import { Link } from 'react-router-dom';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
 import { buildApiUrl } from '../config';
+import DOMPurify from 'dompurify';
 
 interface TabPanelProps {
   children?: React.ReactNode;
@@ -317,30 +318,27 @@ export default function AdminDashboard() {
         </TabPanel>
 
         <TabPanel value={tabValue} index={1}>
-          <Typography variant="h6" gutterBottom>
-            Send Announcement
-          </Typography>
-
-          {error && (
-            <Alert severity="error" sx={{ mb: 3 }}>
-              {error}
-            </Alert>
-          )}
-          {success && (
-            <Alert severity="success" sx={{ mb: 3 }}>
-              {success}
-            </Alert>
-          )}
-
           <Box component="form" onSubmit={handleAnnouncementSubmit}>
+            {error && (
+              <Alert severity="error" sx={{ mb: 3 }}>
+                {error}
+              </Alert>
+            )}
+            {success && (
+              <Alert severity="success" sx={{ mb: 3 }}>
+                {success}
+              </Alert>
+            )}
+
             <TextField
-              label="Email Title"
+              label="Announcement Title"
               value={title}
               onChange={(e) => setTitle(e.target.value)}
               fullWidth
               required
-              sx={{ mb: 3 }}
+              sx={{ mb: 2 }}
             />
+
             <TextField
               label="Announcement Message"
               multiline
@@ -349,50 +347,42 @@ export default function AdminDashboard() {
               onChange={(e) => setMessage(e.target.value)}
               fullWidth
               required
-              sx={{ mb: 3 }}
-              helperText="Enter your message with line breaks for paragraphs"
+              sx={{ mb: 1 }}
+              helperText={
+                <Typography variant="caption">
+                  Supported HTML tags: <code>&lt;b&gt;</code> for bold, <code>&lt;i&gt;</code> for italic, 
+                  <code>&lt;u&gt;</code> for underline, <code>&lt;font color="..."&gt;</code> for text color, 
+                  <code>&lt;br&gt;</code> for line break
+                </Typography>
+              }
             />
 
-            <Box sx={{ mb: 3, display: 'flex', gap: 2 }}>
-              <Button
-                type="submit"
-                variant="contained"
-                disabled={loading}
-                sx={{ minWidth: 120 }}
-              >
-                {loading ? <CircularProgress size={24} /> : 'Send'}
-              </Button>
-              
-              <Button
-                type="button"
-                variant="outlined"
-                onClick={() => setShowPreview(!showPreview)}
-              >
-                {showPreview ? 'Hide Preview' : 'Show Preview'}
-              </Button>
-            </Box>
-
-            {showPreview && (
-              <Paper sx={{ p: 3, bgcolor: 'grey.50' }}>
-                <Typography variant="h6" gutterBottom>
-                  Email Preview
+            {message && (
+              <Box sx={{ mt: 3, mb: 3 }}>
+                <Typography variant="subtitle1" gutterBottom>
+                  Preview:
                 </Typography>
-                <Paper sx={{ p: 2, mb: 2 }}>
-                  <Typography variant="subtitle1" gutterBottom>
-                    Subject: {title}
-                  </Typography>
-                  <Box sx={{ mt: 2 }}>
-                    {message.split('\n').map((line, index) => (
-                      line.trim() && (
-                        <Typography key={index} paragraph>
-                          {line}
-                        </Typography>
-                      )
-                    ))}
-                  </Box>
+                <Paper 
+                  variant="outlined" 
+                  sx={{ 
+                    p: 2,
+                    backgroundColor: 'grey.50',
+                    minHeight: '100px'
+                  }}
+                >
+                  <div dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(message) }} />
                 </Paper>
-              </Paper>
+              </Box>
             )}
+
+            <Button
+              type="submit"
+              variant="contained"
+              disabled={loading}
+              sx={{ minWidth: 120 }}
+            >
+              {loading ? <CircularProgress size={24} /> : 'Send'}
+            </Button>
           </Box>
         </TabPanel>
 
