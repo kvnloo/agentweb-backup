@@ -553,10 +553,18 @@ class WebAgent:
                                     filtered_line = filtered_line.replace(val, f'<secret>{key}</secret>')
                             filtered_lines.append(filtered_line)
 
-                    # Write filtered content to filtered log file
-                    with open(filtered_log, 'w') as f:
-                        f.writelines(filtered_lines)
-                    logger.info("Created filtered log file")
+                    # Only write to filtered log if we have content to write
+                    if filtered_lines:
+                        file_exists = Path(filtered_log).exists()
+                        with open(filtered_log, 'a' if file_exists else 'w') as f:
+                            # Add separator if appending to existing file
+                            if file_exists:
+                                f.write("\n\n")
+                                f.write("="*80 + "\n")
+                                f.write(f"New execution log at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                                f.write("="*80 + "\n\n")
+                            f.writelines(filtered_lines)
+                        logger.info("Created filtered log file")
 
                     # Remove the original unfiltered log file
                     Path(browser_use_log).unlink()

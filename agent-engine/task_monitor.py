@@ -580,6 +580,8 @@ async def execute_task(execution):
         is_deep_research = task and task.get('isDeepResearch', False)
         logger.info(f"Task {task_id} isDeepResearch: {is_deep_research}")
 
+        filtered_activity_log = None
+
         # Try each LLM in sequence until one succeeds
         for llm_name in llm_names:
             try:
@@ -639,18 +641,15 @@ async def execute_task(execution):
                     )
                     # Upload browser-use log to S3 if it exists
                     filtered_activity_log = f'logs/execution_{execution_id}_browser_use.filtered.log'
-                
+
                 # Upload GIF if it exists
                 details_gif = None
                 if Path(gif_path).exists():
                     details_gif = upload_gif(gif_path)
-                         
-                # Upload activity log if it exists
-                if filtered_activity_log and Path(filtered_activity_log).exists():
-                    upload_activity_log(filtered_activity_log, user_id, execution_id)
                 
                 if result['success']:
                     result_summary = result.get('summary', 'No summary available')
+
                     # Update execution status
                     try:
                         update_execution_status(
@@ -694,6 +693,10 @@ async def execute_task(execution):
             except Exception as e:
                 last_error = str(e)
                 logger.error(f"Error with LLM {llm_name}: {e}")
+
+        # Upload activity log if it exists
+        if filtered_activity_log and Path(filtered_activity_log).exists():
+            upload_activity_log(filtered_activity_log, user_id, execution_id)
         
         if not success:
             error_message = f"All LLMs failed. Last error: {last_error}"
