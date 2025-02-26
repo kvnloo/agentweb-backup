@@ -20,7 +20,12 @@ import {
   CardContent,
   TextField,
   Chip,
-  Container
+  Container,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  DialogContentText
 } from '@mui/material';
 import { format } from 'date-fns';
 import { Link } from 'react-router-dom';
@@ -67,10 +72,11 @@ export default function AdminDashboard() {
   const [order, setOrder] = useState<'asc' | 'desc'>('desc');
   const [message, setMessage] = useState('');
   const [title, setTitle] = useState('');
-  const [showPreview, setShowPreview] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
+  const [selectedUser, setSelectedUser] = useState<any>(null);
+  const [deactivateDialogOpen, setDeactivateDialogOpen] = useState(false);
   const { token } = useAuth();
   
   const {
@@ -210,11 +216,31 @@ export default function AdminDashboard() {
       setSuccess('Announcement sent successfully');
       setMessage('');
       setTitle('');
-      setShowPreview(false);
     } catch (error: any) {
       setError(error.response?.data?.message || 'Failed to send announcement');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleDeactivateUser = async () => {
+    if (!selectedUser) return;
+
+    setLoading(true);
+    try {
+      await axios.post(
+        buildApiUrl(`/api/admin/users/${selectedUser.userId}/deactivate`),
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      await loadUsers(); // Reload users list
+      setSuccess(`User ${selectedUser.email} has been deactivated`);
+    } catch (error: any) {
+      setError(error.response?.data?.message || 'Failed to deactivate user');
+    } finally {
+      setLoading(false);
+      setDeactivateDialogOpen(false);
+      setSelectedUser(null);
     }
   };
 
@@ -387,6 +413,16 @@ export default function AdminDashboard() {
         </TabPanel>
 
         <TabPanel value={tabValue} index={2}>
+          {error && (
+            <Alert severity="error" sx={{ mb: 3 }}>
+              {error}
+            </Alert>
+          )}
+          {success && (
+            <Alert severity="success" sx={{ mb: 3 }}>
+              {success}
+            </Alert>
+          )}
           <TableContainer component={Paper}>
             <Table>
               <TableHead>
@@ -398,12 +434,14 @@ export default function AdminDashboard() {
                   <TableCell>Workflows</TableCell>
                   <TableCell>OAuth User</TableCell>
                   <TableCell>Admin</TableCell>
+                  <TableCell>Status</TableCell>
+                  <TableCell>Actions</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={7} align="center">
+                    <TableCell colSpan={9} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -429,6 +467,28 @@ export default function AdminDashboard() {
                       </TableCell>
                       <TableCell>{user.isOAuthUser ? 'Yes' : 'No'}</TableCell>
                       <TableCell>{user.isAdmin ? 'Yes' : 'No'}</TableCell>
+                      <TableCell>
+                        <Chip 
+                          label={user.isActive === false ? 'Inactive' : 'Active'} 
+                          color={user.isActive === false ? 'error' : 'success'}
+                          size="small"
+                        />
+                      </TableCell>
+                      <TableCell>
+                        {!user.isAdmin && user.isActive !== false && (
+                          <Button
+                            variant="outlined"
+                            color="error"
+                            size="small"
+                            onClick={() => {
+                              setSelectedUser(user);
+                              setDeactivateDialogOpen(true);
+                            }}
+                          >
+                            Deactivate
+                          </Button>
+                        )}
+                      </TableCell>
                     </TableRow>
                   ))
                 )}
@@ -561,6 +621,36 @@ export default function AdminDashboard() {
           </TableContainer>
         </TabPanel>
       </Paper>
+
+      {/* Deactivation Confirmation Dialog */}
+      <Dialog
+        open={deactivateDialogOpen}
+        onClose={() => setDeactivateDialogOpen(false)}
+      >
+        <DialogTitle>Confirm User Deactivation</DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            Are you sure you want to deactivate the account for {selectedUser?.email}? 
+            This action will prevent the user from accessing their account.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button 
+            onClick={() => setDeactivateDialogOpen(false)}
+            disabled={loading}
+          >
+            Cancel
+          </Button>
+          <Button 
+            onClick={handleDeactivateUser}
+            color="error"
+            variant="contained"
+            disabled={loading}
+          >
+            {loading ? <CircularProgress size={24} /> : 'Deactivate'}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Container>
   );
 } 
