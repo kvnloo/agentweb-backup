@@ -971,24 +971,32 @@ export default function TaskDetails() {
                     label="Perform Deep Research"
                   />
                 </Tooltip>
-                <FormControl sx={{ minWidth: 200 }}>
-                  <InputLabel id="llm-select-label">Preferred LLM</InputLabel>
-                  <Select
-                    labelId="llm-select-label"
-                    value={task.llmName !== undefined && task.llmName !== null ? task.llmName : ''}
-                    onChange={(e) => handleLLMChange(e.target.value)}
-                    label="Preferred LLM"
-                  >
-                    <MenuItem value="">
-                      <em>System Default Order</em>
-                    </MenuItem>
-                    {AVAILABLE_LLMS.map((llm) => (
-                      <MenuItem key={llm} value={llm}>
-                        {llm}
+                <Tooltip title={
+                  <div>
+                    <p>If selected, this LLM will be used first to run the task. If it fails, other LLMs will be tried as backup.</p>
+                    <p>LLM format: {`<deployment>-><provider>-><version>`}</p>
+                    <p>Example: "azure-{`>`}openai-{`>`}gpt-4o" means GPT-4 model deployed on Azure, provided by OpenAI</p>
+                  </div>
+                } placement="right">
+                  <FormControl sx={{ minWidth: 200 }}>
+                    <InputLabel id="llm-select-label">Preferred LLM</InputLabel>
+                    <Select
+                      labelId="llm-select-label"
+                      value={task.llmName !== undefined && task.llmName !== null ? task.llmName : ''}
+                      onChange={(e) => handleLLMChange(e.target.value)}
+                      label="Preferred LLM"
+                    >
+                      <MenuItem value="">
+                        <em>System Default Order</em>
                       </MenuItem>
-                    ))}
-                  </Select>
-                </FormControl>
+                      {AVAILABLE_LLMS.map((llm) => (
+                        <MenuItem key={llm} value={llm}>
+                          {llm}
+                        </MenuItem>
+                      ))}
+                    </Select>
+                  </FormControl>
+                </Tooltip>
               </Box>
             )}
           </Box>
