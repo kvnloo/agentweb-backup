@@ -16,6 +16,9 @@ import traceback
 import tempfile
 import time
 import argparse
+from datetime import datetime
+import html
+from task_utils import get_downloads_path, upload_task_result_files
 
 # Load environment variables
 load_dotenv()
@@ -42,14 +45,121 @@ except ImportError:
 class DeepResearchAgentWrapper:
     """Wrapper for the DeepResearchAgent from AG2"""
     
-    def __init__(self, config_path="OAI_CONFIG_LIST"):
+    def __init__(self, user_id: str, execution_id: str, config_path: str = "OAI_CONFIG_LIST"):
         """Initialize the DeepResearchAgent wrapper
         
         Args:
+            user_id: User ID for organizing outputs
+            execution_id: Execution ID for tracking
             config_path: Path to the OpenAI config list file
         """
         self.config_path = config_path
         self.llm_name = "azure->openai->gpt-4o" # TODO: support other LLMs
+        self.user_id = user_id
+        self.execution_id = execution_id
+    
+    def _generate_html_report(self, research_result: Dict[str, Any], query: str, output_file: str) -> str:
+        """Generate an HTML5 report from the research results
+        
+        Args:
+            research_result: The research results dictionary
+            query: The original research query
+            output_file: Path to the detailed output log file
+            
+        Returns:
+            Path to the generated HTML report
+        """
+        # Read the detailed log file
+        try:
+            with open(output_file, 'r') as f:
+                detailed_log = f.read()
+        except Exception as e:
+            detailed_log = f"Error reading detailed log: {str(e)}"
+            
+        # Generate timestamp
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Create HTML content
+        html_content = f"""
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Research Report: {html.escape(query[:50])}...</title>
+            <style>
+                body {{
+                    font-family: Arial, sans-serif;
+                    line-height: 1.6;
+                    max-width: 1200px;
+                    margin: 0 auto;
+                    padding: 20px;
+                    color: #333;
+                }}
+                .header {{
+                    background-color: #f5f5f5;
+                    padding: 20px;
+                    border-radius: 5px;
+                    margin-bottom: 20px;
+                }}
+                .summary {{
+                    background-color: #fff;
+                    padding: 20px;
+                    border: 1px solid #ddd;
+                    border-radius: 5px;
+                    margin-bottom: 20px;
+                }}
+                .details {{
+                    background-color: #f9f9f9;
+                    padding: 20px;
+                    border: 1px solid #ddd;
+                    border-radius: 5px;
+                    white-space: pre-wrap;
+                    font-family: monospace;
+                }}
+                .metadata {{
+                    color: #666;
+                    font-size: 0.9em;
+                    margin-top: 10px;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>Research Report</h1>
+                <div class="metadata">
+                    <p>Generated: {timestamp}</p>
+                    <p>Query: {html.escape(query)}</p>
+                    <p>LLM: {html.escape(research_result.get('llm_name', 'Unknown'))}</p>
+                </div>
+            </div>
+            
+            <div class="summary">
+                <h2>Research Summary</h2>
+                <p>{html.escape(research_result.get('summary', 'No summary available.'))}</p>
+            </div>
+            
+            <div class="details">
+                <h2>Detailed Research Log</h2>
+                <pre>{html.escape(detailed_log)}</pre>
+            </div>
+        </body>
+        </html>
+        """
+        
+        # Save HTML report using the shared downloads path with user_id and execution_id
+        report_path = os.path.join(
+            get_downloads_path(
+                user_id=self.user_id,
+                execution_id=self.execution_id
+            ),
+            f"research_report.html"
+        )
+        
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+            
+        return report_path
     
     def run_research(self, query: str, max_turns: int = 2, user_input: bool = False) -> Dict[str, Any]:
         """Run deep research on the given query
@@ -67,13 +177,9 @@ class DeepResearchAgentWrapper:
 
         # Assert that we run with azure openai LLM
         assert self.llm_name == "azure->openai->gpt-4o", "This script only supports azure openai LLM"
-        # Use a timestamp as a fallback if execution_id is not available
-        timestamp = int(time.time())
-        # The execution_id will be set in the main function
-        execution_id = getattr(self, 'execution_id', f"{timestamp}")
         
-        # Create a file for stdout redirection using the requested format
-        output_file = f"logs/execution_{execution_id}_deep_activities.log"
+        # Create a file for stdout redirection using the execution_id
+        output_file = f"logs/execution_{self.execution_id}_deep_activities.log"
         
         try:
             # Load config
@@ -117,6 +223,30 @@ class DeepResearchAgentWrapper:
                 "output_file": output_file  # Include the path to the output file
             }
             
+            # Get downloads path for storing generated files
+            downloads_path = get_downloads_path(
+                user_id=self.user_id,
+                execution_id=self.execution_id
+            )
+            
+            # Generate HTML report
+            try:
+                html_report_path = self._generate_html_report(research_result, query, output_file)
+                research_result["html_report"] = html_report_path
+                logger.info(f"HTML report generated at: {html_report_path}")
+            except Exception as e:
+                logger.error(f"Error generating HTML report: {str(e)}")
+                research_result["html_report_error"] = str(e)
+            
+            # Upload generated files to S3
+            try:
+                result_files = upload_task_result_files(downloads_path, self.execution_id)
+                if result_files:
+                    research_result["result_files"] = result_files
+                    logger.info(f"Uploaded {len(result_files)} files to S3")
+            except Exception as e:
+                logger.error(f"Error uploading result files to S3: {str(e)}")
+            
             logger.info(f"Deep research completed successfully. Summary length: {len(research_result['summary'])}")
             logger.info(f"Full output saved to: {output_file}")
             return research_result
@@ -158,11 +288,11 @@ def main():
         logger.info(f"Running deep research for user {args.user_id}, task {args.task_id}")
         logger.info(f"Prompt: {prompt[:100]}...")
         
-        # Initialize the deep research agent
-        agent = DeepResearchAgentWrapper()
-        
-        # Set the execution_id on the agent instance
-        agent.execution_id = args.execution_id
+        # Initialize the deep research agent with user_id and execution_id
+        agent = DeepResearchAgentWrapper(
+            user_id=args.user_id,
+            execution_id=args.execution_id
+        )
         
         # Run the research
         research_result = agent.run_research(

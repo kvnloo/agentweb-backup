@@ -19,6 +19,7 @@ import yaml
 import random
 from typing import Dict, Any
 from deep_research_agent import DeepResearchAgentWrapper  # Import the wrapper class
+from task_utils import upload_activity_log, upload_gif  # Import new utility functions
 
 # Custom JSON encoder to handle datetime objects
 class DateTimeEncoder(json.JSONEncoder):
@@ -584,22 +585,17 @@ async def execute_task(execution):
                 random_suffix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=20))
                 gif_path = f"agent_history_{execution_id}_{random_suffix}.gif"
                 
-                # Save prompt to a file
-                prompt_file = f'prompts/prompt_{execution_id}.txt'
-                with open(prompt_file, 'w') as f:
-                    f.write(prompt_with_context)
-                
                 # Run appropriate agent based on task type
                 if is_deep_research:
                     # Use DeepResearchAgentWrapper directly instead of CLI
                     try:
                         logger.info(f"Running deep research directly with LLM: {llm_name}")
                         
-                        # Initialize the deep research agent
-                        agent = DeepResearchAgentWrapper()
-                        
-                        # Set the execution_id on the agent instance
-                        agent.execution_id = execution_id
+                        # Initialize the deep research agent with user_id and execution_id
+                        agent = DeepResearchAgentWrapper(
+                            user_id=user_id,
+                            execution_id=execution_id
+                        )
                         
                         # Set the LLM name
                         agent.llm_name = llm_name
@@ -642,75 +638,14 @@ async def execute_task(execution):
                     # Upload browser-use log to S3 if it exists
                     filtered_activity_log = f'logs/execution_{execution_id}_browser_use.filtered.log'
                 
-                # Check for GIF and upload if exists
+                # Upload GIF if it exists
                 details_gif = None
                 if Path(gif_path).exists():
-                    s3_client = get_s3_client()
-                    s3_client.upload_file(gif_path, os.getenv('AWS_S3_BUCKET'), f"execution_gifs/{gif_path}", ExtraArgs={'ContentType': 'image/gif'})
-                    details_gif=f"https://{os.getenv('AWS_S3_BUCKET')}.s3.amazonaws.com/execution_gifs/{gif_path}"
-                    # Clean up local GIF file
-                    Path(gif_path).unlink()
+                    details_gif = upload_gif(gif_path)
                          
+                # Upload activity log if it exists
                 if filtered_activity_log and Path(filtered_activity_log).exists():
-                    try:
-                        s3_client = get_s3_client()
-                        # Generate a random token for this upload
-                        random_token = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=20))
-                        s3_key = f"execution_logs/{user_id}/activities_{execution_id}_{random_token}.log"
-
-                        # Read the log file and wrap it in HTML with pre-formatting
-                        with open(filtered_activity_log, 'r') as f:
-                            log_content = f.read()
-                        html_content = f"""<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <style>
-        pre {{
-            white-space: pre-wrap;
-            word-wrap: break-word;
-            font-family: monospace;
-            padding: 20px;
-            margin: 0;
-        }}
-    </style>
-</head>
-<body>
-    <pre>{log_content}</pre>
-</body>
-</html>"""
-
-                        # Create a temporary file for the HTML content
-                        html_file = filtered_activity_log + '.html'
-                        with open(html_file, 'w') as f:
-                            f.write(html_content)
-
-                        s3_client.upload_file(
-                            html_file,
-                            os.getenv('AWS_S3_BUCKET'),
-                            s3_key,
-                            ExtraArgs={
-                                'ContentType': 'text/html; charset=utf-8',
-                                'ContentDisposition': 'inline'
-                            }
-                        )
-                        logger.info(f"Uploaded browser-use log to S3: {s3_key}")
-                        
-                        # Store the log URL in the execution record
-                        executions_table.update_item(
-                            Key={'executionId': execution_id},
-                            UpdateExpression='SET browser_use_log = :log_url',
-                            ExpressionAttributeValues={
-                                ':log_url': f"https://{os.getenv('AWS_S3_BUCKET')}.s3.amazonaws.com/{s3_key}"
-                            }
-                        )
-                        
-                        # Remove the temporary HTML file and filtered log file
-                        Path(html_file).unlink()
-                        Path(filtered_activity_log).unlink()
-                        logger.info(f"Removed log files after successful upload")
-                    except Exception as e:
-                        logger.error(f"Error uploading browser-use log to S3: {e}")
+                    upload_activity_log(filtered_activity_log, user_id, execution_id)
                 
                 if result['success']:
                     result_summary = result.get('summary', 'No summary available')

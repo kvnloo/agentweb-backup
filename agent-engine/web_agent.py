@@ -25,7 +25,7 @@ import aiohttp
 import base64  # Add at the top with other imports
 import boto3  # Add at the top with other imports
 from urllib.parse import quote
-
+from task_utils import get_downloads_path, upload_task_result_files
 # Load environment variables
 load_dotenv()
 
@@ -302,48 +302,8 @@ class WebAgent:
             # If task completed successfully, check for downloaded files
             result_files = []
             if task_is_done and self.current_execution_id:
-                downloads_path = Path(self._get_downloads_path())
-                if downloads_path.exists():
-                    # Generate a random token for this batch of files
-                    random_token = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=20))
-                    
-                    for file_path in downloads_path.glob('*'):
-                        if file_path.is_file():
-                            try:
-                                # Upload file to S3 with random token in path
-                                s3_key = f"task_results/{self.current_execution_id}/{random_token}/{file_path.name}"
-                                self.s3_client.upload_file(
-                                    str(file_path),
-                                    self.s3_bucket,
-                                    s3_key,
-                                    ExtraArgs={'ContentDisposition': f'attachment; filename="{file_path.name}"'}
-                                )
-                                # Generate URL with proper encoding
-                                encoded_key = quote(s3_key)
-                                url = f"https://{self.s3_bucket}.s3.amazonaws.com/{encoded_key}"
-                                result_files.append({
-                                    'url': url,
-                                    'filename': file_path.name,
-                                    'token': random_token  # Store token for potential future validation
-                                })
-                                logger.info(f"Uploaded result file to S3: {url}")
-                            except Exception as e:
-                                logger.error(f"Error uploading file {file_path} to S3: {e}")
-
-                # Update execution record with result files if any were uploaded
-                if result_files:
-                    try:
-                        table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskExecutions')
-                        table.update_item(
-                            Key={'executionId': self.current_execution_id},
-                            UpdateExpression='SET result_files = :files',
-                            ExpressionAttributeValues={
-                                ':files': result_files
-                            }
-                        )
-                        logger.info(f"Updated execution record with {len(result_files)} result files")
-                    except Exception as e:
-                        logger.error(f"Error updating execution record with result files: {e}")
+                downloads_path = get_downloads_path(user_id=self.user_id, execution_id=self.current_execution_id)
+                result_files = upload_task_result_files(downloads_path, self.current_execution_id)
             
             return {
                 "success": task_is_done,
@@ -646,15 +606,10 @@ class WebAgent:
 
     def _get_downloads_path(self):
         """Get the path to the downloads directory for the current execution"""
-        if not self.current_execution_id:
-            # Fallback to user directory if no execution ID
-            base_path = Path('downloads') / (self.user_id or 'default')
-        else:
-            # Create execution-specific directory
-            base_path = Path('downloads') / (self.user_id or 'default') / self.current_execution_id
-        
-        base_path.mkdir(parents=True, exist_ok=True)
-        return str(base_path)
+        return get_downloads_path(
+            user_id=self.user_id,
+            execution_id=self.current_execution_id
+        )
 
     async def setup(self):
         """Initialize the browser instance"""
