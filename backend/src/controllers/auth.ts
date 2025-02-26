@@ -49,6 +49,11 @@ export const login = async (req: Request, res: Response) => {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
+    // Check if user is deactivated
+    if (user.isActive === false) {
+      return res.status(403).json({ message: 'Account has been deactivated. Please contact support.' });
+    }
+
     const isValidPassword = await bcrypt.compare(password, user.password);
     if (!isValidPassword) {
       return res.status(401).json({ message: 'Invalid credentials' });

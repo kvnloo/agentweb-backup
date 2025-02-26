@@ -20,13 +20,19 @@ import {
   CardContent,
   TextField,
   Chip,
-  Container
+  Container,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  DialogContentText
 } from '@mui/material';
 import { format } from 'date-fns';
 import { Link } from 'react-router-dom';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
 import { buildApiUrl } from '../config';
+import DOMPurify from 'dompurify';
 
 interface TabPanelProps {
   children?: React.ReactNode;
@@ -66,10 +72,11 @@ export default function AdminDashboard() {
   const [order, setOrder] = useState<'asc' | 'desc'>('desc');
   const [message, setMessage] = useState('');
   const [title, setTitle] = useState('');
-  const [showPreview, setShowPreview] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
+  const [selectedUser, setSelectedUser] = useState<any>(null);
+  const [deactivateDialogOpen, setDeactivateDialogOpen] = useState(false);
   const { token } = useAuth();
   
   const {
@@ -209,11 +216,31 @@ export default function AdminDashboard() {
       setSuccess('Announcement sent successfully');
       setMessage('');
       setTitle('');
-      setShowPreview(false);
     } catch (error: any) {
       setError(error.response?.data?.message || 'Failed to send announcement');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleDeactivateUser = async () => {
+    if (!selectedUser) return;
+
+    setLoading(true);
+    try {
+      await axios.post(
+        buildApiUrl(`/api/admin/users/${selectedUser.userId}/deactivate`),
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      await loadUsers(); // Reload users list
+      setSuccess(`User ${selectedUser.email} has been deactivated`);
+    } catch (error: any) {
+      setError(error.response?.data?.message || 'Failed to deactivate user');
+    } finally {
+      setLoading(false);
+      setDeactivateDialogOpen(false);
+      setSelectedUser(null);
     }
   };
 
@@ -317,10 +344,75 @@ export default function AdminDashboard() {
         </TabPanel>
 
         <TabPanel value={tabValue} index={1}>
-          <Typography variant="h6" gutterBottom>
-            Send Announcement
-          </Typography>
+          <Box component="form" onSubmit={handleAnnouncementSubmit}>
+            {error && (
+              <Alert severity="error" sx={{ mb: 3 }}>
+                {error}
+              </Alert>
+            )}
+            {success && (
+              <Alert severity="success" sx={{ mb: 3 }}>
+                {success}
+              </Alert>
+            )}
 
+            <TextField
+              label="Announcement Title"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              fullWidth
+              required
+              sx={{ mb: 2 }}
+            />
+
+            <TextField
+              label="Announcement Message"
+              multiline
+              rows={4}
+              value={message}
+              onChange={(e) => setMessage(e.target.value)}
+              fullWidth
+              required
+              sx={{ mb: 1 }}
+              helperText={
+                <Typography variant="caption">
+                  Supported HTML tags: <code>&lt;b&gt;</code> for bold, <code>&lt;i&gt;</code> for italic, 
+                  <code>&lt;u&gt;</code> for underline, <code>&lt;font color="..."&gt;</code> for text color, 
+                  <code>&lt;br&gt;</code> for line break
+                </Typography>
+              }
+            />
+
+            {message && (
+              <Box sx={{ mt: 3, mb: 3 }}>
+                <Typography variant="subtitle1" gutterBottom>
+                  Preview:
+                </Typography>
+                <Paper 
+                  variant="outlined" 
+                  sx={{ 
+                    p: 2,
+                    backgroundColor: 'grey.50',
+                    minHeight: '100px'
+                  }}
+                >
+                  <div dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(message) }} />
+                </Paper>
+              </Box>
+            )}
+
+            <Button
+              type="submit"
+              variant="contained"
+              disabled={loading}
+              sx={{ minWidth: 120 }}
+            >
+              {loading ? <CircularProgress size={24} /> : 'Send'}
+            </Button>
+          </Box>
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={2}>
           {error && (
             <Alert severity="error" sx={{ mb: 3 }}>
               {error}
@@ -331,72 +423,6 @@ export default function AdminDashboard() {
               {success}
             </Alert>
           )}
-
-          <Box component="form" onSubmit={handleAnnouncementSubmit}>
-            <TextField
-              label="Email Title"
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              fullWidth
-              required
-              sx={{ mb: 3 }}
-            />
-            <TextField
-              label="Announcement Message"
-              multiline
-              rows={4}
-              value={message}
-              onChange={(e) => setMessage(e.target.value)}
-              fullWidth
-              required
-              sx={{ mb: 3 }}
-              helperText="Enter your message with line breaks for paragraphs"
-            />
-
-            <Box sx={{ mb: 3, display: 'flex', gap: 2 }}>
-              <Button
-                type="submit"
-                variant="contained"
-                disabled={loading}
-                sx={{ minWidth: 120 }}
-              >
-                {loading ? <CircularProgress size={24} /> : 'Send'}
-              </Button>
-              
-              <Button
-                type="button"
-                variant="outlined"
-                onClick={() => setShowPreview(!showPreview)}
-              >
-                {showPreview ? 'Hide Preview' : 'Show Preview'}
-              </Button>
-            </Box>
-
-            {showPreview && (
-              <Paper sx={{ p: 3, bgcolor: 'grey.50' }}>
-                <Typography variant="h6" gutterBottom>
-                  Email Preview
-                </Typography>
-                <Paper sx={{ p: 2, mb: 2 }}>
-                  <Typography variant="subtitle1" gutterBottom>
-                    Subject: {title}
-                  </Typography>
-                  <Box sx={{ mt: 2 }}>
-                    {message.split('\n').map((line, index) => (
-                      line.trim() && (
-                        <Typography key={index} paragraph>
-                          {line}
-                        </Typography>
-                      )
-                    ))}
-                  </Box>
-                </Paper>
-              </Paper>
-            )}
-          </Box>
-        </TabPanel>
-
-        <TabPanel value={tabValue} index={2}>
           <TableContainer component={Paper}>
             <Table>
               <TableHead>
@@ -408,12 +434,14 @@ export default function AdminDashboard() {
                   <TableCell>Workflows</TableCell>
                   <TableCell>OAuth User</TableCell>
                   <TableCell>Admin</TableCell>
+                  <TableCell>Status</TableCell>
+                  <TableCell>Actions</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={7} align="center">
+                    <TableCell colSpan={9} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -439,6 +467,28 @@ export default function AdminDashboard() {
                       </TableCell>
                       <TableCell>{user.isOAuthUser ? 'Yes' : 'No'}</TableCell>
                       <TableCell>{user.isAdmin ? 'Yes' : 'No'}</TableCell>
+                      <TableCell>
+                        <Chip 
+                          label={user.isActive === false ? 'Inactive' : 'Active'} 
+                          color={user.isActive === false ? 'error' : 'success'}
+                          size="small"
+                        />
+                      </TableCell>
+                      <TableCell>
+                        {!user.isAdmin && user.isActive !== false && (
+                          <Button
+                            variant="outlined"
+                            color="error"
+                            size="small"
+                            onClick={() => {
+                              setSelectedUser(user);
+                              setDeactivateDialogOpen(true);
+                            }}
+                          >
+                            Deactivate
+                          </Button>
+                        )}
+                      </TableCell>
                     </TableRow>
                   ))
                 )}
@@ -571,6 +621,36 @@ export default function AdminDashboard() {
           </TableContainer>
         </TabPanel>
       </Paper>
+
+      {/* Deactivation Confirmation Dialog */}
+      <Dialog
+        open={deactivateDialogOpen}
+        onClose={() => setDeactivateDialogOpen(false)}
+      >
+        <DialogTitle>Confirm User Deactivation</DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            Are you sure you want to deactivate the account for {selectedUser?.email}? 
+            This action will prevent the user from accessing their account.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button 
+            onClick={() => setDeactivateDialogOpen(false)}
+            disabled={loading}
+          >
+            Cancel
+          </Button>
+          <Button 
+            onClick={handleDeactivateUser}
+            color="error"
+            variant="contained"
+            disabled={loading}
+          >
+            {loading ? <CircularProgress size={24} /> : 'Deactivate'}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Container>
   );
 } 

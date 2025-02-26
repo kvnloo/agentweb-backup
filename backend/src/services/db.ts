@@ -47,6 +47,7 @@ interface User {
   password: string;
   isOAuthUser: boolean;
   isAdmin: boolean;
+  isActive: boolean;
   createdAt: string;
 }
 
@@ -102,6 +103,7 @@ class UserDB {
         password,
         isOAuthUser,
         isAdmin,
+        isActive: true,
         createdAt: new Date().toISOString()
       }
     };
@@ -197,6 +199,33 @@ class UserDB {
     } catch (error) {
       console.error('Error in getUserAnalytics:', error);
       throw error;
+    }
+  }
+
+  async deactivateUser(userId: string) {
+    try {
+      // First get the user to get the email (primary key)
+      const user = await this.getUserById(userId);
+      if (!user) {
+        throw new Error('User not found');
+      }
+
+      const params = {
+        TableName: this.tableName,
+        Key: {
+          email: user.email  // Using email as the primary key
+        },
+        UpdateExpression: 'set isActive = :isActive',
+        ExpressionAttributeValues: {
+          ':isActive': false
+        },
+        ReturnValues: 'ALL_NEW'
+      };
+
+      const result = await this.docClient.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      this.handleError(error, 'deactivateUser');
     }
   }
 }
