@@ -316,7 +316,7 @@ export const taskDb = {
         Key: {
           taskId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
@@ -324,7 +324,8 @@ export const taskDb = {
           '#sum': 'summary',
           '#en': 'emailNotification',
           '#i': 'isInteractive',
-          '#dr': 'isDeepResearch'
+          '#dr': 'isDeepResearch',
+          '#llm': 'llmName'
         }
       };
 

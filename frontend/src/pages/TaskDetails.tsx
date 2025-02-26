@@ -26,6 +26,10 @@ import {
   ListItemSecondaryAction,
   Tooltip,
   Link,
+  Select,
+  MenuItem,
+  FormControl,
+  InputLabel,
 } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
@@ -54,6 +58,7 @@ interface Task {
   emailNotification?: boolean;
   isInteractive?: boolean;
   isDeepResearch?: boolean;
+  llmName?: string;
   attachments?: TaskAttachment[];
 }
 
@@ -321,6 +326,13 @@ const UserInteractionDialog = ({
     </Box>
   );
 };
+
+// Add this constant at the top level of the file
+const AVAILABLE_LLMS = [
+  'azure->openai->gpt-4o',
+  'aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0',
+  'openai->openai->gpt-4o'
+];
 
 export default function TaskDetails() {
   const [task, setTask] = useState<Task | null>(null);
@@ -798,6 +810,35 @@ export default function TaskDetails() {
     }
   };
 
+  const handleLLMChange = async (newLLMName: string) => {
+    if (!task) return;
+    
+    try {
+      await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        {
+          llmName: newLLMName || null // Send null to clear the preference
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+
+      // Update the task state with the response
+      const taskResponse = await axios.get(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+      
+      setTask(taskResponse.data);
+    } catch (error: any) {
+      console.error('Error updating LLM preference:', error);
+      setError(error.response?.data?.message || 'Failed to update LLM preference');
+    }
+  };
+
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
@@ -930,6 +971,24 @@ export default function TaskDetails() {
                     label="Perform Deep Research"
                   />
                 </Tooltip>
+                <FormControl sx={{ minWidth: 200 }}>
+                  <InputLabel id="llm-select-label">Preferred LLM</InputLabel>
+                  <Select
+                    labelId="llm-select-label"
+                    value={task.llmName !== undefined && task.llmName !== null ? task.llmName : ''}
+                    onChange={(e) => handleLLMChange(e.target.value)}
+                    label="Preferred LLM"
+                  >
+                    <MenuItem value="">
+                      <em>System Default Order</em>
+                    </MenuItem>
+                    {AVAILABLE_LLMS.map((llm) => (
+                      <MenuItem key={llm} value={llm}>
+                        {llm}
+                      </MenuItem>
+                    ))}
+                  </Select>
+                </FormControl>
               </Box>
             )}
           </Box>

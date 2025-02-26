@@ -146,6 +146,10 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
       updates.isDeepResearch = Boolean(req.body.isDeepResearch);
     }
 
+    if (req.body.llmName !== undefined) {
+      updates.llmName = req.body.llmName || null;  // Convert empty string to null
+    }
+
     console.log('Updates to apply:', updates);
 
     await taskDb.updateTask(taskId, updates);
