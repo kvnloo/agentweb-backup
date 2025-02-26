@@ -44,7 +44,7 @@ import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
 import ScheduleForm from '../components/ScheduleForm';
 import ScheduleList from '../components/ScheduleList';
-import { buildApiUrl } from '../config';
+import { buildApiUrl, AVAILABLE_LLMS } from '../config';
 
 interface Task {
   taskId: string;
@@ -326,13 +326,6 @@ const UserInteractionDialog = ({
     </Box>
   );
 };
-
-// Add this constant at the top level of the file
-const AVAILABLE_LLMS = [
-  'azure->openai->gpt-4o',
-  'aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0',
-  'openai->openai->gpt-4o'
-];
 
 export default function TaskDetails() {
   const [task, setTask] = useState<Task | null>(null);
@@ -989,7 +982,7 @@ export default function TaskDetails() {
                       <MenuItem value="">
                         <em>System Default Order</em>
                       </MenuItem>
-                      {AVAILABLE_LLMS.map((llm) => (
+                      {AVAILABLE_LLMS.map((llm: string) => (
                         <MenuItem key={llm} value={llm}>
                           {llm}
                         </MenuItem>

@@ -148,7 +148,8 @@ def get_llm(full_llm_name: str) -> Tuple[Any, str]:
     VALID_CONFIGURATIONS = {
         "aws": {
             "anthropic": {
-                "anthropic.claude-3-5-sonnet-20241022-v2:0": get_aws_bedrock_llm
+                "anthropic.claude-3-5-sonnet-20241022-v2:0": get_aws_bedrock_llm,
+                "us.anthropic.claude-3-7-sonnet-20250219-v1:0": get_aws_bedrock_llm
             }
         },
         "azure": {

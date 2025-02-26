@@ -403,7 +403,8 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
         os.unlink(prompt_file)
         
         # Write both stdout and stderr to log file for debugging
-        with open(log_file, 'w') as f:
+        with open(log_file, 'a') as f:
+            f.write("\n\n=== NEW EXECUTION AT " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " ===\n")
             f.write("=== COMMAND ===\n")
             f.write(" ".join(cmd) + "\n\n")
             if stdout:
@@ -414,6 +415,7 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
                 f.write("=== STDERR ===\n")
                 f.write(stderr.decode())
                 f.write("\n")
+            f.write("=" * 80 + "\n")
         
         if process.returncode == 0:
             try:
