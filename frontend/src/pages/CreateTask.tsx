@@ -119,6 +119,9 @@ export default function CreateTask() {
               Deep Research Mode is enabled. When you run this task, it will use advanced AI to perform comprehensive research on your topic using public web data only. Currently does not use your uploads or web accounts (Config), but will support these in the future. Email notifications are automatically enabled for Deep Research tasks.
             </Alert>
           )}
+          <Alert severity="info" sx={{ mt: 2, mb: 2 }}>
+            All settings including task name, prompt, and modes can be modified later in the Task Details page.
+          </Alert>
           <Box sx={{ mt: 3, display: 'flex', gap: 2 }}>
             <Button
               type="submit"
