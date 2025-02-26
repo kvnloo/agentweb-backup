@@ -227,20 +227,39 @@ def upload_task_result_files(downloads_path: str, execution_id: str) -> List[Dic
                     try:
                         # Upload file to S3 with random token in path
                         s3_key = f"task_results/{execution_id}/{random_token}/{file_path.name}"
+                        
+                        # Set different ContentDisposition for HTML files to allow viewing in browser
+                        extra_args = {}
+                        if file_path.suffix.lower() == '.html':
+                            # For HTML files, set inline disposition to open in browser
+                            extra_args = {'ContentDisposition': f'inline; filename="{file_path.name}"', 
+                                         'ContentType': 'text/html; charset=utf-8'}
+                        else:
+                            # For other files, keep attachment disposition for download
+                            extra_args = {'ContentDisposition': f'attachment; filename="{file_path.name}"'}
+                            
                         s3_client.upload_file(
                             str(file_path),
                             s3_bucket,
                             s3_key,
-                            ExtraArgs={'ContentDisposition': f'attachment; filename="{file_path.name}"'}
+                            ExtraArgs=extra_args
                         )
                         # Generate URL with proper encoding
                         encoded_key = quote(s3_key)
                         url = f"https://{s3_bucket}.s3.amazonaws.com/{encoded_key}"
-                        result_files.append({
+                        
+                        # Add a flag to indicate if this is a viewable HTML file
+                        file_info = {
                             'url': url,
                             'filename': file_path.name,
-                            'token': random_token  # Store token for potential future validation
-                        })
+                            'token': random_token,  # Store token for potential future validation
+                        }
+                        
+                        # Add a flag to indicate if this is a viewable HTML file
+                        if file_path.suffix.lower() == '.html':
+                            file_info['is_html'] = True
+                            
+                        result_files.append(file_info)
                         logger.info(f"Uploaded result file to S3: {url}")
                     except Exception as e:
                         logger.error(f"Error uploading file {file_path} to S3: {e}")

@@ -90,6 +90,7 @@ interface TaskExecution {
     url: string;
     filename: string;
     token: string;
+    is_html?: boolean;
   }[];
 }
 
@@ -1175,6 +1176,7 @@ export default function TaskDetails() {
                                           variant="outlined"
                                           size="small"
                                           sx={{ mt: 1 }}
+                                          icon={file.is_html ? <ScreenshotIcon fontSize="small" /> : undefined}
                                         />
                                       ))}
                                     </Box>

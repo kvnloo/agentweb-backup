@@ -79,210 +79,78 @@ class DeepResearchAgentWrapper:
         # Generate timestamp
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        # Use LLM to create a more readable version of the detailed log
+        # For large logs, use first and last portions
+        log_for_prompt = detailed_log
+        if len(detailed_log) > 50000:
+            first_part = detailed_log[:25000]
+            last_part = detailed_log[-25000:]
+            log_for_prompt = f"{first_part}\n\n[...MIDDLE SECTION TRUNCATED...]\n\n{last_part}"
+            logger.info(f"Detailed log truncated from {len(detailed_log)} to {len(log_for_prompt)} characters")
+        
+        # Use LLM to create a complete HTML report
         try:
             # Use the shared get_llm function to get a language model for report generation
-            # We'll use the same LLM as the main research agent
             llm, _ = get_llm(self.llm_name)
-            
-            # For large logs, use first and last portions
-            log_for_prompt = detailed_log
-            if len(detailed_log) > 50000:
-                first_part = detailed_log[:25000]
-                last_part = detailed_log[-25000:]
-                log_for_prompt = f"{first_part}\n\n[...MIDDLE SECTION TRUNCATED...]\n\n{last_part}"
-                logger.info(f"Detailed log truncated from {len(detailed_log)} to {len(log_for_prompt)} characters")
             
             # Prepare prompt for the LLM
             format_prompt = f"""
-            Please analyze the following research log and create a comprehensive, well-structured, detailed report in HTML format.
-            
-            IMPORTANT: Your output will be directly inserted into an HTML document within a div with class "formatted-report".
-            DO NOT include complete HTML document tags like <!DOCTYPE>, <html>, <head>, <body>, etc.
-            DO include proper HTML formatting for the content itself using appropriate tags.
-            
-            Make the report as valuable and informative as possible, including all relevant details, data points, and insights.
-            
-            Organize the information into clear sections such as:
-            
-            1. Research Process: Describe the steps taken during the research in detail
-            2. Key Findings: Highlight the most important discoveries with supporting evidence and data
-            3. References: List and summarize all sources consulted, including URLs, titles, authors, and publication dates where available
-            4. Conclusions: Provide thorough, evidence-based conclusions and recommendations
-            
-            Use proper HTML formatting:
-            - Use <h3>, <h4> tags for section headers (h1 and h2 are already used in the document)
-            - Use <ul> and <li> for bullet point lists
-            - Use <ol> and <li> for numbered lists
-            - Use <table>, <tr>, <th>, <td> for data tables
-            - Use <strong> for emphasis
-            - Use <blockquote> for quotes
-            - Use <a href="URL"> for links
-            - Use <p> for paragraphs
-            
-            Make the report comprehensive, detailed, and visually structured for easy reading.
-            
-            Original Query: {query}
-            
-            Research Log:
+            You are a professional research report generator. Your task is to create a complete, self-contained HTML document 
+            that presents the research findings in a visually appealing and professional format.
+
+            The research was conducted on the following query: "{query}"
+
+            IMPORTANT INSTRUCTIONS:
+            1. Generate a COMPLETE HTML document including <!DOCTYPE html>, <html>, <head>, <body> tags, and embedded CSS.
+            2. The report should be visually appealing with professional styling.
+            3. Extract the initial research summary from the end of the log and use it as a foundation.
+            4. Enrich this summary with additional details from other parts of the log.
+            5. Include all relevant information: research process, key findings, references, and conclusions.
+            6. Make the report as comprehensive and detailed as possible.
+            7. Use proper HTML formatting with semantic tags.
+            8. Include embedded CSS for styling (no external dependencies).
+            9. Use a clean, professional color scheme.
+            10. Ensure the report is well-structured with clear headings and sections.
+            11. Format references as a properly structured list with links where available.
+
+            Here is the research log to analyze:
             {log_for_prompt}
             """
             
-            # Use the LLM directly to generate the formatted report
-            logger.info("Using LLM to create formatted research report")
+            # Use the LLM directly to generate the complete HTML report
+            logger.info("Using LLM to create complete HTML research report")
             
-            # Use the LLM directly for all model types
             from langchain_core.messages import HumanMessage
             formatted_result = llm.invoke([HumanMessage(content=format_prompt)])
-            formatted_report = formatted_result.content
+            html_content = formatted_result.content
             
-            logger.info(f"Successfully generated formatted report with LLM (length: {len(formatted_report)})")
+            logger.info(f"Successfully generated complete HTML report with LLM (length: {len(html_content)})")
             
         except Exception as e:
-            logger.error(f"Error using LLM to format report: {str(e)}")
-            formatted_report = "<p>Error generating formatted report with LLM.</p>"
-            
-        # Create HTML content
-        html_content = f"""
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Research Report: {html.escape(query[:50])}...</title>
-            <style>
-                body {{
-                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                    line-height: 1.6;
-                    max-width: 1200px;
-                    margin: 0 auto;
-                    padding: 20px;
-                    color: #333;
-                    background-color: #f9f9f9;
-                }}
-                .header {{
-                    background-color: #2c3e50;
-                    color: white;
-                    padding: 30px;
-                    border-radius: 8px;
-                    margin-bottom: 30px;
-                    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-                }}
-                .header h1 {{
-                    margin-top: 0;
-                    font-size: 2.2em;
-                }}
-                .summary {{
-                    background-color: white;
-                    padding: 25px;
-                    border-radius: 8px;
-                    margin-bottom: 30px;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-                }}
-                .formatted-report {{
-                    background-color: white;
-                    padding: 25px;
-                    border-radius: 8px;
-                    margin-bottom: 30px;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-                }}
-                .formatted-report table {{
-                    border-collapse: collapse;
-                    width: 100%;
-                    margin: 15px 0;
-                }}
-                .formatted-report th, .formatted-report td {{
-                    border: 1px solid #ddd;
-                    padding: 12px;
-                    text-align: left;
-                }}
-                .formatted-report th {{
-                    background-color: #f2f2f2;
-                }}
-                .formatted-report tr:nth-child(even) {{
-                    background-color: #f9f9f9;
-                }}
-                .formatted-report blockquote {{
-                    border-left: 4px solid #2c3e50;
-                    padding-left: 15px;
-                    margin-left: 0;
-                    color: #555;
-                    font-style: italic;
-                }}
-                .formatted-report ul, .formatted-report ol {{
-                    padding-left: 25px;
-                }}
-                .formatted-report img {{
-                    max-width: 100%;
-                    height: auto;
-                    display: block;
-                    margin: 20px auto;
-                    border-radius: 4px;
-                }}
-                .metadata {{
-                    color: #eee;
-                    font-size: 0.9em;
-                    margin-top: 15px;
-                }}
-                h2 {{
-                    color: #2c3e50;
-                    border-bottom: 2px solid #eee;
-                    padding-bottom: 10px;
-                    margin-top: 30px;
-                }}
-                h3 {{
-                    color: #3498db;
-                    margin-top: 25px;
-                }}
-                h4 {{
-                    color: #2980b9;
-                    margin-top: 20px;
-                }}
-                a {{
-                    color: #3498db;
-                    text-decoration: none;
-                }}
-                a:hover {{
-                    text-decoration: underline;
-                }}
-                code {{
-                    background-color: #f8f8f8;
-                    padding: 2px 5px;
-                    border-radius: 3px;
-                    font-family: monospace;
-                    font-size: 0.9em;
-                }}
-                pre {{
-                    background-color: #f8f8f8;
-                    padding: 15px;
-                    border-radius: 5px;
-                    overflow-x: auto;
-                    font-family: monospace;
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="header">
-                <h1>Research Report</h1>
-                <div class="metadata">
-                    <p>Generated: {timestamp}</p>
-                    <p>Query: {html.escape(query)}</p>
-                    <p>LLM: {html.escape(research_result.get('llm_name', 'Unknown'))}</p>
-                </div>
-            </div>
-            
-            <div class="summary">
-                <h2>Research Summary</h2>
-                <p>{html.escape(research_result.get('summary', 'No summary available.'))}</p>
-            </div>
-            
-            <div class="formatted-report">
-                <h2>Detailed Research Report</h2>
-                {formatted_report}
-            </div>
-        </body>
-        </html>
-        """
+            logger.error(f"Error using LLM to generate report: {str(e)}")
+            # Create a simple error report
+            html_content = f"""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Error Generating Research Report</title>
+                <style>
+                    body {{ font-family: Arial, sans-serif; line-height: 1.6; padding: 20px; }}
+                    .error {{ color: #d32f2f; background-color: #ffebee; padding: 15px; border-radius: 4px; }}
+                </style>
+            </head>
+            <body>
+                <h1>Error Generating Research Report</h1>
+                <p>There was an error while generating the research report:</p>
+                <div class="error">{str(e)}</div>
+                <h2>Research Query</h2>
+                <p>{query}</p>
+                <h2>Timestamp</h2>
+                <p>{timestamp}</p>
+            </body>
+            </html>
+            """
         
         # Save HTML report using the shared downloads path with user_id and execution_id
         report_path = os.path.join(
