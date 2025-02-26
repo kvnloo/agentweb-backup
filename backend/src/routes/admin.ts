@@ -228,13 +228,16 @@ router.post('/announcements/send', async (req, res) => {
       return res.status(400).json({ message: 'Title and message are required' });
     }
 
-    // Get all users
+    // Get all active users
     const users = await userDb.getAllUsers();
-    const emails = users.map(user => user.email).filter(Boolean);
+    const activeEmails = users
+      .filter(user => user.isActive !== false) // Filter out deactivated users
+      .map(user => user.email)
+      .filter(Boolean);
 
-    // Send announcement email to all users
+    // Send announcement email to all active users
     await Promise.all(
-      emails.map(email => 
+      activeEmails.map(email => 
         emailService.sendEmail(
           email,
           title,
@@ -304,7 +307,7 @@ router.post('/announcements/send', async (req, res) => {
       )
     );
 
-    res.json({ message: `Announcement sent to ${emails.length} users` });
+    res.json({ message: `Announcement sent to ${activeEmails.length} active users` });
   } catch (error) {
     console.error('Error sending announcement:', error);
     res.status(500).json({ message: 'Error sending announcement' });
