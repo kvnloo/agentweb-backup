@@ -1,17 +1,24 @@
 import os
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 import boto3
 import random
 import logging
+import sys
 from urllib.parse import quote
-from aws_utils import get_dynamodb_resource, get_s3_client
+from aws_utils import get_dynamodb_resource, get_s3_client, get_bedrock_client
+from pydantic import SecretStr
+from langchain_aws import ChatBedrock
+from langchain_openai import AzureChatOpenAI, ChatOpenAI
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
 # Get table prefix based on NODE_ENV
 TABLE_PREFIX = 'Dev-' if os.getenv('NODE_ENV') == 'development' else ''
+
+# Global variable for vision support
+global_use_vision = True
 
 def get_downloads_path(user_id: Optional[str] = None, execution_id: Optional[str] = None) -> str:
     """Get the downloads path for storing task outputs
@@ -35,6 +42,165 @@ def get_downloads_path(user_id: Optional[str] = None, execution_id: Optional[str
     
     base_path.mkdir(parents=True, exist_ok=True)
     return str(base_path)
+
+def get_aws_bedrock_llm(model_name: str):
+    """Initialize AWS Bedrock language model"""
+    try:
+        # Get Bedrock client with no retries
+        bedrock = get_bedrock_client()
+
+        return ChatBedrock(
+            client=bedrock,
+            model_id=model_name,
+            model_kwargs={"temperature": 0.0}
+        )
+    except Exception as e:
+        if "AccessDeniedException" in str(e):
+            logger.error("Error: The AWS user lacks permission to invoke Claude model in Bedrock.")
+            logger.error("Please ensure the user has the necessary permissions and the model exists.")
+            sys.exit(1)
+        raise
+
+def get_azure_openai_llm(model_name: str):
+    """Initialize Azure OpenAI language model"""
+    try:
+        deployment_name = os.getenv('AZURE_OPENAI_DEPLOYMENT', 'agentweb')
+        
+        return AzureChatOpenAI(
+            model_name=model_name,
+            azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT'),
+            azure_deployment=deployment_name,
+            api_key=os.getenv('AZURE_OPENAI_API_KEY'),
+            api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-08-01-preview'),
+            temperature=0.0
+        )
+    except Exception as e:
+        logger.error(f"Error initializing Azure OpenAI: {e}")
+        logger.error("Please ensure all Azure OpenAI environment variables are set correctly.")
+        sys.exit(1)
+
+def get_deepseek_llm(model_name: str):
+    """Initialize DeepSeek language model"""
+    try:
+        api_key = os.getenv('DEEPSEEK_API_KEY')
+        if not api_key:
+            raise ValueError('DEEPSEEK_API_KEY is not set')
+            
+        return ChatOpenAI(
+            base_url='https://api.deepseek.com/v1',
+            model=model_name,
+            api_key=SecretStr(api_key),
+            temperature=0.0
+        )
+    except Exception as e:
+        logger.error(f"Error initializing DeepSeek: {e}")
+        logger.error("Please ensure DEEPSEEK_API_KEY environment variable is set correctly.")
+        sys.exit(1)
+
+def get_openai_llm(model_name: str):
+    """Initialize OpenAI language model"""
+    try:
+        api_key = os.getenv('OPENAI_API_KEY')
+        if not api_key:
+            raise ValueError('OPENAI_API_KEY is not set')
+            
+        return ChatOpenAI(
+            model=model_name,
+            api_key=SecretStr(api_key),
+            temperature=0.0
+        )
+    except Exception as e:
+        logger.error(f"Error initializing OpenAI: {e}")
+        logger.error("Please ensure OPENAI_API_KEY environment variable is set correctly.")
+        sys.exit(1)
+
+def get_openai_llm_think(model_name: str):
+    """Initialize OpenAI language model"""
+    global global_use_vision
+    try:
+        api_key = os.getenv('OPENAI_API_KEY')
+        if not api_key:
+            raise ValueError('OPENAI_API_KEY is not set')
+            
+        # For think model such as o3-mini, we disable vision: https://github.com/browser-use/browser-use/issues/283
+        global_use_vision = False
+        logger.warning(f"Vision is disabled for {model_name}. Execution details in gif will not be available.")
+        return ChatOpenAI(
+            model=model_name,
+            api_key=SecretStr(api_key),
+            disabled_params={"parallel_tool_calls": None}
+        )
+    except Exception as e:
+        logger.error(f"Error initializing OpenAI: {e}")
+        logger.error("Please ensure OPENAI_API_KEY environment variable is set correctly.")
+        sys.exit(1)
+
+def get_llm(full_llm_name: str) -> Tuple[Any, str]:
+    """Get the appropriate language model based on provided configuration
+    
+    Args:
+        full_llm_name: Full LLM name in format platform->provider->model
+        
+    Returns:
+        Tuple containing the initialized LLM and the full LLM name
+    """
+    # Define valid platform-provider-model combinations with their initialization functions
+    VALID_CONFIGURATIONS = {
+        "aws": {
+            "anthropic": {
+                "anthropic.claude-3-5-sonnet-20241022-v2:0": get_aws_bedrock_llm
+            }
+        },
+        "azure": {
+            "openai": {
+                "gpt-4o": get_azure_openai_llm
+            }
+        },
+        "deepseek": {
+            "deepseek": {
+                "deepseek-reasoner": get_deepseek_llm
+            }
+        },
+        "openai": {
+            "openai": {
+                "gpt-4o": get_openai_llm,
+                "o3-mini": get_openai_llm_think
+            }
+        }
+    }
+
+    try:
+        platform, provider, model_name = full_llm_name.lower().split('->')
+    except ValueError:
+        logger.error(f"Invalid FULL_LLM_NAME format: {full_llm_name}")
+        logger.error("Format should be <platform>-><provider>-><model>")
+        sys.exit(1)
+    
+    logger.info(f"Initializing LLM - Platform: {platform}, Provider: {provider}, Model: {model_name}")
+
+    # Get the provider mapping for the platform
+    platform_config = VALID_CONFIGURATIONS.get(platform)
+    if not platform_config:
+        logger.error(f"Unsupported platform: {platform}")
+        logger.error(f"Valid platforms are: {list(VALID_CONFIGURATIONS.keys())}")
+        sys.exit(1)
+
+    # Get the model mapping for the provider
+    provider_config = platform_config.get(provider)
+    if not provider_config:
+        logger.error(f"Invalid provider '{provider}' for platform '{platform}'")
+        logger.error(f"Valid providers for {platform} are: {list(platform_config.keys())}")
+        sys.exit(1)
+
+    # Get the initialization function for the model
+    init_func = provider_config.get(model_name)
+    if not init_func:
+        logger.error(f"Invalid model '{model_name}' for provider '{provider}' on platform '{platform}'")
+        logger.error(f"Valid models are: {list(provider_config.keys())}")
+        sys.exit(1)
+
+    # Initialize the LLM using the mapped function
+    return init_func(model_name), full_llm_name
 
 def upload_task_result_files(downloads_path: str, execution_id: str) -> List[Dict[str, str]]:
     """Upload task result files from downloads directory to S3
