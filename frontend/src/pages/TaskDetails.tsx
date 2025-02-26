@@ -971,7 +971,7 @@ export default function TaskDetails() {
                     <p>Example: "azure-{`>`}openai-{`>`}gpt-4o" means GPT-4 model deployed on Azure, provided by OpenAI</p>
                   </div>
                 } placement="right">
-                  <FormControl sx={{ minWidth: 200 }}>
+                  <FormControl sx={{ width: 400 }}>
                     <InputLabel id="llm-select-label">Preferred LLM</InputLabel>
                     <Select
                       labelId="llm-select-label"
