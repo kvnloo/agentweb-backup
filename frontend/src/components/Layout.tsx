@@ -10,7 +10,8 @@ import {
   MenuItem,
   Toolbar,
   Typography,
-  Chip
+  Chip,
+  Alert
 } from '@mui/material';
 import AccountCircle from '@mui/icons-material/AccountCircle';
 import { useAuth } from '../contexts/AuthContext';
@@ -193,6 +194,23 @@ export default function Layout() {
           )}
         </Toolbar>
       </AppBar>
+      {user && location.pathname !== '/' && (
+        <Alert 
+          severity="info" 
+          sx={{ 
+            borderRadius: 0,
+            '& .MuiAlert-message': {
+              width: '100%',
+              textAlign: 'center'
+            }
+          }}
+        >
+          🚧 Private Beta: This is a beta version - bugs and issues may arise. Please report them to{' '}
+          <a href="mailto:agentwebpro@gmail.com" style={{ color: 'inherit', fontWeight: 'bold' }}>
+            agentwebpro@gmail.com
+          </a>
+        </Alert>
+      )}
       <Container component="main" sx={{ mt: 4, mb: 4, flexGrow: 1 }}>
         <Outlet />
       </Container>
