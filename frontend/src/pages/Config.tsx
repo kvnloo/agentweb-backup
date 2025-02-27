@@ -32,6 +32,7 @@ interface Config {
   createdAt: string;
   sharedBy?: string;
   sharedWith?: string[];
+  shareWithEveryone?: boolean;
 }
 
 // Helper function to mask email
@@ -44,6 +45,7 @@ const maskEmail = (email: string) => {
 export default function Config() {
   const { token } = useAuth();
   const [configs, setConfigs] = useState<Config[]>([]);
+  const [sharedConfigs, setSharedConfigs] = useState<Config[]>([]);
   const [openDialog, setOpenDialog] = useState(false);
   const [openShareDialog, setOpenShareDialog] = useState(false);
   const [selectedConfig, setSelectedConfig] = useState<string>('');
@@ -57,13 +59,24 @@ export default function Config() {
   const [fieldError, setFieldError] = useState('');
   const [shareError, setShareError] = useState('');
   const [shareSuccess, setShareSuccess] = useState('');
+  const [userId, setUserId] = useState<string>('');
 
   const fetchConfigs = async () => {
     try {
-      const response = await axios.get(buildApiUrl('/api/config'), {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      setConfigs(response.data);
+      const [configsResponse, sharedConfigsResponse, userResponse] = await Promise.all([
+        axios.get(buildApiUrl('/api/config'), {
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+        axios.get(buildApiUrl('/api/config/shared'), {
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+        axios.get(buildApiUrl('/api/auth/me'), {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+      ]);
+      setConfigs(configsResponse.data);
+      setSharedConfigs(sharedConfigsResponse.data);
+      setUserId(userResponse.data.userId);
     } catch (err) {
       console.error('Error fetching configs:', err);
       setError('Failed to fetch configurations');
@@ -117,7 +130,7 @@ export default function Config() {
       setShareSuccess('');
       await axios.post(
         buildApiUrl(`/api/config/${selectedConfig}/share`),
-        { email: shareEmail },
+        shareEmail ? { email: shareEmail } : { shareWithEveryone: true },
         { headers: { Authorization: `Bearer ${token}` } }
       );
       setShareSuccess('Configuration shared successfully');
@@ -166,6 +179,9 @@ export default function Config() {
 
         <Card>
           <CardContent>
+            <Typography variant="h6" gutterBottom>
+              My Configurations
+            </Typography>
             <List>
               {configs.map((config) => (
                 <ListItem
@@ -194,8 +210,8 @@ export default function Config() {
                   <ListItemText
                     primary={
                       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                        {config.website}
-                        {config.sharedBy && (
+                        <span>{config.website}</span>
+                        {config.sharedBy && config.sharedBy !== userId && (
                           <Chip
                             size="small"
                             label={`Shared by ${maskEmail(config.sharedBy)}`}
@@ -203,7 +219,15 @@ export default function Config() {
                             sx={{ ml: 1 }}
                           />
                         )}
-                        {config.sharedWith && config.sharedWith.length > 0 && (
+                        {config.shareWithEveryone && (
+                          <Chip
+                            size="small"
+                            label="Shared with everyone"
+                            color="success"
+                            sx={{ ml: 1 }}
+                          />
+                        )}
+                        {!config.shareWithEveryone && config.sharedWith && config.sharedWith.length > 0 && (
                           <Chip
                             size="small"
                             label={`Shared with ${config.sharedWith.length} user${config.sharedWith.length > 1 ? 's' : ''}`}
@@ -229,6 +253,38 @@ export default function Config() {
             </List>
           </CardContent>
         </Card>
+
+        {sharedConfigs.length > 0 && (
+          <Card sx={{ mt: 3 }}>
+            <CardContent>
+              <Typography variant="h6" gutterBottom>
+                Shared with Me
+              </Typography>
+              <List>
+                {sharedConfigs.map((config) => (
+                  <ListItem key={config.configId} divider>
+                    <ListItemText
+                      primary={
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                          {config.website}
+                          {config.sharedBy && (
+                            <Chip
+                              size="small"
+                              label={`Shared by ${maskEmail(config.sharedBy)}`}
+                              color="info"
+                              sx={{ ml: 1 }}
+                            />
+                          )}
+                        </Box>
+                      }
+                      secondary={`Username: ${config.username}`}
+                    />
+                  </ListItem>
+                ))}
+              </List>
+            </CardContent>
+          </Card>
+        )}
 
         <Dialog open={openDialog} onClose={() => setOpenDialog(false)}>
           <DialogTitle>Add New Configuration</DialogTitle>
@@ -299,16 +355,29 @@ export default function Config() {
                     {shareError}
                   </Alert>
                 )}
-                <TextField
-                  autoFocus
-                  margin="dense"
-                  label="Recipient Email"
-                  type="email"
-                  fullWidth
-                  value={shareEmail}
-                  onChange={(e) => setShareEmail(e.target.value)}
-                  helperText="Enter the email of the user you want to share with"
-                />
+                <Box sx={{ mt: 2 }}>
+                  <Button
+                    variant="contained"
+                    color="primary"
+                    fullWidth
+                    onClick={() => handleShare()}
+                    sx={{ mb: 2 }}
+                  >
+                    Share with Everyone
+                  </Button>
+                  <Typography variant="body2" align="center" sx={{ mb: 2 }}>
+                    - OR -
+                  </Typography>
+                  <TextField
+                    margin="dense"
+                    label="Share with Specific User"
+                    type="email"
+                    fullWidth
+                    value={shareEmail}
+                    onChange={(e) => setShareEmail(e.target.value)}
+                    helperText="Enter the email of the user you want to share with"
+                  />
+                </Box>
               </>
             )}
           </DialogContent>
@@ -322,13 +391,15 @@ export default function Config() {
             >
               Cancel
             </Button>
-            <Button 
-              onClick={handleShare} 
-              color="primary"
-              disabled={!shareEmail || !!shareSuccess}
-            >
-              Share
-            </Button>
+            {shareEmail && (
+              <Button 
+                onClick={handleShare} 
+                color="primary"
+                disabled={!shareEmail || !!shareSuccess}
+              >
+                Share with User
+              </Button>
+            )}
           </DialogActions>
         </Dialog>
       </Box>
