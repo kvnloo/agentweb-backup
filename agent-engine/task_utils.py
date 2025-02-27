@@ -64,7 +64,7 @@ def get_aws_bedrock_llm(model_name: str):
 def get_azure_openai_llm(model_name: str):
     """Initialize Azure OpenAI language model"""
     try:
-        deployment_name = os.getenv('AZURE_OPENAI_DEPLOYMENT', 'agentweb')
+        deployment_name = model_name # use model name as deployment name in Azure portal
         
         return AzureChatOpenAI(
             model_name=model_name,
