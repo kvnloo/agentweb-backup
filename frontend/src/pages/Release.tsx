@@ -7,6 +7,15 @@ interface Release {
 
 const releases: Release[] = [
   {
+    date: "2025-02-28",
+    changes: [
+      "Added public credential sharing feature",
+      "- Users can share their configured website credentials with everyone in Config page",
+      "- Shared credentials remain securely encrypted and protected",
+      "- Enhanced security with session isolation for shared credentials"
+    ]
+  },
+  {
     date: "2025-02-26",
     changes: [
       "Added Deep Research mode powered by AG2 multi-agent framework",
