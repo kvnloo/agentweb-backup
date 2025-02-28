@@ -84,7 +84,8 @@ class WebAgent:
         self.s3_bucket = os.getenv('S3_BUCKET_NAME')  # Make sure to set this in .env
         self._log_handlers = []  # Store log handlers for cleanup
         self.generate_gif = None
-        self.sensitive_data = {}
+        self.sensitive_data = []  # List to store all credentials for log filtering
+        self.cookie_tainted = False  # Flag to track if shared credentials were used
 
     def setup_execution_logging(self, execution_id: str):
         """Setup logging for the current execution"""
@@ -237,6 +238,67 @@ class WebAgent:
             return None
 
     def _register_actions(self):
+        @self.controller.registry.action('Get login credentials by domain')
+        def get_login_credentials(domain: str) -> ActionResult:
+            """Get login credentials for a domain from the database"""
+            if not self.user_id:
+                return ActionResult(error="User ID not provided")
+            if not domain:
+                return ActionResult(error=f"Please provide a domain")
+            logger.info(f"Getting login credentials for domain {domain} under user {self.user_id}")
+                
+            table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
+            # First get user's own configs and configs shared directly with them
+            response = table.query(
+                KeyConditionExpression='userId = :userId',
+                FilterExpression='website = :website',
+                ExpressionAttributeValues={
+                    ':userId': self.user_id,
+                    ':website': domain
+                }
+            )
+
+            items = response.get('Items', [])
+            if not items:
+                # If no direct matches, check for publicly shared configs
+                public_response = table.query(
+                    IndexName='ShareWithEveryoneIndex',
+                    KeyConditionExpression='shareWithEveryone = :shareWithEveryone',
+                    FilterExpression='website = :website AND userId <> :userId',
+                    ExpressionAttributeValues={
+                        ':shareWithEveryone': 1,
+                        ':website': domain,
+                        ':userId': self.user_id
+                    }
+                )
+                items.extend(public_response.get('Items', []))
+
+            if not items:
+                return ActionResult(error=f"No credentials found for domain: {domain}")
+
+            try:
+                # Sort items by priority:
+                # 1. User's own account (no sharedBy)
+                # 2. Directly shared account (has sharedBy)
+                # 3. Publicly shared configs are already filtered to exclude user's own configs
+                sorted_items = sorted(items, key=lambda x: (
+                    0 if not x.get('sharedBy') else 1
+                ))
+
+                config = sorted_items[0]
+                shared_by = config.get('sharedBy')
+                decrypted_password = decrypt_password(config['password'], self.user_id, shared_by)
+
+                if shared_by and shared_by != self.user_id:
+                    logger.info(f"Using shared credentials for {domain} - shared by user: {shared_by}")
+                    # Mark cookies as tainted since we're using shared credentials
+                    self.cookie_tainted = True
+                    logger.info("Cookies marked as tainted - will not be uploaded to S3")
+                
+                return ActionResult(extracted_content=f"username: {config['username']}, password: {decrypted_password}")
+            except Exception as e:
+                return ActionResult(error=f"Error getting credentials: {str(e)}")
+                
         @self.controller.registry.action('Sleep')
         async def sleep(seconds: float) -> ActionResult:
             """Sleep for a specified number of seconds (max 5 minutes)"""
@@ -485,25 +547,39 @@ class WebAgent:
         browser_config = BrowserConfig(new_context_config=context_config, headless=headless)
         self.browser = Browser(config=browser_config)
 
-        # Get credentials from AW-Configs
+        # Get all credentials for log filtering
         if self.user_id:
             try:
                 table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
-                response = table.scan(
-                    FilterExpression='userId = :userId',
+                # Get user's own configs and configs shared directly with them
+                response = table.query(
+                    KeyConditionExpression='userId = :userId',
                     ExpressionAttributeValues={':userId': self.user_id}
                 )
-                for config in response.get('Items', []):
+                
+                # Get publicly shared configs from other users
+                public_response = table.query(
+                    IndexName='ShareWithEveryoneIndex',
+                    KeyConditionExpression='shareWithEveryone = :shareWithEveryone',
+                    FilterExpression='userId <> :userId',
+                    ExpressionAttributeValues={
+                        ':shareWithEveryone': 1,
+                        ':userId': self.user_id
+                    }
+                )
+                
+                # Combine all configs
+                all_configs = response.get('Items', []) + public_response.get('Items', [])
+                
+                for config in all_configs:
                     try:
                         decrypted_password = decrypt_password(config['password'], self.user_id, config.get('sharedBy'))
-                        domain = config['website']
-                        self.sensitive_data[f"{domain}_username"] = config['username']
-                        self.sensitive_data[f"{domain}_password"] = decrypted_password
+                        self.sensitive_data.append(decrypted_password)
                     except Exception as e:
                         logger.error(f"Error decrypting password for {config.get('website')}: {e}")
             except Exception as e:
                 logger.error(f"Error fetching credentials from AW-Configs: {e}")
-        logger.info(f"Sensitive data: {self.sensitive_data.keys()}")
+        logger.info(f"Loaded {len(self.sensitive_data)} sensitive values for log filtering")
 
         # Remove existing GIF file if it exists and generate_gif is provided
         if self.generate_gif:
@@ -520,7 +596,6 @@ class WebAgent:
             use_vision=global_use_vision,
             max_failures=5,  # Increase max retries
             retry_delay=60,   # retry delay in seconds
-            sensitive_data=self.sensitive_data,  # Pass sensitive data
             generate_gif=self.generate_gif  # Pass GIF path from task_monitor
         )
 
@@ -530,9 +605,16 @@ class WebAgent:
             if self.browser:
                 # Save cookies before closing
                 cookies_path = self._get_cookies_path()
-                if cookies_path and self.cookie_sync:
-                    # Upload cookies to S3 after task completion
-                    self.cookie_sync.upload_cookies(self.user_id, cookies_path)
+                if cookies_path:
+                    if self.cookie_sync and not self.cookie_tainted:
+                        # Only upload cookies if they're not tainted by shared credentials
+                        self.cookie_sync.upload_cookies(self.user_id, cookies_path)
+                        logger.info("Cookies uploaded to S3")
+                    elif self.cookie_tainted:
+                        logger.info("Skipping cookie upload - cookies are tainted from using shared credentials")
+                        
+                    Path(cookies_path).unlink(missing_ok=True)
+                    logger.info(f"Deleted cookie file at local: {cookies_path}")
                 
                 await self.browser.close()
             # Clean up logging handlers
@@ -548,9 +630,8 @@ class WebAgent:
                     with open(browser_use_log, 'r') as f:
                         for line in f:
                             filtered_line = line
-                            for key, val in self.sensitive_data.items():
-                                if val:  # Only replace if value is not empty
-                                    filtered_line = filtered_line.replace(val, f'<secret>{key}</secret>')
+                            for val in self.sensitive_data:
+                                filtered_line = filtered_line.replace(val, '[REDACTED]')
                             filtered_lines.append(filtered_line)
 
                     # Only write to filtered log if we have content to write

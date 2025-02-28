@@ -23,6 +23,7 @@ router.get('/', authenticateToken, async (req, res) => {
     const result = await dynamodb.query({
       TableName: `${TABLE_PREFIX}AW-Configs`,
       KeyConditionExpression: 'userId = :userId',
+      FilterExpression: 'attribute_not_exists(sharedBy) OR sharedBy = :userId',
       ExpressionAttributeValues: {
         ':userId': userId
       }
@@ -33,21 +34,7 @@ router.get('/', authenticateToken, async (req, res) => {
       // Remove password from config object
       const { password, ...configWithoutPassword } = config;
 
-      if (config.sharedBy) {
-        // This is a config shared with the user
-        const sharer = await userDb.getUserById(config.sharedBy);
-        if (sharer) {
-          return {
-            ...configWithoutPassword,
-            sharedBy: sharer.email
-          };
-        }
-      } else if (config.sharedConfigIds?.length > 0) {
-        console.log('Found config with sharedConfigIds:', {
-          configId: config.configId,
-          sharedConfigIds: config.sharedConfigIds
-        });
-
+      if (config.sharedConfigIds?.length > 0) {
         // Get shared configs using the GSI
         const sharedConfigPromises = config.sharedConfigIds.map(async (sharedId: string) => {
           const result = await dynamodb.query({
@@ -58,7 +45,6 @@ router.get('/', authenticateToken, async (req, res) => {
               ':configId': sharedId
             }
           }).promise();
-          // Remove password from shared configs as well
           if (result.Items?.[0]) {
             const { password, ...sharedConfigWithoutPassword } = result.Items[0];
             return sharedConfigWithoutPassword;
@@ -67,17 +53,11 @@ router.get('/', authenticateToken, async (req, res) => {
         });
 
         const sharedConfigs = (await Promise.all(sharedConfigPromises)).filter(Boolean);
-        console.log('Shared configs:', sharedConfigs.map(c => ({
-          configId: c.configId,
-          userId: c.userId
-        })));
 
         // Get user emails for shared configs
         const sharedWithUsers = await Promise.all(
           sharedConfigs.map(c => userDb.getUserById(c.userId))
         );
-
-        console.log('Shared with users:', sharedWithUsers.map(u => u?.email));
 
         return {
           ...configWithoutPassword,
@@ -166,10 +146,10 @@ router.post('/:configId/share', authenticateToken, async (req, res) => {
   try {
     const userId = req.user!.userId;
     const { configId } = req.params;
-    const { email } = req.body;
+    const { email, shareWithEveryone } = req.body;
 
-    if (!email) {
-      return res.status(400).json({ error: 'Email is required' });
+    if (!email && !shareWithEveryone) {
+      return res.status(400).json({ error: 'Either email or shareWithEveryone must be provided' });
     }
 
     // Verify the config exists and belongs to the user
@@ -185,6 +165,26 @@ router.post('/:configId/share', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Configuration not found' });
     }
 
+    if (shareWithEveryone) {
+      // Update the config to be shared with everyone
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-Configs`,
+        Key: {
+          userId,
+          configId
+        },
+        UpdateExpression: 'SET shareWithEveryone = :shareWithEveryone, sharedBy = :sharedBy',
+        ExpressionAttributeValues: {
+          ':shareWithEveryone': 1,
+          ':sharedBy': userId
+        }
+      }).promise();
+
+      res.status(201).json({ message: 'Configuration shared with everyone successfully' });
+      return;
+    }
+
+    // If not sharing with everyone, proceed with sharing with specific user
     // Find target user by email
     const targetUser = await userDb.getUserByEmail(email);
     if (!targetUser) {
@@ -227,6 +227,53 @@ router.post('/:configId/share', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Error sharing config:', error);
     res.status(500).json({ error: 'Failed to share configuration' });
+  }
+});
+
+// Get configurations shared with me by other users (both direct and public)
+router.get('/shared', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user!.userId;
+    
+    // Get configs shared directly with me by other users
+    const directlySharedResult = await dynamodb.query({
+      TableName: `${TABLE_PREFIX}AW-Configs`,
+      KeyConditionExpression: 'userId = :userId',
+      FilterExpression: 'attribute_exists(sharedBy) AND sharedBy <> :userId', // Only get configs shared by others
+      ExpressionAttributeValues: {
+        ':userId': userId
+      }
+    }).promise();
+
+    // Get configs shared publicly by other users
+    const publiclySharedResult = await dynamodb.query({
+      TableName: `${TABLE_PREFIX}AW-Configs`,
+      IndexName: 'ShareWithEveryoneIndex',
+      KeyConditionExpression: 'shareWithEveryone = :shareWithEveryone',
+      FilterExpression: 'userId <> :userId AND (attribute_not_exists(sharedBy) OR sharedBy <> :userId)', // Exclude configs shared by me
+      ExpressionAttributeValues: {
+        ':shareWithEveryone': 1,
+        ':userId': userId
+      }
+    }).promise();
+
+    // Combine and process all configs shared with me by others
+    const allSharedConfigs = [...(directlySharedResult.Items || []), ...(publiclySharedResult.Items || [])];
+    
+    const sharedConfigs = await Promise.all(allSharedConfigs.map(async (config) => {
+      const { password, ...configWithoutPassword } = config;
+      const sharer = await userDb.getUserById(config.sharedBy || config.userId);
+      return {
+        ...configWithoutPassword,
+        sharedBy: sharer ? sharer.email : undefined,
+        isPublic: !!config.shareWithEveryone
+      };
+    }));
+
+    res.json(sharedConfigs);
+  } catch (error) {
+    console.error('Error fetching configurations shared with me:', error);
+    res.status(500).json({ error: 'Failed to fetch configurations shared with me' });
   }
 });
 
