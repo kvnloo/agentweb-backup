@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useCallback } from 'react';
 import axios from 'axios';
 import { useAuth } from './AuthContext';
+import { API_URL } from '../config';
 
 interface AdminContextType {
   users: any[];
@@ -37,7 +38,7 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const { token, user } = useAuth();
 
   const api = axios.create({
-    baseURL: import.meta.env.VITE_API_URL,
+    baseURL: API_URL,
     headers: {
       Authorization: `Bearer ${token}`
     }
