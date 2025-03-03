@@ -7,6 +7,15 @@ interface Release {
 
 const releases: Release[] = [
   {
+    date: "2025-03-03",
+    changes: [
+      "Improved Deep Research reports",
+      "- Reduced hallucination on citations",
+      "- Added support for Azure OpenAI o1-mini model, which offers improved reasoning capabilities",
+      "Optimized polling for Task Details page to reduce unnecessary traffic"
+    ]
+  },
+  {
     date: "2025-02-28",
     changes: [
       "Added public credential sharing feature",
