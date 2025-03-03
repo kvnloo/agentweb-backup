@@ -14,7 +14,7 @@ import {
 } from '@mui/material';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
-import { buildApiUrl, DEEP_RESEARCH_LLMS } from '../config';
+import { buildApiUrl } from '../config';
 
 export default function CreateTask() {
   const [name, setName] = useState('');
