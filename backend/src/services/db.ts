@@ -850,7 +850,7 @@ export const subscriberDb = {
     try {
       const subscribedAt = new Date().toISOString();
       const params = {
-        TableName: 'AW-Subscribers',
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
         Item: {
           taskId,
           email,
@@ -872,7 +872,7 @@ export const subscriberDb = {
   async removeSubscriber(taskId: string, email: string) {
     try {
       const params = {
-        TableName: 'AW-Subscribers',
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
         Key: {
           taskId,
           email
@@ -888,7 +888,7 @@ export const subscriberDb = {
   async getTaskSubscribers(taskId: string) {
     try {
       const params = {
-        TableName: 'AW-Subscribers',
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
         KeyConditionExpression: 'taskId = :taskId',
         ExpressionAttributeValues: {
           ':taskId': taskId
@@ -900,7 +900,7 @@ export const subscriberDb = {
     } catch (error) {
       handleDynamoDbError(error, 'getTaskSubscribers');
     }
-  }
+  },
 };
 
 // Add minimal workflow methods for counting
