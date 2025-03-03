@@ -348,6 +348,7 @@ export default function TaskDetails() {
   const [editedName, setEditedName] = useState('');
   const [uploadError, setUploadError] = useState<string>('');
   const [isUploading, setIsUploading] = useState(false);
+  const [shouldPoll, setShouldPoll] = useState(true);
 
   const isAdminRoute = location.pathname.startsWith('/admin/');
   const showActions = !isAdminRoute || (task && user && task.userId === user.userId);
@@ -387,7 +388,7 @@ export default function TaskDetails() {
 
     // Set up polling for executions
     const intervalId = setInterval(() => {
-      if (taskId) {
+      if (taskId && shouldPoll) {
         axios.get(buildApiUrl(`/api/tasks/${taskId}/executions`), {
           headers: { Authorization: `Bearer ${token}` },
         })
@@ -397,7 +398,23 @@ export default function TaskDetails() {
     }, 5000);
 
     return () => clearInterval(intervalId);
-  }, [taskId, token]);
+  }, [taskId, token, shouldPoll]);
+
+  // Control polling interval based on execution status
+  useEffect(() => {
+    // Only poll if there are pending or running executions
+    const hasActiveExecutions = executions.some(
+      execution => execution.status === 'pending' || execution.status === 'running'
+    );
+    
+    setShouldPoll(hasActiveExecutions);
+    
+    if (hasActiveExecutions) {
+      console.log('Active executions found - polling enabled');
+    } else {
+      console.log('No active executions - polling disabled');
+    }
+  }, [executions]);
 
   useEffect(() => {
     const fetchSubscribers = async () => {
