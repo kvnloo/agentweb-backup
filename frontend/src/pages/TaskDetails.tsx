@@ -134,12 +134,14 @@ const CollapsibleText = ({ text, maxLength = 150 }: { text: string, maxLength?: 
   };
 
   return (
-    <Box>
+    <span style={{ display: 'inline-block' }}>
       <Typography 
         variant="body2" 
+        component="span"
         sx={{ 
           whiteSpace: 'pre-wrap',
           wordBreak: 'break-word',
+          display: 'inline-block'
         }}
       >
         {isExpanded ? text : needsCollapse ? `${text.slice(0, maxLength)}...` : text}
@@ -164,7 +166,7 @@ const CollapsibleText = ({ text, maxLength = 150 }: { text: string, maxLength?: 
           </IconButton>
         </Tooltip>
       </Box>
-    </Box>
+    </span>
   );
 };
 
@@ -1215,9 +1217,9 @@ export default function TaskDetails() {
                         ) : (
                           <Box>
                             {execution.error ? (
-                              <Typography color="error" variant="body2">
+                              <Box sx={{ color: 'error.main' }}>
                                 <CollapsibleText text={execution.error} />
-                              </Typography>
+                              </Box>
                             ) : (
                               <>
                                 <CollapsibleText text={execution.result || '-'} />
