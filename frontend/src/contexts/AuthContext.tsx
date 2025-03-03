@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useState, useCallback, useEffect } from 'react';
 import axios from 'axios';
+import { API_URL, buildApiUrl } from '../config';
 
 interface User {
   userId: string;
@@ -42,7 +43,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const storedToken = localStorage.getItem('token');
       if (storedToken) {
         try {
-          const response = await axios.get(`${import.meta.env.VITE_API_URL}/api/auth/me`, {
+          const response = await axios.get(buildApiUrl('/api/auth/me'), {
             headers: {
               Authorization: `Bearer ${storedToken}`
             }
@@ -65,7 +66,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const login = async (email: string, password: string) => {
     try {
       setLoading(true);
-      const response = await axios.post(`${import.meta.env.VITE_API_URL}/api/auth/login`, {
+      const response = await axios.post(buildApiUrl('/api/auth/login'), {
         email,
         password
       });
@@ -84,9 +85,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const loginWithGoogle = async () => {
     try {
       // Redirect to Google OAuth endpoint
-      const googleAuthUrl = `${import.meta.env.VITE_API_URL}/api/auth/google`;
+      const googleAuthUrl = buildApiUrl('/api/auth/google');
       console.log('Redirecting to Google OAuth:', {
-        apiUrl: import.meta.env.VITE_API_URL,
+        apiUrl: API_URL,
         fullUrl: googleAuthUrl
       });
       window.location.href = googleAuthUrl;
@@ -98,7 +99,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const register = async (email: string, password: string) => {
     try {
       setLoading(true);
-      const response = await axios.post(`${import.meta.env.VITE_API_URL}/api/auth/register`, {
+      const response = await axios.post(buildApiUrl('/api/auth/register'), {
         email,
         password,
       });
@@ -125,7 +126,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     try {
       if (newToken) {
         // Get user data using the token
-        const response = await axios.get(`${import.meta.env.VITE_API_URL}/api/auth/me`, {
+        const response = await axios.get(buildApiUrl('/api/auth/me'), {
           headers: {
             Authorization: `Bearer ${newToken}`
           }

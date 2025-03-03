@@ -38,6 +38,7 @@ import TaskNode from '../components/workflow/nodes/TaskNode';
 import LoopNode from '../components/workflow/nodes/LoopNode';
 import ConditionNode from '../components/workflow/nodes/ConditionNode';
 import { useAuth } from '../contexts/AuthContext';
+import { API_URL, buildApiUrl } from '../config';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -188,7 +189,7 @@ export default function WorkflowBuilder() {
     const fetchWorkflow = async () => {
       if (id && id !== 'new') {
         try {
-          const baseUrl = import.meta.env.VITE_API_URL || '';
+          const baseUrl = API_URL;
           const response = await fetch(`${baseUrl}/api/workflows/${id}`, {
             headers: {
               'Authorization': `Bearer ${token}`,
@@ -308,7 +309,7 @@ export default function WorkflowBuilder() {
     setLoading(true);
 
     try {
-      const baseUrl = import.meta.env.VITE_API_URL || '';
+      const baseUrl = API_URL;
       const response = await fetch(`${baseUrl}/api/workflows/generate`, {
         method: 'POST',
         headers: {
@@ -367,53 +368,33 @@ export default function WorkflowBuilder() {
         edges: edges
       };
 
-      const baseUrl = import.meta.env.VITE_API_URL || '';
+      const baseUrl = API_URL;
       const url = id && id !== 'new' 
         ? `${baseUrl}/api/workflows/${id}`
         : `${baseUrl}/api/workflows`;
 
-      const method = id && id !== 'new' ? 'PUT' : 'POST';
-
-      console.log('Saving workflow:', {
-        url,
-        method,
-        data: workflowData
-      });
-
       const response = await fetch(url, {
-        method,
+        method: id && id !== 'new' ? 'PUT' : 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${token}`
         },
-        body: JSON.stringify(workflowData),
-        credentials: 'include'
+        body: JSON.stringify(workflowData)
       });
 
       if (!response.ok) {
-        const errorData = await response.json().catch(() => null);
-        throw new Error(
-          errorData?.error || 
-          `Failed to save workflow: ${response.status} ${response.statusText}`
-        );
+        throw new Error(`Failed to save workflow: ${response.statusText}`);
       }
 
       const savedWorkflow = await response.json();
-      console.log('Workflow saved successfully:', savedWorkflow);
       
-      // Update the workflow ID if this was a new workflow
       if (id === 'new') {
-        navigate(`/workflows/${savedWorkflow.workflowId}/edit`, { replace: true });
+        navigate(`/workflows/builder/${savedWorkflow.id}`);
       }
 
-      setWorkflow(prevWorkflow => ({
-        ...prevWorkflow,
-        id: savedWorkflow.workflowId  // Use workflowId instead of id
-      }));
-
-      setShowSnackbar(true);
       setSnackbarMessage('Workflow saved successfully');
       setSnackbarSeverity('success');
+      setShowSnackbar(true);
     } catch (error) {
       console.error('Error saving workflow:', error);
       setShowSnackbar(true);

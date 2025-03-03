@@ -578,13 +578,16 @@ export default function AdminDashboard() {
                   <TableCell>
                     <SortLabel property="createdAt" label="Created At" />
                   </TableCell>
+                  <TableCell>
+                    <SortLabel property="latestRunStatus" label="Latest Run Status" />
+                  </TableCell>
                   <TableCell>Details</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={6} align="center">
+                    <TableCell colSpan={7} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -600,6 +603,18 @@ export default function AdminDashboard() {
                       </TableCell>
                       <TableCell>{task.userId}</TableCell>
                       <TableCell>{new Date(task.createdAt).toLocaleDateString()}</TableCell>
+                      <TableCell>
+                        <Chip 
+                          label={task.latestRunStatus || 'none'} 
+                          color={
+                            task.latestRunStatus === 'completed' ? 'success' :
+                            task.latestRunStatus === 'failed' ? 'error' :
+                            task.latestRunStatus === 'pending' ? 'warning' :
+                            task.latestRunStatus === 'running' ? 'info' : 'default'
+                          }
+                          size="small"
+                        />
+                      </TableCell>
                       <TableCell>
                         <Link 
                           to={`/admin/tasks/${task.taskId}`}

@@ -27,6 +27,7 @@ import {
   Delete as DeleteIcon
 } from '@mui/icons-material';
 import { useNavigate } from 'react-router-dom';
+import { API_URL } from '../config';
 
 interface Workflow {
   id: string;
@@ -55,7 +56,7 @@ export default function Workflows() {
       try {
         setLoading(true);
         setError(null);
-        const baseUrl = import.meta.env.VITE_API_URL || '';
+        const baseUrl = API_URL;
         const response = await fetch(`${baseUrl}/api/workflows`, {
           headers: {
             'Authorization': `Bearer ${localStorage.getItem('token')}`,
@@ -118,7 +119,7 @@ export default function Workflows() {
     try {
       if (!selectedWorkflow) return;
 
-      const baseUrl = import.meta.env.VITE_API_URL || '';
+      const baseUrl = API_URL;
       const response = await fetch(`${baseUrl}/api/workflows/${selectedWorkflow.id}`, {
         method: 'DELETE',
         headers: {
