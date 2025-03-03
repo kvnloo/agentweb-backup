@@ -64,7 +64,7 @@ def get_aws_bedrock_llm(model_name: str):
 def get_azure_openai_llm(model_name: str):
     """Initialize Azure OpenAI language model"""
     try:
-        deployment_name = os.getenv('AZURE_OPENAI_DEPLOYMENT', 'agentweb')
+        deployment_name = model_name # use model name as deployment name in Azure portal
         
         return AzureChatOpenAI(
             model_name=model_name,
@@ -73,6 +73,24 @@ def get_azure_openai_llm(model_name: str):
             api_key=os.getenv('AZURE_OPENAI_API_KEY'),
             api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-08-01-preview'),
             temperature=0.0
+        )
+    except Exception as e:
+        logger.error(f"Error initializing Azure OpenAI: {e}")
+        logger.error("Please ensure all Azure OpenAI environment variables are set correctly.")
+        sys.exit(1)
+
+def get_azure_openai_llm_o1(model_name: str):
+    """Initialize Azure OpenAI language model"""
+    try:
+        deployment_name = model_name # use model name as deployment name in Azure portal
+        
+        # O1 series model does not support temperature
+        return AzureChatOpenAI(
+            model_name=model_name,
+            azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT'),
+            azure_deployment=deployment_name,
+            api_key=os.getenv('AZURE_OPENAI_API_KEY'),
+            api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-09-12')
         )
     except Exception as e:
         logger.error(f"Error initializing Azure OpenAI: {e}")
@@ -154,7 +172,8 @@ def get_llm(full_llm_name: str) -> Tuple[Any, str]:
         },
         "azure": {
             "openai": {
-                "gpt-4o": get_azure_openai_llm
+                "gpt-4o": get_azure_openai_llm,
+                "o1-mini": get_azure_openai_llm_o1
             }
         },
         "deepseek": {
@@ -165,6 +184,7 @@ def get_llm(full_llm_name: str) -> Tuple[Any, str]:
         "openai": {
             "openai": {
                 "gpt-4o": get_openai_llm,
+                "gpt-4o-mini": get_openai_llm,
                 "o3-mini": get_openai_llm_think
             }
         }

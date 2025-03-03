@@ -558,7 +558,19 @@ async def execute_task(execution):
         llm_names = []
         if task and task.get('llmName'):  # Only check task.llmName if task exists
             llm_names = [task['llmName']]
-        env_llm_names = os.getenv('LIST_FULL_LLM_NAMES', 'aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0')
+        
+        # Check if this is a deep research task
+        is_deep_research = task and task.get('isDeepResearch', False)
+        logger.info(f"Task {task_id} isDeepResearch: {is_deep_research}")
+        
+        # Use different LLM list for deep research tasks
+        if is_deep_research:
+            env_llm_names = os.getenv('DEEP_RESEARCH_LLM_NAMES', 'azure->openai->o1-mini,azure->openai->gpt-4o')
+            logger.info(f"Using deep research LLM list: {env_llm_names}")
+        else:
+            env_llm_names = os.getenv('LIST_FULL_LLM_NAMES', 'azure->openai->gpt-4o,aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0,openai->openai->gpt-4o')
+            logger.info(f"Using standard LLM list: {env_llm_names}")
+            
         # Add each non-empty name if not already in the list
         for name in env_llm_names.split(','):
             name = name.strip()
@@ -575,10 +587,6 @@ async def execute_task(execution):
         
         context = f"You are executing this task at {datetime.now(timezone.utc).isoformat()}."
         prompt_with_context = f"{prompt}\n\n{context}"
-
-        # Check if this is a deep research task
-        is_deep_research = task and task.get('isDeepResearch', False)
-        logger.info(f"Task {task_id} isDeepResearch: {is_deep_research}")
 
         filtered_activity_log = None
 
@@ -598,11 +606,9 @@ async def execute_task(execution):
                         # Initialize the deep research agent with user_id and execution_id
                         agent = DeepResearchAgentWrapper(
                             user_id=user_id,
-                            execution_id=execution_id
+                            execution_id=execution_id,
+                            full_llm_name=llm_name
                         )
-                        
-                        # Set the LLM name
-                        agent.llm_name = llm_name
                         
                         # Run the research
                         result = agent.run_research(
