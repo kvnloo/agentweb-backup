@@ -31,6 +31,7 @@ import {
 } from '@mui/icons-material';
 import { useAuth } from '../contexts/AuthContext';
 import { formatDistanceToNow, intervalToDuration } from 'date-fns';
+import { API_URL } from '../config';
 
 interface WorkflowTask {
   taskId: string;
@@ -128,7 +129,7 @@ export default function WorkflowRun() {
       try {
         setLoading(true);
         setError(null);
-        const baseUrl = import.meta.env.VITE_API_URL || '';
+        const baseUrl = API_URL;
 
         // Fetch workflow details
         const workflowResponse = await fetch(`${baseUrl}/api/workflows/${id}`, {
@@ -190,7 +191,7 @@ export default function WorkflowRun() {
   const handleRunWorkflow = async () => {
     try {
       setError(null);
-      const baseUrl = import.meta.env.VITE_API_URL || '';
+      const baseUrl = API_URL;
       const response = await fetch(`${baseUrl}/api/workflows/${id}/run`, {
         method: 'POST',
         headers: {

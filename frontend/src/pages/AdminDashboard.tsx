@@ -68,7 +68,7 @@ export default function AdminDashboard() {
   const [startDate, setStartDate] = useState<Date | null>(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000));
   const [endDate, setEndDate] = useState<Date | null>(new Date());
   const [tasks, setTasks] = useState<any[]>([]);
-  const [orderBy, setOrderBy] = useState<keyof any>('createdAt');
+  const [orderBy, setOrderBy] = useState<keyof any>('latestRunTime');
   const [order, setOrder] = useState<'asc' | 'desc'>('desc');
   const [message, setMessage] = useState('');
   const [title, setTitle] = useState('');
@@ -147,10 +147,22 @@ export default function AdminDashboard() {
 
   const sortedTasks = React.useMemo(() => {
     return [...tasks].sort((a, b) => {
-      if (orderBy === 'createdAt') {
+      if (orderBy === 'createdAt' || orderBy === 'latestRunTime') {
+        // For date fields, handle null values and sort by date
+        const aValue = a[orderBy] ? new Date(a[orderBy]).getTime() : 0;
+        const bValue = b[orderBy] ? new Date(b[orderBy]).getTime() : 0;
+        
         return order === 'asc' 
-          ? new Date(a[orderBy]).getTime() - new Date(b[orderBy]).getTime()
-          : new Date(b[orderBy]).getTime() - new Date(a[orderBy]).getTime();
+          ? aValue - bValue
+          : bValue - aValue;
+      } else if (orderBy === 'completedRuns') {
+        // For completedRuns, sort by completion ratio
+        const aRatio = a.totalRuns > 0 ? (a.completedRuns / a.totalRuns) : 0;
+        const bRatio = b.totalRuns > 0 ? (b.completedRuns / b.totalRuns) : 0;
+        
+        return order === 'asc'
+          ? aRatio - bRatio
+          : bRatio - aRatio;
       }
       
       const aValue = a[orderBy]?.toString().toLowerCase() ?? '';
@@ -578,13 +590,22 @@ export default function AdminDashboard() {
                   <TableCell>
                     <SortLabel property="createdAt" label="Created At" />
                   </TableCell>
+                  <TableCell>
+                    <SortLabel property="latestRunStatus" label="Latest Run Status" />
+                  </TableCell>
+                  <TableCell>
+                    <SortLabel property="latestRunTime" label="Latest Run Time" />
+                  </TableCell>
+                  <TableCell>
+                    <SortLabel property="completedRuns" label="Completed/Total Runs" />
+                  </TableCell>
                   <TableCell>Details</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={6} align="center">
+                    <TableCell colSpan={9} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -600,6 +621,31 @@ export default function AdminDashboard() {
                       </TableCell>
                       <TableCell>{task.userId}</TableCell>
                       <TableCell>{new Date(task.createdAt).toLocaleDateString()}</TableCell>
+                      <TableCell>
+                        <Chip 
+                          label={task.latestRunStatus || 'none'} 
+                          color={
+                            task.latestRunStatus === 'completed' ? 'success' :
+                            task.latestRunStatus === 'failed' ? 'error' :
+                            task.latestRunStatus === 'pending' ? 'warning' :
+                            task.latestRunStatus === 'running' ? 'info' : 'default'
+                          }
+                          size="small"
+                        />
+                      </TableCell>
+                      <TableCell>
+                        {task.latestRunTime 
+                          ? new Date(task.latestRunTime).toLocaleString() 
+                          : 'Never'}
+                      </TableCell>
+                      <TableCell>
+                        {task.completedRuns || 0}/{task.totalRuns || 0}
+                        {task.totalRuns > 0 && (
+                          <Box component="span" sx={{ ml: 1 }}>
+                            ({Math.round((task.completedRuns / task.totalRuns) * 100)}%)
+                          </Box>
+                        )}
+                      </TableCell>
                       <TableCell>
                         <Link 
                           to={`/admin/tasks/${task.taskId}`}

@@ -106,7 +106,26 @@ router.put('/waitlist/:email/status', async (req, res) => {
 router.get('/tasks', async (req, res) => {
   try {
     const tasks = await taskDb.getAllTasks();
-    res.json(tasks);
+    
+    // Get latest execution for each task
+    const tasksWithLatestExecution = await Promise.all((tasks || []).map(async (task) => {
+      const executions = await taskDb.getTaskExecutions(task.taskId);
+      const latestExecution = executions && executions.length > 0 ? executions[0] : null;
+      
+      // Count completed and total runs
+      const totalRuns = executions ? executions.length : 0;
+      const completedRuns = executions ? executions.filter(exec => exec.status === 'completed').length : 0;
+      
+      return {
+        ...task,
+        latestRunStatus: latestExecution ? latestExecution.status : 'none',
+        latestRunTime: latestExecution ? latestExecution.startTime : null,
+        completedRuns,
+        totalRuns
+      };
+    }));
+    
+    res.json(tasksWithLatestExecution);
   } catch (error) {
     console.error('Error getting tasks:', error);
     res.status(500).json({ message: 'Error fetching tasks' });
