@@ -38,7 +38,7 @@ import TaskNode from '../components/workflow/nodes/TaskNode';
 import LoopNode from '../components/workflow/nodes/LoopNode';
 import ConditionNode from '../components/workflow/nodes/ConditionNode';
 import { useAuth } from '../contexts/AuthContext';
-import { API_URL, buildApiUrl } from '../config';
+import { API_URL } from '../config';
 
 interface Message {
   role: 'user' | 'assistant';
