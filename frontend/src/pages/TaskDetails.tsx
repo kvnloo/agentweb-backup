@@ -44,7 +44,7 @@ import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
 import ScheduleForm from '../components/ScheduleForm';
 import ScheduleList from '../components/ScheduleList';
-import { buildApiUrl, AVAILABLE_LLMS } from '../config';
+import { buildApiUrl, getLLMsForTask } from '../config';
 
 interface Task {
   taskId: string;
@@ -520,18 +520,19 @@ export default function TaskDetails() {
     try {
       const newIsDeepResearch = !task.isDeepResearch;
       
-      // If enabling deep research, also enable email notifications and set LLM
+      // If enabling deep research, also enable email notifications
       const updateData: any = {
         isDeepResearch: newIsDeepResearch
       };
       
-      // If enabling deep research, also enable email notifications and set LLM
-      if (newIsDeepResearch) {
-        if (!task.emailNotification) {
-          updateData.emailNotification = true;
-        }
-        updateData.llmName = 'azure->openai->gpt-4o';
+      // If enabling deep research, also enable email notifications
+      if (newIsDeepResearch && !task.emailNotification) {
+        updateData.emailNotification = true;
       }
+      
+      // Reset LLM selection when toggling deep research mode
+      // This ensures the appropriate LLM list will be used
+      updateData.llmName = null;
       
       await axios.put(
         buildApiUrl(`/api/tasks/${taskId}`),
@@ -807,7 +808,7 @@ export default function TaskDetails() {
   };
 
   const handleLLMChange = async (newLLMName: string) => {
-    if (!task || task.isDeepResearch) return;
+    if (!task) return;
     
     try {
       await axios.put(
@@ -972,22 +973,20 @@ export default function TaskDetails() {
                     <p>If selected, this LLM will be used first to run the task. If it fails, other LLMs will be tried as backup.</p>
                     <p>LLM format: {`<deployment>${'>'}<provider>${'>'}<version>`}</p>
                     <p>Example: "azure-{'>'}-openai-{'>'}-gpt-4o" means GPT-4 model deployed on Azure, provided by OpenAI</p>
-                    {task.isDeepResearch && <p>Deep Research mode requires using azure-{'>'}-openai-{'>'}-gpt-4o</p>}
                   </div>
                 } placement="right">
                   <FormControl sx={{ width: 400 }}>
                     <InputLabel id="llm-select-label">Preferred LLM</InputLabel>
                     <Select
                       labelId="llm-select-label"
-                      value={task.isDeepResearch ? 'azure->openai->gpt-4o' : (task.llmName !== undefined && task.llmName !== null ? task.llmName : '')}
+                      value={task.llmName || ''}
                       onChange={(e) => handleLLMChange(e.target.value)}
                       label="Preferred LLM"
-                      disabled={task.isDeepResearch}
                     >
                       <MenuItem value="">
                         <em>System Default Order</em>
                       </MenuItem>
-                      {AVAILABLE_LLMS.map((llm: string) => (
+                      {getLLMsForTask(Boolean(task.isDeepResearch)).map((llm: string) => (
                         <MenuItem key={llm} value={llm}>
                           {llm}
                         </MenuItem>

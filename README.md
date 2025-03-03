@@ -273,6 +273,7 @@ cd frontend && \
 VITE_API_URL=https://api.agentweb.pro \
 VITE_DEBUG=false \
 VITE_LIST_FULL_LLM_NAMES="azure->openai->gpt-4o,aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0,openai->openai->gpt-4o" \
+VITE_DEEP_RESEARCH_LLM_NAMES="azure->openai->o1-mini,azure->openai->gpt-4o" \
 npm run build && \
 VERSION="0.21" && \
 mkdir -p builds && \
