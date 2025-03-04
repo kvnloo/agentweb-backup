@@ -300,6 +300,7 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                         task_id=execution['taskId'],
                         task_name=task['name'],
                         execution_status=status,
+                        execution_id=execution_id,
                         result=result,
                         error=error,
                         start_time=start_time,
