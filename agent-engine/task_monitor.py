@@ -11,15 +11,19 @@ from web_agent import WebAgent
 from botocore.exceptions import ClientError
 import time
 from decimal import Decimal
-from email_utils import send_task_notification, notify_task_subscribers, get_previous_execution
 import humanize  # Add this import at the top of the file
 from pathlib import Path
 from aws_utils import get_dynamodb_resource, get_s3_client
 import yaml
 import random
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 from deep_research_agent import DeepResearchAgentWrapper  # Import the wrapper class
-from task_utils import upload_activity_log, upload_gif, check_new_information  # Import new utility functions
+from task_utils import upload_activity_log, upload_gif, check_new_information  # Import utility functions
+import subprocess
+import tempfile
+import shutil
+import re
+import traceback
 
 # Custom JSON encoder to handle datetime objects
 class DateTimeEncoder(json.JSONEncoder):
@@ -270,11 +274,24 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                     start_time = datetime.fromisoformat(execution['startTime'].replace('Z', '+00:00'))
                     end_time = datetime.fromisoformat(expression_values[':completedAt'].replace('Z', '+00:00'))
                     
-                    # Check for new information if task completed successfully and has a result
+                    # Check if we need to calculate new_info_summary
+                    need_new_info_check = False
                     new_info_summary = None
-                    if status == 'completed' and result:
+                    
+                    # Check if email notification is enabled
+                    email_notification_enabled = task.get('emailNotification', False)
+                    
+                    # Check if there are subscribers
+                    from email_utils import get_task_subscribers
+                    subscribers = get_task_subscribers(execution['taskId'])
+                    has_subscribers = len(subscribers) > 0
+                    
+                    # Only calculate new_info_summary if needed
+                    if (email_notification_enabled or has_subscribers) and status == 'completed' and result:
+                        logger.info(f"Checking for new information as notifications are enabled for task {execution['taskId']}")
                         try:
                             # Get previous execution using the function from email_utils
+                            from email_utils import get_previous_execution
                             previous_execution = get_previous_execution(execution['taskId'], execution_id)
                             
                             # Check for new information
@@ -283,9 +300,11 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                                 logger.info(f"New information check for task {execution['taskId']}: {has_new_info}, summary: {new_info_summary}")
                         except Exception as e:
                             logger.error(f"Error checking for new information: {e}")
+                    else:
+                        logger.info(f"Skipping new information check as no notifications are needed for task {execution['taskId']}")
 
                     # Send simple notification to task owner if emailNotification is enabled
-                    if task.get('emailNotification'):
+                    if email_notification_enabled:
                         # Get user's email from AW-Users table using UserIdIndex
                         user_response = users_table.query(
                             IndexName='UserIdIndex',
@@ -298,6 +317,7 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                         
                         if user and user.get('email'):
                             # Send simple notification to owner
+                            from email_utils import send_task_notification
                             send_task_notification(
                                 to_email=user['email'],
                                 task_name=task['name'],
@@ -312,17 +332,19 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                             logger.error(f"User email not found for userId: {task['userId']}")
                     
                     # Send detailed results to all subscribers
-                    notify_task_subscribers(
-                        task_id=execution['taskId'],
-                        task_name=task['name'],
-                        execution_status=status,
-                        execution_id=execution_id,
-                        result=result,
-                        error=error,
-                        start_time=start_time,
-                        end_time=end_time,
-                        new_info_summary=new_info_summary
-                    )
+                    if has_subscribers:
+                        from email_utils import notify_task_subscribers
+                        notify_task_subscribers(
+                            task_id=execution['taskId'],
+                            task_name=task['name'],
+                            execution_status=status,
+                            execution_id=execution_id,
+                            result=result,
+                            error=error,
+                            start_time=start_time,
+                            end_time=end_time,
+                            new_info_summary=new_info_summary
+                        )
     except ClientError as e:
         logger.error(f"Error updating execution status: {e}")
 
