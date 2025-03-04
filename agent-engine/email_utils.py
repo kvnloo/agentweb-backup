@@ -7,6 +7,7 @@ import logging
 from dotenv import load_dotenv
 from datetime import datetime
 from aws_utils import get_dynamodb_resource
+from task_utils import check_new_information
 
 # Load environment variables
 load_dotenv()
@@ -22,6 +23,7 @@ dynamodb = get_dynamodb_resource()
 # Initialize tables with environment-specific prefixes
 subscribers_table = dynamodb.Table(f'{TABLE_PREFIX}AW-Subscribers')
 users_table = dynamodb.Table(f'{TABLE_PREFIX}AW-Users')
+executions_table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskExecutions')
 
 def get_task_subscribers(task_id):
     """
@@ -39,7 +41,7 @@ def get_task_subscribers(task_id):
         logger.error(f"Failed to get task subscribers: {e}")
         return []
 
-def send_task_notification(to_email, task_name, task_id, execution_status, result=None, error=None):
+def send_task_notification(to_email, task_name, task_id, execution_status, execution_id=None, result=None, error=None, new_info_summary=None):
     """
     Send an email notification about task completion.
     """
@@ -58,7 +60,11 @@ def send_task_notification(to_email, task_name, task_id, execution_status, resul
         msg = MIMEMultipart()
         msg['From'] = from_email
         msg['To'] = to_email
-        msg['Subject'] = f"Task Run Complete: {task_name}"
+        # Modify subject if new information was found
+        if new_info_summary:
+            msg['Subject'] = f"Task Run {execution_status}: {task_name} [NEW: {new_info_summary}]"
+        else:
+            msg['Subject'] = f"Task Run {execution_status}: {task_name}"
 
         # Create email body
         body = f"""
@@ -86,7 +92,7 @@ def send_task_notification(to_email, task_name, task_id, execution_status, resul
         logger.error(f"Failed to send email notification: {e}")
         return False
 
-def send_task_results(to_email, task_name, task_id, execution_status, result=None, error=None, start_time=None, end_time=None):
+def send_task_results(to_email, task_name, task_id, execution_status, result=None, error=None, start_time=None, end_time=None, new_info_summary=None):
     """
     Send a detailed task results email to subscribers.
     """
@@ -105,7 +111,12 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
         msg = MIMEMultipart()
         msg['From'] = from_email
         msg['To'] = to_email
-        msg['Subject'] = f"Task Run Results: {task_name}"
+        
+        # Modify subject if new information was found
+        if new_info_summary:
+            msg['Subject'] = f"Task Run Results: {task_name} [NEW: {new_info_summary}]"
+        else:
+            msg['Subject'] = f"Task Run Results: {task_name}"
 
         # Format timestamps if provided
         start_time_str = f"{start_time.strftime('%B %d, %Y at %I:%M %p UTC')}" if start_time else "Not available"
@@ -171,7 +182,7 @@ You are receiving this email because you are subscribed to updates for this task
         logger.error(f"Failed to send task results email: {e}")
         return False
 
-def notify_task_subscribers(task_id, task_name, execution_status, result=None, error=None, start_time=None, end_time=None):
+def notify_task_subscribers(task_id, task_name, execution_status, execution_id=None, result=None, error=None, start_time=None, end_time=None, new_info_summary=None):
     """
     Send detailed task results to all subscribers.
     """
@@ -187,9 +198,57 @@ def notify_task_subscribers(task_id, task_name, execution_status, result=None, e
             result,
             error,
             start_time,
-            end_time
+            end_time,
+            new_info_summary
         )
+        
         if success:
             logger.info(f"Successfully sent results to subscriber: {subscriber_email}")
         else:
-            logger.error(f"Failed to send results to subscriber: {subscriber_email}") 
+            logger.error(f"Failed to send results to subscriber: {subscriber_email}")
+
+def get_previous_execution(task_id, current_execution_id=None):
+    """
+    Get the most recent previous execution for a task that is not the current execution.
+    
+    Args:
+        task_id (str): The task ID to find previous executions for
+        current_execution_id (str, optional): The current execution ID to exclude
+        
+    Returns:
+        dict: The previous execution or None if not found
+    """
+    try:
+        # Query for completed executions for this task
+        query_params = {
+            'IndexName': 'TaskIdIndex',
+            'KeyConditionExpression': 'taskId = :taskId',
+            'FilterExpression': '#status = :status',
+            'ExpressionAttributeNames': {
+                '#status': 'status'
+            },
+            'ExpressionAttributeValues': {
+                ':taskId': task_id,
+                ':status': 'completed'
+            },
+            'ScanIndexForward': False,  # Sort by startTime in descending order (most recent first)
+            'Limit': 5  # Get the latest few to find one with a different result
+        }
+        
+        # If execution_id is provided, add it to the filter expression
+        if current_execution_id:
+            query_params['FilterExpression'] += ' AND executionId <> :executionId'
+            query_params['ExpressionAttributeValues'][':executionId'] = current_execution_id
+            logger.info(f"Excluding current execution {current_execution_id} when looking for previous executions")
+        
+        completed_executions = executions_table.query(**query_params).get('Items', [])
+        
+        if completed_executions:
+            previous_execution = completed_executions[0]
+            logger.info(f"Found previous execution {previous_execution.get('executionId')} for task {task_id}")
+            return previous_execution
+        
+        return None
+    except Exception as e:
+        logger.error(f"Error finding previous execution: {e}")
+        return None 

@@ -433,4 +433,69 @@ def upload_gif(gif_path: str) -> Optional[str]:
         
     except Exception as e:
         logger.error(f"Error uploading GIF: {e}")
-        return None 
+        return None
+
+def check_new_information(previous_result, current_result):
+    """
+    Use LLM to check if there is new information in the current task result compared to previous runs.
+    
+    Args:
+        previous_result (str): The result of the previous task run
+        current_result (str): The result of the current task run
+        
+    Returns:
+        tuple: (has_new_info, summary) where has_new_info is a boolean indicating if new information was found
+               and summary is a concise description of the new information (or None if no new info)
+    """
+    try:
+        if not previous_result or not current_result:
+            logger.info("Missing previous or current result for comparison")
+            return False, None
+            
+        # Use O1-mini model for comparison
+        llm = get_azure_openai_llm_o1('o1-mini')
+        
+        # Prepare the prompt for the LLM
+        prompt = f"""
+Compare the following two task results and determine if the current result contains any new or different information compared to the previous result.
+If there is new information, provide a very concise summary (max 50 characters) of what's new or different.
+If there is no new information, respond with "NO_NEW_INFO".
+
+Previous result:
+{previous_result}
+
+Current result:
+{current_result}
+
+Your response should be in the format:
+[YES/NO]
+[Concise summary of new information or "NO_NEW_INFO"]
+"""
+        
+        # Call the LLM
+        response = llm.invoke(prompt)
+        
+        # Parse the response
+        if not response or not response.content:
+            logger.warning("Empty response from LLM when comparing results")
+            return False, None
+            
+        llm_response = response.content.strip()
+        lines = llm_response.split('\n')
+        
+        if len(lines) < 2:
+            logger.warning(f"Unexpected LLM response format: {llm_response}")
+            return False, None
+            
+        has_new_info = lines[0].upper() == "YES"
+        summary = lines[1] if has_new_info else None
+        
+        if summary == "NO_NEW_INFO":
+            summary = None
+            
+        logger.info(f"LLM comparison result: has_new_info={has_new_info}, summary={summary}")
+        return has_new_info, summary
+        
+    except Exception as e:
+        logger.error(f"Error checking for new information: {e}")
+        return False, None 
