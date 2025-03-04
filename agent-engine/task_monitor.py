@@ -11,7 +11,7 @@ from web_agent import WebAgent
 from botocore.exceptions import ClientError
 import time
 from decimal import Decimal
-from email_utils import send_task_notification, notify_task_subscribers
+from email_utils import send_task_notification, notify_task_subscribers, get_previous_execution
 import humanize  # Add this import at the top of the file
 from pathlib import Path
 from aws_utils import get_dynamodb_resource, get_s3_client
@@ -19,7 +19,7 @@ import yaml
 import random
 from typing import Dict, Any
 from deep_research_agent import DeepResearchAgentWrapper  # Import the wrapper class
-from task_utils import upload_activity_log, upload_gif  # Import new utility functions
+from task_utils import upload_activity_log, upload_gif, check_new_information  # Import new utility functions
 
 # Custom JSON encoder to handle datetime objects
 class DateTimeEncoder(json.JSONEncoder):
@@ -269,6 +269,20 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                     # Parse timestamps
                     start_time = datetime.fromisoformat(execution['startTime'].replace('Z', '+00:00'))
                     end_time = datetime.fromisoformat(expression_values[':completedAt'].replace('Z', '+00:00'))
+                    
+                    # Check for new information if task completed successfully and has a result
+                    new_info_summary = None
+                    if status == 'completed' and result:
+                        try:
+                            # Get previous execution using the function from email_utils
+                            previous_execution = get_previous_execution(execution['taskId'], execution_id)
+                            
+                            # Check for new information
+                            if previous_execution and previous_execution.get('result') and previous_execution.get('result') != result:
+                                has_new_info, new_info_summary = check_new_information(previous_execution.get('result'), result)
+                                logger.info(f"New information check for task {execution['taskId']}: {has_new_info}, summary: {new_info_summary}")
+                        except Exception as e:
+                            logger.error(f"Error checking for new information: {e}")
 
                     # Send simple notification to task owner if emailNotification is enabled
                     if task.get('emailNotification'):
@@ -289,8 +303,10 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                                 task_name=task['name'],
                                 task_id=execution['taskId'],
                                 execution_status=status,
+                                execution_id=execution_id,
                                 result=result,
-                                error=error
+                                error=error,
+                                new_info_summary=new_info_summary
                             )
                         else:
                             logger.error(f"User email not found for userId: {task['userId']}")
@@ -304,7 +320,8 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                         result=result,
                         error=error,
                         start_time=start_time,
-                        end_time=end_time
+                        end_time=end_time,
+                        new_info_summary=new_info_summary
                     )
     except ClientError as e:
         logger.error(f"Error updating execution status: {e}")
