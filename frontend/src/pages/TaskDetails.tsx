@@ -32,6 +32,8 @@ import {
   InputLabel,
 } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
+import ArchiveIcon from '@mui/icons-material/Archive';
+import UnarchiveIcon from '@mui/icons-material/Unarchive';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import ThumbUpIcon from '@mui/icons-material/ThumbUp';
 import ThumbDownIcon from '@mui/icons-material/ThumbDown';
@@ -349,6 +351,7 @@ export default function TaskDetails() {
   const [uploadError, setUploadError] = useState<string>('');
   const [isUploading, setIsUploading] = useState(false);
   const [shouldPoll, setShouldPoll] = useState(true);
+  const [success, setSuccess] = useState('');
 
   const isAdminRoute = location.pathname.startsWith('/admin/');
   const showActions = !isAdminRoute || (task && user && task.userId === user.userId);
@@ -433,15 +436,32 @@ export default function TaskDetails() {
     fetchSubscribers();
   }, [taskId, token]);
 
-  const handleDelete = async () => {
+  const handleArchive = async () => {
+    if (!task) return;
+    
     try {
-      await axios.delete(buildApiUrl(`/api/tasks/${taskId}`), {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      navigate('/tasks');
+      if (task.status === 'archived') {
+        // Unarchive the task
+        await axios.put(
+          buildApiUrl(`/api/tasks/${taskId}`),
+          { status: 'active' },
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        // Refresh task data and schedules
+        await fetchTask();
+        // Force a refresh of schedules
+        handleScheduleCreated();
+        setSuccess('Task unarchived successfully');
+      } else {
+        // Archive the task
+        await axios.delete(buildApiUrl(`/api/tasks/${taskId}`), {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        navigate('/tasks');
+      }
     } catch (error: any) {
-      console.error('Error deleting task:', error);
-      setError(error.response?.data?.message || 'Failed to delete task');
+      console.error(`Error ${task.status === 'archived' ? 'unarchiving' : 'archiving'} task:`, error);
+      setError(error.response?.data?.message || `Failed to ${task.status === 'archived' ? 'unarchive' : 'archive'} task`);
     }
   };
 
@@ -626,6 +646,7 @@ export default function TaskDetails() {
   const handleScheduleCreated = async () => {
     console.log('Schedule created, refreshing data');
     await fetchTask();
+    // Force a re-render of the ScheduleList component
     setScheduleRefreshTrigger(prev => prev + 1);
   };
 
@@ -1022,16 +1043,17 @@ export default function TaskDetails() {
                 variant="contained"
                 color="primary"
                 onClick={handleRun}
-                disabled={getLatestExecution()?.status === 'running'}
+                disabled={getLatestExecution()?.status === 'running' || task?.status === 'archived'}
               >
                 Run Task
               </Button>
               <Button
                 variant="outlined"
-                color="error"
-                onClick={handleDelete}
+                color={task?.status === 'archived' ? "info" : "warning"}
+                onClick={handleArchive}
+                startIcon={task?.status === 'archived' ? <UnarchiveIcon /> : <ArchiveIcon />}
               >
-                Delete Task
+                {task?.status === 'archived' ? 'Unarchive Task' : 'Archive Task'}
               </Button>
             </Box>
           )}
@@ -1403,6 +1425,18 @@ export default function TaskDetails() {
           </Typography>
         )}
       </Paper>
+
+      {error && (
+        <Alert severity="error" sx={{ mb: 2 }} onClose={() => setError('')}>
+          {error}
+        </Alert>
+      )}
+
+      {success && (
+        <Alert severity="success" sx={{ mb: 2 }} onClose={() => setSuccess('')}>
+          {success}
+        </Alert>
+      )}
     </Container>
   );
 } 

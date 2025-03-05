@@ -61,6 +61,9 @@ export default function Tasks() {
     return () => clearInterval(intervalId);
   }, [token]);
 
+  // Filter out archived tasks
+  const activeTasks = tasks.filter(task => task.status !== 'archived');
+
   const getStatusColor = (status: string) => {
     switch (status.toLowerCase()) {
       case 'completed':
@@ -135,7 +138,7 @@ export default function Tasks() {
       </Paper>
 
       <Grid container spacing={3}>
-        {tasks.map((task) => (
+        {activeTasks.map((task) => (
           <Grid item xs={12} sm={6} md={4} key={task.taskId}>
             <Card sx={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
               <CardContent sx={{ flexGrow: 1 }}>
@@ -225,7 +228,7 @@ export default function Tasks() {
             </Card>
           </Grid>
         ))}
-        {tasks.length === 0 && (
+        {activeTasks.length === 0 && (
           <Grid item xs={12}>
             <Paper
               sx={{
@@ -243,14 +246,16 @@ export default function Tasks() {
                 color="text.secondary"
                 sx={{ mb: 2 }}
               >
-                No tasks found
+                No active tasks found
               </Typography>
               <Typography 
                 variant="body2" 
                 color="text.secondary"
                 sx={{ mb: 3 }}
               >
-                Create your first task to get started with web automation
+                {tasks.length > 0 ? 
+                  `You have ${tasks.length} archived task${tasks.length > 1 ? 's' : ''}. Active tasks are shown here.` : 
+                  'Create your first task to get started with web automation. Archived tasks are not shown here.'}
               </Typography>
               <Button
                 variant="contained"
@@ -258,7 +263,7 @@ export default function Tasks() {
                 onClick={() => navigate('/tasks/create')}
                 startIcon={<AddIcon />}
               >
-                Create Your First Task
+                {tasks.length > 0 ? 'Create New Task' : 'Create Your First Task'}
               </Button>
             </Paper>
           </Grid>
