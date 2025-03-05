@@ -24,6 +24,7 @@ import tempfile
 import shutil
 import re
 import traceback
+import threading
 
 # Custom JSON encoder to handle datetime objects
 class DateTimeEncoder(json.JSONEncoder):
@@ -91,6 +92,7 @@ logger.info(f"Using table prefix: {TABLE_PREFIX}")
 last_execution_time = None
 running_task_count = 0
 running_user_ids = set()
+running_task_ids = {}  # Dictionary to track running task IDs and their types
 
 def get_pending_executions():
     global last_execution_time
@@ -507,7 +509,7 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
         }
 
 async def execute_task(execution):
-    global running_task_count, running_user_ids
+    global running_task_count, running_user_ids, running_task_ids
     
     execution_id = execution['executionId']
     task_id = execution['taskId']
@@ -534,6 +536,13 @@ async def execute_task(execution):
             
             if not task:
                 raise Exception(f"Task {task_id} not found")
+                
+            # Check if this is a deep research task and track it
+            is_deep_research = task.get('isDeepResearch', False)
+            if is_deep_research:
+                running_task_ids[execution_id] = 'deep_research'
+            else:
+                running_task_ids[execution_id] = 'standard'
 
             # Get both accepted and rejected executions
             accepted_executions = executions_table.query(
@@ -650,14 +659,64 @@ async def execute_task(execution):
                             full_llm_name=llm_name
                         )
                         
-                        # Run the research
-                        result = agent.run_research(
-                            query=prompt_with_context,
-                            max_turns=int(os.getenv('DEEP_RESEARCH_MAX_TURNS', '2')),
-                            user_input=False
-                        )
+                        # Define a function to run the research in a separate thread
+                        def run_research_in_thread(agent, prompt, max_turns):
+                            try:
+                                return agent.run_research(
+                                    query=prompt,
+                                    max_turns=max_turns,
+                                    user_input=False
+                                )
+                            except Exception as e:
+                                logger.error(f"Error in research thread: {str(e)}")
+                                return {
+                                    "success": False,
+                                    "error": f"Research thread error: {str(e)}",
+                                    "llm_name": llm_name
+                                }
                         
-                        logger.info(f"Successfully completed deep research with {llm_name}")
+                        # Set timeout from environment or default to 15 minutes
+                        timeout_seconds = int(os.getenv('DEEP_RESEARCH_TIMEOUT_SECONDS', '900'))
+                        logger.info(f"Running deep research with timeout of {timeout_seconds} seconds")
+                        
+                        # Use asyncio.to_thread to run the research in a separate thread without blocking
+                        try:
+                            # Create a task that will run the research in a separate thread
+                            research_task = asyncio.create_task(
+                                asyncio.to_thread(
+                                    run_research_in_thread,
+                                    agent,
+                                    prompt_with_context,
+                                    int(os.getenv('DEEP_RESEARCH_MAX_TURNS', '2'))
+                                )
+                            )
+                            
+                            # Wait for the research to complete with a timeout
+                            result = await asyncio.wait_for(research_task, timeout=timeout_seconds)
+                            logger.info(f"Successfully completed deep research with {llm_name}")
+                            
+                        except asyncio.TimeoutError:
+                            # Research timed out
+                            logger.error(f"Deep research timed out after {timeout_seconds} seconds")
+                            result = {
+                                "success": False,
+                                "error": f"Deep research timed out after {timeout_seconds} seconds",
+                                "llm_name": llm_name
+                            }
+                            # Cancel the task to prevent it from continuing to run in the background
+                            research_task.cancel()
+                            
+                        except Exception as e:
+                            # Other errors
+                            logger.error(f"Error waiting for deep research: {str(e)}")
+                            result = {
+                                "success": False,
+                                "error": f"Error waiting for deep research: {str(e)}",
+                                "llm_name": llm_name
+                            }
+                            # Cancel the task if it's still running
+                            if 'research_task' in locals() and not research_task.done():
+                                research_task.cancel()
                         
                         # Get the output file path from the result
                         filtered_activity_log = result.get('output_file', None)
@@ -782,6 +841,9 @@ async def execute_task(execution):
     finally:
         running_task_count -= 1
         running_user_ids.remove(user_id)
+        # Remove task from tracking
+        running_task_ids.pop(execution_id, None)
+        logger.info(f"Task {execution_id} cleanup completed")
 
 def get_pending_workflow_executions():
     try:
@@ -905,8 +967,9 @@ async def monitor_executions():
             if pending_executions and running_task_count < MAX_CONCURRENT:
                 for execution in pending_executions:
                     user_id = execution['userId']
+                    
                     if user_id not in running_user_ids and running_task_count < MAX_CONCURRENT:
-                        asyncio.create_task(execute_task(execution))
+                        task = asyncio.create_task(execute_task(execution))
                         executed_count += 1
                 
                 # Only update last_execution_time if we executed all pending executions
