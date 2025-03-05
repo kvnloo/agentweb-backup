@@ -7,6 +7,20 @@ interface Release {
 
 const releases: Release[] = [
   {
+    date: "2025-03-05",
+    changes: [
+      "Replaced Delete Task with Archive Task functionality",
+      "- Tasks can now be archived instead of permanently deleted",
+      "- Archived tasks can be unarchived from the Task Details page",
+      "- Archived tasks are hidden from the main Tasks page",
+      "- Task schedules are automatically disabled when a task is archived",
+      "Enhanced email notifications for task executions",
+      "- Email titles of task executions now include summary of new information",
+      "- This informative subject works for both users and subscribers",
+      "- It helps easily identify important emails"
+    ]
+  },
+  {
     date: "2025-03-03",
     changes: [
       "Improved Deep Research reports",
