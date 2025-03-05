@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { taskDb } from '../services/db';
 import { userDb } from '../services/db';
+import { scheduleDb } from '../services/db';
 import AWS from 'aws-sdk';
 
 interface AuthRequest extends Request {
@@ -149,15 +150,43 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
     if (req.body.llmName !== undefined) {
       updates.llmName = req.body.llmName || null;  // Convert empty string to null
     }
+    
+    if (req.body.status !== undefined) {
+      updates.status = req.body.status;
+    }
 
     console.log('Updates to apply:', updates);
+    
+    // Check if we're unarchiving a task (changing status from 'archived' to 'active')
+    const isUnarchiving = task.status === 'archived' && updates.status === 'active';
 
     await taskDb.updateTask(taskId, updates);
+    
+    // If unarchiving, reactivate schedules that were disabled when the task was archived
+    if (isUnarchiving) {
+      console.log('Unarchiving task, reactivating schedules...');
+      const schedules = await taskDb.getTaskSchedules(taskId);
+      console.log('Found schedules:', schedules);
+      
+      if (schedules && schedules.length > 0) {
+        for (const schedule of schedules) {
+          console.log('Reactivating schedule:', schedule.scheduleId);
+          try {
+            await scheduleDb.updateSchedule(schedule.scheduleId, { status: 'active' });
+            console.log('Schedule reactivated successfully');
+          } catch (scheduleError) {
+            console.error('Error reactivating schedule:', scheduleError);
+          }
+        }
+      } else {
+        console.log('No schedules found for this task');
+      }
+    }
     
     // Get and return the updated task
     const updatedTask = await taskDb.getTaskById(taskId);
     console.log('Updated task:', updatedTask);
-    
+
     res.json(updatedTask);
   } catch (error) {
     console.error('Error in updateTask:', error);
@@ -186,15 +215,24 @@ export const deleteTask = async (req: AuthRequest, res: Response) => {
 
     // Update task status to archived instead of deleting
     await taskDb.updateTask(taskId, { status: 'archived' });
+    console.log('Task archived:', taskId);
     
     // Disable all schedules for this task
     const schedules = await taskDb.getTaskSchedules(taskId);
+    console.log('Found schedules to disable:', schedules);
+    
     if (schedules && schedules.length > 0) {
       for (const schedule of schedules) {
-        // Use the scheduleDb service to update the schedule
-        const { scheduleDb } = require('../services/db');
-        await scheduleDb.updateSchedule(schedule.scheduleId, { status: 'inactive' });
+        console.log('Disabling schedule:', schedule.scheduleId);
+        try {
+          await scheduleDb.updateSchedule(schedule.scheduleId, { status: 'inactive' });
+          console.log('Schedule disabled successfully');
+        } catch (scheduleError) {
+          console.error('Error disabling schedule:', scheduleError);
+        }
       }
+    } else {
+      console.log('No schedules found for this task');
     }
 
     res.status(200).json({ message: 'Task archived successfully' });
