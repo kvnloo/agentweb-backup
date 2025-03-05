@@ -32,6 +32,7 @@ import {
   InputLabel,
 } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
+import ArchiveIcon from '@mui/icons-material/Archive';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import ThumbUpIcon from '@mui/icons-material/ThumbUp';
 import ThumbDownIcon from '@mui/icons-material/ThumbDown';
@@ -433,15 +434,15 @@ export default function TaskDetails() {
     fetchSubscribers();
   }, [taskId, token]);
 
-  const handleDelete = async () => {
+  const handleArchive = async () => {
     try {
       await axios.delete(buildApiUrl(`/api/tasks/${taskId}`), {
         headers: { Authorization: `Bearer ${token}` },
       });
       navigate('/tasks');
     } catch (error: any) {
-      console.error('Error deleting task:', error);
-      setError(error.response?.data?.message || 'Failed to delete task');
+      console.error('Error archiving task:', error);
+      setError(error.response?.data?.message || 'Failed to archive task');
     }
   };
 
@@ -1028,10 +1029,11 @@ export default function TaskDetails() {
               </Button>
               <Button
                 variant="outlined"
-                color="error"
-                onClick={handleDelete}
+                color="warning"
+                onClick={handleArchive}
+                startIcon={<ArchiveIcon />}
               >
-                Delete Task
+                Archive Task
               </Button>
             </Box>
           )}

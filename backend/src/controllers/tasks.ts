@@ -184,11 +184,23 @@ export const deleteTask = async (req: AuthRequest, res: Response) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    await taskDb.deleteTask(taskId);
-    res.status(204).send();
+    // Update task status to archived instead of deleting
+    await taskDb.updateTask(taskId, { status: 'archived' });
+    
+    // Disable all schedules for this task
+    const schedules = await taskDb.getTaskSchedules(taskId);
+    if (schedules && schedules.length > 0) {
+      for (const schedule of schedules) {
+        // Use the scheduleDb service to update the schedule
+        const { scheduleDb } = require('../services/db');
+        await scheduleDb.updateSchedule(schedule.scheduleId, { status: 'inactive' });
+      }
+    }
+
+    res.status(200).json({ message: 'Task archived successfully' });
   } catch (error) {
-    console.error('Error in deleteTask:', error);
-    res.status(500).json({ message: 'Error deleting task' });
+    console.error('Error in archiveTask:', error);
+    res.status(500).json({ message: 'Error archiving task' });
   }
 };
 
