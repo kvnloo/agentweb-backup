@@ -25,7 +25,8 @@ import {
   DialogTitle,
   DialogContent,
   DialogActions,
-  DialogContentText
+  DialogContentText,
+  Tooltip
 } from '@mui/material';
 import { format } from 'date-fns';
 import { Link } from 'react-router-dom';
@@ -33,6 +34,10 @@ import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
 import { buildApiUrl } from '../config';
 import DOMPurify from 'dompurify';
+import {
+  Check as CheckIcon,
+  Info as InfoIcon
+} from '@mui/icons-material';
 
 interface TabPanelProps {
   children?: React.ReactNode;
@@ -551,17 +556,42 @@ export default function AdminDashboard() {
                         </TableCell>
                         <TableCell>
                           {entry.useCaseDescription ? (
-                            <Typography 
-                              variant="body2" 
-                              sx={{ 
-                                maxWidth: 250, 
-                                overflow: 'hidden', 
-                                textOverflow: 'ellipsis', 
-                                whiteSpace: 'nowrap' 
-                              }}
+                            <Tooltip 
+                              title={
+                                <Typography variant="body2" style={{ whiteSpace: 'pre-wrap' }}>
+                                  {entry.useCaseDescription}
+                                </Typography>
+                              } 
+                              placement="top-start"
+                              arrow
+                              enterDelay={500}
+                              leaveDelay={200}
+                              sx={{ maxWidth: 500 }}
                             >
-                              {entry.useCaseDescription}
-                            </Typography>
+                              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                                <Typography 
+                                  variant="body2" 
+                                  sx={{ 
+                                    maxWidth: 220, 
+                                    overflow: 'hidden', 
+                                    textOverflow: 'ellipsis', 
+                                    whiteSpace: 'nowrap',
+                                    cursor: 'pointer'
+                                  }}
+                                >
+                                  {entry.useCaseDescription}
+                                </Typography>
+                                <InfoIcon 
+                                  fontSize="small" 
+                                  color="action" 
+                                  sx={{ 
+                                    opacity: 0.6, 
+                                    fontSize: '0.875rem',
+                                    '&:hover': { opacity: 1 }
+                                  }} 
+                                />
+                              </Box>
+                            </Tooltip>
                           ) : (
                             <Typography variant="body2" color="text.secondary">
                               Not provided
