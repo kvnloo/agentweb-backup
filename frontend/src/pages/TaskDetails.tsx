@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useParams, useNavigate, useLocation } from 'react-router-dom';
+import { useParams, useNavigate, useLocation, Link as RouterLink } from 'react-router-dom';
 import {
   Container,
   Typography,
@@ -973,7 +973,13 @@ export default function TaskDetails() {
               )}
             </Box>
             <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-              Owner: {task.userId}
+              Owner: {user?.isAdmin ? (
+                <RouterLink to={`/profile/${task.userId}`} style={{ textDecoration: 'none' }}>
+                  {task.userId}
+                </RouterLink>
+              ) : (
+                task.userId
+              )}
             </Typography>
             {showActions && (
               <Box sx={{ display: 'flex', gap: 2, alignItems: 'center' }}>
@@ -1297,8 +1303,8 @@ export default function TaskDetails() {
                               variant="body2"
                               onClick={() => navigate(`/tasks/${taskId}/executions/${execution.executionId}`)}
                               sx={{ mt: 1, display: 'block' }}
-                            >
-                              View Full Details
+                             >
+                               View Full Details
                             </Link>
                           </Box>
                         )}

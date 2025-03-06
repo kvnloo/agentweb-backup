@@ -7,22 +7,94 @@ import {
   Card,
   CardContent,
   Divider,
-  Chip
+  Chip,
+  CircularProgress,
+  Alert
 } from '@mui/material';
 import { useAuth } from '../contexts/AuthContext';
+import { useParams } from 'react-router-dom';
+import { useState, useEffect } from 'react';
+import axios from 'axios';
+import { buildApiUrl } from '../config';
 
 export default function Profile() {
-  const { user } = useAuth();
+  const { user, token } = useAuth();
+  const { userId } = useParams<{ userId: string }>();
+  const [profileUser, setProfileUser] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
 
-  if (!user) {
-    return null;
+  useEffect(() => {
+    // If no userId is provided in the URL, show the current user's profile
+    if (!userId) {
+      setProfileUser(user);
+      return;
+    }
+
+    // If the userId matches the current user, use the current user's data
+    if (user && userId === user.userId) {
+      setProfileUser(user);
+      return;
+    }
+
+    // Only admins can view other users' profiles
+    if (!user?.isAdmin) {
+      setError('You do not have permission to view this profile');
+      return;
+    }
+
+    // Otherwise, fetch the user profile for the specified userId
+    const fetchUserProfile = async () => {
+      setLoading(true);
+      try {
+        const response = await axios.get(buildApiUrl(`/api/admin/users/${userId}`), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        setProfileUser(response.data);
+      } catch (error) {
+        console.error('Error fetching user profile:', error);
+        setError(error.response?.data?.message || 'Failed to fetch user profile');
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchUserProfile();
+  }, [userId, user, token]);
+
+  if (loading) {
+    return (
+      <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
+        <CircularProgress />
+      </Box>
+    );
+  }
+
+  if (error) {
+    return (
+      <Container maxWidth="md">
+        <Alert severity="error" sx={{ mt: 4 }}>
+          {error}
+        </Alert>
+      </Container>
+    );
+  }
+
+  if (!profileUser) {
+    return (
+      <Container maxWidth="md">
+        <Alert severity="info" sx={{ mt: 4 }}>
+          User not found
+        </Alert>
+      </Container>
+    );
   }
 
   return (
     <Container maxWidth="md" sx={{ py: 4 }}>
       <Paper sx={{ p: 4 }}>
         <Typography variant="h4" gutterBottom>
-          Profile
+          {userId && userId !== user?.userId ? 'User Profile' : 'My Profile'}
         </Typography>
         <Divider sx={{ mb: 4 }} />
         
@@ -34,14 +106,14 @@ export default function Profile() {
                   <Typography variant="subtitle2" color="text.secondary">
                     Email
                   </Typography>
-                  <Typography variant="body1">{user.email}</Typography>
+                  <Typography variant="body1">{profileUser.email}</Typography>
                 </Box>
 
                 <Box sx={{ mb: 2 }}>
                   <Typography variant="subtitle2" color="text.secondary">
                     User ID
                   </Typography>
-                  <Typography variant="body1">{user.userId}</Typography>
+                  <Typography variant="body1">{profileUser.userId}</Typography>
                 </Box>
 
                 <Box sx={{ mb: 2 }}>
@@ -49,14 +121,14 @@ export default function Profile() {
                     Account Type
                   </Typography>
                   <Box sx={{ mt: 1 }}>
-                    {user.isAdmin && (
+                    {profileUser.isAdmin && (
                       <Chip
                         label="Admin"
                         color="primary"
                         sx={{ mr: 1 }}
                       />
                     )}
-                    {user.isOAuthUser ? (
+                    {profileUser.isOAuthUser ? (
                       <Chip
                         label="Google Account"
                         color="secondary"
@@ -75,7 +147,7 @@ export default function Profile() {
                     Member Since
                   </Typography>
                   <Typography variant="body1">
-                    {new Date(user.createdAt).toLocaleDateString()}
+                    {new Date(profileUser.createdAt).toLocaleDateString()}
                   </Typography>
                 </Box>
               </CardContent>
