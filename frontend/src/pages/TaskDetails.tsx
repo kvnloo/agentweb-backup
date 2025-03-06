@@ -972,6 +972,9 @@ export default function TaskDetails() {
                 />
               )}
             </Box>
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+              Owner: {task.userId}
+            </Typography>
             {showActions && (
               <Box sx={{ display: 'flex', gap: 2, alignItems: 'center' }}>
                 <FormControlLabel
