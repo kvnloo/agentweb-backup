@@ -6,7 +6,7 @@ const router = express.Router();
 
 router.post('/', async (req, res) => {
   try {
-    const { email } = req.body;
+    const { email, useCaseCategories, useCaseDescription } = req.body;
 
     if (!email || !validateEmail(email)) {
       return res.status(400).json({ message: 'Invalid email address' });
@@ -21,7 +21,9 @@ router.post('/', async (req, res) => {
     // Add to waitlist
     const entry = await waitlistDb.add({
       email,
-      joinedAt: new Date().toISOString()
+      joinedAt: new Date().toISOString(),
+      useCaseCategories,
+      useCaseDescription
     });
 
     res.status(201).json(entry);

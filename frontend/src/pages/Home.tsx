@@ -30,6 +30,8 @@ import logo from '../assets/logo.svg';
 
 export default function Home() {
   const [email, setEmail] = useState('');
+  const [useCaseCategories, setUseCaseCategories] = useState<string[]>([]);
+  const [useCaseDescription, setUseCaseDescription] = useState('');
   const [submitted, setSubmitted] = useState(false);
   const [error, setError] = useState('');
 
@@ -38,7 +40,11 @@ export default function Home() {
     setError('');
     
     try {
-      await axios.post(buildApiUrl('/api/waitlist'), { email });
+      await axios.post(buildApiUrl('/api/waitlist'), { 
+        email,
+        useCaseCategories,
+        useCaseDescription
+      });
       setSubmitted(true);
     } catch (err) {
       setError('Failed to join waitlist. Please try again.');
@@ -220,7 +226,7 @@ export default function Home() {
                     <Typography variant="h6" gutterBottom color="text.primary">
                       Join Waitlist
                     </Typography>
-                    <Box sx={{ display: 'flex', gap: 1 }}>
+                    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                       <TextField
                         required
                         fullWidth
@@ -230,13 +236,50 @@ export default function Home() {
                         onChange={(e) => setEmail(e.target.value)}
                         sx={{ bgcolor: 'background.default' }}
                       />
+                      
+                      <Typography variant="subtitle2" color="text.secondary" sx={{ mt: 1 }}>
+                        How do you plan to use AgentWeb? (Select all that apply)
+                      </Typography>
+                      <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
+                        {['Data Entry', 'Web Scraping', 'Form Filling', 'Monitoring', 'Reporting', 'Customer Service', 'Other'].map((category) => (
+                          <Chip
+                            key={category}
+                            label={category}
+                            onClick={() => {
+                              if (useCaseCategories.includes(category)) {
+                                setUseCaseCategories(useCaseCategories.filter(c => c !== category));
+                              } else {
+                                setUseCaseCategories([...useCaseCategories, category]);
+                              }
+                            }}
+                            color={useCaseCategories.includes(category) ? "primary" : "default"}
+                            sx={{ 
+                              cursor: 'pointer',
+                              '&:hover': {
+                                bgcolor: useCaseCategories.includes(category) ? 'primary.light' : 'action.hover'
+                              }
+                            }}
+                          />
+                        ))}
+                      </Box>
+                      
+                      <TextField
+                        fullWidth
+                        multiline
+                        rows={3}
+                        placeholder="Please describe your use case in more detail (helps us prioritize)"
+                        value={useCaseDescription}
+                        onChange={(e) => setUseCaseDescription(e.target.value)}
+                        sx={{ bgcolor: 'background.default' }}
+                      />
+                      
                       <Button
                         type="submit"
                         variant="contained"
                         size="large"
+                        fullWidth
                         sx={{ 
-                          px: 3,
-                          whiteSpace: 'nowrap',
+                          mt: 1,
                           bgcolor: 'primary.main',
                           '&:hover': {
                             bgcolor: 'primary.dark'

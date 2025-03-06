@@ -516,6 +516,8 @@ export default function AdminDashboard() {
                 <TableRow>
                   <TableCell>Email</TableCell>
                   <TableCell>Joined At</TableCell>
+                  <TableCell>Use Cases</TableCell>
+                  <TableCell>Use Case Description</TableCell>
                   <TableCell>Status</TableCell>
                   <TableCell>Actions</TableCell>
                 </TableRow>
@@ -523,7 +525,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={4} align="center">
+                    <TableCell colSpan={6} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -534,6 +536,38 @@ export default function AdminDashboard() {
                       <TableRow key={entry.email}>
                         <TableCell>{entry.email}</TableCell>
                         <TableCell>{new Date(entry.joinedAt).toLocaleDateString()}</TableCell>
+                        <TableCell>
+                          {entry.useCaseCategories && entry.useCaseCategories.length > 0 ? (
+                            <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
+                              {entry.useCaseCategories.map((category: string) => (
+                                <Chip key={category} label={category} size="small" />
+                              ))}
+                            </Box>
+                          ) : (
+                            <Typography variant="body2" color="text.secondary">
+                              Not specified
+                            </Typography>
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          {entry.useCaseDescription ? (
+                            <Typography 
+                              variant="body2" 
+                              sx={{ 
+                                maxWidth: 250, 
+                                overflow: 'hidden', 
+                                textOverflow: 'ellipsis', 
+                                whiteSpace: 'nowrap' 
+                              }}
+                            >
+                              {entry.useCaseDescription}
+                            </Typography>
+                          ) : (
+                            <Typography variant="body2" color="text.secondary">
+                              Not provided
+                            </Typography>
+                          )}
+                        </TableCell>
                         <TableCell>
                           {userExists ? (
                             <Chip label="Registered" color="success" />
