@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import {
   Box,
   Container,
@@ -27,6 +27,7 @@ import {
 import axios from 'axios';
 import { buildApiUrl } from '../config';
 import logo from '../assets/logo.svg';
+import React from 'react';
 
 export default function Home() {
   const [email, setEmail] = useState('');
@@ -34,6 +35,24 @@ export default function Home() {
   const [useCaseDescription, setUseCaseDescription] = useState('');
   const [submitted, setSubmitted] = useState(false);
   const [error, setError] = useState('');
+  const [formExpanded, setFormExpanded] = useState(false);
+  const formRef = React.useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (formRef.current && !formRef.current.contains(event.target as Node)) {
+        // Only fold if both email and use case fields are empty
+        if (!email && useCaseCategories.length === 0 && !useCaseDescription) {
+          setFormExpanded(false);
+        }
+      }
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [email, useCaseCategories, useCaseDescription]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -217,7 +236,7 @@ export default function Home() {
                     Thanks for joining our waitlist! We'll notify you when you're invited.
                   </Alert>
                 ) : (
-                  <Box component="form" onSubmit={handleSubmit}>
+                  <Box component="form" onSubmit={handleSubmit} onClick={() => setFormExpanded(true)} ref={formRef}>
                     {error && (
                       <Alert severity="error" sx={{ mb: 2 }}>
                         {error}
@@ -234,50 +253,78 @@ export default function Home() {
                         placeholder="Enter your email"
                         value={email}
                         onChange={(e) => setEmail(e.target.value)}
+                        onFocus={() => setFormExpanded(true)}
+                        onClick={() => setFormExpanded(true)}
+                        onBlur={() => {
+                          if (!email && useCaseCategories.length === 0 && !useCaseDescription) {
+                            setFormExpanded(false);
+                          }
+                        }}
                         sx={{ bgcolor: 'background.default' }}
+                        helperText={!formExpanded ? "Click to tell us about your use case" : ""}
                       />
                       
-                      <Typography variant="subtitle2" color="text.secondary" sx={{ mt: 1 }}>
-                        How do you plan to use AgentWeb? (Select all that apply)
-                      </Typography>
-                      <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
-                        {['Data Entry', 'Web Scraping', 'Form Filling', 'Monitoring', 'Reporting', 'Customer Service', 'Other'].map((category) => (
-                          <Chip
-                            key={category}
-                            label={category}
-                            onClick={() => {
-                              if (useCaseCategories.includes(category)) {
-                                setUseCaseCategories(useCaseCategories.filter(c => c !== category));
-                              } else {
-                                setUseCaseCategories([...useCaseCategories, category]);
-                              }
-                            }}
-                            color={useCaseCategories.includes(category) ? "primary" : "default"}
-                            sx={{ 
-                              cursor: 'pointer',
-                              '&:hover': {
-                                bgcolor: useCaseCategories.includes(category) ? 'primary.light' : 'action.hover'
-                              }
-                            }}
-                          />
-                        ))}
+                      <Box 
+                        sx={{ 
+                          height: formExpanded ? 'auto' : 0,
+                          overflow: 'hidden',
+                          transition: 'all 0.3s ease-in-out',
+                          opacity: formExpanded ? 1 : 0,
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: 2
+                        }}
+                      >
+                        <Typography variant="subtitle2" color="text.secondary">
+                          How do you plan to use AgentWeb? (Select all that apply)
+                        </Typography>
+                        <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }} onClick={() => setFormExpanded(true)}>
+                          {['Data Entry', 'Web Scraping', 'Form Filling', 'Monitoring', 'Reporting', 'Customer Service', 'Other'].map((category) => (
+                            <Chip
+                              key={category}
+                              label={category}
+                              onClick={() => {
+                                if (useCaseCategories.includes(category)) {
+                                  setUseCaseCategories(useCaseCategories.filter(c => c !== category));
+                                } else {
+                                  setUseCaseCategories([...useCaseCategories, category]);
+                                }
+                              }}
+                              color={useCaseCategories.includes(category) ? "primary" : "default"}
+                              sx={{ 
+                                cursor: 'pointer',
+                                '&:hover': {
+                                  bgcolor: useCaseCategories.includes(category) ? 'primary.light' : 'action.hover'
+                                }
+                              }}
+                            />
+                          ))}
+                        </Box>
+                        
+                        <TextField
+                          fullWidth
+                          multiline
+                          rows={3}
+                          placeholder="Please describe your use case in more detail (helps us prioritize)"
+                          value={useCaseDescription}
+                          onChange={(e) => setUseCaseDescription(e.target.value)}
+                          onFocus={() => setFormExpanded(true)}
+                          onClick={() => setFormExpanded(true)}
+                          onBlur={() => {
+                            if (!email && useCaseCategories.length === 0 && !useCaseDescription) {
+                              setFormExpanded(false);
+                            }
+                          }}
+                          sx={{ bgcolor: 'background.default' }}
+                        />
                       </Box>
-                      
-                      <TextField
-                        fullWidth
-                        multiline
-                        rows={3}
-                        placeholder="Please describe your use case in more detail (helps us prioritize)"
-                        value={useCaseDescription}
-                        onChange={(e) => setUseCaseDescription(e.target.value)}
-                        sx={{ bgcolor: 'background.default' }}
-                      />
                       
                       <Button
                         type="submit"
                         variant="contained"
                         size="large"
                         fullWidth
+                        onClick={() => setFormExpanded(true)}
                         sx={{ 
                           mt: 1,
                           bgcolor: 'primary.main',
