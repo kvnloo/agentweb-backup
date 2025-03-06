@@ -917,6 +917,12 @@ export default function TaskDetails() {
   return (
     <Container maxWidth="lg" sx={{ mt: 4, mb: 4 }}>
       <Paper sx={{ p: 4, mt: 4 }}>
+        {/* Admin viewing indicator */}
+        {user?.isAdmin && user?.userId !== task.userId && (
+          <Alert severity="info" sx={{ mb: 3 }}>
+            You are viewing another user's task as an administrator.
+          </Alert>
+        )}
         <Box sx={{ mb: 4, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
           <Box>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
