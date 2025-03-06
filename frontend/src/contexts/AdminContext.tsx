@@ -61,7 +61,13 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     try {
       setLoading(true);
       const response = await api.get('/api/admin/waitlist');
-      setWaitlist(response.data.items);
+      // Sort waitlist by joinedAt in descending order (newest first)
+      const sortedWaitlist = [...response.data.items].sort((a, b) => {
+        const aDate = new Date(a.joinedAt).getTime();
+        const bDate = new Date(b.joinedAt).getTime();
+        return bDate - aDate; // descending order
+      });
+      setWaitlist(sortedWaitlist);
       setError(null);
     } catch (err: any) {
       setError(err.response?.data?.message || 'Failed to load waitlist');

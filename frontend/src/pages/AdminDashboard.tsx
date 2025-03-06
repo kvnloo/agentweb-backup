@@ -75,6 +75,8 @@ export default function AdminDashboard() {
   const [tasks, setTasks] = useState<any[]>([]);
   const [orderBy, setOrderBy] = useState<keyof any>('latestRunTime');
   const [order, setOrder] = useState<'asc' | 'desc'>('desc');
+  const [waitlistOrderBy, setWaitlistOrderBy] = useState<string>('joinedAt');
+  const [waitlistOrder, setWaitlistOrder] = useState<'asc' | 'desc'>('desc');
   const [message, setMessage] = useState('');
   const [title, setTitle] = useState('');
   const [loading, setLoading] = useState(false);
@@ -144,6 +146,12 @@ export default function AdminDashboard() {
     await updateWaitlistStatus(email, status);
   };
 
+  const handleWaitlistSort = (property: string) => {
+    const isAsc = waitlistOrderBy === property && waitlistOrder === 'asc';
+    setWaitlistOrder(isAsc ? 'desc' : 'asc');
+    setWaitlistOrderBy(property);
+  };
+
   const handleSort = (property: keyof any) => {
     const isAsc = orderBy === property && order === 'asc';
     setOrder(isAsc ? 'desc' : 'asc');
@@ -181,23 +189,45 @@ export default function AdminDashboard() {
 
   const SortLabel = ({ property, label }: { property: keyof any; label: string }) => (
     <Box
-      component="span"
-      onClick={() => handleSort(property)}
       sx={{
-        cursor: 'pointer',
-        display: 'inline-flex',
+        display: 'flex',
         alignItems: 'center',
+        cursor: 'pointer',
+        userSelect: 'none',
         '&:hover': {
           color: 'primary.main',
-        }
+        },
       }}
+      onClick={() => handleSort(property)}
     >
       {label}
-      {orderBy === property && (
-        <Typography component="span" sx={{ ml: 0.5, fontSize: '0.75rem' }}>
-          {order === 'asc' ? '↑' : '↓'}
-        </Typography>
-      )}
+      {orderBy === property ? (
+        <Box component="span" sx={{ ml: 1 }}>
+          {order === 'desc' ? '↓' : '↑'}
+        </Box>
+      ) : null}
+    </Box>
+  );
+
+  const WaitlistSortLabel = ({ property, label }: { property: string; label: string }) => (
+    <Box
+      sx={{
+        display: 'flex',
+        alignItems: 'center',
+        cursor: 'pointer',
+        userSelect: 'none',
+        '&:hover': {
+          color: 'primary.main',
+        },
+      }}
+      onClick={() => handleWaitlistSort(property)}
+    >
+      {label}
+      {waitlistOrderBy === property ? (
+        <Box component="span" sx={{ ml: 1 }}>
+          {waitlistOrder === 'desc' ? '↓' : '↑'}
+        </Box>
+      ) : null}
     </Box>
   );
 
@@ -520,7 +550,21 @@ export default function AdminDashboard() {
               <TableHead>
                 <TableRow>
                   <TableCell>Email</TableCell>
-                  <TableCell>Joined At</TableCell>
+                  <TableCell>
+                    <Box
+                      sx={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 0.5,
+                        fontWeight: 'bold',
+                      }}
+                    >
+                      Joined At
+                      <Box component="span" sx={{ ml: 0.5, fontSize: '0.75rem' }}>
+                        ↓
+                      </Box>
+                    </Box>
+                  </TableCell>
                   <TableCell>Use Cases</TableCell>
                   <TableCell>Use Case Description</TableCell>
                   <TableCell>Status</TableCell>
@@ -535,99 +579,118 @@ export default function AdminDashboard() {
                     </TableCell>
                   </TableRow>
                 ) : (
-                  waitlist.map((entry) => {
-                    const userExists = users.some(user => user.email === entry.email);
-                    return (
-                      <TableRow key={entry.email}>
-                        <TableCell>{entry.email}</TableCell>
-                        <TableCell>{new Date(entry.joinedAt).toLocaleDateString()}</TableCell>
-                        <TableCell>
-                          {entry.useCaseCategories && entry.useCaseCategories.length > 0 ? (
-                            <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
-                              {entry.useCaseCategories.map((category: string) => (
-                                <Chip key={category} label={category} size="small" />
-                              ))}
-                            </Box>
-                          ) : (
-                            <Typography variant="body2" color="text.secondary">
-                              Not specified
-                            </Typography>
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          {entry.useCaseDescription ? (
-                            <Tooltip 
-                              title={
-                                <Typography variant="body2" style={{ whiteSpace: 'pre-wrap' }}>
-                                  {entry.useCaseDescription}
-                                </Typography>
-                              } 
-                              placement="top-start"
-                              arrow
-                              enterDelay={500}
-                              leaveDelay={200}
-                              sx={{ maxWidth: 500 }}
-                            >
-                              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                                <Typography 
-                                  variant="body2" 
-                                  sx={{ 
-                                    maxWidth: 220, 
-                                    overflow: 'hidden', 
-                                    textOverflow: 'ellipsis', 
-                                    whiteSpace: 'nowrap',
-                                    cursor: 'pointer'
-                                  }}
-                                >
-                                  {entry.useCaseDescription}
-                                </Typography>
-                                <InfoIcon 
-                                  fontSize="small" 
-                                  color="action" 
-                                  sx={{ 
-                                    opacity: 0.6, 
-                                    fontSize: '0.875rem',
-                                    '&:hover': { opacity: 1 }
-                                  }} 
-                                />
+                  [...waitlist]
+                    .sort((a, b) => {
+                      const aValue = a[waitlistOrderBy];
+                      const bValue = b[waitlistOrderBy];
+                      
+                      if (waitlistOrderBy === 'joinedAt') {
+                        const aDate = new Date(aValue).getTime();
+                        const bDate = new Date(bValue).getTime();
+                        return waitlistOrder === 'asc' ? aDate - bDate : bDate - aDate;
+                      }
+                      
+                      if (aValue < bValue) {
+                        return waitlistOrder === 'asc' ? -1 : 1;
+                      }
+                      if (aValue > bValue) {
+                        return waitlistOrder === 'asc' ? 1 : -1;
+                      }
+                      return 0;
+                    })
+                    .map((entry) => {
+                      const userExists = users.some(user => user.email === entry.email);
+                      return (
+                        <TableRow key={entry.email}>
+                          <TableCell>{entry.email}</TableCell>
+                          <TableCell>{new Date(entry.joinedAt).toLocaleDateString()}</TableCell>
+                          <TableCell>
+                            {entry.useCaseCategories && entry.useCaseCategories.length > 0 ? (
+                              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
+                                {entry.useCaseCategories.map((category: string) => (
+                                  <Chip key={category} label={category} size="small" />
+                                ))}
                               </Box>
-                            </Tooltip>
-                          ) : (
-                            <Typography variant="body2" color="text.secondary">
-                              Not provided
-                            </Typography>
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          {userExists ? (
-                            <Chip label="Registered" color="success" />
-                          ) : (
-                            entry.status
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          {!userExists && entry.status === 'pending' && (
-                            <Button
-                              variant="contained"
-                              color="primary"
-                              onClick={() => handleWaitlistAction(entry.email, 'invited')}
-                            >
-                              Invite
-                            </Button>
-                          )}
-                          {!userExists && entry.status === 'invited' && (
-                            <Button
-                              variant="outlined"
-                              color="secondary"
-                              onClick={() => handleWaitlistAction(entry.email, 'pending')}
-                            >
-                              Revoke
-                            </Button>
-                          )}
-                        </TableCell>
-                      </TableRow>
-                    );
-                  })
+                            ) : (
+                              <Typography variant="body2" color="text.secondary">
+                                Not specified
+                              </Typography>
+                            )}
+                          </TableCell>
+                          <TableCell>
+                            {entry.useCaseDescription ? (
+                              <Tooltip 
+                                title={
+                                  <Typography variant="body2" style={{ whiteSpace: 'pre-wrap' }}>
+                                    {entry.useCaseDescription}
+                                  </Typography>
+                                } 
+                                placement="top-start"
+                                arrow
+                                enterDelay={500}
+                                leaveDelay={200}
+                                sx={{ maxWidth: 500 }}
+                              >
+                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                                  <Typography 
+                                    variant="body2" 
+                                    sx={{ 
+                                      maxWidth: 220, 
+                                      overflow: 'hidden', 
+                                      textOverflow: 'ellipsis', 
+                                      whiteSpace: 'nowrap',
+                                      cursor: 'pointer'
+                                    }}
+                                  >
+                                    {entry.useCaseDescription}
+                                  </Typography>
+                                  <InfoIcon 
+                                    fontSize="small" 
+                                    color="action" 
+                                    sx={{ 
+                                      opacity: 0.6, 
+                                      fontSize: '0.875rem',
+                                      '&:hover': { opacity: 1 }
+                                    }} 
+                                  />
+                                </Box>
+                              </Tooltip>
+                            ) : (
+                              <Typography variant="body2" color="text.secondary">
+                                Not provided
+                              </Typography>
+                            )}
+                          </TableCell>
+                          <TableCell>
+                            {userExists ? (
+                              <Chip label="Registered" color="success" />
+                            ) : (
+                              entry.status
+                            )}
+                          </TableCell>
+                          <TableCell>
+                            {!userExists && entry.status === 'pending' && (
+                              <Button
+                                variant="contained"
+                                color="primary"
+                                onClick={() => handleWaitlistAction(entry.email, 'invited')}
+                              >
+                                Invite
+                              </Button>
+                            )}
+                            {!userExists && entry.status === 'invited' && (
+                              <Button
+                                variant="outlined"
+                                color="secondary"
+                                onClick={() => handleWaitlistAction(entry.email, 'pending')}
+                              >
+                                Revoke
+                              </Button>
+                            )}
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })
                 )}
               </TableBody>
             </Table>
