@@ -840,7 +840,11 @@ async def execute_task(execution):
                 logger.error(f"Error updating workflow execution after task error: {workflow_error}", exc_info=True)
     finally:
         running_task_count -= 1
-        running_user_ids.remove(user_id)
+        # Check if user_id exists in the set before removing it
+        if user_id in running_user_ids:
+            running_user_ids.remove(user_id)
+        else:
+            logger.warning(f"User ID {user_id} not found in running_user_ids set during cleanup. There could be multiple tasks running for the same user which may cause issues for cookie management.")
         # Remove task from tracking
         running_task_ids.pop(execution_id, None)
         logger.info(f"Task {execution_id} cleanup completed")
