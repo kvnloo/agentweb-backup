@@ -97,6 +97,14 @@ export default function App() {
                         </PrivateRoute>
                       }
                     />
+                    <Route
+                      path="profile/:userId"
+                      element={
+                        <PrivateRoute>
+                          <Profile />
+                        </PrivateRoute>
+                      }
+                    />
                     <Route path="/config" element={<Config />} />
                     <Route
                       path="workflows"

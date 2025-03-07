@@ -272,6 +272,7 @@ export const executeTask = async (req: AuthRequest, res: Response) => {
       executionId: Date.now().toString(),
       taskId,
       userId: task.userId, // Use the task owner's ID for execution
+      run_user_id: userId !== task.userId ? userId : undefined, // Record who actually ran the task if different from owner
       status: 'pending',
       startTime: new Date().toISOString()
     };

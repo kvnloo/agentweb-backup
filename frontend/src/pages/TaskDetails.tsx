@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useParams, useNavigate, useLocation } from 'react-router-dom';
+import { useParams, useNavigate, useLocation, Link as RouterLink } from 'react-router-dom';
 import {
   Container,
   Typography,
@@ -917,6 +917,12 @@ export default function TaskDetails() {
   return (
     <Container maxWidth="lg" sx={{ mt: 4, mb: 4 }}>
       <Paper sx={{ p: 4, mt: 4 }}>
+        {/* Admin viewing indicator */}
+        {user?.isAdmin && user?.userId !== task.userId && (
+          <Alert severity="info" sx={{ mb: 3 }}>
+            You are viewing another user's task as an administrator.
+          </Alert>
+        )}
         <Box sx={{ mb: 4, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
           <Box>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
@@ -972,6 +978,18 @@ export default function TaskDetails() {
                 />
               )}
             </Box>
+            {/* Only show Owner if the current user is not the owner */}
+            {user?.userId !== task.userId && (
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                Owner: {user?.isAdmin ? (
+                  <RouterLink to={`/profile/${task.userId}`} style={{ textDecoration: 'none' }}>
+                    {task.userId}
+                  </RouterLink>
+                ) : (
+                  task.userId
+                )}
+              </Typography>
+            )}
             {showActions && (
               <Box sx={{ display: 'flex', gap: 2, alignItems: 'center' }}>
                 <FormControlLabel
@@ -1294,8 +1312,8 @@ export default function TaskDetails() {
                               variant="body2"
                               onClick={() => navigate(`/tasks/${taskId}/executions/${execution.executionId}`)}
                               sx={{ mt: 1, display: 'block' }}
-                            >
-                              View Full Details
+                             >
+                               View Full Details
                             </Link>
                           </Box>
                         )}

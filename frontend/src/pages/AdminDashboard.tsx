@@ -648,7 +648,7 @@ export default function AdminDashboard() {
                       </TableCell>
                       <TableCell>
                         <Link 
-                          to={`/admin/tasks/${task.taskId}`}
+                          to={`/tasks/${task.taskId}`}
                           style={{ 
                             color: '#1976d2',
                             textDecoration: 'none'

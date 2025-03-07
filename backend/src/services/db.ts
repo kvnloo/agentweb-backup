@@ -424,6 +424,7 @@ export const taskDb = {
     executionId: string;
     taskId: string;
     userId: string;
+    run_user_id?: string;
     status: string;
     startTime: string;
   }) {

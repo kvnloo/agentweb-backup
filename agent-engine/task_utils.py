@@ -410,24 +410,29 @@ def upload_gif(gif_path: str) -> Optional[str]:
     try:
         gif_file = Path(gif_path)
         if not gif_file.exists():
+            logger.warning(f"GIF file not found at path: {gif_path}")
             return None
             
         s3_client = get_s3_client()
         s3_bucket = os.getenv('AWS_S3_BUCKET')
         
         # Upload GIF to S3
+        s3_key = f"execution_gifs/{gif_file.name}"
+        
         s3_client.upload_file(
             gif_path,
             s3_bucket,
-            f"execution_gifs/{gif_file.name}",
+            s3_key,
             ExtraArgs={'ContentType': 'image/gif'}
         )
         
         # Generate and return URL
-        url = f"https://{s3_bucket}.s3.amazonaws.com/execution_gifs/{gif_file.name}"
+        url = f"https://{s3_bucket}.s3.amazonaws.com/{s3_key}"
+        logger.info(f"Successfully uploaded GIF to S3, URL: {url}")
         
         # Clean up local file
         gif_file.unlink()
+        logger.info(f"Removed local GIF file: {gif_path}")
         
         return url
         

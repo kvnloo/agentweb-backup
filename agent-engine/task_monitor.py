@@ -401,7 +401,7 @@ def update_workflow_execution(workflow_execution_id: str, task_id: str, task_sta
         logger.error(f"Error updating workflow execution: {e}")
         return False
 
-async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str) -> Dict[str, Any]:
+async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str, run_user_id: str = None) -> Dict[str, Any]:
     """Run WebAgent via CLI command"""
     try:
         # Create necessary directories
@@ -427,6 +427,8 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
             '--prompt_file', prompt_file,
             '--gif_path', gif_path
         ]
+        if run_user_id:
+            cmd.extend(['--run_user_id', run_user_id])
         if is_interactive:
             cmd.append('--interactive')
             
@@ -514,6 +516,7 @@ async def execute_task(execution):
     execution_id = execution['executionId']
     task_id = execution['taskId']
     user_id = execution['userId']
+    run_user_id = execution.get('run_user_id')  # Get run_user_id from the execution record
     task = None  # Initialize task variable
     prompt = None  # Initialize prompt variable
     
@@ -742,7 +745,8 @@ async def execute_task(execution):
                         execution_id,
                         bool(task.get('isInteractive', False)) if task else False,
                         task_id,
-                        gif_path
+                        gif_path,
+                        run_user_id
                     )
                     # Upload browser-use log to S3 if it exists
                     filtered_activity_log = f'logs/execution_{execution_id}_browser_use.filtered.log'
