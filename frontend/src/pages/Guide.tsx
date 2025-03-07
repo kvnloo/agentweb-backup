@@ -74,9 +74,22 @@ const guideSections: GuideSection[] = [
           "- Toggle email notifications",
           "- Toggle interactive mode",
           "- Toggle deep research mode",
-          "- Archive or delete tasks",
+          "- Archive tasks (archived tasks can be unarchived later)",
           "- Provide feedback on task executions (accept/reject)",
-          "- Upload file attachments for the task"
+          "- Upload file attachments for the task",
+          "- For any execution, click 'View Full Details' to access the execution details page"
+        ]
+      },
+      {
+        title: "Execution Details",
+        content: [
+          "The Execution Details page provides comprehensive information about a specific task execution:",
+          "- View which LLM model was used for the execution",
+          "- See the detailed execution log showing what the agent was doing at each step",
+          "- View execution recordings including screenshots taken by the agent during the task",
+          "- Access any result files or outputs generated during the execution",
+          "- See the complete timeline of the execution from start to finish",
+          "- Review any interactions that occurred during the execution if it was an interactive task"
         ]
       },
       {
@@ -102,8 +115,10 @@ const guideSections: GuideSection[] = [
       "1. Click 'Add Website' to store credentials for websites you want the AI to access",
       "2. Enter the website URL, username, and password",
       "3. Credentials are securely stored and only used during task execution",
-      "4. You can share configurations with other users by entering their email",
-      "5. Delete configurations you no longer need"
+      "4. You can share configurations with specific users by entering their email",
+      "5. You can also 'Share with Everyone' which allows all platform users to use your credentials (without seeing the plaintext)",
+      "6. Be cautious of privacy implications when using 'Share with Everyone' as it empowers other users to use your account",
+      "7. Delete configurations you no longer need"
     ]
   },
   {
@@ -112,10 +127,11 @@ const guideSections: GuideSection[] = [
       "Workflows allow you to chain multiple tasks together:",
       "1. Navigate to the 'Workflows' page",
       "2. Click 'Create Workflow' to build a new workflow",
-      "3. Add tasks to your workflow and define their sequence",
-      "4. Set conditions for task execution",
-      "5. Run workflows manually or schedule them",
-      "6. View workflow execution history and results"
+      "3. Define your workflow using natural language instructions",
+      "4. The system will generate a YAML file defining the tasks and their dependencies",
+      "5. Run workflows manually when needed",
+      "6. View workflow execution history and results",
+      "Note: Scheduling for workflows is not currently supported"
     ]
   },
   {
@@ -124,19 +140,21 @@ const guideSections: GuideSection[] = [
       "For recurring tasks:",
       "1. In the Task Details page, find the 'Schedule' section",
       "2. Click 'Add Schedule'",
-      "3. Set the frequency (one-time, daily, weekly, monthly)",
-      "4. Choose the start date and time",
-      "5. Optionally set an end date",
-      "6. View and manage all schedules for the task"
+      "3. Select the frequency (daily, weekly, monthly)",
+      "4. Click 'Create' to set up the schedule",
+      "5. Manage your schedules by:",
+      "   - Disabling/enabling schedules using the toggle switch",
+      "   - Deleting schedules you no longer need",
+      "Note: One-time scheduling, custom start times, and end dates are not currently supported"
     ]
   },
   {
     title: "Notifications",
     content: [
       "Stay updated on task executions:",
-      "1. Toggle email notifications for individual tasks",
-      "2. Add subscribers to receive notifications about specific tasks",
-      "3. Receive alerts for task completion or failures"
+      "1. On the Task Details page, toggle 'Email Me Latest Run' to receive notifications when a task completes or fails",
+      "2. Add subscribers to receive notifications about specific tasks by entering their email addresses",
+      "3. Email notifications include a summary of the task results and any important information"
     ]
   },
   {
@@ -164,15 +182,6 @@ const guideSections: GuideSection[] = [
           "3. Select the file from your computer",
           "4. The AI agent can reference these files during task execution"
         ]
-      },
-      {
-        title: "Task Sharing",
-        content: [
-          "Share task results with others:",
-          "1. Add subscribers to your task",
-          "2. Enter their email address",
-          "3. They will receive notifications and results when the task completes"
-        ]
       }
     ]
   },
@@ -193,11 +202,9 @@ const guideSections: GuideSection[] = [
     title: "Security Features",
     content: [
       "AgentWeb implements a strict security model:",
-      "- Zero permanent storage of target website credentials",
-      "- Fresh credential input required for each task execution",
-      "- Isolated browser sessions for each task",
-      "- MFA-protected AgentWeb accounts",
-      "- No correlation between AgentWeb accounts and target website credentials",
+      "- 256-bit encryption for all stored credentials",
+      "- HTTPS encryption site-wide for all data transmission",
+      "- Isolated browser sessions for each user",
       "- Automatic session cleanup after task completion"
     ]
   },
@@ -220,8 +227,7 @@ const guideSections: GuideSection[] = [
       "2. Use interactive mode for complex tasks that might need clarification",
       "3. Schedule recurring tasks for regular automation",
       "4. Review task results and provide feedback to improve future executions",
-      "5. Use Deep Research mode for comprehensive information gathering",
-      "6. Organize related tasks into workflows for efficient execution"
+      "5. Use Deep Research mode for comprehensive information gathering"
     ]
   }
 ];
