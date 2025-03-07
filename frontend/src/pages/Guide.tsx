@@ -1,4 +1,4 @@
-import { Container, Typography, Paper, Box, Divider, Link, Accordion, AccordionSummary, AccordionDetails, useTheme } from '@mui/material';
+import { Container, Typography, Paper, Box, Accordion, AccordionSummary, AccordionDetails, useTheme } from '@mui/material';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 
 interface GuideSection {
