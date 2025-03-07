@@ -7,6 +7,13 @@ interface Release {
 
 const releases: Release[] = [
   {
+    date: "2025-03-07",
+    changes: [
+      "Added User Guide page",
+      "Fixed various bugs",
+    ]
+  },
+  {
     date: "2025-03-05",
     changes: [
       "Replaced Delete Task with Archive Task functionality",
