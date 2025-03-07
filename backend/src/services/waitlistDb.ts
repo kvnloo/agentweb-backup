@@ -25,6 +25,8 @@ interface WaitlistEntry {
   joinedAt: string;
   status?: string;
   invitedAt?: string;
+  useCaseCategories?: string[];
+  useCaseDescription?: string;
 }
 
 // Helper function to handle DynamoDB errors
@@ -44,7 +46,9 @@ export const waitlistDb = {
         email: entry.email.toLowerCase(),
         joinedAt: entry.joinedAt,
         status: entry.status || 'pending',
-        invitedAt: entry.invitedAt
+        invitedAt: entry.invitedAt,
+        useCaseCategories: entry.useCaseCategories || [],
+        useCaseDescription: entry.useCaseDescription || ''
       },
       ConditionExpression: 'attribute_not_exists(email)'
     };

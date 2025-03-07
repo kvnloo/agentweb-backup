@@ -25,7 +25,8 @@ import {
   DialogTitle,
   DialogContent,
   DialogActions,
-  DialogContentText
+  DialogContentText,
+  Tooltip
 } from '@mui/material';
 import { format } from 'date-fns';
 import { Link } from 'react-router-dom';
@@ -33,6 +34,9 @@ import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
 import { buildApiUrl } from '../config';
 import DOMPurify from 'dompurify';
+import {
+  Info as InfoIcon
+} from '@mui/icons-material';
 
 interface TabPanelProps {
   children?: React.ReactNode;
@@ -176,23 +180,23 @@ export default function AdminDashboard() {
 
   const SortLabel = ({ property, label }: { property: keyof any; label: string }) => (
     <Box
-      component="span"
-      onClick={() => handleSort(property)}
       sx={{
-        cursor: 'pointer',
-        display: 'inline-flex',
+        display: 'flex',
         alignItems: 'center',
+        cursor: 'pointer',
+        userSelect: 'none',
         '&:hover': {
           color: 'primary.main',
-        }
+        },
       }}
+      onClick={() => handleSort(property)}
     >
       {label}
-      {orderBy === property && (
-        <Typography component="span" sx={{ ml: 0.5, fontSize: '0.75rem' }}>
-          {order === 'asc' ? '↑' : '↓'}
-        </Typography>
-      )}
+      {orderBy === property ? (
+        <Box component="span" sx={{ ml: 1 }}>
+          {order === 'desc' ? '↓' : '↑'}
+        </Box>
+      ) : null}
     </Box>
   );
 
@@ -515,7 +519,23 @@ export default function AdminDashboard() {
               <TableHead>
                 <TableRow>
                   <TableCell>Email</TableCell>
-                  <TableCell>Joined At</TableCell>
+                  <TableCell>
+                    <Box
+                      sx={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 0.5,
+                        fontWeight: 'bold',
+                      }}
+                    >
+                      Joined At
+                      <Box component="span" sx={{ ml: 0.5, fontSize: '0.75rem' }}>
+                        ↓
+                      </Box>
+                    </Box>
+                  </TableCell>
+                  <TableCell>Use Cases</TableCell>
+                  <TableCell>Use Case Description</TableCell>
                   <TableCell>Status</TableCell>
                   <TableCell>Actions</TableCell>
                 </TableRow>
@@ -523,7 +543,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={4} align="center">
+                    <TableCell colSpan={6} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -534,6 +554,63 @@ export default function AdminDashboard() {
                       <TableRow key={entry.email}>
                         <TableCell>{entry.email}</TableCell>
                         <TableCell>{new Date(entry.joinedAt).toLocaleDateString()}</TableCell>
+                        <TableCell>
+                          {entry.useCaseCategories && entry.useCaseCategories.length > 0 ? (
+                            <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
+                              {entry.useCaseCategories.map((category: string) => (
+                                <Chip key={category} label={category} size="small" />
+                              ))}
+                            </Box>
+                          ) : (
+                            <Typography variant="body2" color="text.secondary">
+                              Not specified
+                            </Typography>
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          {entry.useCaseDescription ? (
+                            <Tooltip 
+                              title={
+                                <Typography variant="body2" style={{ whiteSpace: 'pre-wrap' }}>
+                                  {entry.useCaseDescription}
+                                </Typography>
+                              } 
+                              placement="top-start"
+                              arrow
+                              enterDelay={500}
+                              leaveDelay={200}
+                              sx={{ maxWidth: 500 }}
+                            >
+                              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                                <Typography 
+                                  variant="body2" 
+                                  sx={{ 
+                                    maxWidth: 220, 
+                                    overflow: 'hidden', 
+                                    textOverflow: 'ellipsis', 
+                                    whiteSpace: 'nowrap',
+                                    cursor: 'pointer'
+                                  }}
+                                >
+                                  {entry.useCaseDescription}
+                                </Typography>
+                                <InfoIcon 
+                                  fontSize="small" 
+                                  color="action" 
+                                  sx={{ 
+                                    opacity: 0.6, 
+                                    fontSize: '0.875rem',
+                                    '&:hover': { opacity: 1 }
+                                  }} 
+                                />
+                              </Box>
+                            </Tooltip>
+                          ) : (
+                            <Typography variant="body2" color="text.secondary">
+                              Not provided
+                            </Typography>
+                          )}
+                        </TableCell>
                         <TableCell>
                           {userExists ? (
                             <Chip label="Registered" color="success" />
