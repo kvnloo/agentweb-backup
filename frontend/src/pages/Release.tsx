@@ -10,7 +10,7 @@ const releases: Release[] = [
     date: "2025-03-07",
     changes: [
       "Added User Guide page",
-      "Fixed various bugs",
+      "Fixed various UI bugs"
     ]
   },
   {
