@@ -24,6 +24,7 @@ import WorkflowBuilder from './pages/WorkflowBuilder';
 import WorkflowDetails from './pages/WorkflowDetails';
 import WorkflowRun from './pages/WorkflowRun';
 import Release from './pages/Release';
+import Guide from './pages/Guide';
 
 export default function App() {
   return (
@@ -41,6 +42,7 @@ export default function App() {
                     <Route path="register" element={<Register />} />
                     <Route path="oauth-callback" element={<OAuthCallback />} />
                     <Route path="release" element={<Release />} />
+                    <Route path="guide" element={<Guide />} />
                     <Route
                       path="tasks"
                       element={
