@@ -83,31 +83,57 @@ export async function updateSchedule(req: AuthenticatedRequest, res: Response) {
       return res.status(404).json({ error: 'Schedule not found' });
     }
 
-    if (schedule.userId !== userId) {
-      return res.status(403).json({ error: 'Not authorized to update this schedule' });
+    // Check if user is admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
     }
 
     const updates: Partial<Schedule> = {
       updatedAt: new Date().toISOString()
     };
 
-    if (frequency) {
-      if (!isValidFrequency(frequency)) {
-        return res.status(400).json({ error: 'Invalid frequency' });
+    // Admin can only pause schedules they don't own
+    if (user.isAdmin && schedule.userId !== userId) {
+      // Admin can only update status to paused
+      if (status && status !== 'paused') {
+        return res.status(403).json({ error: 'Admins can only pause schedules they don\'t own' });
       }
-      updates.frequency = frequency;
-      updates.nextRunTime = calculateNextRunTime(frequency as Frequency);
+      
+      if (status === 'paused') {
+        updates.status = 'paused';
+      } else if (frequency) {
+        // Admin cannot update frequency of schedules they don't own
+        return res.status(403).json({ error: 'Not authorized to update frequency of this schedule' });
+      }
+    } else if (schedule.userId !== userId) {
+      // Non-admin users cannot update schedules they don't own
+      return res.status(403).json({ error: 'Not authorized to update this schedule' });
+    } else {
+      // Owner can update all properties
+      if (frequency) {
+        if (!isValidFrequency(frequency)) {
+          return res.status(400).json({ error: 'Invalid frequency' });
+        }
+        updates.frequency = frequency;
+        updates.nextRunTime = calculateNextRunTime(frequency as Frequency);
+      }
+
+      if (status) {
+        if (!['active', 'paused'].includes(status)) {
+          return res.status(400).json({ error: 'Invalid status' });
+        }
+        updates.status = status;
+      }
     }
 
-    if (status) {
-      if (!['active', 'paused'].includes(status)) {
-        return res.status(400).json({ error: 'Invalid status' });
-      }
-      updates.status = status;
+    // Only proceed if there are actual updates to apply
+    if (Object.keys(updates).length > 1) { // More than just updatedAt
+      await scheduleDb.updateSchedule(scheduleId, updates);
+      res.json({ message: 'Schedule updated successfully' });
+    } else {
+      res.status(400).json({ error: 'No valid updates provided' });
     }
-
-    await scheduleDb.updateSchedule(scheduleId, updates);
-    res.json({ message: 'Schedule updated successfully' });
   } catch (error) {
     console.error('Error updating schedule:', error);
     res.status(500).json({ error: 'Failed to update schedule' });
@@ -129,6 +155,7 @@ export async function deleteSchedule(req: AuthenticatedRequest, res: Response) {
       return res.status(404).json({ error: 'Schedule not found' });
     }
 
+    // Only the owner can delete their schedule
     if (schedule.userId !== userId) {
       return res.status(403).json({ error: 'Not authorized to delete this schedule' });
     }
