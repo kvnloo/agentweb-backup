@@ -86,6 +86,7 @@ class WebAgent:
         self.generate_gif = None
         self.sensitive_data = []  # List to store all credentials for log filtering
         self.cookie_tainted = False  # Flag to track if shared credentials were used
+        self.run_user_id = None  # Added to store run_user_id
 
     def setup_execution_logging(self, execution_id: str):
         """Setup logging for the current execution"""
@@ -544,6 +545,12 @@ class WebAgent:
 
         # Get headless mode from environment variable, default to False if not set
         headless = os.getenv('BROWSER_HEADLESS', 'true').lower() == 'true'
+        
+        # If run_user_id is set, force headless to false to allow admin interaction
+        if self.run_user_id:
+            logger.info(f"Task run by user {self.run_user_id} who is not the owner. Setting headless=false to allow admin interaction.")
+            headless = False
+            
         browser_config = BrowserConfig(new_context_config=context_config, headless=headless)
         self.browser = Browser(config=browser_config)
 
@@ -677,6 +684,7 @@ async def main():
     parser.add_argument('--execution_id', required=True, help='Execution ID')
     parser.add_argument('--gif_path', required=True, help='Path for the GIF output')
     parser.add_argument('--interactive', action='store_true', help='Enable interactive mode')
+    parser.add_argument('--run_user_id', help='ID of the user who ran the task if different from owner')
     args = parser.parse_args()
 
     # Read prompt from file
@@ -692,6 +700,7 @@ async def main():
         sys.exit(1)
 
     agent = WebAgent(args.user_id, args.llm_name)
+    agent.run_user_id = args.run_user_id  # Set run_user_id
     try:
         result = await agent.execute_task(
             prompt,
