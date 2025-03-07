@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { AuthenticatedRequest } from '../middleware/auth';
 import { scheduleDb, Schedule } from '../services/scheduleDb';
 import { calculateNextRunTime, isValidFrequency, Frequency } from '../utils/scheduleUtils';
+import { userDb } from '../services/db';
 
 export async function createSchedule(req: AuthenticatedRequest, res: Response) {
   try {
@@ -45,11 +46,21 @@ export async function getSchedulesByTaskId(req: AuthenticatedRequest, res: Respo
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
+    // Check if user is admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
     const schedules = await scheduleDb.getSchedulesByTaskId(taskId);
     
-    // Filter schedules to only return those belonging to the user
-    const userSchedules = schedules.filter(schedule => schedule.userId === userId);
-    res.json(userSchedules);
+    // If user is admin, return all schedules, otherwise filter by userId
+    if (user.isAdmin) {
+      res.json(schedules);
+    } else {
+      const userSchedules = schedules.filter(schedule => schedule.userId === userId);
+      res.json(userSchedules);
+    }
   } catch (error) {
     console.error('Error getting schedules:', error);
     res.status(500).json({ error: 'Failed to get schedules' });
