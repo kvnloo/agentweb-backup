@@ -66,6 +66,19 @@ interface TaskAttachment {
   uploadedAt: string;
 }
 
+interface TaskTemplate {
+  templateId: string;
+  userId: string;
+  name: string;
+  description: string;
+  prompt: string;
+  parameters: string[];
+  isInteractive: boolean;
+  isDeepResearch: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
 interface UserWithCounts extends User {
   taskCount: number;
   workflowCount: number;
@@ -925,4 +938,122 @@ export const workflowDb = {
       return 0;
     }
   }
-}; 
+};
+
+class TaskTemplateDB {
+  private docClient: AWS.DynamoDB.DocumentClient;
+  private tableName: string;
+
+  constructor() {
+    this.docClient = dynamodb;
+    this.tableName = `${TABLE_PREFIX}AW-TaskTemplates`;
+  }
+
+  async createTemplate(template: TaskTemplate) {
+    const params = {
+      TableName: this.tableName,
+      Item: template
+    };
+
+    try {
+      await this.docClient.put(params).promise();
+      return template;
+    } catch (error) {
+      handleDynamoDbError(error, 'createTemplate');
+      throw error;
+    }
+  }
+
+  async getTemplatesByUserId(userId: string) {
+    const params = {
+      TableName: this.tableName,
+      IndexName: 'UserIdIndex',
+      KeyConditionExpression: 'userId = :userId',
+      ExpressionAttributeValues: {
+        ':userId': userId
+      }
+    };
+
+    try {
+      const result = await this.docClient.query(params).promise();
+      return result.Items as TaskTemplate[];
+    } catch (error) {
+      handleDynamoDbError(error, 'getTemplatesByUserId');
+      throw error;
+    }
+  }
+
+  async getTemplateById(templateId: string) {
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        templateId
+      }
+    };
+
+    try {
+      const result = await this.docClient.get(params).promise();
+      return result.Item as TaskTemplate;
+    } catch (error) {
+      handleDynamoDbError(error, 'getTemplateById');
+      throw error;
+    }
+  }
+
+  async updateTemplate(templateId: string, updates: Partial<Omit<TaskTemplate, 'templateId' | 'userId' | 'createdAt'>>) {
+    const updateExpressions: string[] = [];
+    const expressionAttributeNames: Record<string, string> = {};
+    const expressionAttributeValues: Record<string, any> = {};
+
+    Object.entries(updates).forEach(([key, value]) => {
+      if (value !== undefined) {
+        updateExpressions.push(`#${key} = :${key}`);
+        expressionAttributeNames[`#${key}`] = key;
+        expressionAttributeValues[`:${key}`] = value;
+      }
+    });
+
+    // Always update the updatedAt timestamp
+    updateExpressions.push('#updatedAt = :updatedAt');
+    expressionAttributeNames['#updatedAt'] = 'updatedAt';
+    expressionAttributeValues[':updatedAt'] = new Date().toISOString();
+
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        templateId
+      },
+      UpdateExpression: `SET ${updateExpressions.join(', ')}`,
+      ExpressionAttributeNames: expressionAttributeNames,
+      ExpressionAttributeValues: expressionAttributeValues,
+      ReturnValues: 'ALL_NEW'
+    };
+
+    try {
+      const result = await this.docClient.update(params).promise();
+      return result.Attributes as TaskTemplate;
+    } catch (error) {
+      handleDynamoDbError(error, 'updateTemplate');
+      throw error;
+    }
+  }
+
+  async deleteTemplate(templateId: string) {
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        templateId
+      }
+    };
+
+    try {
+      await this.docClient.delete(params).promise();
+      return { success: true };
+    } catch (error) {
+      handleDynamoDbError(error, 'deleteTemplate');
+      throw error;
+    }
+  }
+}
+
+export const taskTemplateDb = new TaskTemplateDB(); 

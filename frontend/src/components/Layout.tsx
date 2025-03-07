@@ -126,6 +126,14 @@ export default function Layout() {
                 <Button 
                   color="primary" 
                   component={RouterLink} 
+                  to="/templates"
+                  variant={isActivePath('/templates') ? 'contained' : 'text'}
+                >
+                  Templates
+                </Button>
+                <Button 
+                  color="primary" 
+                  component={RouterLink} 
                   to="/workflows"
                   variant={isActivePath('/workflows') ? 'contained' : 'text'}
                 >
