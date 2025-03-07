@@ -14,26 +14,44 @@ import {
 import { useAuth } from '../contexts/AuthContext';
 import { useParams } from 'react-router-dom';
 import { useState, useEffect } from 'react';
-import axios from 'axios';
+import axios, { AxiosError } from 'axios';
 import { buildApiUrl } from '../config';
+
+// Define the User interface
+interface User {
+  userId: string;
+  email: string;
+  isAdmin: boolean;
+  isOAuthUser: boolean;
+  createdAt: string;
+  [key: string]: any; // Allow for additional properties
+}
+
+// Define the error response interface
+interface ErrorResponse {
+  message?: string;
+  [key: string]: any;
+}
 
 export default function Profile() {
   const { user, token } = useAuth();
   const { userId } = useParams<{ userId: string }>();
-  const [profileUser, setProfileUser] = useState(null);
+  const [profileUser, setProfileUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
   useEffect(() => {
     // If no userId is provided in the URL, show the current user's profile
     if (!userId) {
-      setProfileUser(user);
+      if (user) {
+        setProfileUser(user as User);
+      }
       return;
     }
 
     // If the userId matches the current user, use the current user's data
     if (user && userId === user.userId) {
-      setProfileUser(user);
+      setProfileUser(user as User);
       return;
     }
 
@@ -51,9 +69,11 @@ export default function Profile() {
           headers: { Authorization: `Bearer ${token}` }
         });
         setProfileUser(response.data);
-      } catch (error) {
-        console.error('Error fetching user profile:', error);
-        setError(error.response?.data?.message || 'Failed to fetch user profile');
+      } catch (err) {
+        console.error('Error fetching user profile:', err);
+        const error = err as AxiosError<ErrorResponse>;
+        const errorMessage = error.response?.data?.message || 'Failed to fetch user profile';
+        setError(errorMessage);
       } finally {
         setLoading(false);
       }
