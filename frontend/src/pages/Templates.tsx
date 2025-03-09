@@ -49,6 +49,7 @@ interface Template {
   description: string;
   prompt: string;
   parameters: string[];
+  nameParameter: string | null;
   isInteractive: boolean;
   isDeepResearch: boolean;
   published: boolean;
@@ -166,7 +167,20 @@ export default function Templates() {
       setIsInteractive(template.isInteractive);
       setIsDeepResearch(template.isDeepResearch);
     } else {
-      setCurrentTemplate(null);
+      setCurrentTemplate({
+        templateId: '',
+        userId: user?.userId || '',
+        name: '',
+        description: '',
+        prompt: '',
+        parameters: [],
+        nameParameter: null,
+        isInteractive: false,
+        isDeepResearch: false,
+        published: false,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      });
       setName('');
       setDescription('');
       setPrompt('');
@@ -188,12 +202,16 @@ export default function Templates() {
         return;
       }
 
+      // Extract parameters for validation
+      const extractedParams = extractParameters(prompt);
+      
       const templateData: any = {
         name,
         description,
         prompt,
         isInteractive,
-        isDeepResearch
+        isDeepResearch,
+        nameParameter: currentTemplate?.nameParameter || null
       };
 
       let response;
@@ -495,6 +513,46 @@ export default function Templates() {
                   );
                 })()}
               </Box>
+              
+              {/* Parameter for task name */}
+              {extractParameters(prompt).length > 0 && (
+                <Box sx={{ mt: 2 }}>
+                  <Typography variant="subtitle2" gutterBottom>
+                    Parameter for Task Name:
+                  </Typography>
+                  <Typography variant="body2" color="text.secondary" paragraph>
+                    Select a parameter to include in the task name. This helps differentiate tasks created from this template.
+                  </Typography>
+                  <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
+                    <Chip 
+                      label="None" 
+                      color={currentTemplate?.nameParameter === null ? "primary" : "default"}
+                      onClick={() => {
+                        setCurrentTemplate(prev => 
+                          prev ? { ...prev, nameParameter: null } : null
+                        );
+                      }}
+                    />
+                    {extractParameters(prompt).map(param => (
+                      <Chip 
+                        key={param}
+                        label={param}
+                        color={currentTemplate?.nameParameter === param ? "primary" : "default"}
+                        onClick={() => {
+                          setCurrentTemplate(prev => 
+                            prev ? { ...prev, nameParameter: param } : null
+                          );
+                        }}
+                      />
+                    ))}
+                  </Box>
+                  <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+                    {currentTemplate?.nameParameter 
+                      ? `Tasks will be named: "${name} - [${currentTemplate.nameParameter}]"` 
+                      : "Tasks will use the template name without modification."}
+                  </Typography>
+                </Box>
+              )}
             </Box>
           )}
           

@@ -73,6 +73,7 @@ interface TaskTemplate {
   description: string;
   prompt: string;
   parameters: string[];
+  nameParameter: string | null;
   isInteractive: boolean;
   isDeepResearch: boolean;
   published: boolean;

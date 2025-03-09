@@ -21,7 +21,7 @@ export const createTemplate = async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const { name, description, prompt, isInteractive, isDeepResearch } = req.body;
+    const { name, description, prompt, isInteractive, isDeepResearch, nameParameter } = req.body;
     
     if (!name || !prompt) {
       return res.status(400).json({ message: 'Name and prompt are required' });
@@ -30,6 +30,13 @@ export const createTemplate = async (req: AuthRequest, res: Response) => {
     // Extract parameters from the prompt
     const parameters = extractParameters(prompt);
 
+    // Validate nameParameter is one of the extracted parameters or null
+    if (nameParameter && !parameters.includes(nameParameter)) {
+      return res.status(400).json({ 
+        message: 'Name parameter must be one of the parameters in the prompt' 
+      });
+    }
+
     const template = {
       templateId: Date.now().toString(),
       userId,
@@ -37,6 +44,7 @@ export const createTemplate = async (req: AuthRequest, res: Response) => {
       description: description || '',
       prompt,
       parameters,
+      nameParameter: nameParameter || null,
       isInteractive: Boolean(isInteractive),
       isDeepResearch: Boolean(isDeepResearch),
       published: false, // New templates are not published by default
@@ -151,7 +159,7 @@ export const updateTemplate = async (req: AuthRequest, res: Response) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    const { name, description, prompt, isInteractive, isDeepResearch, published } = req.body;
+    const { name, description, prompt, isInteractive, isDeepResearch, published, nameParameter } = req.body;
     
     const updates: any = {};
     if (name !== undefined) updates.name = name;
@@ -160,7 +168,29 @@ export const updateTemplate = async (req: AuthRequest, res: Response) => {
     // If prompt is updated, extract parameters
     if (prompt !== undefined) {
       updates.prompt = prompt;
-      updates.parameters = extractParameters(prompt);
+      const newParameters = extractParameters(prompt);
+      updates.parameters = newParameters;
+      
+      // If nameParameter is provided, validate it's in the new parameters
+      if (nameParameter !== undefined) {
+        if (nameParameter && !newParameters.includes(nameParameter)) {
+          return res.status(400).json({ 
+            message: 'Name parameter must be one of the parameters in the prompt' 
+          });
+        }
+        updates.nameParameter = nameParameter || null;
+      } else if (template.nameParameter && !newParameters.includes(template.nameParameter)) {
+        // If existing nameParameter is no longer in the parameters, set it to null
+        updates.nameParameter = null;
+      }
+    } else if (nameParameter !== undefined) {
+      // If prompt is not updated but nameParameter is
+      if (nameParameter && !template.parameters.includes(nameParameter)) {
+        return res.status(400).json({ 
+          message: 'Name parameter must be one of the parameters in the prompt' 
+        });
+      }
+      updates.nameParameter = nameParameter || null;
     }
     
     if (isInteractive !== undefined) updates.isInteractive = Boolean(isInteractive);

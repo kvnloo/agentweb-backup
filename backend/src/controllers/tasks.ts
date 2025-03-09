@@ -64,11 +64,17 @@ export const createTask = async (req: AuthRequest, res: Response) => {
             ? isDeepResearch 
             : template.isDeepResearch;
         
+        // Create task name with nameParameter if specified
+        let finalName = name || template.name;
+        if (template.nameParameter && parameterValues && parameterValues[template.nameParameter]) {
+          finalName = `${finalName} - ${parameterValues[template.nameParameter]}`;
+        }
+        
         // Create task using template values, but allow overrides from request body
         const task = {
           taskId: Date.now().toString(),
           userId,
-          name: name || template.name,
+          name: finalName,
           prompt: prompt || finalPrompt,
           status: 'active',
           emailNotification: finalEmailNotification,

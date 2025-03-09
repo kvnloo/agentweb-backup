@@ -40,6 +40,7 @@ interface Template {
   description: string;
   prompt: string;
   parameters: string[];
+  nameParameter: string | null;
   isInteractive: boolean;
   isDeepResearch: boolean;
   published: boolean;
@@ -236,6 +237,23 @@ export default function CreateTask() {
   const getSelectedTemplate = () => {
     if (!selectedTemplate) return null;
     return templates.find(t => t.templateId === selectedTemplate) || null;
+  };
+
+  // Get the preview task name with parameter value if applicable
+  const getPreviewTaskName = () => {
+    const template = getSelectedTemplate();
+    if (!template) return '';
+    
+    let taskName = template.name;
+    
+    // If template has a nameParameter and the parameter has a value, append it to the name
+    if (template.nameParameter && 
+        parameterValues && 
+        parameterValues[template.nameParameter]) {
+      taskName = `${taskName} - ${parameterValues[template.nameParameter]}`;
+    }
+    
+    return taskName;
   };
 
   return (
@@ -459,9 +477,16 @@ export default function CreateTask() {
                     <Typography variant="subtitle2" gutterBottom>
                       Task Name:
                     </Typography>
-                    <Typography variant="body1">
-                      {getSelectedTemplate()?.name || ''}
+                    <Typography variant="body1" fontWeight="medium">
+                      {getPreviewTaskName()}
                     </Typography>
+                    {getSelectedTemplate()?.nameParameter && (
+                      <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                        {parameterValues[getSelectedTemplate()?.nameParameter || ''] 
+                          ? `Using parameter [${getSelectedTemplate()?.nameParameter}] in the task name`
+                          : `Will include parameter [${getSelectedTemplate()?.nameParameter}] when provided`}
+                      </Typography>
+                    )}
                   </Box>
                   
                   <Box>
