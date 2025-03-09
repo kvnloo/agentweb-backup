@@ -34,9 +34,31 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
       return res.status(403).json({ message: 'Account has been deactivated. Please contact support.' });
     }
 
-    req.user = decoded;
+    // Add user info to request
+    (req as AuthenticatedRequest).user = {
+      userId: decoded.userId,
+      email: decoded.email,
+      isAdmin: user.isAdmin || false
+    };
+    
     next();
   } catch (error) {
     return res.status(403).json({ message: 'Invalid token' });
   }
+}
+
+export async function isAdmin(req: Request, res: Response, next: NextFunction) {
+  const authReq = req as AuthenticatedRequest;
+  
+  // Check if user exists in request (should be added by authenticateToken)
+  if (!authReq.user) {
+    return res.status(401).json({ message: 'Authentication required' });
+  }
+  
+  // Check if user is admin
+  if (!authReq.user.isAdmin) {
+    return res.status(403).json({ message: 'Admin access required' });
+  }
+  
+  next();
 } 

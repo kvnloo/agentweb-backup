@@ -3,6 +3,7 @@ import { taskDb } from '../services/db';
 import { userDb } from '../services/db';
 import { scheduleDb } from '../services/db';
 import AWS from 'aws-sdk';
+import { taskTemplateDb } from '../services/db';
 
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
@@ -23,8 +24,74 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const { name, prompt, isInteractive, isDeepResearch, emailNotification } = req.body;
+    const { name, prompt, isInteractive, isDeepResearch, emailNotification, templateId, parameterValues } = req.body;
     
+    // If templateId is provided, fetch the template and use its values
+    if (templateId) {
+      try {
+        const template = await taskTemplateDb.getTemplateById(templateId);
+        
+        // Check if template exists
+        if (!template) {
+          return res.status(404).json({ message: 'Template not found' });
+        }
+        
+        // Check if user has access to the template (either owns it or it's published)
+        if (template.userId !== userId && !template.published) {
+          return res.status(403).json({ message: 'Access denied to this template' });
+        }
+        
+        // Get the template prompt and substitute parameters if provided
+        let finalPrompt = template.prompt;
+        
+        // If the template has parameters and parameter values are provided
+        if (template.parameters && template.parameters.length > 0 && parameterValues) {
+          // Substitute each parameter with its value
+          template.parameters.forEach(param => {
+            const paramValue = parameterValues[param];
+            if (paramValue) {
+              // Replace all occurrences of [param] with the provided value
+              const paramRegex = new RegExp(`\\[${param}\\]`, 'g');
+              finalPrompt = finalPrompt.replace(paramRegex, paramValue);
+            }
+          });
+        }
+        
+        // For deep research tasks, email notification is automatically enabled
+        const finalEmailNotification = emailNotification !== undefined 
+          ? emailNotification 
+          : isDeepResearch !== undefined 
+            ? isDeepResearch 
+            : template.isDeepResearch;
+        
+        // Create task name with nameParameter if specified
+        let finalName = name || template.name;
+        if (template.nameParameter && parameterValues && parameterValues[template.nameParameter]) {
+          finalName = `${finalName} - ${parameterValues[template.nameParameter]}`;
+        }
+        
+        // Create task using template values, but allow overrides from request body
+        const task = {
+          taskId: Date.now().toString(),
+          userId,
+          name: finalName,
+          prompt: prompt || finalPrompt,
+          status: 'active',
+          emailNotification: finalEmailNotification,
+          isInteractive: isInteractive !== undefined ? Boolean(isInteractive) : template.isInteractive,
+          isDeepResearch: isDeepResearch !== undefined ? Boolean(isDeepResearch) : template.isDeepResearch,
+          createdAt: new Date().toISOString()
+        };
+
+        const createdTask = await taskDb.createTask(task);
+        return res.status(201).json(createdTask);
+      } catch (error) {
+        console.error('Error fetching template:', error);
+        return res.status(500).json({ message: 'Error fetching template' });
+      }
+    }
+    
+    // Regular task creation without template
     if (!name || !prompt) {
       return res.status(400).json({ message: 'Name and prompt are required' });
     }
@@ -35,7 +102,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       name,
       prompt,
       status: 'active',
-      emailNotification: emailNotification ?? false,  // Use provided value or default to false
+      emailNotification: emailNotification ?? isDeepResearch,  // Use provided value or default to isDeepResearch
       isInteractive: Boolean(isInteractive),  // Convert to boolean
       isDeepResearch: Boolean(isDeepResearch),  // Convert to boolean
       createdAt: new Date().toISOString()

@@ -8,6 +8,7 @@ import scheduleRoutes from './routes/schedules';
 import adminRoutes from './routes/admin';
 import configRouter from './routes/config';
 import workflowRoutes from './routes/workflows';
+import templateRoutes from './routes/templates';
 
 const app = express();
 
@@ -36,6 +37,7 @@ app.use('/api/schedules', scheduleRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/config', configRouter);
 app.use('/api/workflows', workflowRoutes);
+app.use('/api/templates', templateRoutes);
 
 // Health check endpoint
 app.get('/', (req, res) => {

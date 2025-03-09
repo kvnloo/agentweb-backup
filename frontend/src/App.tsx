@@ -25,6 +25,7 @@ import WorkflowDetails from './pages/WorkflowDetails';
 import WorkflowRun from './pages/WorkflowRun';
 import Release from './pages/Release';
 import Guide from './pages/Guide';
+import Templates from './pages/Templates';
 
 export default function App() {
   return (
@@ -48,6 +49,14 @@ export default function App() {
                       element={
                         <PrivateRoute>
                           <Tasks />
+                        </PrivateRoute>
+                      }
+                    />
+                    <Route
+                      path="templates"
+                      element={
+                        <PrivateRoute>
+                          <Templates />
                         </PrivateRoute>
                       }
                     />
