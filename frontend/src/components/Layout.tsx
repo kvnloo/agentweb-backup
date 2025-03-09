@@ -123,14 +123,16 @@ export default function Layout() {
                 >
                   Tasks
                 </Button>
-                <Button 
-                  color="primary" 
-                  component={RouterLink} 
-                  to="/templates"
-                  variant={isActivePath('/templates') ? 'contained' : 'text'}
-                >
-                  Templates
-                </Button>
+                {user.isAdmin && (
+                  <Button 
+                    color="primary" 
+                    component={RouterLink} 
+                    to="/templates"
+                    variant={isActivePath('/templates') ? 'contained' : 'text'}
+                  >
+                    Templates
+                  </Button>
+                )}
                 <Button 
                   color="primary" 
                   component={RouterLink} 

@@ -31,12 +31,13 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       try {
         const template = await taskTemplateDb.getTemplateById(templateId);
         
-        // Check if template exists and belongs to the user
+        // Check if template exists
         if (!template) {
           return res.status(404).json({ message: 'Template not found' });
         }
         
-        if (template.userId !== userId) {
+        // Check if user has access to the template (either owns it or it's published)
+        if (template.userId !== userId && !template.published) {
           return res.status(403).json({ message: 'Access denied to this template' });
         }
         

@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { taskTemplateDb } from '../services/db';
+import { taskTemplateDb, userDb } from '../services/db';
 
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
@@ -39,6 +39,7 @@ export const createTemplate = async (req: AuthRequest, res: Response) => {
       parameters,
       isInteractive: Boolean(isInteractive),
       isDeepResearch: Boolean(isDeepResearch),
+      published: false, // New templates are not published by default
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
     };
@@ -58,8 +59,35 @@ export const getTemplates = async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const templates = await taskTemplateDb.getTemplatesByUserId(userId);
-    res.json(templates);
+    // Get user to check if admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    // Get user's own templates
+    const userTemplates = await taskTemplateDb.getTemplatesByUserId(userId);
+    
+    // If user is admin, also get all published templates
+    let publishedTemplates: any[] = [];
+    if (user.isAdmin) {
+      publishedTemplates = await taskTemplateDb.getAllTemplates();
+    } else {
+      // For non-admin users, get all published templates by other users
+      publishedTemplates = await taskTemplateDb.getPublishedTemplates();
+    }
+    
+    // Combine user's templates with published templates, removing duplicates
+    const allTemplates = [...userTemplates];
+    
+    // Add published templates that aren't already in the user's templates
+    publishedTemplates.forEach(template => {
+      if (template.userId !== userId && template.published) {
+        allTemplates.push(template);
+      }
+    });
+    
+    res.json(allTemplates);
   } catch (error) {
     console.error('Error in getTemplates:', error);
     res.status(500).json({ message: 'Error fetching templates' });
@@ -80,8 +108,14 @@ export const getTemplate = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ message: 'Template not found' });
     }
 
-    // Check if user is the template owner
-    if (template.userId !== userId) {
+    // Get user to check if admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    // Check if user is the template owner or if the template is published or if user is admin
+    if (template.userId !== userId && !template.published && !user.isAdmin) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -106,12 +140,18 @@ export const updateTemplate = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ message: 'Template not found' });
     }
 
-    // Check if user is the template owner
-    if (template.userId !== userId) {
+    // Get user to check if admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    // Check if user is the template owner or admin
+    if (template.userId !== userId && !user.isAdmin) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    const { name, description, prompt, isInteractive, isDeepResearch } = req.body;
+    const { name, description, prompt, isInteractive, isDeepResearch, published } = req.body;
     
     const updates: any = {};
     if (name !== undefined) updates.name = name;
@@ -125,12 +165,58 @@ export const updateTemplate = async (req: AuthRequest, res: Response) => {
     
     if (isInteractive !== undefined) updates.isInteractive = Boolean(isInteractive);
     if (isDeepResearch !== undefined) updates.isDeepResearch = Boolean(isDeepResearch);
+    
+    // Only allow admins to update the published status
+    if (published !== undefined && user.isAdmin) {
+      updates.published = Boolean(published);
+    }
 
     const updatedTemplate = await taskTemplateDb.updateTemplate(templateId, updates);
     res.json(updatedTemplate);
   } catch (error) {
     console.error('Error in updateTemplate:', error);
     res.status(500).json({ message: 'Error updating template' });
+  }
+};
+
+export const publishTemplate = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Get user to check if admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    // Only admins can publish templates
+    if (!user.isAdmin) {
+      return res.status(403).json({ message: 'Only admins can publish templates' });
+    }
+
+    const templateId = req.params.id;
+    const template = await taskTemplateDb.getTemplateById(templateId);
+
+    if (!template) {
+      return res.status(404).json({ message: 'Template not found' });
+    }
+
+    const { published } = req.body;
+    if (published === undefined) {
+      return res.status(400).json({ message: 'Published status is required' });
+    }
+
+    const updatedTemplate = await taskTemplateDb.updateTemplate(templateId, {
+      published: Boolean(published)
+    });
+
+    res.json(updatedTemplate);
+  } catch (error) {
+    console.error('Error in publishTemplate:', error);
+    res.status(500).json({ message: 'Error publishing template' });
   }
 };
 
@@ -148,8 +234,14 @@ export const deleteTemplate = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ message: 'Template not found' });
     }
 
-    // Check if user is the template owner
-    if (template.userId !== userId) {
+    // Get user to check if admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    // Check if user is the template owner or admin
+    if (template.userId !== userId && !user.isAdmin) {
       return res.status(403).json({ message: 'Access denied' });
     }
 

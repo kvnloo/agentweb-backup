@@ -24,9 +24,21 @@ import {
   Tooltip,
   Alert,
   CircularProgress,
-  Chip
+  Chip,
+  Stack,
+  Divider,
+  Tabs,
+  Tab
 } from '@mui/material';
-import { Edit as EditIcon, Delete as DeleteIcon, Add as AddIcon } from '@mui/icons-material';
+import { 
+  Edit as EditIcon, 
+  Delete as DeleteIcon, 
+  Add as AddIcon,
+  Public as PublicIcon,
+  PublicOff as PublicOffIcon,
+  Person as PersonIcon,
+  AdminPanelSettings as AdminIcon
+} from '@mui/icons-material';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
 import { buildApiUrl } from '../config';
@@ -39,6 +51,8 @@ interface Template {
   parameters: string[];
   isInteractive: boolean;
   isDeepResearch: boolean;
+  published: boolean;
+  userId: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -60,6 +74,8 @@ export default function Templates() {
   const [deleteId, setDeleteId] = useState('');
   const [openEditDialog, setOpenEditDialog] = useState(false);
   const [currentTemplate, setCurrentTemplate] = useState<Template | null>(null);
+  const [publishLoading, setPublishLoading] = useState<string | null>(null);
+  const [tabValue, setTabValue] = useState(0);
   
   // Form state
   const [name, setName] = useState('');
@@ -68,12 +84,21 @@ export default function Templates() {
   const [isInteractive, setIsInteractive] = useState(false);
   const [isDeepResearch, setIsDeepResearch] = useState(false);
   
-  const { token } = useAuth();
+  const { token, user } = useAuth();
   const navigate = useNavigate();
 
+  // Check if user is admin and redirect if not
   useEffect(() => {
-    fetchTemplates();
-  }, [token]);
+    if (user && !user.isAdmin) {
+      navigate('/tasks');
+    }
+  }, [user, navigate]);
+
+  useEffect(() => {
+    if (user?.isAdmin) {
+      fetchTemplates();
+    }
+  }, [token, user]);
 
   const fetchTemplates = async () => {
     setLoading(true);
@@ -88,6 +113,23 @@ export default function Templates() {
       console.error(err);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleTabChange = (_event: React.SyntheticEvent, newValue: number) => {
+    setTabValue(newValue);
+  };
+
+  // Filter templates based on the current tab
+  const getFilteredTemplates = () => {
+    if (!user) return [];
+    
+    if (tabValue === 0) {
+      // My Templates tab - show only admin's own templates
+      return templates.filter(template => template.userId === user.userId);
+    } else {
+      // Published Templates tab - show all published templates
+      return templates.filter(template => template.published);
     }
   };
 
@@ -146,7 +188,7 @@ export default function Templates() {
         return;
       }
 
-      const templateData = {
+      const templateData: any = {
         name,
         description,
         prompt,
@@ -154,6 +196,7 @@ export default function Templates() {
         isDeepResearch
       };
 
+      let response;
       if (currentTemplate) {
         // Update existing template
         const updateResponse = await axios.put<Template>(
@@ -191,17 +234,151 @@ export default function Templates() {
     }
   };
 
+  const handlePublishToggle = async (templateId: string, currentStatus: boolean) => {
+    setPublishLoading(templateId);
+    try {
+      const response = await axios.put(
+        buildApiUrl(`/api/templates/${templateId}/publish`),
+        { published: !currentStatus },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      
+      // Update the templates list
+      setTemplates(
+        templates.map(template => 
+          template.templateId === templateId ? response.data : template
+        )
+      );
+    } catch (err) {
+      setError('Failed to update template publish status');
+      console.error(err);
+    } finally {
+      setPublishLoading(null);
+    }
+  };
+
   const formatDate = (dateString: string) => {
     return new Date(dateString).toLocaleString();
   };
+
+  // Check if a template belongs to the current user
+  const isOwnTemplate = (template: Template) => {
+    return user && template.userId === user.userId;
+  };
+
+  const renderTemplateTable = (templates: Template[]) => {
+    if (templates.length === 0) {
+      return (
+        <Alert severity="info" sx={{ mt: 2 }}>
+          {tabValue === 0 
+            ? "You don't have any templates yet. Create your first template to get started."
+            : "No published templates are available."
+          }
+        </Alert>
+      );
+    }
+
+    return (
+      <TableContainer>
+        <Table>
+          <TableHead>
+            <TableRow>
+              <TableCell>Name</TableCell>
+              <TableCell>Description</TableCell>
+              <TableCell>Parameters</TableCell>
+              <TableCell>Status</TableCell>
+              <TableCell>Created</TableCell>
+              <TableCell>Last Updated</TableCell>
+              <TableCell>Actions</TableCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {templates.map((template) => (
+              <TableRow key={template.templateId}>
+                <TableCell>
+                  {template.name}
+                  {template.published && (
+                    <Tooltip title="This template is published and available to all users">
+                      <Chip 
+                        icon={<PublicIcon fontSize="small" />}
+                        label="Published" 
+                        color="success" 
+                        size="small"
+                        sx={{ ml: 1 }}
+                      />
+                    </Tooltip>
+                  )}
+                </TableCell>
+                <TableCell>{template.description || '-'}</TableCell>
+                <TableCell>
+                  {template.parameters && template.parameters.length > 0 ? (
+                    <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
+                      {template.parameters.map(param => (
+                        <Chip key={param} label={param} size="small" />
+                      ))}
+                    </Box>
+                  ) : (
+                    'None'
+                  )}
+                </TableCell>
+                <TableCell>
+                  <Button
+                    variant={template.published ? "outlined" : "contained"}
+                    color={template.published ? "success" : "primary"}
+                    size="small"
+                    startIcon={template.published ? <PublicOffIcon /> : <PublicIcon />}
+                    onClick={() => handlePublishToggle(template.templateId, template.published)}
+                    disabled={publishLoading === template.templateId}
+                    sx={{ minWidth: '130px' }}
+                  >
+                    {publishLoading === template.templateId ? (
+                      <CircularProgress size={20} />
+                    ) : (
+                      template.published ? "Unpublish" : "Publish"
+                    )}
+                  </Button>
+                </TableCell>
+                <TableCell>{formatDate(template.createdAt)}</TableCell>
+                <TableCell>{formatDate(template.updatedAt)}</TableCell>
+                <TableCell>
+                  <Stack direction="row" spacing={1}>
+                    <Tooltip title="Edit Template">
+                      <IconButton onClick={() => handleOpenEditDialog(template)}>
+                        <EditIcon />
+                      </IconButton>
+                    </Tooltip>
+                    <Tooltip title="Delete Template">
+                      <IconButton onClick={() => handleOpenDialog(template.templateId)}>
+                        <DeleteIcon />
+                      </IconButton>
+                    </Tooltip>
+                  </Stack>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </TableContainer>
+    );
+  };
+
+  // If user is not admin, don't render the page
+  if (user && !user.isAdmin) {
+    return null;
+  }
 
   return (
     <Container maxWidth="lg">
       <Paper sx={{ p: 4, mt: 4 }}>
         <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 3 }}>
-          <Typography variant="h4" component="h1">
-            Task Templates
-          </Typography>
+          <Box sx={{ display: 'flex', alignItems: 'center' }}>
+            <AdminIcon color="primary" sx={{ mr: 1 }} />
+            <Typography variant="h4" component="h1">
+              Template Management
+            </Typography>
+          </Box>
           <Button
             variant="contained"
             color="primary"
@@ -212,68 +389,33 @@ export default function Templates() {
           </Button>
         </Box>
 
+        <Alert severity="info" sx={{ mb: 3 }}>
+          As an admin, you can create and manage templates that will be available to all users when creating tasks.
+          Published templates will appear in the task creation page for all users.
+        </Alert>
+
         {error && (
           <Alert severity="error" sx={{ mb: 3 }}>
             {error}
           </Alert>
         )}
 
+        <Tabs 
+          value={tabValue} 
+          onChange={handleTabChange} 
+          sx={{ mb: 3 }}
+          variant="fullWidth"
+        >
+          <Tab label="My Templates" />
+          <Tab label="Published Templates" />
+        </Tabs>
+
         {loading ? (
           <Box sx={{ display: 'flex', justifyContent: 'center', p: 3 }}>
             <CircularProgress />
           </Box>
-        ) : templates.length === 0 ? (
-          <Alert severity="info">
-            You don't have any templates yet. Create your first template to get started.
-          </Alert>
         ) : (
-          <TableContainer>
-            <Table>
-              <TableHead>
-                <TableRow>
-                  <TableCell>Name</TableCell>
-                  <TableCell>Description</TableCell>
-                  <TableCell>Parameters</TableCell>
-                  <TableCell>Created</TableCell>
-                  <TableCell>Last Updated</TableCell>
-                  <TableCell>Actions</TableCell>
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {templates.map((template) => (
-                  <TableRow key={template.templateId}>
-                    <TableCell>{template.name}</TableCell>
-                    <TableCell>{template.description || '-'}</TableCell>
-                    <TableCell>
-                      {template.parameters && template.parameters.length > 0 ? (
-                        <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
-                          {template.parameters.map(param => (
-                            <Chip key={param} label={param} size="small" />
-                          ))}
-                        </Box>
-                      ) : (
-                        'None'
-                      )}
-                    </TableCell>
-                    <TableCell>{formatDate(template.createdAt)}</TableCell>
-                    <TableCell>{formatDate(template.updatedAt)}</TableCell>
-                    <TableCell>
-                      <Tooltip title="Edit Template">
-                        <IconButton onClick={() => handleOpenEditDialog(template)}>
-                          <EditIcon />
-                        </IconButton>
-                      </Tooltip>
-                      <Tooltip title="Delete Template">
-                        <IconButton onClick={() => handleOpenDialog(template.templateId)}>
-                          <DeleteIcon />
-                        </IconButton>
-                      </Tooltip>
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </TableContainer>
+          renderTemplateTable(getFilteredTemplates())
         )}
       </Paper>
 
@@ -382,6 +524,7 @@ export default function Templates() {
               />
             </Tooltip>
           </Box>
+          
         </DialogContent>
         <DialogActions>
           <Button onClick={handleCloseEditDialog}>Cancel</Button>

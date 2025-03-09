@@ -42,6 +42,8 @@ interface Template {
   parameters: string[];
   isInteractive: boolean;
   isDeepResearch: boolean;
+  published: boolean;
+  userId: string;
 }
 
 export default function CreateTask() {

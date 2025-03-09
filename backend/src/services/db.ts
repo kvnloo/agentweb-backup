@@ -75,6 +75,7 @@ interface TaskTemplate {
   parameters: string[];
   isInteractive: boolean;
   isDeepResearch: boolean;
+  published: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -979,6 +980,38 @@ class TaskTemplateDB {
       return result.Items as TaskTemplate[];
     } catch (error) {
       handleDynamoDbError(error, 'getTemplatesByUserId');
+      throw error;
+    }
+  }
+
+  async getAllTemplates() {
+    const params = {
+      TableName: this.tableName
+    };
+
+    try {
+      const result = await this.docClient.scan(params).promise();
+      return result.Items as TaskTemplate[];
+    } catch (error) {
+      handleDynamoDbError(error, 'getAllTemplates');
+      throw error;
+    }
+  }
+
+  async getPublishedTemplates() {
+    const params = {
+      TableName: this.tableName,
+      FilterExpression: 'published = :published',
+      ExpressionAttributeValues: {
+        ':published': true
+      }
+    };
+
+    try {
+      const result = await this.docClient.scan(params).promise();
+      return result.Items as TaskTemplate[];
+    } catch (error) {
+      handleDynamoDbError(error, 'getPublishedTemplates');
       throw error;
     }
   }

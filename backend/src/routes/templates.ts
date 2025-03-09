@@ -1,6 +1,6 @@
 import express from 'express';
-import { createTemplate, getTemplates, getTemplate, updateTemplate, deleteTemplate } from '../controllers/templates';
-import { authenticateToken } from '../middleware/auth';
+import { createTemplate, getTemplates, getTemplate, updateTemplate, deleteTemplate, publishTemplate } from '../controllers/templates';
+import { authenticateToken, isAdmin } from '../middleware/auth';
 
 const router = express.Router();
 
@@ -21,5 +21,8 @@ router.put('/:id', updateTemplate);
 
 // Delete a template
 router.delete('/:id', deleteTemplate);
+
+// Publish/unpublish a template (admin only)
+router.put('/:id/publish', isAdmin, publishTemplate);
 
 export default router; 
