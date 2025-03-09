@@ -281,17 +281,10 @@ export default function CreateTask() {
 
         {tabValue === 0 && (
           <>
-            <Box sx={{ mb: 3, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <Box sx={{ mb: 3 }}>
               <Typography variant="h6">
                 Choose a Template
               </Typography>
-              <Button
-                variant="outlined"
-                startIcon={<AddIcon />}
-                onClick={() => navigate('/templates')}
-              >
-                Manage Templates
-              </Button>
             </Box>
 
             {loadingTemplates ? (
@@ -300,7 +293,7 @@ export default function CreateTask() {
               </Box>
             ) : templates.length === 0 ? (
               <Alert severity="info" sx={{ mb: 3 }}>
-                You don't have any templates yet. <Button onClick={() => navigate('/templates')}>Create a template</Button> to get started.
+                No templates are available. Please check back later or create a task from scratch.
               </Alert>
             ) : (
               <Grid container spacing={3} sx={{ mb: 4 }}>
