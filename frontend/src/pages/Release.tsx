@@ -7,6 +7,15 @@ interface Release {
 
 const releases: Release[] = [
   {
+    date: "2025-03-09",
+    changes: [
+      "Introduced Templates for task creation",
+      "- Pre-configured templates with customizable parameters",
+      "- Parameter values can be included in task names",
+      "- Saves time and ensures consistency across similar tasks"
+    ]
+  },
+  {
     date: "2025-03-07",
     changes: [
       "Added User Guide page",
