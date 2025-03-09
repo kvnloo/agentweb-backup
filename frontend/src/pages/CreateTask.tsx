@@ -26,7 +26,6 @@ import {
 } from '@mui/material';
 import {
   ExpandMore as ExpandMoreIcon,
-  Add as AddIcon,
   Check as CheckIcon,
   Description as DescriptionIcon,
 } from '@mui/icons-material';

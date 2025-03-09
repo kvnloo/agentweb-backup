@@ -25,8 +25,7 @@ import {
   Alert,
   CircularProgress,
   Chip,
-  Stack,
-  Divider
+  Stack
 } from '@mui/material';
 import { 
   Edit as EditIcon, 
@@ -73,6 +72,7 @@ export default function Templates() {
   const [openEditDialog, setOpenEditDialog] = useState(false);
   const [currentTemplate, setCurrentTemplate] = useState<Template | null>(null);
   const [publishLoading, setPublishLoading] = useState<string | null>(null);
+  const [selectedNameParameter, setSelectedNameParameter] = useState<string | null>(null);
   
   // Form state
   const [name, setName] = useState('');
@@ -145,26 +145,15 @@ export default function Templates() {
       setPrompt(template.prompt);
       setIsInteractive(template.isInteractive);
       setIsDeepResearch(template.isDeepResearch);
+      setSelectedNameParameter(template.nameParameter);
     } else {
-      setCurrentTemplate({
-        templateId: '',
-        userId: user?.userId || '',
-        name: '',
-        description: '',
-        prompt: '',
-        parameters: [],
-        nameParameter: null,
-        isInteractive: false,
-        isDeepResearch: false,
-        published: false,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-      });
+      setCurrentTemplate(null);
       setName('');
       setDescription('');
       setPrompt('');
       setIsInteractive(false);
       setIsDeepResearch(false);
+      setSelectedNameParameter(null);
     }
     setOpenEditDialog(true);
   };
@@ -172,6 +161,7 @@ export default function Templates() {
   const handleCloseEditDialog = () => {
     setOpenEditDialog(false);
     setCurrentTemplate(null);
+    setSelectedNameParameter(null);
   };
 
   const handleSubmit = async () => {
@@ -180,9 +170,6 @@ export default function Templates() {
         setError('Name and prompt are required');
         return;
       }
-
-      // Extract parameters for validation
-      const extractedParams = extractParameters(prompt);
       
       const templateData: any = {
         name,
@@ -190,11 +177,11 @@ export default function Templates() {
         prompt,
         isInteractive,
         isDeepResearch,
-        nameParameter: currentTemplate?.nameParameter || null
+        nameParameter: selectedNameParameter
       };
 
-      let response;
-      if (currentTemplate) {
+      // Check if we're updating an existing template (has a valid templateId)
+      if (currentTemplate && currentTemplate.templateId && currentTemplate.templateId.length > 0) {
         // Update existing template
         const updateResponse = await axios.put<Template>(
           buildApiUrl(`/api/templates/${currentTemplate.templateId}`),
@@ -496,29 +483,21 @@ export default function Templates() {
                   <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
                     <Chip 
                       label="None" 
-                      color={currentTemplate?.nameParameter === null ? "primary" : "default"}
-                      onClick={() => {
-                        setCurrentTemplate(prev => 
-                          prev ? { ...prev, nameParameter: null } : null
-                        );
-                      }}
+                      color={selectedNameParameter === null ? "primary" : "default"}
+                      onClick={() => setSelectedNameParameter(null)}
                     />
                     {extractParameters(prompt).map(param => (
                       <Chip 
                         key={param}
                         label={param}
-                        color={currentTemplate?.nameParameter === param ? "primary" : "default"}
-                        onClick={() => {
-                          setCurrentTemplate(prev => 
-                            prev ? { ...prev, nameParameter: param } : null
-                          );
-                        }}
+                        color={selectedNameParameter === param ? "primary" : "default"}
+                        onClick={() => setSelectedNameParameter(param)}
                       />
                     ))}
                   </Box>
                   <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-                    {currentTemplate?.nameParameter 
-                      ? `Tasks will be named: "${name} - [${currentTemplate.nameParameter}]"` 
+                    {selectedNameParameter 
+                      ? `Tasks will be named: "${name} - [${selectedNameParameter}]"` 
                       : "Tasks will use the template name without modification."}
                   </Typography>
                 </Box>
