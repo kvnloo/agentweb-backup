@@ -65,6 +65,21 @@ const guideSections: GuideSection[] = [
         ]
       },
       {
+        title: "Using Templates",
+        content: [
+          "Templates provide pre-configured task setups for common operations:",
+          "1. When creating a task, select the 'From Template' tab",
+          "2. Browse available templates and select one that matches your needs",
+          "3. Fill in any required parameters specific to your task",
+          "4. Review the task preview showing how your parameters will be applied",
+          "5. Create the task with your customized parameters",
+          "Benefits of using templates:",
+          "- Saves time by using pre-configured instructions",
+          "- Ensures consistency across similar tasks",
+          "- Automatically includes parameter values in task names for better organization"
+        ]
+      },
+      {
         title: "Task Details",
         content: [
           "The Task Details page provides comprehensive information and management options:",
@@ -196,6 +211,21 @@ const guideSections: GuideSection[] = [
       "   - Task analytics and monitoring",
       "   - System performance metrics",
       "   - Comprehensive task overview across all users"
+    ],
+    subsections: [
+      {
+        title: "Template Management",
+        content: [
+          "As an admin, you can create and manage templates for all users:",
+          "1. Navigate to the 'Templates' page from the main menu",
+          "2. Create new templates with customizable parameters using [parameter_name] syntax",
+          "3. Optionally select a parameter to include in task names for better organization",
+          "4. Test templates before publishing them",
+          "5. Publish templates to make them available to all users",
+          "6. Edit or unpublish templates as needed",
+          "Note: Only admins can create and manage templates, while all users can use published templates"
+        ]
+      }
     ]
   },
   {
