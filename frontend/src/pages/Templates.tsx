@@ -26,9 +26,7 @@ import {
   CircularProgress,
   Chip,
   Stack,
-  Divider,
-  Tabs,
-  Tab
+  Divider
 } from '@mui/material';
 import { 
   Edit as EditIcon, 
@@ -36,7 +34,6 @@ import {
   Add as AddIcon,
   Public as PublicIcon,
   PublicOff as PublicOffIcon,
-  Person as PersonIcon,
   AdminPanelSettings as AdminIcon
 } from '@mui/icons-material';
 import axios from 'axios';
@@ -76,7 +73,6 @@ export default function Templates() {
   const [openEditDialog, setOpenEditDialog] = useState(false);
   const [currentTemplate, setCurrentTemplate] = useState<Template | null>(null);
   const [publishLoading, setPublishLoading] = useState<string | null>(null);
-  const [tabValue, setTabValue] = useState(0);
   
   // Form state
   const [name, setName] = useState('');
@@ -114,23 +110,6 @@ export default function Templates() {
       console.error(err);
     } finally {
       setLoading(false);
-    }
-  };
-
-  const handleTabChange = (_event: React.SyntheticEvent, newValue: number) => {
-    setTabValue(newValue);
-  };
-
-  // Filter templates based on the current tab
-  const getFilteredTemplates = () => {
-    if (!user) return [];
-    
-    if (tabValue === 0) {
-      // My Templates tab - show only admin's own templates
-      return templates.filter(template => template.userId === user.userId);
-    } else {
-      // Published Templates tab - show all published templates
-      return templates.filter(template => template.published);
     }
   };
 
@@ -281,19 +260,16 @@ export default function Templates() {
     return new Date(dateString).toLocaleString();
   };
 
-  // Check if a template belongs to the current user
-  const isOwnTemplate = (template: Template) => {
-    return user && template.userId === user.userId;
-  };
+  // If user is not admin, don't render the page
+  if (user && !user.isAdmin) {
+    return null;
+  }
 
-  const renderTemplateTable = (templates: Template[]) => {
+  const renderTemplateTable = () => {
     if (templates.length === 0) {
       return (
         <Alert severity="info" sx={{ mt: 2 }}>
-          {tabValue === 0 
-            ? "You don't have any templates yet. Create your first template to get started."
-            : "No published templates are available."
-          }
+          You don't have any templates yet. Create your first template to get started.
         </Alert>
       );
     }
@@ -323,6 +299,15 @@ export default function Templates() {
                         icon={<PublicIcon fontSize="small" />}
                         label="Published" 
                         color="success" 
+                        size="small"
+                        sx={{ ml: 1 }}
+                      />
+                    </Tooltip>
+                  )}
+                  {template.nameParameter && (
+                    <Tooltip title={`Uses parameter [${template.nameParameter}] in task name`}>
+                      <Chip 
+                        label="Named" 
                         size="small"
                         sx={{ ml: 1 }}
                       />
@@ -382,11 +367,6 @@ export default function Templates() {
     );
   };
 
-  // If user is not admin, don't render the page
-  if (user && !user.isAdmin) {
-    return null;
-  }
-
   return (
     <Container maxWidth="lg">
       <Paper sx={{ p: 4, mt: 4 }}>
@@ -418,22 +398,12 @@ export default function Templates() {
           </Alert>
         )}
 
-        <Tabs 
-          value={tabValue} 
-          onChange={handleTabChange} 
-          sx={{ mb: 3 }}
-          variant="fullWidth"
-        >
-          <Tab label="My Templates" />
-          <Tab label="Published Templates" />
-        </Tabs>
-
         {loading ? (
           <Box sx={{ display: 'flex', justifyContent: 'center', p: 3 }}>
             <CircularProgress />
           </Box>
         ) : (
-          renderTemplateTable(getFilteredTemplates())
+          renderTemplateTable()
         )}
       </Paper>
 
