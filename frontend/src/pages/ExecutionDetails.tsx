@@ -220,7 +220,14 @@ export default function ExecutionDetails() {
               Prompt
             </Typography>
             <Paper variant="outlined" sx={{ p: 2, bgcolor: 'grey.50' }}>
-              <Typography variant="body1" sx={{ whiteSpace: 'pre-wrap' }}>
+              <Typography 
+                variant="body1" 
+                sx={{ 
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                  overflowWrap: 'break-word'
+                }}
+              >
                 {execution.prompt || 'No prompt available'}
               </Typography>
             </Paper>
@@ -235,7 +242,11 @@ export default function ExecutionDetails() {
               <Typography 
                 variant="body1" 
                 color={execution.error ? 'error' : 'inherit'}
-                sx={{ whiteSpace: 'pre-wrap' }}
+                sx={{ 
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                  overflowWrap: 'break-word'
+                }}
               >
                 {execution.error || execution.result || 'No result available'}
               </Typography>
@@ -292,12 +303,16 @@ export default function ExecutionDetails() {
                       width: '100%',
                       height: '500px',
                       border: 'none',
-                      backgroundColor: 'white'
+                      backgroundColor: 'white',
+                      overflow: 'auto'
                     }}
                     title="Execution Log"
                   />
                 </Paper>
-                <Box sx={{ mt: 1, textAlign: 'right' }}>
+                <Box sx={{ mt: 1, display: 'flex', justifyContent: 'space-between' }}>
+                  <Typography variant="caption" color="text.secondary">
+                    Note: HTML content in logs is escaped to prevent display issues.
+                  </Typography>
                   <Link
                     href={execution.browser_use_log}
                     target="_blank"
