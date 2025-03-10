@@ -251,4 +251,61 @@ def get_previous_execution(task_id, current_execution_id=None):
         return None
     except Exception as e:
         logger.error(f"Error finding previous execution: {e}")
-        return None 
+        return None
+
+def send_oncall_alert(task_name, task_id, error, llm_names_tried):
+    """
+    Send an alert to the oncall team when a task fails with all LLMs.
+    """
+    try:
+        smtp_host = os.getenv('SMTP_HOST', 'smtp.gmail.com')
+        smtp_port = int(os.getenv('SMTP_PORT', '587'))
+        smtp_user = os.getenv('SMTP_USER')
+        smtp_pass = os.getenv('SMTP_PASS')
+        from_email = os.getenv('FROM_EMAIL', smtp_user)
+        site_domain = os.getenv('SITE_DOMAIN', 'http://localhost:3000')
+        oncall_emails = os.getenv('ONCALL_EMAIL_LIST', '').split(',')
+
+        if not all([smtp_user, smtp_pass]) or not oncall_emails:
+            logger.error("Missing email configuration or ONCALL_EMAIL_LIST")
+            return False
+
+        msg = MIMEMultipart()
+        msg['From'] = from_email
+        msg['To'] = ', '.join(oncall_emails)
+        msg['Subject'] = f"[URGENT] Task Failed with All LLMs: {task_name}"
+
+        body = f"""
+⚠️ ALERT: Task Failure Across All LLMs ⚠️
+
+Task Name: {task_name}
+Task ID: {task_id}
+
+Error Details:
+-------------
+{error}
+
+LLMs Attempted:
+--------------
+{', '.join(llm_names_tried)}
+
+View task details: {site_domain}/tasks/{task_id}
+
+This is an urgent alert that needs immediate assistance.
+All configured LLMs have failed to execute this task.
+"""
+
+        msg.attach(MIMEText(body, 'plain'))
+
+        # Send email to all oncall recipients
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+
+        logger.info(f"Sent oncall alert to {oncall_emails}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to send oncall alert: {e}")
+        return False 
