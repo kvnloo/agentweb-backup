@@ -519,6 +519,7 @@ async def execute_task(execution):
     run_user_id = execution.get('run_user_id')  # Get run_user_id from the execution record
     task = None  # Initialize task variable
     prompt = None  # Initialize prompt variable
+    llm_names_tried = []  # Track LLM attempts
     
     try:
         running_task_count += 1
@@ -645,6 +646,7 @@ async def execute_task(execution):
         # Try each LLM in sequence until one succeeds
         for llm_name in llm_names:
             try:
+                llm_names_tried.append(llm_name)  # Track attempt
                 # Generate unique GIF path
                 random_suffix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=20))
                 gif_path = f"agent_history_{execution_id}_{random_suffix}.gif"
@@ -810,6 +812,15 @@ async def execute_task(execution):
         if not success:
             error_message = f"All LLMs failed. Last error: {last_error}"
             try:
+                # Send oncall alert before updating status
+                from email_utils import send_oncall_alert
+                send_oncall_alert(
+                    task_name=task['name'] if task else 'Unknown Task',
+                    task_id=task_id,
+                    error=error_message,
+                    llm_names_tried=llm_names_tried
+                )
+                
                 update_execution_status(
                     execution_id, 
                     'failed', 
@@ -817,7 +828,7 @@ async def execute_task(execution):
                 )
                 logger.info(f"Updated execution status to failed for {execution_id}")
             except Exception as e:
-                logger.error(f"Error updating execution status to failed: {e}", exc_info=True)
+                logger.error(f"Error sending oncall alert: {e}")
             
             # Update workflow execution if this is a workflow task
             if 'workflowExecutionId' in execution:
