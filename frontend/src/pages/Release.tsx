@@ -7,6 +7,14 @@ interface Release {
 
 const releases: Release[] = [
   {
+    date: "2025-03-10",
+    changes: [
+      "Added Complex Task toggle on Task Details page",
+      "- Allows agents to run up to 100 steps (instead of default 25)",
+      "- Enables completion of more complex tasks requiring more actions"
+    ]
+  },
+  {
     date: "2025-03-09",
     changes: [
       "Introduced Templates for task creation",
