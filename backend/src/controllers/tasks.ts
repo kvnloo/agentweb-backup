@@ -24,7 +24,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const { name, prompt, isInteractive, isDeepResearch, emailNotification, templateId, parameterValues } = req.body;
+    const { name, prompt, isInteractive, isDeepResearch, emailNotification, templateId, parameterValues, isComplexTask } = req.body;
     
     // If templateId is provided, fetch the template and use its values
     if (templateId) {
@@ -80,6 +80,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           emailNotification: finalEmailNotification,
           isInteractive: isInteractive !== undefined ? Boolean(isInteractive) : template.isInteractive,
           isDeepResearch: isDeepResearch !== undefined ? Boolean(isDeepResearch) : template.isDeepResearch,
+          isComplexTask: isComplexTask !== undefined ? Boolean(isComplexTask) : template.isComplexTask,
           createdAt: new Date().toISOString()
         };
 
@@ -105,6 +106,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       emailNotification: emailNotification ?? isDeepResearch,  // Use provided value or default to isDeepResearch
       isInteractive: Boolean(isInteractive),  // Convert to boolean
       isDeepResearch: Boolean(isDeepResearch),  // Convert to boolean
+      isComplexTask: Boolean(isComplexTask),  // Convert to boolean
       createdAt: new Date().toISOString()
     };
 
@@ -212,6 +214,10 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
 
     if (req.body.isDeepResearch !== undefined) {
       updates.isDeepResearch = Boolean(req.body.isDeepResearch);
+    }
+
+    if (req.body.isComplexTask !== undefined) {
+      updates.isComplexTask = Boolean(req.body.isComplexTask);
     }
 
     if (req.body.llmName !== undefined) {

@@ -76,6 +76,7 @@ interface TaskTemplate {
   nameParameter: string | null;
   isInteractive: boolean;
   isDeepResearch: boolean;
+  isComplexTask?: boolean;
   published: boolean;
   createdAt: string;
   updatedAt: string;
@@ -256,6 +257,8 @@ export const taskDb = {
     status: string;
     createdAt: string;
     isInteractive?: boolean;
+    isDeepResearch?: boolean;
+    isComplexTask?: boolean;
     emailNotification?: boolean;
     attachments?: TaskAttachment[];
   }) {
@@ -360,7 +363,7 @@ export const taskDb = {
         Key: {
           taskId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
@@ -369,7 +372,8 @@ export const taskDb = {
           '#en': 'emailNotification',
           '#i': 'isInteractive',
           '#dr': 'isDeepResearch',
-          '#llm': 'llmName'
+          '#llm': 'llmName',
+          '#ct': 'isComplexTask'
         }
       };
 
@@ -389,6 +393,8 @@ export const taskDb = {
     emailNotification: boolean;
     isInteractive: boolean;
     isDeepResearch: boolean;
+    isComplexTask: boolean;
+    llmName: string;
     attachments: TaskAttachment[];
   }>) {
     try {
