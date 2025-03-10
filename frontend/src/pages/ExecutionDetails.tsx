@@ -220,7 +220,14 @@ export default function ExecutionDetails() {
               Prompt
             </Typography>
             <Paper variant="outlined" sx={{ p: 2, bgcolor: 'grey.50' }}>
-              <Typography variant="body1" sx={{ whiteSpace: 'pre-wrap' }}>
+              <Typography 
+                variant="body1" 
+                sx={{ 
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                  overflowWrap: 'break-word'
+                }}
+              >
                 {execution.prompt || 'No prompt available'}
               </Typography>
             </Paper>
@@ -235,7 +242,11 @@ export default function ExecutionDetails() {
               <Typography 
                 variant="body1" 
                 color={execution.error ? 'error' : 'inherit'}
-                sx={{ whiteSpace: 'pre-wrap' }}
+                sx={{ 
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                  overflowWrap: 'break-word'
+                }}
               >
                 {execution.error || execution.result || 'No result available'}
               </Typography>
