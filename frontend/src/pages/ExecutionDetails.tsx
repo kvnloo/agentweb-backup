@@ -292,12 +292,16 @@ export default function ExecutionDetails() {
                       width: '100%',
                       height: '500px',
                       border: 'none',
-                      backgroundColor: 'white'
+                      backgroundColor: 'white',
+                      overflow: 'auto'
                     }}
                     title="Execution Log"
                   />
                 </Paper>
-                <Box sx={{ mt: 1, textAlign: 'right' }}>
+                <Box sx={{ mt: 1, display: 'flex', justifyContent: 'space-between' }}>
+                  <Typography variant="caption" color="text.secondary">
+                    Note: HTML content in logs is escaped to prevent display issues.
+                  </Typography>
                   <Link
                     href={execution.browser_use_log}
                     target="_blank"

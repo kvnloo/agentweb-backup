@@ -328,9 +328,14 @@ def upload_activity_log(log_file: str, user_id: str, execution_id: str) -> Optio
         random_token = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=20))
         s3_key = f"execution_logs/{user_id}/activities_{execution_id}_{random_token}.log"
 
-        # Read the log file and wrap it in HTML with pre-formatting
+        # Read the log file and escape HTML content
+        import html
         with open(log_file, 'r') as f:
             log_content = f.read()
+            
+        # Escape HTML content to prevent browser interpretation
+        escaped_content = html.escape(log_content)
+        
         html_content = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -346,7 +351,7 @@ def upload_activity_log(log_file: str, user_id: str, execution_id: str) -> Optio
     </style>
 </head>
 <body>
-    <pre>{log_content}</pre>
+    <pre>{escaped_content}</pre>
 </body>
 </html>"""
 
