@@ -955,8 +955,15 @@ export default function TaskDetails() {
             You are viewing another user's task as an administrator.
           </Alert>
         )}
-        <Box sx={{ mb: 4, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-          <Box>
+        <Box sx={{ 
+          mb: 4, 
+          display: 'flex', 
+          flexDirection: { xs: 'column', md: 'row' },
+          justifyContent: 'space-between', 
+          alignItems: { xs: 'stretch', md: 'flex-start' },
+          gap: 2
+        }}>
+          <Box sx={{ flex: 1 }}>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
               {isEditingName ? (
                 <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
@@ -1023,53 +1030,63 @@ export default function TaskDetails() {
               </Typography>
             )}
             {showActions && (
-              <Box sx={{ display: 'flex', gap: 2, alignItems: 'center' }}>
-                <FormControlLabel
-                  control={
-                    <Switch
-                      checked={Boolean(task.emailNotification)}
-                      onChange={handleEmailToggle}
-                      color="primary"
+              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+                <Box sx={{ 
+                  display: 'grid', 
+                  gridTemplateColumns: {
+                    xs: '1fr',
+                    sm: 'repeat(2, 1fr)'
+                  }, 
+                  gap: 1, 
+                  mb: 2 
+                }}>
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        checked={Boolean(task.emailNotification)}
+                        onChange={handleEmailToggle}
+                        color="primary"
+                      />
+                    }
+                    label="Email Me Latest Run"
+                  />
+                  <Tooltip title="When enabled, the agent can pause execution to request additional information from you">
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          checked={Boolean(task.isInteractive)}
+                          onChange={handleInteractiveModeToggle}
+                          color="primary"
+                        />
+                      }
+                      label="Interactive Mode"
                     />
-                  }
-                  label="Email Me Latest Run"
-                />
-                <Tooltip title="When enabled, the agent can pause execution to request additional information from you">
-                  <FormControlLabel
-                    control={
-                      <Switch
-                        checked={Boolean(task.isInteractive)}
-                        onChange={handleInteractiveModeToggle}
-                        color="primary"
-                      />
-                    }
-                    label="Interactive Mode"
-                  />
-                </Tooltip>
-                <Tooltip title="When enabled, the task will use advanced AI to perform comprehensive research on your topic using public web data only. Currently does not use your uploads or web accounts (Config), but will support these in the future.">
-                  <FormControlLabel
-                    control={
-                      <Switch
-                        checked={Boolean(task.isDeepResearch)}
-                        onChange={handleDeepResearchToggle}
-                        color="primary"
-                      />
-                    }
-                    label="Perform Deep Research"
-                  />
-                </Tooltip>
-                <Tooltip title="When enabled, the task will allow the agent to take up to 100 steps (instead of the default 25) to complete complex tasks that require more actions">
-                  <FormControlLabel
-                    control={
-                      <Switch
-                        checked={Boolean(task.isComplexTask)}
-                        onChange={handleComplexTaskToggle}
-                        color="primary"
-                      />
-                    }
-                    label="Complex Task"
-                  />
-                </Tooltip>
+                  </Tooltip>
+                  <Tooltip title="When enabled, the task will use advanced AI to perform comprehensive research on your topic using public web data only. Currently does not use your uploads or web accounts (Config), but will support these in the future.">
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          checked={Boolean(task.isDeepResearch)}
+                          onChange={handleDeepResearchToggle}
+                          color="primary"
+                        />
+                      }
+                      label="Perform Deep Research"
+                    />
+                  </Tooltip>
+                  <Tooltip title="When enabled, the task will allow the agent to take up to 100 steps (instead of the default 25) to complete complex tasks that require more actions">
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          checked={Boolean(task.isComplexTask)}
+                          onChange={handleComplexTaskToggle}
+                          color="primary"
+                        />
+                      }
+                      label="Complex Task"
+                    />
+                  </Tooltip>
+                </Box>
                 <Tooltip title={
                   <div>
                     <p>If selected, this LLM will be used first to run the task. If it fails, other LLMs will be tried as backup.</p>
@@ -1077,7 +1094,7 @@ export default function TaskDetails() {
                     <p>Example: "azure-{'>'}-openai-{'>'}-gpt-4o" means GPT-4 model deployed on Azure, provided by OpenAI</p>
                   </div>
                 } placement="right">
-                  <FormControl sx={{ width: 400 }}>
+                  <FormControl sx={{ width: '100%' }}>
                     <InputLabel id="llm-select-label">Preferred LLM</InputLabel>
                     <Select
                       labelId="llm-select-label"
@@ -1100,7 +1117,13 @@ export default function TaskDetails() {
             )}
           </Box>
           {showActions && (
-            <Box sx={{ display: 'flex', gap: 2 }}>
+            <Box sx={{ 
+              display: 'flex', 
+              gap: 2, 
+              flexShrink: 0,
+              justifyContent: { xs: 'flex-start', md: 'flex-end' },
+              mt: { xs: 2, md: 0 }
+            }}>
               <Button
                 variant="contained"
                 color="primary"
