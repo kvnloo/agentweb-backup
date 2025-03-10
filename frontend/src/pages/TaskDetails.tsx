@@ -60,6 +60,7 @@ interface Task {
   emailNotification?: boolean;
   isInteractive?: boolean;
   isDeepResearch?: boolean;
+  isComplexTask?: boolean;
   llmName?: string;
   attachments?: TaskAttachment[];
 }
@@ -596,6 +597,37 @@ export default function TaskDetails() {
     }
   };
 
+  const handleComplexTaskToggle = async () => {
+    if (!task) return;
+    
+    try {
+      const newIsComplexTask = !task.isComplexTask;
+      
+      await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        {
+          isComplexTask: newIsComplexTask
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+
+      // Update the task state with the response
+      const taskResponse = await axios.get(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+      
+      setTask(taskResponse.data);
+    } catch (error: any) {
+      console.error('Error updating complex task mode:', error);
+      setError(error.response?.data?.message || 'Failed to update complex task mode');
+    }
+  };
+
   const handleFeedbackChange = async (executionId: string, feedback: 'accepted' | 'rejected' | null) => {
     try {
       await axios.put(
@@ -1024,6 +1056,18 @@ export default function TaskDetails() {
                       />
                     }
                     label="Perform Deep Research"
+                  />
+                </Tooltip>
+                <Tooltip title="When enabled, the task will allow the agent to take up to 100 steps (instead of the default 25) to complete complex tasks that require more actions">
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        checked={Boolean(task.isComplexTask)}
+                        onChange={handleComplexTaskToggle}
+                        color="primary"
+                      />
+                    }
+                    label="Complex Task"
                   />
                 </Tooltip>
                 <Tooltip title={

@@ -401,8 +401,8 @@ def update_workflow_execution(workflow_execution_id: str, task_id: str, task_sta
         logger.error(f"Error updating workflow execution: {e}")
         return False
 
-async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str, run_user_id: str = None) -> Dict[str, Any]:
-    """Run WebAgent via CLI command"""
+async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str, run_user_id: str = None, is_complex_task: bool = False) -> Dict[str, Any]:
+    """Run the web agent with the given parameters"""
     try:
         # Create necessary directories
         os.makedirs('prompts', exist_ok=True)
@@ -431,6 +431,8 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
             cmd.extend(['--run_user_id', run_user_id])
         if is_interactive:
             cmd.append('--interactive')
+        if is_complex_task:
+            cmd.append('--is_complex_task')
             
         # Run command with output redirection
         logger.info(f"Running command: {' '.join(cmd)}")
@@ -748,7 +750,8 @@ async def execute_task(execution):
                         bool(task.get('isInteractive', False)) if task else False,
                         task_id,
                         gif_path,
-                        run_user_id
+                        run_user_id,
+                        bool(task.get('isComplexTask', False)) if task else False
                     )
                     # Upload browser-use log to S3 if it exists
                     filtered_activity_log = f'logs/execution_{execution_id}_browser_use.filtered.log'

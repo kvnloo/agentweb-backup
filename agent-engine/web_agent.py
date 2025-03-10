@@ -112,7 +112,7 @@ class WebAgent:
             handler.close()
         self._log_handlers.clear()
 
-    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None) -> Dict[str, Any]:
+    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
         log_file = None
         try:
@@ -137,8 +137,10 @@ class WebAgent:
             
             await self.setup()  # Setup after we have the task
             
-            # Run the agent
-            result = await self.agent.run(max_steps=25)
+            # Run the agent with max_steps based on complexity
+            max_steps = 100 if is_complex_task else 25
+            logger.info(f"Running agent with max_steps={max_steps} (Complex Task: {is_complex_task})")
+            result = await self.agent.run(max_steps=max_steps)
             
             task_is_done = False  # Initialize task_is_done
             agent_message = None
@@ -685,6 +687,7 @@ async def main():
     parser.add_argument('--gif_path', required=True, help='Path for the GIF output')
     parser.add_argument('--interactive', action='store_true', help='Enable interactive mode')
     parser.add_argument('--run_user_id', help='ID of the user who ran the task if different from owner')
+    parser.add_argument('--is_complex_task', action='store_true', help='Enable complex task mode with 100 steps')
     args = parser.parse_args()
 
     # Read prompt from file
@@ -707,7 +710,8 @@ async def main():
             execution_id=args.execution_id,
             is_interactive=args.interactive,
             task_id=args.task_id,
-            generate_gif=args.gif_path
+            generate_gif=args.gif_path,
+            is_complex_task=args.is_complex_task
         )
         print(json.dumps(result))
         sys.exit(0 if result["success"] else 1)
