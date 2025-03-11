@@ -9,7 +9,7 @@ const DEBUG = import.meta.env.VITE_DEBUG !== 'false';
 export const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
 
 // Get the list of available LLMs from environment variable or use default list
-export const AVAILABLE_LLMS = (import.meta.env.VITE_LIST_FULL_LLM_NAMES || 'azure->openai->gpt-4o,aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0,openai->openai->gpt-4o,aws->anthropic->us.anthropic.claude-3-7-sonnet-20250219-v1:0,openai->openai->gpt-4o-mini,azure->openai->o1-mini')
+export const AVAILABLE_LLMS = (import.meta.env.VITE_LIST_FULL_LLM_NAMES || 'azure->openai->gpt-4o,aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0,openai->openai->gpt-4o,aws->anthropic->us.anthropic.claude-3-7-sonnet-20250219-v1:0,openai->openai->gpt-4o-mini,azure->openai->o1-mini,pld->deepseek->DeepSeek-R1,deepseek->deepseek->deepseek-reasoner')
   .split(',')
   .map((llm: string) => llm.trim())
   .filter((llm: string) => llm); // Remove empty strings
