@@ -42,6 +42,7 @@ interface Template {
   nameParameter: string | null;
   isInteractive: boolean;
   isDeepResearch: boolean;
+  isComplexTask: boolean;
   published: boolean;
   userId: string;
 }
@@ -51,6 +52,7 @@ export default function CreateTask() {
   const [prompt, setPrompt] = useState('');
   const [isInteractive, setIsInteractive] = useState(false);
   const [isDeepResearch, setIsDeepResearch] = useState(false);
+  const [isComplexTask, setIsComplexTask] = useState(false);
   const [error, setError] = useState('');
   const [selectedTemplate, setSelectedTemplate] = useState('');
   const [templates, setTemplates] = useState<Template[]>([]);
@@ -88,6 +90,7 @@ export default function CreateTask() {
       setPrompt('');
       setIsInteractive(false);
       setIsDeepResearch(false);
+      setIsComplexTask(false);
       setCurrentTemplateParams([]);
       setParameterValues({});
       return;
@@ -104,6 +107,7 @@ export default function CreateTask() {
       setPrompt('');
       setIsInteractive(false);
       setIsDeepResearch(false);
+      setIsComplexTask(false);
       setCurrentTemplateParams([]);
       return;
     }
@@ -116,6 +120,7 @@ export default function CreateTask() {
       setPrompt(template.prompt);
       setIsInteractive(template.isInteractive);
       setIsDeepResearch(template.isDeepResearch);
+      setIsComplexTask(template.isComplexTask);
       
       // Set current template parameters
       setCurrentTemplateParams(template.parameters || []);
@@ -152,6 +157,7 @@ export default function CreateTask() {
       setPrompt('');
       setIsInteractive(false);
       setIsDeepResearch(false);
+      setIsComplexTask(false);
       setCurrentTemplateParams([]);
       setParameterValues({});
     }
@@ -189,6 +195,7 @@ export default function CreateTask() {
         prompt: finalPrompt,
         isInteractive: selectedTemplateObj ? selectedTemplateObj.isInteractive : isInteractive,
         isDeepResearch: selectedTemplateObj ? selectedTemplateObj.isDeepResearch : isDeepResearch,
+        isComplexTask: selectedTemplateObj ? selectedTemplateObj.isComplexTask : isComplexTask,
         emailNotification
       };
       
@@ -509,6 +516,9 @@ export default function CreateTask() {
                       {getSelectedTemplate()?.isDeepResearch && (
                         <Chip label="Deep Research" size="small" />
                       )}
+                      {getSelectedTemplate()?.isComplexTask && (
+                        <Chip label="Complex Task" size="small" />
+                      )}
                       {getSelectedTemplate()?.isDeepResearch && (
                         <Chip label="Email Notifications" size="small" />
                       )}
@@ -557,9 +567,11 @@ export default function CreateTask() {
                         checked={isInteractive}
                         onChange={(e) => setIsInteractive(e.target.checked)}
                         color="primary"
+                        disabled={isDeepResearch}
                       />
                     }
                     label="Interactive Mode"
+                    sx={{ opacity: isDeepResearch ? 0.5 : 1 }}
                   />
                 </Tooltip>
                 <Tooltip title="When enabled, the task will use advanced AI to perform comprehensive research on your topic using public web data only. Currently does not use your uploads or web accounts (Config), but will support these in the future.">
@@ -567,17 +579,38 @@ export default function CreateTask() {
                     control={
                       <Switch
                         checked={isDeepResearch}
-                        onChange={(e) => setIsDeepResearch(e.target.checked)}
+                        onChange={(e) => {
+                          setIsDeepResearch(e.target.checked);
+                          // If Deep Research is enabled, disable Interactive Mode and Complex Task
+                          if (e.target.checked) {
+                            setIsInteractive(false);
+                            setIsComplexTask(false);
+                          }
+                        }}
                         color="primary"
                       />
                     }
                     label="Perform Deep Research"
                   />
                 </Tooltip>
+                <Tooltip title="When enabled, the task will use a more complex system prompt and have a higher step limit for handling complex tasks">
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        checked={isComplexTask}
+                        onChange={(e) => setIsComplexTask(e.target.checked)}
+                        color="primary"
+                        disabled={isDeepResearch}
+                      />
+                    }
+                    label="Complex Task"
+                    sx={{ opacity: isDeepResearch ? 0.5 : 1 }}
+                  />
+                </Tooltip>
               </Box>
               {isDeepResearch && (
                 <Alert severity="info" sx={{ mt: 2 }}>
-                  Deep Research Mode is enabled. When you run this task, it will use advanced AI to perform comprehensive research on your topic using public web data only. Currently does not use your uploads or web accounts (Config), but will support these in the future. Email notifications are automatically enabled for Deep Research tasks.
+                  Deep Research Mode is enabled. When you run this task, it will use advanced AI to perform comprehensive research on your topic using public web data only. Currently does not use your uploads or web accounts (Config), but will support these in the future. Email notifications are automatically enabled for Deep Research tasks. Interactive Mode and Complex Task options are not applicable for Deep Research tasks.
                 </Alert>
               )}
             </>
