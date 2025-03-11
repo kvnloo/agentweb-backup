@@ -7,6 +7,14 @@ interface Release {
 
 const releases: Release[] = [
   {
+    date: "2025-03-11",
+    changes: [
+      "Added new models for running regular tasks: Anthropic 3.7 sonnet and Google Gemini 2.0 flash",
+      "- Note: These models are not available for deep research yet",
+      "- Expanded model selection provides more options for different task types"
+    ]
+  },
+  {
     date: "2025-03-10",
     changes: [
       "Added Complex Task toggle on Task Details page",

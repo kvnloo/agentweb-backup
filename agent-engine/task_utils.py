@@ -99,13 +99,15 @@ def get_azure_openai_llm_o1(model_name: str):
 
 def get_deepseek_llm(model_name: str):
     """Initialize DeepSeek language model"""
+    global global_use_vision
     try:
+        global_use_vision = False
         api_key = os.getenv('DEEPSEEK_API_KEY')
         if not api_key:
             raise ValueError('DEEPSEEK_API_KEY is not set')
             
         return ChatOpenAI(
-            base_url='https://api.deepseek.com/v1',
+            base_url='https://api.deepseek.com',
             model=model_name,
             api_key=SecretStr(api_key),
             temperature=0.0
@@ -113,6 +115,26 @@ def get_deepseek_llm(model_name: str):
     except Exception as e:
         logger.error(f"Error initializing DeepSeek: {e}")
         logger.error("Please ensure DEEPSEEK_API_KEY environment variable is set correctly.")
+        sys.exit(1)
+
+def get_pld_deepseek_llm(model_name: str):
+    """Initialize DeepSeek language model hosted on Pale Blue Dot"""
+    global global_use_vision
+    try:
+        global_use_vision = False
+        api_key = os.getenv('PLD_DEEPSEEK_API_KEY')
+        if not api_key:
+            raise ValueError('PLD_DEEPSEEK_API_KEY is not set')
+            
+        return ChatOpenAI(
+            base_url='https://www.palebluedot.ai/api',
+            model=model_name,
+            api_key=SecretStr(api_key),
+            temperature=0.0
+        )
+    except Exception as e:
+        logger.error(f"Error initializing DeepSeek: {e}")
+        logger.error("Please ensure PLD_DEEPSEEK_API_KEY environment variable is set correctly.")
         sys.exit(1)
 
 def get_openai_llm(model_name: str):
@@ -153,6 +175,29 @@ def get_openai_llm_think(model_name: str):
         logger.error("Please ensure OPENAI_API_KEY environment variable is set correctly.")
         sys.exit(1)
 
+def get_gemini_llm(model_name: str):
+    """Initialize Google Gemini language model"""
+    try:
+        api_key = os.getenv('GEMINI_API_KEY')
+        if not api_key:
+            raise ValueError('GEMINI_API_KEY is not set')
+            
+        # Import here to avoid requiring the package for all users
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        
+        return ChatGoogleGenerativeAI(
+            model=model_name,
+            api_key=SecretStr(api_key),
+            temperature=0.0
+        )
+    except ImportError:
+        logger.error("langchain_google_genai package is not installed. Install it with: pip install langchain-google-genai")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Error initializing Gemini: {e}")
+        logger.error("Please ensure GEMINI_API_KEY environment variable is set correctly.")
+        sys.exit(1)
+
 def get_llm(full_llm_name: str) -> Tuple[Any, str]:
     """Get the appropriate language model based on provided configuration
     
@@ -181,17 +226,34 @@ def get_llm(full_llm_name: str) -> Tuple[Any, str]:
                 "deepseek-reasoner": get_deepseek_llm
             }
         },
+        "pld": {
+            "deepseek": {
+                "DeepSeek-R1": get_pld_deepseek_llm
+            }
+        },
         "openai": {
             "openai": {
                 "gpt-4o": get_openai_llm,
                 "gpt-4o-mini": get_openai_llm,
                 "o3-mini": get_openai_llm_think
             }
+        },
+        "google": {
+            "google": {
+                "gemini-2.0-flash": get_gemini_llm
+            }
         }
     }
 
     try:
-        platform, provider, model_name = full_llm_name.lower().split('->')
+        # Split the full LLM name but only convert platform and provider to lowercase
+        parts = full_llm_name.split('->')
+        if len(parts) != 3:
+            raise ValueError(f"Invalid format: {full_llm_name}")
+            
+        platform = parts[0].lower()
+        provider = parts[1].lower()
+        model_name = parts[2]  # Keep original case for model name
     except ValueError:
         logger.error(f"Invalid FULL_LLM_NAME format: {full_llm_name}")
         logger.error("Format should be <platform>-><provider>-><model>")
