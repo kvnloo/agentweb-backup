@@ -60,6 +60,8 @@ const guideSections: GuideSection[] = [
           "Fill in the following details:",
           "- Task Name: A descriptive name for your task",
           "- Task Prompt: Natural language instructions for what you want the AI agent to do",
+          "  • Include specific output format requests (e.g., 'Output results as CSV file')",
+          "  • Be clear about what data should be included in any output files",
           "- Interactive Mode: Toggle this on if you want the AI to ask for additional information during execution",
           "- Deep Research Mode: Toggle this on for comprehensive research tasks using public web data (automatically enables email notifications)"
         ]
@@ -118,7 +120,9 @@ const guideSections: GuideSection[] = [
           "   - Text summaries",
           "   - Screenshots",
           "   - Downloaded files",
-          "   - HTML reports"
+          "   - HTML reports",
+          "   - Structured data files (CSV, JSON, etc.) if requested in your prompt",
+          "5. Click on result files to view them directly in the browser (for supported formats) or download them"
         ]
       }
     ]
@@ -197,6 +201,26 @@ const guideSections: GuideSection[] = [
           "3. Select the file from your computer",
           "4. The AI agent can reference these files during task execution"
         ]
+      },
+      {
+        title: "File Output Formats",
+        content: [
+          "Request the agent to output results in specific file formats:",
+          "1. In your task prompt, explicitly state the desired output format",
+          "2. Use clear instructions like:",
+          "   - 'Output the results as a CSV file'",
+          "   - 'Save the data in JSON format'",
+          "   - 'Create an HTML report with the findings'",
+          "   - 'Generate a TXT file with the summary'",
+          "3. Be specific about what data should be included in the file",
+          "4. After task execution, you'll see the generated file in the 'Result Files' section",
+          "5. Click on the file to view it directly in the browser (for supported formats) or download it",
+          "Supported viewable formats include:",
+          "- Text formats: .html, .htm, .txt, .json, .csv, .xml, .md, .js, .css",
+          "- Image formats: .jpg, .jpeg, .png, .gif, .svg, .webp",
+          "- PDF format: .pdf",
+          "Other formats will be downloaded when accessed."
+        ]
       }
     ]
   },
@@ -257,7 +281,9 @@ const guideSections: GuideSection[] = [
       "2. Use interactive mode for complex tasks that might need clarification",
       "3. Schedule recurring tasks for regular automation",
       "4. Review task results and provide feedback to improve future executions",
-      "5. Use Deep Research mode for comprehensive information gathering"
+      "5. Use Deep Research mode for comprehensive information gathering",
+      "6. Request specific file formats (CSV, JSON, etc.) for structured data output",
+      "7. Be explicit about what data should be included in output files"
     ]
   }
 ];

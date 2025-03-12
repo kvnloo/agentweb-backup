@@ -9,6 +9,12 @@ const releases: Release[] = [
   {
     date: "2025-03-11",
     changes: [
+      "Added support for output files (CSV, JSON, etc.)",
+      "- Agents can now write results directly to files in various formats",
+      "- Supported formats include CSV, JSON, TXT, XML, HTML, and more",
+      "- Files can be downloaded after task execution is complete",
+      "Added Complex Task support with Templates",
+      "- Templates can now be configured with Complex Task option",
       "Added new models for running regular tasks: Anthropic 3.7 sonnet and Google Gemini 2.0 flash",
       "- Note: These models are not available for deep research yet",
       "- Expanded model selection provides more options for different task types"
