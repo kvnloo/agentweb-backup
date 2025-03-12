@@ -705,6 +705,13 @@ class WebAgent:
                                 f.write("\n\n")
                                 f.write("="*80 + "\n")
                                 f.write(f"New execution log at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                                f.write(f"Using LLM: {self.llm_name}\n")
+                                f.write("="*80 + "\n\n")
+                            else:
+                                # Add header with LLM information for new file
+                                f.write("="*80 + "\n")
+                                f.write(f"Execution log started at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                                f.write(f"Using LLM: {self.llm_name}\n")
                                 f.write("="*80 + "\n\n")
                             f.writelines(filtered_lines)
                         logger.info("Created filtered log file")
