@@ -305,18 +305,52 @@ def upload_task_result_files(downloads_path: str, execution_id: str) -> List[Dic
             s3_client = get_s3_client()
             s3_bucket = os.getenv('AWS_S3_BUCKET')
             
+            # Define viewable file types with their MIME types
+            viewable_types = {
+                # Text formats
+                '.html': {'content_type': 'text/html; charset=utf-8', 'view_type': 'html'},
+                '.htm': {'content_type': 'text/html; charset=utf-8', 'view_type': 'html'},
+                '.txt': {'content_type': 'text/plain; charset=utf-8', 'view_type': 'text'},
+                '.json': {'content_type': 'application/json; charset=utf-8', 'view_type': 'text'},
+                '.csv': {'content_type': 'text/csv; charset=utf-8', 'view_type': 'text'},
+                '.xml': {'content_type': 'application/xml; charset=utf-8', 'view_type': 'text'},
+                '.md': {'content_type': 'text/markdown; charset=utf-8', 'view_type': 'text'},
+                '.js': {'content_type': 'application/javascript; charset=utf-8', 'view_type': 'text'},
+                '.css': {'content_type': 'text/css; charset=utf-8', 'view_type': 'text'},
+                
+                # Image formats
+                '.jpg': {'content_type': 'image/jpeg', 'view_type': 'image'},
+                '.jpeg': {'content_type': 'image/jpeg', 'view_type': 'image'},
+                '.png': {'content_type': 'image/png', 'view_type': 'image'},
+                '.gif': {'content_type': 'image/gif', 'view_type': 'image'},
+                '.svg': {'content_type': 'image/svg+xml', 'view_type': 'image'},
+                '.webp': {'content_type': 'image/webp', 'view_type': 'image'},
+                
+                # PDF format
+                '.pdf': {'content_type': 'application/pdf', 'view_type': 'pdf'},
+            }
+            
             for file_path in downloads_dir.glob('*'):
                 if file_path.is_file():
                     try:
                         # Upload file to S3 with random token in path
                         s3_key = f"task_results/{execution_id}/{random_token}/{file_path.name}"
                         
-                        # Set different ContentDisposition for HTML files to allow viewing in browser
+                        # Get file extension (lowercase)
+                        file_ext = file_path.suffix.lower()
+                        
+                        # Set content type and disposition based on file type
                         extra_args = {}
-                        if file_path.suffix.lower() == '.html':
-                            # For HTML files, set inline disposition to open in browser
-                            extra_args = {'ContentDisposition': f'inline; filename="{file_path.name}"', 
-                                         'ContentType': 'text/html; charset=utf-8'}
+                        
+                        if file_ext in viewable_types:
+                            # For viewable files, set inline disposition to open in browser
+                            content_type = viewable_types[file_ext]['content_type']
+                            view_type = viewable_types[file_ext]['view_type']
+                            
+                            extra_args = {
+                                'ContentDisposition': f'inline; filename="{file_path.name}"',
+                                'ContentType': content_type
+                            }
                         else:
                             # For other files, keep attachment disposition for download
                             extra_args = {'ContentDisposition': f'attachment; filename="{file_path.name}"'}
@@ -331,16 +365,16 @@ def upload_task_result_files(downloads_path: str, execution_id: str) -> List[Dic
                         encoded_key = quote(s3_key)
                         url = f"https://{s3_bucket}.s3.amazonaws.com/{encoded_key}"
                         
-                        # Add a flag to indicate if this is a viewable HTML file
+                        # Create file info dictionary
                         file_info = {
                             'url': url,
                             'filename': file_path.name,
                             'token': random_token,  # Store token for potential future validation
                         }
                         
-                        # Add a flag to indicate if this is a viewable HTML file
-                        if file_path.suffix.lower() == '.html':
-                            file_info['is_html'] = True
+                        # Add view type flag if this is a viewable file
+                        if file_ext in viewable_types:
+                            file_info['view_type'] = viewable_types[file_ext]['view_type']
                             
                         result_files.append(file_info)
                         logger.info(f"Uploaded result file to S3: {url}")
@@ -506,6 +540,70 @@ def upload_gif(gif_path: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"Error uploading GIF: {e}")
         return None
+
+def validate_content_format(extension: str, content: str) -> Optional[str]:
+    """Validate that the content matches the expected format for the given extension.
+    
+    Args:
+        extension: File extension (lowercase, without the dot)
+        content: Content to validate
+        
+    Returns:
+        Optional[str]: Error message if validation fails, None if validation passes
+    """
+    try:
+        # Skip validation for empty content
+        if not content.strip():
+            return "Content cannot be empty"
+            
+        # JSON validation
+        if extension == 'json':
+            try:
+                import json
+                json.loads(content)
+            except json.JSONDecodeError as e:
+                return f"Invalid JSON format: {str(e)}"
+                
+        # CSV validation
+        elif extension == 'csv':
+            # Basic CSV validation - check for comma-separated values
+            lines = content.strip().split('\n')
+            if not lines:
+                return "CSV file must have at least one line"
+                
+            # Check if all rows have the same number of columns
+            first_row_cols = lines[0].count(',') + 1
+            for i, line in enumerate(lines[1:], 2):
+                if line.count(',') + 1 != first_row_cols:
+                    return f"CSV format error: Row {i} has a different number of columns than the header row"
+                    
+        # XML validation
+        elif extension == 'xml':
+            try:
+                import xml.etree.ElementTree as ET
+                ET.fromstring(content)
+            except Exception as e:
+                return f"Invalid XML format: {str(e)}"
+                
+        # HTML validation (basic check)
+        elif extension == 'html' or extension == 'htm':
+            if not content.strip().startswith(('<html', '<!DOCTYPE', '<HTML')):
+                return "HTML content should start with <!DOCTYPE html> or <html> tag"
+                
+        # YAML validation
+        elif extension == 'yaml' or extension == 'yml':
+            try:
+                import yaml
+                yaml.safe_load(content)
+            except Exception as e:
+                return f"Invalid YAML format: {str(e)}"
+                
+        # No specific validation for other formats
+        return None
+            
+    except Exception as e:
+        logger.error(f"Error during content validation: {str(e)}")
+        return f"Content validation error: {str(e)}"
 
 def check_new_information(previous_result, current_result):
     """

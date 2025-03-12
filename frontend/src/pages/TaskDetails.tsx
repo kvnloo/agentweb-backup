@@ -561,13 +561,21 @@ export default function TaskDetails() {
       const newIsDeepResearch = !task.isDeepResearch;
       
       // If enabling deep research, also enable email notifications
+      // and disable interactive mode and complex task
       const updateData: any = {
         isDeepResearch: newIsDeepResearch
       };
       
       // If enabling deep research, also enable email notifications
-      if (newIsDeepResearch && !task.emailNotification) {
-        updateData.emailNotification = true;
+      if (newIsDeepResearch) {
+        // Enable email notifications if not already enabled
+        if (!task.emailNotification) {
+          updateData.emailNotification = true;
+        }
+        
+        // Disable interactive mode and complex task
+        updateData.isInteractive = false;
+        updateData.isComplexTask = false;
       }
       
       // Reset LLM selection when toggling deep research mode
@@ -1057,9 +1065,11 @@ export default function TaskDetails() {
                           checked={Boolean(task.isInteractive)}
                           onChange={handleInteractiveModeToggle}
                           color="primary"
+                          disabled={Boolean(task.isDeepResearch)}
                         />
                       }
                       label="Interactive Mode"
+                      sx={{ opacity: Boolean(task.isDeepResearch) ? 0.5 : 1 }}
                     />
                   </Tooltip>
                   <Tooltip title="When enabled, the task will use advanced AI to perform comprehensive research on your topic using public web data only. Currently does not use your uploads or web accounts (Config), but will support these in the future.">
@@ -1081,9 +1091,11 @@ export default function TaskDetails() {
                           checked={Boolean(task.isComplexTask)}
                           onChange={handleComplexTaskToggle}
                           color="primary"
+                          disabled={Boolean(task.isDeepResearch)}
                         />
                       }
                       label="Complex Task"
+                      sx={{ opacity: Boolean(task.isDeepResearch) ? 0.5 : 1 }}
                     />
                   </Tooltip>
                 </Box>

@@ -48,6 +48,7 @@ interface Template {
   nameParameter: string | null;
   isInteractive: boolean;
   isDeepResearch: boolean;
+  isComplexTask: boolean;
   published: boolean;
   userId: string;
   createdAt: string;
@@ -80,6 +81,7 @@ export default function Templates() {
   const [prompt, setPrompt] = useState('');
   const [isInteractive, setIsInteractive] = useState(false);
   const [isDeepResearch, setIsDeepResearch] = useState(false);
+  const [isComplexTask, setIsComplexTask] = useState(false);
   
   const { token, user } = useAuth();
   const navigate = useNavigate();
@@ -145,6 +147,7 @@ export default function Templates() {
       setPrompt(template.prompt);
       setIsInteractive(template.isInteractive);
       setIsDeepResearch(template.isDeepResearch);
+      setIsComplexTask(template.isComplexTask);
       setSelectedNameParameter(template.nameParameter);
     } else {
       setCurrentTemplate(null);
@@ -153,6 +156,7 @@ export default function Templates() {
       setPrompt('');
       setIsInteractive(false);
       setIsDeepResearch(false);
+      setIsComplexTask(false);
       setSelectedNameParameter(null);
     }
     setOpenEditDialog(true);
@@ -177,6 +181,7 @@ export default function Templates() {
         prompt,
         isInteractive,
         isDeepResearch,
+        isComplexTask,
         nameParameter: selectedNameParameter
       };
 
@@ -513,9 +518,11 @@ export default function Templates() {
                     checked={isInteractive}
                     onChange={(e) => setIsInteractive(e.target.checked)}
                     color="primary"
+                    disabled={isDeepResearch}
                   />
                 }
                 label="Interactive Mode"
+                sx={{ opacity: isDeepResearch ? 0.5 : 1 }}
               />
             </Tooltip>
             <Tooltip title="When enabled, the task will use advanced AI to perform comprehensive research">
@@ -523,11 +530,32 @@ export default function Templates() {
                 control={
                   <Switch
                     checked={isDeepResearch}
-                    onChange={(e) => setIsDeepResearch(e.target.checked)}
+                    onChange={(e) => {
+                      setIsDeepResearch(e.target.checked);
+                      // If Deep Research is enabled, disable Interactive Mode
+                      if (e.target.checked) {
+                        setIsInteractive(false);
+                        setIsComplexTask(false);
+                      }
+                    }}
                     color="primary"
                   />
                 }
                 label="Perform Deep Research"
+              />
+            </Tooltip>
+            <Tooltip title="When enabled, the task will allow the agent to take up to 100 steps (instead of the default 25) to complete complex tasks that require more actions">
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={isComplexTask}
+                    onChange={(e) => setIsComplexTask(e.target.checked)}
+                    color="primary"
+                    disabled={isDeepResearch}
+                  />
+                }
+                label="Complex Task"
+                sx={{ opacity: isDeepResearch ? 0.5 : 1 }}
               />
             </Tooltip>
           </Box>

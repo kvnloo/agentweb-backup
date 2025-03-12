@@ -69,6 +69,35 @@ To update dependencies:
 conda env update -f environment.yml
 ```
 
+### Running Tests
+
+The agent engine includes unit tests to ensure functionality works as expected. To run the tests:
+
+1. Activate the conda environment:
+```bash
+conda activate agent-engine
+```
+
+2. Run all tests:
+```bash
+python run_tests.py
+```
+
+3. Run a specific test file:
+```bash
+python -m unittest tests/test_validate_content_format.py
+```
+
+4. Run standalone tests (no dependencies):
+```bash
+python tests/test_validate_content_format_standalone.py
+```
+
+#### Available Tests
+
+- `test_validate_content_format.py`: Tests for the content format validation function
+- `test_task_monitor.py`: Tests for the task monitoring functionality
+
 ## Integration
 
 The agent engine integrates with the main application through:

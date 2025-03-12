@@ -25,7 +25,7 @@ import aiohttp
 import base64  # Add at the top with other imports
 import boto3  # Add at the top with other imports
 from urllib.parse import quote
-from task_utils import get_downloads_path, upload_task_result_files, get_llm
+from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format
 # Load environment variables
 load_dotenv()
 
@@ -426,6 +426,58 @@ class WebAgent:
                 logger.error(f'Error in download_image: {str(e)}')
                 return ActionResult(error=f'Failed to download image: {str(e)}')
 
+        @self.controller.registry.action('Write file')
+        async def write_file(file_name: str, extension: str, content: str) -> ActionResult:
+            """Write content to a file with the specified name and extension in the downloads folder.
+            
+            Args:
+                file_name: Name of the file without extension
+                extension: File extension (without the dot)
+                content: Content to write to the file in the format specified by the extension
+                         (e.g., CSV format for .csv files, JSON format for .json files)
+                
+            Returns:
+                ActionResult with the path to the created file or an error message
+                
+            Notes:
+                The following file formats can be viewed directly in the browser:
+                - Text formats: .html, .htm, .txt, .json, .csv, .xml, .md, .js, .css
+                - Image formats: .jpg, .jpeg, .png, .gif, .svg, .webp
+                - PDF format: .pdf
+                Other formats will be downloaded when accessed.
+            """
+            try:
+                # Get user-specific downloads path
+                downloads_path = Path(self._get_downloads_path())
+                
+                # Sanitize file name and extension
+                sanitized_name = ''.join(c for c in file_name if c.isalnum() or c in '-_')
+                sanitized_ext = ''.join(c for c in extension if c.isalnum())
+                
+                # Create full filename with extension
+                full_filename = f"{sanitized_name}.{sanitized_ext}"
+                filepath = downloads_path / full_filename
+                
+                # Check if file already exists
+                if filepath.exists():
+                    return ActionResult(error=f"File {full_filename} already exists in the downloads folder. Please choose a different name.")
+                
+                # Validate content format based on extension
+                validation_error = validate_content_format(sanitized_ext.lower(), content)
+                if validation_error:
+                    return ActionResult(error=validation_error)
+                
+                # Write content to file
+                filepath.write_text(content)
+                
+                msg = f"Successfully wrote content to {full_filename}"
+                logger.info(msg)
+                return ActionResult(extracted_content=msg)
+                
+            except Exception as e:
+                logger.error(f'Error in write_file: {str(e)}')
+                return ActionResult(error=f'Failed to write file: {str(e)}')
+
         # Only register ask_user action if interactive mode is enabled
         if self.is_interactive:
             @self.controller.registry.action('Ask user for input')
@@ -518,12 +570,13 @@ class WebAgent:
         return str(self.context_dir / f"{self.user_id}_cookies.json")
 
     def _get_downloads_path(self):
-        """Get the path to the downloads directory for the current execution"""
-        return get_downloads_path(
-            user_id=self.user_id,
-            execution_id=self.current_execution_id
-        )
-
+        """Get the path to the downloads directory"""
+        if self.current_execution_id:
+            downloads_path = get_downloads_path(user_id=self.user_id, execution_id=self.current_execution_id)
+        else:
+            downloads_path = get_downloads_path(user_id=self.user_id)
+        return downloads_path
+        
     async def setup(self):
         """Initialize the browser instance"""
         if not self.task:
@@ -652,6 +705,13 @@ class WebAgent:
                                 f.write("\n\n")
                                 f.write("="*80 + "\n")
                                 f.write(f"New execution log at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                                f.write(f"Using LLM: {self.llm_name}\n")
+                                f.write("="*80 + "\n\n")
+                            else:
+                                # Add header with LLM information for new file
+                                f.write("="*80 + "\n")
+                                f.write(f"Execution log started at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                                f.write(f"Using LLM: {self.llm_name}\n")
                                 f.write("="*80 + "\n\n")
                             f.writelines(filtered_lines)
                         logger.info("Created filtered log file")
