@@ -7,6 +7,15 @@ interface Release {
 
 const releases: Release[] = [
   {
+    date: "2025-03-13",
+    changes: [
+      "Added execution details sharing functionality",
+      "- Users can now share execution details via a secure URL",
+      "- Share button added to Execution Details page",
+      "- Shared executions can be viewed without requiring login"
+    ]
+  },
+  {
     date: "2025-03-11",
     changes: [
       "Added support for output files (CSV, JSON, etc.)",
