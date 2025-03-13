@@ -13,10 +13,19 @@ import {
   IconButton,
   Tooltip,
   Divider,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  Button,
+  TextField,
+  Snackbar,
 } from '@mui/material';
 import ThumbUpIcon from '@mui/icons-material/ThumbUp';
 import ThumbDownIcon from '@mui/icons-material/ThumbDown';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
+import ShareIcon from '@mui/icons-material/Share';
+import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import { useAuth } from '../contexts/AuthContext';
 import axios from 'axios';
 import { buildApiUrl } from '../config';
@@ -61,6 +70,11 @@ export default function ExecutionDetails() {
   const { executionId, taskId } = useParams<{ executionId: string; taskId: string }>();
   const { token } = useAuth();
   const navigate = useNavigate();
+  const [shareDialogOpen, setShareDialogOpen] = useState(false);
+  const [shareUrl, setShareUrl] = useState('');
+  const [shareLoading, setShareLoading] = useState(false);
+  const [shareError, setShareError] = useState('');
+  const [copySuccess, setCopySuccess] = useState(false);
 
   useEffect(() => {
     const fetchExecution = async () => {
@@ -118,6 +132,44 @@ export default function ExecutionDetails() {
       default:
         return 'default';
     }
+  };
+
+  const handleShareClick = async () => {
+    if (!taskId || !executionId) return;
+    
+    try {
+      setShareLoading(true);
+      setShareError('');
+      
+      const response = await axios.get(
+        buildApiUrl(`/api/tasks/${taskId}/executions/${executionId}/share`),
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      
+      const shareToken = response.data.shareToken;
+      // Create a share URL using the current URL with the token as a query parameter
+      const shareUrl = `${window.location.origin}/execution/${executionId}/token/${shareToken}`;
+      
+      setShareUrl(shareUrl);
+      setShareDialogOpen(true);
+    } catch (error: any) {
+      console.error('Error generating share link:', error);
+      setShareError(error.response?.data?.message || 'Failed to generate share link');
+    } finally {
+      setShareLoading(false);
+    }
+  };
+
+  const handleCopyShareUrl = () => {
+    navigator.clipboard.writeText(shareUrl).then(
+      () => {
+        setCopySuccess(true);
+        setTimeout(() => setCopySuccess(false), 3000);
+      },
+      () => {
+        setShareError('Failed to copy to clipboard');
+      }
+    );
   };
 
   if (loading) {
@@ -178,6 +230,14 @@ export default function ExecutionDetails() {
                 )}
               </Box>
               <Box sx={{ display: 'flex', gap: 1 }}>
+                <Tooltip title="Share execution details">
+                  <IconButton
+                    onClick={handleShareClick}
+                    disabled={shareLoading}
+                  >
+                    <ShareIcon />
+                  </IconButton>
+                </Tooltip>
                 <Tooltip title={execution.feedback ? `Current: ${execution.feedback}` : 'Set feedback'}>
                   <IconButton
                     onClick={() => handleFeedbackChange(
@@ -394,6 +454,52 @@ export default function ExecutionDetails() {
           )}
         </Grid>
       </Paper>
+
+      {/* Share Dialog */}
+      <Dialog open={shareDialogOpen} onClose={() => setShareDialogOpen(false)}>
+        <DialogTitle>Share Execution Details</DialogTitle>
+        <DialogContent>
+          {shareError ? (
+            <Alert severity="error" sx={{ mb: 2 }}>
+              {shareError}
+            </Alert>
+          ) : (
+            <>
+              <Typography variant="body2" sx={{ mb: 2 }}>
+                Share this link to allow others to view this execution without requiring login:
+              </Typography>
+              <Box sx={{ display: 'flex', alignItems: 'center', mb: 2 }}>
+                <TextField
+                  fullWidth
+                  value={shareUrl}
+                  variant="outlined"
+                  size="small"
+                  InputProps={{
+                    readOnly: true,
+                  }}
+                />
+                <IconButton onClick={handleCopyShareUrl} sx={{ ml: 1 }}>
+                  <ContentCopyIcon />
+                </IconButton>
+              </Box>
+              <Typography variant="caption" color="text.secondary">
+                Anyone with this link can view the execution details.
+              </Typography>
+            </>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setShareDialogOpen(false)}>Close</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Copy Success Snackbar */}
+      <Snackbar
+        open={copySuccess}
+        autoHideDuration={3000}
+        onClose={() => setCopySuccess(false)}
+        message="Share URL copied to clipboard"
+      />
     </Container>
   );
 } 
