@@ -485,6 +485,7 @@ export const taskDb = {
     completedAt: string;
     feedback: 'accepted' | 'rejected' | null;
     userInteractions: UserInteraction[];
+    shareToken: string;
   }>) {
     try {
       const updateExpressions: string[] = [];

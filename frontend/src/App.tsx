@@ -12,6 +12,7 @@ import Tasks from './pages/Tasks';
 import CreateTask from './pages/CreateTask';
 import TaskDetails from './pages/TaskDetails';
 import ExecutionDetails from './pages/ExecutionDetails';
+import SharedExecution from './pages/SharedExecution';
 import Layout from './components/Layout';
 import OAuthCallback from './pages/OAuthCallback';
 import AdminDashboard from './pages/AdminDashboard';
@@ -44,6 +45,7 @@ export default function App() {
                     <Route path="oauth-callback" element={<OAuthCallback />} />
                     <Route path="release" element={<Release />} />
                     <Route path="guide" element={<Guide />} />
+                    <Route path="execution/:executionId/token/:token" element={<SharedExecution />} />
                     <Route
                       path="tasks"
                       element={

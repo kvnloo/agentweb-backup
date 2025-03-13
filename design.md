@@ -1,7 +1,7 @@
 # AgentWeb - Technical Design Document
 
 ## Overview
-AgentWeb is a web platform that enables users to create and manage AI-powered web automation tasks using natural language instructions. The platform provides secure credential management and reliable task execution in isolated environments.
+AgentWeb is a web platform that enables users to create and manage AI-powered web automation tasks using natural language instructions. The platform provides secure credential management, reliable task execution in isolated environments, and advanced features like deep research capabilities, workflows, and task templates.
 
 ## System Security Architecture
 
@@ -81,52 +81,71 @@ AgentWeb is a web platform that enables users to create and manage AI-powered we
    - User interface for task creation and management
    - Real-time task status monitoring
    - Secure credential input interface
+   - Workflow builder interface
+   - Task templates management
+   - Configuration management
 
 2. **Backend**
    - Node.js/Express API server
    - Authentication and authorization system
    - Task orchestration engine
    - Browser session management
+   - DynamoDB integration for data storage
+   - Email notification system
 
-3. **Task Execution Engine**
+3. **Agent Engine**
    - browser-use based automation
    - Isolated browser sessions per user
    - Task scheduling and queuing system
    - Error handling and retry mechanisms
+   - Deep research capabilities
+   - Interactive task execution
+   - File upload/download handling
+   - GIF generation for task visualization
 
 4. **Security Layer**
-   - AWS Secrets Manager integration
-   - Encryption for credential storage
+   - JWT-based encryption for credentials
+   - Secure credential handling
    - MFA implementation
    - Session isolation
 
 ### Infrastructure
 1. **Compute**
    - AWS EC2 with Auto Scaling
-   - Application Load Balancer
+   - Elastic Beanstalk for deployment
    - Docker containers for task isolation
 
 2. **Database**
    - Amazon DynamoDB for scalable storage
    - Tables:
-     - Users
-     - Tasks
-     - TaskExecutions
-     - Credentials (encrypted)
-     - Workflows
-     - WorkflowExecutions
-     - WorkflowTaskMappings
+     - AW-Users: User accounts
+     - AW-Tasks: Task definitions
+     - AW-TaskExecutions: Task execution records
+     - AW-Waitlist: Waitlist entries
+     - AW-Subscribers: Task subscribers
+     - AW-TaskSchedules: Task schedules
+     - AW-Configs: User website configurations
+     - AW-Workflows: Workflow definitions
+     - AW-WorkflowExecutions: Workflow execution records
+     - AW-TaskTemplates: Task templates
 
-3. **Monitoring & Logging**
+3. **Storage**
+   - Amazon S3 for file storage
+   - Task execution results
+   - Screenshots and GIFs
+   - Downloadable reports
+
+4. **Monitoring & Logging**
    - CloudWatch integration
    - Alert system for task failures
    - Audit logging
+   - Execution logs for debugging
 
 ## Security Design
 
 ### Credential Management
 1. **Storage**
-   - AWS Secrets Manager for sensitive data
+   - JWT-based encryption for credentials
    - End-to-end encryption for credentials
    - Temporary session-based access
 
@@ -153,17 +172,22 @@ AgentWeb is a web platform that enables users to create and manage AI-powered we
    - One-time execution
    - Immediate or scheduled
    - Result storage and notification
+   - Interactive mode for user input during execution
 
 2. **Recurring Tasks**
-   - Configurable schedules
-   - Dependency management
+   - Configurable schedules (daily, weekly, monthly)
+   - Status management (active, paused)
    - Failure handling and retries
 
-3. **Workflows**
+3. **Deep Research Tasks**
+   - Advanced research capabilities
+   - Multiple LLM options
+   - Detailed HTML reports
+   - Source citations
+
+4. **Workflows**
    - Multiple tasks in defined sequence
    - Conditional branching based on task results
-   - Parallel task execution support
-   - Inter-task data passing
    - Error handling and recovery strategies
    - Visual workflow builder interface
 
@@ -185,6 +209,41 @@ AgentWeb is a web platform that enables users to create and manage AI-powered we
    - Resource usage monitoring
    - Workflow progress visualization
    - Task dependency graphs
+   - GIF generation for visual task replay
+
+### Task Templates
+1. **Template Management**
+   - Create and save task templates
+   - Share templates with other users
+   - Quick task creation from templates
+   - Template categories and tags
+
+## User Interaction
+
+### Interactive Tasks
+1. **User Input During Execution**
+   - Real-time questions from the agent
+   - User responses integrated into task flow
+   - Timeout handling for responses
+   - Execution continuation based on input
+
+2. **Execution Visualization**
+   - GIF generation of task execution
+   - Step-by-step replay
+   - Screenshot capture at key points
+
+### Notifications
+1. **Email Notifications**
+   - Task completion notifications
+   - Error alerts
+   - Subscriber notifications with detailed results
+   - Scheduled task reminders
+
+2. **In-App Notifications**
+   - Real-time execution status
+   - Task completion alerts
+   - Error notifications
+   - Interactive task prompts
 
 ## Scalability
 
@@ -200,53 +259,11 @@ AgentWeb is a web platform that enables users to create and manage AI-powered we
    - Partition optimization
 
 ### Performance Optimization
-1. **Caching**
-   - Redis for session data
-   - Browser cache management
-   - API response caching
-
-2. **Resource Management**
+1. **Resource Management**
    - Task queuing
    - Priority scheduling
    - Resource pooling
-
-## Development Roadmap
-
-### Phase 1: Core Platform
-1. Basic user authentication
-2. Single task execution
-3. Secure credential management
-4. Basic monitoring
-5. Simple sequential workflows
-
-### Phase 2: Enhanced Features
-1. Recurring tasks
-2. Advanced security features
-3. Improved monitoring
-4. API integrations
-5. Advanced workflow features:
-   - Parallel execution
-   - Conditional branching
-   - Error recovery
-   - Workflow templates
-
-### Phase 3: Scale & Optimize
-1. Performance optimization
-2. Advanced analytics
-3. Additional automation features
-4. Partner integrations
-5. Workflow marketplace
-6. Visual workflow designer
-
-## Future Considerations
-1. API marketplace for custom integrations
-2. Machine learning for task optimization
-3. Advanced credential delegation system
-4. Mobile application
-5. Enterprise features
-6. AI-powered workflow suggestions
-7. Workflow version control and rollback
-8. Cross-organization workflow sharing
+   - Concurrent task execution limits
 
 ## Technical Stack
 
@@ -254,7 +271,7 @@ AgentWeb is a web platform that enables users to create and manage AI-powered we
 - React.js
 - TypeScript
 - Material-UI
-- Redux for state management
+- Context API for state management
 
 ### Backend
 - Node.js
@@ -262,44 +279,44 @@ AgentWeb is a web platform that enables users to create and manage AI-powered we
 - TypeScript
 - browser-use for web agent automation
 - JWT for authentication
+- AWS SDK for DynamoDB and S3 integration
+
+### Agent Engine
+- Python
+- browser-use library
+- LangChain integration
+- Multiple LLM support (Azure OpenAI, AWS Bedrock, OpenAI, Google)
+- Playwright for browser automation
 
 ### Infrastructure
-- AWS (EC2, DynamoDB, Secrets Manager)
+- AWS (EC2, DynamoDB, S3, Elastic Beanstalk)
 - Docker
-- Redis
 - Nginx
 
 ### Monitoring
 - AWS CloudWatch
-- ELK Stack
-- Custom monitoring dashboard
+- Custom logging system
+- Execution tracking dashboard
 
 ## Workflow Management
 
 ### Workflow Components
 1. **Workflow Definition**
    - Task sequence and dependencies
-   - Conditional logic
    - Error handling rules
    - Data passing between tasks
    - Timeout configurations
-   - Retry policies
 
 2. **Workflow Engine**
    - Task orchestration
    - State management
    - Error recovery
-   - Parallel execution handling
-   - Resource optimization
-   - Event-driven execution
+   - Sequential execution handling
 
 3. **Workflow Interface**
    - Visual workflow builder
-   - Dependency visualization
    - Real-time execution monitoring
    - Debug and testing tools
-   - Version management
-   - Template system
 
 ### Workflow Security
 1. **Access Control**
@@ -314,24 +331,28 @@ AgentWeb is a web platform that enables users to create and manage AI-powered we
    - Result data encryption
    - Clean-up procedures
 
-### Workflow Features
-1. **Basic Features**
-   - Sequential task execution
-   - Simple condition branching
-   - Error notifications
-   - Execution logs
+## Configuration Management
 
-2. **Advanced Features**
-   - Parallel task execution
-   - Complex conditional logic
-   - Dynamic task generation
-   - External service integration
-   - Workflow templates
-   - Import/Export capabilities
+### Website Configurations
+1. **Configuration Storage**
+   - Secure storage of website-specific configurations
+   - Sharing options for configurations
+   - Version management
 
-3. **Enterprise Features**
-   - Cross-team workflows
-   - Approval workflows
-   - SLA monitoring
-   - Compliance tracking
-   - Advanced analytics 
+2. **Configuration Types**
+   - Login procedures
+   - Navigation paths
+   - Data extraction rules
+   - Form submission templates
+
+## Future Considerations
+1. **API marketplace for custom integrations**
+2. **Machine learning for task optimization**
+3. **Advanced credential delegation system**
+4. **Mobile application**
+5. **Enterprise features**
+6. **AI-powered workflow suggestions**
+7. **Workflow version control and rollback**
+8. **Cross-organization workflow sharing**
+9. **Advanced analytics dashboard**
+10. **Integration with popular productivity tools** 

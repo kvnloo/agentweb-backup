@@ -4,6 +4,7 @@ import { userDb } from '../services/db';
 import { scheduleDb } from '../services/db';
 import AWS from 'aws-sdk';
 import { taskTemplateDb } from '../services/db';
+import crypto from 'crypto';
 
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
@@ -599,5 +600,97 @@ export const getExecutionLog = async (req: AuthRequest, res: Response) => {
   } catch (error) {
     console.error('Error fetching execution log:', error);
     res.status(500).json({ message: 'Error fetching execution log' });
+  }
+};
+
+export const generateShareToken = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const taskId = req.params.id;
+    const executionId = req.params.executionId;
+    
+    // Get the task to check permissions
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Check if user is admin or task owner
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Get the execution
+    const execution = await taskDb.getTaskExecutionById(executionId);
+    if (!execution) {
+      return res.status(404).json({ message: 'Execution not found' });
+    }
+
+    // Verify the execution belongs to the task
+    if (execution.taskId !== taskId) {
+      return res.status(404).json({ message: 'Execution not found for this task' });
+    }
+
+    // If a share token already exists, use it; otherwise, generate a new one
+    let shareToken = execution.shareToken;
+    
+    if (!shareToken) {
+      // Generate a random token (16 characters)
+      shareToken = crypto.randomBytes(8).toString('hex');
+      
+      // Save the token to the execution record
+      await taskDb.updateTaskExecution(executionId, { shareToken });
+    }
+    
+    res.json({ shareToken });
+  } catch (error) {
+    console.error('Error generating share token:', error);
+    res.status(500).json({ message: 'Error generating share token' });
+  }
+};
+
+export const getExecutionWithToken = async (req: Request, res: Response) => {
+  try {
+    const { executionId, token } = req.params;
+    
+    if (!executionId || !token) {
+      return res.status(400).json({ message: 'Execution ID and token are required' });
+    }
+    
+    // Get the execution
+    const execution = await taskDb.getTaskExecutionById(executionId);
+    if (!execution) {
+      return res.status(404).json({ message: 'Execution not found' });
+    }
+    
+    // Verify the token matches
+    if (execution.shareToken !== token) {
+      return res.status(403).json({ message: 'Invalid token' });
+    }
+    
+    // Get the task for additional context
+    const task = await taskDb.getTaskById(execution.taskId);
+    
+    // Return the execution with minimal task info
+    res.json({
+      execution,
+      task: task ? {
+        taskId: task.taskId,
+        name: task.name,
+        prompt: task.prompt
+      } : null
+    });
+  } catch (error) {
+    console.error('Error fetching execution with token:', error);
+    res.status(500).json({ message: 'Error fetching execution' });
   }
 }; 
