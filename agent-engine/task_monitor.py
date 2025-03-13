@@ -742,17 +742,53 @@ async def execute_task(execution):
                         }
                 else:
                     # Run WebAgent via CLI for non-deep-research tasks
-                    result = await run_web_agent_cli(
-                        user_id,
-                        llm_name,
-                        prompt_with_context,
-                        execution_id,
-                        bool(task.get('isInteractive', False)) if task else False,
-                        task_id,
-                        gif_path,
-                        run_user_id,
-                        bool(task.get('isComplexTask', False)) if task else False
-                    )
+                    try:
+                        # Set timeout from environment or default to 15 minutes
+                        timeout_seconds = int(os.getenv('TASK_EXECUTION_TIMEOUT_SECONDS', '900'))
+                        logger.info(f"Running web agent with timeout of {timeout_seconds} seconds")
+                        
+                        # Create a task for running the web agent
+                        web_agent_task = asyncio.create_task(
+                            run_web_agent_cli(
+                                user_id,
+                                llm_name,
+                                prompt_with_context,
+                                execution_id,
+                                bool(task.get('isInteractive', False)) if task else False,
+                                task_id,
+                                gif_path,
+                                run_user_id,
+                                bool(task.get('isComplexTask', False)) if task else False
+                            )
+                        )
+                        
+                        # Wait for the web agent to complete with a timeout
+                        result = await asyncio.wait_for(web_agent_task, timeout=timeout_seconds)
+                        logger.info(f"Successfully completed web agent execution with {llm_name}")
+                        
+                    except asyncio.TimeoutError:
+                        # Task execution timed out
+                        logger.error(f"Task execution timed out after {timeout_seconds} seconds")
+                        result = {
+                            "success": False,
+                            "error": f"Task execution timed out after {timeout_seconds} seconds",
+                            "llm_name": llm_name
+                        }
+                        # Cancel the task to prevent it from continuing to run in the background
+                        web_agent_task.cancel()
+                        
+                    except Exception as e:
+                        # Other errors
+                        logger.error(f"Error waiting for task execution: {str(e)}")
+                        result = {
+                            "success": False,
+                            "error": f"Error waiting for task execution: {str(e)}",
+                            "llm_name": llm_name
+                        }
+                        # Cancel the task if it's still running
+                        if 'web_agent_task' in locals() and not web_agent_task.done():
+                            web_agent_task.cancel()
+                    
                     # Upload browser-use log to S3 if it exists
                     filtered_activity_log = f'logs/execution_{execution_id}_browser_use.filtered.log'
 
