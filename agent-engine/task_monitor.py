@@ -25,6 +25,11 @@ import shutil
 import re
 import traceback
 import threading
+import resource
+
+# Increase file descriptor limit
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, 4096), hard))
 
 # Custom JSON encoder to handle datetime objects
 class DateTimeEncoder(json.JSONEncoder):
@@ -403,6 +408,7 @@ def update_workflow_execution(workflow_execution_id: str, task_id: str, task_sta
 
 async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str, run_user_id: str = None, is_complex_task: bool = False) -> Dict[str, Any]:
     """Run the web agent with the given parameters"""
+    process = None
     try:
         # Create necessary directories
         os.makedirs('prompts', exist_ok=True)
@@ -511,6 +517,13 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
             "error": str(e),
             "llmName": llm_name
         }
+    finally:
+        if process:
+            try:
+                process.kill()
+                await process.wait()
+            except:
+                pass
 
 async def execute_task(execution):
     global running_task_count, running_user_ids, running_task_ids
@@ -518,10 +531,13 @@ async def execute_task(execution):
     execution_id = execution['executionId']
     task_id = execution['taskId']
     user_id = execution['userId']
-    run_user_id = execution.get('run_user_id')  # Get run_user_id from the execution record
-    task = None  # Initialize task variable
-    prompt = None  # Initialize prompt variable
-    llm_names_tried = []  # Track LLM attempts
+    run_user_id = execution.get('run_user_id')
+    task = None
+    prompt = None
+    llm_names_tried = []
+    research_task = None
+    web_agent_task = None
+    agent = None
     
     try:
         running_task_count += 1
@@ -893,6 +909,28 @@ async def execute_task(execution):
             except Exception as workflow_error:
                 logger.error(f"Error updating workflow execution after task error: {workflow_error}", exc_info=True)
     finally:
+        # Clean up tasks if they're still running
+        if research_task and not research_task.done():
+            research_task.cancel()
+            try:
+                await research_task
+            except:
+                pass
+            
+        if web_agent_task and not web_agent_task.done():
+            web_agent_task.cancel()
+            try:
+                await web_agent_task
+            except:
+                pass
+            
+        # Clean up agent resources
+        if agent:
+            try:
+                await agent.cleanup()
+            except:
+                pass
+
         running_task_count -= 1
         # Check if user_id exists in the set before removing it
         if user_id in running_user_ids:
