@@ -12,6 +12,8 @@ const releases: Release[] = [
       "Added Extract Page Content option on Task Details page",
       "- Contents on pages can be extracted and saved as JSON files for download",
       "- Enable this option to automatically extract structured data from web pages",
+      "Added Validate Output option on Task Details page",
+      "- When enabled, the agent will validate its output to ensure higher accuracy",
       "Bug fixes"
     ]
   },

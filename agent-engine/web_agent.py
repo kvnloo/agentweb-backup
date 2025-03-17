@@ -114,25 +114,24 @@ class WebAgent:
             handler.close()
         self._log_handlers.clear()
 
-    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False) -> Dict[str, Any]:
+    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
         log_file = None
         try:
-            self.is_interactive = is_interactive  # Set interactive mode
-            self.current_execution_id = execution_id  # Store execution ID
-            self.current_task_id = task_id  # Store task ID
-            self.generate_gif = generate_gif  # Store GIF path
+            # Set class variables
+            self.current_execution_id = execution_id
+            self.current_task_id = task_id
+            self.generate_gif = generate_gif
+            self.is_interactive = is_interactive
+
+            # Configure logging for this execution
+            log_file = self.setup_execution_logging(execution_id)
             
-            # Setup logging for this execution
-            if execution_id:
-                log_file = self.setup_execution_logging(execution_id)
-                logger.info(f"Logging setup complete. Logs will be written to {log_file}")
-            
-            logger.info(f"Executing task with prompt: {prompt}")
-            logger.info(f"Task ID: {task_id}, Execution ID: {execution_id}")
+            logger.info(f"Executing task with prompt: {prompt[:100]}...")
             logger.info(f"Interactive mode: {is_interactive}")
-            logger.info(f"Complex task mode: {is_complex_task}")
+            logger.info(f"Complex task: {is_complex_task}")
             logger.info(f"Extract page content: {extract_page_content}")
+            logger.info(f"Validate output: {validate_output}")
             
             # Register actions after setting is_interactive
             self._register_actions()
@@ -141,12 +140,15 @@ class WebAgent:
             if self.is_interactive:
                 prompt = f"{prompt}\n\nNote: This task is running in interactive mode. You can ask the user questions using the 'Ask user for input' action when you need additional information."
             
-            self.task = prompt  # Store the task after prompt is potentially modified
-            
-            await self.setup()  # Setup after we have the task
-            
-            # Run the agent with max_steps based on complexity
+            # Create task
+            self.task = prompt
+
+            # Initialize browser and controller
+            await self.setup(validate_output)
+
+            # Set max_steps based on task complexity
             max_steps = 100 if is_complex_task else 25
+            
             logger.info(f"Running agent with max_steps={max_steps} (Complex Task: {is_complex_task})")
             result = await self.agent.run(max_steps=max_steps)
             
@@ -624,7 +626,7 @@ class WebAgent:
             downloads_path = get_downloads_path(user_id=self.user_id)
         return downloads_path
         
-    async def setup(self):
+    async def setup(self, validate_output=False):
         """Initialize the browser instance"""
         if not self.task:
             raise ValueError("Task must be set before setup")
@@ -644,7 +646,7 @@ class WebAgent:
         if cookies_path:
             logger.info(f"Using cookies file for user {self.user_id}: {cookies_path}")
         logger.info(f"Using downloads path: {downloads_path}")
-
+        
         # Get headless mode from environment variable, default to False if not set
         headless = os.getenv('BROWSER_HEADLESS', 'true').lower() == 'true'
         
@@ -655,7 +657,7 @@ class WebAgent:
             
         browser_config = BrowserConfig(new_context_config=context_config, headless=headless)
         self.browser = Browser(config=browser_config)
-
+        
         # Get all credentials for log filtering
         if self.user_id:
             try:
@@ -705,7 +707,8 @@ class WebAgent:
             use_vision=global_use_vision,
             max_failures=5,  # Increase max retries
             retry_delay=60,   # retry delay in seconds
-            generate_gif=self.generate_gif  # Pass GIF path from task_monitor
+            generate_gif=self.generate_gif,  # Pass GIF path from task_monitor
+            validate_output=validate_output  # Pass validate_output parameter
         )
 
     async def cleanup(self):
@@ -796,6 +799,7 @@ async def main():
     parser.add_argument('--run_user_id', help='ID of the user who ran the task if different from owner')
     parser.add_argument('--is_complex_task', action='store_true', help='Enable complex task mode with 100 steps')
     parser.add_argument('--extract-page-content', action='store_true', help='Extract page content as JSON files')
+    parser.add_argument('--validate-output', action='store_true', help='Validate output from the agent')
     args = parser.parse_args()
 
     # Read prompt from file
@@ -820,7 +824,8 @@ async def main():
             task_id=args.task_id,
             generate_gif=args.gif_path,
             is_complex_task=args.is_complex_task,
-            extract_page_content=args.extract_page_content
+            extract_page_content=args.extract_page_content,
+            validate_output=args.validate_output
         )
         print(json.dumps(result))
         sys.exit(0 if result["success"] else 1)

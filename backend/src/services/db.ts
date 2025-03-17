@@ -281,11 +281,12 @@ export const taskDb = {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Tasks`,
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, #epc',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, #epc, #vo',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
-          '#epc': 'extractPageContent'
+          '#epc': 'extractPageContent',
+          '#vo': 'validateOutput'
         }
       };
 
@@ -323,13 +324,14 @@ export const taskDb = {
         ExpressionAttributeValues: {
           ':userId': userId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
           '#e': 'error',
           '#sum': 'summary',
-          '#epc': 'extractPageContent'
+          '#epc': 'extractPageContent',
+          '#vo': 'validateOutput'
         }
       };
 
@@ -367,7 +369,7 @@ export const taskDb = {
         Key: {
           taskId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
@@ -378,7 +380,8 @@ export const taskDb = {
           '#dr': 'isDeepResearch',
           '#llm': 'llmName',
           '#ct': 'isComplexTask',
-          '#epc': 'extractPageContent'
+          '#epc': 'extractPageContent',
+          '#vo': 'validateOutput'
         }
       };
 
@@ -400,6 +403,7 @@ export const taskDb = {
     isDeepResearch: boolean;
     isComplexTask: boolean;
     extractPageContent: boolean;
+    validateOutput: boolean;
     llmName: string;
     attachments: TaskAttachment[];
   }>) {
@@ -425,9 +429,13 @@ export const taskDb = {
         ReturnValues: 'ALL_NEW'
       };
 
+      console.log('DynamoDB update params:', JSON.stringify(params, null, 2));
+
       const result = await dynamodb.update(params).promise();
+      console.log('DynamoDB update result:', result);
       return result.Attributes;
     } catch (error) {
+      console.error('Error in updateTask:', error);
       handleDynamoDbError(error, 'updateTask');
     }
   },

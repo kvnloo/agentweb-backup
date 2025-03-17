@@ -229,6 +229,10 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
       updates.extractPageContent = Boolean(req.body.extractPageContent);
     }
 
+    if (req.body.validateOutput !== undefined) {
+      updates.validateOutput = Boolean(req.body.validateOutput);
+    }
+
     if (req.body.llmName !== undefined) {
       updates.llmName = req.body.llmName || null;  // Convert empty string to null
     }

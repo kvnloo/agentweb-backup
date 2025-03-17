@@ -62,6 +62,7 @@ interface Task {
   isDeepResearch?: boolean;
   isComplexTask?: boolean;
   extractPageContent?: boolean;  // New flag for extracting page content
+  validateOutput?: boolean;  // Flag for validating agent output
   llmName?: string;
   attachments?: TaskAttachment[];
 }
@@ -574,10 +575,11 @@ export default function TaskDetails() {
           updateData.emailNotification = true;
         }
         
-        // Disable interactive mode, complex task, and extract page content
+        // Disable interactive mode, complex task, extract page content, and validate output
         updateData.isInteractive = false;
         updateData.isComplexTask = false;
         updateData.extractPageContent = false;
+        updateData.validateOutput = false;
       }
       
       // Reset LLM selection when toggling deep research mode
@@ -657,6 +659,36 @@ export default function TaskDetails() {
       setTask(taskResponse.data);
     } catch (error) {
       console.error('Error updating task:', error);
+    }
+  };
+
+  const handleValidateOutputToggle = async () => {
+    try {
+      console.log('Toggling validateOutput from', task?.validateOutput, 'to', !task?.validateOutput);
+      
+      const response = await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        { validateOutput: !task?.validateOutput },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      
+      console.log('Validate output toggle response:', response.data);
+
+      // Update the task state with the response from the server
+      const taskResponse = await axios.get(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+      
+      console.log('Get task after toggle:', taskResponse.data);
+      console.log('validateOutput in response:', taskResponse.data.validateOutput);
+      
+      setTask(taskResponse.data);
+    } catch (error) {
+      console.error('Error updating validateOutput setting:', error);
+      setError('Failed to update Validate Output setting');
     }
   };
 
@@ -1132,6 +1164,20 @@ export default function TaskDetails() {
                         />
                       }
                       label="Extract Page Content"
+                      sx={{ mt: 1, opacity: Boolean(task.isDeepResearch) ? 0.5 : 1 }}
+                    />
+                  </Tooltip>
+                  <Tooltip title="When enabled, the agent will validate its output to ensure accuracy">
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          checked={task?.validateOutput || false}
+                          onChange={handleValidateOutputToggle}
+                          disabled={loading || Boolean(task.isDeepResearch)}
+                          color="primary"
+                        />
+                      }
+                      label="Validate Output"
                       sx={{ mt: 1, opacity: Boolean(task.isDeepResearch) ? 0.5 : 1 }}
                     />
                   </Tooltip>
