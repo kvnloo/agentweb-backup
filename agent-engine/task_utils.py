@@ -668,4 +668,41 @@ Your response should be in the format:
         
     except Exception as e:
         logger.error(f"Error checking for new information: {e}")
-        return False, None 
+        return False, None
+
+def extract_json_from_content(content_list: List[str]) -> List[Dict[str, Any]]:
+    """Extract JSON objects from the extracted content
+    
+    Args:
+        content_list: List of content strings to extract JSON from
+        
+    Returns:
+        List[Dict[str, Any]]: List of extracted JSON objects
+    """
+    import re
+    import json
+    import logging
+    
+    json_objects = []
+    
+    if not isinstance(content_list, list):
+        # If content_list is not a list, convert it to a list with a single item
+        content_list = [content_list]
+        
+    for content in content_list:
+        if not content or not isinstance(content, str):
+            continue
+            
+        # Only extract JSON from code blocks with ```json marker
+        if "```json" in content:
+            # Extract the JSON part from code blocks
+            json_matches = re.findall(r'```json\s*(.*?)\s*```', content, re.DOTALL)
+            for json_str in json_matches:
+                try:
+                    json_obj = json.loads(json_str)
+                    json_objects.append(json_obj)
+                except json.JSONDecodeError:
+                    logging.error(f"Failed to parse JSON from code block: {json_str[:100]}...")
+        # Skip direct JSON parsing if ```json marker doesn't exist
+                
+    return json_objects 

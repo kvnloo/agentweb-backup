@@ -3,7 +3,9 @@ import argparse
 import json
 import sys
 import os
-from typing import Dict, Any, Optional
+import re
+import uuid
+from typing import Dict, Any, Optional, List
 import browser_use
 from browser_use import Agent, Controller
 from browser_use.browser.browser import Browser, BrowserConfig
@@ -25,7 +27,7 @@ import aiohttp
 import base64  # Add at the top with other imports
 import boto3  # Add at the top with other imports
 from urllib.parse import quote
-from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format
+from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content
 # Load environment variables
 load_dotenv()
 
@@ -112,7 +114,7 @@ class WebAgent:
             handler.close()
         self._log_handlers.clear()
 
-    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False) -> Dict[str, Any]:
+    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
         log_file = None
         try:
@@ -125,6 +127,12 @@ class WebAgent:
             if execution_id:
                 log_file = self.setup_execution_logging(execution_id)
                 logger.info(f"Logging setup complete. Logs will be written to {log_file}")
+            
+            logger.info(f"Executing task with prompt: {prompt}")
+            logger.info(f"Task ID: {task_id}, Execution ID: {execution_id}")
+            logger.info(f"Interactive mode: {is_interactive}")
+            logger.info(f"Complex task mode: {is_complex_task}")
+            logger.info(f"Extract page content: {extract_page_content}")
             
             # Register actions after setting is_interactive
             self._register_actions()
@@ -153,8 +161,39 @@ class WebAgent:
             
             # If task completed successfully, check for downloaded files
             result_files = []
-            if task_is_done and self.current_execution_id:
-                downloads_path = get_downloads_path(user_id=self.user_id, execution_id=self.current_execution_id)
+            downloads_path = self._get_downloads_path()
+            
+            # Extract JSON content if enabled
+            if extract_page_content and task_is_done:
+                logger.info("Extract page content flag is enabled, extracting JSON objects...")
+                # Use history.extracted_content() to get all extracted content
+                all_content = result.extracted_content()
+                
+                json_objects = extract_json_from_content(all_content)
+                
+                if json_objects:
+                    # Create downloads directory if it doesn't exist
+                    downloads_path = Path(downloads_path)
+                    downloads_path.mkdir(parents=True, exist_ok=True)
+                    
+                    # Save each JSON object to a file with a random name
+                    json_files = []
+                    for json_obj in json_objects:
+                        # Generate a random filename
+                        random_name = f"extracted_{uuid.uuid4().hex[:8]}.json"
+                        file_path = downloads_path / random_name
+                        
+                        # Save the JSON object to the file
+                        with open(file_path, 'w') as f:
+                            json.dump(json_obj, f, indent=2)
+                        
+                        json_files.append(str(file_path))
+                    
+                    logger.info(f"Extracted and saved {len(json_files)} JSON files")
+                else:
+                    logger.info("No JSON objects found in the extracted content")
+
+            if self.current_execution_id:
                 result_files = upload_task_result_files(downloads_path, self.current_execution_id)
             
             return {
@@ -165,6 +204,8 @@ class WebAgent:
             }
         except Exception as e:
             logger.error(f"Error in execute_task: {e}")
+            # Clean up
+            await self.cleanup()
             return {
                 "success": False,
                 "error": str(e),
@@ -748,6 +789,7 @@ async def main():
     parser.add_argument('--interactive', action='store_true', help='Enable interactive mode')
     parser.add_argument('--run_user_id', help='ID of the user who ran the task if different from owner')
     parser.add_argument('--is_complex_task', action='store_true', help='Enable complex task mode with 100 steps')
+    parser.add_argument('--extract-page-content', action='store_true', help='Extract page content as JSON files')
     args = parser.parse_args()
 
     # Read prompt from file
@@ -771,7 +813,8 @@ async def main():
             is_interactive=args.interactive,
             task_id=args.task_id,
             generate_gif=args.gif_path,
-            is_complex_task=args.is_complex_task
+            is_complex_task=args.is_complex_task,
+            extract_page_content=args.extract_page_content
         )
         print(json.dumps(result))
         sys.exit(0 if result["success"] else 1)

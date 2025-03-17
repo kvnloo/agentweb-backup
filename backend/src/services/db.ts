@@ -77,6 +77,7 @@ interface TaskTemplate {
   isInteractive: boolean;
   isDeepResearch: boolean;
   isComplexTask?: boolean;
+  extractPageContent?: boolean;
   published: boolean;
   createdAt: string;
   updatedAt: string;
@@ -259,6 +260,7 @@ export const taskDb = {
     isInteractive?: boolean;
     isDeepResearch?: boolean;
     isComplexTask?: boolean;
+    extractPageContent?: boolean;
     emailNotification?: boolean;
     attachments?: TaskAttachment[];
   }) {
@@ -279,10 +281,11 @@ export const taskDb = {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Tasks`,
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, #epc',
         ExpressionAttributeNames: {
           '#n': 'name',
-          '#s': 'status'
+          '#s': 'status',
+          '#epc': 'extractPageContent'
         }
       };
 
@@ -320,12 +323,13 @@ export const taskDb = {
         ExpressionAttributeValues: {
           ':userId': userId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
           '#e': 'error',
-          '#sum': 'summary'
+          '#sum': 'summary',
+          '#epc': 'extractPageContent'
         }
       };
 
@@ -363,7 +367,7 @@ export const taskDb = {
         Key: {
           taskId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
@@ -373,7 +377,8 @@ export const taskDb = {
           '#i': 'isInteractive',
           '#dr': 'isDeepResearch',
           '#llm': 'llmName',
-          '#ct': 'isComplexTask'
+          '#ct': 'isComplexTask',
+          '#epc': 'extractPageContent'
         }
       };
 
@@ -394,6 +399,7 @@ export const taskDb = {
     isInteractive: boolean;
     isDeepResearch: boolean;
     isComplexTask: boolean;
+    extractPageContent: boolean;
     llmName: string;
     attachments: TaskAttachment[];
   }>) {

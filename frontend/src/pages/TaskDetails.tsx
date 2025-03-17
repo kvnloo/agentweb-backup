@@ -41,6 +41,7 @@ import EditIcon from '@mui/icons-material/Edit';
 import SaveIcon from '@mui/icons-material/Save';
 import CancelIcon from '@mui/icons-material/Cancel';
 import ScreenshotIcon from '@mui/icons-material/Screenshot';
+import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
 import { styled } from '@mui/material/styles';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
@@ -61,6 +62,7 @@ interface Task {
   isInteractive?: boolean;
   isDeepResearch?: boolean;
   isComplexTask?: boolean;
+  extractPageContent?: boolean;  // New flag for extracting page content
   llmName?: string;
   attachments?: TaskAttachment[];
 }
@@ -636,6 +638,28 @@ export default function TaskDetails() {
     }
   };
 
+  const handleExtractPageContentToggle = async () => {
+    try {
+      await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        { extractPageContent: !task?.extractPageContent },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      // Update the task state with the response from the server
+      const taskResponse = await axios.get(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+      
+      setTask(taskResponse.data);
+    } catch (error) {
+      console.error('Error updating task:', error);
+    }
+  };
+
   const handleFeedbackChange = async (executionId: string, feedback: 'accepted' | 'rejected' | null) => {
     try {
       await axios.put(
@@ -1096,6 +1120,19 @@ export default function TaskDetails() {
                       }
                       label="Complex Task"
                       sx={{ opacity: Boolean(task.isDeepResearch) ? 0.5 : 1 }}
+                    />
+                  </Tooltip>
+                  <Tooltip title="When enabled, the agent will extract structured content from web pages and save it as JSON files">
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          checked={task?.extractPageContent || false}
+                          onChange={handleExtractPageContentToggle}
+                          disabled={loading}
+                        />
+                      }
+                      label="Extract Page Content"
+                      sx={{ mt: 1 }}
                     />
                   </Tooltip>
                 </Box>
