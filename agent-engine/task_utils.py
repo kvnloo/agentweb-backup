@@ -5,6 +5,8 @@ import boto3
 import random
 import logging
 import sys
+import json
+import hashlib
 from urllib.parse import quote
 from aws_utils import get_dynamodb_resource, get_s3_client, get_bedrock_client
 from pydantic import SecretStr
@@ -19,6 +21,24 @@ TABLE_PREFIX = 'Dev-' if os.getenv('NODE_ENV') == 'development' else ''
 
 # Global variable for vision support
 global_use_vision = True
+
+def generate_content_hash(content: Any) -> str:
+    """Generate a hash of the content to use as a filename.
+    
+    This function converts the content to a sorted, normalized JSON string
+    and then generates an MD5 hash of that string. This ensures that identical
+    content will always produce the same hash, preventing duplicate files.
+    
+    Args:
+        content: The content to hash (typically a JSON object)
+        
+    Returns:
+        A 16-character hexadecimal hash string
+    """
+    # Convert the content to a sorted, normalized string to ensure consistent hashing
+    content_str = json.dumps(content, sort_keys=True)
+    # Generate a hash of the content
+    return hashlib.md5(content_str.encode('utf-8')).hexdigest()[:16]
 
 def get_downloads_path(user_id: Optional[str] = None, execution_id: Optional[str] = None) -> str:
     """Get the downloads path for storing task outputs
@@ -300,6 +320,21 @@ def upload_task_result_files(downloads_path: str, execution_id: str) -> List[Dic
     
     if downloads_dir.exists():
         try:
+            # Check if there are already uploaded files for this execution
+            existing_files = []
+            try:
+                table = get_dynamodb_resource().Table(f'{TABLE_PREFIX}AW-TaskExecutions')
+                response = table.get_item(Key={'executionId': execution_id})
+                if 'Item' in response and 'result_files' in response['Item']:
+                    existing_files = response['Item']['result_files']
+                    logger.info(f"Found {len(existing_files)} previously uploaded files for execution {execution_id}")
+            except Exception as e:
+                logger.error(f"Error checking for existing files: {e}")
+                # Continue with empty existing_files list
+            
+            # Extract existing filenames for quick lookup
+            existing_filenames = {file_info.get('filename'): file_info for file_info in existing_files}
+            
             # Generate a random token for this batch of files
             random_token = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=20))
             s3_client = get_s3_client()
@@ -330,9 +365,17 @@ def upload_task_result_files(downloads_path: str, execution_id: str) -> List[Dic
                 '.pdf': {'content_type': 'application/pdf', 'view_type': 'pdf'},
             }
             
+            # First, add all existing files to the result_files list
+            result_files.extend(existing_files)
+            
             for file_path in downloads_dir.glob('*'):
                 if file_path.is_file():
                     try:
+                        # Check if this file has already been uploaded
+                        if file_path.name in existing_filenames:
+                            logger.info(f"File {file_path.name} already uploaded, skipping")
+                            continue
+                        
                         # Upload file to S3 with random token in path
                         s3_key = f"task_results/{execution_id}/{random_token}/{file_path.name}"
                         
@@ -671,7 +714,12 @@ Your response should be in the format:
         return False, None
 
 def extract_json_from_content(content_list: List[str]) -> List[Dict[str, Any]]:
-    """Extract JSON objects from the extracted content
+    """Extract JSON objects from content that contains ```json code blocks.
+    
+    This function specifically looks for JSON blocks that start with ```json.
+    It handles both complete blocks (ending with ```) and truncated blocks.
+    For truncated blocks, it attempts to find the last valid closing brace
+    and completes the JSON structure.
     
     Args:
         content_list: List of content strings to extract JSON from
@@ -681,7 +729,6 @@ def extract_json_from_content(content_list: List[str]) -> List[Dict[str, Any]]:
     """
     import re
     import json
-    import logging
     
     json_objects = []
     
@@ -693,16 +740,167 @@ def extract_json_from_content(content_list: List[str]) -> List[Dict[str, Any]]:
         if not content or not isinstance(content, str):
             continue
             
-        # Only extract JSON from code blocks with ```json marker
-        if "```json" in content:
-            # Extract the JSON part from code blocks
-            json_matches = re.findall(r'```json\s*(.*?)\s*```', content, re.DOTALL)
-            for json_str in json_matches:
-                try:
-                    json_obj = json.loads(json_str)
-                    json_objects.append(json_obj)
-                except json.JSONDecodeError:
-                    logging.error(f"Failed to parse JSON from code block: {json_str[:100]}...")
-        # Skip direct JSON parsing if ```json marker doesn't exist
+        # Find all blocks that start with ```json
+        # This pattern captures everything after ```json until the end of the string
+        # or until the next ``` marker
+        json_blocks = re.findall(r'```json\s*(.*?)(?:```|$)', content, re.DOTALL)
+        
+        for json_str in json_blocks:
+            try:
+                # Try to parse as is first
+                json_obj = json.loads(json_str)
+                json_objects.append(json_obj)
+                logger.info("Successfully parsed complete JSON block")
+            except json.JSONDecodeError:
+                # If parsing fails, assume it might be truncated
+                logger.info("JSON parsing failed, attempting to fix truncated JSON")
                 
+                # Determine if it's an object or array
+                is_array = json_str.strip().startswith('[')
+                
+                if is_array:
+                    # Handle truncated array
+                    try:
+                        # Find the last complete object in the array
+                        last_brace_index = json_str.rfind('}')
+                        if last_brace_index != -1:
+                            # Extract up to the last closing brace and add closing bracket
+                            fixed_json = json_str[:last_brace_index+1] + ']'
+                            json_obj = json.loads(fixed_json)
+                            json_objects.append(json_obj)
+                            logger.info("Successfully extracted truncated JSON array")
+                        else:
+                            logger.warning("Could not find a complete object in the truncated array")
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"Failed to extract truncated JSON array: {e}")
+                else:
+                    # Handle truncated object
+                    try:
+                        # Check if this is an object with a nested array that's truncated
+                        array_pattern = r'"([^"]+)"\s*:\s*\[\s*{.*'
+                        array_matches = re.findall(array_pattern, json_str, re.DOTALL)
+                        
+                        if array_matches:
+                            # This is an object with a truncated array
+                            array_key = array_matches[0]
+                            
+                            # Find the last complete object in the array
+                            # First, find the array start
+                            array_start = json_str.find('[', json_str.find(array_key))
+                            
+                            # Find all complete objects in the array
+                            objects_in_array = []
+                            open_braces = 0
+                            start_pos = None
+                            
+                            for i in range(array_start + 1, len(json_str)):
+                                if json_str[i] == '{' and open_braces == 0:
+                                    start_pos = i
+                                    open_braces += 1
+                                elif json_str[i] == '{':
+                                    open_braces += 1
+                                elif json_str[i] == '}':
+                                    open_braces -= 1
+                                    if open_braces == 0 and start_pos is not None:
+                                        # Found a complete object
+                                        objects_in_array.append(json_str[start_pos:i+1])
+                                        start_pos = None
+                            
+                            if objects_in_array:
+                                # Reconstruct the JSON with the complete objects
+                                # First, get everything before the array
+                                prefix = json_str[:array_start+1]
+                                
+                                # Construct the fixed JSON
+                                fixed_json = prefix + ','.join(objects_in_array) + ']}'
+                                
+                                try:
+                                    json_obj = json.loads(fixed_json)
+                                    json_objects.append(json_obj)
+                                    logger.info("Successfully reconstructed object with truncated array")
+                                except json.JSONDecodeError:
+                                    # If that fails, try adding closing braces
+                                    open_count = fixed_json.count('{')
+                                    close_count = fixed_json.count('}')
+                                    
+                                    if open_count > close_count:
+                                        fixed_json += '}' * (open_count - close_count)
+                                        
+                                        try:
+                                            json_obj = json.loads(fixed_json)
+                                            json_objects.append(json_obj)
+                                            logger.info("Successfully fixed object with truncated array by adding closing braces")
+                                        except json.JSONDecodeError:
+                                            logger.warning("Failed to fix object with truncated array")
+                        else:
+                            # Regular truncated object without nested array
+                            # Find the last valid closing brace
+                            last_brace_index = json_str.rfind('}')
+                            if last_brace_index != -1:
+                                # Extract up to the last closing brace
+                                fixed_json = json_str[:last_brace_index+1]
+                                
+                                # Try to parse the fixed JSON
+                                try:
+                                    json_obj = json.loads(fixed_json)
+                                    json_objects.append(json_obj)
+                                    logger.info("Successfully extracted truncated JSON object")
+                                except json.JSONDecodeError:
+                                    # If direct parsing fails, try a more aggressive approach
+                                    # This handles cases where the JSON is truncated in the middle of a nested structure
+                                    
+                                    # Count opening and closing braces to find complete objects
+                                    open_count = fixed_json.count('{')
+                                    close_count = fixed_json.count('}')
+                                    
+                                    # If we have more opening braces than closing, we need to add closing braces
+                                    if open_count > close_count:
+                                        # Add missing closing braces
+                                        fixed_json += '}' * (open_count - close_count)
+                                        
+                                        try:
+                                            json_obj = json.loads(fixed_json)
+                                            json_objects.append(json_obj)
+                                            logger.info("Successfully extracted truncated JSON object with added closing braces")
+                                        except json.JSONDecodeError:
+                                            logger.warning("Failed to parse truncated JSON even with added closing braces")
+                                            
+                                            # If still failing, try to extract key properties
+                                            # Extract all complete key-value pairs
+                                            pattern = r'"([^"]+)"\s*:\s*("[^"]*"|null|true|false|\d+|\{[^}]*\})'
+                                            matches = list(re.finditer(pattern, json_str))
+                                            if matches:
+                                                # Reconstruct a valid JSON object with the properties we found
+                                                props = []
+                                                for match in matches:
+                                                    props.append(f'{match.group(0)}')
+                                                fixed_json = '{' + ','.join(props) + '}'
+                                                try:
+                                                    json_obj = json.loads(fixed_json)
+                                                    json_objects.append(json_obj)
+                                                    logger.info("Successfully reconstructed partial JSON object")
+                                                except json.JSONDecodeError:
+                                                    logger.warning("Failed to reconstruct partial JSON object")
+                            else:
+                                # If no complete object is found, try to extract what we can
+                                # Find the last property that has a complete value
+                                pattern = r'"([^"]+)"\s*:\s*("[^"]*"|null|true|false|\d+)'
+                                matches = list(re.finditer(pattern, json_str))
+                                if matches:
+                                    # Reconstruct a valid JSON object with the properties we found
+                                    props = []
+                                    for match in matches:
+                                        props.append(f'{match.group(0)}')
+                                    fixed_json = '{' + ','.join(props) + '}'
+                                    try:
+                                        json_obj = json.loads(fixed_json)
+                                        json_objects.append(json_obj)
+                                        logger.info("Successfully reconstructed partial JSON object")
+                                    except json.JSONDecodeError:
+                                        logger.warning("Failed to reconstruct partial JSON object")
+                                else:
+                                    logger.warning("Could not find any complete properties in the truncated object")
+                    except Exception as e:
+                        logger.warning(f"Failed to extract truncated JSON object: {e}")
+    
     return json_objects 

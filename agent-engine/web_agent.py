@@ -27,7 +27,7 @@ import aiohttp
 import base64  # Add at the top with other imports
 import boto3  # Add at the top with other imports
 from urllib.parse import quote
-from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content
+from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content, generate_content_hash
 # Load environment variables
 load_dotenv()
 
@@ -164,7 +164,7 @@ class WebAgent:
             downloads_path = self._get_downloads_path()
             
             # Extract JSON content if enabled
-            if extract_page_content and task_is_done:
+            if extract_page_content:
                 logger.info("Extract page content flag is enabled, extracting JSON objects...")
                 # Use history.extracted_content() to get all extracted content
                 all_content = result.extracted_content()
@@ -176,12 +176,18 @@ class WebAgent:
                     downloads_path = Path(downloads_path)
                     downloads_path.mkdir(parents=True, exist_ok=True)
                     
-                    # Save each JSON object to a file with a random name
+                    # Save each JSON object to a file with a hash of its content as the filename
                     json_files = []
                     for json_obj in json_objects:
-                        # Generate a random filename
-                        random_name = f"extracted_{uuid.uuid4().hex[:8]}.json"
-                        file_path = downloads_path / random_name
+                        # Generate a filename based on content hash
+                        content_hash = generate_content_hash(json_obj)
+                        file_path = downloads_path / f"extracted_{content_hash}.json"
+                        
+                        # Skip if a file with this hash already exists (same content)
+                        if file_path.exists():
+                            logger.info(f"File with hash {content_hash} already exists, skipping duplicate content")
+                            json_files.append(str(file_path))
+                            continue
                         
                         # Save the JSON object to the file
                         with open(file_path, 'w') as f:

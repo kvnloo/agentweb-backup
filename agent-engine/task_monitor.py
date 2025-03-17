@@ -761,9 +761,10 @@ async def execute_task(execution):
                 else:
                     # Run WebAgent via CLI for non-deep-research tasks
                     try:
-                        # Set timeout from environment or default to 15 minutes
-                        timeout_seconds = int(os.getenv('TASK_EXECUTION_TIMEOUT_SECONDS', '900'))
-                        logger.info(f"Running web agent with timeout of {timeout_seconds} seconds")
+                        # Set timeout based on task complexity - 30 minutes for complex tasks, 15 minutes for regular tasks
+                        is_complex = bool(task.get('isComplexTask', False)) if task else False
+                        timeout_seconds = int(os.getenv('COMPLEX_TASK_EXECUTION_TIMEOUT_SECONDS', '1800')) if is_complex else int(os.getenv('TASK_EXECUTION_TIMEOUT_SECONDS', '900'))
+                        logger.info(f"Running web agent with timeout of {timeout_seconds} seconds (Complex task: {is_complex})")
                         
                         # Create a task for running the web agent
                         web_agent_task = asyncio.create_task(
@@ -776,7 +777,7 @@ async def execute_task(execution):
                                 task_id,
                                 gif_path,
                                 run_user_id,
-                                bool(task.get('isComplexTask', False)) if task else False,
+                                is_complex,
                                 bool(task.get('extractPageContent', False)) if task else False
                             )
                         )
