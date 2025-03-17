@@ -575,10 +575,11 @@ export default function TaskDetails() {
           updateData.emailNotification = true;
         }
         
-        // Disable interactive mode, complex task, and extract page content
+        // Disable interactive mode, complex task, extract page content, and validate output
         updateData.isInteractive = false;
         updateData.isComplexTask = false;
         updateData.extractPageContent = false;
+        updateData.validateOutput = false;
       }
       
       // Reset LLM selection when toggling deep research mode
@@ -1173,6 +1174,7 @@ export default function TaskDetails() {
                           checked={task?.validateOutput || false}
                           onChange={handleValidateOutputToggle}
                           disabled={loading || Boolean(task.isDeepResearch)}
+                          color="primary"
                         />
                       }
                       label="Validate Output"
