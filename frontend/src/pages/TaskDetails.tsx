@@ -1395,43 +1395,43 @@ export default function TaskDetails() {
                                 <CollapsibleText text={execution.error} />
                               </Box>
                             ) : (
-                              <>
-                                <CollapsibleText text={execution.result || '-'} />
-                                {execution.result_files && execution.result_files.length > 0 && (
-                                  <Box mt={1}>
-                                    <Typography variant="subtitle2" color="textSecondary">
-                                      Result Files:
-                                    </Typography>
-                                    <Box display="flex" gap={1} flexWrap="wrap">
-                                      {execution.result_files.map((file, index) => (
-                                        <Chip
-                                          key={index}
-                                          label={truncateFilename(file.filename)}
-                                          component="a"
-                                          href={file.url}
-                                          target="_blank"
-                                          rel="noopener noreferrer"
-                                          clickable
-                                          color="primary"
-                                          variant="outlined"
-                                          size="small"
-                                          sx={{ mt: 1 }}
-                                          icon={file.is_html ? <ScreenshotIcon fontSize="small" /> : undefined}
-                                        />
-                                      ))}
-                                    </Box>
-                                  </Box>
-                                )}
-                              </>
+                              <CollapsibleText text={execution.result || '-'} />
                             )}
-                            <Link
-                              component="button"
-                              variant="body2"
-                              onClick={() => navigate(`/tasks/${taskId}/executions/${execution.executionId}`)}
-                              sx={{ mt: 1, display: 'block' }}
-                             >
-                               View Full Details
-                            </Link>
+                            {execution.result_files && execution.result_files.length > 0 && (
+                              <Box mt={1}>
+                                <Typography variant="subtitle2" color="textSecondary">
+                                  Result Files:
+                                </Typography>
+                                <Box display="flex" gap={1} flexWrap="wrap">
+                                  {execution.result_files.map((file, index) => (
+                                    <Chip
+                                      key={index}
+                                      label={truncateFilename(file.filename)}
+                                      component="a"
+                                      href={file.url}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      clickable
+                                      color="primary"
+                                      variant="outlined"
+                                      size="small"
+                                      sx={{ mt: 1 }}
+                                      icon={file.is_html ? <ScreenshotIcon fontSize="small" /> : undefined}
+                                    />
+                                  ))}
+                                </Box>
+                              </Box>
+                            )}
+                            <Box sx={{ mt: 1 }}>
+                              <Link
+                                component="button"
+                                variant="body2"
+                                onClick={() => navigate(`/tasks/${taskId}/executions/${execution.executionId}`)}
+                                sx={{ display: 'block' }}
+                              >
+                                View Full Details
+                              </Link>
+                            </Box>
                           </Box>
                         )}
                       </TableCell>
