@@ -25,7 +25,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const { name, prompt, isInteractive, isDeepResearch, emailNotification, templateId, parameterValues, isComplexTask } = req.body;
+    const { name, prompt, isInteractive, isDeepResearch, emailNotification, templateId, parameterValues, isComplexTask, extractPageContent } = req.body;
     
     // If templateId is provided, fetch the template and use its values
     if (templateId) {
@@ -76,13 +76,15 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           taskId: Date.now().toString(),
           userId,
           name: finalName,
-          prompt: prompt || finalPrompt,
+          prompt: finalPrompt || prompt,
           status: 'active',
           emailNotification: finalEmailNotification,
           isInteractive: isInteractive !== undefined ? Boolean(isInteractive) : template.isInteractive,
           isDeepResearch: isDeepResearch !== undefined ? Boolean(isDeepResearch) : template.isDeepResearch,
           isComplexTask: isComplexTask !== undefined ? Boolean(isComplexTask) : template.isComplexTask,
-          createdAt: new Date().toISOString()
+          extractPageContent: extractPageContent !== undefined ? Boolean(extractPageContent) : template.extractPageContent,
+          createdAt: new Date().toISOString(),
+          llmName: req.body.llmName || null
         };
 
         const createdTask = await taskDb.createTask(task);
@@ -108,7 +110,9 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       isInteractive: Boolean(isInteractive),  // Convert to boolean
       isDeepResearch: Boolean(isDeepResearch),  // Convert to boolean
       isComplexTask: Boolean(isComplexTask),  // Convert to boolean
-      createdAt: new Date().toISOString()
+      extractPageContent: extractPageContent ?? isDeepResearch,  // Convert to boolean
+      createdAt: new Date().toISOString(),
+      llmName: req.body.llmName || null
     };
 
     const createdTask = await taskDb.createTask(task);
@@ -219,6 +223,10 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
 
     if (req.body.isComplexTask !== undefined) {
       updates.isComplexTask = Boolean(req.body.isComplexTask);
+    }
+
+    if (req.body.extractPageContent !== undefined) {
+      updates.extractPageContent = Boolean(req.body.extractPageContent);
     }
 
     if (req.body.llmName !== undefined) {

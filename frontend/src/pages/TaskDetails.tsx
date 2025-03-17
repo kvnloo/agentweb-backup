@@ -61,6 +61,7 @@ interface Task {
   isInteractive?: boolean;
   isDeepResearch?: boolean;
   isComplexTask?: boolean;
+  extractPageContent?: boolean;  // New flag for extracting page content
   llmName?: string;
   attachments?: TaskAttachment[];
 }
@@ -573,9 +574,10 @@ export default function TaskDetails() {
           updateData.emailNotification = true;
         }
         
-        // Disable interactive mode and complex task
+        // Disable interactive mode, complex task, and extract page content
         updateData.isInteractive = false;
         updateData.isComplexTask = false;
+        updateData.extractPageContent = false;
       }
       
       // Reset LLM selection when toggling deep research mode
@@ -633,6 +635,28 @@ export default function TaskDetails() {
     } catch (error: any) {
       console.error('Error updating complex task mode:', error);
       setError(error.response?.data?.message || 'Failed to update complex task mode');
+    }
+  };
+
+  const handleExtractPageContentToggle = async () => {
+    try {
+      await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        { extractPageContent: !task?.extractPageContent },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      // Update the task state with the response from the server
+      const taskResponse = await axios.get(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+      
+      setTask(taskResponse.data);
+    } catch (error) {
+      console.error('Error updating task:', error);
     }
   };
 
@@ -1098,6 +1122,19 @@ export default function TaskDetails() {
                       sx={{ opacity: Boolean(task.isDeepResearch) ? 0.5 : 1 }}
                     />
                   </Tooltip>
+                  <Tooltip title="When enabled, the agent will extract structured content from web pages and save it as JSON files">
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          checked={task?.extractPageContent || false}
+                          onChange={handleExtractPageContentToggle}
+                          disabled={loading || Boolean(task.isDeepResearch)}
+                        />
+                      }
+                      label="Extract Page Content"
+                      sx={{ mt: 1, opacity: Boolean(task.isDeepResearch) ? 0.5 : 1 }}
+                    />
+                  </Tooltip>
                 </Box>
                 <Tooltip title={
                   <div>
@@ -1357,43 +1394,43 @@ export default function TaskDetails() {
                                 <CollapsibleText text={execution.error} />
                               </Box>
                             ) : (
-                              <>
-                                <CollapsibleText text={execution.result || '-'} />
-                                {execution.result_files && execution.result_files.length > 0 && (
-                                  <Box mt={1}>
-                                    <Typography variant="subtitle2" color="textSecondary">
-                                      Result Files:
-                                    </Typography>
-                                    <Box display="flex" gap={1} flexWrap="wrap">
-                                      {execution.result_files.map((file, index) => (
-                                        <Chip
-                                          key={index}
-                                          label={truncateFilename(file.filename)}
-                                          component="a"
-                                          href={file.url}
-                                          target="_blank"
-                                          rel="noopener noreferrer"
-                                          clickable
-                                          color="primary"
-                                          variant="outlined"
-                                          size="small"
-                                          sx={{ mt: 1 }}
-                                          icon={file.is_html ? <ScreenshotIcon fontSize="small" /> : undefined}
-                                        />
-                                      ))}
-                                    </Box>
-                                  </Box>
-                                )}
-                              </>
+                              <CollapsibleText text={execution.result || '-'} />
                             )}
-                            <Link
-                              component="button"
-                              variant="body2"
-                              onClick={() => navigate(`/tasks/${taskId}/executions/${execution.executionId}`)}
-                              sx={{ mt: 1, display: 'block' }}
-                             >
-                               View Full Details
-                            </Link>
+                            {execution.result_files && execution.result_files.length > 0 && (
+                              <Box mt={1}>
+                                <Typography variant="subtitle2" color="textSecondary">
+                                  Result Files:
+                                </Typography>
+                                <Box display="flex" gap={1} flexWrap="wrap">
+                                  {execution.result_files.map((file, index) => (
+                                    <Chip
+                                      key={index}
+                                      label={truncateFilename(file.filename)}
+                                      component="a"
+                                      href={file.url}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      clickable
+                                      color="primary"
+                                      variant="outlined"
+                                      size="small"
+                                      sx={{ mt: 1 }}
+                                      icon={file.is_html ? <ScreenshotIcon fontSize="small" /> : undefined}
+                                    />
+                                  ))}
+                                </Box>
+                              </Box>
+                            )}
+                            <Box sx={{ mt: 1 }}>
+                              <Link
+                                component="button"
+                                variant="body2"
+                                onClick={() => navigate(`/tasks/${taskId}/executions/${execution.executionId}`)}
+                                sx={{ display: 'block' }}
+                              >
+                                View Full Details
+                              </Link>
+                            </Box>
                           </Box>
                         )}
                       </TableCell>
