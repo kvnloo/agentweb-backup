@@ -406,7 +406,7 @@ def update_workflow_execution(workflow_execution_id: str, task_id: str, task_sta
         logger.error(f"Error updating workflow execution: {e}")
         return False
 
-async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str, run_user_id: str = None, is_complex_task: bool = False, extract_page_content: bool = False) -> Dict[str, Any]:
+async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str, run_user_id: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False) -> Dict[str, Any]:
     """Run the web agent with the given parameters"""
     process = None
     try:
@@ -441,6 +441,8 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
             cmd.append('--is_complex_task')
         if extract_page_content:
             cmd.append('--extract-page-content')
+        if validate_output:
+            cmd.append('--validate-output')
         
         # Run command with output redirection
         logger.info(f"Running command: {' '.join(cmd)}")
@@ -778,7 +780,8 @@ async def execute_task(execution):
                                 gif_path,
                                 run_user_id,
                                 is_complex,
-                                bool(task.get('extractPageContent', False)) if task else False
+                                bool(task.get('extractPageContent', False)) if task else False,
+                                bool(task.get('validateOutput', False)) if task else False
                             )
                         )
                         
