@@ -575,9 +575,10 @@ export default function TaskDetails() {
           updateData.emailNotification = true;
         }
         
-        // Disable interactive mode and complex task
+        // Disable interactive mode, complex task, and extract page content
         updateData.isInteractive = false;
         updateData.isComplexTask = false;
+        updateData.extractPageContent = false;
       }
       
       // Reset LLM selection when toggling deep research mode
@@ -1128,11 +1129,11 @@ export default function TaskDetails() {
                         <Switch
                           checked={task?.extractPageContent || false}
                           onChange={handleExtractPageContentToggle}
-                          disabled={loading}
+                          disabled={loading || Boolean(task.isDeepResearch)}
                         />
                       }
                       label="Extract Page Content"
-                      sx={{ mt: 1 }}
+                      sx={{ mt: 1, opacity: Boolean(task.isDeepResearch) ? 0.5 : 1 }}
                     />
                   </Tooltip>
                 </Box>
