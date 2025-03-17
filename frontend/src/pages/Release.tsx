@@ -7,6 +7,15 @@ interface Release {
 
 const releases: Release[] = [
   {
+    date: "2025-03-17",
+    changes: [
+      "Added Extract Page Content option on Task Details page",
+      "- Contents on pages can be extracted and saved as JSON files for download",
+      "- Enable this option to automatically extract structured data from web pages",
+      "Bug fixes"
+    ]
+  },
+  {
     date: "2025-03-13",
     changes: [
       "Added execution details sharing functionality",

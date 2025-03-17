@@ -41,7 +41,6 @@ import EditIcon from '@mui/icons-material/Edit';
 import SaveIcon from '@mui/icons-material/Save';
 import CancelIcon from '@mui/icons-material/Cancel';
 import ScreenshotIcon from '@mui/icons-material/Screenshot';
-import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
 import { styled } from '@mui/material/styles';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
