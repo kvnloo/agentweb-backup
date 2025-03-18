@@ -561,10 +561,21 @@ class WebAgent:
                 import tempfile
                 import subprocess
                 import uuid
+                import os
                 
-                # Create a temporary file with a random name
+                # Create a temporary directory with the execution ID for isolation
                 temp_dir = tempfile.gettempdir()
-                temp_file_path = os.path.join(temp_dir, f"integration_{uuid.uuid4()}.py")
+                execution_subdir = os.path.join(temp_dir, f"execution_{self.current_execution_id}")
+                
+                # Create the execution-specific directory if it doesn't exist
+                os.makedirs(execution_subdir, exist_ok=True)
+                
+                # Set permissions to restrict access (0o700 = rwx------)
+                os.chmod(execution_subdir, 0o700)
+                
+                # Create a temporary file within the execution-specific directory
+                script_id = uuid.uuid4()
+                temp_file_path = os.path.join(execution_subdir, f"integration_{script_id}.py")
                 
                 # Replace the placeholder with the actual credential
                 modified_code = python_code.replace("YOUR_API_CREDENTIAL", api_key)
@@ -586,46 +597,59 @@ class WebAgent:
                 # Execute the script with a timeout
                 try:
                     logger.info(f"Executing integration script with timeout of 30 seconds")
+                    
+                    # Use a restricted environment for the subprocess
+                    env = os.environ.copy()
+                    # Set PYTHONPATH to only the execution directory for isolation
+                    env["PYTHONPATH"] = execution_subdir
+                    
                     result = subprocess.run(
                         ["python", temp_file_path],
                         capture_output=True,
                         text=True,
-                        timeout=30  # 30 second timeout for safety
+                        timeout=30,  # 30 second timeout for safety
+                        cwd=execution_subdir,  # Run from the isolated directory
+                        env=env  # Use the restricted environment
                     )
                     
-                    # Clean up the temporary file
+                    # Clean up the temporary file and directory
                     if os.path.exists(temp_file_path):
                         os.remove(temp_file_path)
-                        logger.info("Temporary script file removed")
                     
                     # Process the result
                     if result.returncode == 0:
-                        logger.info("Script executed successfully")
                         output = result.stdout
-                        if not output:
-                            logger.info("Script executed but produced no output")
                         return ActionResult(extracted_content=output if output else "Code executed successfully with no output")
                     else:
                         error_msg = result.stderr
-                        logger.error(f"Script execution failed with error: {error_msg}")
                         return ActionResult(error=f"Execution failed: {error_msg}")
                         
                 except subprocess.TimeoutExpired:
-                    logger.error("Script execution timed out after 30 seconds")
                     # Clean up on timeout
                     if os.path.exists(temp_file_path):
                         os.remove(temp_file_path)
-                        logger.info("Temporary script file removed after timeout")
                     return ActionResult(error="Execution timed out after 30 seconds")
                     
                 except Exception as e:
-                    logger.error(f"Unexpected error during script execution: {str(e)}")
                     # Clean up on any other error
                     if os.path.exists(temp_file_path):
                         os.remove(temp_file_path)
-                        logger.info("Temporary script file removed after error")
                     return ActionResult(error=f"Error during execution: {str(e)}")
-                    
+                
+                finally:
+                    # Instead of removing the directory, just clean up files but preserve the directory
+                    try:
+                        # Remove any remaining files in the directory except the script
+                        script_filename = f"integration_{script_id}.py"
+                        for file in os.listdir(execution_subdir):
+                            if file != script_filename:  # Skip the integration script file
+                                file_path = os.path.join(execution_subdir, file)
+                                if os.path.isfile(file_path):
+                                    os.remove(file_path)
+                        
+                        logger.info(f"Cleaned up temporary files in execution directory: {execution_subdir}")
+                    except Exception as e:
+                        logger.warning(f"Failed to clean up temporary files in execution directory: {str(e)}")
             except Exception as e:
                 logger.error(f"Error during API integration setup: {str(e)}")
                 return ActionResult(error=f"Error running integration: {str(e)}")
