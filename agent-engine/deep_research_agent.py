@@ -64,6 +64,8 @@ class DeepResearchAgentWrapper:
             list: Filtered config list for the LLM
         """
         try:
+            logger.info(f"Getting config list for LLM: {self.llm_name}")
+            
             # Parse the LLM name components
             platform, provider, model = self.llm_name.lower().split('->')
             
