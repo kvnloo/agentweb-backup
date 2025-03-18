@@ -47,18 +47,6 @@ const maskEmail = (email: string) => {
 
 // Helper function to determine if a configuration is an API configuration
 const isApiConfiguration = (config: Config): boolean => {
-  // More detailed logging to debug classification issues
-  if (config.configId) {
-    const details = {
-      configId: config.configId,
-      isApiConfig: config.isApiConfig,
-      appName: config.appName,
-      website: config.website,
-      source: config.sharedBy ? 'shared' : 'owned'
-    };
-    console.log(`Config classification check: ${JSON.stringify(details)}`);
-  }
-  
   // Check explicit flag first
   if (config.isApiConfig === true) {
     return true;
@@ -66,7 +54,6 @@ const isApiConfiguration = (config: Config): boolean => {
   
   // Otherwise, check if it has appName but no website
   if (config.appName && !config.website) {
-    console.log(`Identified API config by fields: ${config.configId}`);
     return true;
   }
   
@@ -113,37 +100,25 @@ export default function Config() {
         })
       ]);
       
-      // Log the configs for debugging purposes
-      console.log('My configs:', configsResponse.data);
-      console.log('Shared configs:', sharedConfigsResponse.data);
-      
-      // Make sure API configurations have proper fields
+      // Process shared configurations to ensure correct field values
       const processedSharedConfigs = sharedConfigsResponse.data.map((config: Config) => {
-        console.log(`Processing shared config: ${config.configId}`);
-        
         // Fix any API configs that are missing the isApiConfig flag
         if (config.appName && !config.website && config.isApiConfig !== true) {
-          console.warn(`Fixing API config that was missing isApiConfig flag: ${config.configId}`);
           config.isApiConfig = true;
         }
         
-        // Flag configs that should be API but don't have appName
+        // Add fallback values for missing fields
         if (config.isApiConfig === true && !config.appName) {
-          console.warn(`API config missing appName: ${config.configId}`);
           config.appName = 'Unknown API';
         }
         
-        // Flag website configs with no website field
+        // Add fallback for website configs with no website field
         if (config.isApiConfig !== true && !config.website && !config.appName) {
-          console.warn(`Website config missing website field: ${config.configId}`);
           config.website = 'Unknown Website';
         }
         
-        // Extra check - if no website but has appName, it must be an API config
+        // Ensure consistent API config identification
         if (!config.website && config.appName) {
-          if (!config.isApiConfig) {
-            console.warn(`Fixed miscategorized API config: ${config.configId}`);
-          }
           config.isApiConfig = true;
         }
         

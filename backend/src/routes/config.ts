@@ -275,15 +275,6 @@ router.post('/:configId/share', authenticateToken, async (req, res) => {
       Item: sharedConfig
     }).promise();
 
-    // Log the shared config
-    console.log('Shared config saved:', {
-      configId: sharedConfig.configId,
-      isApiConfig: sharedConfig.isApiConfig,
-      appName: sharedConfig.appName,
-      website: sharedConfig.website,
-      username: sharedConfig.username
-    });
-
     res.status(201).json({ message: 'Configuration shared successfully' });
   } catch (error) {
     console.error('Error sharing config:', error);
@@ -325,28 +316,17 @@ router.get('/shared', authenticateToken, async (req, res) => {
       const { password, ...configWithoutPassword } = config;
       const sharer = await userDb.getUserById(config.sharedBy || config.userId);
       
-      // Log each shared config before processing
-      console.log('Raw shared config:', {
-        configId: config.configId,
-        isApiConfig: config.isApiConfig,
-        appName: config.appName,
-        website: config.website,
-        hasAppNameButNoWebsite: Boolean(config.appName && !config.website)
-      });
-      
       // Determine if this is an API configuration
       const isApiConfig = !!(config.appName && !config.website) || config.isApiConfig === true;
       
       // Ensure API configuration flag is properly set
       if (isApiConfig && configWithoutPassword.isApiConfig !== true) {
         configWithoutPassword.isApiConfig = true;
-        console.log('Fixed isApiConfig flag for API configuration:', config.configId);
       }
       
       // Add any missing API fields that might have been lost during sharing
       if (isApiConfig && !configWithoutPassword.appName && config.appName) {
         configWithoutPassword.appName = config.appName;
-        console.log('Restored missing appName field for API configuration:', config.configId);
       }
       
       // Ensure we pass along the API configuration properties
@@ -355,14 +335,6 @@ router.get('/shared', authenticateToken, async (req, res) => {
         sharedBy: sharer ? sharer.email : undefined,
         isPublic: !!config.shareWithEveryone
       };
-      
-      // Log the shared config for debugging
-      console.log(
-        `Shared config ${config.configId} (${isApiConfig ? 'API' : 'Website'})`,
-        'isApiConfig:', isApiConfig,
-        'appName:', config.appName,
-        'website:', config.website
-      );
       
       return result;
     }));
