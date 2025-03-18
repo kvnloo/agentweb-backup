@@ -69,9 +69,10 @@ class DeepResearchAgentWrapper:
             
             # Load the base config list
             base_config = config_list_from_json(env_or_file="OAI_CONFIG_LIST")
+            logger.info(f"Loaded base config list with {len(base_config)} items")
             
             # Create filter tags based on platform and model
-            filter_tags = [platform, model]
+            filter_tags = [platform.lower(), model.lower()]
             
             # Filter the config list
             filtered_config = filter_config(base_config, {"tags": filter_tags})
@@ -84,8 +85,7 @@ class DeepResearchAgentWrapper:
             
         except Exception as e:
             logger.error(f"Error creating filtered config list: {str(e)}")
-            logger.warning("Using full config list as fallback")
-            return config_list_from_json(env_or_file="OAI_CONFIG_LIST")
+            return None
 
     def _generate_html_report(self, research_result: Dict[str, Any], query: str, output_file: str) -> str:
         """Generate an HTML5 report from the research results
@@ -215,6 +215,7 @@ class DeepResearchAgentWrapper:
             config_list = self._get_config_list()
             
             # Initialize DeepResearchAgent with proper configuration
+            logger.info("Initializing DeepResearchAgent...")
             agent = DeepResearchAgent(
                 name="DeepResearchAgent",
                 llm_config={"config_list": config_list},
@@ -239,6 +240,7 @@ class DeepResearchAgentWrapper:
                             user_input=user_input,
                             summary_method="reflection_with_llm",
                         )
+                        logger.info("Agent run completed successfully")
                     except Exception as e:
                         logger.error(f"Error during agent.run: {str(e)}")
                         raise
@@ -296,48 +298,48 @@ class DeepResearchAgentWrapper:
             # Don't try to clean up asyncio tasks - this causes more problems than it solves
             pass
 
+    async def cleanup(self):
+        """Clean up resources used by the agent"""
+        # No specific cleanup needed for this wrapper
+        logger.info(f"Cleaning up DeepResearchAgentWrapper for execution {self.execution_id}")
+        return True
+
 def main():
     """
     CLI entry point for deep research agent.
     This script is designed to be called from task_monitor.py in a similar way to web_agent.py.
     """
-    parser = argparse.ArgumentParser(description='Run deep research on a query')
-    parser.add_argument('--user_id', required=True, help='User ID')
-    parser.add_argument('--execution_id', required=True, help='Execution ID')
-    parser.add_argument('--task_id', required=True, help='Task ID')
-    parser.add_argument('--prompt_file', required=True, help='File containing the prompt')
-    parser.add_argument('--max_turns', type=int, default=2, help='Maximum number of turns for the agent')
-    parser.add_argument('--llm_name', required=True, help='Full LLM name in format platform->provider->model')
+    parser = argparse.ArgumentParser(description='Run deep research agent')
+    parser.add_argument('--user_id', type=str, required=True, help='User ID')
+    parser.add_argument('--execution_id', type=str, required=True, help='Execution ID')
+    parser.add_argument('--task_id', type=str, required=True, help='Task ID')
+    parser.add_argument('--prompt_file', type=str, required=True, help='Path to prompt file')
+    parser.add_argument('--llm_name', type=str, required=True, help='Full LLM name')
+    parser.add_argument('--max_turns', type=int, default=2, help='Maximum conversation turns')
     
     args = parser.parse_args()
     
+    # Read prompt from file
+    with open(args.prompt_file, 'r') as f:
+        query = f.read()
+    
+    # Initialize the agent
+    agent = DeepResearchAgentWrapper(
+        user_id=args.user_id,
+        execution_id=args.execution_id,
+        full_llm_name=args.llm_name
+    )
+    
     try:
-        logger.info(f"Starting deep research for execution {args.execution_id}")
-        
-        # Read prompt from file
-        with open(args.prompt_file, 'r') as f:
-            prompt = f.read()
-        
-        logger.info(f"Running deep research for user {args.user_id}, task {args.task_id}")
-        logger.info(f"Using LLM: {args.llm_name}")
-        logger.info(f"Prompt: {prompt[:100]}...")
-        
-        # Initialize the deep research agent with user_id and execution_id
-        agent = DeepResearchAgentWrapper(
-            user_id=args.user_id,
-            execution_id=args.execution_id,
-            full_llm_name=args.llm_name
-        )
-        
-        # Run the research
-        research_result = agent.run_research(
-            query=prompt,
+        # Normal execution
+        result = agent.run_research(
+            query=query,
             max_turns=args.max_turns,
             user_input=False
         )
         
-        # Print the result as JSON to stdout (will be captured by task_monitor.py)
-        print(json.dumps(research_result))
+        # Print results as JSON for task_monitor.py to parse
+        print(json.dumps(result))
         logger.info("Deep research completed successfully")
         
         # Return success
@@ -368,9 +370,4 @@ def main():
 
 # Example usage as a script
 if __name__ == "__main__":
-    # If arguments are provided, run as CLI
-    if len(sys.argv) > 1:
-        sys.exit(main())
-    # Otherwise, print the help message
-    else:
-        print("Usage: deep_research_agent.py --user_id=<user_id> --execution_id=<execution_id> --task_id=<task_id> --prompt_file=<prompt_file> --max_turns=<max_turns> --llm_name=<llm_name>")
+    sys.exit(main())

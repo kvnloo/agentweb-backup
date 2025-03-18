@@ -529,6 +529,147 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
             except:
                 pass
 
+async def run_deep_research_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, task_id: str) -> Dict[str, Any]:
+    """Run the deep research agent with the given parameters"""
+    process = None
+    try:
+        # Create necessary directories
+        os.makedirs('prompts', exist_ok=True)
+        os.makedirs('logs', exist_ok=True)
+        
+        # Save prompt to a file
+        prompt_file = f'prompts/prompt_{execution_id}.txt'
+        with open(prompt_file, 'w') as f:
+            f.write(prompt)
+        
+        # Set up log file for this execution
+        log_file = f'logs/execution_{execution_id}_deep_research.log'
+        
+        # Build command
+        cmd = [
+            'python3', '-u',  # -u for unbuffered output
+            'deep_research_agent.py',
+            '--user_id', user_id,
+            '--execution_id', execution_id,
+            '--task_id', task_id,
+            '--prompt_file', prompt_file,
+            '--llm_name', llm_name
+        ]
+        
+        # Run command with output redirection
+        logger.info(f"Running command: {' '.join(cmd)}")
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, 'PYTHONUNBUFFERED': '1'}  # Ensure unbuffered output
+        )
+        
+        # Set timeout from environment or default to 15 minutes
+        timeout_seconds = int(os.getenv('DEEP_RESEARCH_TIMEOUT_SECONDS', '900'))
+        
+        try:
+            # Wait for the deep research to complete with a timeout
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+            
+            # Clean up prompt file
+            os.unlink(prompt_file)
+            
+            # Write both stdout and stderr to log file for debugging
+            with open(log_file, 'a') as f:
+                f.write("\n\n=== NEW EXECUTION AT " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " ===\n")
+                f.write("=== COMMAND ===\n")
+                f.write(" ".join(cmd) + "\n\n")
+                if stdout:
+                    f.write("=== STDOUT ===\n")
+                    f.write(stdout.decode())
+                    f.write("\n")
+                if stderr:
+                    f.write("=== STDERR ===\n")
+                    f.write(stderr.decode())
+                    f.write("\n")
+                f.write("=" * 80 + "\n")
+            
+            if process.returncode == 0:
+                try:
+                    # Try to find the JSON output in stdout
+                    output = stdout.decode()
+                    # Split into lines and reverse to find the last JSON object
+                    lines = output.split('\n')
+                    for line in reversed(lines):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            result = json.loads(line)
+                            if isinstance(result, dict):
+                                logger.info(f"Successfully parsed result from deep_research_agent.py")
+                                result["llm_name"] = llm_name  # Ensure llm_name is set
+                                return result
+                        except json.JSONDecodeError:
+                            continue
+                    
+                    # If we get here, no valid JSON was found
+                    logger.error(f"No valid JSON found in output. Full output written to {log_file}")
+                    return {
+                        "success": False,
+                        "error": f"No valid JSON output found. Check {log_file} for details.",
+                        "llm_name": llm_name
+                    }
+                except Exception as e:
+                    logger.error(f"Error parsing output: {e}")
+                    return {
+                        "success": False,
+                        "error": f"Failed to parse output: {str(e)}. Check {log_file} for details.",
+                        "llm_name": llm_name
+                    }
+            else:
+                error_msg = stderr.decode() if stderr else "Unknown error"
+                logger.error(f"Deep research process failed with error: {error_msg}")
+                return {
+                    "success": False,
+                    "error": f"Process error: {error_msg}. Check {log_file} for details.",
+                    "llm_name": llm_name
+                }
+                
+        except asyncio.TimeoutError:
+            # Research timed out
+            logger.error(f"Deep research timed out after {timeout_seconds} seconds")
+            return {
+                "success": False,
+                "error": f"Deep research timed out after {timeout_seconds} seconds",
+                "llm_name": llm_name
+            }
+            
+    except Exception as e:
+        logger.error(f"Error in run_deep_research_cli: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "llm_name": llm_name
+        }
+    finally:
+        if process:
+            try:
+                process.kill()
+                await process.wait()
+            except:
+                pass
+        
+        # Return a proper error dictionary instead of just a log file path
+        if "log_file" in locals():
+            return {
+                "success": False,
+                "error": f"Unexpected error in deep research execution. Check log: {log_file}",
+                "llm_name": llm_name
+            }
+        else:
+            return {
+                "success": False,
+                "error": "Deep research failed without creating a log file",
+                "llm_name": llm_name
+            }
+
 async def execute_task(execution):
     global running_task_count, running_user_ids, running_task_ids
     
@@ -675,91 +816,70 @@ async def execute_task(execution):
                 
                 # Run appropriate agent based on task type
                 if is_deep_research:
-                    # Use DeepResearchAgentWrapper directly instead of CLI
+                    # Run DeepResearchAgent via CLI
                     try:
-                        logger.info(f"Running deep research directly with LLM: {llm_name}")
-                        
-                        # Initialize the deep research agent with user_id and execution_id
-                        agent = DeepResearchAgentWrapper(
-                            user_id=user_id,
-                            execution_id=execution_id,
-                            full_llm_name=llm_name
-                        )
-                        
-                        # Define a function to run the research in a separate thread
-                        def run_research_in_thread(agent, prompt, max_turns):
-                            try:
-                                return agent.run_research(
-                                    query=prompt,
-                                    max_turns=max_turns,
-                                    user_input=False
-                                )
-                            except Exception as e:
-                                logger.error(f"Error in research thread: {str(e)}")
-                                return {
-                                    "success": False,
-                                    "error": f"Research thread error: {str(e)}",
-                                    "llm_name": llm_name
-                                }
-                        
                         # Set timeout from environment or default to 15 minutes
                         timeout_seconds = int(os.getenv('DEEP_RESEARCH_TIMEOUT_SECONDS', '900'))
-                        logger.info(f"Running deep research with timeout of {timeout_seconds} seconds")
+                        logger.info(f"Running deep research via CLI with timeout of {timeout_seconds} seconds")
                         
-                        # Use asyncio.to_thread to run the research in a separate thread without blocking
-                        try:
-                            # Create a task that will run the research in a separate thread
-                            research_task = asyncio.create_task(
-                                asyncio.to_thread(
-                                    run_research_in_thread,
-                                    agent,
-                                    prompt_with_context,
-                                    int(os.getenv('DEEP_RESEARCH_MAX_TURNS', '2'))
-                                )
+                        # Create a task for running the deep research agent
+                        research_task = asyncio.create_task(
+                            run_deep_research_cli(
+                                user_id,
+                                llm_name,
+                                prompt_with_context,
+                                execution_id,
+                                task_id
                             )
-                            
-                            # Wait for the research to complete with a timeout
-                            result = await asyncio.wait_for(research_task, timeout=timeout_seconds)
-                            logger.info(f"Successfully completed deep research with {llm_name}")
-                            
-                        except asyncio.TimeoutError:
-                            # Research timed out
-                            logger.error(f"Deep research timed out after {timeout_seconds} seconds")
-                            result = {
-                                "success": False,
-                                "error": f"Deep research timed out after {timeout_seconds} seconds",
-                                "llm_name": llm_name
-                            }
-                            # Cancel the task to prevent it from continuing to run in the background
-                            research_task.cancel()
-                            
-                        except Exception as e:
-                            # Other errors
-                            logger.error(f"Error waiting for deep research: {str(e)}")
-                            result = {
-                                "success": False,
-                                "error": f"Error waiting for deep research: {str(e)}",
-                                "llm_name": llm_name
-                            }
-                            # Cancel the task if it's still running
-                            if 'research_task' in locals() and not research_task.done():
-                                research_task.cancel()
+                        )
                         
-                        # Get the output file path from the result
-                        filtered_activity_log = result.get('output_file', None)
-                        if filtered_activity_log and os.path.exists(filtered_activity_log):
-                            logger.info(f"Found output file: {filtered_activity_log}")
+                        # Wait for the research to complete with a timeout
+                        result = await asyncio.wait_for(research_task, timeout=timeout_seconds)
+                        logger.info(f"Successfully completed deep research with {llm_name}")
+                        
+                        # Debug the result
+                        if isinstance(result, dict):
+                            logger.info(f"Deep research result keys: {result.keys()}")
+                            try:
+                                logger.info(f"Full result (stringified): {json.dumps(result, default=str)}")
+                            except Exception as json_err:
+                                logger.error(f"Error stringifying result: {json_err}")
                         else:
-                            logger.warning(f"Output file not found or not specified in result")
-                            filtered_activity_log = None
-                            
-                    except Exception as e:
-                        logger.error(f"Error running deep research directly: {str(e)}")
+                            logger.info(f"Deep research result is not a dict: {type(result)}")
+                            # Convert string result (likely a log file path) to error dictionary
+                            log_path = str(result)
+                            result = {
+                                "success": False,
+                                "error": f"Deep research failed to return a valid result. See log: {log_path}",
+                                "llm_name": llm_name
+                            }
+                            logger.error(f"Converted string result to error dictionary: {result}")
+                        
+                    except asyncio.TimeoutError:
+                        # Research timed out
+                        logger.error(f"Deep research timed out after {timeout_seconds} seconds")
                         result = {
                             "success": False,
-                            "error": f"Deep research error: {str(e)}",
+                            "error": f"Deep research timed out after {timeout_seconds} seconds",
                             "llm_name": llm_name
                         }
+                        # Cancel the task
+                        research_task.cancel()
+                        
+                    except Exception as e:
+                        # Other errors
+                        logger.error(f"Error waiting for deep research: {str(e)}")
+                        result = {
+                            "success": False,
+                            "error": f"Error waiting for deep research: {str(e)}",
+                            "llm_name": llm_name
+                        }
+                        # Cancel the task if it's still running
+                        if 'research_task' in locals() and not research_task.done():
+                            research_task.cancel()
+                    
+                    # Set the activity log path for upload
+                    filtered_activity_log = f'logs/execution_{execution_id}_deep_research.log'
                 else:
                     # Run WebAgent via CLI for non-deep-research tasks
                     try:
@@ -931,13 +1051,6 @@ async def execute_task(execution):
             except:
                 pass
             
-        # Clean up agent resources
-        if agent:
-            try:
-                await agent.cleanup()
-            except:
-                pass
-
         running_task_count -= 1
         # Check if user_id exists in the set before removing it
         if user_id in running_user_ids:
