@@ -599,9 +599,19 @@ class WebAgent:
                     logger.info(f"Executing integration script with timeout of 30 seconds")
                     
                     # Use a restricted environment for the subprocess
-                    env = os.environ.copy()
-                    # Set PYTHONPATH to only the execution directory for isolation
-                    env["PYTHONPATH"] = execution_subdir
+                    # Instead of copying all environment variables, create a minimal set
+                    env = {
+                        "PATH": os.environ.get("PATH", ""),  # Needed to find Python executable
+                        "PYTHONPATH": execution_subdir,  # Set PYTHONPATH to only the execution directory for isolation
+                        "LANG": os.environ.get("LANG", "en_US.UTF-8"),  # Basic locale setting
+                        "PYTHONIOENCODING": os.environ.get("PYTHONIOENCODING", "utf-8"),  # Ensure proper encoding
+                        "TEMP": temp_dir,  # Provide access to temp directory
+                        "TMP": temp_dir,  # Provide access to temp directory
+                        "INTEGRATION_EXECUTION_ID": self.current_execution_id  # Allow tracking which execution this is
+                    }
+                    
+                    # Don't include AWS credentials, API keys, or other sensitive environment variables
+                    logger.info("Created restricted environment with limited variables for integration execution")
                     
                     result = subprocess.run(
                         ["python", temp_file_path],
@@ -611,10 +621,6 @@ class WebAgent:
                         cwd=execution_subdir,  # Run from the isolated directory
                         env=env  # Use the restricted environment
                     )
-                    
-                    # Clean up the temporary file and directory
-                    if os.path.exists(temp_file_path):
-                        os.remove(temp_file_path)
                     
                     # Process the result
                     if result.returncode == 0:
