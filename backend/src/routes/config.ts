@@ -80,40 +80,69 @@ router.get('/', authenticateToken, async (req, res) => {
 router.post('/', authenticateToken, async (req, res) => {
   try {
     const userId = req.user!.userId;
-    let { website, username, password } = req.body;
+    let { website, username, password, isApiConfig, appName, integrationDocLink } = req.body;
 
-    if (!website || !username || !password) {
-      return res.status(400).json({ error: 'Missing required fields' });
+    // Check if this is a website config or API config
+    if (isApiConfig) {
+      // API Configuration validation
+      if (!appName || !username || !password) {
+        return res.status(400).json({ error: 'Missing required fields for API configuration' });
+      }
+
+      const configId = uuidv4();
+      const config = {
+        configId,
+        userId,
+        isApiConfig: true,
+        appName,
+        username,
+        password: encryptPassword(password, userId),
+        integrationDocLink: integrationDocLink || null,
+        createdAt: new Date().toISOString()
+      };
+
+      await dynamodb.put({
+        TableName: `${TABLE_PREFIX}AW-Configs`,
+        Item: config
+      }).promise();
+
+      res.status(201).json({ configId });
+    } else {
+      // Regular website configuration
+      if (!website || !username || !password) {
+        return res.status(400).json({ error: 'Missing required fields' });
+      }
+
+      // Convert website to lowercase
+      website = website.toLowerCase();
+
+      // Validate domain name format
+      const domainRegex = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/;
+      if (!domainRegex.test(website)) {
+        return res.status(400).json({ 
+          error: 'Invalid domain name format. Please enter a valid domain (e.g., example.com, sub.example.com)',
+          type: 'INVALID_DOMAIN'
+        });
+      }
+
+      const configId = uuidv4();
+      const config = {
+        configId,
+        userId,
+        isApiConfig: false,
+        website,
+        username,
+        password: encryptPassword(password, userId),
+        createdAt: new Date().toISOString()
+      };
+
+      await dynamodb.put({
+        TableName: `${TABLE_PREFIX}AW-Configs`,
+        Item: config
+      }).promise();
+
+      res.status(201).json({ configId });
     }
-
-    // Convert website to lowercase
-    website = website.toLowerCase();
-
-    // Validate domain name format
-    const domainRegex = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/;
-    if (!domainRegex.test(website)) {
-      return res.status(400).json({ 
-        error: 'Invalid domain name format. Please enter a valid domain (e.g., example.com, sub.example.com)',
-        type: 'INVALID_DOMAIN'
-      });
-    }
-
-    const configId = uuidv4();
-    const config = {
-      configId,
-      userId,
-      website,
-      username,
-      password: encryptPassword(password, userId),
-      createdAt: new Date().toISOString()
-    };
-
-    await dynamodb.put({
-      TableName: `${TABLE_PREFIX}AW-Configs`,
-      Item: config
-    }).promise();
-
-    res.status(201).json({ configId });
   } catch (error) {
     console.error('Error creating config:', error);
     res.status(500).json({ error: 'Failed to create configuration' });
@@ -166,7 +195,12 @@ router.post('/:configId/share', authenticateToken, async (req, res) => {
     }
 
     if (shareWithEveryone) {
-      // Update the config to be shared with everyone
+      // Determine if this is an API configuration
+      const isApiConfig = result.Item.isApiConfig === true;
+      console.log(`Sharing config with everyone - isApiConfig: ${isApiConfig}`);
+
+      // When sharing with everyone, we just update the existing config
+      // No need to modify anything related to API since the original fields are preserved
       await dynamodb.update({
         TableName: `${TABLE_PREFIX}AW-Configs`,
         Key: {
@@ -180,7 +214,7 @@ router.post('/:configId/share', authenticateToken, async (req, res) => {
         }
       }).promise();
 
-      res.status(201).json({ message: 'Configuration shared with everyone successfully' });
+      res.status(201).json({ message: `Configuration shared with everyone successfully (Type: ${isApiConfig ? 'API' : 'Website'})` });
       return;
     }
 
@@ -193,15 +227,33 @@ router.post('/:configId/share', authenticateToken, async (req, res) => {
 
     // Create a new config for the target user
     const newConfigId = uuidv4();
-    const sharedConfig = {
+    
+    // Get the isApiConfig flag from the original configuration
+    const isApiConfig = result.Item.isApiConfig === true;
+    console.log(`Sharing config directly - isApiConfig: ${isApiConfig}, appName: ${result.Item.appName || 'N/A'}`);
+    
+    // Prepare the shared config, preserving API-specific fields if present
+    const sharedConfig: any = {
       configId: newConfigId,
       userId: targetUser.userId,
-      website: result.Item.website,
+      isApiConfig: result.Item.isApiConfig || false,
       username: result.Item.username,
       password: result.Item.password,
       createdAt: new Date().toISOString(),
       sharedBy: userId
     };
+
+    // Add website field for regular website configurations
+    if (!result.Item.isApiConfig) {
+      sharedConfig.website = result.Item.website;
+    } 
+    // Add API-specific fields for API configurations
+    else {
+      sharedConfig.appName = result.Item.appName;
+      if (result.Item.integrationDocLink) {
+        sharedConfig.integrationDocLink = result.Item.integrationDocLink;
+      }
+    }
 
     // Update original config with the new shared configId
     const sharedConfigIds = result.Item.sharedConfigIds || [];
@@ -222,6 +274,15 @@ router.post('/:configId/share', authenticateToken, async (req, res) => {
       TableName: `${TABLE_PREFIX}AW-Configs`,
       Item: sharedConfig
     }).promise();
+
+    // Log the shared config
+    console.log('Shared config saved:', {
+      configId: sharedConfig.configId,
+      isApiConfig: sharedConfig.isApiConfig,
+      appName: sharedConfig.appName,
+      website: sharedConfig.website,
+      username: sharedConfig.username
+    });
 
     res.status(201).json({ message: 'Configuration shared successfully' });
   } catch (error) {
@@ -263,17 +324,111 @@ router.get('/shared', authenticateToken, async (req, res) => {
     const sharedConfigs = await Promise.all(allSharedConfigs.map(async (config) => {
       const { password, ...configWithoutPassword } = config;
       const sharer = await userDb.getUserById(config.sharedBy || config.userId);
-      return {
+      
+      // Log each shared config before processing
+      console.log('Raw shared config:', {
+        configId: config.configId,
+        isApiConfig: config.isApiConfig,
+        appName: config.appName,
+        website: config.website,
+        hasAppNameButNoWebsite: Boolean(config.appName && !config.website)
+      });
+      
+      // Determine if this is an API configuration
+      const isApiConfig = !!(config.appName && !config.website) || config.isApiConfig === true;
+      
+      // Ensure API configuration flag is properly set
+      if (isApiConfig && configWithoutPassword.isApiConfig !== true) {
+        configWithoutPassword.isApiConfig = true;
+        console.log('Fixed isApiConfig flag for API configuration:', config.configId);
+      }
+      
+      // Add any missing API fields that might have been lost during sharing
+      if (isApiConfig && !configWithoutPassword.appName && config.appName) {
+        configWithoutPassword.appName = config.appName;
+        console.log('Restored missing appName field for API configuration:', config.configId);
+      }
+      
+      // Ensure we pass along the API configuration properties
+      const result = {
         ...configWithoutPassword,
         sharedBy: sharer ? sharer.email : undefined,
         isPublic: !!config.shareWithEveryone
       };
+      
+      // Log the shared config for debugging
+      console.log(
+        `Shared config ${config.configId} (${isApiConfig ? 'API' : 'Website'})`,
+        'isApiConfig:', isApiConfig,
+        'appName:', config.appName,
+        'website:', config.website
+      );
+      
+      return result;
     }));
 
     res.json(sharedConfigs);
   } catch (error) {
     console.error('Error fetching configurations shared with me:', error);
     res.status(500).json({ error: 'Failed to fetch configurations shared with me' });
+  }
+});
+
+// Get API configurations by app name
+router.get('/api/:appName', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user!.userId;
+    const { appName } = req.params;
+    
+    if (!appName) {
+      return res.status(400).json({ error: 'App name is required' });
+    }
+
+    // First check user's own API configs
+    const userConfigs = await dynamodb.query({
+      TableName: `${TABLE_PREFIX}AW-Configs`,
+      KeyConditionExpression: 'userId = :userId',
+      FilterExpression: 'isApiConfig = :isApiConfig AND appName = :appName',
+      ExpressionAttributeValues: {
+        ':userId': userId,
+        ':isApiConfig': true,
+        ':appName': appName
+      }
+    }).promise();
+
+    if (userConfigs.Items && userConfigs.Items.length > 0) {
+      // Return user's own config (without password)
+      const config = userConfigs.Items[0];
+      const { password, ...configWithoutPassword } = config;
+      return res.json(configWithoutPassword);
+    }
+
+    // If no user configs, check publicly shared API configs
+    const publicConfigs = await dynamodb.query({
+      TableName: `${TABLE_PREFIX}AW-Configs`,
+      IndexName: 'ShareWithEveryoneIndex',
+      KeyConditionExpression: 'shareWithEveryone = :shareWithEveryone',
+      FilterExpression: 'isApiConfig = :isApiConfig AND appName = :appName AND userId <> :userId',
+      ExpressionAttributeValues: {
+        ':shareWithEveryone': 1,
+        ':isApiConfig': true,
+        ':appName': appName,
+        ':userId': userId
+      }
+    }).promise();
+
+    if (publicConfigs.Items && publicConfigs.Items.length > 0) {
+      // Return the publicly shared config (without password)
+      const config = publicConfigs.Items[0];
+      const { password, ...configWithoutPassword } = config;
+      return res.json(configWithoutPassword);
+    }
+
+    // No configs found for this app name
+    return res.status(404).json({ error: `No API configuration found for ${appName}` });
+  } catch (error) {
+    console.error('Error fetching API config:', error);
+    res.status(500).json({ error: 'Failed to fetch API configuration' });
   }
 });
 

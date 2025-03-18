@@ -10,6 +10,7 @@ AgentWeb is a powerful web automation platform that allows users to create and m
 - ⏱️ Support for both single and recurring tasks
 - 📊 Real-time task monitoring and alerts
 - 🔐 MFA for AgentWeb account security
+- 🔌 API Integration support - connect with external APIs
 - 👥 Admin dashboard for user management and analytics
   - User overview and management
   - Waitlist management with email invitations
@@ -58,6 +59,28 @@ npm run dev
 3. Monitor task execution and results
 4. Set up alerts for task completion or failures
 
+### API Integrations
+
+AgentWeb supports integrating with external APIs by securely storing API credentials:
+
+1. Navigate to the Configurations page
+2. Click "Add API Config"
+3. Enter the API details:
+   - API/App Name: A unique identifier for this API (e.g., "Stripe", "GitHub")
+   - API Key Name: The name of the credential parameter (e.g., "api_key", "access_token")
+   - API Key/Secret: The actual API credential value
+   - Documentation URL: Optional link to integration documentation
+
+When creating tasks, your agents can access these API integrations with:
+
+- `get_integration_instructions`: Retrieves the API configuration details including documentation links
+- `run_integration`: Executes Python code with the API credentials automatically injected
+
+Example task prompt that uses an API integration:
+```
+Get my latest GitHub repositories and create a report. Use my GitHub API integration to access the data.
+```
+
 For detailed documentation, please refer to our [Design Document](./design.md).
 
 ## Security
@@ -69,6 +92,7 @@ AgentWeb implements a strict security model:
 - MFA-protected AgentWeb accounts
 - No correlation between AgentWeb accounts and target website credentials
 - Automatic session cleanup after task completion
+- Secure API credential management with isolated execution environments
 
 ## Contributing
 

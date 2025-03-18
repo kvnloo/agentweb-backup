@@ -27,12 +27,15 @@ import { buildApiUrl } from '../config';
 
 interface Config {
   configId: string;
-  website: string;
+  website?: string;
   username: string;
   createdAt: string;
   sharedBy?: string;
   sharedWith?: string[];
   shareWithEveryone?: boolean;
+  isApiConfig?: boolean;
+  appName?: string;
+  integrationDocLink?: string;
 }
 
 // Helper function to mask email
@@ -42,11 +45,40 @@ const maskEmail = (email: string) => {
   return `${maskedUsername}@${domain}`;
 };
 
+// Helper function to determine if a configuration is an API configuration
+const isApiConfiguration = (config: Config): boolean => {
+  // More detailed logging to debug classification issues
+  if (config.configId) {
+    const details = {
+      configId: config.configId,
+      isApiConfig: config.isApiConfig,
+      appName: config.appName,
+      website: config.website,
+      source: config.sharedBy ? 'shared' : 'owned'
+    };
+    console.log(`Config classification check: ${JSON.stringify(details)}`);
+  }
+  
+  // Check explicit flag first
+  if (config.isApiConfig === true) {
+    return true;
+  }
+  
+  // Otherwise, check if it has appName but no website
+  if (config.appName && !config.website) {
+    console.log(`Identified API config by fields: ${config.configId}`);
+    return true;
+  }
+  
+  return false;
+};
+
 export default function Config() {
   const { token } = useAuth();
   const [configs, setConfigs] = useState<Config[]>([]);
   const [sharedConfigs, setSharedConfigs] = useState<Config[]>([]);
   const [openDialog, setOpenDialog] = useState(false);
+  const [openApiDialog, setOpenApiDialog] = useState(false);
   const [openShareDialog, setOpenShareDialog] = useState(false);
   const [selectedConfig, setSelectedConfig] = useState<string>('');
   const [shareEmail, setShareEmail] = useState('');
@@ -54,6 +86,12 @@ export default function Config() {
     website: '',
     username: '',
     password: '',
+  });
+  const [newApiConfig, setNewApiConfig] = useState({
+    appName: '',
+    username: '',
+    password: '',
+    integrationDocLink: '',
   });
   const [error, setError] = useState('');
   const [fieldError, setFieldError] = useState('');
@@ -74,8 +112,46 @@ export default function Config() {
           headers: { Authorization: `Bearer ${token}` },
         })
       ]);
+      
+      // Log the configs for debugging purposes
+      console.log('My configs:', configsResponse.data);
+      console.log('Shared configs:', sharedConfigsResponse.data);
+      
+      // Make sure API configurations have proper fields
+      const processedSharedConfigs = sharedConfigsResponse.data.map((config: Config) => {
+        console.log(`Processing shared config: ${config.configId}`);
+        
+        // Fix any API configs that are missing the isApiConfig flag
+        if (config.appName && !config.website && config.isApiConfig !== true) {
+          console.warn(`Fixing API config that was missing isApiConfig flag: ${config.configId}`);
+          config.isApiConfig = true;
+        }
+        
+        // Flag configs that should be API but don't have appName
+        if (config.isApiConfig === true && !config.appName) {
+          console.warn(`API config missing appName: ${config.configId}`);
+          config.appName = 'Unknown API';
+        }
+        
+        // Flag website configs with no website field
+        if (config.isApiConfig !== true && !config.website && !config.appName) {
+          console.warn(`Website config missing website field: ${config.configId}`);
+          config.website = 'Unknown Website';
+        }
+        
+        // Extra check - if no website but has appName, it must be an API config
+        if (!config.website && config.appName) {
+          if (!config.isApiConfig) {
+            console.warn(`Fixed miscategorized API config: ${config.configId}`);
+          }
+          config.isApiConfig = true;
+        }
+        
+        return config;
+      });
+      
       setConfigs(configsResponse.data);
-      setSharedConfigs(sharedConfigsResponse.data);
+      setSharedConfigs(processedSharedConfigs);
       setUserId(userResponse.data.userId);
     } catch (err) {
       console.error('Error fetching configs:', err);
@@ -103,6 +179,24 @@ export default function Config() {
       } else {
         setError('Failed to add configuration');
       }
+    }
+  };
+
+  const handleAddApiConfig = async () => {
+    try {
+      setFieldError('');
+      await axios.post(buildApiUrl('/api/config'), {
+        ...newApiConfig,
+        isApiConfig: true
+      }, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setOpenApiDialog(false);
+      setNewApiConfig({ appName: '', username: '', password: '', integrationDocLink: '' });
+      fetchConfigs();
+    } catch (err: any) {
+      console.error('Error adding API config:', err);
+      setError('Failed to add API configuration');
     }
   };
 
@@ -158,18 +252,27 @@ export default function Config() {
     <Container maxWidth="md">
       <Box sx={{ mt: 4, mb: 4 }}>
         <Typography variant="h4" component="h1" gutterBottom>
-          Website Configurations
+          Configurations
         </Typography>
         
-        <Button
-          variant="contained"
-          color="primary"
-          startIcon={<AddIcon />}
-          onClick={() => setOpenDialog(true)}
-          sx={{ mb: 3 }}
-        >
-          Add New Configuration
-        </Button>
+        <Box sx={{ display: 'flex', gap: 2, mb: 3 }}>
+          <Button
+            variant="contained"
+            color="primary"
+            startIcon={<AddIcon />}
+            onClick={() => setOpenDialog(true)}
+          >
+            Add Website Config
+          </Button>
+          <Button
+            variant="contained"
+            color="secondary"
+            startIcon={<AddIcon />}
+            onClick={() => setOpenApiDialog(true)}
+          >
+            Add API Config
+          </Button>
+        </Box>
 
         {error && (
           <Typography color="error" sx={{ mb: 2 }}>
@@ -209,8 +312,26 @@ export default function Config() {
                 >
                   <ListItemText
                     primary={
-                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                        <span>{config.website}</span>
+                      <Box component="div" sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                        <Typography 
+                          component="span"
+                          sx={{ 
+                            fontWeight: isApiConfiguration(config) ? 'bold' : 'normal',
+                            color: isApiConfiguration(config) ? 'primary.main' : 'inherit'
+                          }}
+                        >
+                          {isApiConfiguration(config)
+                            ? (config.appName || 'API Configuration')
+                            : (config.website || 'Website Configuration')
+                          }
+                        </Typography>
+                        {isApiConfiguration(config) && (
+                          <Chip
+                            size="small"
+                            label="API"
+                            color="info"
+                          />
+                        )}
                         {config.sharedBy && config.sharedBy !== userId && (
                           <Chip
                             size="small"
@@ -241,32 +362,83 @@ export default function Config() {
                         )}
                       </Box>
                     }
-                    secondary={`Username: ${config.username}`}
+                    secondaryTypographyProps={{ component: 'div' }}
+                    secondary={
+                      <Box component="div" sx={{ mt: 0.5 }}>
+                        <Typography component="span" variant="body2">
+                          {isApiConfiguration(config)
+                            ? `Key Name: ${config.username || 'Unknown'}` 
+                            : `Username: ${config.username || 'Unknown'}`
+                          }
+                        </Typography>
+                        {isApiConfiguration(config) && (
+                          <Box component="div" mt={1}>
+                            {config.integrationDocLink ? (
+                              <Button 
+                                variant="outlined" 
+                                size="small"
+                                href={config.integrationDocLink} 
+                                target="_blank" 
+                                rel="noopener noreferrer"
+                                sx={{ textTransform: 'none' }}
+                              >
+                                View API Documentation
+                              </Button>
+                            ) : (
+                              <Typography component="span" variant="caption" color="text.secondary">
+                                No documentation link provided
+                              </Typography>
+                            )}
+                          </Box>
+                        )}
+                      </Box>
+                    }
                   />
                 </ListItem>
               ))}
               {configs.length === 0 && (
                 <ListItem>
-                  <ListItemText primary="No configurations added yet" />
+                  <ListItemText 
+                    primaryTypographyProps={{ component: 'div' }}
+                    primary={<Typography component="span">No configurations added yet</Typography>} 
+                  />
                 </ListItem>
               )}
             </List>
           </CardContent>
         </Card>
 
-        {sharedConfigs.length > 0 && (
-          <Card sx={{ mt: 3 }}>
-            <CardContent>
-              <Typography variant="h6" gutterBottom>
-                Shared with Me
-              </Typography>
-              <List>
-                {sharedConfigs.map((config) => (
+        <Card sx={{ mt: 3 }}>
+          <CardContent>
+            <Typography variant="h6" gutterBottom>
+              Shared with Me
+            </Typography>
+            <List>
+              {sharedConfigs.length > 0 ? 
+                sharedConfigs.map((config) => (
                   <ListItem key={config.configId} divider>
                     <ListItemText
                       primary={
-                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                          {config.website}
+                        <Box component="div" sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                          <Typography 
+                            component="span"
+                            sx={{ 
+                              fontWeight: isApiConfiguration(config) ? 'bold' : 'normal',
+                              color: isApiConfiguration(config) ? 'primary.main' : 'inherit'
+                            }}
+                          >
+                            {isApiConfiguration(config)
+                              ? (config.appName || 'API Configuration')
+                              : (config.website || 'Website Configuration')
+                            }
+                          </Typography>
+                          {isApiConfiguration(config) && (
+                            <Chip
+                              size="small"
+                              label="API"
+                              color="info"
+                            />
+                          )}
                           {config.sharedBy && (
                             <Chip
                               size="small"
@@ -275,19 +447,65 @@ export default function Config() {
                               sx={{ ml: 1 }}
                             />
                           )}
+                          {config.shareWithEveryone && (
+                            <Chip
+                              size="small"
+                              label="Public"
+                              color="success"
+                              sx={{ ml: 1 }}
+                            />
+                          )}
                         </Box>
                       }
-                      secondary={`Username: ${config.username}`}
+                      secondaryTypographyProps={{ component: 'div' }}
+                      secondary={
+                        <Box component="div" sx={{ mt: 0.5 }}>
+                          <Typography component="span" variant="body2">
+                            {isApiConfiguration(config)
+                              ? `Key Name: ${config.username || 'Unknown'}` 
+                              : `Username: ${config.username || 'Unknown'}`
+                            }
+                          </Typography>
+                          {isApiConfiguration(config) && (
+                            <Box component="div" mt={1}>
+                              {config.integrationDocLink ? (
+                                <Button 
+                                  variant="outlined" 
+                                  size="small"
+                                  href={config.integrationDocLink} 
+                                  target="_blank" 
+                                  rel="noopener noreferrer"
+                                  sx={{ textTransform: 'none' }}
+                                >
+                                  View API Documentation
+                                </Button>
+                              ) : (
+                                <Typography component="span" variant="caption" color="text.secondary">
+                                  No documentation link provided
+                                </Typography>
+                              )}
+                            </Box>
+                          )}
+                        </Box>
+                      }
                     />
                   </ListItem>
-                ))}
-              </List>
-            </CardContent>
-          </Card>
-        )}
+                )) : (
+                  <ListItem>
+                    <ListItemText 
+                      primaryTypographyProps={{ component: 'div' }}
+                      primary={<Typography component="span">No configurations have been shared with you</Typography>} 
+                    />
+                  </ListItem>
+                )
+              }
+            </List>
+          </CardContent>
+        </Card>
 
+        {/* Website Configuration Dialog */}
         <Dialog open={openDialog} onClose={() => setOpenDialog(false)}>
-          <DialogTitle>Add New Configuration</DialogTitle>
+          <DialogTitle>Add Website Configuration</DialogTitle>
           <DialogContent>
             <TextField
               autoFocus
@@ -328,6 +546,70 @@ export default function Config() {
               Cancel
             </Button>
             <Button onClick={handleAddConfig} color="primary">
+              Add
+            </Button>
+          </DialogActions>
+        </Dialog>
+
+        {/* API Configuration Dialog */}
+        <Dialog open={openApiDialog} onClose={() => setOpenApiDialog(false)}>
+          <DialogTitle>Add API Configuration</DialogTitle>
+          <DialogContent>
+            <TextField
+              autoFocus
+              margin="dense"
+              label="API/App Name"
+              fullWidth
+              value={newApiConfig.appName}
+              onChange={(e) =>
+                setNewApiConfig({ ...newApiConfig, appName: e.target.value })
+              }
+              helperText="Provide a name for the API integration (e.g., Stripe, GitHub)"
+            />
+            <TextField
+              margin="dense"
+              label="API Key Name"
+              fullWidth
+              value={newApiConfig.username}
+              onChange={(e) =>
+                setNewApiConfig({ ...newApiConfig, username: e.target.value })
+              }
+              helperText="Provide the key name or property name as required by the API"
+            />
+            <TextField
+              margin="dense"
+              label="API Key/Secret"
+              type="password"
+              fullWidth
+              value={newApiConfig.password}
+              onChange={(e) =>
+                setNewApiConfig({ ...newApiConfig, password: e.target.value })
+              }
+              helperText="The actual API key or secret value"
+            />
+            <TextField
+              margin="dense"
+              label="Documentation URL (Optional)"
+              fullWidth
+              value={newApiConfig.integrationDocLink}
+              onChange={(e) =>
+                setNewApiConfig({ ...newApiConfig, integrationDocLink: e.target.value })
+              }
+              helperText="Link to integration documentation (optional)"
+            />
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={() => {
+              setOpenApiDialog(false);
+              setFieldError('');
+            }}>
+              Cancel
+            </Button>
+            <Button 
+              onClick={handleAddApiConfig} 
+              color="primary"
+              disabled={!newApiConfig.appName || !newApiConfig.username || !newApiConfig.password}
+            >
               Add
             </Button>
           </DialogActions>

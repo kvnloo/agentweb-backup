@@ -323,7 +323,8 @@ const createConfigsTable = async () => {
     AttributeDefinitions: [
       { AttributeName: 'userId', AttributeType: 'S' },
       { AttributeName: 'configId', AttributeType: 'S' },
-      { AttributeName: 'shareWithEveryone', AttributeType: 'N' }
+      { AttributeName: 'shareWithEveryone', AttributeType: 'N' },
+      { AttributeName: 'appName', AttributeType: 'S' }
     ],
     GlobalSecondaryIndexes: [
       {
@@ -343,6 +344,19 @@ const createConfigsTable = async () => {
         IndexName: 'ShareWithEveryoneIndex',
         KeySchema: [
           { AttributeName: 'shareWithEveryone', KeyType: 'HASH' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5
+        }
+      },
+      {
+        IndexName: 'AppNameIndex',
+        KeySchema: [
+          { AttributeName: 'appName', KeyType: 'HASH' }
         ],
         Projection: {
           ProjectionType: 'ALL'
