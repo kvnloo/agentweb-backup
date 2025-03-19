@@ -451,7 +451,7 @@ class WebAgent:
             except Exception as e:
                 return ActionResult(error=f"Error retrieving integration details: {str(e)}")
                 
-        @self.controller.registry.action('Run integration')
+        @self.controller.registry.action('Run integration. Use "YOUR_API_CREDENTIAL" as a placeholder wherever you need to use the actual API credential in your code. Never print the API credential in your code.')
         def run_integration(app_name: str, python_code: str) -> ActionResult:
             """Run Python code with API credentials injected
             
