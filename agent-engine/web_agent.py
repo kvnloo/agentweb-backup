@@ -351,6 +351,315 @@ class WebAgent:
             except Exception as e:
                 return ActionResult(error=f"Error getting credentials: {str(e)}")
                 
+        @self.controller.registry.action('Get integration instructions')
+        def get_integration_instructions(app_name: str) -> ActionResult:
+            """Get integration instructions and details for an API
+            
+            Parameters:
+            - app_name: The name of the API configuration to retrieve (e.g., 'Stripe', 'GitHub')
+            
+            Returns:
+            - API Name: The name of the API configuration
+            - Key Name: The name of the API key as stored in the config
+            - Documentation: Link to the API documentation if provided
+            
+            This action should be called first before using run_integration to:
+            1. Verify the API configuration exists
+            2. Get the API key name for reference
+            3. Access documentation links for understanding how to use the API
+            
+            Workflow:
+            1. Call get_integration_instructions with the app_name
+            2. Read documentation if needed (from the returned link)
+            3. Create Python code that uses the "YOUR_API_CREDENTIAL" placeholder
+            4. Call run_integration with the same app_name and your Python code
+            
+            IMPORTANT: When creating your Python code for run_integration, 
+            use "YOUR_API_CREDENTIAL" as a placeholder wherever you need to use
+            the actual API credential in your code. This placeholder will be 
+            automatically replaced with the real credential when the code runs.
+            
+            Example:
+            ```python
+            # GitHub API example using the placeholder
+            headers = {'Authorization': f'token YOUR_API_CREDENTIAL'}
+            
+            # Stripe API example using the placeholder
+            stripe.api_key = YOUR_API_CREDENTIAL
+            ```
+            """
+            if not self.user_id:
+                return ActionResult(error="User ID not provided")
+            if not app_name:
+                return ActionResult(error="Please provide an API/App name")
+                
+            logger.info(f"Getting integration instructions for {app_name} under user {self.user_id}")
+                
+            table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
+            
+            # First check user's own API configs
+            user_response = table.query(
+                KeyConditionExpression='userId = :userId',
+                FilterExpression='isApiConfig = :isApiConfig AND appName = :appName',
+                ExpressionAttributeValues={
+                    ':userId': self.user_id,
+                    ':isApiConfig': True,
+                    ':appName': app_name
+                }
+            )
+            
+            items = user_response.get('Items', [])
+            
+            if not items:
+                # If no direct matches, check for publicly shared API configs
+                public_response = table.query(
+                    IndexName='ShareWithEveryoneIndex',
+                    KeyConditionExpression='shareWithEveryone = :shareWithEveryone',
+                    FilterExpression='isApiConfig = :isApiConfig AND appName = :appName AND userId <> :userId',
+                    ExpressionAttributeValues={
+                        ':shareWithEveryone': 1,
+                        ':isApiConfig': True,
+                        ':appName': app_name,
+                        ':userId': self.user_id
+                    }
+                )
+                items.extend(public_response.get('Items', []))
+            
+            if not items:
+                return ActionResult(error=f"No API configuration found for: {app_name}")
+                
+            try:
+                # Sort items by priority (user's own first, then shared)
+                sorted_items = sorted(items, key=lambda x: (
+                    0 if not x.get('sharedBy') else 1
+                ))
+                
+                config = sorted_items[0]
+                
+                # Create an information packet including documentation link and credential field names
+                integration_info = {
+                    "app_name": config['appName'],
+                    "credential_field": config['username'],  # This is the API key name/field
+                    "documentation_link": config.get('integrationDocLink', "No documentation link provided")
+                }
+                
+                return ActionResult(
+                    extracted_content=f"API Name: {integration_info['app_name']}\n"
+                                    f"Key Name: {integration_info['credential_field']}\n"
+                                    f"Documentation: {integration_info['documentation_link']}"
+                )
+            except Exception as e:
+                return ActionResult(error=f"Error retrieving integration details: {str(e)}")
+                
+        @self.controller.registry.action('Run integration. Use "YOUR_API_CREDENTIAL" as a placeholder wherever you need to use the actual API credential in your code. Never print the API credential in your code.')
+        def run_integration(app_name: str, python_code: str) -> ActionResult:
+            """Run Python code with API credentials injected
+            
+            Parameters:
+            - app_name: The name of the API configuration to use (e.g., 'Stripe', 'GitHub')
+            - python_code: Valid Python code to execute with the API credentials
+            
+            The python_code parameter should contain complete, executable Python code that uses the API.
+            
+            IMPORTANT: Use 'YOUR_API_CREDENTIAL' as a placeholder in your code where you need the 
+            actual API credential value. This placeholder will be automatically replaced with the 
+            real credential when the code runs.
+            
+            Example for GitHub API:
+            ```python
+            import requests
+            
+            # Use the YOUR_API_CREDENTIAL placeholder in your code where you need the token
+            headers = {'Authorization': f'token YOUR_API_CREDENTIAL'}
+            response = requests.get('https://api.github.com/user/repos', headers=headers)
+            
+            # Print results for the agent to see
+            if response.status_code == 200:
+                repos = response.json()
+                for repo in repos:
+                    print(f"Repository: {repo['name']}")
+                    print(f"Description: {repo['description']}")
+                    print(f"URL: {repo['html_url']}")
+                    print("-" * 40)
+            else:
+                print(f"Error: {response.status_code}")
+                print(response.text)
+            ```
+            
+            Important notes:
+            - Code execution has a 30-second timeout
+            - Standard Python libraries are available
+            - External libraries like 'requests' are available
+            - Return values should be printed to stdout to be returned to the agent
+            - DO NOT include real credentials in your code - use YOUR_API_CREDENTIAL placeholder
+            - The same placeholder text (YOUR_API_CREDENTIAL) must be used regardless of the API being used
+            """
+            if not self.user_id:
+                return ActionResult(error="User ID not provided")
+            if not app_name:
+                return ActionResult(error="Please provide an API/App name")
+            if not python_code:
+                return ActionResult(error="Please provide Python code to execute")
+            
+            # Check if the placeholder is present
+            if "YOUR_API_CREDENTIAL" not in python_code:
+                return ActionResult(error="No 'YOUR_API_CREDENTIAL' placeholder found in code. Please include this placeholder where the API credential should be used.")
+                
+            logger.info(f"Running integration for {app_name}")
+                
+            # Get API credentials
+            table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
+            
+            # First check user's own API configs
+            user_response = table.query(
+                KeyConditionExpression='userId = :userId',
+                FilterExpression='isApiConfig = :isApiConfig AND appName = :appName',
+                ExpressionAttributeValues={
+                    ':userId': self.user_id,
+                    ':isApiConfig': True,
+                    ':appName': app_name
+                }
+            )
+            
+            items = user_response.get('Items', [])
+            
+            if not items:
+                # If no direct matches, check for publicly shared API configs
+                logger.info(f"No personal API config found for {app_name}, checking shared configs")
+                public_response = table.query(
+                    IndexName='ShareWithEveryoneIndex',
+                    KeyConditionExpression='shareWithEveryone = :shareWithEveryone',
+                    FilterExpression='isApiConfig = :isApiConfig AND appName = :appName AND userId <> :userId',
+                    ExpressionAttributeValues={
+                        ':shareWithEveryone': 1,
+                        ':isApiConfig': True,
+                        ':appName': app_name,
+                        ':userId': self.user_id
+                    }
+                )
+                items.extend(public_response.get('Items', []))
+            
+            if not items:
+                return ActionResult(error=f"No API configuration found for: {app_name}")
+                
+            try:
+                # Sort items by priority (user's own first, then shared)
+                sorted_items = sorted(items, key=lambda x: (
+                    0 if not x.get('sharedBy') else 1
+                ))
+                
+                config = sorted_items[0]
+                shared_by = config.get('sharedBy')
+                
+                # Decrypt the API key/secret
+                api_key = decrypt_password(config['password'], self.user_id, shared_by)
+                api_key_name = config['username']  # This is the API key name
+                
+                logger.info(f"Successfully retrieved credential for {app_name} (key name: {api_key_name})")
+                
+                # Execute the Python code in a safe environment with the API credentials
+                import tempfile
+                import subprocess
+                import uuid
+                import os
+                
+                # Create a temporary directory with the execution ID for isolation
+                temp_dir = tempfile.gettempdir()
+                execution_subdir = os.path.join(temp_dir, f"execution_{self.current_execution_id}")
+                
+                # Create the execution-specific directory if it doesn't exist
+                os.makedirs(execution_subdir, exist_ok=True)
+                
+                # Set permissions to restrict access (0o700 = rwx------)
+                os.chmod(execution_subdir, 0o700)
+                
+                # Create a temporary file within the execution-specific directory
+                script_id = uuid.uuid4()
+                temp_file_path = os.path.join(execution_subdir, f"integration_{script_id}.py")
+                
+                # Replace the placeholder with the actual credential
+                modified_code = python_code.replace("YOUR_API_CREDENTIAL", api_key)
+                
+                # Add a header comment
+                final_code = f"""# Integration script for {app_name}
+# API credential placeholder has been replaced with the actual credential
+# Original credential field name: {api_key_name}
+
+{modified_code}
+"""
+                
+                # Write the code to the temporary file
+                with open(temp_file_path, "w") as f:
+                    f.write(final_code)
+                
+                logger.info(f"Created temporary script at {temp_file_path}")
+                
+                # Execute the script with a timeout
+                try:
+                    logger.info(f"Executing integration script with timeout of 30 seconds")
+                    
+                    # Use a restricted environment for the subprocess
+                    # Instead of copying all environment variables, create a minimal set
+                    env = {
+                        "PATH": os.environ.get("PATH", ""),  # Needed to find Python executable
+                        "PYTHONPATH": execution_subdir,  # Set PYTHONPATH to only the execution directory for isolation
+                        "LANG": os.environ.get("LANG", "en_US.UTF-8"),  # Basic locale setting
+                        "PYTHONIOENCODING": os.environ.get("PYTHONIOENCODING", "utf-8"),  # Ensure proper encoding
+                        "TEMP": temp_dir,  # Provide access to temp directory
+                        "TMP": temp_dir,  # Provide access to temp directory
+                        "INTEGRATION_EXECUTION_ID": self.current_execution_id  # Allow tracking which execution this is
+                    }
+                    
+                    # Don't include AWS credentials, API keys, or other sensitive environment variables
+                    logger.info("Created restricted environment with limited variables for integration execution")
+                    
+                    result = subprocess.run(
+                        ["python", temp_file_path],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,  # 30 second timeout for safety
+                        cwd=execution_subdir,  # Run from the isolated directory
+                        env=env  # Use the restricted environment
+                    )
+                    
+                    # Process the result
+                    if result.returncode == 0:
+                        output = result.stdout
+                        return ActionResult(extracted_content=output if output else "Code executed successfully with no output")
+                    else:
+                        error_msg = result.stderr
+                        return ActionResult(error=f"Execution failed: {error_msg}")
+                        
+                except subprocess.TimeoutExpired:
+                    # Clean up on timeout
+                    if os.path.exists(temp_file_path):
+                        os.remove(temp_file_path)
+                    return ActionResult(error="Execution timed out after 30 seconds")
+                    
+                except Exception as e:
+                    # Clean up on any other error
+                    if os.path.exists(temp_file_path):
+                        os.remove(temp_file_path)
+                    return ActionResult(error=f"Error during execution: {str(e)}")
+                
+                finally:
+                    # Instead of removing the directory, just clean up files but preserve the directory
+                    try:
+                        # Remove any remaining files in the directory except the script
+                        script_filename = f"integration_{script_id}.py"
+                        for file in os.listdir(execution_subdir):
+                            if file != script_filename:  # Skip the integration script file
+                                file_path = os.path.join(execution_subdir, file)
+                                if os.path.isfile(file_path):
+                                    os.remove(file_path)
+                        
+                        logger.info(f"Cleaned up temporary files in execution directory: {execution_subdir}")
+                    except Exception as e:
+                        logger.warning(f"Failed to clean up temporary files in execution directory: {str(e)}")
+            except Exception as e:
+                logger.error(f"Error during API integration setup: {str(e)}")
+                return ActionResult(error=f"Error running integration: {str(e)}")
+
         @self.controller.registry.action('Sleep')
         async def sleep(seconds: float) -> ActionResult:
             """Sleep for a specified number of seconds (max 5 minutes)"""

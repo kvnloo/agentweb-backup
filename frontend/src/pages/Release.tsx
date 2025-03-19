@@ -7,6 +7,16 @@ interface Release {
 
 const releases: Release[] = [
   {
+    date: "2025-03-18",
+    changes: [
+      "Added no-code API access via Config page",
+      "- Users can now connect to external APIs without writing any code",
+      "- Simply provide API name, key, and documentation link in the Config page",
+      "- Agents then can use the API in their tasks",
+      "- Share API configurations while maintaining security"
+    ]
+  },
+  {
     date: "2025-03-17",
     changes: [
       "Added Extract Page Content option on Task Details page",
