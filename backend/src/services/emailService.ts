@@ -48,6 +48,16 @@ export const emailService = {
           </div>
           <p>If the button doesn't work, you can copy and paste this link into your browser:</p>
           <p>${process.env.FRONTEND_URL}/register?email=${encodeURIComponent(email)}</p>
+          
+          <h3>Getting Started with AgentWeb</h3>
+          <p>Check out these resources to help you get the most out of AgentWeb:</p>
+          <ul>
+            <li><a href="${process.env.FRONTEND_URL}/release">Release Notes</a> - Learn about our latest features and updates</li>
+            <li><a href="${process.env.FRONTEND_URL}/guide">User Guide</a> - Detailed instructions on how to create and manage your web automation tasks</li>
+          </ul>
+          
+          <p>Your feedback is invaluable as we continue to improve our platform. Please reply to this email with any questions, suggestions, or insights about your experience with AgentWeb.</p>
+          
           <p>Best regards,<br>The AgentWeb Team</p>
         </div>
       `
