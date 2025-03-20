@@ -58,7 +58,7 @@ export const emailService = {
           
           <p>Your feedback is invaluable as we continue to improve our platform. Please reply to this email with any questions, suggestions, or insights about your experience with AgentWeb.</p>
           
-          <p>Best regards,<br>The AgentWeb Team</p>
+          <p>Best regards,<br>Rui Wang<br>CTO, AgentWeb</p>
         </div>
       `
     };
