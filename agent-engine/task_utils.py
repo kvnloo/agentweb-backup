@@ -1054,3 +1054,115 @@ async def call_github_api(
         error_msg = f"Error making GitHub API request: {str(e)}"
         logger.error(error_msg)
         return 500, {}, error_msg 
+
+def run_python_code_in_sandbox(
+    python_code: str, 
+    execution_id: str, 
+    script_type: str = "script",
+    header_comment: Optional[str] = None,
+    additional_env_vars: Optional[Dict[str, str]] = None
+) -> ActionResult:
+    """Execute Python code in a sandboxed environment.
+    
+    This function creates a temporary file in an isolated directory and executes
+    the provided Python code with limited permissions and environment variables.
+    It handles timeouts, captures output, and cleans up temporary files.
+    
+    Args:
+        python_code: The Python code to execute
+        execution_id: Current execution ID, used to create an isolated directory
+        script_type: Type of script for naming (e.g., "github", "integration")
+        header_comment: Optional header comment to add to the script
+        additional_env_vars: Optional additional environment variables for the execution
+        
+    Returns:
+        ActionResult object containing execution output or error
+    """
+    import tempfile
+    import subprocess
+    import uuid
+    import os
+    from pathlib import Path
+    from browser_use.agent.views import ActionResult
+    
+    try:
+        # Create a temporary directory with the execution ID for isolation
+        temp_dir = tempfile.gettempdir()
+        execution_subdir = os.path.join(temp_dir, f"execution_{execution_id}")
+        
+        # Create the execution-specific directory if it doesn't exist
+        os.makedirs(execution_subdir, exist_ok=True)
+        
+        # Set permissions to restrict access (0o700 = rwx------)
+        os.chmod(execution_subdir, 0o700)
+        
+        # Create a temporary file within the execution-specific directory
+        script_id = uuid.uuid4()
+        temp_file_path = os.path.join(execution_subdir, f"{script_type}_{script_id}.py")
+        
+        # Add a header comment if provided
+        if header_comment:
+            final_code = f"{header_comment}\n\n{python_code}"
+        else:
+            final_code = python_code
+        
+        # Write the code to the temporary file
+        with open(temp_file_path, "w") as f:
+            f.write(final_code)
+        
+        logger.info(f"Created temporary script at {temp_file_path}")
+        
+        # Execute the script with a timeout
+        try:
+            logger.info(f"Executing {script_type} script with timeout of 30 seconds")
+            
+            # Use a restricted environment for the subprocess
+            env = {
+                "PATH": os.environ.get("PATH", ""),  # Needed to find Python executable
+                "PYTHONPATH": execution_subdir,  # Set PYTHONPATH to only the execution directory for isolation
+                "LANG": os.environ.get("LANG", "en_US.UTF-8"),  # Basic locale setting
+                "PYTHONIOENCODING": os.environ.get("PYTHONIOENCODING", "utf-8"),  # Ensure proper encoding
+                "TEMP": temp_dir,  # Provide access to temp directory
+                "TMP": temp_dir,  # Provide access to temp directory
+                "EXECUTION_ID": execution_id  # Allow tracking which execution this is
+            }
+            
+            # Add any additional environment variables
+            if additional_env_vars:
+                env.update(additional_env_vars)
+            
+            result = subprocess.run(
+                ["python", temp_file_path],
+                capture_output=True,
+                text=True,
+                timeout=30,  # 30 second timeout for safety
+                cwd=execution_subdir,  # Run from the isolated directory
+                env=env  # Use the restricted environment
+            )
+            
+            # Process the result
+            if result.returncode == 0:
+                output = result.stdout
+                return ActionResult(extracted_content=output if output else f"Code executed successfully with no output")
+            else:
+                error_msg = result.stderr
+                return ActionResult(error=f"Execution failed: {error_msg}")
+                
+        except subprocess.TimeoutExpired:
+            return ActionResult(error="Execution timed out after 30 seconds")
+            
+        except Exception as e:
+            return ActionResult(error=f"Error during execution: {str(e)}")
+        
+        finally:
+            # Clean up
+            try:
+                if os.path.exists(temp_file_path):
+                    os.remove(temp_file_path)
+                logger.info(f"Cleaned up temporary script file")
+            except Exception as e:
+                logger.warning(f"Failed to clean up temporary file: {str(e)}")
+    
+    except Exception as e:
+        logger.error(f"Error setting up Python code execution: {str(e)}")
+        return ActionResult(error=f"Failed to execute Python code: {str(e)}") 

@@ -27,7 +27,7 @@ import aiohttp
 import base64  # Add at the top with other imports
 import boto3  # Add at the top with other imports
 from urllib.parse import quote
-from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content, generate_content_hash, get_agent_code_base_path, call_github_api
+from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content, generate_content_hash, get_agent_code_base_path, call_github_api, run_python_code_in_sandbox
 # Load environment variables
 load_dotenv()
 
@@ -557,105 +557,23 @@ class WebAgent:
                 
                 logger.info(f"Successfully retrieved credential for {app_name} (key name: {api_key_name})")
                 
-                # Execute the Python code in a safe environment with the API credentials
-                import tempfile
-                import subprocess
-                import uuid
-                import os
-                
-                # Create a temporary directory with the execution ID for isolation
-                temp_dir = tempfile.gettempdir()
-                execution_subdir = os.path.join(temp_dir, f"execution_{self.current_execution_id}")
-                
-                # Create the execution-specific directory if it doesn't exist
-                os.makedirs(execution_subdir, exist_ok=True)
-                
-                # Set permissions to restrict access (0o700 = rwx------)
-                os.chmod(execution_subdir, 0o700)
-                
-                # Create a temporary file within the execution-specific directory
-                script_id = uuid.uuid4()
-                temp_file_path = os.path.join(execution_subdir, f"integration_{script_id}.py")
-                
                 # Replace the placeholder with the actual credential
                 modified_code = python_code.replace("YOUR_API_CREDENTIAL", api_key)
                 
-                # Add a header comment
-                final_code = f"""# Integration script for {app_name}
+                # Create header comment
+                header_comment = f"""# Integration script for {app_name}
 # API credential placeholder has been replaced with the actual credential
-# Original credential field name: {api_key_name}
-
-{modified_code}
-"""
+# Original credential field name: {api_key_name}"""
                 
-                # Write the code to the temporary file
-                with open(temp_file_path, "w") as f:
-                    f.write(final_code)
+                # Execute the Python code in a sandboxed environment using the utility function
+                return run_python_code_in_sandbox(
+                    python_code=modified_code,
+                    execution_id=self.current_execution_id,
+                    script_type="integration",
+                    header_comment=header_comment,
+                    additional_env_vars={"INTEGRATION_EXECUTION_ID": self.current_execution_id}
+                )
                 
-                logger.info(f"Created temporary script at {temp_file_path}")
-                
-                # Execute the script with a timeout
-                try:
-                    logger.info(f"Executing integration script with timeout of 30 seconds")
-                    
-                    # Use a restricted environment for the subprocess
-                    # Instead of copying all environment variables, create a minimal set
-                    env = {
-                        "PATH": os.environ.get("PATH", ""),  # Needed to find Python executable
-                        "PYTHONPATH": execution_subdir,  # Set PYTHONPATH to only the execution directory for isolation
-                        "LANG": os.environ.get("LANG", "en_US.UTF-8"),  # Basic locale setting
-                        "PYTHONIOENCODING": os.environ.get("PYTHONIOENCODING", "utf-8"),  # Ensure proper encoding
-                        "TEMP": temp_dir,  # Provide access to temp directory
-                        "TMP": temp_dir,  # Provide access to temp directory
-                        "INTEGRATION_EXECUTION_ID": self.current_execution_id  # Allow tracking which execution this is
-                    }
-                    
-                    # Don't include AWS credentials, API keys, or other sensitive environment variables
-                    logger.info("Created restricted environment with limited variables for integration execution")
-                    
-                    result = subprocess.run(
-                        ["python", temp_file_path],
-                        capture_output=True,
-                        text=True,
-                        timeout=30,  # 30 second timeout for safety
-                        cwd=execution_subdir,  # Run from the isolated directory
-                        env=env  # Use the restricted environment
-                    )
-                    
-                    # Process the result
-                    if result.returncode == 0:
-                        output = result.stdout
-                        return ActionResult(extracted_content=output if output else "Code executed successfully with no output")
-                    else:
-                        error_msg = result.stderr
-                        return ActionResult(error=f"Execution failed: {error_msg}")
-                        
-                except subprocess.TimeoutExpired:
-                    # Clean up on timeout
-                    if os.path.exists(temp_file_path):
-                        os.remove(temp_file_path)
-                    return ActionResult(error="Execution timed out after 30 seconds")
-                    
-                except Exception as e:
-                    # Clean up on any other error
-                    if os.path.exists(temp_file_path):
-                        os.remove(temp_file_path)
-                    return ActionResult(error=f"Error during execution: {str(e)}")
-                
-                finally:
-                    # Instead of removing the directory, just clean up files but preserve the directory
-                    try:
-                        # Remove any remaining files in the directory except the script
-                        script_filename = f"integration_{script_id}.py"
-                        for file in os.listdir(execution_subdir):
-                            if file != script_filename:  # Skip the integration script file
-                                file_path = os.path.join(execution_subdir, file)
-                                if os.path.isfile(file_path):
-                                    os.remove(file_path)
-                        
-                        logger.info(f"Cleaned up temporary files in execution directory: {execution_subdir}")
-                    except Exception as e:
-                        logger.warning(f"Failed to clean up temporary files in execution directory: {str(e)}")
             except Exception as e:
                 logger.error(f"Error during API integration setup: {str(e)}")
                 return ActionResult(error=f"Error running integration: {str(e)}")
@@ -772,11 +690,9 @@ class WebAgent:
                 # Call GitHub API to get file content
                 status, content, error = await call_github_api("get", endpoint)
                 
-                # If file not found, try searching in user directories
+                # Return error if file not found
                 if status == 404:
-                    error_message = f"Failed to search in user directory: {error}"
-                    logger.info(error_message)
-                    return ActionResult(error=error_message)
+                    return ActionResult(error=f"File '{code_file_name}' not found in the specified path.")
                 elif error:
                     return ActionResult(error=f"Failed to fetch code: {status}")
                 
@@ -786,86 +702,19 @@ class WebAgent:
                 else:
                     return ActionResult(error="Invalid content format received from GitHub")
                 
-                # Execute the Python code in a safe environment
-                import tempfile
-                import subprocess
-                import uuid
-                import os
-                
-                # Create a temporary directory with the execution ID for isolation
-                temp_dir = tempfile.gettempdir()
-                execution_subdir = os.path.join(temp_dir, f"execution_{self.current_execution_id}")
-                
-                # Create the execution-specific directory if it doesn't exist
-                os.makedirs(execution_subdir, exist_ok=True)
-                
-                # Set permissions to restrict access (0o700 = rwx------)
-                os.chmod(execution_subdir, 0o700)
-                
-                # Create a temporary file within the execution-specific directory
-                script_id = uuid.uuid4()
-                temp_file_path = os.path.join(execution_subdir, f"github_code_{script_id}.py")
-                
-                # Add a header comment
-                final_code = f"""# GitHub code execution from {code_file_name}
-# Executed at: {time.strftime('%Y-%m-%d %H:%M:%S')}
+                # Create a header comment for the script
+                header_comment = f"""# GitHub code execution from {code_file_name}
+# Executed at: {time.strftime('%Y-%m-%d %H:%M:%S')}"""
 
-{python_code}
-"""
+                # Execute the Python code in a sandboxed environment using the utility function
+                return run_python_code_in_sandbox(
+                    python_code=python_code,
+                    execution_id=self.current_execution_id,
+                    script_type="github",
+                    header_comment=header_comment,
+                    additional_env_vars={"GITHUB_EXECUTION_ID": self.current_execution_id}
+                )
                 
-                # Write the code to the temporary file
-                with open(temp_file_path, "w") as f:
-                    f.write(final_code)
-                
-                logger.info(f"Created temporary script at {temp_file_path}")
-                
-                # Execute the script with a timeout
-                try:
-                    logger.info(f"Executing GitHub script with timeout of 30 seconds")
-                    
-                    # Use a restricted environment for the subprocess
-                    env = {
-                        "PATH": os.environ.get("PATH", ""),
-                        "PYTHONPATH": execution_subdir,
-                        "LANG": os.environ.get("LANG", "en_US.UTF-8"),
-                        "PYTHONIOENCODING": os.environ.get("PYTHONIOENCODING", "utf-8"),
-                        "TEMP": temp_dir,
-                        "TMP": temp_dir,
-                        "GITHUB_EXECUTION_ID": self.current_execution_id
-                    }
-                    
-                    result = subprocess.run(
-                        ["python", temp_file_path],
-                        capture_output=True,
-                        text=True,
-                        timeout=30,  # 30 second timeout for safety
-                        cwd=execution_subdir,  # Run from the isolated directory
-                        env=env  # Use the restricted environment
-                    )
-                    
-                    # Process the result
-                    if result.returncode == 0:
-                        output = result.stdout
-                        return ActionResult(extracted_content=output if output else f"Code from {code_file_name} executed successfully with no output")
-                    else:
-                        error_msg = result.stderr
-                        return ActionResult(error=f"Execution failed: {error_msg}")
-                        
-                except subprocess.TimeoutExpired:
-                    return ActionResult(error="Execution timed out after 30 seconds")
-                    
-                except Exception as e:
-                    return ActionResult(error=f"Error during execution: {str(e)}")
-                
-                finally:
-                    # Clean up
-                    try:
-                        if os.path.exists(temp_file_path):
-                            os.remove(temp_file_path)
-                        logger.info(f"Cleaned up temporary script file")
-                    except Exception as e:
-                        logger.warning(f"Failed to clean up temporary file: {str(e)}")
-                        
             except Exception as e:
                 logger.error(f"Error running Python code: {str(e)}")
                 return ActionResult(error=f"Failed to run Python code: {str(e)}")
