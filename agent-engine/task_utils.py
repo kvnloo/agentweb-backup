@@ -83,9 +83,6 @@ def get_agent_code_base_path(user_id: str, task_id: Optional[str] = None) -> str
     env = os.getenv('NODE_ENV')
     env_path = 'dev' if env == 'development' else 'prod'
     
-    logger.info(f"Building agent code path with NODE_ENV={env}, resulting in env_path={env_path}")
-    logger.info(f"Using user_id={user_id}, task_id={task_id}")
-    
     # Create base path with user_id
     base_path = f"agent-scripts/{env_path}/{user_id}"
     
@@ -93,7 +90,6 @@ def get_agent_code_base_path(user_id: str, task_id: Optional[str] = None) -> str
     if task_id:
         base_path = f"{base_path}/{task_id}"
     
-    logger.info(f"Final base path for agent code: {base_path}")
     return base_path
 
 def get_aws_bedrock_llm(model_name: str):
@@ -990,11 +986,6 @@ async def call_github_api(
     
     logger.info(f"Making GitHub API {method.upper()} request to: {api_url}")
     
-    # For troubleshooting, construct the equivalent browser URL
-    browser_url = api_url.replace("api.github.com/repos", "github.com")
-    browser_url = browser_url.replace("/contents/", "/blob/main/")
-    logger.info(f"Equivalent browser URL would be: {browser_url}")
-    
     # Make the API request
     try:
         async with aiohttp.ClientSession() as session:
@@ -1002,22 +993,10 @@ async def call_github_api(
             if method.lower() == "get":
                 async with session.get(api_url, headers=headers) as response:
                     status = response.status
-                    logger.info(f"GitHub API response status: {status}")
-                    
                     if status == 200:
                         try:
                             # Try to parse as JSON
                             result = await response.json()
-                            # Log the first few items if it's a list
-                            if isinstance(result, list):
-                                logger.info(f"Received list response with {len(result)} items")
-                                if len(result) > 0:
-                                    logger.info(f"First item example: {result[0]}")
-                            else:
-                                # Log some basic info about the response
-                                if isinstance(result, dict):
-                                    keys = list(result.keys())
-                                    logger.info(f"Received JSON response with keys: {keys}")
                         except:
                             # If not JSON, return text
                             result = await response.text()
