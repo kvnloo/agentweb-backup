@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Union
 import boto3
 import random
 import logging
@@ -8,6 +8,8 @@ import sys
 import json
 import hashlib
 from urllib.parse import quote
+import aiohttp
+from browser_use.agent.views import ActionResult
 from aws_utils import get_dynamodb_resource, get_s3_client, get_bedrock_client
 from pydantic import SecretStr
 from langchain_aws import ChatBedrock
@@ -62,6 +64,37 @@ def get_downloads_path(user_id: Optional[str] = None, execution_id: Optional[str
     
     base_path.mkdir(parents=True, exist_ok=True)
     return str(base_path)
+
+def get_agent_code_base_path(user_id: str, task_id: Optional[str] = None) -> str:
+    """
+    Get the base path for agent code files in the GitHub repository.
+    
+    This function constructs the path based on the environment (production or development)
+    and the provided user_id and task_id.
+    
+    Args:
+        user_id: The user ID
+        task_id: Optional task ID to include in the path
+        
+    Returns:
+        A string representing the path to the agent code directory in the GitHub repository
+    """
+    # Determine environment based on NODE_ENV
+    env = os.getenv('NODE_ENV')
+    env_path = 'dev' if env == 'development' else 'prod'
+    
+    logger.info(f"Building agent code path with NODE_ENV={env}, resulting in env_path={env_path}")
+    logger.info(f"Using user_id={user_id}, task_id={task_id}")
+    
+    # Create base path with user_id
+    base_path = f"agent-scripts/{env_path}/{user_id}"
+    
+    # Add task_id if provided
+    if task_id:
+        base_path = f"{base_path}/{task_id}"
+    
+    logger.info(f"Final base path for agent code: {base_path}")
+    return base_path
 
 def get_aws_bedrock_llm(model_name: str):
     """Initialize AWS Bedrock language model"""
@@ -904,3 +937,141 @@ def extract_json_from_content(content_list: List[str]) -> List[Dict[str, Any]]:
                         logger.warning(f"Failed to extract truncated JSON object: {e}")
     
     return json_objects 
+
+async def call_github_api(
+    method: str,
+    endpoint: str,
+    json_data: Optional[Dict[str, Any]] = None
+) -> Tuple[int, Union[Dict[str, Any], List[Dict[str, Any]], str], Optional[str]]:
+    """Make a call to the GitHub API with proper authentication and error handling.
+    
+    This function centralizes GitHub API calls to ensure consistent authentication,
+    error handling, and logging across different API operations.
+    
+    Args:
+        method: HTTP method ("get", "post", "put", "delete")
+        endpoint: GitHub API endpoint path (e.g., "/repos/{owner}/{repo}/contents/{path}")
+        json_data: Optional JSON data to send with the request (for POST/PUT methods)
+        
+    Returns:
+        Tuple containing:
+        - HTTP status code
+        - Response data (parsed JSON or text if not JSON)
+        - Error message if there was an error, None otherwise
+    """
+    # GitHub repository information
+    owner = "john-the-dev"
+    repo = "agentweb-agentcode"
+    
+    # Get GitHub API key
+    github_api_key = os.getenv('GITHUB_API_KEY')
+    if not github_api_key:
+        return 401, {}, "GitHub API key not found in environment"
+    
+    # Set up headers with authorization
+    headers = {
+        "Authorization": f"token {github_api_key}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    
+    # Format endpoint with owner and repo if needed
+    if "{owner}" in endpoint and "{repo}" in endpoint:
+        endpoint = endpoint.format(owner=owner, repo=repo)
+    
+    # Construct full URL
+    api_base = "https://api.github.com"
+    if not endpoint.startswith(api_base):
+        # If endpoint starts with /, remove it to avoid double slash
+        if endpoint.startswith('/'):
+            endpoint = endpoint[1:]
+        api_url = f"{api_base}/{endpoint}"
+    else:
+        api_url = endpoint
+    
+    logger.info(f"Making GitHub API {method.upper()} request to: {api_url}")
+    
+    # For troubleshooting, construct the equivalent browser URL
+    browser_url = api_url.replace("api.github.com/repos", "github.com")
+    browser_url = browser_url.replace("/contents/", "/blob/main/")
+    logger.info(f"Equivalent browser URL would be: {browser_url}")
+    
+    # Make the API request
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Choose the appropriate method
+            if method.lower() == "get":
+                async with session.get(api_url, headers=headers) as response:
+                    status = response.status
+                    logger.info(f"GitHub API response status: {status}")
+                    
+                    if status == 200:
+                        try:
+                            # Try to parse as JSON
+                            result = await response.json()
+                            # Log the first few items if it's a list
+                            if isinstance(result, list):
+                                logger.info(f"Received list response with {len(result)} items")
+                                if len(result) > 0:
+                                    logger.info(f"First item example: {result[0]}")
+                            else:
+                                # Log some basic info about the response
+                                if isinstance(result, dict):
+                                    keys = list(result.keys())
+                                    logger.info(f"Received JSON response with keys: {keys}")
+                        except:
+                            # If not JSON, return text
+                            result = await response.text()
+                        return status, result, None
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"GitHub API error: {status} - {error_text}")
+                        return status, error_text, f"GitHub API error: {status}"
+            
+            elif method.lower() == "post":
+                async with session.post(api_url, headers=headers, json=json_data) as response:
+                    status = response.status
+                    if status in [200, 201]:
+                        try:
+                            result = await response.json()
+                        except:
+                            result = await response.text()
+                        return status, result, None
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"GitHub API error: {status} - {error_text}")
+                        return status, error_text, f"GitHub API error: {status}"
+            
+            elif method.lower() == "put":
+                async with session.put(api_url, headers=headers, json=json_data) as response:
+                    status = response.status
+                    if status in [200, 201]:
+                        try:
+                            result = await response.json()
+                        except:
+                            result = await response.text()
+                        return status, result, None
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"GitHub API error: {status} - {error_text}")
+                        return status, error_text, f"GitHub API error: {status}"
+            
+            elif method.lower() == "delete":
+                async with session.delete(api_url, headers=headers) as response:
+                    status = response.status
+                    if status in [200, 204]:
+                        try:
+                            result = await response.json()
+                        except:
+                            result = await response.text() if response.content_length and response.content_length > 0 else ""
+                        return status, result, None
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"GitHub API error: {status} - {error_text}")
+                        return status, error_text, f"GitHub API error: {status}"
+            else:
+                return 400, {}, f"Unsupported HTTP method: {method}"
+    
+    except Exception as e:
+        error_msg = f"Error making GitHub API request: {str(e)}"
+        logger.error(error_msg)
+        return 500, {}, error_msg 
