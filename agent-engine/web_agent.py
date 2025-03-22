@@ -621,7 +621,11 @@ class WebAgent:
                 # Call GitHub API
                 status, content, error = await call_github_api("get", endpoint)
                 
-                if error:
+                if status == 404:
+                    # Special handling for 404 - no files available yet
+                    message = "No Python code files are available yet for this user/task."
+                    return ActionResult(extracted_content=message)
+                elif error:
                     return ActionResult(error=f"Failed to fetch code list: {status}. Path {base_path} may not exist.")
                 
                 # Filter for Python files only
@@ -692,7 +696,7 @@ class WebAgent:
                 
                 # Return error if file not found
                 if status == 404:
-                    return ActionResult(error=f"File '{code_file_name}' not found in the specified path.")
+                    return ActionResult(error=f"File '{code_file_name}' not found")
                 elif error:
                     return ActionResult(error=f"Failed to fetch code: {status}")
                 
