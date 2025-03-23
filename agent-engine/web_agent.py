@@ -702,6 +702,7 @@ class WebAgent:
             Run Python code identified by the provided filename.
             
             The function retrieves the code from GitHub and executes it in a sandboxed environment.
+            API credentials will be automatically replaced if their placeholders are found in the code.
             
             Parameters:
                 code_file_name: The filename of the Python code to run (e.g., "script.py").
@@ -747,13 +748,85 @@ class WebAgent:
                 else:
                     return ActionResult(error="Invalid content format received from GitHub")
                 
+                # Check if code has API credential placeholders
+                modified_code = python_code
+                header_parts = [
+                    f"# GitHub code execution from {code_file_name}",
+                    f"# Executed at: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                ]
+                
+                # Get all API credentials
+                try:
+                    table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
+                    api_credentials = {}
+                    api_key_names = {}
+                    
+                    # Get user's own API configs
+                    user_response = table.query(
+                        KeyConditionExpression='userId = :userId',
+                        FilterExpression='isApiConfig = :isApiConfig',
+                        ExpressionAttributeValues={
+                            ':userId': self.user_id,
+                            ':isApiConfig': True
+                        }
+                    )
+                    
+                    items = user_response.get('Items', [])
+                    
+                    # If no direct matches, check for publicly shared API configs
+                    public_response = table.query(
+                        IndexName='ShareWithEveryoneIndex',
+                        KeyConditionExpression='shareWithEveryone = :shareWithEveryone',
+                        FilterExpression='isApiConfig = :isApiConfig AND userId <> :userId',
+                        ExpressionAttributeValues={
+                            ':shareWithEveryone': 1,
+                            ':isApiConfig': True,
+                            ':userId': self.user_id
+                        }
+                    )
+                    items.extend(public_response.get('Items', []))
+                    
+                    # Process all API configs
+                    for config in items:
+                        app_name = config['appName']
+                        shared_by = config.get('sharedBy')
+                        
+                        # Decrypt the API key/secret
+                        api_key = decrypt_password(config['password'], self.user_id, shared_by)
+                        api_key_name = config['username']  # This is the API key name
+                        
+                        # Create the app-specific credential placeholder name
+                        app_name_clean = app_name.upper().replace(" ", "_").replace("-", "_")
+                        placeholder = f"YOUR_{app_name_clean}_API_CREDENTIAL"
+                        
+                        api_credentials[app_name] = {
+                            "value": api_key,
+                            "placeholder": placeholder
+                        }
+                        api_key_names[app_name] = api_key_name
+                    
+                    # Replace API-specific placeholders
+                    credentials_replaced = False
+                    for app_name, cred_info in api_credentials.items():
+                        placeholder = cred_info["placeholder"]
+                        if placeholder in modified_code:
+                            modified_code = modified_code.replace(placeholder, cred_info["value"])
+                            header_parts.append(f"# API credential replaced: {app_name}")
+                            header_parts.append(f"# API credential field name: {api_key_names[app_name]}")
+                            credentials_replaced = True
+                    
+                    if credentials_replaced:
+                        header_parts.append("# Note: API credentials have been automatically injected")
+                except Exception as e:
+                    logger.warning(f"Error processing API credentials: {str(e)}")
+                    # Continue without credential replacement
+
                 # Create a header comment for the script
-                header_comment = f"""# GitHub code execution from {code_file_name}
-# Executed at: {time.strftime('%Y-%m-%d %H:%M:%S')}"""
+                header_comment = "\n".join(header_parts)
 
                 # Execute the Python code in a sandboxed environment using the utility function
                 return run_python_code_in_sandbox(
-                    python_code=python_code,
+                    python_code=modified_code,
                     execution_id=self.current_execution_id,
                     script_type="github",
                     header_comment=header_comment,
