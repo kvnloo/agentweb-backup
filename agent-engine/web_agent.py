@@ -5,7 +5,7 @@ import sys
 import os
 import re
 import uuid
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union
 import browser_use
 from browser_use import Agent, Controller
 from browser_use.browser.browser import Browser, BrowserConfig
@@ -363,7 +363,7 @@ class WebAgent:
             - Key Name: The name of the API key as stored in the config
             - Documentation: Link to the API documentation if provided
             
-            This action should be called first before using run_integration to:
+            This action should be called first before using run_integration_test to:
             1. Verify the API configuration exists
             2. Get the API key name for reference
             3. Access documentation links for understanding how to use the API
@@ -371,21 +371,26 @@ class WebAgent:
             Workflow:
             1. Call get_integration_instructions with the app_name
             2. Read documentation if needed (from the returned link)
-            3. Create Python code that uses the "YOUR_API_CREDENTIAL" placeholder
-            4. Call run_integration with the same app_name and your Python code
+            3. Create Python code that uses the appropriate placeholder (e.g., YOUR_GITHUB_API_CREDENTIAL)
+            4. Call run_integration_test with a list containing the app_name and your Python code
             
-            IMPORTANT: When creating your Python code for run_integration, 
-            use "YOUR_API_CREDENTIAL" as a placeholder wherever you need to use
-            the actual API credential in your code. This placeholder will be 
-            automatically replaced with the real credential when the code runs.
+            For multiple APIs:
+            1. Call get_integration_instructions for each API you need
+            2. Create Python code that uses specific API placeholders matching the API names
+               For example: YOUR_GITHUB_API_CREDENTIAL for GitHub, YOUR_STRIPE_API_CREDENTIAL for Stripe
+            3. Call run_integration_test with a list of all app_names and your Python code using the appropriate placeholders
             
-            Example:
+            IMPORTANT: When creating your Python code for run_integration_test, 
+            use API-specific credential placeholders that match each API name.
+            These placeholders will be automatically replaced with the real credentials when the code runs.
+            
+            For example:
             ```python
-            # GitHub API example using the placeholder
-            headers = {'Authorization': f'token YOUR_API_CREDENTIAL'}
+            # GitHub API example
+            headers = {'Authorization': f'token YOUR_GITHUB_API_CREDENTIAL'}
             
-            # Stripe API example using the placeholder
-            stripe.api_key = YOUR_API_CREDENTIAL
+            # Stripe API example
+            stripe.api_key = YOUR_STRIPE_API_CREDENTIAL
             ```
             """
             if not self.user_id:
@@ -451,39 +456,45 @@ class WebAgent:
             except Exception as e:
                 return ActionResult(error=f"Error retrieving integration details: {str(e)}")
                 
-        @self.controller.registry.action('Run integration. Use "YOUR_API_CREDENTIAL" as a placeholder wherever you need to use the actual API credential in your code. Never print the API credential in your code.')
-        def run_integration(app_name: str, python_code: str) -> ActionResult:
+        @self.controller.registry.action('Run integration. Use "YOUR_GITHUB_API_CREDENTIAL" as a placeholder wherever you need to use the actual API credential in your code. Never print the API credential in your code.')
+        def run_integration_test(app_names: list, python_code: str) -> ActionResult:
             """Run Python code with API credentials injected
             
             Parameters:
-            - app_name: The name of the API configuration to use (e.g., 'Stripe', 'GitHub')
+            - app_names: List of API configuration names to retrieve (e.g., ['Stripe', 'GitHub'])
+              Must be provided as a list, even for a single API (e.g., ['GitHub'])
             - python_code: Valid Python code to execute with the API credentials
             
             The python_code parameter should contain complete, executable Python code that uses the API.
             
-            IMPORTANT: Use 'YOUR_API_CREDENTIAL' as a placeholder in your code where you need the 
-            actual API credential value. This placeholder will be automatically replaced with the 
-            real credential when the code runs.
+            IMPORTANT: Use API-specific credential placeholders in your code where you need the 
+            actual API credential values. For example, use YOUR_GITHUB_API_CREDENTIAL for GitHub API,
+            YOUR_STRIPE_API_CREDENTIAL for Stripe API, etc. These placeholders will be automatically 
+            replaced with the real credentials when the code runs.
             
-            Example for GitHub API:
+            Example for GitHub and Stripe API:
             ```python
             import requests
+            import stripe
             
-            # Use the YOUR_API_CREDENTIAL placeholder in your code where you need the token
-            headers = {'Authorization': f'token YOUR_API_CREDENTIAL'}
+            # GitHub API
+            headers = {'Authorization': f'token YOUR_GITHUB_API_CREDENTIAL'}
             response = requests.get('https://api.github.com/user/repos', headers=headers)
             
-            # Print results for the agent to see
+            # Stripe API
+            stripe.api_key = YOUR_STRIPE_API_CREDENTIAL
+            customers = stripe.Customer.list(limit=3)
+            
+            # Print results
+            print("GitHub repositories:")
             if response.status_code == 200:
                 repos = response.json()
-                for repo in repos:
-                    print(f"Repository: {repo['name']}")
-                    print(f"Description: {repo['description']}")
-                    print(f"URL: {repo['html_url']}")
-                    print("-" * 40)
-            else:
-                print(f"Error: {response.status_code}")
-                print(response.text)
+                for repo in repos[:3]:
+                    print(f"- {repo['name']}")
+            
+            print("\nStripe customers:")
+            for customer in customers:
+                print(f"- {customer.id}: {customer.email}")
             ```
             
             Important notes:
@@ -491,79 +502,109 @@ class WebAgent:
             - Standard Python libraries are available
             - External libraries like 'requests' are available
             - Return values should be printed to stdout to be returned to the agent
-            - DO NOT include real credentials in your code - use YOUR_API_CREDENTIAL placeholder
-            - The same placeholder text (YOUR_API_CREDENTIAL) must be used regardless of the API being used
+            - DO NOT include real credentials in your code - use appropriate API credential placeholders
+            - Match each API name to its appropriate placeholder (e.g., YOUR_GITHUB_API_CREDENTIAL for GitHub API)
             """
             if not self.user_id:
                 return ActionResult(error="User ID not provided")
-            if not app_name:
-                return ActionResult(error="Please provide an API/App name")
+            
+            # Type checking for app_names
+            if not isinstance(app_names, list):
+                return ActionResult(error="app_names must be a list of strings. Example: ['GitHub'] or ['GitHub', 'Stripe']")
+            
+            if not app_names:
+                return ActionResult(error="Please provide at least one API/App name in the list")
+                
+            # Verify all items in app_names are strings
+            if not all(isinstance(name, str) for name in app_names):
+                return ActionResult(error="All API names in app_names must be strings")
+                
             if not python_code:
                 return ActionResult(error="Please provide Python code to execute")
             
-            # Check if the placeholder is present
-            if "YOUR_API_CREDENTIAL" not in python_code:
-                return ActionResult(error="No 'YOUR_API_CREDENTIAL' placeholder found in code. Please include this placeholder where the API credential should be used.")
-                
-            logger.info(f"Running integration for {app_name}")
-                
-            # Get API credentials
-            table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
+            logger.info(f"Running integration for apps: {', '.join(app_names)}")
             
-            # First check user's own API configs
-            user_response = table.query(
-                KeyConditionExpression='userId = :userId',
-                FilterExpression='isApiConfig = :isApiConfig AND appName = :appName',
-                ExpressionAttributeValues={
-                    ':userId': self.user_id,
-                    ':isApiConfig': True,
-                    ':appName': app_name
-                }
-            )
-            
-            items = user_response.get('Items', [])
-            
-            if not items:
-                # If no direct matches, check for publicly shared API configs
-                logger.info(f"No personal API config found for {app_name}, checking shared configs")
-                public_response = table.query(
-                    IndexName='ShareWithEveryoneIndex',
-                    KeyConditionExpression='shareWithEveryone = :shareWithEveryone',
-                    FilterExpression='isApiConfig = :isApiConfig AND appName = :appName AND userId <> :userId',
-                    ExpressionAttributeValues={
-                        ':shareWithEveryone': 1,
-                        ':isApiConfig': True,
-                        ':appName': app_name,
-                        ':userId': self.user_id
-                    }
-                )
-                items.extend(public_response.get('Items', []))
-            
-            if not items:
-                return ActionResult(error=f"No API configuration found for: {app_name}")
-                
             try:
-                # Sort items by priority (user's own first, then shared)
-                sorted_items = sorted(items, key=lambda x: (
-                    0 if not x.get('sharedBy') else 1
-                ))
+                # Get API credentials for each app
+                table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
+                api_credentials = {}
+                api_key_names = {}
                 
-                config = sorted_items[0]
-                shared_by = config.get('sharedBy')
+                for app_name in app_names:
+                    # First check user's own API configs
+                    user_response = table.query(
+                        KeyConditionExpression='userId = :userId',
+                        FilterExpression='isApiConfig = :isApiConfig AND appName = :appName',
+                        ExpressionAttributeValues={
+                            ':userId': self.user_id,
+                            ':isApiConfig': True,
+                            ':appName': app_name
+                        }
+                    )
+                    
+                    items = user_response.get('Items', [])
+                    
+                    if not items:
+                        # If no direct matches, check for publicly shared API configs
+                        logger.info(f"No personal API config found for {app_name}, checking shared configs")
+                        public_response = table.query(
+                            IndexName='ShareWithEveryoneIndex',
+                            KeyConditionExpression='shareWithEveryone = :shareWithEveryone',
+                            FilterExpression='isApiConfig = :isApiConfig AND appName = :appName AND userId <> :userId',
+                            ExpressionAttributeValues={
+                                ':shareWithEveryone': 1,
+                                ':isApiConfig': True,
+                                ':appName': app_name,
+                                ':userId': self.user_id
+                            }
+                        )
+                        items.extend(public_response.get('Items', []))
+                    
+                    if not items:
+                        return ActionResult(error=f"No API configuration found for: {app_name}")
+                    
+                    # Sort items by priority (user's own first, then shared)
+                    sorted_items = sorted(items, key=lambda x: (
+                        0 if not x.get('sharedBy') else 1
+                    ))
+                    
+                    config = sorted_items[0]
+                    shared_by = config.get('sharedBy')
+                    
+                    # Decrypt the API key/secret
+                    api_key = decrypt_password(config['password'], self.user_id, shared_by)
+                    api_key_name = config['username']  # This is the API key name
+                    
+                    logger.info(f"Successfully retrieved credential for {app_name} (key name: {api_key_name})")
+                    
+                    # Create the app-specific credential placeholder name
+                    app_name_clean = app_name.upper().replace(" ", "_").replace("-", "_")
+                    placeholder = f"YOUR_{app_name_clean}_API_CREDENTIAL"
+                    
+                    api_credentials[app_name] = {
+                        "value": api_key,
+                        "placeholder": placeholder
+                    }
+                    api_key_names[app_name] = api_key_name
                 
-                # Decrypt the API key/secret
-                api_key = decrypt_password(config['password'], self.user_id, shared_by)
-                api_key_name = config['username']  # This is the API key name
+                # Create a modified version of the code with the placeholders replaced
+                modified_code = python_code
                 
-                logger.info(f"Successfully retrieved credential for {app_name} (key name: {api_key_name})")
+                # Replace API-specific placeholders
+                header_parts = []
+                for app_name, cred_info in api_credentials.items():
+                    placeholder = cred_info["placeholder"]
+                    if placeholder in modified_code:
+                        modified_code = modified_code.replace(placeholder, cred_info["value"])
+                        header_parts.append(f"# App: {app_name}")
+                        header_parts.append(f"# API credential field name: {api_key_names[app_name]}")
+                        header_parts.append(f"# Placeholder replaced: {placeholder}")
+                        header_parts.append("")
                 
-                # Replace the placeholder with the actual credential
-                modified_code = python_code.replace("YOUR_API_CREDENTIAL", api_key)
+                header_comment = "\n".join(header_parts).strip()
                 
-                # Create header comment
-                header_comment = f"""# Integration script for {app_name}
-# API credential placeholder has been replaced with the actual credential
-# Original credential field name: {api_key_name}"""
+                if header_comment == "":
+                    return ActionResult(error="No API placeholders were found in your code. Please include appropriate placeholders like YOUR_GITHUB_API_CREDENTIAL.")
                 
                 # Execute the Python code in a sandboxed environment using the utility function
                 return run_python_code_in_sandbox(
@@ -724,7 +765,7 @@ class WebAgent:
                 return ActionResult(error=f"Failed to run Python code: {str(e)}")
 
         @self.controller.registry.action('Submit Python code')
-        async def submit_python_code(python_code: str, code_file_name: str = None, is_new_file: bool = False) -> ActionResult:
+        async def submit_python_code(python_code: str, code_file_name: str, is_new_file: bool = False) -> ActionResult:
             """
             Submit Python code to GitHub as a pull request.
             
@@ -733,7 +774,7 @@ class WebAgent:
             Parameters:
                 python_code: The Python code to submit
                 code_file_name: The filename to use. Should be just a filename (e.g., "script.py") without any path.
-                                If not provided, a new filename will be generated automatically.
+                                This parameter is required.
                 is_new_file: Boolean indicating whether to create a new file (True) or update an existing one (False).
                              If set to True and a file with the same name already exists, a new file with a timestamp
                              will be created instead.
@@ -751,12 +792,6 @@ class WebAgent:
                 
                 # GitHub API endpoints
                 api_base = "https://api.github.com"
-                
-                # Process the code_file_name
-                if not code_file_name:
-                    # Generate a random filename if none provided
-                    timestamp = int(time.time())
-                    code_file_name = f"agent_generated_{timestamp}.py"
                 
                 # Validate that code_file_name is just a filename, not a path
                 if "/" in code_file_name or "\\" in code_file_name:

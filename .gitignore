@@ -48,6 +48,7 @@ yarn-error.log*
 agent_history.gif
 backend/agent_history.gif
 agent-engine/agent_history.gif
+agent-engine/agent_history_*.gif
 
 # Python compiled files
 *.pyc
