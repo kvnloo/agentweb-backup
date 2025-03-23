@@ -387,3 +387,7 @@ The agent engine should be deployed as a separate service using AWS ECS (Elastic
    - Monitor costs through AWS Cost Explorer
 
 For detailed troubleshooting and advanced configuration options, refer to the [AWS Elastic Beanstalk documentation](https://docs.aws.amazon.com/elasticbeanstalk/latest/dg/Welcome.html).
+
+## Upgrade AG2
+pip install --upgrade ag2
+pip install 'ag2[openai]'
