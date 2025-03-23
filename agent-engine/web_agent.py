@@ -596,8 +596,8 @@ class WebAgent:
                 logger.error(f"Error in sleep: {str(e)}")
                 return ActionResult(error=f"Failed to sleep: {str(e)}")
 
-        @self.controller.registry.action('Get available Python code')
-        async def get_available_python_code() -> ActionResult:
+        @self.controller.registry.action('Get approved Python code')
+        async def get_approved_python_code() -> ActionResult:
             """
             Retrieve a list of available Python code from GitHub that the agent is allowed to run.
             
@@ -605,7 +605,7 @@ class WebAgent:
             
             Returns:
                 A list of available Python code files with their filenames.
-                You should use just the filename when calling run_python_code or submit_python_code.
+                You should use just the filename when calling run_approved_python_code or submit_python_code.
             """
             try:
                 # Check if user_id is available
@@ -644,7 +644,7 @@ class WebAgent:
                         result_text += f"  Filename: {file['name']}\n"
                         result_text += f"  Size: {file['size']} bytes\n\n"
                     
-                    result_text += "Note: Use only the filename when calling run_python_code or submit_python_code."
+                    result_text += "Note: Use only the filename when calling run_approved_python_code or submit_python_code."
                 else:
                     result_text = f"No Python code files found"
                 
@@ -655,8 +655,8 @@ class WebAgent:
                 logger.error(f"Error retrieving Python code list: {str(e)}")
                 return ActionResult(error=f"Failed to retrieve Python code list: {str(e)}")
 
-        @self.controller.registry.action('Run Python code')
-        async def run_python_code(code_file_name: str) -> ActionResult:
+        @self.controller.registry.action('Run approved Python code')
+        async def run_approved_python_code(code_file_name: str) -> ActionResult:
             """
             Run Python code identified by the provided filename.
             
@@ -825,7 +825,7 @@ class WebAgent:
                 
                 # If file exists and is_new_file is False, we need the SHA to update
                 if not is_new_file and not file_exists:
-                    return ActionResult(error=f"File '{code_file_name}' does not exist. Please choose an existing filename from get_available_python_code or set is_new_file to True to create a new file.")
+                    return ActionResult(error=f"File '{code_file_name}' does not exist. Please choose an existing filename from get_approved_python_code or set is_new_file to True to create a new file.")
                 
                 # 5. Create or update the file
                 # Add header comment with metadata
@@ -879,7 +879,7 @@ Branch: {branch_name}
 Pull Request: {pr_html_url}
 Operation: {'Created new file' if (is_new_file or not file_exists) else 'Updated existing file'}
 
-Once the PR is approved and merged, this code will be available through the 'Run Python code' action using the filename: {code_file_name}
+Once the PR is approved and merged, this code will be available through the 'Run approved Python code' action using the filename: {code_file_name}
 """
                 
                 return ActionResult(extracted_content=result_message)
