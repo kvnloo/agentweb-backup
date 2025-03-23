@@ -24,6 +24,9 @@ TABLE_PREFIX = 'Dev-' if os.getenv('NODE_ENV') == 'development' else ''
 # Global variable for vision support
 global_use_vision = True
 
+# Initialize DynamoDB client
+dynamodb = get_dynamodb_resource()
+
 def generate_content_hash(content: Any) -> str:
     """Generate a hash of the content to use as a filename.
     
@@ -1166,3 +1169,155 @@ def run_python_code_in_sandbox(
     except Exception as e:
         logger.error(f"Error setting up Python code execution: {str(e)}")
         return ActionResult(error=f"Failed to execute Python code: {str(e)}") 
+
+def decrypt_password(encrypted_password: str, user_id: str, shared_by: str = None) -> str:
+    """Decrypt password using JWT_SECRET. For shared passwords, use the sharer's userId."""
+    try:
+        import jwt
+        decoded = jwt.decode(encrypted_password, os.getenv('JWT_SECRET'), algorithms=['HS256'])
+        # For shared passwords, verify against the original sharer's userId
+        expected_user_id = shared_by if shared_by else user_id
+        if shared_by:
+            logger.info(f"Using shared credentials - decrypting with sharer's userId: {shared_by}")
+        if decoded['userId'] != expected_user_id:
+            raise Exception("Invalid user ID in encrypted password")
+        return decoded['password']
+    except Exception as e:
+        logger.error(f"Error decrypting password: {e}")
+        raise Exception("Failed to decrypt password") 
+
+def fetch_api_credentials(user_id: str, app_names=None):
+    """
+    Fetch API credentials for the specified apps or all available credentials if no app names provided.
+    
+    Args:
+        user_id: The ID of the user whose API credentials to fetch
+        app_names: Optional list of API app names to fetch credentials for.
+                  If None, all available credentials are fetched.
+    
+    Returns:
+        Dictionary containing:
+        - api_credentials: Dict mapping app names to their credential values and placeholders
+        - api_key_names: Dict mapping app names to their credential field names
+    """
+    if not user_id:
+        return None, None
+    
+    try:
+        table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
+        api_credentials = {}
+        api_key_names = {}
+        
+        # Build the filter expression based on whether specific app names were provided
+        filter_expression = 'isApiConfig = :isApiConfig'
+        expression_values = {
+            ':userId': user_id,
+            ':isApiConfig': True
+        }
+        
+        if app_names:
+            # Handle single app_name passed as string
+            if isinstance(app_names, str):
+                app_names = [app_names]
+            
+            # Verify all items in app_names are strings if provided
+            if not all(isinstance(name, str) for name in app_names):
+                logger.error("All API names must be strings")
+                return None, None
+            
+            # Add app names to filter if specific ones were requested
+            if len(app_names) == 1:
+                filter_expression += ' AND appName = :appName'
+                expression_values[':appName'] = app_names[0]
+            else:
+                app_name_values = {}
+                app_name_filters = []
+                
+                for i, name in enumerate(app_names):
+                    key = f':appName{i}'
+                    app_name_values[key] = name
+                    app_name_filters.append(f'appName = {key}')
+                
+                filter_expression += f" AND ({' OR '.join(app_name_filters)})"
+                expression_values.update(app_name_values)
+        
+        # Get user's own API configs
+        user_response = table.query(
+            KeyConditionExpression='userId = :userId',
+            FilterExpression=filter_expression,
+            ExpressionAttributeValues=expression_values
+        )
+        
+        items = user_response.get('Items', [])
+        
+        # If no direct matches or not all requested apps found, check for publicly shared API configs
+        public_filter_expression = 'isApiConfig = :isApiConfig AND userId <> :userId'
+        public_expression_values = {
+            ':shareWithEveryone': 1,
+            ':isApiConfig': True,
+            ':userId': user_id
+        }
+        
+        if app_names:
+            # Add the same app name filtering for public configs
+            if len(app_names) == 1:
+                public_filter_expression += ' AND appName = :appName'
+                public_expression_values[':appName'] = app_names[0]
+            else:
+                public_expression_values.update(app_name_values)
+                public_filter_expression += f" AND ({' OR '.join(app_name_filters)})"
+        
+        public_response = table.query(
+            IndexName='ShareWithEveryoneIndex',
+            KeyConditionExpression='shareWithEveryone = :shareWithEveryone',
+            FilterExpression=public_filter_expression,
+            ExpressionAttributeValues=public_expression_values
+        )
+        items.extend(public_response.get('Items', []))
+        
+        # Process all API configs
+        for config in items:
+            app_name = config['appName']
+            
+            # Skip if we already have this app_name from user's own configs
+            if app_name in api_credentials:
+                continue
+            
+            shared_by = config.get('sharedBy')
+            
+            # Decrypt the API key/secret
+            api_key = decrypt_password(config['password'], user_id, shared_by)
+            api_key_name = config['username']  # This is the API key name
+            
+            # Create the app-specific credential placeholder name
+            app_name_clean = app_name.upper().replace(" ", "_").replace("-", "_")
+            placeholder = f"YOUR_{app_name_clean}_API_CREDENTIAL"
+            
+            api_credentials[app_name] = {
+                "value": api_key,
+                "placeholder": placeholder
+            }
+            api_key_names[app_name] = api_key_name
+            
+            logger.info(f"Successfully retrieved credential for {app_name} (key name: {api_key_name})")
+        
+        return api_credentials, api_key_names
+        
+    except Exception as e:
+        logger.error(f"Error fetching API credentials: {str(e)}")
+        return None, None 
+
+# List of functions to be exported from this module
+__all__ = [
+    'get_downloads_path',
+    'upload_task_result_files',
+    'get_llm',
+    'validate_content_format',
+    'extract_json_from_content', 
+    'generate_content_hash',
+    'get_agent_code_base_path',
+    'call_github_api',
+    'run_python_code_in_sandbox',
+    'decrypt_password',
+    'fetch_api_credentials'
+] 

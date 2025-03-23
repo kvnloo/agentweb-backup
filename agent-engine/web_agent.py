@@ -27,7 +27,7 @@ import aiohttp
 import base64  # Add at the top with other imports
 import boto3  # Add at the top with other imports
 from urllib.parse import quote
-from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content, generate_content_hash, get_agent_code_base_path, call_github_api, run_python_code_in_sandbox
+from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content, generate_content_hash, get_agent_code_base_path, call_github_api, run_python_code_in_sandbox, fetch_api_credentials, decrypt_password
 # Load environment variables
 load_dotenv()
 
@@ -44,22 +44,6 @@ logger = logging.getLogger(__name__)
 global_use_vision = True
 
 controller = Controller()
-
-def decrypt_password(encrypted_password: str, user_id: str, shared_by: str = None) -> str:
-    """Decrypt password using JWT_SECRET. For shared passwords, use the sharer's userId."""
-    try:
-        import jwt
-        decoded = jwt.decode(encrypted_password, os.getenv('JWT_SECRET'), algorithms=['HS256'])
-        # For shared passwords, verify against the original sharer's userId
-        expected_user_id = shared_by if shared_by else user_id
-        if shared_by:
-            logger.info(f"Using shared credentials - decrypting with sharer's userId: {shared_by}")
-        if decoded['userId'] != expected_user_id:
-            raise Exception("Invalid user ID in encrypted password")
-        return decoded['password']
-    except Exception as e:
-        logger.error(f"Error decrypting password: {e}")
-        raise Exception("Failed to decrypt password")
 
 class WebAgent:
     def __init__(self, user_id=None, full_llm_name=None):
@@ -525,67 +509,16 @@ class WebAgent:
             logger.info(f"Running integration for apps: {', '.join(app_names)}")
             
             try:
-                # Get API credentials for each app
-                table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
-                api_credentials = {}
-                api_key_names = {}
+                # Get API credentials
+                api_credentials, api_key_names = fetch_api_credentials(self.user_id, app_names)
                 
-                for app_name in app_names:
-                    # First check user's own API configs
-                    user_response = table.query(
-                        KeyConditionExpression='userId = :userId',
-                        FilterExpression='isApiConfig = :isApiConfig AND appName = :appName',
-                        ExpressionAttributeValues={
-                            ':userId': self.user_id,
-                            ':isApiConfig': True,
-                            ':appName': app_name
-                        }
-                    )
-                    
-                    items = user_response.get('Items', [])
-                    
-                    if not items:
-                        # If no direct matches, check for publicly shared API configs
-                        logger.info(f"No personal API config found for {app_name}, checking shared configs")
-                        public_response = table.query(
-                            IndexName='ShareWithEveryoneIndex',
-                            KeyConditionExpression='shareWithEveryone = :shareWithEveryone',
-                            FilterExpression='isApiConfig = :isApiConfig AND appName = :appName AND userId <> :userId',
-                            ExpressionAttributeValues={
-                                ':shareWithEveryone': 1,
-                                ':isApiConfig': True,
-                                ':appName': app_name,
-                                ':userId': self.user_id
-                            }
-                        )
-                        items.extend(public_response.get('Items', []))
-                    
-                    if not items:
-                        return ActionResult(error=f"No API configuration found for: {app_name}")
-                    
-                    # Sort items by priority (user's own first, then shared)
-                    sorted_items = sorted(items, key=lambda x: (
-                        0 if not x.get('sharedBy') else 1
-                    ))
-                    
-                    config = sorted_items[0]
-                    shared_by = config.get('sharedBy')
-                    
-                    # Decrypt the API key/secret
-                    api_key = decrypt_password(config['password'], self.user_id, shared_by)
-                    api_key_name = config['username']  # This is the API key name
-                    
-                    logger.info(f"Successfully retrieved credential for {app_name} (key name: {api_key_name})")
-                    
-                    # Create the app-specific credential placeholder name
-                    app_name_clean = app_name.upper().replace(" ", "_").replace("-", "_")
-                    placeholder = f"YOUR_{app_name_clean}_API_CREDENTIAL"
-                    
-                    api_credentials[app_name] = {
-                        "value": api_key,
-                        "placeholder": placeholder
-                    }
-                    api_key_names[app_name] = api_key_name
+                if not api_credentials:
+                    return ActionResult(error=f"Failed to retrieve API credentials for {', '.join(app_names)}")
+                
+                # Check if we got all the requested credentials
+                missing_apps = [app for app in app_names if app not in api_credentials]
+                if missing_apps:
+                    return ActionResult(error=f"No API configuration found for: {', '.join(missing_apps)}")
                 
                 # Create a modified version of the code with the placeholders replaced
                 modified_code = python_code
@@ -757,66 +690,22 @@ class WebAgent:
                 
                 # Get all API credentials
                 try:
-                    table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
-                    api_credentials = {}
-                    api_key_names = {}
+                    # Get all available API credentials
+                    api_credentials, api_key_names = fetch_api_credentials(self.user_id)
                     
-                    # Get user's own API configs
-                    user_response = table.query(
-                        KeyConditionExpression='userId = :userId',
-                        FilterExpression='isApiConfig = :isApiConfig',
-                        ExpressionAttributeValues={
-                            ':userId': self.user_id,
-                            ':isApiConfig': True
-                        }
-                    )
-                    
-                    items = user_response.get('Items', [])
-                    
-                    # If no direct matches, check for publicly shared API configs
-                    public_response = table.query(
-                        IndexName='ShareWithEveryoneIndex',
-                        KeyConditionExpression='shareWithEveryone = :shareWithEveryone',
-                        FilterExpression='isApiConfig = :isApiConfig AND userId <> :userId',
-                        ExpressionAttributeValues={
-                            ':shareWithEveryone': 1,
-                            ':isApiConfig': True,
-                            ':userId': self.user_id
-                        }
-                    )
-                    items.extend(public_response.get('Items', []))
-                    
-                    # Process all API configs
-                    for config in items:
-                        app_name = config['appName']
-                        shared_by = config.get('sharedBy')
+                    if api_credentials:
+                        # Replace API-specific placeholders
+                        credentials_replaced = False
+                        for app_name, cred_info in api_credentials.items():
+                            placeholder = cred_info["placeholder"]
+                            if placeholder in modified_code:
+                                modified_code = modified_code.replace(placeholder, cred_info["value"])
+                                header_parts.append(f"# API credential replaced: {app_name}")
+                                header_parts.append(f"# API credential field name: {api_key_names[app_name]}")
+                                credentials_replaced = True
                         
-                        # Decrypt the API key/secret
-                        api_key = decrypt_password(config['password'], self.user_id, shared_by)
-                        api_key_name = config['username']  # This is the API key name
-                        
-                        # Create the app-specific credential placeholder name
-                        app_name_clean = app_name.upper().replace(" ", "_").replace("-", "_")
-                        placeholder = f"YOUR_{app_name_clean}_API_CREDENTIAL"
-                        
-                        api_credentials[app_name] = {
-                            "value": api_key,
-                            "placeholder": placeholder
-                        }
-                        api_key_names[app_name] = api_key_name
-                    
-                    # Replace API-specific placeholders
-                    credentials_replaced = False
-                    for app_name, cred_info in api_credentials.items():
-                        placeholder = cred_info["placeholder"]
-                        if placeholder in modified_code:
-                            modified_code = modified_code.replace(placeholder, cred_info["value"])
-                            header_parts.append(f"# API credential replaced: {app_name}")
-                            header_parts.append(f"# API credential field name: {api_key_names[app_name]}")
-                            credentials_replaced = True
-                    
-                    if credentials_replaced:
-                        header_parts.append("# Note: API credentials have been automatically injected")
+                        if credentials_replaced:
+                            header_parts.append("# Note: API credentials have been automatically injected")
                 except Exception as e:
                     logger.warning(f"Error processing API credentials: {str(e)}")
                     # Continue without credential replacement
