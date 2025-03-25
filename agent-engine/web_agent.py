@@ -346,36 +346,6 @@ class WebAgent:
             - API Name: The name of the API configuration
             - Key Name: The name of the API key as stored in the config
             - Documentation: Link to the API documentation if provided
-            
-            This action should be called first before using run_integration_test to:
-            1. Verify the API configuration exists
-            2. Get the API key name for reference
-            3. Access documentation links for understanding how to use the API
-            
-            Workflow:
-            1. Call get_integration_instructions with the app_name
-            2. Read documentation if needed (from the returned link)
-            3. Create Python code that uses the appropriate placeholder (e.g., YOUR_GITHUB_API_CREDENTIAL)
-            4. Call run_integration_test with a list containing the app_name and your Python code
-            
-            For multiple APIs:
-            1. Call get_integration_instructions for each API you need
-            2. Create Python code that uses specific API placeholders matching the API names
-               For example: YOUR_GITHUB_API_CREDENTIAL for GitHub, YOUR_STRIPE_API_CREDENTIAL for Stripe
-            3. Call run_integration_test with a list of all app_names and your Python code using the appropriate placeholders
-            
-            IMPORTANT: When creating your Python code for run_integration_test, 
-            use API-specific credential placeholders that match each API name.
-            These placeholders will be automatically replaced with the real credentials when the code runs.
-            
-            For example:
-            ```python
-            # GitHub API example
-            headers = {'Authorization': f'token YOUR_GITHUB_API_CREDENTIAL'}
-            
-            # Stripe API example
-            stripe.api_key = YOUR_STRIPE_API_CREDENTIAL
-            ```
             """
             if not self.user_id:
                 return ActionResult(error="User ID not provided")
@@ -440,9 +410,9 @@ class WebAgent:
             except Exception as e:
                 return ActionResult(error=f"Error retrieving integration details: {str(e)}")
                 
-        @self.controller.registry.action('Run integration. Use "YOUR_GITHUB_API_CREDENTIAL" as a placeholder wherever you need to use the actual API credential in your code. Never print the API credential in your code.')
+        @self.controller.registry.action('Run integration test with API credentials, load the API credentials from environment variables with names like GITHUB_API_CREDENTIAL, STRIPE_API_CREDENTIAL, etc.')
         def run_integration_test(app_names: list, python_code: str) -> ActionResult:
-            """Run Python code with API credentials injected
+            """Run Python code with API credentials loaded from environment variables
             
             Parameters:
             - app_names: List of API configuration names to retrieve (e.g., ['Stripe', 'GitHub'])
@@ -451,22 +421,25 @@ class WebAgent:
             
             The python_code parameter should contain complete, executable Python code that uses the API.
             
-            IMPORTANT: Use API-specific credential placeholders in your code where you need the 
-            actual API credential values. For example, use YOUR_GITHUB_API_CREDENTIAL for GitHub API,
-            YOUR_STRIPE_API_CREDENTIAL for Stripe API, etc. These placeholders will be automatically 
-            replaced with the real credentials when the code runs.
+            IMPORTANT: The code should use environment variables directly to access API credentials.
+            For example, use GITHUB_API_CREDENTIAL for GitHub API, STRIPE_API_CREDENTIAL for Stripe API, etc.
             
             Example for GitHub and Stripe API:
             ```python
             import requests
             import stripe
+            import os
+            from dotenv import load_dotenv
+            
+            # Load environment variables from .env file
+            load_dotenv()
             
             # GitHub API
-            headers = {'Authorization': f'token YOUR_GITHUB_API_CREDENTIAL'}
+            headers = {'Authorization': f'token {os.getenv("GITHUB_API_CREDENTIAL")}'}
             response = requests.get('https://api.github.com/user/repos', headers=headers)
             
             # Stripe API
-            stripe.api_key = YOUR_STRIPE_API_CREDENTIAL
+            stripe.api_key = os.getenv("STRIPE_API_CREDENTIAL")
             customers = stripe.Customer.list(limit=3)
             
             # Print results
@@ -482,12 +455,12 @@ class WebAgent:
             ```
             
             Important notes:
-            - Code execution has a 30-second timeout
+            - Code execution has a timeout set by SANDBOX_TIMEOUT_SECONDS environment variable
             - Standard Python libraries are available
             - External libraries like 'requests' are available
             - Return values should be printed to stdout to be returned to the agent
-            - DO NOT include real credentials in your code - use appropriate API credential placeholders
-            - Match each API name to its appropriate placeholder (e.g., YOUR_GITHUB_API_CREDENTIAL for GitHub API)
+            - Use environment variables directly to access API credentials
+            - The credentials will be loaded from environment variables at runtime
             """
             if not self.user_id:
                 return ActionResult(error="User ID not provided")
@@ -520,32 +493,27 @@ class WebAgent:
                 if missing_apps:
                     return ActionResult(error=f"No API configuration found for: {', '.join(missing_apps)}")
                 
-                # Create a modified version of the code with the placeholders replaced
-                modified_code = python_code
-                
-                # Replace API-specific placeholders
+                # Create environment variables for the credentials
+                env_vars = {}
                 header_parts = []
                 for app_name, cred_info in api_credentials.items():
-                    placeholder = cred_info["placeholder"]
-                    if placeholder in modified_code:
-                        modified_code = modified_code.replace(placeholder, cred_info["value"])
-                        header_parts.append(f"# App: {app_name}")
-                        header_parts.append(f"# API credential field name: {api_key_names[app_name]}")
-                        header_parts.append(f"# Placeholder replaced: {placeholder}")
-                        header_parts.append("")
+                    env_var_name = f"{app_name.upper()}_API_CREDENTIAL"
+                    env_vars[env_var_name] = cred_info["value"]
+                    header_parts.append(f"# App: {app_name}")
+                    header_parts.append(f"# API credential field name: {api_key_names[app_name]}")
+                    header_parts.append(f"# Environment variable: {env_var_name}")
+                    header_parts.append("")
                 
                 header_comment = "\n".join(header_parts).strip()
                 
-                if header_comment == "":
-                    return ActionResult(error="No API placeholders were found in your code. Please include appropriate placeholders like YOUR_GITHUB_API_CREDENTIAL.")
-                
                 # Execute the Python code in a sandboxed environment using the utility function
                 return run_python_code_in_sandbox(
-                    python_code=modified_code,
+                    python_code=python_code,
                     execution_id=self.current_execution_id,
+                    user_id=self.user_id,
                     script_type="integration",
                     header_comment=header_comment,
-                    additional_env_vars={"INTEGRATION_EXECUTION_ID": self.current_execution_id}
+                    additional_env_vars=env_vars
                 )
                 
             except Exception as e:
@@ -635,7 +603,7 @@ class WebAgent:
             Run Python code identified by the provided filename.
             
             The function retrieves the code from GitHub and executes it in a sandboxed environment.
-            API credentials will be automatically replaced if their placeholders are found in the code.
+            API credentials will be loaded from environment variables.
             
             Parameters:
                 code_file_name: The filename of the Python code to run (e.g., "script.py").
@@ -681,8 +649,7 @@ class WebAgent:
                 else:
                     return ActionResult(error="Invalid content format received from GitHub")
                 
-                # Check if code has API credential placeholders
-                modified_code = python_code
+                # Create header comment with metadata
                 header_parts = [
                     f"# GitHub code execution from {code_file_name}",
                     f"# Executed at: {time.strftime('%Y-%m-%d %H:%M:%S')}"
@@ -694,32 +661,32 @@ class WebAgent:
                     api_credentials, api_key_names = fetch_api_credentials(self.user_id)
                     
                     if api_credentials:
-                        # Replace API-specific placeholders
-                        credentials_replaced = False
+                        # Create environment variables for the credentials
+                        env_vars = {}
                         for app_name, cred_info in api_credentials.items():
-                            placeholder = cred_info["placeholder"]
-                            if placeholder in modified_code:
-                                modified_code = modified_code.replace(placeholder, cred_info["value"])
-                                header_parts.append(f"# API credential replaced: {app_name}")
-                                header_parts.append(f"# API credential field name: {api_key_names[app_name]}")
-                                credentials_replaced = True
+                            env_var_name = f"{app_name.upper()}_API_CREDENTIAL"
+                            env_vars[env_var_name] = cred_info["value"]
+                            header_parts.append(f"# API credential available: {app_name}")
+                            header_parts.append(f"# API credential field name: {api_key_names[app_name]}")
+                            header_parts.append(f"# Environment variable: {env_var_name}")
+                            header_parts.append("")
                         
-                        if credentials_replaced:
-                            header_parts.append("# Note: API credentials have been automatically injected")
+                        header_parts.append("# Note: API credentials are available as environment variables")
                 except Exception as e:
                     logger.warning(f"Error processing API credentials: {str(e)}")
-                    # Continue without credential replacement
+                    # Continue without credential setup
 
                 # Create a header comment for the script
                 header_comment = "\n".join(header_parts)
 
                 # Execute the Python code in a sandboxed environment using the utility function
                 return run_python_code_in_sandbox(
-                    python_code=modified_code,
+                    python_code=python_code,
                     execution_id=self.current_execution_id,
-                    script_type="github",
+                    user_id=self.user_id,
+                    script_type="approved",
                     header_comment=header_comment,
-                    additional_env_vars={"GITHUB_EXECUTION_ID": self.current_execution_id}
+                    additional_env_vars=env_vars
                 )
                 
             except Exception as e:

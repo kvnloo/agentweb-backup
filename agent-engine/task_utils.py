@@ -1060,7 +1060,8 @@ async def call_github_api(
 
 def run_python_code_in_sandbox(
     python_code: str, 
-    execution_id: str, 
+    execution_id: str,
+    user_id: str,
     script_type: str = "script",
     header_comment: Optional[str] = None,
     additional_env_vars: Optional[Dict[str, str]] = None
@@ -1074,6 +1075,7 @@ def run_python_code_in_sandbox(
     Args:
         python_code: The Python code to execute
         execution_id: Current execution ID, used to create an isolated directory
+        user_id: User ID for creating user-specific directories
         script_type: Type of script for naming (e.g., "github", "integration")
         header_comment: Optional header comment to add to the script
         additional_env_vars: Optional additional environment variables for the execution
@@ -1085,6 +1087,8 @@ def run_python_code_in_sandbox(
     import subprocess
     import uuid
     import os
+    import shutil
+    import zipfile
     from pathlib import Path
     from browser_use.agent.views import ActionResult
     
@@ -1108,16 +1112,36 @@ def run_python_code_in_sandbox(
             final_code = f"{header_comment}\n\n{python_code}"
         else:
             final_code = python_code
+            
+        # Add python-dotenv import and loading at the start of the code
+        final_code = f"""from dotenv import load_dotenv
+import os
+
+# Load environment variables from .env file
+load_dotenv()
+
+{final_code}
+"""
         
         # Write the code to the temporary file
         with open(temp_file_path, "w") as f:
             f.write(final_code)
+            
+        # Create a temporary .env file with the credentials
+        env_file_path = os.path.join(execution_subdir, ".env")
+        with open(env_file_path, "w") as f:
+            # Write any additional environment variables to .env
+            if additional_env_vars:
+                for key, value in additional_env_vars.items():
+                    f.write(f"{key}={value}\n")
         
         logger.info(f"Created temporary script at {temp_file_path}")
         
         # Execute the script with a timeout
         try:
-            logger.info(f"Executing {script_type} script with timeout of 30 seconds")
+            # Get timeout from environment variable
+            timeout_seconds = int(os.getenv('SANDBOX_TIMEOUT_SECONDS', '300'))
+            logger.info(f"Executing {script_type} script with timeout of {timeout_seconds} seconds")
             
             # Use a restricted environment for the subprocess
             env = {
@@ -1138,7 +1162,7 @@ def run_python_code_in_sandbox(
                 ["python", temp_file_path],
                 capture_output=True,
                 text=True,
-                timeout=30,  # 30 second timeout for safety
+                timeout=timeout_seconds,  # Use timeout from environment variable
                 cwd=execution_subdir,  # Run from the isolated directory
                 env=env  # Use the restricted environment
             )
@@ -1146,13 +1170,37 @@ def run_python_code_in_sandbox(
             # Process the result
             if result.returncode == 0:
                 output = result.stdout
+                
+                # Check if there are files in the data folder
+                data_folder = os.path.join(execution_subdir, "data")
+                if os.path.exists(data_folder) and any(os.scandir(data_folder)):
+                    try:
+                        # Create downloads directory with user_id
+                        downloads_path = get_downloads_path(user_id=user_id, execution_id=execution_id)
+                        os.makedirs(downloads_path, exist_ok=True)
+                        
+                        # Create zip file
+                        zip_filename = "output.zip"
+                        zip_path = os.path.join(downloads_path, zip_filename)
+                        
+                        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                            for root, _, files in os.walk(data_folder):
+                                for file in files:
+                                    file_path = os.path.join(root, file)
+                                    arcname = os.path.relpath(file_path, data_folder)
+                                    zipf.write(file_path, arcname)
+                        
+                        logger.info(f"Created zip file with output files at {zip_path}")
+                    except Exception as e:
+                        logger.error(f"Error creating zip file: {str(e)}")
+                
                 return ActionResult(extracted_content=output if output else f"Code executed successfully with no output")
             else:
                 error_msg = result.stderr
                 return ActionResult(error=f"Execution failed: {error_msg}")
                 
         except subprocess.TimeoutExpired:
-            return ActionResult(error="Execution timed out after 30 seconds")
+            return ActionResult(error=f"Execution timed out after {timeout_seconds} seconds")
             
         except Exception as e:
             return ActionResult(error=f"Error during execution: {str(e)}")
@@ -1162,9 +1210,11 @@ def run_python_code_in_sandbox(
             try:
                 if os.path.exists(temp_file_path):
                     os.remove(temp_file_path)
-                logger.info(f"Cleaned up temporary script file")
+                if os.path.exists(env_file_path):
+                    os.remove(env_file_path)
+                logger.info(f"Cleaned up temporary files")
             except Exception as e:
-                logger.warning(f"Failed to clean up temporary file: {str(e)}")
+                logger.warning(f"Failed to clean up temporary files: {str(e)}")
     
     except Exception as e:
         logger.error(f"Error setting up Python code execution: {str(e)}")
