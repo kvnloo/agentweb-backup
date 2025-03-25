@@ -1,4 +1,4 @@
-import { Container, Typography, Paper, Box, Accordion, AccordionSummary, AccordionDetails, useTheme } from '@mui/material';
+import { Container, Typography, Paper, Box, Accordion, AccordionSummary, AccordionDetails } from '@mui/material';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 
 interface ApiSection {
@@ -179,8 +179,6 @@ const apiSections: ApiSection[] = [
 ];
 
 export default function Api() {
-  const theme = useTheme();
-
   return (
     <Container maxWidth="lg" sx={{ py: 4 }}>
       <Typography variant="h3" component="h1" gutterBottom>
