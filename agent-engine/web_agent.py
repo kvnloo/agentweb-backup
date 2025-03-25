@@ -5,7 +5,7 @@ import sys
 import os
 import re
 import uuid
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union
 import browser_use
 from browser_use import Agent, Controller
 from browser_use.browser.browser import Browser, BrowserConfig
@@ -27,7 +27,7 @@ import aiohttp
 import base64  # Add at the top with other imports
 import boto3  # Add at the top with other imports
 from urllib.parse import quote
-from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content, generate_content_hash
+from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content, generate_content_hash, get_agent_code_base_path, call_github_api, run_python_code_in_sandbox, fetch_api_credentials, decrypt_password
 # Load environment variables
 load_dotenv()
 
@@ -44,22 +44,6 @@ logger = logging.getLogger(__name__)
 global_use_vision = True
 
 controller = Controller()
-
-def decrypt_password(encrypted_password: str, user_id: str, shared_by: str = None) -> str:
-    """Decrypt password using JWT_SECRET. For shared passwords, use the sharer's userId."""
-    try:
-        import jwt
-        decoded = jwt.decode(encrypted_password, os.getenv('JWT_SECRET'), algorithms=['HS256'])
-        # For shared passwords, verify against the original sharer's userId
-        expected_user_id = shared_by if shared_by else user_id
-        if shared_by:
-            logger.info(f"Using shared credentials - decrypting with sharer's userId: {shared_by}")
-        if decoded['userId'] != expected_user_id:
-            raise Exception("Invalid user ID in encrypted password")
-        return decoded['password']
-    except Exception as e:
-        logger.error(f"Error decrypting password: {e}")
-        raise Exception("Failed to decrypt password")
 
 class WebAgent:
     def __init__(self, user_id=None, full_llm_name=None):
@@ -362,31 +346,6 @@ class WebAgent:
             - API Name: The name of the API configuration
             - Key Name: The name of the API key as stored in the config
             - Documentation: Link to the API documentation if provided
-            
-            This action should be called first before using run_integration to:
-            1. Verify the API configuration exists
-            2. Get the API key name for reference
-            3. Access documentation links for understanding how to use the API
-            
-            Workflow:
-            1. Call get_integration_instructions with the app_name
-            2. Read documentation if needed (from the returned link)
-            3. Create Python code that uses the "YOUR_API_CREDENTIAL" placeholder
-            4. Call run_integration with the same app_name and your Python code
-            
-            IMPORTANT: When creating your Python code for run_integration, 
-            use "YOUR_API_CREDENTIAL" as a placeholder wherever you need to use
-            the actual API credential in your code. This placeholder will be 
-            automatically replaced with the real credential when the code runs.
-            
-            Example:
-            ```python
-            # GitHub API example using the placeholder
-            headers = {'Authorization': f'token YOUR_API_CREDENTIAL'}
-            
-            # Stripe API example using the placeholder
-            stripe.api_key = YOUR_API_CREDENTIAL
-            ```
             """
             if not self.user_id:
                 return ActionResult(error="User ID not provided")
@@ -451,211 +410,112 @@ class WebAgent:
             except Exception as e:
                 return ActionResult(error=f"Error retrieving integration details: {str(e)}")
                 
-        @self.controller.registry.action('Run integration. Use "YOUR_API_CREDENTIAL" as a placeholder wherever you need to use the actual API credential in your code. Never print the API credential in your code.')
-        def run_integration(app_name: str, python_code: str) -> ActionResult:
-            """Run Python code with API credentials injected
+        @self.controller.registry.action('Run integration test with API credentials, load the API credentials from environment variables with names like GITHUB_API_CREDENTIAL, STRIPE_API_CREDENTIAL, etc.')
+        def run_integration_test(app_names: list, python_code: str) -> ActionResult:
+            """Run Python code with API credentials loaded from environment variables
             
             Parameters:
-            - app_name: The name of the API configuration to use (e.g., 'Stripe', 'GitHub')
+            - app_names: List of API configuration names to retrieve (e.g., ['Stripe', 'GitHub'])
+              Must be provided as a list, even for a single API (e.g., ['GitHub'])
             - python_code: Valid Python code to execute with the API credentials
             
             The python_code parameter should contain complete, executable Python code that uses the API.
             
-            IMPORTANT: Use 'YOUR_API_CREDENTIAL' as a placeholder in your code where you need the 
-            actual API credential value. This placeholder will be automatically replaced with the 
-            real credential when the code runs.
+            IMPORTANT: The code should use environment variables directly to access API credentials.
+            For example, use GITHUB_API_CREDENTIAL for GitHub API, STRIPE_API_CREDENTIAL for Stripe API, etc.
             
-            Example for GitHub API:
+            Example for GitHub and Stripe API:
             ```python
             import requests
+            import stripe
+            import os
+            from dotenv import load_dotenv
             
-            # Use the YOUR_API_CREDENTIAL placeholder in your code where you need the token
-            headers = {'Authorization': f'token YOUR_API_CREDENTIAL'}
+            # Load environment variables from .env file
+            load_dotenv()
+            
+            # GitHub API
+            headers = {'Authorization': f'token {os.getenv("GITHUB_API_CREDENTIAL")}'}
             response = requests.get('https://api.github.com/user/repos', headers=headers)
             
-            # Print results for the agent to see
+            # Stripe API
+            stripe.api_key = os.getenv("STRIPE_API_CREDENTIAL")
+            customers = stripe.Customer.list(limit=3)
+            
+            # Print results
+            print("GitHub repositories:")
             if response.status_code == 200:
                 repos = response.json()
-                for repo in repos:
-                    print(f"Repository: {repo['name']}")
-                    print(f"Description: {repo['description']}")
-                    print(f"URL: {repo['html_url']}")
-                    print("-" * 40)
-            else:
-                print(f"Error: {response.status_code}")
-                print(response.text)
+                for repo in repos[:3]:
+                    print(f"- {repo['name']}")
+            
+            print("\nStripe customers:")
+            for customer in customers:
+                print(f"- {customer.id}: {customer.email}")
             ```
             
             Important notes:
-            - Code execution has a 30-second timeout
+            - Code execution has a timeout set by SANDBOX_TIMEOUT_SECONDS environment variable
             - Standard Python libraries are available
             - External libraries like 'requests' are available
             - Return values should be printed to stdout to be returned to the agent
-            - DO NOT include real credentials in your code - use YOUR_API_CREDENTIAL placeholder
-            - The same placeholder text (YOUR_API_CREDENTIAL) must be used regardless of the API being used
+            - Use environment variables directly to access API credentials
+            - The credentials will be loaded from environment variables at runtime
             """
             if not self.user_id:
                 return ActionResult(error="User ID not provided")
-            if not app_name:
-                return ActionResult(error="Please provide an API/App name")
+            
+            # Type checking for app_names
+            if not isinstance(app_names, list):
+                return ActionResult(error="app_names must be a list of strings. Example: ['GitHub'] or ['GitHub', 'Stripe']")
+            
+            if not app_names:
+                return ActionResult(error="Please provide at least one API/App name in the list")
+                
+            # Verify all items in app_names are strings
+            if not all(isinstance(name, str) for name in app_names):
+                return ActionResult(error="All API names in app_names must be strings")
+                
             if not python_code:
                 return ActionResult(error="Please provide Python code to execute")
             
-            # Check if the placeholder is present
-            if "YOUR_API_CREDENTIAL" not in python_code:
-                return ActionResult(error="No 'YOUR_API_CREDENTIAL' placeholder found in code. Please include this placeholder where the API credential should be used.")
-                
-            logger.info(f"Running integration for {app_name}")
-                
-            # Get API credentials
-            table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
+            logger.info(f"Running integration for apps: {', '.join(app_names)}")
             
-            # First check user's own API configs
-            user_response = table.query(
-                KeyConditionExpression='userId = :userId',
-                FilterExpression='isApiConfig = :isApiConfig AND appName = :appName',
-                ExpressionAttributeValues={
-                    ':userId': self.user_id,
-                    ':isApiConfig': True,
-                    ':appName': app_name
-                }
-            )
-            
-            items = user_response.get('Items', [])
-            
-            if not items:
-                # If no direct matches, check for publicly shared API configs
-                logger.info(f"No personal API config found for {app_name}, checking shared configs")
-                public_response = table.query(
-                    IndexName='ShareWithEveryoneIndex',
-                    KeyConditionExpression='shareWithEveryone = :shareWithEveryone',
-                    FilterExpression='isApiConfig = :isApiConfig AND appName = :appName AND userId <> :userId',
-                    ExpressionAttributeValues={
-                        ':shareWithEveryone': 1,
-                        ':isApiConfig': True,
-                        ':appName': app_name,
-                        ':userId': self.user_id
-                    }
-                )
-                items.extend(public_response.get('Items', []))
-            
-            if not items:
-                return ActionResult(error=f"No API configuration found for: {app_name}")
-                
             try:
-                # Sort items by priority (user's own first, then shared)
-                sorted_items = sorted(items, key=lambda x: (
-                    0 if not x.get('sharedBy') else 1
-                ))
+                # Get API credentials
+                api_credentials, api_key_names = fetch_api_credentials(self.user_id, app_names)
                 
-                config = sorted_items[0]
-                shared_by = config.get('sharedBy')
+                if not api_credentials:
+                    return ActionResult(error=f"Failed to retrieve API credentials for {', '.join(app_names)}")
                 
-                # Decrypt the API key/secret
-                api_key = decrypt_password(config['password'], self.user_id, shared_by)
-                api_key_name = config['username']  # This is the API key name
+                # Check if we got all the requested credentials
+                missing_apps = [app for app in app_names if app not in api_credentials]
+                if missing_apps:
+                    return ActionResult(error=f"No API configuration found for: {', '.join(missing_apps)}")
                 
-                logger.info(f"Successfully retrieved credential for {app_name} (key name: {api_key_name})")
+                # Create environment variables for the credentials
+                env_vars = {}
+                header_parts = []
+                for app_name, cred_info in api_credentials.items():
+                    env_var_name = f"{app_name.upper()}_API_CREDENTIAL"
+                    env_vars[env_var_name] = cred_info["value"]
+                    header_parts.append(f"# App: {app_name}")
+                    header_parts.append(f"# API credential field name: {api_key_names[app_name]}")
+                    header_parts.append(f"# Environment variable: {env_var_name}")
+                    header_parts.append("")
                 
-                # Execute the Python code in a safe environment with the API credentials
-                import tempfile
-                import subprocess
-                import uuid
-                import os
+                header_comment = "\n".join(header_parts).strip()
                 
-                # Create a temporary directory with the execution ID for isolation
-                temp_dir = tempfile.gettempdir()
-                execution_subdir = os.path.join(temp_dir, f"execution_{self.current_execution_id}")
+                # Execute the Python code in a sandboxed environment using the utility function
+                return run_python_code_in_sandbox(
+                    python_code=python_code,
+                    execution_id=self.current_execution_id,
+                    user_id=self.user_id,
+                    script_type="integration",
+                    header_comment=header_comment,
+                    additional_env_vars=env_vars
+                )
                 
-                # Create the execution-specific directory if it doesn't exist
-                os.makedirs(execution_subdir, exist_ok=True)
-                
-                # Set permissions to restrict access (0o700 = rwx------)
-                os.chmod(execution_subdir, 0o700)
-                
-                # Create a temporary file within the execution-specific directory
-                script_id = uuid.uuid4()
-                temp_file_path = os.path.join(execution_subdir, f"integration_{script_id}.py")
-                
-                # Replace the placeholder with the actual credential
-                modified_code = python_code.replace("YOUR_API_CREDENTIAL", api_key)
-                
-                # Add a header comment
-                final_code = f"""# Integration script for {app_name}
-# API credential placeholder has been replaced with the actual credential
-# Original credential field name: {api_key_name}
-
-{modified_code}
-"""
-                
-                # Write the code to the temporary file
-                with open(temp_file_path, "w") as f:
-                    f.write(final_code)
-                
-                logger.info(f"Created temporary script at {temp_file_path}")
-                
-                # Execute the script with a timeout
-                try:
-                    logger.info(f"Executing integration script with timeout of 30 seconds")
-                    
-                    # Use a restricted environment for the subprocess
-                    # Instead of copying all environment variables, create a minimal set
-                    env = {
-                        "PATH": os.environ.get("PATH", ""),  # Needed to find Python executable
-                        "PYTHONPATH": execution_subdir,  # Set PYTHONPATH to only the execution directory for isolation
-                        "LANG": os.environ.get("LANG", "en_US.UTF-8"),  # Basic locale setting
-                        "PYTHONIOENCODING": os.environ.get("PYTHONIOENCODING", "utf-8"),  # Ensure proper encoding
-                        "TEMP": temp_dir,  # Provide access to temp directory
-                        "TMP": temp_dir,  # Provide access to temp directory
-                        "INTEGRATION_EXECUTION_ID": self.current_execution_id  # Allow tracking which execution this is
-                    }
-                    
-                    # Don't include AWS credentials, API keys, or other sensitive environment variables
-                    logger.info("Created restricted environment with limited variables for integration execution")
-                    
-                    result = subprocess.run(
-                        ["python", temp_file_path],
-                        capture_output=True,
-                        text=True,
-                        timeout=30,  # 30 second timeout for safety
-                        cwd=execution_subdir,  # Run from the isolated directory
-                        env=env  # Use the restricted environment
-                    )
-                    
-                    # Process the result
-                    if result.returncode == 0:
-                        output = result.stdout
-                        return ActionResult(extracted_content=output if output else "Code executed successfully with no output")
-                    else:
-                        error_msg = result.stderr
-                        return ActionResult(error=f"Execution failed: {error_msg}")
-                        
-                except subprocess.TimeoutExpired:
-                    # Clean up on timeout
-                    if os.path.exists(temp_file_path):
-                        os.remove(temp_file_path)
-                    return ActionResult(error="Execution timed out after 30 seconds")
-                    
-                except Exception as e:
-                    # Clean up on any other error
-                    if os.path.exists(temp_file_path):
-                        os.remove(temp_file_path)
-                    return ActionResult(error=f"Error during execution: {str(e)}")
-                
-                finally:
-                    # Instead of removing the directory, just clean up files but preserve the directory
-                    try:
-                        # Remove any remaining files in the directory except the script
-                        script_filename = f"integration_{script_id}.py"
-                        for file in os.listdir(execution_subdir):
-                            if file != script_filename:  # Skip the integration script file
-                                file_path = os.path.join(execution_subdir, file)
-                                if os.path.isfile(file_path):
-                                    os.remove(file_path)
-                        
-                        logger.info(f"Cleaned up temporary files in execution directory: {execution_subdir}")
-                    except Exception as e:
-                        logger.warning(f"Failed to clean up temporary files in execution directory: {str(e)}")
             except Exception as e:
                 logger.error(f"Error during API integration setup: {str(e)}")
                 return ActionResult(error=f"Error running integration: {str(e)}")
@@ -677,6 +537,320 @@ class WebAgent:
             except Exception as e:
                 logger.error(f"Error in sleep: {str(e)}")
                 return ActionResult(error=f"Failed to sleep: {str(e)}")
+
+        @self.controller.registry.action('Get approved Python code')
+        async def get_approved_python_code() -> ActionResult:
+            """
+            Retrieve a list of available Python code from GitHub that the agent is allowed to run.
+            
+            This action searches the GitHub repository and returns a list of available Python code files.
+            
+            Returns:
+                A list of available Python code files with their filenames.
+                You should use just the filename when calling run_approved_python_code or submit_python_code.
+            """
+            try:
+                # Check if user_id is available
+                if not self.user_id:
+                    return ActionResult(error="User ID not available")
+                
+                # Get the base path using the utility function
+                base_path = get_agent_code_base_path(self.user_id, self.current_task_id)
+                
+                # Create the GitHub API endpoint
+                endpoint = f"repos/john-the-dev/agentweb-agentcode/contents/{base_path}"
+                
+                # Call GitHub API
+                status, content, error = await call_github_api("get", endpoint)
+                
+                if status == 404:
+                    # Special handling for 404 - no files available yet
+                    message = "No Python code files are available yet for this user/task."
+                    return ActionResult(extracted_content=message)
+                elif error:
+                    return ActionResult(error=f"Failed to fetch code list: {status}. Path {base_path} may not exist.")
+                
+                # Filter for Python files only
+                python_files = [
+                    {
+                        "name": item["name"],
+                        "size": item["size"]
+                    }
+                    for item in content if item["name"].endswith(".py")
+                ]
+                
+                # Format the result
+                if python_files:
+                    result_text = "Available Python code:\n\n"
+                    for file in python_files:
+                        result_text += f"  Filename: {file['name']}\n"
+                        result_text += f"  Size: {file['size']} bytes\n\n"
+                    
+                    result_text += "Note: Use only the filename when calling run_approved_python_code or submit_python_code."
+                else:
+                    result_text = f"No Python code files found"
+                
+                logger.info(f"Found {len(python_files)} Python files")
+                return ActionResult(extracted_content=result_text)
+                
+            except Exception as e:
+                logger.error(f"Error retrieving Python code list: {str(e)}")
+                return ActionResult(error=f"Failed to retrieve Python code list: {str(e)}")
+
+        @self.controller.registry.action('Run approved Python code')
+        async def run_approved_python_code(code_file_name: str) -> ActionResult:
+            """
+            Run Python code identified by the provided filename.
+            
+            The function retrieves the code from GitHub and executes it in a sandboxed environment.
+            API credentials will be loaded from environment variables.
+            
+            Parameters:
+                code_file_name: The filename of the Python code to run (e.g., "script.py").
+                               Do not include any path information, just the filename.
+                
+            Returns:
+                The output of the executed Python code
+            """
+            try:
+                # Check if user_id is available
+                if not self.user_id:
+                    return ActionResult(error="User ID not available")
+                
+                # Validate that code_file_name is just a filename, not a path
+                if "/" in code_file_name or "\\" in code_file_name:
+                    return ActionResult(error="Invalid filename. Please provide just the filename without any path (e.g., 'script.py')")
+                
+                # Ensure filename ends with .py
+                if not code_file_name.endswith('.py'):
+                    return ActionResult(error="Invalid filename. The file must have a .py extension")
+                
+                # Get the base path using the utility function
+                base_path = get_agent_code_base_path(self.user_id, self.current_task_id)
+                full_path = f"{base_path}/{code_file_name}"
+                
+                logger.info(f"Using filename: {code_file_name}, full path: {full_path}")
+                
+                # Create GitHub API endpoint
+                endpoint = f"repos/john-the-dev/agentweb-agentcode/contents/{full_path}"
+                
+                # Call GitHub API to get file content
+                status, content, error = await call_github_api("get", endpoint)
+                
+                # Return error if file not found
+                if status == 404:
+                    return ActionResult(error=f"File '{code_file_name}' not found")
+                elif error:
+                    return ActionResult(error=f"Failed to fetch code: {status}")
+                
+                # Decode content from base64
+                if content.get("encoding") == "base64" and content.get("content"):
+                    python_code = base64.b64decode(content["content"]).decode("utf-8")
+                else:
+                    return ActionResult(error="Invalid content format received from GitHub")
+                
+                # Create header comment with metadata
+                header_parts = [
+                    f"# GitHub code execution from {code_file_name}",
+                    f"# Executed at: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                ]
+                
+                # Get all API credentials
+                try:
+                    # Get all available API credentials
+                    api_credentials, api_key_names = fetch_api_credentials(self.user_id)
+                    
+                    if api_credentials:
+                        # Create environment variables for the credentials
+                        env_vars = {}
+                        for app_name, cred_info in api_credentials.items():
+                            env_var_name = f"{app_name.upper()}_API_CREDENTIAL"
+                            env_vars[env_var_name] = cred_info["value"]
+                            header_parts.append(f"# API credential available: {app_name}")
+                            header_parts.append(f"# API credential field name: {api_key_names[app_name]}")
+                            header_parts.append(f"# Environment variable: {env_var_name}")
+                            header_parts.append("")
+                        
+                        header_parts.append("# Note: API credentials are available as environment variables")
+                except Exception as e:
+                    logger.warning(f"Error processing API credentials: {str(e)}")
+                    # Continue without credential setup
+
+                # Create a header comment for the script
+                header_comment = "\n".join(header_parts)
+
+                # Execute the Python code in a sandboxed environment using the utility function
+                return run_python_code_in_sandbox(
+                    python_code=python_code,
+                    execution_id=self.current_execution_id,
+                    user_id=self.user_id,
+                    script_type="approved",
+                    header_comment=header_comment,
+                    additional_env_vars=env_vars
+                )
+                
+            except Exception as e:
+                logger.error(f"Error running Python code: {str(e)}")
+                return ActionResult(error=f"Failed to run Python code: {str(e)}")
+
+        @self.controller.registry.action('Submit Python code')
+        async def submit_python_code(python_code: str, code_file_name: str, is_new_file: bool = False) -> ActionResult:
+            """
+            Submit Python code to GitHub as a pull request.
+            
+            The function creates or updates a file in the GitHub repository via a PR.
+            
+            Parameters:
+                python_code: The Python code to submit
+                code_file_name: The filename to use. Should be just a filename (e.g., "script.py") without any path.
+                                This parameter is required.
+                is_new_file: Boolean indicating whether to create a new file (True) or update an existing one (False).
+                             If set to True and a file with the same name already exists, a new file with a timestamp
+                             will be created instead.
+                
+            Returns:
+                The URL of the created pull request
+            """
+            try:
+                # Check if user_id is available
+                if not self.user_id:
+                    return ActionResult(error="User ID not available")
+                
+                # Get the base path using the utility function
+                base_path = get_agent_code_base_path(self.user_id, self.current_task_id)
+                
+                # GitHub API endpoints
+                api_base = "https://api.github.com"
+                
+                # Validate that code_file_name is just a filename, not a path
+                if "/" in code_file_name or "\\" in code_file_name:
+                    return ActionResult(error="Invalid filename. Please provide just the filename without any path (e.g., 'script.py')")
+                
+                # Ensure filename ends with .py
+                if not code_file_name.endswith('.py'):
+                    code_file_name += '.py'
+                
+                # Construct the full path
+                full_path = f"{base_path}/{code_file_name}"
+                logger.info(f"Using filename: {code_file_name}, full path: {full_path}")
+                
+                # Create a unique branch name for the PR
+                timestamp = int(time.time())
+                random_suffix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=6))
+                branch_name = f"agent-code-submission-{timestamp}-{random_suffix}"
+                
+                # 1. Get the default branch (usually 'main' or 'master')
+                repo_endpoint = "repos/john-the-dev/agentweb-agentcode"
+                repo_status, repo_info, repo_error = await call_github_api("get", repo_endpoint)
+                
+                if repo_error:
+                    return ActionResult(error=f"Failed to get repository info: {repo_status}")
+                
+                default_branch = repo_info["default_branch"]
+                
+                # 2. Get the latest commit SHA on the default branch
+                ref_endpoint = f"repos/john-the-dev/agentweb-agentcode/git/ref/heads/{default_branch}"
+                ref_status, ref_data, ref_error = await call_github_api("get", ref_endpoint)
+                
+                if ref_error:
+                    return ActionResult(error=f"Failed to get reference: {ref_status}")
+                
+                sha = ref_data["object"]["sha"]
+                
+                # 3. Create a new branch
+                branch_endpoint = "repos/john-the-dev/agentweb-agentcode/git/refs"
+                branch_data = {
+                    "ref": f"refs/heads/{branch_name}",
+                    "sha": sha
+                }
+                
+                branch_status, branch_result, branch_error = await call_github_api("post", branch_endpoint, json_data=branch_data)
+                
+                if branch_error:
+                    return ActionResult(error=f"Failed to create branch: {branch_status}")
+                
+                logger.info(f"Created branch: {branch_name}")
+                
+                # 4. Check if file exists to get its SHA (for updates)
+                file_sha = None
+                file_exists = False
+                
+                check_file_endpoint = f"repos/john-the-dev/agentweb-agentcode/contents/{full_path}"
+                file_status, file_info, file_error = await call_github_api("get", check_file_endpoint)
+                
+                if file_status == 200:
+                    file_exists = True
+                    file_sha = file_info.get("sha")
+                    logger.info(f"Existing file found, SHA: {file_sha}")
+                
+                # If is_new_file is True and file exists, create a new filename with timestamp
+                if is_new_file and file_exists:
+                    return ActionResult(error=f"File '{code_file_name}' already exists. Please choose a different filename or set is_new_file to False to update the existing file.")
+                
+                # If file exists and is_new_file is False, we need the SHA to update
+                if not is_new_file and not file_exists:
+                    return ActionResult(error=f"File '{code_file_name}' does not exist. Please choose an existing filename from get_approved_python_code or set is_new_file to True to create a new file.")
+                
+                # 5. Create or update the file
+                # Add header comment with metadata
+                python_code_with_header = f"""#!/usr/bin/env python3
+# Agent-generated Python code
+# Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}
+# Description: Code submitted by AgentWeb
+
+{python_code}
+"""
+                
+                file_data = {
+                    "message": f"Agent submission: {code_file_name}",
+                    "content": base64.b64encode(python_code_with_header.encode()).decode(),
+                    "branch": branch_name
+                }
+                
+                if file_sha:
+                    file_data["sha"] = file_sha
+                
+                put_file_endpoint = f"repos/john-the-dev/agentweb-agentcode/contents/{full_path}"
+                put_status, put_result, put_error = await call_github_api("put", put_file_endpoint, json_data=file_data)
+                
+                if put_error:
+                    return ActionResult(error=f"Failed to create/update file: {put_status}")
+                
+                logger.info(f"Successfully {'created' if not file_sha else 'updated'} file: {code_file_name}")
+                
+                # 6. Create a pull request
+                pr_endpoint = "repos/john-the-dev/agentweb-agentcode/pulls"
+                pr_data = {
+                    "title": f"Agent Code Submission: {code_file_name}",
+                    "body": "This PR contains Python code generated or submitted by the AgentWeb agent.\n\nPlease review the code carefully before merging.",
+                    "head": branch_name,
+                    "base": default_branch
+                }
+                
+                pr_status, pr_info, pr_error = await call_github_api("post", pr_endpoint, json_data=pr_data)
+                
+                if pr_error:
+                    return ActionResult(error=f"Failed to create PR: {pr_status}")
+                
+                pr_html_url = pr_info["html_url"]
+                logger.info(f"Created PR: {pr_html_url}")
+                
+                result_message = f"""
+Python code successfully submitted to GitHub.
+                
+Filename: {code_file_name}
+Branch: {branch_name}
+Pull Request: {pr_html_url}
+Operation: {'Created new file' if (is_new_file or not file_exists) else 'Updated existing file'}
+
+Once the PR is approved and merged, this code will be available through the 'Run approved Python code' action using the filename: {code_file_name}
+"""
+                
+                return ActionResult(extracted_content=result_message)
+                
+            except Exception as e:
+                logger.error(f"Error submitting Python code: {str(e)}")
+                return ActionResult(error=f"Failed to submit Python code: {str(e)}")
 
         @self.controller.registry.action('Upload file')
         async def upload_file(file_name: str, index: int, browser: BrowserContext) -> ActionResult:

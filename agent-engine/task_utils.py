@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Union
 import boto3
 import random
 import logging
@@ -8,6 +8,8 @@ import sys
 import json
 import hashlib
 from urllib.parse import quote
+import aiohttp
+from browser_use.agent.views import ActionResult
 from aws_utils import get_dynamodb_resource, get_s3_client, get_bedrock_client
 from pydantic import SecretStr
 from langchain_aws import ChatBedrock
@@ -21,6 +23,9 @@ TABLE_PREFIX = 'Dev-' if os.getenv('NODE_ENV') == 'development' else ''
 
 # Global variable for vision support
 global_use_vision = True
+
+# Initialize DynamoDB client
+dynamodb = get_dynamodb_resource()
 
 def generate_content_hash(content: Any) -> str:
     """Generate a hash of the content to use as a filename.
@@ -62,6 +67,33 @@ def get_downloads_path(user_id: Optional[str] = None, execution_id: Optional[str
     
     base_path.mkdir(parents=True, exist_ok=True)
     return str(base_path)
+
+def get_agent_code_base_path(user_id: str, task_id: Optional[str] = None) -> str:
+    """
+    Get the base path for agent code files in the GitHub repository.
+    
+    This function constructs the path based on the environment (production or development)
+    and the provided user_id and task_id.
+    
+    Args:
+        user_id: The user ID
+        task_id: Optional task ID to include in the path
+        
+    Returns:
+        A string representing the path to the agent code directory in the GitHub repository
+    """
+    # Determine environment based on NODE_ENV
+    env = os.getenv('NODE_ENV')
+    env_path = 'dev' if env == 'development' else 'prod'
+    
+    # Create base path with user_id
+    base_path = f"agent-scripts/{env_path}/{user_id}"
+    
+    # Add task_id if provided
+    if task_id:
+        base_path = f"{base_path}/{task_id}"
+    
+    return base_path
 
 def get_aws_bedrock_llm(model_name: str):
     """Initialize AWS Bedrock language model"""
@@ -904,3 +936,438 @@ def extract_json_from_content(content_list: List[str]) -> List[Dict[str, Any]]:
                         logger.warning(f"Failed to extract truncated JSON object: {e}")
     
     return json_objects 
+
+async def call_github_api(
+    method: str,
+    endpoint: str,
+    json_data: Optional[Dict[str, Any]] = None
+) -> Tuple[int, Union[Dict[str, Any], List[Dict[str, Any]], str], Optional[str]]:
+    """Make a call to the GitHub API with proper authentication and error handling.
+    
+    This function centralizes GitHub API calls to ensure consistent authentication,
+    error handling, and logging across different API operations.
+    
+    Args:
+        method: HTTP method ("get", "post", "put", "delete")
+        endpoint: GitHub API endpoint path (e.g., "/repos/{owner}/{repo}/contents/{path}")
+        json_data: Optional JSON data to send with the request (for POST/PUT methods)
+        
+    Returns:
+        Tuple containing:
+        - HTTP status code
+        - Response data (parsed JSON or text if not JSON)
+        - Error message if there was an error, None otherwise
+    """
+    # GitHub repository information
+    owner = "john-the-dev"
+    repo = "agentweb-agentcode"
+    
+    # Get GitHub API key
+    github_api_key = os.getenv('GITHUB_API_KEY')
+    if not github_api_key:
+        return 401, {}, "GitHub API key not found in environment"
+    
+    # Set up headers with authorization
+    headers = {
+        "Authorization": f"token {github_api_key}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    
+    # Format endpoint with owner and repo if needed
+    if "{owner}" in endpoint and "{repo}" in endpoint:
+        endpoint = endpoint.format(owner=owner, repo=repo)
+    
+    # Construct full URL
+    api_base = "https://api.github.com"
+    if not endpoint.startswith(api_base):
+        # If endpoint starts with /, remove it to avoid double slash
+        if endpoint.startswith('/'):
+            endpoint = endpoint[1:]
+        api_url = f"{api_base}/{endpoint}"
+    else:
+        api_url = endpoint
+    
+    logger.info(f"Making GitHub API {method.upper()} request to: {api_url}")
+    
+    # Make the API request
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Choose the appropriate method
+            if method.lower() == "get":
+                async with session.get(api_url, headers=headers) as response:
+                    status = response.status
+                    if status == 200:
+                        try:
+                            # Try to parse as JSON
+                            result = await response.json()
+                        except:
+                            # If not JSON, return text
+                            result = await response.text()
+                        return status, result, None
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"GitHub API error: {status} - {error_text}")
+                        return status, error_text, f"GitHub API error: {status}"
+            
+            elif method.lower() == "post":
+                async with session.post(api_url, headers=headers, json=json_data) as response:
+                    status = response.status
+                    if status in [200, 201]:
+                        try:
+                            result = await response.json()
+                        except:
+                            result = await response.text()
+                        return status, result, None
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"GitHub API error: {status} - {error_text}")
+                        return status, error_text, f"GitHub API error: {status}"
+            
+            elif method.lower() == "put":
+                async with session.put(api_url, headers=headers, json=json_data) as response:
+                    status = response.status
+                    if status in [200, 201]:
+                        try:
+                            result = await response.json()
+                        except:
+                            result = await response.text()
+                        return status, result, None
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"GitHub API error: {status} - {error_text}")
+                        return status, error_text, f"GitHub API error: {status}"
+            
+            elif method.lower() == "delete":
+                async with session.delete(api_url, headers=headers) as response:
+                    status = response.status
+                    if status in [200, 204]:
+                        try:
+                            result = await response.json()
+                        except:
+                            result = await response.text() if response.content_length and response.content_length > 0 else ""
+                        return status, result, None
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"GitHub API error: {status} - {error_text}")
+                        return status, error_text, f"GitHub API error: {status}"
+            else:
+                return 400, {}, f"Unsupported HTTP method: {method}"
+    
+    except Exception as e:
+        error_msg = f"Error making GitHub API request: {str(e)}"
+        logger.error(error_msg)
+        return 500, {}, error_msg 
+
+def run_python_code_in_sandbox(
+    python_code: str, 
+    execution_id: str,
+    user_id: str,
+    script_type: str = "script",
+    header_comment: Optional[str] = None,
+    additional_env_vars: Optional[Dict[str, str]] = None
+) -> ActionResult:
+    """Execute Python code in a sandboxed environment.
+    
+    This function creates a temporary file in an isolated directory and executes
+    the provided Python code with limited permissions and environment variables.
+    It handles timeouts, captures output, and cleans up temporary files.
+    
+    Args:
+        python_code: The Python code to execute
+        execution_id: Current execution ID, used to create an isolated directory
+        user_id: User ID for creating user-specific directories
+        script_type: Type of script for naming (e.g., "github", "integration")
+        header_comment: Optional header comment to add to the script
+        additional_env_vars: Optional additional environment variables for the execution
+        
+    Returns:
+        ActionResult object containing execution output or error
+    """
+    import tempfile
+    import subprocess
+    import uuid
+    import os
+    import shutil
+    import zipfile
+    from pathlib import Path
+    from browser_use.agent.views import ActionResult
+    
+    try:
+        # Create a temporary directory with the execution ID for isolation
+        temp_dir = tempfile.gettempdir()
+        execution_subdir = os.path.join(temp_dir, f"execution_{execution_id}")
+        
+        # Create the execution-specific directory if it doesn't exist
+        os.makedirs(execution_subdir, exist_ok=True)
+        
+        # Set permissions to restrict access (0o700 = rwx------)
+        os.chmod(execution_subdir, 0o700)
+        
+        # Create a temporary file within the execution-specific directory
+        script_id = uuid.uuid4()
+        temp_file_path = os.path.join(execution_subdir, f"{script_type}_{script_id}.py")
+        
+        # Add a header comment if provided
+        if header_comment:
+            final_code = f"{header_comment}\n\n{python_code}"
+        else:
+            final_code = python_code
+            
+        # Add python-dotenv import and loading at the start of the code
+        final_code = f"""from dotenv import load_dotenv
+import os
+
+# Load environment variables from .env file
+load_dotenv()
+
+{final_code}
+"""
+        
+        # Write the code to the temporary file
+        with open(temp_file_path, "w") as f:
+            f.write(final_code)
+            
+        # Create a temporary .env file with the credentials
+        env_file_path = os.path.join(execution_subdir, ".env")
+        with open(env_file_path, "w") as f:
+            # Write any additional environment variables to .env
+            if additional_env_vars:
+                for key, value in additional_env_vars.items():
+                    f.write(f"{key}={value}\n")
+        
+        logger.info(f"Created temporary script at {temp_file_path}")
+        
+        # Execute the script with a timeout
+        try:
+            # Get timeout from environment variable
+            timeout_seconds = int(os.getenv('SANDBOX_TIMEOUT_SECONDS', '300'))
+            logger.info(f"Executing {script_type} script with timeout of {timeout_seconds} seconds")
+            
+            # Use a restricted environment for the subprocess
+            env = {
+                "PATH": os.environ.get("PATH", ""),  # Needed to find Python executable
+                "PYTHONPATH": execution_subdir,  # Set PYTHONPATH to only the execution directory for isolation
+                "LANG": os.environ.get("LANG", "en_US.UTF-8"),  # Basic locale setting
+                "PYTHONIOENCODING": os.environ.get("PYTHONIOENCODING", "utf-8"),  # Ensure proper encoding
+                "TEMP": temp_dir,  # Provide access to temp directory
+                "TMP": temp_dir,  # Provide access to temp directory
+                "EXECUTION_ID": execution_id  # Allow tracking which execution this is
+            }
+            
+            # Add any additional environment variables
+            if additional_env_vars:
+                env.update(additional_env_vars)
+            
+            result = subprocess.run(
+                ["python", temp_file_path],
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,  # Use timeout from environment variable
+                cwd=execution_subdir,  # Run from the isolated directory
+                env=env  # Use the restricted environment
+            )
+            
+            # Process the result
+            if result.returncode == 0:
+                output = result.stdout
+                
+                # Check if there are files in the data folder
+                data_folder = os.path.join(execution_subdir, "data")
+                if os.path.exists(data_folder) and any(os.scandir(data_folder)):
+                    try:
+                        # Create downloads directory with user_id
+                        downloads_path = get_downloads_path(user_id=user_id, execution_id=execution_id)
+                        os.makedirs(downloads_path, exist_ok=True)
+                        
+                        # Create zip file
+                        zip_filename = "output.zip"
+                        zip_path = os.path.join(downloads_path, zip_filename)
+                        
+                        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                            for root, _, files in os.walk(data_folder):
+                                for file in files:
+                                    file_path = os.path.join(root, file)
+                                    arcname = os.path.relpath(file_path, data_folder)
+                                    zipf.write(file_path, arcname)
+                        
+                        logger.info(f"Created zip file with output files at {zip_path}")
+                    except Exception as e:
+                        logger.error(f"Error creating zip file: {str(e)}")
+                
+                return ActionResult(extracted_content=output if output else f"Code executed successfully with no output")
+            else:
+                error_msg = result.stderr
+                return ActionResult(error=f"Execution failed: {error_msg}")
+                
+        except subprocess.TimeoutExpired:
+            return ActionResult(error=f"Execution timed out after {timeout_seconds} seconds")
+            
+        except Exception as e:
+            return ActionResult(error=f"Error during execution: {str(e)}")
+        
+        finally:
+            # Clean up
+            try:
+                if os.path.exists(temp_file_path):
+                    os.remove(temp_file_path)
+                if os.path.exists(env_file_path):
+                    os.remove(env_file_path)
+                logger.info(f"Cleaned up temporary files")
+            except Exception as e:
+                logger.warning(f"Failed to clean up temporary files: {str(e)}")
+    
+    except Exception as e:
+        logger.error(f"Error setting up Python code execution: {str(e)}")
+        return ActionResult(error=f"Failed to execute Python code: {str(e)}") 
+
+def decrypt_password(encrypted_password: str, user_id: str, shared_by: str = None) -> str:
+    """Decrypt password using JWT_SECRET. For shared passwords, use the sharer's userId."""
+    try:
+        import jwt
+        decoded = jwt.decode(encrypted_password, os.getenv('JWT_SECRET'), algorithms=['HS256'])
+        # For shared passwords, verify against the original sharer's userId
+        expected_user_id = shared_by if shared_by else user_id
+        if shared_by:
+            logger.info(f"Using shared credentials - decrypting with sharer's userId: {shared_by}")
+        if decoded['userId'] != expected_user_id:
+            raise Exception("Invalid user ID in encrypted password")
+        return decoded['password']
+    except Exception as e:
+        logger.error(f"Error decrypting password: {e}")
+        raise Exception("Failed to decrypt password") 
+
+def fetch_api_credentials(user_id: str, app_names=None):
+    """
+    Fetch API credentials for the specified apps or all available credentials if no app names provided.
+    
+    Args:
+        user_id: The ID of the user whose API credentials to fetch
+        app_names: Optional list of API app names to fetch credentials for.
+                  If None, all available credentials are fetched.
+    
+    Returns:
+        Dictionary containing:
+        - api_credentials: Dict mapping app names to their credential values and placeholders
+        - api_key_names: Dict mapping app names to their credential field names
+    """
+    if not user_id:
+        return None, None
+    
+    try:
+        table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
+        api_credentials = {}
+        api_key_names = {}
+        
+        # Build the filter expression based on whether specific app names were provided
+        filter_expression = 'isApiConfig = :isApiConfig'
+        expression_values = {
+            ':userId': user_id,
+            ':isApiConfig': True
+        }
+        
+        if app_names:
+            # Handle single app_name passed as string
+            if isinstance(app_names, str):
+                app_names = [app_names]
+            
+            # Verify all items in app_names are strings if provided
+            if not all(isinstance(name, str) for name in app_names):
+                logger.error("All API names must be strings")
+                return None, None
+            
+            # Add app names to filter if specific ones were requested
+            if len(app_names) == 1:
+                filter_expression += ' AND appName = :appName'
+                expression_values[':appName'] = app_names[0]
+            else:
+                app_name_values = {}
+                app_name_filters = []
+                
+                for i, name in enumerate(app_names):
+                    key = f':appName{i}'
+                    app_name_values[key] = name
+                    app_name_filters.append(f'appName = {key}')
+                
+                filter_expression += f" AND ({' OR '.join(app_name_filters)})"
+                expression_values.update(app_name_values)
+        
+        # Get user's own API configs
+        user_response = table.query(
+            KeyConditionExpression='userId = :userId',
+            FilterExpression=filter_expression,
+            ExpressionAttributeValues=expression_values
+        )
+        
+        items = user_response.get('Items', [])
+        
+        # If no direct matches or not all requested apps found, check for publicly shared API configs
+        public_filter_expression = 'isApiConfig = :isApiConfig AND userId <> :userId'
+        public_expression_values = {
+            ':shareWithEveryone': 1,
+            ':isApiConfig': True,
+            ':userId': user_id
+        }
+        
+        if app_names:
+            # Add the same app name filtering for public configs
+            if len(app_names) == 1:
+                public_filter_expression += ' AND appName = :appName'
+                public_expression_values[':appName'] = app_names[0]
+            else:
+                public_expression_values.update(app_name_values)
+                public_filter_expression += f" AND ({' OR '.join(app_name_filters)})"
+        
+        public_response = table.query(
+            IndexName='ShareWithEveryoneIndex',
+            KeyConditionExpression='shareWithEveryone = :shareWithEveryone',
+            FilterExpression=public_filter_expression,
+            ExpressionAttributeValues=public_expression_values
+        )
+        items.extend(public_response.get('Items', []))
+        
+        # Process all API configs
+        for config in items:
+            app_name = config['appName']
+            
+            # Skip if we already have this app_name from user's own configs
+            if app_name in api_credentials:
+                continue
+            
+            shared_by = config.get('sharedBy')
+            
+            # Decrypt the API key/secret
+            api_key = decrypt_password(config['password'], user_id, shared_by)
+            api_key_name = config['username']  # This is the API key name
+            
+            # Create the app-specific credential placeholder name
+            app_name_clean = app_name.upper().replace(" ", "_").replace("-", "_")
+            placeholder = f"YOUR_{app_name_clean}_API_CREDENTIAL"
+            
+            api_credentials[app_name] = {
+                "value": api_key,
+                "placeholder": placeholder
+            }
+            api_key_names[app_name] = api_key_name
+            
+            logger.info(f"Successfully retrieved credential for {app_name} (key name: {api_key_name})")
+        
+        return api_credentials, api_key_names
+        
+    except Exception as e:
+        logger.error(f"Error fetching API credentials: {str(e)}")
+        return None, None 
+
+# List of functions to be exported from this module
+__all__ = [
+    'get_downloads_path',
+    'upload_task_result_files',
+    'get_llm',
+    'validate_content_format',
+    'extract_json_from_content', 
+    'generate_content_hash',
+    'get_agent_code_base_path',
+    'call_github_api',
+    'run_python_code_in_sandbox',
+    'decrypt_password',
+    'fetch_api_credentials'
+] 

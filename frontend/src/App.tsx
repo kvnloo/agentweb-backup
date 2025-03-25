@@ -27,6 +27,7 @@ import WorkflowRun from './pages/WorkflowRun';
 import Release from './pages/Release';
 import Guide from './pages/Guide';
 import Templates from './pages/Templates';
+import Api from './pages/Api';
 
 export default function App() {
   return (
@@ -45,6 +46,7 @@ export default function App() {
                     <Route path="oauth-callback" element={<OAuthCallback />} />
                     <Route path="release" element={<Release />} />
                     <Route path="guide" element={<Guide />} />
+                    <Route path="api" element={<Api />} />
                     <Route path="execution/:executionId/token/:token" element={<SharedExecution />} />
                     <Route
                       path="tasks"
