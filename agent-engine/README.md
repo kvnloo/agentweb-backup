@@ -22,7 +22,7 @@ chmod +x web_agent.py
 
 ### Alternative Setup (pip)
 
-If you prefer not to use Conda, you can install dependencies directly with pip:
+You can install dependencies directly with pip:
 ```bash
 pip install -r requirements.txt
 ```
