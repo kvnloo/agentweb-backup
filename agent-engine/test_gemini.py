@@ -9,9 +9,12 @@ import sys
 import logging
 import asyncio
 from pathlib import Path
+from typing import List
 from dotenv import load_dotenv
-from pydantic import SecretStr
-from browser_use import Agent
+from pydantic import SecretStr, BaseModel
+from browser_use import Agent, ActionResult, Controller
+from browser_use.browser.browser import Browser, BrowserConfig
+from browser_use.browser.context import BrowserContextConfig, BrowserContext
 
 # Configure logging
 logging.basicConfig(
@@ -20,7 +23,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def test_gemini():
+# Create a controller for custom actions
+controller = Controller()
+
+class NameList(BaseModel):
+    names: List[str]
+
+@controller.action('Say hello to someone')
+async def hello(name: str, browser: BrowserContext):
+    """Say hello to the specified person"""
+    try:
+        return ActionResult(extracted_content=f"Hello, {name}!")
+    except Exception as e:
+        return ActionResult(error=str(e))
+
+@controller.action('Say hello to a list of people', param_model=NameList)
+async def hello_list(name_list: NameList, browser: BrowserContext):
+    """Say hello to a list of people"""
+    try:
+        greetings = [f"Hello, {name}!" for name in name_list.names]
+        return ActionResult(extracted_content="\n".join(greetings))
+    except Exception as e:
+        return ActionResult(error=str(e))
+
+def test_gemini(model_name="gemini-2.0-flash"):
     """Test the Google Gemini integration"""
     # Load environment variables from .env file
     load_dotenv()
@@ -31,7 +57,6 @@ def test_gemini():
         logger.error("GEMINI_API_KEY environment variable is not set")
         sys.exit(1)
     
-    model_name = "gemini-2.0-flash"
     logger.info(f"Testing Google Gemini with model: {model_name}")
     
     try:
@@ -66,7 +91,7 @@ def test_gemini():
         logger.error(traceback.format_exc())
         return False
 
-async def test_with_browser_use_async():
+async def test_with_browser_use_async(model_name="gemini-2.0-flash"):
     """Test using Gemini with browser-use for web automation"""
     # Load environment variables from .env file
     load_dotenv()
@@ -77,7 +102,6 @@ async def test_with_browser_use_async():
         logger.error("GEMINI_API_KEY environment variable is not set")
         sys.exit(1)
     
-    model_name = "gemini-2.0-flash"
     logger.info(f"Testing Google Gemini with browser-use using model: {model_name}")
     
     try:
@@ -95,6 +119,15 @@ async def test_with_browser_use_async():
             temperature=0.0
         )
         
+        # Create browser instance
+        browser = Browser(
+            config=BrowserConfig(
+                new_context_config=BrowserContextConfig(
+                    viewport_expansion=0,
+                )
+            )
+        )
+        
         # Create downloads directory
         downloads_path = Path('downloads/test_gemini')
         downloads_path.mkdir(parents=True, exist_ok=True)
@@ -102,15 +135,17 @@ async def test_with_browser_use_async():
         # Define a simple web automation task
         task = """
         1. Go to https://www.example.com
-        2. Read the main heading text
-        3. Return the heading text
+        2. Use the hello_list function to say hello to ["World", "Python", "Gemini"]
+        3. Return the greeting messages
         """
         
-        # Initialize Agent with the ChatGoogleGenerativeAI model
+        # Initialize Agent with the ChatGoogleGenerativeAI model and controller
         logger.info("Initializing Agent with Gemini model...")
         agent = Agent(
             task=task,
             llm=chat,
+            controller=controller,
+            browser=browser,
             use_vision=False
         )
         
@@ -133,6 +168,14 @@ async def test_with_browser_use_async():
         logger.info(f"Task completed: {task_is_done}")
         logger.info(f"Message: {agent_message}")
         
+        # Print function call history
+        logger.info("\nFunction call history:")
+        for step in result.history:
+            if hasattr(step, 'result') and step.result:
+                for action in step.result:
+                    if hasattr(action, 'function_call'):
+                        logger.info(f"Function called: {action.function_call}")
+        
         logger.info("Browser-use test completed successfully!")
         return True
         
@@ -142,25 +185,26 @@ async def test_with_browser_use_async():
         logger.error(traceback.format_exc())
         return False
 
-def test_with_browser_use():
+def test_with_browser_use(model_name="gemini-2.0-flash"):
     """Wrapper to run the async browser-use test"""
-    return asyncio.run(test_with_browser_use_async())
+    return asyncio.run(test_with_browser_use_async(model_name))
 
 if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='Test Google Gemini integration')
     parser.add_argument('--browser-use', action='store_true', help='Test with browser-use for web automation')
+    parser.add_argument('--model', type=str, default="gemini-2.0-flash", help='Model name to use (default: gemini-2.0-flash)')
     args = parser.parse_args()
     
     if args.browser_use:
-        success = test_with_browser_use()
+        success = test_with_browser_use(args.model)
         if success:
             print("\nBrowser-use test completed successfully!")
         else:
             print("\nBrowser-use test failed. Please check the logs for details.")
     else:
-        success = test_gemini()
+        success = test_gemini(args.model)
         if success:
             print("\nTest completed successfully!")
         else:

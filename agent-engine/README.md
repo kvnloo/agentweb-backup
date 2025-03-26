@@ -27,6 +27,42 @@ You can install dependencies directly with pip:
 pip install -r requirements.txt
 ```
 
+## Testing Gemini Integration
+
+The project includes a test script for Google's Gemini model integration. To run the tests:
+
+1. Set up your Gemini API key in the environment:
+```bash
+# Add to your .env file
+GEMINI_API_KEY=your_api_key_here
+```
+
+2. Run the basic test (tests basic Gemini functionality):
+```bash
+python test_gemini.py
+```
+
+3. Run the browser-use test (tests Gemini with web automation):
+```bash
+python test_gemini.py --browser-use
+```
+
+4. Test with a specific Gemini model:
+```bash
+python test_gemini.py --model "google->google->gemini-2.5-pro-exp-03-25"
+```
+
+5. Test browser-use with a specific model:
+```bash
+python test_gemini.py --browser-use --model "google->google->gemini-2.5-pro-exp-03-25"
+```
+
+The test script includes:
+- Basic Gemini model testing
+- Browser automation testing
+- Function calling examples
+- Support for different Gemini models
+
 ## Architecture
 
 The agent engine consists of:

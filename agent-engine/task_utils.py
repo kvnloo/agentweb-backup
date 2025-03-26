@@ -292,7 +292,8 @@ def get_llm(full_llm_name: str) -> Tuple[Any, str]:
         },
         "google": {
             "google": {
-                "gemini-2.0-flash": get_gemini_llm
+                "gemini-2.0-flash": get_gemini_llm,
+                "gemini-2.5-pro-exp-03-25": get_gemini_llm
             }
         }
     }
