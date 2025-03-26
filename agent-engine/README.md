@@ -216,4 +216,83 @@ http://localhost:3000/tasks/123456
 ## Database Schema
 
 ### AW-TaskExecutions
-- Primary Key: `
+- Primary Key: `executionId` (String)
+- GSI: StatusStartTimeIndex
+  - Hash Key: `status` (String)
+  - Range Key: `startTime` (String)
+- Attributes:
+  - `taskId` (String)
+  - `userId` (String)
+  - `status` (String): pending, running, completed, failed
+  - `result` (String, optional)
+  - `error` (String, optional)
+  - `completedAt` (String, optional)
+
+### AW-Subscribers
+- Primary Key: Composite key of `taskId` (Hash) and `email` (Range)
+- Attributes:
+  - `taskId` (String)
+  - `email` (String)
+  - `subscribedAt` (String)
+
+### AW-TaskSchedules
+- Primary Key: `scheduleId` (String)
+- GSI: StatusStartTimeIndex
+  - Hash Key: `status` (String)
+  - Range Key: `nextRunTime` (String)
+- GSI: TaskIdIndex
+  - Hash Key: `taskId` (String)
+- Attributes:
+  - `userId` (String)
+  - `frequency` (String): daily, weekly, monthly
+  - `status` (String): active, paused
+
+## Unit Tests
+
+The test suite (`tests/test_task_monitor.py`) covers the core functionality of the task monitor:
+
+### Running Tests
+```bash
+# Activate conda environment
+conda activate agent-engine
+
+# Run tests with verbose output
+python -m unittest tests/test_task_monitor.py -v
+```
+
+### Test Coverage
+
+1. Execution Monitoring
+   - `test_get_pending_executions_no_last_time`: Tests basic execution querying
+   - `test_get_pending_executions_with_last_time`: Tests timestamp optimization
+   - `test_create_execution`: Validates execution creation
+   - `test_update_execution_status`: Tests status updates for success/failure
+
+2. Schedule Management
+   - `test_get_due_schedules`: Tests schedule querying
+   - `test_update_schedule_next_run_time`: Tests next run time calculations
+     - Daily schedules: Next day at 9:00 AM
+     - Weekly schedules: Next week at 9:00 AM
+     - Monthly schedules: Next month at 9:00 AM
+
+### Adding New Tests
+
+To add new tests:
+1. Add test methods to `TestTaskMonitor` class in `tests/test_task_monitor.py`
+2. Use `@patch` decorators to mock DynamoDB interactions
+3. Follow existing patterns for setup and assertions
+
+Example:
+```python
+@patch('task_monitor.executions_table')
+def test_new_feature(self, mock_table):
+    # Setup test data
+    mock_table.query.return_value = {'Items': [...]}
+    
+    # Call function
+    result = your_function()
+    
+    # Verify behavior
+    self.assertEqual(result, expected_result)
+    mock_table.query.assert_called_once_with(...)
+```
