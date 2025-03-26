@@ -6,6 +6,7 @@ task_monitor.log
 
 # Environment variables
 .env
+.env.prod
 
 # Browser context files
 context/
