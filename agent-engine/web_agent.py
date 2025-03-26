@@ -414,7 +414,7 @@ class WebAgent:
             except Exception as e:
                 return ActionResult(error=f"Error retrieving integration details: {str(e)}")
                 
-        @self.controller.registry.action('Run integration test with API credentials, load the API credentials from environment variables with names like GITHUB_API_CREDENTIAL, STRIPE_API_CREDENTIAL, etc.')
+        @self.controller.registry.action('Run integration test with API credentials, load the API credentials from environment variables with names like GITHUB_API_CREDENTIAL, STRIPE_API_CREDENTIAL, etc.', param_model=IntegrationTestParams)
         def run_integration_test(params: IntegrationTestParams) -> ActionResult:
             """Run Python code with API credentials loaded from environment variables
             
