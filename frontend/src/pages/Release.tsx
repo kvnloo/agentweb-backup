@@ -7,6 +7,16 @@ interface Release {
 
 const releases: Release[] = [
   {
+    date: "2025-03-26",
+    changes: [
+      "Added support for code management with GitHub",
+      "- Agents can now use submit_python_code to submit code to GitHub, subject for admin review",
+      "- Once merged, the code can be loaded with get_approved_python_code() and run with run_approved_python_code",
+      "Added support for the latest Gemini 2.5 Pro LLM",
+      "Fixed various bugs and improved stability"
+    ]
+  },
+  {
     date: "2025-03-18",
     changes: [
       "Added no-code API access via Config page",
