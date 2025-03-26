@@ -12,7 +12,7 @@ from browser_use.browser.browser import Browser, BrowserConfig
 from browser_use.browser.context import BrowserContextConfig, BrowserContext
 from langchain_aws import ChatBedrock
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
-from pydantic import SecretStr
+from pydantic import SecretStr, BaseModel
 from botocore.config import Config
 from dotenv import load_dotenv
 import logging
@@ -44,6 +44,10 @@ logger = logging.getLogger(__name__)
 global_use_vision = True
 
 controller = Controller()
+
+class IntegrationTestParams(BaseModel):
+    app_names: List[str]
+    python_code: str
 
 class WebAgent:
     def __init__(self, user_id=None, full_llm_name=None):
@@ -411,13 +415,14 @@ class WebAgent:
                 return ActionResult(error=f"Error retrieving integration details: {str(e)}")
                 
         @self.controller.registry.action('Run integration test with API credentials, load the API credentials from environment variables with names like GITHUB_API_CREDENTIAL, STRIPE_API_CREDENTIAL, etc.')
-        def run_integration_test(app_names: list, python_code: str) -> ActionResult:
+        def run_integration_test(params: IntegrationTestParams) -> ActionResult:
             """Run Python code with API credentials loaded from environment variables
             
             Parameters:
-            - app_names: List of API configuration names to retrieve (e.g., ['Stripe', 'GitHub'])
-              Must be provided as a list, even for a single API (e.g., ['GitHub'])
-            - python_code: Valid Python code to execute with the API credentials
+            - params: IntegrationTestParams containing:
+              - app_names: List of API configuration names to retrieve (e.g., ['Stripe', 'GitHub'])
+                Must be provided as a list, even for a single API (e.g., ['GitHub'])
+              - python_code: Valid Python code to execute with the API credentials
             
             The python_code parameter should contain complete, executable Python code that uses the API.
             
@@ -466,30 +471,30 @@ class WebAgent:
                 return ActionResult(error="User ID not provided")
             
             # Type checking for app_names
-            if not isinstance(app_names, list):
+            if not isinstance(params.app_names, list):
                 return ActionResult(error="app_names must be a list of strings. Example: ['GitHub'] or ['GitHub', 'Stripe']")
             
-            if not app_names:
+            if not params.app_names:
                 return ActionResult(error="Please provide at least one API/App name in the list")
                 
             # Verify all items in app_names are strings
-            if not all(isinstance(name, str) for name in app_names):
+            if not all(isinstance(name, str) for name in params.app_names):
                 return ActionResult(error="All API names in app_names must be strings")
                 
-            if not python_code:
+            if not params.python_code:
                 return ActionResult(error="Please provide Python code to execute")
             
-            logger.info(f"Running integration for apps: {', '.join(app_names)}")
+            logger.info(f"Running integration for apps: {', '.join(params.app_names)}")
             
             try:
                 # Get API credentials
-                api_credentials, api_key_names = fetch_api_credentials(self.user_id, app_names)
+                api_credentials, api_key_names = fetch_api_credentials(self.user_id, params.app_names)
                 
                 if not api_credentials:
-                    return ActionResult(error=f"Failed to retrieve API credentials for {', '.join(app_names)}")
+                    return ActionResult(error=f"Failed to retrieve API credentials for {', '.join(params.app_names)}")
                 
                 # Check if we got all the requested credentials
-                missing_apps = [app for app in app_names if app not in api_credentials]
+                missing_apps = [app for app in params.app_names if app not in api_credentials]
                 if missing_apps:
                     return ActionResult(error=f"No API configuration found for: {', '.join(missing_apps)}")
                 
@@ -508,14 +513,14 @@ class WebAgent:
                 
                 # Execute the Python code in a sandboxed environment using the utility function
                 return run_python_code_in_sandbox(
-                    python_code=python_code,
+                    python_code=params.python_code,
                     execution_id=self.current_execution_id,
                     user_id=self.user_id,
                     script_type="integration",
                     header_comment=header_comment,
                     additional_env_vars=env_vars
                 )
-                
+
             except Exception as e:
                 logger.error(f"Error during API integration setup: {str(e)}")
                 return ActionResult(error=f"Error running integration: {str(e)}")
