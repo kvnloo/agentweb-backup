@@ -226,8 +226,14 @@ class DeepResearchAgentWrapper:
             logger.info(f"Using LLM: {self.llm_name}")
             logger.info(f"Redirecting output to file: {output_file}")
             
-            # Redirect stdout to a file
-            with open(output_file, 'w') as f:
+            # Write initial info to the output file
+            with open(output_file, 'a') as f:
+                f.write(f"\n=== Deep Research Started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+                f.write(f"Using LLM: {self.llm_name}\n")
+                f.write("=" * 80 + "\n\n")
+            
+            # Redirect stdout to append to the file
+            with open(output_file, 'a') as f:
                 with contextlib.redirect_stdout(f):
                     # Run the agent with proper error handling
                     try:

@@ -293,7 +293,8 @@ def get_llm(full_llm_name: str) -> Tuple[Any, str]:
         "google": {
             "google": {
                 "gemini-2.0-flash": get_gemini_llm,
-                "gemini-2.5-pro-exp-03-25": get_gemini_llm
+                "gemini-2.5-pro-exp-03-25": get_gemini_llm,
+                "gemini-2.0-flash-exp": get_gemini_llm
             }
         }
     }
@@ -557,17 +558,16 @@ def upload_activity_log(log_file: str, user_id: str, execution_id: str) -> Optio
             }
         )
         
-        # Clean up temporary files
+        # Clean up temporary HTML file only
         Path(html_file).unlink()
-        Path(log_file).unlink()
-        logger.info("Cleaned up temporary files")
+        logger.info("Cleaned up temporary HTML file")
         
         return url
         
     except Exception as e:
         logger.error(f"Error uploading activity log: {e}")
         # Clean up any temporary files
-        for temp_file in [log_file, log_file + '.html']:
+        for temp_file in [log_file + '.html']:
             try:
                 if Path(temp_file).exists():
                     Path(temp_file).unlink()
