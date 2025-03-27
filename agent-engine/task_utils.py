@@ -1225,11 +1225,49 @@ def decrypt_password(encrypted_password: str, user_id: str, shared_by: str = Non
     """Decrypt password using JWT_SECRET. For shared passwords, use the sharer's userId."""
     try:
         import jwt
-        decoded = jwt.decode(encrypted_password, os.getenv('JWT_SECRET'), algorithms=['HS256'])
+        import base64
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+        
+        # First try to decode as encrypted format
+        logger.info(f"Decrypting password for user {user_id} with shared_by {shared_by}")
+        try:
+            # Decode base64 string
+            combined = base64.b64decode(encrypted_password)
+            
+            # Extract IV (first 16 bytes), encrypted data, and auth tag (last 16 bytes)
+            iv = combined[:16]
+            auth_tag = combined[-16:]
+            encrypted_data = combined[16:-16]
+            
+            # Derive key using PBKDF2 (same as in Node.js)
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=b'salt',
+                iterations=100000,
+            )
+            # Convert JWT_SECRET to bytes for key derivation
+            secret_bytes = os.getenv('JWT_SECRET').encode('utf-8')
+            key = kdf.derive(secret_bytes)
+            
+            # Create AESGCM instance with derived key
+            aesgcm = AESGCM(key)
+            
+            # Decrypt the data
+            decrypted = aesgcm.decrypt(iv, encrypted_data + auth_tag, None)
+            signed_password = decrypted.decode('utf-8')
+            
+            # Decode the signed password
+            decoded = jwt.decode(signed_password, os.getenv('JWT_SECRET'), algorithms=['HS256'])
+        except Exception as e:
+            # If decryption fails, try as old signed format
+            logger.info("Decryption failed, trying old signed format")
+            decoded = jwt.decode(encrypted_password, os.getenv('JWT_SECRET'), algorithms=['HS256'])
+
         # For shared passwords, verify against the original sharer's userId
         expected_user_id = shared_by if shared_by else user_id
-        if shared_by:
-            logger.info(f"Using shared credentials - decrypting with sharer's userId: {shared_by}")
         if decoded['userId'] != expected_user_id:
             raise Exception("Invalid user ID in encrypted password")
         return decoded['password']
