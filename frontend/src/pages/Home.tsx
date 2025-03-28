@@ -20,7 +20,6 @@ import {
 import { Link as RouterLink } from 'react-router-dom';
 import {
   Check as CheckIcon,
-  Psychology as PsychologyIcon,
   Bolt as BoltIcon,
   Security as SecurityIcon,
   AutoGraph as AutoGraphIcon,
