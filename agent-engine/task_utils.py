@@ -1374,8 +1374,14 @@ def fetch_api_credentials(user_id: str, app_names=None):
             
             shared_by = config.get('sharedBy')
             
+            # Get the encrypted password from either encryptedPassword or legacy password field
+            encrypted_password = config.get('encryptedPassword') or config.get('password')
+            if not encrypted_password:
+                logger.warning(f"No password found for {app_name}")
+                continue
+                
             # Decrypt the API key/secret
-            api_key = decrypt_password(config['password'], user_id, shared_by)
+            api_key = decrypt_password(encrypted_password, user_id, shared_by)
             api_key_name = config['username']  # This is the API key name
             
             # Create the app-specific credential placeholder name

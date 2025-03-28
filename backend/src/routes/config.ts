@@ -127,7 +127,7 @@ router.post('/', authenticateToken, async (req, res) => {
         isApiConfig: true,
         appName,
         username,
-        password: encryptPassword(password, userId),
+        encryptedPassword: encryptPassword(password, userId),
         integrationDocLink: integrationDocLink || null,
         createdAt: new Date().toISOString()
       };
@@ -163,7 +163,7 @@ router.post('/', authenticateToken, async (req, res) => {
         isApiConfig: false,
         website,
         username,
-        password: encryptPassword(password, userId),
+        encryptedPassword: encryptPassword(password, userId),
         createdAt: new Date().toISOString()
       };
 
@@ -270,6 +270,7 @@ router.post('/:configId/share', authenticateToken, async (req, res) => {
       isApiConfig: result.Item.isApiConfig || false,
       username: result.Item.username,
       password: result.Item.password,
+      encryptedPassword: result.Item.encryptedPassword,
       createdAt: new Date().toISOString(),
       sharedBy: userId
     };
