@@ -293,7 +293,8 @@ def get_llm(full_llm_name: str) -> Tuple[Any, str]:
         "google": {
             "google": {
                 "gemini-2.0-flash": get_gemini_llm,
-                "gemini-2.5-pro-exp-03-25": get_gemini_llm
+                "gemini-2.5-pro-exp-03-25": get_gemini_llm,
+                "gemini-2.0-flash-exp": get_gemini_llm
             }
         }
     }
@@ -557,17 +558,16 @@ def upload_activity_log(log_file: str, user_id: str, execution_id: str) -> Optio
             }
         )
         
-        # Clean up temporary files
+        # Clean up temporary HTML file only
         Path(html_file).unlink()
-        Path(log_file).unlink()
-        logger.info("Cleaned up temporary files")
+        logger.info("Cleaned up temporary HTML file")
         
         return url
         
     except Exception as e:
         logger.error(f"Error uploading activity log: {e}")
         # Clean up any temporary files
-        for temp_file in [log_file, log_file + '.html']:
+        for temp_file in [log_file + '.html']:
             try:
                 if Path(temp_file).exists():
                     Path(temp_file).unlink()
@@ -1225,11 +1225,49 @@ def decrypt_password(encrypted_password: str, user_id: str, shared_by: str = Non
     """Decrypt password using JWT_SECRET. For shared passwords, use the sharer's userId."""
     try:
         import jwt
-        decoded = jwt.decode(encrypted_password, os.getenv('JWT_SECRET'), algorithms=['HS256'])
+        import base64
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+        
+        # First try to decode as encrypted format
+        logger.info(f"Decrypting password for user {user_id} with shared_by {shared_by}")
+        try:
+            # Decode base64 string
+            combined = base64.b64decode(encrypted_password)
+            
+            # Extract IV (first 16 bytes), encrypted data, and auth tag (last 16 bytes)
+            iv = combined[:16]
+            auth_tag = combined[-16:]
+            encrypted_data = combined[16:-16]
+            
+            # Derive key using PBKDF2 (same as in Node.js)
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=b'salt',
+                iterations=100000,
+            )
+            # Convert JWT_SECRET to bytes for key derivation
+            secret_bytes = os.getenv('JWT_SECRET').encode('utf-8')
+            key = kdf.derive(secret_bytes)
+            
+            # Create AESGCM instance with derived key
+            aesgcm = AESGCM(key)
+            
+            # Decrypt the data
+            decrypted = aesgcm.decrypt(iv, encrypted_data + auth_tag, None)
+            signed_password = decrypted.decode('utf-8')
+            
+            # Decode the signed password
+            decoded = jwt.decode(signed_password, os.getenv('JWT_SECRET'), algorithms=['HS256'])
+        except Exception as e:
+            # If decryption fails, try as old signed format
+            logger.info("Decryption failed, trying old signed format")
+            decoded = jwt.decode(encrypted_password, os.getenv('JWT_SECRET'), algorithms=['HS256'])
+
         # For shared passwords, verify against the original sharer's userId
         expected_user_id = shared_by if shared_by else user_id
-        if shared_by:
-            logger.info(f"Using shared credentials - decrypting with sharer's userId: {shared_by}")
         if decoded['userId'] != expected_user_id:
             raise Exception("Invalid user ID in encrypted password")
         return decoded['password']
@@ -1336,8 +1374,14 @@ def fetch_api_credentials(user_id: str, app_names=None):
             
             shared_by = config.get('sharedBy')
             
+            # Get the encrypted password from either encryptedPassword or legacy password field
+            encrypted_password = config.get('encryptedPassword') or config.get('password')
+            if not encrypted_password:
+                logger.warning(f"No password found for {app_name}")
+                continue
+                
             # Decrypt the API key/secret
-            api_key = decrypt_password(config['password'], user_id, shared_by)
+            api_key = decrypt_password(encrypted_password, user_id, shared_by)
             api_key_name = config['username']  # This is the API key name
             
             # Create the app-specific credential placeholder name

@@ -15,7 +15,7 @@ export const AVAILABLE_LLMS = (import.meta.env.VITE_LIST_FULL_LLM_NAMES || 'azur
   .filter((llm: string) => llm); // Remove empty strings
 
 // Get the list of available LLMs for deep research from environment variable or use default list
-export const DEEP_RESEARCH_LLMS = (import.meta.env.VITE_DEEP_RESEARCH_LLM_NAMES || 'azure->openai->o1-mini,azure->openai->gpt-4o')
+export const DEEP_RESEARCH_LLMS = (import.meta.env.VITE_DEEP_RESEARCH_LLM_NAMES || 'azure->openai->o1-mini,azure->openai->gpt-4o,google->google->gemini-2.0-flash-exp')
   .split(',')
   .map((llm: string) => llm.trim())
   .filter((llm: string) => llm); // Remove empty strings

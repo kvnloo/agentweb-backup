@@ -327,7 +327,14 @@ class WebAgent:
 
                 config = sorted_items[0]
                 shared_by = config.get('sharedBy')
-                decrypted_password = decrypt_password(config['password'], self.user_id, shared_by)
+                
+                # Get the encrypted password from either encryptedPassword or legacy password field
+                encrypted_password = config.get('encryptedPassword') or config.get('password')
+                if not encrypted_password:
+                    logger.warning(f"No password found for {config.get('website')}")
+                    return ActionResult(error=f"No password found for {config.get('website')}")
+                    
+                decrypted_password = decrypt_password(encrypted_password, self.user_id, shared_by)
 
                 if shared_by and shared_by != self.user_id:
                     logger.info(f"Using shared credentials for {domain} - shared by user: {shared_by}")
@@ -1172,7 +1179,13 @@ Once the PR is approved and merged, this code will be available through the 'Run
                 
                 for config in all_configs:
                     try:
-                        decrypted_password = decrypt_password(config['password'], self.user_id, config.get('sharedBy'))
+                        # Get the encrypted password from either encryptedPassword or legacy password field
+                        encrypted_password = config.get('encryptedPassword') or config.get('password')
+                        if not encrypted_password:
+                            logger.warning(f"No password found for {config.get('configId')}")
+                            continue
+                            
+                        decrypted_password = decrypt_password(encrypted_password, self.user_id, config.get('sharedBy'))
                         self.sensitive_data.append(decrypted_password)
                     except Exception as e:
                         logger.error(f"Error decrypting password for {config.get('website')}: {e}")

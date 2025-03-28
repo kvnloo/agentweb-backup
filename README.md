@@ -47,6 +47,23 @@ cp .env.example .env
 # Edit .env with your configuration
 ```
 
+4. Migrate passwords (if upgrading from an older version):
+```bash
+# For development - process 1 record at a time (default)
+NODE_ENV=development npx ts-node src/scripts/encrypt-passwords.ts
+
+# For development - process multiple records
+NODE_ENV=development npx ts-node src/scripts/encrypt-passwords.ts 5
+
+# For production - process 1 record at a time (default)
+NODE_ENV=production npx ts-node src/scripts/encrypt-passwords.ts
+
+# For production - process multiple records
+NODE_ENV=production npx ts-node src/scripts/encrypt-passwords.ts 5
+```
+
+Note: The password migration script processes records one at a time by default for safety. You can specify a number to process more records at once. It's recommended to start with the default (1) to verify the migration works correctly before processing more records.
+
 4. Start the development server:
 ```bash
 npm run dev

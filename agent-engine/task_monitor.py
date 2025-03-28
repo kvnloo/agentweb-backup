@@ -870,6 +870,8 @@ async def execute_task(execution):
         # Upload activity log if it exists
         if filtered_activity_log and Path(filtered_activity_log).exists():
             upload_activity_log(filtered_activity_log, user_id, execution_id)
+            Path(filtered_activity_log).unlink()
+            logger.info(f"Deleted activity log file: {filtered_activity_log}")
         
         if not success:
             error_message = f"All LLMs failed. Last error: {last_error}"
