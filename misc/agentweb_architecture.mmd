@@ -1,0 +1,34 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'fontSize': '16px' }}}%%
+graph TD
+    A[User Interface] --> B[Task Manager]
+    B --> C[AG2 Orchestrator]
+    
+    subgraph AG2 Agents
+        C --> D[Web Navigator Agent]
+        C --> E[Research Agent]
+        C --> F[Data Analyzer Agent]
+        C --> G[Verification Agent]
+    end
+    
+    D --> H[Browser Automation]
+    E --> I[Content Analysis]
+    F --> J[Data Processing]
+    G --> K[Quality Control]
+    
+    H --> L[Results Aggregator]
+    I --> L
+    J --> L
+    K --> L
+    
+    L --> M[Output Generator]
+    M --> N[User Dashboard]
+    
+    subgraph Cloud Services
+        O[AWS]
+        P[Azure]
+        Q[Google Cloud]
+    end
+    
+    L --> O
+    L --> P
+    L --> Q 
