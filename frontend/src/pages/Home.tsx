@@ -22,11 +22,24 @@ import {
   Check as CheckIcon,
   Psychology as PsychologyIcon,
   Bolt as BoltIcon,
-  Security as SecurityIcon
+  Security as SecurityIcon,
+  AutoGraph as AutoGraphIcon,
+  IntegrationInstructions as IntegrationIcon,
+  SmartToy as SmartToyIcon,
+  Category as CategoryIcon
 } from '@mui/icons-material';
 import axios from 'axios';
 import { buildApiUrl } from '../config';
 import logo from '../assets/logo.svg';
+import margenticLogo from '../assets/partners/logo-margentic.png';
+import havnlyLogo from '../assets/partners/logo-havnly.png';
+import ai2030Logo from '../assets/partners/logo-ai2030.png';
+import storyWithAiLogo from '../assets/partners/logo-storywithai.png';
+import facetoonLogo from '../assets/partners/logo-facetoon.png';
+import awsLogo from '../assets/partners/logo-aws.png';
+import azureLogo from '../assets/partners/logo-azure.png';
+import googleCloudLogo from '../assets/partners/logo-google-cloud.png';
+import ag2Logo from '../assets/partners/logo-ag2.png';
 import React from 'react';
 
 export default function Home() {
@@ -371,8 +384,8 @@ export default function Home() {
                   <CheckIcon color="primary" />
                 </ListItemIcon>
                 <ListItemText 
-                  primary="Natural Language Instructions" 
-                  secondary="Simply describe what you want in plain English - no coding required"
+                  primary="State-of-the-Art AI" 
+                  secondary="Powered by Claude 3.7, GPT-4o, and Gemini 2.5 Pro with automatic fallback"
                 />
               </ListItem>
               <ListItem>
@@ -380,8 +393,8 @@ export default function Home() {
                   <CheckIcon color="primary" />
                 </ListItemIcon>
                 <ListItemText 
-                  primary="Advanced AI Technology" 
-                  secondary="Powered by state-of-the-art language models for intelligent automation"
+                  primary="Smart Workflows" 
+                  secondary="Create complex task chains with natural language and multiple output formats"
                 />
               </ListItem>
               <ListItem>
@@ -389,8 +402,8 @@ export default function Home() {
                   <CheckIcon color="primary" />
                 </ListItemIcon>
                 <ListItemText 
-                  primary="Time-Saving Automation" 
-                  secondary="Reduce manual work and focus on what matters most"
+                  primary="Deep Research Capabilities" 
+                  secondary="Comprehensive research powered by AG2 multi-agent framework with citations"
                 />
               </ListItem>
             </List>
@@ -402,8 +415,8 @@ export default function Home() {
                   <CheckIcon color="primary" />
                 </ListItemIcon>
                 <ListItemText 
-                  primary="Secure & Private" 
-                  secondary="Enterprise-grade security with end-to-end encryption"
+                  primary="Enterprise Security" 
+                  secondary="AES256 encryption and isolated browser sessions with end-to-end protection"
                 />
               </ListItem>
               <ListItem>
@@ -411,8 +424,8 @@ export default function Home() {
                   <CheckIcon color="primary" />
                 </ListItemIcon>
                 <ListItemText 
-                  primary="24/7 Operation" 
-                  secondary="Your automated tasks run reliably around the clock"
+                  primary="No-Code Integration" 
+                  secondary="Connect to external APIs and accounts without writing any code"
                 />
               </ListItem>
               <ListItem>
@@ -420,8 +433,8 @@ export default function Home() {
                   <CheckIcon color="primary" />
                 </ListItemIcon>
                 <ListItemText 
-                  primary="Detailed Reporting" 
-                  secondary="Track and monitor your automation performance"
+                  primary="Smart Templates" 
+                  secondary="Pre-configured templates with customizable parameters for quick automation"
                 />
               </ListItem>
             </List>
@@ -455,12 +468,12 @@ export default function Home() {
                   }
                 }}
               >
-                <PsychologyIcon sx={{ fontSize: 48, color: 'primary.main', mb: 2 }} />
+                <AutoGraphIcon sx={{ fontSize: 48, color: 'primary.main', mb: 2 }} />
                 <Typography variant="h5" gutterBottom fontWeight={600}>
-                  AI-Powered Automation
+                  Advanced AI Models
                 </Typography>
                 <Typography variant="body1" color="text.secondary">
-                  Our intelligent agents understand context and handle complex web tasks with ease.
+                  Powered by Claude 3.7, GPT-4o, and Gemini 2.5 Pro, with automatic fallback for reliability.
                 </Typography>
               </Paper>
             </Grid>
@@ -478,10 +491,10 @@ export default function Home() {
               >
                 <BoltIcon sx={{ fontSize: 48, color: 'primary.main', mb: 2 }} />
                 <Typography variant="h5" gutterBottom fontWeight={600}>
-                  Lightning Fast
+                  Smart Workflows
                 </Typography>
                 <Typography variant="body1" color="text.secondary">
-                  Execute tasks in minutes that would take hours to do manually.
+                  Create complex task chains with natural language, support for file attachments, and multiple output formats including CSV, JSON, and HTML.
                 </Typography>
               </Paper>
             </Grid>
@@ -502,7 +515,70 @@ export default function Home() {
                   Enterprise Security
                 </Typography>
                 <Typography variant="body1" color="text.secondary">
-                  Bank-grade encryption and security protocols protect your data.
+                  AES256 encryption for all stored credentials and isolated browser sessions with end-to-end encryption.
+                </Typography>
+              </Paper>
+            </Grid>
+            <Grid item xs={12} md={4}>
+              <Paper 
+                sx={{ 
+                  p: 4, 
+                  height: '100%',
+                  textAlign: 'center',
+                  transition: 'transform 0.2s',
+                  '&:hover': {
+                    transform: 'translateY(-4px)'
+                  }
+                }}
+              >
+                <SmartToyIcon sx={{ fontSize: 48, color: 'primary.main', mb: 2 }} />
+                <Typography variant="h5" gutterBottom fontWeight={600}>
+                  Deep Research Mode
+                </Typography>
+                <Typography variant="body1" color="text.secondary">
+                  Comprehensive research powered by AG2 (AutoGen) multi-agent framework with detailed reports and citations.
+                </Typography>
+              </Paper>
+            </Grid>
+            <Grid item xs={12} md={4}>
+              <Paper 
+                sx={{ 
+                  p: 4, 
+                  height: '100%',
+                  textAlign: 'center',
+                  transition: 'transform 0.2s',
+                  '&:hover': {
+                    transform: 'translateY(-4px)'
+                  }
+                }}
+              >
+                <IntegrationIcon sx={{ fontSize: 48, color: 'primary.main', mb: 2 }} />
+                <Typography variant="h5" gutterBottom fontWeight={600}>
+                  No-Code API/Account Integration
+                </Typography>
+                <Typography variant="body1" color="text.secondary">
+                  Connect to external APIs and accounts without coding, with secure credential management, documentation integration, and GitHub code management.
+                </Typography>
+              </Paper>
+            </Grid>
+            <Grid item xs={12} md={4}>
+              <Paper 
+                sx={{ 
+                  p: 4, 
+                  height: '100%',
+                  textAlign: 'center',
+                  transition: 'transform 0.2s',
+                  '&:hover': {
+                    transform: 'translateY(-4px)'
+                  }
+                }}
+              >
+                <CategoryIcon sx={{ fontSize: 48, color: 'primary.main', mb: 2 }} />
+                <Typography variant="h5" gutterBottom fontWeight={600}>
+                  Smart Templates
+                </Typography>
+                <Typography variant="body1" color="text.secondary">
+                  Pre-configured task templates with customizable parameters, complex task support, and automatic parameter-based task naming.
                 </Typography>
               </Paper>
             </Grid>
@@ -525,65 +601,345 @@ export default function Home() {
           <Grid item xs={12} md={6} lg={4}>
             <Paper sx={{ p: 3 }}>
               <Typography variant="h6" gutterBottom color="primary">
-                Data Collection
+                Web Research & Analysis
               </Typography>
               <Typography variant="body1" paragraph>
-                Automatically gather data from websites, forms, and databases.
+                Comprehensive research using AG2 multi-agent framework with detailed reports and citations.
               </Typography>
             </Paper>
           </Grid>
           <Grid item xs={12} md={6} lg={4}>
             <Paper sx={{ p: 3 }}>
               <Typography variant="h6" gutterBottom color="primary">
-                Form Automation
+                Data Collection & Processing
               </Typography>
               <Typography variant="body1" paragraph>
-                Fill out web forms automatically with high accuracy.
+                Extract and process data from websites with support for CSV, JSON, and HTML outputs.
               </Typography>
             </Paper>
           </Grid>
           <Grid item xs={12} md={6} lg={4}>
             <Paper sx={{ p: 3 }}>
               <Typography variant="h6" gutterBottom color="primary">
-                Content Management
+                API & Account Integration
               </Typography>
               <Typography variant="body1" paragraph>
-                Update and manage content across multiple platforms.
+                Connect and automate any external services without coding.
               </Typography>
             </Paper>
           </Grid>
           <Grid item xs={12} md={6} lg={4}>
             <Paper sx={{ p: 3 }}>
               <Typography variant="h6" gutterBottom color="primary">
-                Monitoring & Alerts
+                Complex Workflows
               </Typography>
               <Typography variant="body1" paragraph>
-                Monitor websites and receive alerts for changes.
+                Create multi-step automation chains with natural language and file attachments.
               </Typography>
             </Paper>
           </Grid>
           <Grid item xs={12} md={6} lg={4}>
             <Paper sx={{ p: 3 }}>
               <Typography variant="h6" gutterBottom color="primary">
-                Report Generation
+                Form & Data Entry
               </Typography>
               <Typography variant="body1" paragraph>
-                Create automated reports from web data sources.
+                Automate form filling and data entry with high accuracy and validation.
               </Typography>
             </Paper>
           </Grid>
           <Grid item xs={12} md={6} lg={4}>
             <Paper sx={{ p: 3 }}>
               <Typography variant="h6" gutterBottom color="primary">
-                Testing & QA
+                Monitoring & Reporting
               </Typography>
               <Typography variant="body1" paragraph>
-                Automate web testing and quality assurance tasks.
+                Track changes and generate automated reports with customizable templates.
               </Typography>
             </Paper>
           </Grid>
         </Grid>
       </Container>
+
+      {/* Partners Section */}
+      <Box sx={{ 
+        bgcolor: 'grey.50', 
+        py: { xs: 8, sm: 12 },
+        width: '100%'
+      }}>
+        <Container maxWidth="lg" sx={{ px: { xs: 2, sm: 3 } }}>
+          <Typography
+            variant="h3"
+            align="center"
+            sx={{ mb: 6, fontWeight: 700 }}
+          >
+            Valued Partners/Customers
+          </Typography>
+          <Grid container spacing={4} justifyContent="center" alignItems="center">
+            <Grid item xs={12} md={4}>
+              <Box sx={{ 
+                display: 'flex', 
+                justifyContent: 'center',
+                alignItems: 'center',
+                height: '100%'
+              }}>
+                <Link
+                  href="https://margentic.com/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <Box
+                    component="img"
+                    src={margenticLogo} 
+                    alt="Margentic AI" 
+                    sx={{ 
+                      maxWidth: '200px',
+                      height: 'auto',
+                      opacity: 0.8,
+                      transition: 'opacity 0.3s ease',
+                      '&:hover': {
+                        opacity: 1
+                      }
+                    }}
+                  />
+                </Link>
+              </Box>
+            </Grid>
+            <Grid item xs={12} md={4}>
+              <Box sx={{ 
+                display: 'flex', 
+                justifyContent: 'center',
+                alignItems: 'center',
+                height: '100%'
+              }}>
+                <Link
+                  href="https://havnly.ai/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <Box
+                    component="img"
+                    src={havnlyLogo} 
+                    alt="Havnly AI" 
+                    sx={{ 
+                      maxWidth: '200px',
+                      height: 'auto',
+                      opacity: 0.8,
+                      transition: 'opacity 0.3s ease',
+                      '&:hover': {
+                        opacity: 1
+                      }
+                    }}
+                  />
+                </Link>
+              </Box>
+            </Grid>
+            <Grid item xs={12} md={4}>
+              <Box sx={{ 
+                display: 'flex', 
+                justifyContent: 'center',
+                alignItems: 'center',
+                height: '100%'
+              }}>
+                <Link
+                  href="https://ai2030.org/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <Box
+                    component="img"
+                    src={ai2030Logo} 
+                    alt="AI 2030" 
+                    sx={{ 
+                      maxWidth: '200px',
+                      height: 'auto',
+                      opacity: 0.8,
+                      transition: 'opacity 0.3s ease',
+                      '&:hover': {
+                        opacity: 1
+                      }
+                    }}
+                  />
+                </Link>
+              </Box>
+            </Grid>
+            <Grid item xs={12} md={4}>
+              <Box sx={{ 
+                display: 'flex', 
+                justifyContent: 'center',
+                alignItems: 'center',
+                height: '100%'
+              }}>
+                <Link
+                  href="https://storywithai.info/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <Box
+                    component="img"
+                    src={storyWithAiLogo} 
+                    alt="StoryWithAI" 
+                    sx={{ 
+                      maxWidth: '200px',
+                      height: 'auto',
+                      opacity: 0.8,
+                      transition: 'opacity 0.3s ease',
+                      '&:hover': {
+                        opacity: 1
+                      }
+                    }}
+                  />
+                </Link>
+              </Box>
+            </Grid>
+            <Grid item xs={12} md={4}>
+              <Box sx={{ 
+                display: 'flex', 
+                justifyContent: 'center',
+                alignItems: 'center',
+                height: '100%'
+              }}>
+                <Link
+                  href="https://facetoonshop.com/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <Box
+                    component="img"
+                    src={facetoonLogo} 
+                    alt="Facetoon" 
+                    sx={{ 
+                      maxWidth: '200px',
+                      height: 'auto',
+                      opacity: 0.8,
+                      transition: 'opacity 0.3s ease',
+                      '&:hover': {
+                        opacity: 1
+                      }
+                    }}
+                  />
+                </Link>
+              </Box>
+            </Grid>
+            <Grid item xs={12} md={4}>
+              <Box sx={{ 
+                display: 'flex', 
+                justifyContent: 'center',
+                alignItems: 'center',
+                height: '100%'
+              }}>
+                <Link
+                  href="https://aws.amazon.com/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <Box
+                    component="img"
+                    src={awsLogo} 
+                    alt="AWS" 
+                    sx={{ 
+                      maxWidth: '200px',
+                      height: 'auto',
+                      opacity: 0.8,
+                      transition: 'opacity 0.3s ease',
+                      '&:hover': {
+                        opacity: 1
+                      }
+                    }}
+                  />
+                </Link>
+              </Box>
+            </Grid>
+            <Grid item xs={12} md={4}>
+              <Box sx={{ 
+                display: 'flex', 
+                justifyContent: 'center',
+                alignItems: 'center',
+                height: '100%'
+              }}>
+                <Link
+                  href="https://azure.microsoft.com/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <Box
+                    component="img"
+                    src={azureLogo} 
+                    alt="Azure" 
+                    sx={{ 
+                      maxWidth: '200px',
+                      height: 'auto',
+                      opacity: 0.8,
+                      transition: 'opacity 0.3s ease',
+                      '&:hover': {
+                        opacity: 1
+                      }
+                    }}
+                  />
+                </Link>
+              </Box>
+            </Grid>
+            <Grid item xs={12} md={4}>
+              <Box sx={{ 
+                display: 'flex', 
+                justifyContent: 'center',
+                alignItems: 'center',
+                height: '100%'
+              }}>
+                <Link
+                  href="https://cloud.google.com/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <Box
+                    component="img"
+                    src={googleCloudLogo} 
+                    alt="Google Cloud" 
+                    sx={{ 
+                      maxWidth: '200px',
+                      height: 'auto',
+                      opacity: 0.8,
+                      transition: 'opacity 0.3s ease',
+                      '&:hover': {
+                        opacity: 1
+                      }
+                    }}
+                  />
+                </Link>
+              </Box>
+            </Grid>
+            <Grid item xs={12} md={4}>
+              <Box sx={{ 
+                display: 'flex', 
+                justifyContent: 'center',
+                alignItems: 'center',
+                height: '100%'
+              }}>
+                <Link
+                  href="https://ag2.ai/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <Box
+                    component="img"
+                    src={ag2Logo} 
+                    alt="AG2.ai" 
+                    sx={{ 
+                      maxWidth: '200px',
+                      height: 'auto',
+                      opacity: 0.8,
+                      transition: 'opacity 0.3s ease',
+                      '&:hover': {
+                        opacity: 1
+                      }
+                    }}
+                  />
+                </Link>
+              </Box>
+            </Grid>
+          </Grid>
+        </Container>
+      </Box>
 
       {/* Final CTA Section */}
       <Box id="join" sx={{ 
