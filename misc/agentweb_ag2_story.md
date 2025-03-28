@@ -16,43 +16,9 @@ The integration of AG2 brought several key advantages to AgentWeb:
 
 2. **Enhanced Research Capabilities**: The platform now offers a "Deep Research Mode" powered by AG2, which enables comprehensive research with detailed reports and citations. This feature is particularly valuable for users who need thorough analysis of web content.
 
-## AgentWeb Architecture with AG2
+## AgentWeb + AG2 Architecture
 
-```mermaid
-graph TD
-    A[User Interface] --> B[Task Manager]
-    B --> C[AG2 Orchestrator]
-    
-    subgraph AG2 Agents
-        C --> D[Web Navigator Agent]
-        C --> E[Research Agent]
-        C --> F[Data Analyzer Agent]
-        C --> G[Verification Agent]
-    end
-    
-    D --> H[Browser Automation]
-    E --> I[Content Analysis]
-    F --> J[Data Processing]
-    G --> K[Quality Control]
-    
-    H --> L[Results Aggregator]
-    I --> L
-    J --> L
-    K --> L
-    
-    L --> M[Output Generator]
-    M --> N[User Dashboard]
-    
-    subgraph Cloud Services
-        O[AWS]
-        P[Azure]
-        Q[Google Cloud]
-    end
-    
-    L --> O
-    L --> P
-    L --> Q
-```
+![AgentWeb + AG2 Architecture Diagram](agentweb_architecture.png)
 
 ## Implementation Details
 
@@ -88,4 +54,6 @@ Looking ahead, AgentWeb plans to further leverage AG2's capabilities:
 
 ## Conclusion
 
-The integration of AG2 has positioned AgentWeb at the forefront of AI-powered web automation, offering users unprecedented capabilities in handling complex web tasks with intelligent, collaborative agents. As AG2 and similar technologies continue to evolve, we're eager to explore new possibilities and innovations in the field of web automation. 
+The integration of AG2 has positioned AgentWeb at the forefront of AI-powered web automation, offering users unprecedented capabilities in handling complex web tasks with intelligent, collaborative agents. As AG2 and similar technologies continue to evolve, we're eager to explore new possibilities and innovations in the field of web automation.
+
+Ready to experience the power of AI-driven web automation? Visit **[agentweb.pro](https://agentweb.pro)** to start your journey with AgentWeb. 
