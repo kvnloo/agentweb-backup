@@ -4,6 +4,14 @@
 
 In the rapidly evolving landscape of AI-powered automation, AgentWeb made a strategic decision to integrate AG2 (AutoGen) into its platform, marking a significant milestone in its development journey. This integration has transformed how AgentWeb handles complex web automation tasks, particularly in research and analysis scenarios.
 
+\begin{quote}
+\textit{AG2 has revolutionized how we approach web automation at AgentWeb. By leveraging AG2's multi-agent capabilities, we've created a powerful platform that enables our users to conduct sophisticated web research and automation tasks with unprecedented efficiency. The integration has allowed us to deliver intelligent, collaborative solutions that not only automate complex workflows but also ensure accuracy and reliability through built-in verification mechanisms. This partnership represents a significant leap forward in our mission to make web automation more accessible and powerful for everyone.}
+
+\vspace{0.5em}
+\textbf{Rui Wang}\\
+CTO, AgentWeb
+\end{quote}
+
 ## The Challenge
 
 Before adopting AG2, AgentWeb faced limitations in handling complex research tasks that required multiple steps of analysis, verification, and synthesis. While the platform excelled at single-task automation, it needed a more sophisticated approach for tasks that required deep research capabilities and multi-step reasoning.
@@ -56,4 +64,4 @@ Looking ahead, AgentWeb plans to further leverage AG2's capabilities:
 
 The integration of AG2 has positioned AgentWeb at the forefront of AI-powered web automation, offering users unprecedented capabilities in handling complex web tasks with intelligent, collaborative agents. As AG2 and similar technologies continue to evolve, we're eager to explore new possibilities and innovations in the field of web automation.
 
-Ready to experience the power of AI-driven web automation? Visit **[agentweb.pro](https://agentweb.pro)** to start your journey with AgentWeb. 
+Ready to experience the power of AI-driven web automation? Visit **[agentweb.pro](https://agentweb.pro)** to start your journey. 
