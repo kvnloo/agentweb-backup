@@ -369,42 +369,173 @@ zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json .env.
    - Click "Apply"
    - Wait for the environment update to complete
 
-### Agent Engine Deployment
+### Agent Engine Deployment to Google Cloud VM
 
-The agent engine should be deployed as a separate service using AWS ECS (Elastic Container Service) due to its Python dependencies and browser automation requirements. See the agent-engine directory for specific deployment instructions.
+This section describes how to deploy the agent-engine on a single Google Cloud VM instance, suitable for development, testing, or lower-scale production use.
 
-### Important Notes
+#### Prerequisites
+- Google Cloud Platform account
+- gcloud CLI installed and configured
+- SSH client
 
-1. CORS Configuration:
-   - Update the CORS settings in the backend to allow requests from your frontend domain
-   - Update the API URL in the frontend to point to your backend domain
+#### 1. VM Instance Setup
 
-2. Database:
-   - Ensure your DynamoDB tables are created in the same region
-   - Configure proper IAM roles for Elastic Beanstalk to access DynamoDB
-     - Go to IAM > Roles
-     - Find your Elastic Beanstalk role
-     - Attach the necessary DynamoDB policies
+##### Option A: Using Google Cloud Console (UI)
+1. Access Google Cloud Console
+   - Go to https://console.cloud.google.com
+   - Select or create a project
+   - Click "New Project" if needed
+   - Enter project name and click "CREATE"
 
-3. Security:
-   - Use environment variables for all sensitive information
-   - Enable HTTPS:
-     - In your environment, go to Configuration > Load balancer
-     - Add a listener for port 443
-     - Configure SSL certificate
-   - Configure security groups through the Elastic Beanstalk environment settings
+2. Enable Required APIs
+   - Navigate to "APIs & Services" > "Dashboard"
+   - Click "+ ENABLE APIS AND SERVICES"
+   - Search for and enable "Compute Engine API"
 
-4. Monitoring:
-   - Set up CloudWatch alarms through the Elastic Beanstalk monitoring page
-   - Configure proper logging in the environment's configuration panel
+3. Create VM Instance
+   - Go to "Compute Engine" > "VM instances"
+   - Click "CREATE INSTANCE"
+   - Configure the following settings:
 
-5. Cost Management:
-   - Choose t3.micro instances for development in the capacity settings
-   - Configure auto-scaling rules in the capacity section
-   - Monitor costs through AWS Cost Explorer
+   **Basic Settings:**
+   - Name: `agent-engine`
+   - Region: `us-west-1` (or preferred region)
+   - Machine type: `e2-standard-4` (4 vCPU, 16 GB memory)
+     - For cost optimization, start with `e2-standard-2`
 
-For detailed troubleshooting and advanced configuration options, refer to the [AWS Elastic Beanstalk documentation](https://docs.aws.amazon.com/elasticbeanstalk/latest/dg/Welcome.html).
+   **Boot Disk:**
+   - Operating System: `Ubuntu`
+   - Version: `Ubuntu 24.04 LTS`
+   - Size: `100 GB`
+   - Type: `Standard persistent disk`
 
-## Upgrade AG2
-pip install --upgrade ag2
-pip install 'ag2[openai]'
+   **Identity and Security:**
+   - Service account: `Compute Engine default service account`
+   - Access scopes: `Allow default access`
+   - Enable Secure Boot, vTPM, and Integrity Monitoring
+
+   **Networking:**
+   - Default settings (only outbound connections needed)
+
+4. Launch and Connect
+   - Click "CREATE" and wait for deployment
+   - Click "SSH" in the VM instances list to connect
+
+```
+
+#### 2. System Dependencies
+
+```bash
+# Update package list
+sudo apt-get update
+
+# Install Chrome dependencies
+sudo apt-get install -y \
+    ca-certificates \
+    fonts-liberation \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libatk1.0-0 \
+    libc6 \
+    libcairo2 \
+    libcups2 \
+    libdbus-1-3 \
+    libexpat1 \
+    libfontconfig1 \
+    libgbm1 \
+    libgcc1 \
+    libglib2.0-0 \
+    libgtk-3-0 \
+    libnspr4 \
+    libnss3 \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    libstdc++6 \
+    libx11-6 \
+    libx11-xcb1 \
+    libxcb1 \
+    libxcomposite1 \
+    libxcursor1 \
+    libxdamage1 \
+    libxext6 \
+    libxfixes3 \
+    libxi6 \
+    libxrandr2 \
+    libxrender1 \
+    libxss1 \
+    libxtst6 \
+    lsb-release \
+    wget \
+    xdg-utils
+
+# Install Playwright-specific dependencies
+sudo apt-get install -y \
+    libnss3 \
+    libnspr4 \
+    libatk1.0-0t64 \
+    libatk-bridge2.0-0t64 \
+    libcups2t64 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libasound2t64 \
+    libatspi2.0-0t64
+
+#### 3. Python Environment Setup
+
+```bash
+# Install Miniconda
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh
+bash ~/miniconda.sh -b -p $HOME/miniconda
+eval "$($HOME/miniconda/bin/conda shell.bash hook)"
+conda init
+
+# Restart your shell or run:
+source ~/.bashrc
+```
+
+#### 4. Agent Engine Setup
+
+```bash
+# Clone repository
+git clone https://github.com/yourusername/agentweb.git
+cd agentweb/agent-engine
+
+# Create and activate Conda environment
+conda env create -f environment.yml
+conda activate agent-engine
+
+# Install Playwright browsers
+playwright install
+```
+
+#### 5. Running the Agent Engine
+
+```bash
+# Ensure you're in the correct directory and environment
+cd ~/agentweb/agent-engine
+conda activate agent-engine
+
+# Start the agent engine
+python task_monitor.py
+```
+
+#### Maintenance
+
+For system updates:
+```bash
+sudo apt-get update
+sudo apt-get upgrade -y
+```
+
+For agent-engine updates:
+```bash
+cd ~/agentweb
+git pull
+conda env update -f environment.yml --prune
+pip install -r requirements.txt
+```
