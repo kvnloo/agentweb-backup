@@ -166,8 +166,8 @@ export default function Home() {
                     component="span"
                     sx={{
                       fontSize: '0.9rem',
-                      fontWeight: 400,
-                      opacity: 0.7,
+                      fontWeight: 500,
+                      opacity: 0.9,
                       ml: 1,
                       display: { xs: 'none', sm: 'block' }
                     }}
@@ -184,12 +184,6 @@ export default function Home() {
             >
               <Button
                 color="primary"
-                onClick={() => scrollToSection('benefits')}
-              >
-                Benefits
-              </Button>
-              <Button
-                color="primary"
                 onClick={() => scrollToSection('features')}
               >
                 Features
@@ -199,6 +193,12 @@ export default function Home() {
                 onClick={() => scrollToSection('use-cases')}
               >
                 Use Cases
+              </Button>
+              <Button
+                color="primary"
+                onClick={() => scrollToSection('partners')}
+              >
+                Customers & Partners
               </Button>
               <Button
                 variant="contained"
@@ -266,13 +266,14 @@ export default function Home() {
               </Typography>
               <Typography
                 variant="h5"
-                sx={{ 
+                sx={{
                   mb: 4,
+                  fontWeight: 400,
                   opacity: 0.9,
-                  fontSize: { xs: '1.2rem', sm: '1.5rem' }
+                  fontSize: { xs: '1.25rem', sm: '1.5rem' }
                 }}
               >
-                Automate your marketing workflows with AI agents. From market research to campaign execution and performance tracking - all in one platform.
+                Transform your marketing operations with AI-powered automation. From market research to campaign execution and performance tracking, AgentWeb handles it all.
               </Typography>
 
               <Grid container spacing={3} sx={{ mb: 2 }}>
@@ -362,83 +363,6 @@ export default function Home() {
         </Container>
       </Box>
 
-      <Container id="benefits" maxWidth="lg" sx={{ 
-        py: { xs: 8, sm: 12 },
-        px: { xs: 2, sm: 3 }
-      }}>
-        <Typography
-          variant="h3"
-          align="center"
-          sx={{ mb: 6, fontWeight: 700 }}
-        >
-          Why Choose AgentWeb for Marketing?
-        </Typography>
-        <Grid container spacing={4} justifyContent="center">
-          <Grid item xs={12} md={6}>
-            <List>
-              <ListItem>
-                <ListItemIcon>
-                  <CheckIcon color="primary" />
-                </ListItemIcon>
-                <ListItemText 
-                  primary="End-to-End Marketing Automation" 
-                  secondary="From market research to campaign execution and performance tracking"
-                />
-              </ListItem>
-              <ListItem>
-                <ListItemIcon>
-                  <CheckIcon color="primary" />
-                </ListItemIcon>
-                <ListItemText 
-                  primary="AI-Powered Market Research" 
-                  secondary="Automated competitor analysis, creative strategy research, and social listening"
-                />
-              </ListItem>
-              <ListItem>
-                <ListItemIcon>
-                  <CheckIcon color="primary" />
-                </ListItemIcon>
-                <ListItemText 
-                  primary="One-Click Campaign Setup" 
-                  secondary="Pre-built templates for quick campaign launches with optimized targeting"
-                />
-              </ListItem>
-            </List>
-          </Grid>
-          <Grid item xs={12} md={6}>
-            <List>
-              <ListItem>
-                <ListItemIcon>
-                  <CheckIcon color="primary" />
-                </ListItemIcon>
-                <ListItemText 
-                  primary="Real-Time KPI Tracking" 
-                  secondary="Centralized dashboard with automated alerts for media buyers"
-                />
-              </ListItem>
-              <ListItem>
-                <ListItemIcon>
-                  <CheckIcon color="primary" />
-                </ListItemIcon>
-                <ListItemText 
-                  primary="Expert-Built AI Playbooks" 
-                  secondary="Marketing workflows designed by industry experts"
-                />
-              </ListItem>
-              <ListItem>
-                <ListItemIcon>
-                  <CheckIcon color="primary" />
-                </ListItemIcon>
-                <ListItemText 
-                  primary="Cost-Effective Solution" 
-                  secondary="Affordable automation for SMBs and startups"
-                />
-              </ListItem>
-            </List>
-          </Grid>
-        </Grid>
-      </Container>
-
       <Box id="features" sx={{ 
         bgcolor: 'grey.50', 
         py: { xs: 8, sm: 12 },
@@ -450,7 +374,7 @@ export default function Home() {
             align="center"
             sx={{ mb: 6, fontWeight: 700 }}
           >
-            Marketing Automation Features
+            Key Features
           </Typography>
           <Grid container spacing={4} justifyContent="center">
             <Grid item xs={12} md={4}>
@@ -659,7 +583,7 @@ export default function Home() {
       </Container>
 
       {/* Partners Section */}
-      <Box sx={{ 
+      <Box id="partners" sx={{ 
         bgcolor: 'grey.50', 
         py: { xs: 8, sm: 12 },
         width: '100%'
