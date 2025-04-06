@@ -226,6 +226,7 @@ npm run dev
 ```
 
 The frontend development server will be available at:
+- Local access: http://localhost:5173
 - Network access: http://[your-ip-address]:5173
 
 ### Admin Setup
