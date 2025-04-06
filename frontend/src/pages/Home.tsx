@@ -132,7 +132,21 @@ export default function Home() {
                 }}
               >
                 <img src={logo} alt="AgentWeb Logo" style={{ height: 32, width: 32 }} />
-                AgentWeb
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                  AgentWeb
+                  <Typography
+                    component="span"
+                    sx={{
+                      fontSize: '0.9rem',
+                      fontWeight: 400,
+                      opacity: 0.7,
+                      ml: 1,
+                      display: { xs: 'none', sm: 'block' }
+                    }}
+                  >
+                    Your Marketing Operator
+                  </Typography>
+                </Box>
               </Link>
             </Typography>
             <Stack
@@ -220,7 +234,7 @@ export default function Home() {
                   fontSize: { xs: '2rem', sm: '2.5rem', md: '3rem' },
                 }}
               >
-                Transform Your Web Tasks with AI
+                End-to-End Online Marketing Automation for SMBs and Startups
               </Typography>
               <Typography
                 variant="h5"
@@ -230,7 +244,7 @@ export default function Home() {
                   fontSize: { xs: '1.2rem', sm: '1.5rem' }
                 }}
               >
-                Let our intelligent agents handle your web automation needs with simple natural language instructions.
+                Automate your marketing workflows with AI agents. From market research to campaign execution and performance tracking - all in one platform.
               </Typography>
 
               {/* Waitlist Form */}
@@ -291,7 +305,15 @@ export default function Home() {
                           How do you plan to use AgentWeb? (Select all that apply)
                         </Typography>
                         <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }} onClick={() => setFormExpanded(true)}>
-                          {['Data Entry', 'Web Scraping', 'Form Filling', 'Monitoring', 'Reporting', 'Customer Service', 'Other'].map((category) => (
+                          {[
+                            'Market Research',
+                            'Campaign Management',
+                            'Performance Tracking',
+                            'Social Media Management',
+                            'Competitor Analysis',
+                            'Budget Optimization',
+                            'Other'
+                          ].map((category) => (
                             <Chip
                               key={category}
                               label={category}
@@ -373,7 +395,7 @@ export default function Home() {
           align="center"
           sx={{ mb: 6, fontWeight: 700 }}
         >
-          Why Choose AgentWeb?
+          Why Choose AgentWeb for Marketing?
         </Typography>
         <Grid container spacing={4} justifyContent="center">
           <Grid item xs={12} md={6}>
@@ -383,8 +405,8 @@ export default function Home() {
                   <CheckIcon color="primary" />
                 </ListItemIcon>
                 <ListItemText 
-                  primary="State-of-the-Art AI" 
-                  secondary="Powered by Claude 3.7, GPT-4o, and Gemini 2.5 Pro with automatic fallback"
+                  primary="End-to-End Marketing Automation" 
+                  secondary="From market research to campaign execution and performance tracking"
                 />
               </ListItem>
               <ListItem>
@@ -392,8 +414,8 @@ export default function Home() {
                   <CheckIcon color="primary" />
                 </ListItemIcon>
                 <ListItemText 
-                  primary="Smart Workflows" 
-                  secondary="Create complex task chains with natural language and multiple output formats"
+                  primary="AI-Powered Market Research" 
+                  secondary="Automated competitor analysis, creative strategy research, and social listening"
                 />
               </ListItem>
               <ListItem>
@@ -401,8 +423,8 @@ export default function Home() {
                   <CheckIcon color="primary" />
                 </ListItemIcon>
                 <ListItemText 
-                  primary="Deep Research Capabilities" 
-                  secondary="Comprehensive research powered by AG2 multi-agent framework with citations"
+                  primary="One-Click Campaign Setup" 
+                  secondary="Pre-built templates for quick campaign launches with optimized targeting"
                 />
               </ListItem>
             </List>
@@ -414,8 +436,8 @@ export default function Home() {
                   <CheckIcon color="primary" />
                 </ListItemIcon>
                 <ListItemText 
-                  primary="Enterprise Security" 
-                  secondary="AES256 encryption and isolated browser sessions with end-to-end protection"
+                  primary="Real-Time KPI Tracking" 
+                  secondary="Centralized dashboard with automated alerts for media buyers"
                 />
               </ListItem>
               <ListItem>
@@ -423,8 +445,8 @@ export default function Home() {
                   <CheckIcon color="primary" />
                 </ListItemIcon>
                 <ListItemText 
-                  primary="No-Code Integration" 
-                  secondary="Connect to external APIs and accounts without writing any code"
+                  primary="Expert-Built AI Playbooks" 
+                  secondary="Marketing workflows designed by industry experts"
                 />
               </ListItem>
               <ListItem>
@@ -432,8 +454,8 @@ export default function Home() {
                   <CheckIcon color="primary" />
                 </ListItemIcon>
                 <ListItemText 
-                  primary="Smart Templates" 
-                  secondary="Pre-configured templates with customizable parameters for quick automation"
+                  primary="Cost-Effective Solution" 
+                  secondary="Affordable automation for SMBs and startups"
                 />
               </ListItem>
             </List>
@@ -452,7 +474,7 @@ export default function Home() {
             align="center"
             sx={{ mb: 6, fontWeight: 700 }}
           >
-            Powerful Features
+            Marketing Automation Features
           </Typography>
           <Grid container spacing={4} justifyContent="center">
             <Grid item xs={12} md={4}>
@@ -469,10 +491,10 @@ export default function Home() {
               >
                 <AutoGraphIcon sx={{ fontSize: 48, color: 'primary.main', mb: 2 }} />
                 <Typography variant="h5" gutterBottom fontWeight={600}>
-                  Advanced AI Models
+                  Market Research
                 </Typography>
                 <Typography variant="body1" color="text.secondary">
-                  Powered by Claude 3.7, GPT-4o, and Gemini 2.5 Pro, with automatic fallback for reliability.
+                  Automated competitor analysis, creative strategy research, and omni-channel social listening.
                 </Typography>
               </Paper>
             </Grid>
@@ -490,10 +512,10 @@ export default function Home() {
               >
                 <BoltIcon sx={{ fontSize: 48, color: 'primary.main', mb: 2 }} />
                 <Typography variant="h5" gutterBottom fontWeight={600}>
-                  Smart Workflows
+                  Campaign Builder
                 </Typography>
                 <Typography variant="body1" color="text.secondary">
-                  Create complex task chains with natural language, support for file attachments, and multiple output formats including CSV, JSON, and HTML.
+                  One-click campaign setup with automated audience targeting and budget optimization.
                 </Typography>
               </Paper>
             </Grid>
@@ -511,10 +533,10 @@ export default function Home() {
               >
                 <SecurityIcon sx={{ fontSize: 48, color: 'primary.main', mb: 2 }} />
                 <Typography variant="h5" gutterBottom fontWeight={600}>
-                  Enterprise Security
+                  KPI Tracker
                 </Typography>
                 <Typography variant="body1" color="text.secondary">
-                  AES256 encryption for all stored credentials and isolated browser sessions with end-to-end encryption.
+                  Real-time performance monitoring with automated alerts and centralized dashboard.
                 </Typography>
               </Paper>
             </Grid>
@@ -532,10 +554,10 @@ export default function Home() {
               >
                 <SmartToyIcon sx={{ fontSize: 48, color: 'primary.main', mb: 2 }} />
                 <Typography variant="h5" gutterBottom fontWeight={600}>
-                  Deep Research Mode
+                  AI Playbooks
                 </Typography>
                 <Typography variant="body1" color="text.secondary">
-                  Comprehensive research powered by AG2 (AutoGen) multi-agent framework with detailed reports and citations.
+                  Expert-built marketing workflows with task-specific AI optimization.
                 </Typography>
               </Paper>
             </Grid>
@@ -553,10 +575,10 @@ export default function Home() {
               >
                 <IntegrationIcon sx={{ fontSize: 48, color: 'primary.main', mb: 2 }} />
                 <Typography variant="h5" gutterBottom fontWeight={600}>
-                  No-Code API/Account Integration
+                  Platform Integration
                 </Typography>
                 <Typography variant="body1" color="text.secondary">
-                  Connect to external APIs and accounts without coding, with secure credential management, documentation integration, and GitHub code management.
+                  Connect with major marketing platforms and tools without coding.
                 </Typography>
               </Paper>
             </Grid>
@@ -577,7 +599,7 @@ export default function Home() {
                   Smart Templates
                 </Typography>
                 <Typography variant="body1" color="text.secondary">
-                  Pre-configured task templates with customizable parameters, complex task support, and automatic parameter-based task naming.
+                  Pre-configured marketing workflows with customizable parameters.
                 </Typography>
               </Paper>
             </Grid>
@@ -594,66 +616,66 @@ export default function Home() {
           align="center"
           sx={{ mb: 6, fontWeight: 700 }}
         >
-          What You Can Automate
+          Marketing Automation Use Cases
         </Typography>
         <Grid container spacing={4} justifyContent="center">
           <Grid item xs={12} md={6} lg={4}>
             <Paper sx={{ p: 3 }}>
               <Typography variant="h6" gutterBottom color="primary">
-                Web Research & Analysis
+                Competitor Analysis
               </Typography>
               <Typography variant="body1" paragraph>
-                Comprehensive research using AG2 multi-agent framework with detailed reports and citations.
+                Automated research on competitor strategies, creative approaches, and market positioning.
               </Typography>
             </Paper>
           </Grid>
           <Grid item xs={12} md={6} lg={4}>
             <Paper sx={{ p: 3 }}>
               <Typography variant="h6" gutterBottom color="primary">
-                Data Collection & Processing
+                Campaign Setup
               </Typography>
               <Typography variant="body1" paragraph>
-                Extract and process data from websites with support for CSV, JSON, and HTML outputs.
+                One-click campaign creation with optimized targeting and budget allocation.
               </Typography>
             </Paper>
           </Grid>
           <Grid item xs={12} md={6} lg={4}>
             <Paper sx={{ p: 3 }}>
               <Typography variant="h6" gutterBottom color="primary">
-                API & Account Integration
+                Performance Tracking
               </Typography>
               <Typography variant="body1" paragraph>
-                Connect and automate any external services without coding.
+                Real-time KPI monitoring with automated alerts and reporting.
               </Typography>
             </Paper>
           </Grid>
           <Grid item xs={12} md={6} lg={4}>
             <Paper sx={{ p: 3 }}>
               <Typography variant="h6" gutterBottom color="primary">
-                Complex Workflows
+                Social Listening
               </Typography>
               <Typography variant="body1" paragraph>
-                Create multi-step automation chains with natural language and file attachments.
+                Automated monitoring of brand mentions and industry trends across platforms.
               </Typography>
             </Paper>
           </Grid>
           <Grid item xs={12} md={6} lg={4}>
             <Paper sx={{ p: 3 }}>
               <Typography variant="h6" gutterBottom color="primary">
-                Form & Data Entry
+                Creative Research
               </Typography>
               <Typography variant="body1" paragraph>
-                Automate form filling and data entry with high accuracy and validation.
+                AI-powered analysis of creative strategies and content performance.
               </Typography>
             </Paper>
           </Grid>
           <Grid item xs={12} md={6} lg={4}>
             <Paper sx={{ p: 3 }}>
               <Typography variant="h6" gutterBottom color="primary">
-                Monitoring & Reporting
+                Budget Optimization
               </Typography>
               <Typography variant="body1" paragraph>
-                Track changes and generate automated reports with customizable templates.
+                Automated budget allocation and performance-based adjustments.
               </Typography>
             </Paper>
           </Grid>
