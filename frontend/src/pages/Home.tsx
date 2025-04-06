@@ -103,7 +103,6 @@ export default function Home() {
         useCaseInfo: JSON.stringify(useCaseInfo)
       });
       setSubmitted(true);
-      setIsWaitlistOpen(false);
     } catch (err) {
       setError('Failed to join waitlist. Please try again.');
     } finally {
@@ -203,7 +202,7 @@ export default function Home() {
               </Button>
               <Button
                 variant="contained"
-                onClick={() => scrollToSection('join')}
+                onClick={() => setIsWaitlistOpen(true)}
                 sx={{ 
                   boxShadow: 'none',
                   '&:hover': { boxShadow: 'none' }
@@ -216,13 +215,13 @@ export default function Home() {
         </Container>
       </Box>
 
-      <Box sx={{ height: '64px' }} />
+      <Box sx={{ height: '32px' }} />
 
       <Box id="hero" sx={{ 
         background: 'linear-gradient(45deg, #1a237e 30%, #0d47a1 90%)',
         color: 'white',
-        pt: { xs: 8, sm: 12 },
-        pb: { xs: 8, sm: 12 },
+        pt: { xs: 4, sm: 6 },
+        pb: { xs: 4, sm: 6 },
         width: '100%'
       }}>
         <Container maxWidth="lg" sx={{ px: { xs: 2, sm: 3 } }}>
@@ -276,40 +275,80 @@ export default function Home() {
                 Automate your marketing workflows with AI agents. From market research to campaign execution and performance tracking - all in one platform.
               </Typography>
 
-              {/* Waitlist Form */}
-              <Paper 
-                elevation={2}
+              <Grid container spacing={3} sx={{ mb: 2 }}>
+                <Grid item xs={6}>
+                  <Paper 
+                    elevation={0}
+                    sx={{ 
+                      p: 3,
+                      height: '100%',
+                      bgcolor: 'rgba(255, 255, 255, 0.1)',
+                      color: 'white',
+                      textAlign: 'center',
+                      borderRadius: 2,
+                      backdropFilter: 'blur(8px)'
+                    }}
+                  >
+                    <Typography variant="h2" sx={{ fontWeight: 800, mb: 1 }}>
+                      10x
+                    </Typography>
+                    <Typography variant="h6">
+                      Cost Reduction
+                    </Typography>
+                    <Typography variant="body2" sx={{ mt: 1, opacity: 0.9 }}>
+                      Reduce marketing operation costs through automation
+                    </Typography>
+                  </Paper>
+                </Grid>
+                <Grid item xs={6}>
+                  <Paper 
+                    elevation={0}
+                    sx={{ 
+                      p: 3,
+                      height: '100%',
+                      bgcolor: 'rgba(255, 255, 255, 0.1)',
+                      color: 'white',
+                      textAlign: 'center',
+                      borderRadius: 2,
+                      backdropFilter: 'blur(8px)'
+                    }}
+                  >
+                    <Typography variant="h2" sx={{ fontWeight: 800, mb: 1 }}>
+                      3x
+                    </Typography>
+                    <Typography variant="h6">
+                      Performance Boost
+                    </Typography>
+                    <Typography variant="body2" sx={{ mt: 1, opacity: 0.9 }}>
+                      Improve campaign performance with AI optimization
+                    </Typography>
+                  </Paper>
+                </Grid>
+              </Grid>
+
+              <Button
+                variant="contained"
+                size="large"
+                onClick={() => setIsWaitlistOpen(true)}
                 sx={{ 
-                  p: 3,
-                  maxWidth: 500,
-                  bgcolor: 'background.paper',
-                  borderRadius: 2
+                  bgcolor: 'primary.main',
+                  color: 'white',
+                  px: 6,
+                  py: 2,
+                  fontSize: '1.2rem',
+                  fontWeight: 600,
+                  borderRadius: 2,
+                  boxShadow: '0 4px 14px rgba(0,0,0,0.2)',
+                  '&:hover': {
+                    bgcolor: 'primary.dark',
+                    boxShadow: '0 6px 20px rgba(0,0,0,0.25)',
+                    transform: 'translateY(-2px)'
+                  },
+                  transition: 'all 0.3s ease'
                 }}
               >
-                <Button
-                  variant="contained"
-                  size="large"
-                  onClick={() => setIsWaitlistOpen(true)}
-                  sx={{ 
-                    bgcolor: 'primary.main',
-                    color: 'white',
-                    px: 6,
-                    py: 2,
-                    fontSize: '1.2rem',
-                    fontWeight: 600,
-                    borderRadius: 2,
-                    boxShadow: '0 4px 14px rgba(0,0,0,0.2)',
-                    '&:hover': {
-                      bgcolor: 'primary.dark',
-                      boxShadow: '0 6px 20px rgba(0,0,0,0.25)',
-                      transform: 'translateY(-2px)'
-                    },
-                    transition: 'all 0.3s ease'
-                  }}
-                >
-                  Click to Join Waitlist
-                </Button>
-              </Paper>
+                Click to Join Waitlist
+              </Button>
             </Grid>
             <Grid item xs={12} md={5} sx={{ display: { xs: 'none', md: 'block' } }}>
               <Box
@@ -1017,7 +1056,7 @@ export default function Home() {
                         onChange={(e) => setRequestReport(e.target.checked)}
                       />
                     }
-                    label="Request a FREE competition landscape report"
+                    label="Request a competition landscape report for my company (FREE)"
                   />
                 </Grid>
                 <Grid item xs={12}>
