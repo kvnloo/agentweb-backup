@@ -6,10 +6,23 @@ const router = express.Router();
 
 router.post('/', async (req, res) => {
   try {
-    const { email, useCaseCategories, useCaseDescription } = req.body;
+    const { email, useCaseInfo } = req.body;
 
     if (!email || !validateEmail(email)) {
       return res.status(400).json({ message: 'Invalid email address' });
+    }
+
+    // Parse the useCaseInfo string into an object
+    let parsedUseCaseInfo;
+    try {
+      parsedUseCaseInfo = JSON.parse(useCaseInfo);
+    } catch (error) {
+      return res.status(400).json({ message: 'Invalid use case information format' });
+    }
+
+    // Validate required fields
+    if (!parsedUseCaseInfo.fullName || !parsedUseCaseInfo.companyName) {
+      return res.status(400).json({ message: 'Full name and company name are required' });
     }
 
     // Check if email already exists
@@ -22,8 +35,12 @@ router.post('/', async (req, res) => {
     const entry = await waitlistDb.add({
       email,
       joinedAt: new Date().toISOString(),
-      useCaseCategories,
-      useCaseDescription
+      fullName: parsedUseCaseInfo.fullName,
+      phoneNumber: parsedUseCaseInfo.phoneNumber,
+      companyName: parsedUseCaseInfo.companyName,
+      requestReport: parsedUseCaseInfo.requestReport,
+      useCaseCategories: parsedUseCaseInfo.categories,
+      useCaseDescription: parsedUseCaseInfo.description
     });
 
     res.status(201).json(entry);
