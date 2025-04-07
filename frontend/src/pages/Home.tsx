@@ -8,10 +8,6 @@ import {
   Paper,
   Grid,
   Alert,
-  List,
-  ListItem,
-  ListItemIcon,
-  ListItemText,
   Stack,
   Link,
   Toolbar,
@@ -22,7 +18,6 @@ import {
 } from '@mui/material';
 import { Link as RouterLink, useLocation } from 'react-router-dom';
 import {
-  Check as CheckIcon,
   Bolt as BoltIcon,
   Security as SecurityIcon,
   AutoGraph as AutoGraphIcon,
@@ -56,8 +51,6 @@ export default function Home() {
   const [useCaseDescription, setUseCaseDescription] = useState('');
   const [submitted, setSubmitted] = useState(false);
   const [error, setError] = useState('');
-  const [formExpanded, setFormExpanded] = useState(false);
-  const formRef = React.useRef<HTMLDivElement>(null);
   const [isWaitlistOpen, setIsWaitlistOpen] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
