@@ -25,6 +25,10 @@ interface WaitlistEntry {
   joinedAt: string;
   status?: string;
   invitedAt?: string;
+  fullName?: string;
+  phoneNumber?: string;
+  companyName?: string;
+  requestReport?: boolean;
   useCaseCategories?: string[];
   useCaseDescription?: string;
 }
@@ -47,6 +51,10 @@ export const waitlistDb = {
         joinedAt: entry.joinedAt,
         status: entry.status || 'pending',
         invitedAt: entry.invitedAt,
+        fullName: entry.fullName,
+        phoneNumber: entry.phoneNumber,
+        companyName: entry.companyName,
+        requestReport: entry.requestReport || false,
         useCaseCategories: entry.useCaseCategories || [],
         useCaseDescription: entry.useCaseDescription || ''
       },

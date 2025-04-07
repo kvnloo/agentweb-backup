@@ -225,7 +225,9 @@ VITE_API_URL=http://localhost:3001
 npm run dev
 ```
 
-The application will be available at http://localhost:5173
+The frontend development server will be available at:
+- Local access: http://localhost:5173
+- Network access: http://[your-ip-address]:5173
 
 ### Admin Setup
 

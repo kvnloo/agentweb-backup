@@ -8,24 +8,29 @@ import {
   Paper,
   Grid,
   Alert,
-  List,
-  ListItem,
-  ListItemIcon,
-  ListItemText,
   Stack,
   Link,
   Toolbar,
   Chip,
+  Checkbox,
+  FormControlLabel,
+  IconButton,
+  Drawer,
+  List,
+  ListItem,
+  useMediaQuery,
+  useTheme
 } from '@mui/material';
-import { Link as RouterLink } from 'react-router-dom';
+import { Link as RouterLink, useLocation } from 'react-router-dom';
 import {
-  Check as CheckIcon,
   Bolt as BoltIcon,
   Security as SecurityIcon,
   AutoGraph as AutoGraphIcon,
   IntegrationInstructions as IntegrationIcon,
   SmartToy as SmartToyIcon,
-  Category as CategoryIcon
+  Category as CategoryIcon,
+  Close as CloseIcon,
+  Menu as MenuIcon,
 } from '@mui/icons-material';
 import axios from 'axios';
 import { buildApiUrl } from '../config';
@@ -42,21 +47,35 @@ import ag2Logo from '../assets/partners/logo-ag2.png';
 import React from 'react';
 
 export default function Home() {
+  const location = useLocation();
+  const theme = useTheme();
+  const isMobile = useMediaQuery(theme.breakpoints.down('md'));
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [email, setEmail] = useState('');
+  const [fullName, setFullName] = useState('');
+  const [phoneNumber, setPhoneNumber] = useState('');
+  const [companyName, setCompanyName] = useState('');
+  const [requestReport, setRequestReport] = useState(false);
   const [useCaseCategories, setUseCaseCategories] = useState<string[]>([]);
   const [useCaseDescription, setUseCaseDescription] = useState('');
   const [submitted, setSubmitted] = useState(false);
   const [error, setError] = useState('');
-  const [formExpanded, setFormExpanded] = useState(false);
-  const formRef = React.useRef<HTMLDivElement>(null);
+  const [isWaitlistOpen, setIsWaitlistOpen] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  useEffect(() => {
+    if (location.state?.openWaitlist) {
+      setIsWaitlistOpen(true);
+      // Clear the state to prevent reopening on refresh
+      window.history.replaceState({}, document.title);
+    }
+  }, [location.state]);
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
-      if (formRef.current && !formRef.current.contains(event.target as Node)) {
-        // Only fold if both email and use case fields are empty
-        if (!email && useCaseCategories.length === 0 && !useCaseDescription) {
-          setFormExpanded(false);
-        }
+      const waitlistSection = document.getElementById('waitlist-section');
+      if (waitlistSection && !waitlistSection.contains(event.target as Node)) {
+        setIsWaitlistOpen(false);
       }
     };
 
@@ -64,21 +83,32 @@ export default function Home() {
     return () => {
       document.removeEventListener('mousedown', handleClickOutside);
     };
-  }, [email, useCaseCategories, useCaseDescription]);
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
+    setIsSubmitting(true);
     
     try {
+      const useCaseInfo = {
+        fullName,
+        phoneNumber,
+        companyName,
+        requestReport,
+        categories: useCaseCategories,
+        description: useCaseDescription
+      };
+
       await axios.post(buildApiUrl('/api/waitlist'), { 
         email,
-        useCaseCategories,
-        useCaseDescription
+        useCaseInfo: JSON.stringify(useCaseInfo)
       });
       setSubmitted(true);
     } catch (err) {
       setError('Failed to join waitlist. Please try again.');
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -132,54 +162,151 @@ export default function Home() {
                 }}
               >
                 <img src={logo} alt="AgentWeb Logo" style={{ height: 32, width: 32 }} />
-                AgentWeb
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                  AgentWeb
+                  <Typography
+                    component="span"
+                    sx={{
+                      fontSize: '0.9rem',
+                      fontWeight: 500,
+                      opacity: 0.9,
+                      ml: 1,
+                      display: { xs: 'none', sm: 'block' }
+                    }}
+                  >
+                    Your Marketing Operator
+                  </Typography>
+                </Box>
               </Link>
             </Typography>
-            <Stack
-              direction="row"
-              spacing={3}
-              alignItems="center"
-            >
-              <Button
-                color="primary"
-                onClick={() => scrollToSection('benefits')}
+            
+            {isMobile ? (
+              <IconButton
+                edge="end"
+                color="inherit"
+                aria-label="menu"
+                onClick={() => setMobileMenuOpen(true)}
+                sx={{ ml: 2 }}
               >
-                Benefits
-              </Button>
-              <Button
-                color="primary"
-                onClick={() => scrollToSection('features')}
+                <MenuIcon />
+              </IconButton>
+            ) : (
+              <Stack
+                direction="row"
+                spacing={3}
+                alignItems="center"
               >
-                Features
-              </Button>
-              <Button
-                color="primary"
-                onClick={() => scrollToSection('use-cases')}
-              >
-                Use Cases
-              </Button>
-              <Button
-                variant="contained"
-                onClick={() => scrollToSection('join')}
-                sx={{ 
-                  boxShadow: 'none',
-                  '&:hover': { boxShadow: 'none' }
-                }}
-              >
-                Join Waitlist
-              </Button>
-            </Stack>
+                <Button
+                  color="primary"
+                  onClick={() => scrollToSection('features')}
+                >
+                  Features
+                </Button>
+                <Button
+                  color="primary"
+                  onClick={() => scrollToSection('use-cases')}
+                >
+                  Use Cases
+                </Button>
+                <Button
+                  color="primary"
+                  onClick={() => scrollToSection('partners')}
+                >
+                  Customers & Partners
+                </Button>
+                <Button
+                  variant="contained"
+                  onClick={() => setIsWaitlistOpen(true)}
+                  sx={{ 
+                    boxShadow: 'none',
+                    '&:hover': { boxShadow: 'none' }
+                  }}
+                >
+                  Join Waitlist
+                </Button>
+              </Stack>
+            )}
           </Toolbar>
         </Container>
       </Box>
 
-      <Box sx={{ height: '64px' }} />
+      <Drawer
+        anchor="right"
+        open={mobileMenuOpen}
+        onClose={() => setMobileMenuOpen(false)}
+        sx={{
+          '& .MuiDrawer-paper': {
+            width: 250,
+            boxSizing: 'border-box',
+            backgroundColor: theme.palette.background.paper,
+          },
+        }}
+      >
+        <Box sx={{ width: 250, pt: 2 }}>
+          <List>
+            <ListItem>
+              <Button 
+                onClick={() => {
+                  scrollToSection('features');
+                  setMobileMenuOpen(false);
+                }}
+                color="inherit"
+                fullWidth
+                sx={{ justifyContent: 'flex-start' }}
+              >
+                Features
+              </Button>
+            </ListItem>
+            <ListItem>
+              <Button 
+                onClick={() => {
+                  scrollToSection('use-cases');
+                  setMobileMenuOpen(false);
+                }}
+                color="inherit"
+                fullWidth
+                sx={{ justifyContent: 'flex-start' }}
+              >
+                Use Cases
+              </Button>
+            </ListItem>
+            <ListItem>
+              <Button 
+                onClick={() => {
+                  scrollToSection('partners');
+                  setMobileMenuOpen(false);
+                }}
+                color="inherit"
+                fullWidth
+                sx={{ justifyContent: 'flex-start' }}
+              >
+                Customers & Partners
+              </Button>
+            </ListItem>
+            <ListItem>
+              <Button 
+                onClick={() => {
+                  setIsWaitlistOpen(true);
+                  setMobileMenuOpen(false);
+                }}
+                variant="contained"
+                fullWidth
+                sx={{ justifyContent: 'flex-start' }}
+              >
+                Join Waitlist
+              </Button>
+            </ListItem>
+          </List>
+        </Box>
+      </Drawer>
+
+      <Box sx={{ height: '32px' }} />
 
       <Box id="hero" sx={{ 
         background: 'linear-gradient(45deg, #1a237e 30%, #0d47a1 90%)',
         color: 'white',
-        pt: { xs: 8, sm: 12 },
-        pb: { xs: 8, sm: 12 },
+        pt: { xs: 4, sm: 6 },
+        pb: { xs: 4, sm: 6 },
         width: '100%'
       }}>
         <Container maxWidth="lg" sx={{ px: { xs: 2, sm: 3 } }}>
@@ -220,137 +347,94 @@ export default function Home() {
                   fontSize: { xs: '2rem', sm: '2.5rem', md: '3rem' },
                 }}
               >
-                Transform Your Web Tasks with AI
+                End-to-End Online Marketing Automation for SMBs and Startups
               </Typography>
               <Typography
                 variant="h5"
-                sx={{ 
+                sx={{
                   mb: 4,
+                  fontWeight: 400,
                   opacity: 0.9,
-                  fontSize: { xs: '1.2rem', sm: '1.5rem' }
+                  fontSize: { xs: '1.25rem', sm: '1.5rem' }
                 }}
               >
-                Let our intelligent agents handle your web automation needs with simple natural language instructions.
+                Transform your marketing operations with AI-powered automation. From market research to campaign execution and performance tracking, AgentWeb handles it all.
               </Typography>
 
-              {/* Waitlist Form */}
-              <Paper 
-                elevation={2}
+              <Grid container spacing={3} sx={{ mb: 2 }}>
+                <Grid item xs={6}>
+                  <Paper 
+                    elevation={0}
+                    sx={{ 
+                      p: 3,
+                      height: '100%',
+                      bgcolor: 'rgba(255, 255, 255, 0.1)',
+                      color: 'white',
+                      textAlign: 'center',
+                      borderRadius: 2,
+                      backdropFilter: 'blur(8px)'
+                    }}
+                  >
+                    <Typography variant="h2" sx={{ fontWeight: 800, mb: 1 }}>
+                      10x
+                    </Typography>
+                    <Typography variant="h6">
+                      Cost Reduction
+                    </Typography>
+                    <Typography variant="body2" sx={{ mt: 1, opacity: 0.9 }}>
+                      Reduce marketing operation costs through automation
+                    </Typography>
+                  </Paper>
+                </Grid>
+                <Grid item xs={6}>
+                  <Paper 
+                    elevation={0}
+                    sx={{ 
+                      p: 3,
+                      height: '100%',
+                      bgcolor: 'rgba(255, 255, 255, 0.1)',
+                      color: 'white',
+                      textAlign: 'center',
+                      borderRadius: 2,
+                      backdropFilter: 'blur(8px)'
+                    }}
+                  >
+                    <Typography variant="h2" sx={{ fontWeight: 800, mb: 1 }}>
+                      3x
+                    </Typography>
+                    <Typography variant="h6">
+                      Performance Boost
+                    </Typography>
+                    <Typography variant="body2" sx={{ mt: 1, opacity: 0.9 }}>
+                      Improve campaign performance with AI optimization
+                    </Typography>
+                  </Paper>
+                </Grid>
+              </Grid>
+
+              <Button
+                variant="contained"
+                size="large"
+                onClick={() => setIsWaitlistOpen(true)}
                 sx={{ 
-                  p: 3,
-                  maxWidth: 500,
-                  bgcolor: 'background.paper',
-                  borderRadius: 2
+                  bgcolor: 'primary.main',
+                  color: 'white',
+                  px: 6,
+                  py: 2,
+                  fontSize: '1.2rem',
+                  fontWeight: 600,
+                  borderRadius: 2,
+                  boxShadow: '0 4px 14px rgba(0,0,0,0.2)',
+                  '&:hover': {
+                    bgcolor: 'primary.dark',
+                    boxShadow: '0 6px 20px rgba(0,0,0,0.25)',
+                    transform: 'translateY(-2px)'
+                  },
+                  transition: 'all 0.3s ease'
                 }}
               >
-                {submitted ? (
-                  <Alert severity="success" sx={{ mb: 2 }}>
-                    Thanks for joining our waitlist! We'll notify you when you're invited.
-                  </Alert>
-                ) : (
-                  <Box component="form" onSubmit={handleSubmit} onClick={() => setFormExpanded(true)} ref={formRef}>
-                    {error && (
-                      <Alert severity="error" sx={{ mb: 2 }}>
-                        {error}
-                      </Alert>
-                    )}
-                    <Typography variant="h6" gutterBottom color="text.primary">
-                      Join Waitlist
-                    </Typography>
-                    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                      <TextField
-                        required
-                        fullWidth
-                        type="email"
-                        placeholder="Enter your email"
-                        value={email}
-                        onChange={(e) => setEmail(e.target.value)}
-                        onFocus={() => setFormExpanded(true)}
-                        onClick={() => setFormExpanded(true)}
-                        onBlur={() => {
-                          if (!email && useCaseCategories.length === 0 && !useCaseDescription) {
-                            setFormExpanded(false);
-                          }
-                        }}
-                        sx={{ bgcolor: 'background.default' }}
-                        helperText={!formExpanded ? "Click to tell us about your use case" : ""}
-                      />
-                      
-                      <Box 
-                        sx={{ 
-                          height: formExpanded ? 'auto' : 0,
-                          overflow: 'hidden',
-                          transition: 'all 0.3s ease-in-out',
-                          opacity: formExpanded ? 1 : 0,
-                          display: 'flex',
-                          flexDirection: 'column',
-                          gap: 2
-                        }}
-                      >
-                        <Typography variant="subtitle2" color="text.secondary">
-                          How do you plan to use AgentWeb? (Select all that apply)
-                        </Typography>
-                        <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }} onClick={() => setFormExpanded(true)}>
-                          {['Data Entry', 'Web Scraping', 'Form Filling', 'Monitoring', 'Reporting', 'Customer Service', 'Other'].map((category) => (
-                            <Chip
-                              key={category}
-                              label={category}
-                              onClick={() => {
-                                if (useCaseCategories.includes(category)) {
-                                  setUseCaseCategories(useCaseCategories.filter(c => c !== category));
-                                } else {
-                                  setUseCaseCategories([...useCaseCategories, category]);
-                                }
-                              }}
-                              color={useCaseCategories.includes(category) ? "primary" : "default"}
-                              sx={{ 
-                                cursor: 'pointer',
-                                '&:hover': {
-                                  bgcolor: useCaseCategories.includes(category) ? 'primary.light' : 'action.hover'
-                                }
-                              }}
-                            />
-                          ))}
-                        </Box>
-                        
-                        <TextField
-                          fullWidth
-                          multiline
-                          rows={3}
-                          placeholder="Please describe your use case in more detail (helps us prioritize)"
-                          value={useCaseDescription}
-                          onChange={(e) => setUseCaseDescription(e.target.value)}
-                          onFocus={() => setFormExpanded(true)}
-                          onClick={() => setFormExpanded(true)}
-                          onBlur={() => {
-                            if (!email && useCaseCategories.length === 0 && !useCaseDescription) {
-                              setFormExpanded(false);
-                            }
-                          }}
-                          sx={{ bgcolor: 'background.default' }}
-                        />
-                      </Box>
-                      
-                      <Button
-                        type="submit"
-                        variant="contained"
-                        size="large"
-                        fullWidth
-                        onClick={() => setFormExpanded(true)}
-                        sx={{ 
-                          mt: 1,
-                          bgcolor: 'primary.main',
-                          '&:hover': {
-                            bgcolor: 'primary.dark'
-                          }
-                        }}
-                      >
-                        Join Now
-                      </Button>
-                    </Box>
-                  </Box>
-                )}
-              </Paper>
+                Click to Join Waitlist
+              </Button>
             </Grid>
             <Grid item xs={12} md={5} sx={{ display: { xs: 'none', md: 'block' } }}>
               <Box
@@ -364,83 +448,6 @@ export default function Home() {
         </Container>
       </Box>
 
-      <Container id="benefits" maxWidth="lg" sx={{ 
-        py: { xs: 8, sm: 12 },
-        px: { xs: 2, sm: 3 }
-      }}>
-        <Typography
-          variant="h3"
-          align="center"
-          sx={{ mb: 6, fontWeight: 700 }}
-        >
-          Why Choose AgentWeb?
-        </Typography>
-        <Grid container spacing={4} justifyContent="center">
-          <Grid item xs={12} md={6}>
-            <List>
-              <ListItem>
-                <ListItemIcon>
-                  <CheckIcon color="primary" />
-                </ListItemIcon>
-                <ListItemText 
-                  primary="State-of-the-Art AI" 
-                  secondary="Powered by Claude 3.7, GPT-4o, and Gemini 2.5 Pro with automatic fallback"
-                />
-              </ListItem>
-              <ListItem>
-                <ListItemIcon>
-                  <CheckIcon color="primary" />
-                </ListItemIcon>
-                <ListItemText 
-                  primary="Smart Workflows" 
-                  secondary="Create complex task chains with natural language and multiple output formats"
-                />
-              </ListItem>
-              <ListItem>
-                <ListItemIcon>
-                  <CheckIcon color="primary" />
-                </ListItemIcon>
-                <ListItemText 
-                  primary="Deep Research Capabilities" 
-                  secondary="Comprehensive research powered by AG2 multi-agent framework with citations"
-                />
-              </ListItem>
-            </List>
-          </Grid>
-          <Grid item xs={12} md={6}>
-            <List>
-              <ListItem>
-                <ListItemIcon>
-                  <CheckIcon color="primary" />
-                </ListItemIcon>
-                <ListItemText 
-                  primary="Enterprise Security" 
-                  secondary="AES256 encryption and isolated browser sessions with end-to-end protection"
-                />
-              </ListItem>
-              <ListItem>
-                <ListItemIcon>
-                  <CheckIcon color="primary" />
-                </ListItemIcon>
-                <ListItemText 
-                  primary="No-Code Integration" 
-                  secondary="Connect to external APIs and accounts without writing any code"
-                />
-              </ListItem>
-              <ListItem>
-                <ListItemIcon>
-                  <CheckIcon color="primary" />
-                </ListItemIcon>
-                <ListItemText 
-                  primary="Smart Templates" 
-                  secondary="Pre-configured templates with customizable parameters for quick automation"
-                />
-              </ListItem>
-            </List>
-          </Grid>
-        </Grid>
-      </Container>
-
       <Box id="features" sx={{ 
         bgcolor: 'grey.50', 
         py: { xs: 8, sm: 12 },
@@ -452,7 +459,7 @@ export default function Home() {
             align="center"
             sx={{ mb: 6, fontWeight: 700 }}
           >
-            Powerful Features
+            Key Features
           </Typography>
           <Grid container spacing={4} justifyContent="center">
             <Grid item xs={12} md={4}>
@@ -469,10 +476,10 @@ export default function Home() {
               >
                 <AutoGraphIcon sx={{ fontSize: 48, color: 'primary.main', mb: 2 }} />
                 <Typography variant="h5" gutterBottom fontWeight={600}>
-                  Advanced AI Models
+                  Market Research
                 </Typography>
                 <Typography variant="body1" color="text.secondary">
-                  Powered by Claude 3.7, GPT-4o, and Gemini 2.5 Pro, with automatic fallback for reliability.
+                  Automated competitor analysis, creative strategy research, and omni-channel social listening.
                 </Typography>
               </Paper>
             </Grid>
@@ -490,10 +497,10 @@ export default function Home() {
               >
                 <BoltIcon sx={{ fontSize: 48, color: 'primary.main', mb: 2 }} />
                 <Typography variant="h5" gutterBottom fontWeight={600}>
-                  Smart Workflows
+                  Campaign Builder
                 </Typography>
                 <Typography variant="body1" color="text.secondary">
-                  Create complex task chains with natural language, support for file attachments, and multiple output formats including CSV, JSON, and HTML.
+                  One-click campaign setup with automated audience targeting and budget optimization.
                 </Typography>
               </Paper>
             </Grid>
@@ -511,10 +518,10 @@ export default function Home() {
               >
                 <SecurityIcon sx={{ fontSize: 48, color: 'primary.main', mb: 2 }} />
                 <Typography variant="h5" gutterBottom fontWeight={600}>
-                  Enterprise Security
+                  KPI Tracker
                 </Typography>
                 <Typography variant="body1" color="text.secondary">
-                  AES256 encryption for all stored credentials and isolated browser sessions with end-to-end encryption.
+                  Real-time performance monitoring with automated alerts and centralized dashboard.
                 </Typography>
               </Paper>
             </Grid>
@@ -532,10 +539,10 @@ export default function Home() {
               >
                 <SmartToyIcon sx={{ fontSize: 48, color: 'primary.main', mb: 2 }} />
                 <Typography variant="h5" gutterBottom fontWeight={600}>
-                  Deep Research Mode
+                  AI Playbooks
                 </Typography>
                 <Typography variant="body1" color="text.secondary">
-                  Comprehensive research powered by AG2 (AutoGen) multi-agent framework with detailed reports and citations.
+                  Expert-built marketing workflows with task-specific AI optimization.
                 </Typography>
               </Paper>
             </Grid>
@@ -553,10 +560,10 @@ export default function Home() {
               >
                 <IntegrationIcon sx={{ fontSize: 48, color: 'primary.main', mb: 2 }} />
                 <Typography variant="h5" gutterBottom fontWeight={600}>
-                  No-Code API/Account Integration
+                  Platform Integration
                 </Typography>
                 <Typography variant="body1" color="text.secondary">
-                  Connect to external APIs and accounts without coding, with secure credential management, documentation integration, and GitHub code management.
+                  Connect with major marketing platforms and tools without coding.
                 </Typography>
               </Paper>
             </Grid>
@@ -577,7 +584,7 @@ export default function Home() {
                   Smart Templates
                 </Typography>
                 <Typography variant="body1" color="text.secondary">
-                  Pre-configured task templates with customizable parameters, complex task support, and automatic parameter-based task naming.
+                  Pre-configured marketing workflows with customizable parameters.
                 </Typography>
               </Paper>
             </Grid>
@@ -594,66 +601,66 @@ export default function Home() {
           align="center"
           sx={{ mb: 6, fontWeight: 700 }}
         >
-          What You Can Automate
+          Marketing Automation Use Cases
         </Typography>
         <Grid container spacing={4} justifyContent="center">
           <Grid item xs={12} md={6} lg={4}>
             <Paper sx={{ p: 3 }}>
               <Typography variant="h6" gutterBottom color="primary">
-                Web Research & Analysis
+                Competitor Analysis
               </Typography>
               <Typography variant="body1" paragraph>
-                Comprehensive research using AG2 multi-agent framework with detailed reports and citations.
+                Automated research on competitor strategies, creative approaches, and market positioning.
               </Typography>
             </Paper>
           </Grid>
           <Grid item xs={12} md={6} lg={4}>
             <Paper sx={{ p: 3 }}>
               <Typography variant="h6" gutterBottom color="primary">
-                Data Collection & Processing
+                Campaign Setup
               </Typography>
               <Typography variant="body1" paragraph>
-                Extract and process data from websites with support for CSV, JSON, and HTML outputs.
+                One-click campaign creation with optimized targeting and budget allocation.
               </Typography>
             </Paper>
           </Grid>
           <Grid item xs={12} md={6} lg={4}>
             <Paper sx={{ p: 3 }}>
               <Typography variant="h6" gutterBottom color="primary">
-                API & Account Integration
+                Performance Tracking
               </Typography>
               <Typography variant="body1" paragraph>
-                Connect and automate any external services without coding.
+                Real-time KPI monitoring with automated alerts and reporting.
               </Typography>
             </Paper>
           </Grid>
           <Grid item xs={12} md={6} lg={4}>
             <Paper sx={{ p: 3 }}>
               <Typography variant="h6" gutterBottom color="primary">
-                Complex Workflows
+                Social Listening
               </Typography>
               <Typography variant="body1" paragraph>
-                Create multi-step automation chains with natural language and file attachments.
+                Automated monitoring of brand mentions and industry trends across platforms.
               </Typography>
             </Paper>
           </Grid>
           <Grid item xs={12} md={6} lg={4}>
             <Paper sx={{ p: 3 }}>
               <Typography variant="h6" gutterBottom color="primary">
-                Form & Data Entry
+                Creative Research
               </Typography>
               <Typography variant="body1" paragraph>
-                Automate form filling and data entry with high accuracy and validation.
+                AI-powered analysis of creative strategies and content performance.
               </Typography>
             </Paper>
           </Grid>
           <Grid item xs={12} md={6} lg={4}>
             <Paper sx={{ p: 3 }}>
               <Typography variant="h6" gutterBottom color="primary">
-                Monitoring & Reporting
+                Budget Optimization
               </Typography>
               <Typography variant="body1" paragraph>
-                Track changes and generate automated reports with customizable templates.
+                Automated budget allocation and performance-based adjustments.
               </Typography>
             </Paper>
           </Grid>
@@ -661,7 +668,7 @@ export default function Home() {
       </Container>
 
       {/* Partners Section */}
-      <Box sx={{ 
+      <Box id="partners" sx={{ 
         bgcolor: 'grey.50', 
         py: { xs: 8, sm: 12 },
         width: '100%'
@@ -958,19 +965,7 @@ export default function Home() {
           <Button
             variant="contained"
             size="large"
-            onClick={() => {
-              const heroSection = document.getElementById('hero');
-              if (heroSection) {
-                heroSection.scrollIntoView({ behavior: 'smooth' });
-                // Focus the email input after scrolling
-                setTimeout(() => {
-                  const emailInput = document.querySelector('input[type="email"]') as HTMLInputElement;
-                  if (emailInput) {
-                    emailInput.focus();
-                  }
-                }, 800); // Wait for scroll animation
-              }
-            }}
+            onClick={() => setIsWaitlistOpen(true)}
             sx={{ 
               bgcolor: 'white',
               color: 'primary.main',
@@ -985,6 +980,156 @@ export default function Home() {
             Join the Waitlist Now
           </Button>
         </Container>
+      </Box>
+
+      <Box
+        id="waitlist-section"
+        sx={{
+          position: 'fixed',
+          bottom: 0,
+          left: 0,
+          right: 0,
+          bgcolor: 'background.paper',
+          boxShadow: '0 -2px 10px rgba(0,0,0,0.1)',
+          zIndex: 1000,
+          transition: 'transform 0.3s ease-in-out',
+          transform: isWaitlistOpen ? 'translateY(0)' : 'translateY(100%)'
+        }}
+      >
+        <Box sx={{ maxWidth: 1200, mx: 'auto', p: 3 }}>
+          <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+            <Typography variant="h6" sx={{ fontWeight: 'bold' }}>
+              Join the Waitlist
+            </Typography>
+            <IconButton onClick={() => setIsWaitlistOpen(false)}>
+              <CloseIcon />
+            </IconButton>
+          </Box>
+          {submitted ? (
+            <Alert severity="success" sx={{ mb: 2 }}>
+              Thanks for joining our waitlist! We'll notify you when you're invited.
+            </Alert>
+          ) : (
+            <form onSubmit={handleSubmit}>
+              {error && (
+                <Alert severity="error" sx={{ mb: 2 }}>
+                  {error}
+                </Alert>
+              )}
+              <Grid container spacing={2}>
+                <Grid item xs={12} sm={6}>
+                  <TextField
+                    fullWidth
+                    required
+                    label="Full Name"
+                    value={fullName}
+                    onChange={(e) => setFullName(e.target.value)}
+                    variant="outlined"
+                  />
+                </Grid>
+                <Grid item xs={12} sm={6}>
+                  <TextField
+                    fullWidth
+                    label="Phone Number (Optional)"
+                    value={phoneNumber}
+                    onChange={(e) => setPhoneNumber(e.target.value)}
+                    variant="outlined"
+                  />
+                </Grid>
+                <Grid item xs={12} sm={6}>
+                  <TextField
+                    fullWidth
+                    required
+                    label="Company Name"
+                    value={companyName}
+                    onChange={(e) => setCompanyName(e.target.value)}
+                    variant="outlined"
+                  />
+                </Grid>
+                <Grid item xs={12} sm={6}>
+                  <TextField
+                    fullWidth
+                    required
+                    label="Email"
+                    type="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    variant="outlined"
+                  />
+                </Grid>
+                <Grid item xs={12}>
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={requestReport}
+                        onChange={(e) => setRequestReport(e.target.checked)}
+                      />
+                    }
+                    label="Request a competition landscape report for my company (FREE)"
+                  />
+                </Grid>
+                <Grid item xs={12}>
+                  <Typography variant="subtitle2" color="text.secondary" sx={{ mb: 1 }}>
+                    How do you plan to use AgentWeb? (Select all that apply)
+                  </Typography>
+                  <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
+                    {[
+                      'Market Research',
+                      'Campaign Management',
+                      'Performance Tracking',
+                      'Social Media Management',
+                      'Competitor Analysis',
+                      'Budget Optimization',
+                      'Other'
+                    ].map((category) => (
+                      <Chip
+                        key={category}
+                        label={category}
+                        onClick={() => {
+                          if (useCaseCategories.includes(category)) {
+                            setUseCaseCategories(useCaseCategories.filter(c => c !== category));
+                          } else {
+                            setUseCaseCategories([...useCaseCategories, category]);
+                          }
+                        }}
+                        color={useCaseCategories.includes(category) ? "primary" : "default"}
+                        sx={{ 
+                          cursor: 'pointer',
+                          '&:hover': {
+                            bgcolor: useCaseCategories.includes(category) ? 'primary.light' : 'action.hover'
+                          }
+                        }}
+                      />
+                    ))}
+                  </Box>
+                </Grid>
+                <Grid item xs={12}>
+                  <TextField
+                    fullWidth
+                    multiline
+                    rows={3}
+                    label="Please describe your use case in more detail (helps us prioritize)"
+                    value={useCaseDescription}
+                    onChange={(e) => setUseCaseDescription(e.target.value)}
+                    variant="outlined"
+                  />
+                </Grid>
+                <Grid item xs={12}>
+                  <Button
+                    type="submit"
+                    variant="contained"
+                    color="primary"
+                    size="large"
+                    fullWidth
+                    disabled={isSubmitting}
+                  >
+                    {isSubmitting ? 'Submitting...' : 'Join Waitlist'}
+                  </Button>
+                </Grid>
+              </Grid>
+            </form>
+          )}
+        </Box>
       </Box>
     </Box>
   );

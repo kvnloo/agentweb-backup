@@ -519,6 +519,9 @@ export default function AdminDashboard() {
               <TableHead>
                 <TableRow>
                   <TableCell>Email</TableCell>
+                  <TableCell>Full Name</TableCell>
+                  <TableCell>Company Name</TableCell>
+                  <TableCell>Phone Number</TableCell>
                   <TableCell>
                     <Box
                       sx={{
@@ -536,6 +539,7 @@ export default function AdminDashboard() {
                   </TableCell>
                   <TableCell>Use Cases</TableCell>
                   <TableCell>Use Case Description</TableCell>
+                  <TableCell>Request Report</TableCell>
                   <TableCell>Status</TableCell>
                   <TableCell>Actions</TableCell>
                 </TableRow>
@@ -543,7 +547,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={6} align="center">
+                    <TableCell colSpan={10} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -553,6 +557,9 @@ export default function AdminDashboard() {
                     return (
                       <TableRow key={entry.email}>
                         <TableCell>{entry.email}</TableCell>
+                        <TableCell>{entry.fullName || '-'}</TableCell>
+                        <TableCell>{entry.companyName || '-'}</TableCell>
+                        <TableCell>{entry.phoneNumber || '-'}</TableCell>
                         <TableCell>{new Date(entry.joinedAt).toLocaleDateString()}</TableCell>
                         <TableCell>
                           {entry.useCaseCategories && entry.useCaseCategories.length > 0 ? (
@@ -598,43 +605,45 @@ export default function AdminDashboard() {
                                   fontSize="small" 
                                   color="action" 
                                   sx={{ 
-                                    opacity: 0.6, 
-                                    fontSize: '0.875rem',
+                                    opacity: 0.7,
                                     '&:hover': { opacity: 1 }
-                                  }} 
+                                  }}
                                 />
                               </Box>
                             </Tooltip>
                           ) : (
                             <Typography variant="body2" color="text.secondary">
-                              Not provided
+                              Not specified
                             </Typography>
                           )}
                         </TableCell>
                         <TableCell>
-                          {userExists ? (
-                            <Chip label="Registered" color="success" />
-                          ) : (
-                            entry.status
-                          )}
+                          <Chip 
+                            label={entry.requestReport ? 'Yes' : 'No'} 
+                            size="small"
+                            color={entry.requestReport ? 'primary' : 'default'}
+                          />
                         </TableCell>
                         <TableCell>
-                          {!userExists && entry.status === 'pending' && (
-                            <Button
-                              variant="contained"
-                              color="primary"
-                              onClick={() => handleWaitlistAction(entry.email, 'invited')}
-                            >
-                              Invite
-                            </Button>
-                          )}
-                          {!userExists && entry.status === 'invited' && (
+                          <Chip 
+                            label={entry.status || 'pending'} 
+                            color={
+                              entry.status === 'invited' ? 'success' : 
+                              entry.status === 'rejected' ? 'error' : 
+                              'default'
+                            }
+                            size="small"
+                          />
+                        </TableCell>
+                        <TableCell>
+                          {!userExists && (
                             <Button
                               variant="outlined"
-                              color="secondary"
-                              onClick={() => handleWaitlistAction(entry.email, 'pending')}
+                              size="small"
+                              onClick={() => handleWaitlistAction(entry.email, 'invited')}
+                              disabled={entry.status === 'invited'}
                             >
-                              Revoke
+                              Invite
                             </Button>
                           )}
                         </TableCell>
