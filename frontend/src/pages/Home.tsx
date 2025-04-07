@@ -15,6 +15,13 @@ import {
   Checkbox,
   FormControlLabel,
   IconButton,
+  Drawer,
+  List,
+  ListItem,
+  ListItemText,
+  Divider,
+  useMediaQuery,
+  useTheme
 } from '@mui/material';
 import { Link as RouterLink, useLocation } from 'react-router-dom';
 import {
@@ -25,6 +32,7 @@ import {
   SmartToy as SmartToyIcon,
   Category as CategoryIcon,
   Close as CloseIcon,
+  Menu as MenuIcon,
 } from '@mui/icons-material';
 import axios from 'axios';
 import { buildApiUrl } from '../config';
@@ -42,6 +50,9 @@ import React from 'react';
 
 export default function Home() {
   const location = useLocation();
+  const theme = useTheme();
+  const isMobile = useMediaQuery(theme.breakpoints.down('md'));
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [email, setEmail] = useState('');
   const [fullName, setFullName] = useState('');
   const [phoneNumber, setPhoneNumber] = useState('');
@@ -170,43 +181,126 @@ export default function Home() {
                 </Box>
               </Link>
             </Typography>
-            <Stack
-              direction="row"
-              spacing={3}
-              alignItems="center"
-            >
-              <Button
-                color="primary"
-                onClick={() => scrollToSection('features')}
+            
+            {isMobile ? (
+              <IconButton
+                edge="end"
+                color="inherit"
+                aria-label="menu"
+                onClick={() => setMobileMenuOpen(true)}
+                sx={{ ml: 2 }}
               >
-                Features
-              </Button>
-              <Button
-                color="primary"
-                onClick={() => scrollToSection('use-cases')}
+                <MenuIcon />
+              </IconButton>
+            ) : (
+              <Stack
+                direction="row"
+                spacing={3}
+                alignItems="center"
               >
-                Use Cases
-              </Button>
-              <Button
-                color="primary"
-                onClick={() => scrollToSection('partners')}
-              >
-                Customers & Partners
-              </Button>
-              <Button
-                variant="contained"
-                onClick={() => setIsWaitlistOpen(true)}
-                sx={{ 
-                  boxShadow: 'none',
-                  '&:hover': { boxShadow: 'none' }
-                }}
-              >
-                Join Waitlist
-              </Button>
-            </Stack>
+                <Button
+                  color="primary"
+                  onClick={() => scrollToSection('features')}
+                >
+                  Features
+                </Button>
+                <Button
+                  color="primary"
+                  onClick={() => scrollToSection('use-cases')}
+                >
+                  Use Cases
+                </Button>
+                <Button
+                  color="primary"
+                  onClick={() => scrollToSection('partners')}
+                >
+                  Customers & Partners
+                </Button>
+                <Button
+                  variant="contained"
+                  onClick={() => setIsWaitlistOpen(true)}
+                  sx={{ 
+                    boxShadow: 'none',
+                    '&:hover': { boxShadow: 'none' }
+                  }}
+                >
+                  Join Waitlist
+                </Button>
+              </Stack>
+            )}
           </Toolbar>
         </Container>
       </Box>
+
+      <Drawer
+        anchor="right"
+        open={mobileMenuOpen}
+        onClose={() => setMobileMenuOpen(false)}
+        sx={{
+          '& .MuiDrawer-paper': {
+            width: 250,
+            boxSizing: 'border-box',
+            backgroundColor: theme.palette.background.paper,
+          },
+        }}
+      >
+        <Box sx={{ width: 250, pt: 2 }}>
+          <List>
+            <ListItem>
+              <Button 
+                onClick={() => {
+                  scrollToSection('features');
+                  setMobileMenuOpen(false);
+                }}
+                color="inherit"
+                fullWidth
+                sx={{ justifyContent: 'flex-start' }}
+              >
+                Features
+              </Button>
+            </ListItem>
+            <ListItem>
+              <Button 
+                onClick={() => {
+                  scrollToSection('use-cases');
+                  setMobileMenuOpen(false);
+                }}
+                color="inherit"
+                fullWidth
+                sx={{ justifyContent: 'flex-start' }}
+              >
+                Use Cases
+              </Button>
+            </ListItem>
+            <ListItem>
+              <Button 
+                onClick={() => {
+                  scrollToSection('partners');
+                  setMobileMenuOpen(false);
+                }}
+                color="inherit"
+                fullWidth
+                sx={{ justifyContent: 'flex-start' }}
+              >
+                Customers & Partners
+              </Button>
+            </ListItem>
+            <ListItem>
+              <Button 
+                onClick={() => {
+                  setIsWaitlistOpen(true);
+                  setMobileMenuOpen(false);
+                }}
+                variant="contained"
+                fullWidth
+                sx={{ justifyContent: 'flex-start' }}
+              >
+                Join Waitlist
+              </Button>
+            </ListItem>
+          </List>
+        </Box>
+      </Drawer>
 
       <Box sx={{ height: '32px' }} />
 
