@@ -4,6 +4,9 @@ import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { taskDb, subscriberDb } from '../services/db';
 import multer from 'multer';
 import { RequestHandler as ExpressRequestHandler } from 'express-serve-static-core';
+import { isAdmin } from '../middleware/admin';
+import { userDb } from '../services/db';
+import { emailService } from '../services/emailService';
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -121,5 +124,91 @@ router.delete('/:taskId/attachments/:key', authenticateToken, (async (req: Authe
     res.status(500).json({ error: 'Failed to delete attachment' });
   }
 }) as unknown as RequestHandler);
+
+// Change task owner
+router.put('/:id/owner', isAdmin, async (req: Request, res: Response) => {
+  try {
+    const { newOwnerEmail } = req.body;
+    const taskId = req.params.id;
+    const currentUserId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!newOwnerEmail) {
+      return res.status(400).json({ message: 'New owner email is required' });
+    }
+
+    // Get the task
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Get the new owner
+    const newOwner = await userDb.getUserByEmail(newOwnerEmail);
+    if (!newOwner) {
+      return res.status(404).json({ message: 'New owner not found' });
+    }
+
+    // Get the current owner
+    const currentOwner = await userDb.getUserById(task.userId);
+    if (!currentOwner) {
+      return res.status(404).json({ message: 'Current owner not found' });
+    }
+
+    // Check if new owner is the same as current owner
+    if (currentOwner.email === newOwnerEmail) {
+      return res.status(400).json({ message: 'Cannot change ownership to the same owner' });
+    }
+
+    // Get the admin who made the change
+    const adminUser = await userDb.getUserById(currentUserId);
+    if (!adminUser) {
+      return res.status(404).json({ message: 'Admin user not found' });
+    }
+
+    // Update task owner
+    await taskDb.updateTaskOwner(taskId, newOwner.userId);
+
+    // Send email notifications
+    const siteDomain = process.env.FRONTEND_URL || 'https://agentweb.pro';
+    
+    // Send to admin with both users CCed
+    await emailService.sendTaskOwnershipChangeEmail(
+      process.env.ADMIN_EMAIL || '',
+      task.name,
+      taskId,
+      currentOwner.email,
+      newOwnerEmail,
+      adminUser.email,
+      siteDomain
+    );
+
+    // Send to old owner
+    await emailService.sendTaskOwnershipChangeEmail(
+      currentOwner.email,
+      task.name,
+      taskId,
+      currentOwner.email,
+      newOwnerEmail,
+      adminUser.email,
+      siteDomain
+    );
+
+    // Send to new owner
+    await emailService.sendTaskOwnershipChangeEmail(
+      newOwnerEmail,
+      task.name,
+      taskId,
+      currentOwner.email,
+      newOwnerEmail,
+      adminUser.email,
+      siteDomain
+    );
+
+    res.json({ message: 'Task ownership updated successfully' });
+  } catch (error) {
+    console.error('Error changing task owner:', error);
+    res.status(500).json({ message: 'Error changing task owner' });
+  }
+});
 
 export default router; 

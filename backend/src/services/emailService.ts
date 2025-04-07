@@ -70,5 +70,49 @@ export const emailService = {
       console.error('Error sending invitation email:', error);
       throw error;
     }
+  },
+
+  async sendTaskOwnershipChangeEmail(
+    recipientEmail: string,
+    taskName: string,
+    taskId: string,
+    oldOwnerEmail: string,
+    newOwnerEmail: string,
+    changedByEmail: string,
+    siteDomain: string
+  ) {
+    const subject = 'Task Ownership Change Notification';
+    const taskUrl = `${siteDomain}/tasks/${taskId}`;
+    
+    const text = `Task Ownership Change\n\n` +
+      `The ownership of task "${taskName}" has been changed.\n\n` +
+      `Previous Owner: ${oldOwnerEmail}\n` +
+      `New Owner: ${newOwnerEmail}\n` +
+      `Changed By: ${changedByEmail}\n\n` +
+      `View task details: ${taskUrl}\n\n` +
+      `Best regards,\nAgentWeb Team`;
+
+    const html = `
+      <h2>Task Ownership Change</h2>
+      <p>The ownership of task "${taskName}" has been changed.</p>
+      <table style="border-collapse: collapse; margin: 10px 0;">
+        <tr>
+          <td style="padding: 5px; border: 1px solid #ddd;"><strong>Previous Owner:</strong></td>
+          <td style="padding: 5px; border: 1px solid #ddd;">${oldOwnerEmail}</td>
+        </tr>
+        <tr>
+          <td style="padding: 5px; border: 1px solid #ddd;"><strong>New Owner:</strong></td>
+          <td style="padding: 5px; border: 1px solid #ddd;">${newOwnerEmail}</td>
+        </tr>
+        <tr>
+          <td style="padding: 5px; border: 1px solid #ddd;"><strong>Changed By:</strong></td>
+          <td style="padding: 5px; border: 1px solid #ddd;">${changedByEmail}</td>
+        </tr>
+      </table>
+      <p>You can view the task details <a href="${taskUrl}">here</a>.</p>
+      <p>Best regards,<br>AgentWeb Team</p>
+    `;
+
+    await this.sendEmail(recipientEmail, subject, text, html);
   }
 }; 
