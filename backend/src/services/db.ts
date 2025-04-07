@@ -710,6 +710,38 @@ export const taskDb = {
 
     const result = await dynamodb.update(params).promise();
     return result.Attributes;
+  },
+
+  async archiveExecution(taskId: string, executionId: string) {
+    const params = {
+      TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
+      Key: {
+        executionId
+      },
+      UpdateExpression: 'SET archived = :archived, archivedAt = :archivedAt',
+      ExpressionAttributeValues: {
+        ':archived': true,
+        ':archivedAt': new Date().toISOString()
+      },
+      ReturnValues: 'ALL_NEW'
+    };
+
+    const result = await dynamodb.update(params).promise();
+    return result.Attributes;
+  },
+
+  async unarchiveExecution(taskId: string, executionId: string) {
+    const params = {
+      TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
+      Key: {
+        executionId
+      },
+      UpdateExpression: 'REMOVE archived, archivedAt',
+      ReturnValues: 'ALL_NEW'
+    };
+
+    const result = await dynamodb.update(params).promise();
+    return result.Attributes;
   }
 };
 

@@ -211,4 +211,64 @@ router.put('/:id/owner', isAdmin, async (req: Request, res: Response) => {
   }
 });
 
+// Archive execution
+router.put('/:taskId/executions/:executionId/archive', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { taskId, executionId } = req.params;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Get the task to check ownership
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Check if user is owner or admin
+    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+      return res.status(403).json({ message: 'Not authorized to modify this task' });
+    }
+
+    // Archive the execution
+    const updatedExecution = await taskDb.archiveExecution(taskId, executionId);
+    res.json(updatedExecution);
+  } catch (error) {
+    console.error('Error archiving execution:', error);
+    res.status(500).json({ message: 'Error archiving execution' });
+  }
+});
+
+// Unarchive execution
+router.put('/:taskId/executions/:executionId/unarchive', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { taskId, executionId } = req.params;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Get the task to check ownership
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Check if user is owner or admin
+    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+      return res.status(403).json({ message: 'Not authorized to modify this task' });
+    }
+
+    // Unarchive the execution
+    const updatedExecution = await taskDb.unarchiveExecution(taskId, executionId);
+    res.json(updatedExecution);
+  } catch (error) {
+    console.error('Error unarchiving execution:', error);
+    res.status(500).json({ message: 'Error unarchiving execution' });
+  }
+});
+
 export default router; 

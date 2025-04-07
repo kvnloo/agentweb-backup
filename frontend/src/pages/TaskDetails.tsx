@@ -107,6 +107,7 @@ interface TaskExecution {
     token: string;
     is_html?: boolean;
   }[];
+  archived: boolean;
 }
 
 interface Subscriber {
@@ -1504,7 +1505,7 @@ export default function TaskDetails() {
                   </TableRow>
                 </TableHead>
                 <TableBody>
-                  {executions.map((execution) => (
+                  {executions.filter(execution => !execution.archived).map((execution) => (
                     <TableRow key={execution.executionId}>
                       <TableCell>
                         <Chip

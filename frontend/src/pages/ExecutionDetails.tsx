@@ -26,6 +26,8 @@ import ThumbDownIcon from '@mui/icons-material/ThumbDown';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
 import ShareIcon from '@mui/icons-material/Share';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
+import ArchiveIcon from '@mui/icons-material/Archive';
+import UnarchiveIcon from '@mui/icons-material/Unarchive';
 import { useAuth } from '../contexts/AuthContext';
 import axios from 'axios';
 import { buildApiUrl } from '../config';
@@ -52,6 +54,8 @@ interface TaskExecution {
     is_html?: boolean;
   }[];
   llmName?: string;
+  archived?: boolean;
+  archivedAt?: string;
 }
 
 interface UserInteraction {
@@ -68,13 +72,15 @@ export default function ExecutionDetails() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const { executionId, taskId } = useParams<{ executionId: string; taskId: string }>();
-  const { token } = useAuth();
+  const { token, user } = useAuth();
   const navigate = useNavigate();
   const [shareDialogOpen, setShareDialogOpen] = useState(false);
   const [shareUrl, setShareUrl] = useState('');
   const [shareLoading, setShareLoading] = useState(false);
   const [shareError, setShareError] = useState('');
   const [copySuccess, setCopySuccess] = useState(false);
+  const [archiveDialogOpen, setArchiveDialogOpen] = useState(false);
+  const [archiveAction, setArchiveAction] = useState<'archive' | 'unarchive'>('archive');
 
   useEffect(() => {
     const fetchExecution = async () => {
@@ -172,6 +178,29 @@ export default function ExecutionDetails() {
     );
   };
 
+  const handleArchiveToggle = async () => {
+    if (!taskId || !executionId) return;
+    
+    try {
+      await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}/executions/${executionId}/${archiveAction}`),
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      
+      // Refresh execution data
+      const response = await axios.get(
+        buildApiUrl(`/api/tasks/${taskId}/executions/${executionId}`),
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setExecution(response.data);
+      setArchiveDialogOpen(false);
+    } catch (error: any) {
+      console.error('Error toggling archive status:', error);
+      setError(error.response?.data?.message || 'Failed to update archive status');
+    }
+  };
+
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
@@ -228,8 +257,28 @@ export default function ExecutionDetails() {
                     variant="outlined"
                   />
                 )}
+                {execution.archived && (
+                  <Chip
+                    label="Archived"
+                    color="default"
+                    variant="outlined"
+                    sx={{ ml: 2 }}
+                  />
+                )}
               </Box>
               <Box sx={{ display: 'flex', gap: 1 }}>
+                {user?.userId === execution.userId && (
+                  <Tooltip title={execution.archived ? "Unarchive execution" : "Archive execution"}>
+                    <IconButton
+                      onClick={() => {
+                        setArchiveAction(execution.archived ? 'unarchive' : 'archive');
+                        setArchiveDialogOpen(true);
+                      }}
+                    >
+                      {execution.archived ? <UnarchiveIcon /> : <ArchiveIcon />}
+                    </IconButton>
+                  </Tooltip>
+                )}
                 <Tooltip title="Share execution details">
                   <IconButton
                     onClick={handleShareClick}
@@ -266,6 +315,11 @@ export default function ExecutionDetails() {
             {execution.completedAt && (
               <Typography variant="body1" sx={{ mb: 1 }}>
                 <strong>Completed:</strong> {new Date(execution.completedAt).toLocaleString()}
+              </Typography>
+            )}
+            {execution.archivedAt && (
+              <Typography variant="body1" sx={{ mb: 1 }}>
+                <strong>Archived:</strong> {new Date(execution.archivedAt).toLocaleString()}
               </Typography>
             )}
           </Grid>
@@ -500,6 +554,33 @@ export default function ExecutionDetails() {
         onClose={() => setCopySuccess(false)}
         message="Share URL copied to clipboard"
       />
+
+      {/* Archive Confirmation Dialog */}
+      <Dialog
+        open={archiveDialogOpen}
+        onClose={() => setArchiveDialogOpen(false)}
+      >
+        <DialogTitle>
+          {archiveAction === 'archive' ? 'Archive Execution' : 'Unarchive Execution'}
+        </DialogTitle>
+        <DialogContent>
+          <Typography>
+            {archiveAction === 'archive'
+              ? 'Are you sure you want to archive this execution? Archived executions will not appear in the task details page.'
+              : 'Are you sure you want to unarchive this execution? The execution will be visible again in the task details page.'}
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setArchiveDialogOpen(false)}>Cancel</Button>
+          <Button
+            variant="contained"
+            color="primary"
+            onClick={handleArchiveToggle}
+          >
+            {archiveAction === 'archive' ? 'Archive' : 'Unarchive'}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Container>
   );
 } 
