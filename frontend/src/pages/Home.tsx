@@ -18,8 +18,6 @@ import {
   Drawer,
   List,
   ListItem,
-  ListItemText,
-  Divider,
   useMediaQuery,
   useTheme
 } from '@mui/material';
