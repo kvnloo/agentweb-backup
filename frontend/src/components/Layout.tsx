@@ -73,10 +73,24 @@ export default function Layout() {
                 flexGrow: 0, 
                 mr: 1,
                 fontWeight: 600,
-                fontSize: { xs: '1.25rem', sm: '1.5rem' }
+                fontSize: { xs: '1.25rem', sm: '1.5rem' },
+                display: 'flex',
+                alignItems: 'center',
+                gap: 1
               }}
             >
               AgentWeb
+              <Typography
+                component="span"
+                sx={{
+                  fontSize: '0.9rem',
+                  fontWeight: 500,
+                  opacity: 0.9,
+                  display: { xs: 'none', sm: 'block' }
+                }}
+              >
+                Your Marketing Operator
+              </Typography>
             </Typography>
             <Chip
               label="BETA"
