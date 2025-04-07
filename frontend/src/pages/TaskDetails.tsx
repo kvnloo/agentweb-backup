@@ -725,7 +725,9 @@ export default function TaskDetails() {
 
   const getLatestExecution = () => {
     if (executions.length === 0) return null;
-    return executions.reduce((latest, current) => {
+    const nonArchivedExecutions = executions.filter(execution => !execution.archived);
+    if (nonArchivedExecutions.length === 0) return null;
+    return nonArchivedExecutions.reduce((latest, current) => {
       return new Date(current.startTime) > new Date(latest.startTime) ? current : latest;
     });
   };

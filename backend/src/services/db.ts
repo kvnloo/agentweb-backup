@@ -346,7 +346,9 @@ export const taskDb = {
           subscriberDb.getTaskSubscribers(task.taskId)
         ]);
         
-        const latestExecution = executions && executions.length > 0 ? executions[0] : null;
+        // Filter out archived executions and get the latest one
+        const nonArchivedExecutions = executions?.filter(exec => !exec.archived) || [];
+        const latestExecution = nonArchivedExecutions.length > 0 ? nonArchivedExecutions[0] : null;
         
         return {
           ...task,
