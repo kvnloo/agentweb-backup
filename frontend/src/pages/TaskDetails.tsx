@@ -30,6 +30,10 @@ import {
   MenuItem,
   FormControl,
   InputLabel,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
 } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import ArchiveIcon from '@mui/icons-material/Archive';
@@ -41,6 +45,7 @@ import EditIcon from '@mui/icons-material/Edit';
 import SaveIcon from '@mui/icons-material/Save';
 import CancelIcon from '@mui/icons-material/Cancel';
 import ScreenshotIcon from '@mui/icons-material/Screenshot';
+import PersonAddIcon from '@mui/icons-material/PersonAdd';
 import { styled } from '@mui/material/styles';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
@@ -355,6 +360,10 @@ export default function TaskDetails() {
   const [isUploading, setIsUploading] = useState(false);
   const [shouldPoll, setShouldPoll] = useState(true);
   const [success, setSuccess] = useState('');
+  const [ownerChangeDialogOpen, setOwnerChangeDialogOpen] = useState(false);
+  const [newOwnerEmail, setNewOwnerEmail] = useState('');
+  const [ownerChangeError, setOwnerChangeError] = useState('');
+  const [ownerChangeSuccess, setOwnerChangeSuccess] = useState('');
 
   const isAdminRoute = location.pathname.startsWith('/admin/');
   const showActions = !isAdminRoute || (task && user && task.userId === user.userId);
@@ -972,6 +981,29 @@ export default function TaskDetails() {
     }
   };
 
+  const handleOwnerChange = async () => {
+    if (!newOwnerEmail.trim()) {
+      setOwnerChangeError('Please enter an email address');
+      return;
+    }
+
+    try {
+      await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}/owner`),
+        { newOwnerEmail: newOwnerEmail.trim() },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      
+      setOwnerChangeSuccess('Task ownership updated successfully');
+      setNewOwnerEmail('');
+      setOwnerChangeDialogOpen(false);
+      await fetchTask(); // Refresh task data
+    } catch (error: any) {
+      console.error('Error changing task owner:', error);
+      setOwnerChangeError(error.response?.data?.message || 'Failed to change task owner');
+    }
+  };
+
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
@@ -1019,6 +1051,114 @@ export default function TaskDetails() {
             You are viewing another user's task as an administrator.
           </Alert>
         )}
+
+        {/* Task header with owner change button */}
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 3 }}>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+            {isEditingName ? (
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                <TextField
+                  value={editedName}
+                  onChange={(e) => setEditedName(e.target.value)}
+                  variant="outlined"
+                  size="small"
+                  autoFocus
+                  sx={{ minWidth: '300px' }}
+                />
+                <IconButton
+                  onClick={handleNameEdit}
+                  size="small"
+                  color="primary"
+                  disabled={!editedName.trim() || editedName === task?.name}
+                >
+                  <SaveIcon />
+                </IconButton>
+                <IconButton
+                  onClick={cancelEditingName}
+                  size="small"
+                >
+                  <CancelIcon />
+                </IconButton>
+              </Box>
+            ) : (
+              <>
+                <Typography variant="h4" component="h1">
+                  {task.name}
+                </Typography>
+                {showActions && (
+                  <Tooltip title="Edit name">
+                    <IconButton onClick={startEditingName} size="small">
+                      <EditIcon />
+                    </IconButton>
+                  </Tooltip>
+                )}
+                {user?.isAdmin && (
+                  <Tooltip title="Change Owner">
+                    <IconButton 
+                      color="primary" 
+                      onClick={() => setOwnerChangeDialogOpen(true)}
+                      size="small"
+                    >
+                      <PersonAddIcon />
+                    </IconButton>
+                  </Tooltip>
+                )}
+              </>
+            )}
+          </Box>
+        </Box>
+
+        {/* Change Owner Dialog */}
+        <Dialog 
+          open={ownerChangeDialogOpen} 
+          onClose={() => {
+            setOwnerChangeDialogOpen(false);
+            setOwnerChangeError('');
+            setOwnerChangeSuccess('');
+          }}
+        >
+          <DialogTitle>Change Task Owner</DialogTitle>
+          <DialogContent>
+            <Box sx={{ pt: 2 }}>
+              <TextField
+                label="New Owner Email"
+                variant="outlined"
+                fullWidth
+                value={newOwnerEmail}
+                onChange={(e) => setNewOwnerEmail(e.target.value)}
+                error={!!ownerChangeError}
+                helperText={ownerChangeError}
+                type="email"
+                placeholder="Enter new owner's email address"
+              />
+              {ownerChangeSuccess && (
+                <Alert severity="success" sx={{ mt: 2 }}>
+                  {ownerChangeSuccess}
+                </Alert>
+              )}
+            </Box>
+          </DialogContent>
+          <DialogActions>
+            <Button 
+              onClick={() => {
+                setOwnerChangeDialogOpen(false);
+                setOwnerChangeError('');
+                setOwnerChangeSuccess('');
+              }}
+            >
+              Cancel
+            </Button>
+            <Button 
+              variant="contained" 
+              color="primary" 
+              onClick={handleOwnerChange}
+              disabled={!newOwnerEmail.trim()}
+            >
+              Change Owner
+            </Button>
+          </DialogActions>
+        </Dialog>
+
         <Box sx={{ 
           mb: 4, 
           display: 'flex', 
@@ -1029,47 +1169,6 @@ export default function TaskDetails() {
         }}>
           <Box sx={{ flex: 1 }}>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-              {isEditingName ? (
-                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                  <TextField
-                    value={editedName}
-                    onChange={(e) => setEditedName(e.target.value)}
-                    variant="outlined"
-                    size="small"
-                    autoFocus
-                    sx={{ minWidth: '300px' }}
-                  />
-                  <IconButton
-                    onClick={handleNameEdit}
-                    size="small"
-                    color="primary"
-                    disabled={!editedName.trim() || editedName === task?.name}
-                  >
-                    <SaveIcon />
-                  </IconButton>
-                  <IconButton
-                    onClick={cancelEditingName}
-                    size="small"
-                  >
-                    <CancelIcon />
-                  </IconButton>
-                </Box>
-              ) : (
-                <>
-                  <Typography variant="h4" component="h1">
-                    {task.name}
-                  </Typography>
-                  {showActions && (
-                    <Tooltip title="Edit name">
-                      <IconButton onClick={startEditingName} size="small">
-                        <EditIcon />
-                      </IconButton>
-                    </Tooltip>
-                  )}
-                </>
-              )}
-            </Box>
-            <Box sx={{ display: 'flex', gap: 1, mb: 2 }}>
               <Chip
                 label={`Task: ${task.status}`}
                 color={getStatusColor(task.status)}

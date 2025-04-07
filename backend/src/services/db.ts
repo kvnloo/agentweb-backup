@@ -693,6 +693,23 @@ export const taskDb = {
     } catch (error) {
       handleDynamoDbError(error, 'deleteAttachment');
     }
+  },
+
+  async updateTaskOwner(taskId: string, newOwnerId: string) {
+    const params = {
+      TableName: `${TABLE_PREFIX}AW-Tasks`,
+      Key: {
+        taskId
+      },
+      UpdateExpression: 'set userId = :userId',
+      ExpressionAttributeValues: {
+        ':userId': newOwnerId
+      },
+      ReturnValues: 'ALL_NEW'
+    };
+
+    const result = await dynamodb.update(params).promise();
+    return result.Attributes;
   }
 };
 
