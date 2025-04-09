@@ -88,10 +88,11 @@ export default function Layout() {
                     fontSize: '0.9rem',
                     fontWeight: 500,
                     opacity: 0.9,
+                    ml: 1,
                     display: { xs: 'none', sm: 'block' }
                   }}
                 >
-                  Your Marketing Operator
+                  Your Marketing Operator 24/7
                 </Typography>
               </Typography>
               <Chip
