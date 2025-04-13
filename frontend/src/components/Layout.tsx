@@ -242,8 +242,8 @@ export default function Layout() {
           }}
         >
           🚧 Private Beta: This is a beta version - bugs and issues may arise. Please report them to{' '}
-          <a href="mailto:agentwebpro@gmail.com" style={{ color: 'inherit', fontWeight: 'bold' }}>
-            agentwebpro@gmail.com
+          <a href="mailto:support@agentweb.pro" style={{ color: 'inherit', fontWeight: 'bold' }}>
+            support@agentweb.pro
           </a>
         </Alert>
       )}
