@@ -50,7 +50,7 @@ def send_task_notification(to_email, task_name, task_id, execution_status, execu
         smtp_port = int(os.getenv('SMTP_PORT', '587'))
         smtp_user = os.getenv('SMTP_USER')
         smtp_pass = os.getenv('SMTP_PASS')
-        from_email = os.getenv('FROM_EMAIL', smtp_user)
+        from_email = os.getenv('FROM_EMAIL')
         site_domain = os.getenv('SITE_DOMAIN', 'http://localhost:3000')
 
         if not all([smtp_user, smtp_pass, to_email]):
@@ -59,6 +59,7 @@ def send_task_notification(to_email, task_name, task_id, execution_status, execu
 
         msg = MIMEMultipart()
         msg['From'] = from_email
+        msg['Reply-To'] = 'support@agentweb.pro'
         msg['To'] = to_email
         # Modify subject if new information was found
         if new_info_summary:
@@ -101,7 +102,7 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
         smtp_port = int(os.getenv('SMTP_PORT', '587'))
         smtp_user = os.getenv('SMTP_USER')
         smtp_pass = os.getenv('SMTP_PASS')
-        from_email = os.getenv('FROM_EMAIL', smtp_user)
+        from_email = os.getenv('FROM_EMAIL')
         site_domain = os.getenv('SITE_DOMAIN', 'http://localhost:3000')
 
         if not all([smtp_user, smtp_pass, to_email]):
@@ -110,6 +111,7 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
 
         msg = MIMEMultipart()
         msg['From'] = from_email
+        msg['Reply-To'] = 'support@agentweb.pro'
         msg['To'] = to_email
         
         # Modify subject if new information was found
@@ -262,7 +264,7 @@ def send_oncall_alert(task_name, task_id, error, llm_names_tried):
         smtp_port = int(os.getenv('SMTP_PORT', '587'))
         smtp_user = os.getenv('SMTP_USER')
         smtp_pass = os.getenv('SMTP_PASS')
-        from_email = os.getenv('FROM_EMAIL', smtp_user)
+        from_email = os.getenv('FROM_EMAIL')
         site_domain = os.getenv('SITE_DOMAIN', 'http://localhost:3000')
         oncall_emails = os.getenv('ONCALL_EMAIL_LIST', '').split(',')
 
@@ -272,6 +274,7 @@ def send_oncall_alert(task_name, task_id, error, llm_names_tried):
 
         msg = MIMEMultipart()
         msg['From'] = from_email
+        msg['Reply-To'] = 'support@agentweb.pro'
         msg['To'] = ', '.join(oncall_emails)
         msg['Subject'] = f"[URGENT] Task Failed with All LLMs: {task_name}"
 

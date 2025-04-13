@@ -174,7 +174,7 @@ export default function Home() {
                       display: { xs: 'none', sm: 'block' }
                     }}
                   >
-                    Your Marketing Operator
+                    Your Marketing Operator 24/7
                   </Typography>
                 </Box>
               </Link>

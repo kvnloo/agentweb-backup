@@ -345,6 +345,7 @@ router.post('/announcements/send', async (req, res) => {
                 </div>
                 <div class="footer">
                   <p>This is an official announcement from AgentWeb</p>
+                  <p>If you have any questions, please contact our support team at support@agentweb.pro</p>
                 </div>
               </body>
             </html>`

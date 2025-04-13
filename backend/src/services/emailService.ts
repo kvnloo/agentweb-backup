@@ -14,7 +14,8 @@ const transporter = nodemailer.createTransport({
 export const emailService = {
   async sendEmail(to: string, subject: string, text: string, html: string) {
     const mailOptions = {
-      from: process.env.FROM_EMAIL || 'AgentWeb team',
+      from: process.env.FROM_EMAIL,
+      replyTo: 'support@agentweb.pro',
       to,
       subject,
       text,
@@ -32,7 +33,8 @@ export const emailService = {
 
   async sendInvitation(email: string) {
     const mailOptions = {
-      from: process.env.FROM_EMAIL || 'AgentWeb team',
+      from: process.env.FROM_EMAIL,
+      replyTo: 'support@agentweb.pro',
       to: email,
       subject: 'Welcome to AgentWeb - Your Invitation',
       html: `
@@ -56,9 +58,9 @@ export const emailService = {
             <li><a href="${process.env.FRONTEND_URL}/guide">User Guide</a> - Detailed instructions on how to create and manage your web automation tasks</li>
           </ul>
           
-          <p>Your feedback is invaluable as we continue to improve our platform. Please reply to this email with any questions, suggestions, or insights about your experience with AgentWeb.</p>
+          <p>If you have any questions or need assistance, please reply to this email or contact our support team at support@agentweb.pro.</p>
           
-          <p>Best regards,<br>Rui Wang<br>CTO, AgentWeb</p>
+          <p>Best regards,<br>The AgentWeb Team</p>
         </div>
       `
     };
