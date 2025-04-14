@@ -160,7 +160,7 @@ export default function AdminDashboard() {
   const handleResendInvitation = async (email: string) => {
     try {
       setLoading(true);
-      const response = await axios.post(
+      await axios.post(
         buildApiUrl('/api/admin/waitlist/resend-invitation'),
         { email },
         { headers: { Authorization: `Bearer ${token}` } }
