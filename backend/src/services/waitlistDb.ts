@@ -110,13 +110,13 @@ export const waitlistDb = {
       Key: {
         email: email.toLowerCase()
       },
-      UpdateExpression: 'SET #status = :status, invitedAt = :invitedAt',
+      UpdateExpression: 'SET #status = :status' + (invitedAt ? ', invitedAt = :invitedAt' : ''),
       ExpressionAttributeNames: {
         '#status': 'status'
       },
       ExpressionAttributeValues: {
         ':status': status,
-        ':invitedAt': invitedAt || null
+        ...(invitedAt && { ':invitedAt': invitedAt })
       },
       ReturnValues: 'ALL_NEW'
     };

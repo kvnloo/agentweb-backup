@@ -94,11 +94,13 @@ router.put('/waitlist/:email/status', async (req, res) => {
       return res.status(400).json({ message: 'User already exists' });
     }
 
-    const entry = await waitlistDb.updateStatus(
-      email,
-      status,
-      status === 'invited' ? new Date().toISOString() : undefined
-    );
+    // Update invitedAt timestamp for invited users
+    let invitedAt;
+    if (status === 'invited') {
+      invitedAt = new Date().toISOString();
+    }
+
+    const entry = await waitlistDb.updateStatus(email, status, invitedAt);
 
     // Send invitation email if status is 'invited'
     if (status === 'invited') {
@@ -116,6 +118,51 @@ router.put('/waitlist/:email/status', async (req, res) => {
   } catch (error) {
     console.error('Error updating waitlist status:', error);
     res.status(500).json({ message: 'Error updating waitlist status' });
+  }
+});
+
+// Resend invitation email
+router.post('/waitlist/resend-invitation', async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ message: 'Email is required' });
+    }
+
+    // Check if waitlist entry exists and has invited status
+    const entry = await waitlistDb.getByEmail(email);
+    
+    if (!entry) {
+      return res.status(404).json({ message: 'Waitlist entry not found' });
+    }
+
+    if (entry.status !== 'invited') {
+      return res.status(400).json({ message: 'User has not been invited yet' });
+    }
+
+    // Check if user already exists
+    const existingUser = await userDb.getUserByEmail(email);
+    if (existingUser) {
+      return res.status(400).json({ message: 'User already exists' });
+    }
+
+    // Update the invitedAt timestamp
+    const invitedAt = new Date().toISOString();
+    await waitlistDb.updateStatus(email, 'invited', invitedAt);
+
+    // Send the invitation email
+    try {
+      await emailService.sendInvitation(email);
+    } catch (emailError) {
+      console.error('Error sending invitation email:', emailError);
+      return res.status(500).json({ message: 'Failed to send invitation email' });
+    }
+
+    res.json({ message: 'Invitation email resent successfully' });
+  } catch (error) {
+    console.error('Error resending invitation email:', error);
+    res.status(500).json({ message: 'Error resending invitation email' });
   }
 });
 

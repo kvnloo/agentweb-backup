@@ -67,6 +67,20 @@ function a11yProps(index: number) {
   };
 }
 
+interface WaitlistEntry {
+  email: string;
+  status: 'pending' | 'invited' | 'rejected';
+  createdAt: string;
+  invitedAt?: string;
+  fullName?: string;
+  companyName?: string;
+  phoneNumber?: string;
+  joinedAt?: string;
+  useCaseCategories?: string[];
+  useCaseDescription?: string;
+  requestReport?: boolean;
+}
+
 export default function AdminDashboard() {
   const [tabValue, setTabValue] = useState(0);
   const [startDate, setStartDate] = useState<Date | null>(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000));
@@ -141,6 +155,50 @@ export default function AdminDashboard() {
 
   const handleWaitlistAction = async (email: string, status: string) => {
     await updateWaitlistStatus(email, status);
+  };
+
+  const handleResendInvitation = async (email: string) => {
+    try {
+      setLoading(true);
+      const response = await axios.post(
+        buildApiUrl('/api/admin/waitlist/resend-invitation'),
+        { email },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setSuccess(`Invitation email resent to ${email}`);
+      await loadWaitlist(); // Reload waitlist data
+    } catch (error: any) {
+      setError(error.response?.data?.message || 'Failed to resend invitation');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const getTimeAgo = (dateString?: string) => {
+    if (!dateString) return 'Never';
+    
+    const date = new Date(dateString);
+    const now = new Date();
+    const diffMs = now.getTime() - date.getTime();
+    
+    // Convert to appropriate time unit
+    const diffSec = Math.floor(diffMs / 1000);
+    const diffMin = Math.floor(diffSec / 60);
+    const diffHours = Math.floor(diffMin / 60);
+    const diffDays = Math.floor(diffHours / 24);
+    
+    if (diffDays > 30) {
+      const diffMonths = Math.floor(diffDays / 30);
+      return `${diffMonths} month${diffMonths > 1 ? 's' : ''} ago`;
+    } else if (diffDays > 0) {
+      return `${diffDays} day${diffDays > 1 ? 's' : ''} ago`;
+    } else if (diffHours > 0) {
+      return `${diffHours} hour${diffHours > 1 ? 's' : ''} ago`;
+    } else if (diffMin > 0) {
+      return `${diffMin} minute${diffMin > 1 ? 's' : ''} ago`;
+    } else {
+      return 'Just now';
+    }
   };
 
   const handleSort = (property: keyof any) => {
@@ -514,6 +572,16 @@ export default function AdminDashboard() {
         </TabPanel>
 
         <TabPanel value={tabValue} index={3}>
+          {error && (
+            <Alert severity="error" sx={{ mb: 3 }}>
+              {error}
+            </Alert>
+          )}
+          {success && (
+            <Alert severity="success" sx={{ mb: 3 }}>
+              {success}
+            </Alert>
+          )}
           <TableContainer component={Paper}>
             <Table>
               <TableHead>
@@ -539,6 +607,7 @@ export default function AdminDashboard() {
                   </TableCell>
                   <TableCell>Use Cases</TableCell>
                   <TableCell>Use Case Description</TableCell>
+                  <TableCell>Last Invited</TableCell>
                   <TableCell>Request Report</TableCell>
                   <TableCell>Status</TableCell>
                   <TableCell>Actions</TableCell>
@@ -547,12 +616,12 @@ export default function AdminDashboard() {
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={10} align="center">
+                    <TableCell colSpan={11} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
                 ) : (
-                  waitlist.map((entry) => {
+                  waitlist.map((entry: WaitlistEntry) => {
                     const userExists = users.some(user => user.email === entry.email);
                     return (
                       <TableRow key={entry.email}>
@@ -560,7 +629,7 @@ export default function AdminDashboard() {
                         <TableCell>{entry.fullName || '-'}</TableCell>
                         <TableCell>{entry.companyName || '-'}</TableCell>
                         <TableCell>{entry.phoneNumber || '-'}</TableCell>
-                        <TableCell>{new Date(entry.joinedAt).toLocaleDateString()}</TableCell>
+                        <TableCell>{entry.joinedAt ? new Date(entry.joinedAt).toLocaleDateString() : '-'}</TableCell>
                         <TableCell>
                           {entry.useCaseCategories && entry.useCaseCategories.length > 0 ? (
                             <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
@@ -618,6 +687,9 @@ export default function AdminDashboard() {
                           )}
                         </TableCell>
                         <TableCell>
+                          {getTimeAgo(entry.invitedAt)}
+                        </TableCell>
+                        <TableCell>
                           <Chip 
                             label={entry.requestReport ? 'Yes' : 'No'} 
                             size="small"
@@ -636,14 +708,22 @@ export default function AdminDashboard() {
                           />
                         </TableCell>
                         <TableCell>
-                          {!userExists && (
+                          {!userExists && entry.status !== 'invited' && (
                             <Button
                               variant="outlined"
                               size="small"
                               onClick={() => handleWaitlistAction(entry.email, 'invited')}
-                              disabled={entry.status === 'invited'}
                             >
                               Invite
+                            </Button>
+                          )}
+                          {entry.status === 'invited' && (
+                            <Button
+                              variant="outlined"
+                              size="small"
+                              onClick={() => handleResendInvitation(entry.email)}
+                            >
+                              Resend
                             </Button>
                           )}
                         </TableCell>
