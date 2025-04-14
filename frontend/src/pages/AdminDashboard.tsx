@@ -717,7 +717,7 @@ export default function AdminDashboard() {
                               Invite
                             </Button>
                           )}
-                          {entry.status === 'invited' && (
+                          {!userExists && entry.status === 'invited' && (
                             <Button
                               variant="outlined"
                               size="small"
@@ -725,6 +725,11 @@ export default function AdminDashboard() {
                             >
                               Resend
                             </Button>
+                          )}
+                          {userExists && (
+                            <Typography variant="body2" color="text.secondary">
+                              Registered
+                            </Typography>
                           )}
                         </TableCell>
                       </TableRow>
