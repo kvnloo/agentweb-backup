@@ -196,12 +196,7 @@ class UserDB {
   async getUserAnalytics(startDate: string, endDate: string) {
     try {
       const params = {
-        TableName: this.tableName,
-        FilterExpression: 'createdAt BETWEEN :startDate AND :endDate',
-        ExpressionAttributeValues: {
-          ':startDate': startDate,
-          ':endDate': endDate
-        }
+        TableName: this.tableName
       };
 
       const result = await this.docClient.scan(params).promise();
@@ -211,6 +206,7 @@ class UserDB {
         totalUsers: users.length,
         newUsers: users.filter(u => u.createdAt >= startDate && u.createdAt <= endDate).length,
         oauthUsers: users.filter(u => u.isOAuthUser).length,
+        newOauthUsers: users.filter(u => u.isOAuthUser && u.createdAt >= startDate && u.createdAt <= endDate).length,
         adminUsers: users.filter(u => u.isAdmin).length
       };
     } catch (error) {
@@ -581,31 +577,61 @@ export const taskDb = {
 
   async getTaskAnalytics(startDate: string, endDate: string) {
     try {
-      // Get tasks for the period
+      // Get all tasks (no date filter)
       const taskParams = {
-        TableName: `${TABLE_PREFIX}AW-Tasks`,
-        FilterExpression: 'createdAt BETWEEN :startDate AND :endDate',
-        ExpressionAttributeValues: {
-          ':startDate': startDate,
-          ':endDate': endDate
-        }
+        TableName: `${TABLE_PREFIX}AW-Tasks`
       };
 
       const taskResult = await dynamodb.scan(taskParams).promise();
       const tasks = taskResult.Items || [];
 
-      // Get executions for the period
+      // Get all executions (no date filter)
       const executionParams = {
-        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
-        FilterExpression: 'startTime BETWEEN :startDate AND :endDate',
-        ExpressionAttributeValues: {
-          ':startDate': startDate,
-          ':endDate': endDate
-        }
+        TableName: `${TABLE_PREFIX}AW-TaskExecutions`
       };
 
       const executionResult = await dynamodb.scan(executionParams).promise();
       const executions = executionResult.Items || [];
+
+      // Get all schedules (no date filter)
+      const scheduleParams = {
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`
+      };
+      
+      const scheduleResult = await dynamodb.scan(scheduleParams).promise();
+      const schedules = scheduleResult.Items || [];
+
+      // Get all templates (no date filter)
+      const templateParams = {
+        TableName: `${TABLE_PREFIX}AW-TaskTemplates`
+      };
+      
+      const templateResult = await dynamodb.scan(templateParams).promise();
+      const templates = templateResult.Items || [];
+
+      // Get all configurations (no date filter)
+      const configParams = {
+        TableName: `${TABLE_PREFIX}AW-Configs`
+      };
+      
+      const configResult = await dynamodb.scan(configParams).promise();
+      const configs = configResult.Items || [];
+      
+      // Get all workflows (no date filter)
+      const workflowParams = {
+        TableName: `${TABLE_PREFIX}AW-Workflows`
+      };
+      
+      const workflowResult = await dynamodb.scan(workflowParams).promise();
+      const workflows = workflowResult.Items || [];
+      
+      // Get all workflow executions (no date filter)
+      const workflowExecParams = {
+        TableName: `${TABLE_PREFIX}AW-WorkflowExecutions`
+      };
+      
+      const workflowExecResult = await dynamodb.scan(workflowExecParams).promise();
+      const workflowExecutions = workflowExecResult.Items || [];
 
       return {
         totalTasks: tasks.length,
@@ -613,6 +639,29 @@ export const taskDb = {
         totalExecutions: executions.length,
         successfulExecutions: executions.filter(e => e.status === 'completed').length,
         failedExecutions: executions.filter(e => e.status === 'failed').length,
+        newExecutions: executions.filter(e => e.startTime >= startDate && e.startTime <= endDate).length,
+        scheduledTasks: schedules.length,
+        newScheduledTasks: schedules.filter(s => s.createdAt >= startDate && s.createdAt <= endDate).length,
+        templates: templates.length,
+        newTemplates: templates.filter(t => t.createdAt >= startDate && t.createdAt <= endDate).length,
+        websiteConfigs: configs.filter(c => !c.isApiConfig).length,
+        newWebsiteConfigs: configs.filter(c => !c.isApiConfig && c.createdAt >= startDate && c.createdAt <= endDate).length,
+        apiConfigs: configs.filter(c => c.isApiConfig === true).length,
+        newApiConfigs: configs.filter(c => c.isApiConfig === true && c.createdAt >= startDate && c.createdAt <= endDate).length,
+        sharedConfigs: configs.filter(c => c.sharedBy || c.sharedConfigIds).length,
+        totalWorkflows: workflows.length,
+        newWorkflows: workflows.filter(w => w.createdAt >= startDate && w.createdAt <= endDate).length,
+        workflowExecutions: workflowExecutions.length,
+        newWorkflowExecutions: workflowExecutions.filter(e => e.startTime >= startDate && e.startTime <= endDate).length,
+        successfulWorkflowExecutions: workflowExecutions.filter(e => e.status === 'success' || e.status === 'completed').length,
+        failedWorkflowExecutions: workflowExecutions.filter(e => e.status === 'failed').length,
+        pendingWorkflowExecutions: workflowExecutions.filter(e => e.status === 'pending' || e.status === 'running').length,
+        workflowExecutionStatusBreakdown: Object.entries(
+          workflowExecutions.reduce<Record<string, number>>((acc, exec) => {
+            acc[exec.status || 'unknown'] = (acc[exec.status || 'unknown'] || 0) + 1;
+            return acc;
+          }, {})
+        ),
         averageExecutionTime: executions
           .filter(e => e.status === 'completed' && e.completedAt)
           .reduce((acc, e) => {
