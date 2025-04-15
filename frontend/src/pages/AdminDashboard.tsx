@@ -379,9 +379,18 @@ export default function AdminDashboard() {
                     </Typography>
                     {userAnalytics && (
                       <>
-                        <Typography>Total Users: {userAnalytics.totalUsers}</Typography>
-                        <Typography>New Users: {userAnalytics.newUsers}</Typography>
-                        <Typography>OAuth Users: {userAnalytics.oauthUsers}</Typography>
+                        <Typography>
+                          Total Users: {userAnalytics.totalUsers}
+                          <Box component="span" sx={{ color: 'success.main', ml: 1 }}>
+                            +{userAnalytics.newUsers} new
+                          </Box>
+                        </Typography>
+                        <Typography>
+                          OAuth Users: {userAnalytics.oauthUsers}
+                          <Box component="span" sx={{ color: 'success.main', ml: 1 }}>
+                            +{userAnalytics.newOauthUsers} new
+                          </Box>
+                        </Typography>
                         <Typography>Admin Users: {userAnalytics.adminUsers}</Typography>
                       </>
                     )}
@@ -396,11 +405,35 @@ export default function AdminDashboard() {
                     </Typography>
                     {taskAnalytics && (
                       <>
-                        <Typography>Total Tasks: {taskAnalytics.totalTasks}</Typography>
-                        <Typography>New Tasks: {taskAnalytics.newTasks}</Typography>
-                        <Typography>Total Executions: {taskAnalytics.totalExecutions}</Typography>
+                        <Typography>
+                          Total Tasks: {taskAnalytics.totalTasks} 
+                          <Box component="span" sx={{ color: 'success.main', ml: 1 }}>
+                            +{taskAnalytics.newTasks} new
+                          </Box>
+                        </Typography>
+                        <Typography>
+                          Total Executions: {taskAnalytics.totalExecutions}
+                          <Box component="span" sx={{ color: 'success.main', ml: 1 }}>
+                            +{taskAnalytics.newExecutions} new
+                          </Box>
+                        </Typography>
                         <Typography>Successful Executions: {taskAnalytics.successfulExecutions}</Typography>
                         <Typography>Failed Executions: {taskAnalytics.failedExecutions}</Typography>
+                        <Typography>Pending/Running Executions: {
+                          taskAnalytics.totalExecutions - taskAnalytics.successfulExecutions - taskAnalytics.failedExecutions
+                        }</Typography>
+                        <Typography>
+                          Scheduled Tasks: {taskAnalytics.scheduledTasks}
+                          <Box component="span" sx={{ color: 'success.main', ml: 1 }}>
+                            +{taskAnalytics.newScheduledTasks} new
+                          </Box>
+                        </Typography>
+                        <Typography>
+                          Templates: {taskAnalytics.templates}
+                          <Box component="span" sx={{ color: 'success.main', ml: 1 }}>
+                            +{taskAnalytics.newTemplates} new
+                          </Box>
+                        </Typography>
                         <Typography>
                           Average Execution Time: {
                             taskAnalytics.averageExecutionTime != null 
@@ -408,6 +441,60 @@ export default function AdminDashboard() {
                               : 'N/A'
                           }
                         </Typography>
+                      </>
+                    )}
+                  </CardContent>
+                </Card>
+              </Grid>
+              <Grid item xs={12} md={6}>
+                <Card>
+                  <CardContent>
+                    <Typography variant="h6" gutterBottom>
+                      Config Analytics
+                    </Typography>
+                    {taskAnalytics && (
+                      <>
+                        <Typography>
+                          Website Credentials: {taskAnalytics.websiteConfigs}
+                          <Box component="span" sx={{ color: 'success.main', ml: 1 }}>
+                            +{taskAnalytics.newWebsiteConfigs} new
+                          </Box>
+                        </Typography>
+                        <Typography>
+                          API Credentials: {taskAnalytics.apiConfigs}
+                          <Box component="span" sx={{ color: 'success.main', ml: 1 }}>
+                            +{taskAnalytics.newApiConfigs} new
+                          </Box>
+                        </Typography>
+                        <Typography>Shared Credentials: {taskAnalytics.sharedConfigs}</Typography>
+                      </>
+                    )}
+                  </CardContent>
+                </Card>
+              </Grid>
+              <Grid item xs={12} md={6}>
+                <Card>
+                  <CardContent>
+                    <Typography variant="h6" gutterBottom>
+                      Workflow Analytics
+                    </Typography>
+                    {taskAnalytics && (
+                      <>
+                        <Typography>
+                          Total Workflows: {taskAnalytics.totalWorkflows}
+                          <Box component="span" sx={{ color: 'success.main', ml: 1 }}>
+                            +{taskAnalytics.newWorkflows} new
+                          </Box>
+                        </Typography>
+                        <Typography>
+                          Workflow Executions: {taskAnalytics.workflowExecutions}
+                          <Box component="span" sx={{ color: 'success.main', ml: 1 }}>
+                            +{taskAnalytics.newWorkflowExecutions} new
+                          </Box>
+                        </Typography>
+                        <Typography>Successful Workflow Executions: {taskAnalytics.successfulWorkflowExecutions}</Typography>
+                        <Typography>Failed Workflow Executions: {taskAnalytics.failedWorkflowExecutions}</Typography>
+                        <Typography>Pending/Running Workflow Executions: {taskAnalytics.pendingWorkflowExecutions}</Typography>
                       </>
                     )}
                   </CardContent>
