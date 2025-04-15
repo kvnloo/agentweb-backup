@@ -3,27 +3,55 @@
 ## Overview
 AgentWeb is a web platform that enables users to create and manage AI-powered web automation tasks using natural language instructions. The platform provides secure credential management, reliable task execution in isolated environments, and advanced features like deep research capabilities, workflows, and task templates.
 
-## System Security Architecture
+## System Architecture Diagram
 
 ```
-┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
-│   AgentWeb      │         │    AgentWeb     │         │    Web Agent    │
-│    Frontend     │         │     Backend      │         │     Engine      │
-│                 │         │                  │         │                 │
-│  ┌───────────┐  │   1    │  ┌───────────┐   │    3    │ ┌───────────┐  │
-│  │  User     │  │◄──────►│  │  Auth &   │   │◄───────►│ │ Isolated  │  │
-│  │ Interface │  │   JWT   │  │  API      │   │  Task   │ │ Browser   │  │
-│  └───────────┘  │         │  └───────────┘   │  Queue  │ │ Sessions  │  │
-│        ▲        │         │        ▲         │         │ └───────────┘  │
-│        │        │         │        │         │         │        ▲       │
-│        │        │         │        │         │         │        │       │
-│        │     2  │         │        │      4  │         │        │    5  │
-│        └────────┼─────────┼────────┘         │         │        │       │
-│   Credentials   │         │                   │         │        │       │
-│   Input Only    │         │                   │         │        ▼       │
-└─────────────────┘         └─────────────────┘         └─────────────────┘
-                                                              Target
-                                                             Websites
+┌─────────────────┐         ┌─────────────────┐         ┌─────────────────────────┐
+│   AgentWeb      │         │    AgentWeb     │         │    Orchestration        │
+│    Frontend     │         │     Backend      │         │    Layer - Google ADK   │
+│                 │         │                  │         │                         │
+│  ┌───────────┐  │   1    │  ┌───────────┐   │    3    │ ┌───────────────────┐  │
+│  │  User     │  │◄──────►│  │  Auth &   │   │◄───────►│ │  Task Routing &   │  │
+│  │ Interface │  │   JWT   │  │  API      │   │  Task   │ │  Orchestration    │  │
+│  └───────────┘  │         │  └───────────┘   │ Request │ └───────────────────┘  │
+│        ▲        │         │        ▲         │         │           │            │
+│        │        │         │        │         │         │           │            │
+│        │     2  │         │        │      4  │         │           │            │
+│        └────────┼─────────┼────────┘         │         │           │            │
+│   Credentials   │         │   Results        │         │           │            │
+│   Input Only    │         │                  │         │           │            │
+└─────────────────┘         └─────────────────┘         └─────────────┬───────────┘
+                                                                      │
+                                                                      │ 5. Route Tasks
+                                                                      ▼
+         ┌───────────────────────────────────────────────────────────────────────────────┐
+         │                                                                               │
+         │                            Agent Execution Platforms                          │
+         │                                                                               │
+         │  ┌────────────────────┐   ┌─────────────────────┐    ┌────────────────────┐  │
+         │  │                    │   │                     │    │                    │  │
+         │  │ Google Cloud       │   │ BrowserUse Engine   │    │  Future Platforms  │  │
+         │  │ Agent Engine       │   │ (Website Navigation)│    │                    │  │
+         │  │                    │   │                     │    │  - AWS Bedrock     │  │
+         │  │                    │   │                     │    │  - OpenAI Agents   │  │
+         │  │                    │   │                     │    │                    │  │
+         │  └──────────┬─────────┘   └──────────┬──────────┘    └──────────┬─────────┘  │
+         │             │                        │                          │            │
+         └─────────────┼────────────────────────┼──────────────────────────┼────────────┘
+                       │                        │                          │
+                       │                        │ 6a. Web                  │
+                       │ 6b. Google            │ Interaction              │ 6c. Other
+                       │ Services              ▼                          │ Data Sources
+                       ▼          ┌─────────────────────────────┐          ▼
+           ┌────────────────────┐ │                             │ ┌──────────────────────┐
+           │                    │ │                             │ │                      │
+           │  Google Services   │ │       Websites              │ │  Other Agent         │
+           │  - Google Search   │ │       - Login Pages         │ │  Data Sources        │
+           │  - Google Maps     │ │       - Web Applications    │ │                      │
+           │  - YouTube         │ │       - E-commerce          │ │                      │
+           │  - Gmail           │ │       - SaaS Platforms      │ │                      │
+           │                    │ │                             │ │                      │
+           └────────────────────┘ └─────────────────────────────┘ └──────────────────────┘
 ```
 
 ### Security Boundaries and Data Flow
@@ -40,20 +68,37 @@ AgentWeb is a web platform that enables users to create and manage AI-powered we
    - Credentials are transmitted securely using end-to-end encryption
 
 3. **Task Orchestration (Flow 3)**
-   - Backend schedules tasks in the Web Agent Engine
-   - Task instructions and metadata only (no credentials)
-   - Secure queue system for task management
+   - Backend sends task requests to the Google ADK orchestration layer
+   - Task instructions and metadata only (no credentials at this stage)
+   - Secure API communication between backend and ADK
 
-4. **Task Execution Control (Flow 4)**
-   - Backend monitors and controls task execution
+4. **Task Results (Flow 4)**
+   - ADK returns execution results to the backend
    - Real-time status updates
    - Error handling and task termination capabilities
 
-5. **Website Interaction (Flow 5)**
-   - Isolated browser sessions per task
-   - Fresh browser instance for each execution
-   - No cross-task data sharing
-   - Automatic session cleanup after task completion
+5. **Task Routing (Flow 5)**
+   - ADK routes tasks to the appropriate agent execution platform
+   - Routing based on task requirements and platform capabilities
+   - Orchestration of multiple agents when needed
+
+6. **External System Interactions**
+   - **Web Interaction (Flow 6a)**: BrowserUse Engine interacts with websites
+     - Isolated browser sessions per task
+     - Fresh browser instance for each execution
+     - Credentials injected only during execution
+     - No cross-task data sharing
+     - Automatic session cleanup after task completion
+   
+   - **Google Services Interaction (Flow 6b)**: Google Cloud Agent Engine connects to Google services
+     - Agents execute against Google Search, Maps, YouTube, Gmail, etc.
+     - Managed environment provided by Google
+     - Secure API access to Google services
+   
+   - **Other Data Sources (Flow 6c)**: Future platforms will connect to various data sources
+     - AWS Bedrock agents will access AWS services and data sources
+     - OpenAI agents will connect to appropriate data sources
+     - Each platform uses its own secure connection methods
 
 ### Security Principles
 
@@ -80,7 +125,7 @@ AgentWeb is a web platform that enables users to create and manage AI-powered we
    - React-based web application
    - User interface for task creation and management
    - Real-time task status monitoring
-   - Secure credential input interface
+   - Secure credential input interface (Note: Credentials still not stored permanently)
    - Workflow builder interface
    - Task templates management
    - Configuration management
@@ -88,32 +133,40 @@ AgentWeb is a web platform that enables users to create and manage AI-powered we
 2. **Backend**
    - Node.js/Express API server
    - Authentication and authorization system
-   - Task orchestration engine
-   - Browser session management
+   - Task scheduling and management (interfacing with ADK)
    - DynamoDB integration for data storage
    - Email notification system
+   - Receives results from the ADK orchestration layer
 
-3. **Agent Engine**
-   - browser-use based automation
-   - Isolated browser sessions per user
-   - Task scheduling and queuing system
-   - Error handling and retry mechanisms
-   - Deep research capabilities
-   - Interactive task execution
-   - File upload/download handling
-   - GIF generation for task visualization
+3. **Orchestration Layer (Google ADK)**
+   - Central component based on Google Agent Development Kit (ADK).
+   - Responsible for multi-agent orchestration.
+   - Receives task requests from the AgentWeb Backend.
+   - Routes tasks to appropriate agent execution platforms.
+   - Aggregates results from agents and returns them to the Backend.
+   - Connects to various agent platforms:
+       - **Google Cloud Agent Engine:** Runs managed agents provided by Google.
+       - **BrowserUse Agent Engine:** Executes agents specifically designed for browser automation and website navigation using the `browser-use` library.
+       - **(Future) AWS Bedrock:** Integration point for running agents managed by AWS Bedrock.
+       - **(Future) OpenAI Agents:** Integration point for leveraging OpenAI's agent capabilities.
 
-4. **Security Layer**
-   - JWT-based encryption for credentials
-   - Secure credential handling
-   - MFA implementation
-   - Session isolation
+4. **Agent Execution Platforms**
+   - **Google Cloud Agent Engine:** Managed environment for executing Google's agents.
+   - **BrowserUse Agent Engine:** Dedicated environment for running `browser-use` based agents for web interaction tasks. Requires separate deployment and management (e.g., on GCE VM as per README). Handles browser isolation, task execution, credential injection (scoped to task), and result/artifact generation (e.g., screenshots, GIFs).
+   - Future platforms (Bedrock, OpenAI) will integrate via ADK.
+
+5. **Security Layer**
+   - JWT-based encryption for credentials during transit/temporary use.
+   - Secure credential handling (credentials passed ephemerally to BrowserUse engine when needed).
+   - MFA implementation for AgentWeb accounts.
+   - Isolation between different agent execution environments managed by ADK.
 
 ### Infrastructure
 1. **Compute**
-   - AWS EC2 with Auto Scaling
-   - Elastic Beanstalk for deployment
-   - Docker containers for task isolation
+   - **AgentWeb Frontend/Backend:** AWS Elastic Beanstalk (Node.js platform).
+   - **BrowserUse Agent Engine:** Deployed separately, e.g., Google Cloud VM (as detailed in README) or containerized service. Requires resources capable of running browser instances.
+   - **Google Cloud Agent Engine:** Managed service within Google Cloud Platform.
+   - Potential future use of AWS Lambda/ECS for specific agent types via Bedrock.
 
 2. **Database**
    - Amazon DynamoDB for scalable storage
@@ -277,26 +330,44 @@ AgentWeb is a web platform that enables users to create and manage AI-powered we
 - Node.js
 - Express.js
 - TypeScript
-- browser-use for web agent automation
 - JWT for authentication
 - AWS SDK for DynamoDB and S3 integration
 
-### Agent Engine
-- Python
-- browser-use library
-- LangChain integration
-- Multiple LLM support (Azure OpenAI, AWS Bedrock, OpenAI, Google)
-- Playwright for browser automation
+### Orchestration Layer
+- Google Agent Development Kit (ADK)
+- Multi-agent orchestration capabilities
+- Agent routing and selection logic
+- Result aggregation and processing
+
+### Agent Execution Platforms
+- **Google Cloud Agent Engine**
+  - Managed agent execution environment
+  - Access to Google services (Search, Maps, YouTube, Gmail)
+  - Scalable and reliable execution infrastructure
+  
+- **BrowserUse Engine**
+  - Python-based engine
+  - browser-use library for web automation
+  - Playwright for browser control
+  - Browser isolation and security features
+  - Screenshot and GIF generation capabilities
+  
+- **Future Platforms** (planned)
+  - AWS Bedrock integration
+  - OpenAI agents support
+  - Custom agent deployment options
 
 ### Infrastructure
-- AWS (EC2, DynamoDB, S3, Elastic Beanstalk)
-- Docker
-- Nginx
+- AWS (DynamoDB, S3, Elastic Beanstalk) for AgentWeb components
+- Google Cloud Platform for Agent Engine components
+- Docker containerization
+- Nginx for web serving
 
 ### Monitoring
 - AWS CloudWatch
 - Custom logging system
 - Execution tracking dashboard
+- Cross-platform monitoring capabilities
 
 ## Workflow Management
 
@@ -346,13 +417,31 @@ AgentWeb is a web platform that enables users to create and manage AI-powered we
    - Form submission templates
 
 ## Future Considerations
-1. **API marketplace for custom integrations**
-2. **Machine learning for task optimization**
-3. **Advanced credential delegation system**
-4. **Mobile application**
-5. **Enterprise features**
-6. **AI-powered workflow suggestions**
-7. **Workflow version control and rollback**
-8. **Cross-organization workflow sharing**
-9. **Advanced analytics dashboard**
-10. **Integration with popular productivity tools** 
+1. **Expanded agent platform integrations**
+   - Integration with additional LLM providers through ADK
+   - Custom agent deployment options for enterprise customers
+   - Specialized agents for industry-specific tasks
+
+2. **Advanced multi-agent workflows**
+   - Complex workflows involving multiple specialized agents
+   - Agent collaboration and knowledge sharing capabilities
+   - Dynamic agent selection based on task performance
+
+3. **Enhanced agent capabilities**
+   - Multi-modal agents (text, image, audio processing)
+   - Improved reasoning and planning abilities
+   - Long-context memory and learning from past executions
+
+4. **Platform evolution**
+   - API marketplace for custom integrations
+   - Machine learning for task optimization and agent selection
+   - Advanced credential delegation system
+   - Mobile application for monitoring and control
+   - Enterprise features for large-scale deployment
+
+5. **Workflow improvements**
+   - AI-powered workflow suggestions
+   - Workflow version control and rollback
+   - Cross-organization workflow sharing
+   - Advanced analytics dashboard
+   - Integration with popular productivity tools 
