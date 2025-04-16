@@ -27,7 +27,7 @@ import aiohttp
 import base64  # Add at the top with other imports
 import boto3  # Add at the top with other imports
 from urllib.parse import quote
-from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content, generate_content_hash, get_agent_code_base_path, call_github_api, run_python_code_in_sandbox, fetch_api_credentials, decrypt_password
+from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content, generate_content_hash, get_agent_code_base_path, call_github_api, run_python_code_in_sandbox, fetch_api_credentials, decrypt_password, get_all_configs
 # Load environment variables
 load_dotenv()
 
@@ -314,7 +314,22 @@ class WebAgent:
                 items.extend(public_response.get('Items', []))
 
             if not items:
-                return ActionResult(error=f"No credentials found for domain: {domain}")
+                # If still no credentials found, get all available domains for the user
+                available_domains = set()
+                
+                # Get all configurations for the user
+                all_configs = get_all_configs(self.user_id)
+                
+                # Filter for website configurations and extract unique domains
+                for config in all_configs:
+                    if 'website' in config and config['website']:
+                        available_domains.add(config['website'])
+                
+                domains_text = ""
+                if available_domains:
+                    domains_text = f"\nAvailable domains: {', '.join(available_domains)}"
+                
+                return ActionResult(error=f"No credentials found for domain: {domain}.{domains_text}")
 
             try:
                 # Sort items by priority:
@@ -1156,26 +1171,8 @@ Once the PR is approved and merged, this code will be available through the 'Run
         # Get all credentials for log filtering
         if self.user_id:
             try:
-                table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
-                # Get user's own configs and configs shared directly with them
-                response = table.query(
-                    KeyConditionExpression='userId = :userId',
-                    ExpressionAttributeValues={':userId': self.user_id}
-                )
-                
-                # Get publicly shared configs from other users
-                public_response = table.query(
-                    IndexName='ShareWithEveryoneIndex',
-                    KeyConditionExpression='shareWithEveryone = :shareWithEveryone',
-                    FilterExpression='userId <> :userId',
-                    ExpressionAttributeValues={
-                        ':shareWithEveryone': 1,
-                        ':userId': self.user_id
-                    }
-                )
-                
-                # Combine all configs
-                all_configs = response.get('Items', []) + public_response.get('Items', [])
+                # Get all configurations for the user
+                all_configs = get_all_configs(self.user_id)
                 
                 for config in all_configs:
                     try:
