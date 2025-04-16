@@ -1402,6 +1402,62 @@ def fetch_api_credentials(user_id: str, app_names=None):
         logger.error(f"Error fetching API credentials: {str(e)}")
         return None, None 
 
+def get_all_configs(user_id: str) -> List[Dict[str, Any]]:
+    """
+    Get all configurations (website and API) for a user.
+    
+    This function fetches all configurations available to a user, including:
+    - User's own configs
+    - Configs shared directly with the user
+    - Publicly shared configs
+    
+    Args:
+        user_id: The user ID to fetch configurations for
+        
+    Returns:
+        A list of configuration dictionaries
+    """
+    if not user_id:
+        logger.error("User ID not provided")
+        return []
+        
+    try:
+        # Initialize empty list to store configs
+        all_configs = []
+        
+        # Get DynamoDB table
+        table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
+        
+        # First get user's own configs and configs shared directly with them
+        response = table.query(
+            KeyConditionExpression='userId = :userId',
+            ExpressionAttributeValues={
+                ':userId': user_id
+            }
+        )
+        
+        all_configs.extend(response.get('Items', []))
+        
+        # Get publicly shared configs from other users
+        public_response = table.query(
+            IndexName='ShareWithEveryoneIndex',
+            KeyConditionExpression='shareWithEveryone = :shareWithEveryone',
+            FilterExpression='userId <> :userId',
+            ExpressionAttributeValues={
+                ':shareWithEveryone': 1,
+                ':userId': user_id
+            }
+        )
+        
+        all_configs.extend(public_response.get('Items', []))
+        
+        logger.info(f"Retrieved {len(all_configs)} configurations for user {user_id}")
+        return all_configs
+        
+    except Exception as e:
+        logger.error(f"Error fetching configurations: {str(e)}")
+        return []
+
 # List of functions to be exported from this module
 __all__ = [
     'get_downloads_path',
@@ -1414,5 +1470,6 @@ __all__ = [
     'call_github_api',
     'run_python_code_in_sandbox',
     'decrypt_password',
-    'fetch_api_credentials'
+    'fetch_api_credentials',
+    'get_all_configs'
 ] 
