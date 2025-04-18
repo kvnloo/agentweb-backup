@@ -56,6 +56,7 @@ interface TaskExecution {
   llmName?: string;
   archived?: boolean;
   archivedAt?: string;
+  outputAsJson?: boolean;
 }
 
 interface UserInteraction {
@@ -66,6 +67,46 @@ interface UserInteraction {
   timestamp: number;
   screenshot_url?: string;
 }
+
+// Add helper function to detect JSON and format it
+const formatJsonIfValid = (text: string): JSX.Element => {
+  // Check if text is valid JSON
+  try {
+    const parsed = JSON.parse(text);
+    const formattedJson = JSON.stringify(parsed, null, 2);
+    
+    return (
+      <pre
+        style={{
+          backgroundColor: '#f5f5f5',
+          padding: '12px',
+          borderRadius: '4px',
+          overflow: 'auto',
+          maxHeight: '500px',
+          fontSize: '0.9rem',
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-word'
+        }}
+      >
+        {formattedJson}
+      </pre>
+    );
+  } catch (e) {
+    // If not valid JSON, return regular text
+    return (
+      <Typography 
+        variant="body1" 
+        sx={{ 
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-word',
+          overflowWrap: 'break-word'
+        }}
+      >
+        {text}
+      </Typography>
+    );
+  }
+};
 
 export default function ExecutionDetails() {
   const [execution, setExecution] = useState<TaskExecution | null>(null);
@@ -353,17 +394,36 @@ export default function ExecutionDetails() {
               Result
             </Typography>
             <Paper variant="outlined" sx={{ p: 2, bgcolor: execution.error ? 'error.50' : 'success.50' }}>
-              <Typography 
-                variant="body1" 
-                color={execution.error ? 'error' : 'inherit'}
-                sx={{ 
-                  whiteSpace: 'pre-wrap',
-                  wordBreak: 'break-word',
-                  overflowWrap: 'break-word'
-                }}
-              >
-                {execution.error || execution.result || 'No result available'}
-              </Typography>
+              {execution.error ? (
+                <Typography 
+                  variant="body1" 
+                  color="error"
+                  sx={{ 
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-word',
+                    overflowWrap: 'break-word'
+                  }}
+                >
+                  {execution.error}
+                </Typography>
+              ) : execution.result ? (
+                execution.outputAsJson ? (
+                  formatJsonIfValid(execution.result)
+                ) : (
+                  <Typography 
+                    variant="body1" 
+                    sx={{ 
+                      whiteSpace: 'pre-wrap',
+                      wordBreak: 'break-word',
+                      overflowWrap: 'break-word'
+                    }}
+                  >
+                    {execution.result}
+                  </Typography>
+                )
+              ) : (
+                <Typography variant="body1">No result available</Typography>
+              )}
             </Paper>
           </Grid>
 

@@ -219,7 +219,7 @@ async def process_schedules():
     except Exception as e:
         logger.error(f"Error in process_schedules: {e}")
 
-def update_execution_status(execution_id, status, result=None, error=None, details_gif=None, prompt=None, llm_name=None):
+def update_execution_status(execution_id, status, result=None, error=None, details_gif=None, prompt=None, llm_name=None, output_as_json=False):
     try:
         update_expression = "SET #status = :status"
         expression_values = {
@@ -255,6 +255,10 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
         if llm_name is not None:
             update_expression += ", llmName = :llmName"
             expression_values[':llmName'] = llm_name
+            
+        if output_as_json is not None:
+            update_expression += ", outputAsJson = :outputAsJson"
+            expression_values[':outputAsJson'] = output_as_json
 
         # Get the execution to get the taskId and startTime
         execution = executions_table.get_item(Key={'executionId': execution_id}).get('Item')
@@ -406,9 +410,7 @@ def update_workflow_execution(workflow_execution_id: str, task_id: str, task_sta
         logger.error(f"Error updating workflow execution: {e}")
         return False
 
-async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str, run_user_id: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False) -> Dict[str, Any]:
-    """Run the web agent with the given parameters"""
-    process = None
+async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str, run_user_id: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False) -> Dict[str, Any]:
     try:
         # Create necessary directories
         os.makedirs('prompts', exist_ok=True)
@@ -443,6 +445,8 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
             cmd.append('--extract-page-content')
         if validate_output:
             cmd.append('--validate-output')
+        if output_as_json:
+            cmd.append('--output-as-json')
         
         # Run command with output redirection
         logger.info(f"Running command: {' '.join(cmd)}")
@@ -625,6 +629,9 @@ async def execute_task(execution):
             if task.get('attachments'):
                 attachment_list = "\n".join([f"- {attachment['filename']}" for attachment in task['attachments']])
                 prompt += f"\n\nThe following files are attached to this task:\n{attachment_list}"
+
+            # if task.get('outputAsJson'):
+            #     prompt = f"{prompt} Output result as JSON instead of free text."
             
             # Update execution status to running and include the prompt
             update_execution_status(execution_id, 'running', prompt=prompt)
@@ -767,6 +774,8 @@ async def execute_task(execution):
                         is_complex = bool(task.get('isComplexTask', False)) if task else False
                         timeout_seconds = int(os.getenv('COMPLEX_TASK_EXECUTION_TIMEOUT_SECONDS', '1800')) if is_complex else int(os.getenv('TASK_EXECUTION_TIMEOUT_SECONDS', '900'))
                         logger.info(f"Running web agent with timeout of {timeout_seconds} seconds (Complex task: {is_complex})")
+
+                        output_as_json = bool(task.get('outputAsJson', False)) if task else False
                         
                         # Create a task for running the web agent
                         web_agent_task = asyncio.create_task(
@@ -781,7 +790,8 @@ async def execute_task(execution):
                                 run_user_id,
                                 is_complex,
                                 bool(task.get('extractPageContent', False)) if task else False,
-                                bool(task.get('validateOutput', False)) if task else False
+                                bool(task.get('validateOutput', False)) if task else False,
+                                output_as_json
                             )
                         )
                         
@@ -830,7 +840,8 @@ async def execute_task(execution):
                             'completed', 
                             result=result_summary,
                             details_gif=details_gif,
-                            llm_name=llm_name
+                            llm_name=llm_name,
+                            output_as_json=output_as_json
                         )
                         logger.info(f"Updated execution status to completed for {execution_id}")
                     except Exception as e:
