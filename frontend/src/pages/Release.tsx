@@ -7,6 +7,16 @@ interface Release {
 
 const releases: Release[] = [
   {
+    date: "2025-04-17",
+    changes: [
+      "Added Output As JSON option on Task Details page",
+      "- When enabled, the agent will output results in structured JSON format",
+      "- Useful for programmatic processing of agent outputs",
+      "- Task will fail if agent cannot produce valid JSON output",
+      "Improved reliability of agent login by providing the list of domains with valid credentials to the agent"
+    ]
+  },
+  {
     date: "2025-03-26",
     changes: [
       "Added support for code management with GitHub",
