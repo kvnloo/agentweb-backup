@@ -68,6 +68,7 @@ interface Task {
   isComplexTask?: boolean;
   extractPageContent?: boolean;  // New flag for extracting page content
   validateOutput?: boolean;  // Flag for validating agent output
+  outputAsJson?: boolean;  // Flag for outputting result as JSON
   llmName?: string;
   attachments?: TaskAttachment[];
 }
@@ -590,6 +591,7 @@ export default function TaskDetails() {
         updateData.isComplexTask = false;
         updateData.extractPageContent = false;
         updateData.validateOutput = false;
+        updateData.outputAsJson = false;
       }
       
       // Reset LLM selection when toggling deep research mode
@@ -1007,6 +1009,30 @@ export default function TaskDetails() {
     }
   };
 
+  // Add JSON output toggle handler
+  const handleJsonOutputToggle = async () => {
+    try {
+      await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        { outputAsJson: !task?.outputAsJson },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      // Update the task state with the response from the server
+      const taskResponse = await axios.get(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+      
+      setTask(taskResponse.data);
+    } catch (error) {
+      console.error('Error updating JSON output setting:', error);
+      setError('Failed to update Output As JSON setting');
+    }
+  };
+
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
@@ -1280,6 +1306,20 @@ export default function TaskDetails() {
                         />
                       }
                       label="Validate Output"
+                      sx={{ mt: 1, opacity: Boolean(task.isDeepResearch) ? 0.5 : 1 }}
+                    />
+                  </Tooltip>
+                  <Tooltip title="When enabled, the agent will output the result in JSON format. If the agent fails to produce valid JSON, the task will fail.">
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          checked={task?.outputAsJson || false}
+                          onChange={handleJsonOutputToggle}
+                          disabled={loading || Boolean(task.isDeepResearch)}
+                          color="primary"
+                        />
+                      }
+                      label="Output As JSON"
                       sx={{ mt: 1, opacity: Boolean(task.isDeepResearch) ? 0.5 : 1 }}
                     />
                   </Tooltip>

@@ -233,6 +233,10 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
       updates.validateOutput = Boolean(req.body.validateOutput);
     }
 
+    if (req.body.outputAsJson !== undefined) {
+      updates.outputAsJson = Boolean(req.body.outputAsJson);
+    }
+
     if (req.body.llmName !== undefined) {
       updates.llmName = req.body.llmName || null;  // Convert empty string to null
     }

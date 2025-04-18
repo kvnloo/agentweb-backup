@@ -320,14 +320,15 @@ export const taskDb = {
         ExpressionAttributeValues: {
           ':userId': userId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
           '#e': 'error',
           '#sum': 'summary',
           '#epc': 'extractPageContent',
-          '#vo': 'validateOutput'
+          '#vo': 'validateOutput',
+          '#oaj': 'outputAsJson'
         }
       };
 
@@ -367,7 +368,7 @@ export const taskDb = {
         Key: {
           taskId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
@@ -379,7 +380,8 @@ export const taskDb = {
           '#llm': 'llmName',
           '#ct': 'isComplexTask',
           '#epc': 'extractPageContent',
-          '#vo': 'validateOutput'
+          '#vo': 'validateOutput',
+          '#oaj': 'outputAsJson'
         }
       };
 
@@ -402,6 +404,7 @@ export const taskDb = {
     isComplexTask: boolean;
     extractPageContent: boolean;
     validateOutput: boolean;
+    outputAsJson: boolean;
     llmName: string;
     attachments: TaskAttachment[];
   }>) {

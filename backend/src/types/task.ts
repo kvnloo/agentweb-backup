@@ -13,5 +13,6 @@ export interface Task {
   isComplexTask?: boolean;  // Whether the task requires more steps to complete (100 vs 25)
   extractPageContent?: boolean;  // Whether to extract JSON content from pages
   validateOutput?: boolean;  // Whether to validate output from the agent
+  outputAsJson?: boolean;  // Whether the agent should output the result in JSON format
   llmName?: string;  // The preferred LLM to try first for this task
 } 

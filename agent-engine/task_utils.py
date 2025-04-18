@@ -1458,6 +1458,43 @@ def get_all_configs(user_id: str) -> List[Dict[str, Any]]:
         logger.error(f"Error fetching configurations: {str(e)}")
         return []
 
+def parse_json(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Extract and parse JSON from text content.
+    
+    This function attempts to find and parse JSON in the provided text:
+    1. First tries to parse the entire text directly
+    2. If that fails, looks for content between the first { and last }
+    
+    Args:
+        text: The text content that may contain JSON
+        
+    Returns:
+        Parsed JSON object or None if no valid JSON was found
+    """
+    if not text or not isinstance(text, str):
+        return None
+    
+    # Try parsing the entire text as JSON first (fastest path)
+    try:
+        return json.loads(text.strip())
+    except json.JSONDecodeError:
+        pass
+    
+    # If direct parsing fails, try to extract JSON between braces
+    try:
+        start_idx = text.find('{')
+        end_idx = text.rfind('}')
+        
+        if start_idx != -1 and end_idx != -1 and start_idx < end_idx:
+            potential_json = text[start_idx:end_idx+1]
+            return json.loads(potential_json)
+    except json.JSONDecodeError:
+        pass
+        
+    # No valid JSON found
+    return None
+
 # List of functions to be exported from this module
 __all__ = [
     'get_downloads_path',
@@ -1471,5 +1508,6 @@ __all__ = [
     'run_python_code_in_sandbox',
     'decrypt_password',
     'fetch_api_credentials',
-    'get_all_configs'
+    'get_all_configs',
+    'parse_json'
 ] 

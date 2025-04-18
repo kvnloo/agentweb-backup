@@ -27,7 +27,7 @@ import aiohttp
 import base64  # Add at the top with other imports
 import boto3  # Add at the top with other imports
 from urllib.parse import quote
-from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content, generate_content_hash, get_agent_code_base_path, call_github_api, run_python_code_in_sandbox, fetch_api_credentials, decrypt_password, get_all_configs
+from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content, generate_content_hash, get_agent_code_base_path, call_github_api, run_python_code_in_sandbox, fetch_api_credentials, decrypt_password, get_all_configs, parse_json
 # Load environment variables
 load_dotenv()
 
@@ -102,7 +102,7 @@ class WebAgent:
             handler.close()
         self._log_handlers.clear()
 
-    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False) -> Dict[str, Any]:
+    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
         log_file = None
         try:
@@ -120,6 +120,7 @@ class WebAgent:
             logger.info(f"Complex task: {is_complex_task}")
             logger.info(f"Extract page content: {extract_page_content}")
             logger.info(f"Validate output: {validate_output}")
+            logger.info(f"Output as JSON: {output_as_json}")
             
             # Register actions after setting is_interactive
             self._register_actions()
@@ -128,6 +129,10 @@ class WebAgent:
             if self.is_interactive:
                 prompt = f"{prompt}\n\nNote: This task is running in interactive mode. You can ask the user questions using the 'Ask user for input' action when you need additional information."
             
+            # Add JSON output instruction if enabled
+            if output_as_json:
+                prompt = f"{prompt}\n\nRequirement: Output result as JSON instead of free text."
+
             # Create task
             self.task = prompt
 
@@ -148,6 +153,32 @@ class WebAgent:
 
             if agent_message is None:
                 agent_message = 'Oops! Something went wrong while running AgentWeb.'
+            
+            # If json output is required, validate the response is proper JSON
+            if output_as_json and task_is_done:
+                logger.info("JSON output required, validating response...")
+                try:
+                    # Use parse_json function to extract JSON from the response
+                    json_output = parse_json(agent_message)
+                    
+                    if json_output is None:
+                        # No valid JSON found
+                        logger.error("No valid JSON found in response")
+                        return {
+                            "success": False,
+                            "error": "The agent failed to produce a valid JSON output as requested.",
+                            "llmName": self.llm_name
+                        }
+                    
+                    logger.info(f"Valid JSON output extracted: {agent_message[:100]}...")
+                
+                except Exception as e:
+                    logger.error(f"Error validating JSON output: {e}")
+                    return {
+                        "success": False,
+                        "error": f"The agent failed to produce a valid JSON output: {str(e)}",
+                        "llmName": self.llm_name
+                    }
             
             # If task completed successfully, check for downloaded files
             result_files = []
@@ -1298,6 +1329,7 @@ async def main():
     parser.add_argument('--is_complex_task', action='store_true', help='Enable complex task mode with 100 steps')
     parser.add_argument('--extract-page-content', action='store_true', help='Extract page content as JSON files')
     parser.add_argument('--validate-output', action='store_true', help='Validate output from the agent')
+    parser.add_argument('--output-as-json', action='store_true', help='Format output as valid JSON')
     args = parser.parse_args()
 
     # Read prompt from file
@@ -1323,7 +1355,8 @@ async def main():
             generate_gif=args.gif_path,
             is_complex_task=args.is_complex_task,
             extract_page_content=args.extract_page_content,
-            validate_output=args.validate_output
+            validate_output=args.validate_output,
+            output_as_json=args.output_as_json
         )
         print(json.dumps(result))
         sys.exit(0 if result["success"] else 1)
