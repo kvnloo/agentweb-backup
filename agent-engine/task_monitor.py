@@ -679,6 +679,8 @@ async def execute_task(execution):
                 # Generate unique GIF path
                 random_suffix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=20))
                 gif_path = f"agent_history_{execution_id}_{random_suffix}.gif"
+
+                output_as_json = bool(task.get('outputAsJson', False)) if task else False
                 
                 # Run appropriate agent based on task type
                 if is_deep_research:
@@ -774,8 +776,6 @@ async def execute_task(execution):
                         is_complex = bool(task.get('isComplexTask', False)) if task else False
                         timeout_seconds = int(os.getenv('COMPLEX_TASK_EXECUTION_TIMEOUT_SECONDS', '1800')) if is_complex else int(os.getenv('TASK_EXECUTION_TIMEOUT_SECONDS', '900'))
                         logger.info(f"Running web agent with timeout of {timeout_seconds} seconds (Complex task: {is_complex})")
-
-                        output_as_json = bool(task.get('outputAsJson', False)) if task else False
                         
                         # Create a task for running the web agent
                         web_agent_task = asyncio.create_task(
