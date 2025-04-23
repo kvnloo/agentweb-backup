@@ -130,6 +130,14 @@ export default function Layout() {
               >
                 Guide
               </Button>
+              <Button 
+                color="primary" 
+                component={RouterLink} 
+                to="/marketing"
+                variant={isActivePath('/marketing') ? 'contained' : 'text'}
+              >
+                Marketing
+              </Button>
               {user && (
                 <>
                   <Button 
