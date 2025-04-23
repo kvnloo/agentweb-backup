@@ -41,15 +41,33 @@ export const createMarketResearch = async (params: MarketResearchParams, token: 
   try {
     console.log('Creating market research task with params:', JSON.stringify(params));
     
+    // Build a comprehensive research prompt using the format from agentWebService.ts
+    const defaultPrompt = `Conduct a comprehensive market research for ${params.target || 'the specified target'}.
+
+RESEARCH REQUIREMENTS:
+1. Market Overview: Provide current market size, growth trends, and major market segments
+2. Competitor Analysis: Identify key competitors${params.competitors?.length ? ` (including ${params.competitors.join(', ')})` : ''} and analyze their market share, strengths, and weaknesses
+3. Target Audience: ${params.audience ? `Analyze the specified audience: ${params.audience}` : 'Identify and analyze key customer segments, their needs, and buying behaviors'}
+4. SWOT Analysis: Strengths, weaknesses, opportunities, and threats in the market
+5. Industry Trends: ${params.industry ? `Specific to the ${params.industry} industry` : 'Major trends shaping the industry'}, including technological advancements and regulatory changes
+6. Pricing Analysis: Review of pricing strategies in the market
+7. Distribution Channels: Analysis of how products/services reach customers
+
+OUTPUT FORMAT:
+- Executive Summary: Brief overview of key findings (1-2 paragraphs)
+- Detailed Sections: Each requirement above should have its own clearly labeled section
+- Data Visualization: Describe any relevant charts or graphs that would enhance the research
+- Recommendations: Actionable insights based on the research findings
+- Sources: List of data sources used for the research
+
+Please provide comprehensive, data-backed analysis with specific examples and statistics where available.`;
+    
     // Prepare the task data
     const taskData = {
       name: `Market Research ${params.target ? `for ${params.target}` : ''}`,
-      prompt: params.prompt || `Perform market research on ${params.target || 'the specified industry'}.
-        ${params.industry ? `Industry: ${params.industry}` : ''}
-        ${params.competitors?.length ? `Competitors: ${params.competitors.join(', ')}` : ''}
-        ${params.audience ? `Target audience: ${params.audience}` : ''}`,
+      prompt: params.prompt || defaultPrompt,
       isInteractive: false,
-      isDeepResearch: true,
+      isDeepResearch: false,
       emailNotification: false
     };
     
