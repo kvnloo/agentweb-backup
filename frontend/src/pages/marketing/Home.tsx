@@ -108,7 +108,7 @@ const Home: React.FC = () => {
                 </Typography>
                 <Button 
                   component={Link} 
-                  to="/marketing/market-research"
+                  to="/marketing/research"
                   endIcon={<ChevronRightIcon />}
                   sx={{ 
                     '&:hover .MuiSvgIcon-root': { transform: 'translateX(4px)' },

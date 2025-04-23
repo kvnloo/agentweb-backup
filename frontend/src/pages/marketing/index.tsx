@@ -8,6 +8,7 @@ import Home from './Home';
 import SocialListening from './SocialListening';
 import NotFound from './NotFound';
 import MarketResearch from './MarketResearch';
+import MarketResearchDetail from './MarketResearchDetail';
 
 // Placeholders for components we haven't implemented yet
 const ReportDetail = () => <div>Report Detail</div>;
@@ -26,7 +27,9 @@ const Marketing: React.FC = () => {
       <Routes>
         <Route path="/" element={<Home />} />
         <Route path="/social-listening" element={<SocialListening />} />
-        <Route path="/market-research" element={<MarketResearch />} />
+        <Route path="/research" element={<MarketResearch />} />
+        <Route path="/research/:taskId" element={<MarketResearchDetail />} />
+        <Route path="/market-research" element={<Navigate to="/marketing/research" replace />} />
         <Route path="/report/:id" element={<ReportDetail />} />
         <Route path="/blog" element={<Blog />} />
         <Route path="*" element={<NotFound />} />

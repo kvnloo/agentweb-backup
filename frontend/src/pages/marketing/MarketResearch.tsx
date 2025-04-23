@@ -10,7 +10,6 @@ import {
   Card,
   CardContent,
   CircularProgress,
-  Divider,
   Alert,
   AlertTitle,
   IconButton,
@@ -19,16 +18,13 @@ import {
 } from '@mui/material';
 import SearchIcon from '@mui/icons-material/Search';
 import RefreshIcon from '@mui/icons-material/Refresh';
-import SaveIcon from '@mui/icons-material/Save';
-import CloseIcon from '@mui/icons-material/Close';
 import { useAuth } from '../../contexts/AuthContext';
 import { 
   createMarketResearch, 
-  getMarketResearch, 
   getAllMarketResearch 
 } from '../../services/marketingService';
-import { Link as RouterLink } from 'react-router-dom';
-import ReactMarkdown from 'react-markdown';
+import { Link as RouterLink, useNavigate } from 'react-router-dom';
+import CloseIcon from '@mui/icons-material/Close';
 
 interface MarketResearchTask {
   taskId: string;
@@ -47,6 +43,7 @@ interface MarketResearchTask {
 const MarketResearch: React.FC = () => {
   // Get auth context
   const { user, token, isAuthenticated } = useAuth();
+  const navigate = useNavigate();
   
   // Research form state
   const [target, setTarget] = useState('');
@@ -58,9 +55,7 @@ const MarketResearch: React.FC = () => {
   
   // Task state
   const [isLoading, setIsLoading] = useState(false);
-  const [currentTask, setCurrentTask] = useState<MarketResearchTask | null>(null);
   const [recentTasks, setRecentTasks] = useState<MarketResearchTask[]>([]);
-  const [refreshInterval, setRefreshInterval] = useState<NodeJS.Timeout | null>(null);
   
   // Error state
   const [error, setError] = useState<string | null>(null);
@@ -83,24 +78,6 @@ const MarketResearch: React.FC = () => {
       loadRecentTasks();
     }
   }, [isAuthenticated, token]);
-
-  // Auto-refresh current task status
-  useEffect(() => {
-    if (currentTask && currentTask.execution?.status === 'running' && token) {
-      const interval = setInterval(() => {
-        refreshTaskStatus(currentTask.taskId);
-      }, 5000); // Check every 5 seconds
-      
-      setRefreshInterval(interval);
-      
-      return () => {
-        if (interval) clearInterval(interval);
-      };
-    } else if (refreshInterval) {
-      clearInterval(refreshInterval);
-      setRefreshInterval(null);
-    }
-  }, [currentTask, token]);
 
   const loadRecentTasks = async () => {
     if (!token) {
@@ -144,28 +121,6 @@ const MarketResearch: React.FC = () => {
     }
   };
 
-  const refreshTaskStatus = async (taskId: string) => {
-    if (!token) {
-      console.error('Cannot refresh task: No authentication token available');
-      return;
-    }
-
-    try {
-      const task = await getMarketResearch(taskId, token);
-      setCurrentTask(task);
-      
-      // If task is completed, refresh the recent tasks list
-      if (task.execution?.status === 'completed' && refreshInterval) {
-        clearInterval(refreshInterval);
-        setRefreshInterval(null);
-        loadRecentTasks();
-      }
-    } catch (error) {
-      console.error('Error refreshing task status:', error);
-      // Don't show error for refresh failures to avoid spamming the user
-    }
-  };
-
   const handleSubmitResearch = async () => {
     if (!token) {
       setSnackbar({
@@ -202,19 +157,14 @@ const MarketResearch: React.FC = () => {
       const result = await createMarketResearch(params, token);
       
       if (result && result.task) {
-        setCurrentTask(result.task);
-        
-        // If task is executed, start monitoring
-        if (result.execution) {
-          // Immediately load task details to get initial status
-          refreshTaskStatus(result.task.taskId);
-        }
-        
         setSnackbar({
           open: true,
           message: 'Market research task started successfully',
           severity: 'success'
         });
+        
+        // Navigate to the detail page for the new task
+        navigate(`/marketing/research/${result.task.taskId}`);
       }
     } catch (error) {
       console.error('Error creating market research task:', error);
@@ -237,131 +187,8 @@ const MarketResearch: React.FC = () => {
     }
   };
 
-  const loadTask = async (taskId: string) => {
-    if (!token) {
-      console.error('Cannot load task: No authentication token available');
-      return;
-    }
-
-    setIsLoading(true);
-    setError(null);
-    
-    try {
-      const task = await getMarketResearch(taskId, token);
-      setCurrentTask(task);
-    } catch (error) {
-      console.error('Error loading task:', error);
-      
-      let errorMessage = 'Failed to load task details';
-      
-      if (error instanceof Error) {
-        errorMessage += `: ${error.message}`;
-      }
-      
-      setError(errorMessage);
-      
-      setSnackbar({
-        open: true,
-        message: errorMessage,
-        severity: 'error'
-      });
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  const renderTaskResult = () => {
-    if (!currentTask || !currentTask.execution) {
-      return null;
-    }
-
-    const { execution } = currentTask;
-    
-    if (execution.status === 'running') {
-      return (
-        <Box sx={{ textAlign: 'center', py: 4 }}>
-          <CircularProgress size={40} />
-          <Typography variant="h6" sx={{ mt: 2 }}>
-            Research in progress...
-          </Typography>
-          <Typography variant="body2" color="text.secondary">
-            This may take a few minutes to complete.
-          </Typography>
-        </Box>
-      );
-    }
-    
-    if (execution.status === 'failed') {
-      return (
-        <Alert severity="error" sx={{ my: 2 }}>
-          <AlertTitle>Research task failed</AlertTitle>
-          There was an error processing your research request.
-        </Alert>
-      );
-    }
-    
-    if (execution.status === 'completed' && execution.result) {
-      // Get content for markdown rendering
-      const resultContent = typeof execution.result === 'string' 
-        ? execution.result 
-        : JSON.stringify(execution.result, null, 2);
-      
-      return (
-        <Box>
-          <Box sx={{ mb: 2 }}>
-            <Typography variant="h5" gutterBottom>
-              Research Results for {currentTask.name}
-            </Typography>
-          </Box>
-          
-          <Paper sx={{ p: 3, mb: 4, maxWidth: '100%', overflow: 'auto' }}>
-            <Box sx={{ 
-              p: 2,
-              '& a': { color: 'primary.main' },
-              '& img': { maxWidth: '100%' },
-              '& h1, & h2, & h3, & h4, & h5, & h6': { 
-                mt: 2, 
-                mb: 1,
-                fontWeight: 'bold'
-              },
-              '& ul, & ol': { pl: 3, my: 1 },
-              '& code': { 
-                bgcolor: 'grey.100', 
-                px: 0.5, 
-                borderRadius: 0.5,
-                fontFamily: 'monospace'
-              },
-              '& pre': { 
-                bgcolor: 'grey.100', 
-                p: 1.5, 
-                borderRadius: 1,
-                overflow: 'auto',
-                fontFamily: 'monospace'
-              },
-              '& blockquote': {
-                borderLeft: '4px solid',
-                borderColor: 'grey.300',
-                pl: 2,
-                py: 0.5,
-                my: 1,
-                color: 'text.secondary'
-              }
-            }}>
-              <ReactMarkdown>
-                {resultContent}
-              </ReactMarkdown>
-            </Box>
-          </Paper>
-        </Box>
-      );
-    }
-    
-    return (
-      <Alert severity="warning" sx={{ my: 2 }}>
-        <AlertTitle>No results available</AlertTitle>
-        The research task has not yet produced any results.
-      </Alert>
-    );
+  const viewTaskDetails = (taskId: string) => {
+    navigate(`/marketing/research/${taskId}`);
   };
 
   return (
@@ -510,22 +337,6 @@ const MarketResearch: React.FC = () => {
               </Grid>
             </Paper>
 
-            {currentTask && (
-              <Paper sx={{ p: 3, mb: 4 }}>
-                <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
-                  <Typography variant="h6">Current Research Task</Typography>
-                  <Button 
-                    startIcon={<RefreshIcon />}
-                    onClick={() => refreshTaskStatus(currentTask.taskId)}
-                    disabled={isLoading}
-                  >
-                    Refresh
-                  </Button>
-                </Box>
-                {renderTaskResult()}
-              </Paper>
-            )}
-
             {!isLoading && (
               <Box sx={{ display: 'flex', justifyContent: 'center', mb: 4 }}>
                 <Button 
@@ -564,7 +375,7 @@ const MarketResearch: React.FC = () => {
                             <Grid item xs={2} sx={{ display: 'flex', justifyContent: 'flex-end' }}>
                               <Button 
                                 size="small" 
-                                onClick={() => loadTask(task.taskId)}
+                                onClick={() => viewTaskDetails(task.taskId)}
                                 disabled={isLoading}
                               >
                                 View
