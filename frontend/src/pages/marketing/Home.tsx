@@ -11,13 +11,15 @@ import {
   Container,
   Avatar,
   Chip,
-  useTheme
+  useTheme,
+  Stack
 } from '@mui/material';
 import SearchIcon from '@mui/icons-material/Search';
 import RadioIcon from '@mui/icons-material/Radio';
 import LightbulbIcon from '@mui/icons-material/Lightbulb';
 import ChevronRightIcon from '@mui/icons-material/ChevronRight';
 import FormatQuoteIcon from '@mui/icons-material/FormatQuote';
+import BrushIcon from '@mui/icons-material/Brush';
 
 const testimonials = [
   {
@@ -83,7 +85,7 @@ const Home: React.FC = () => {
         </Box>
 
         <Grid container spacing={3} sx={{ mb: 6 }}>
-          <Grid item xs={12} md={4}>
+          <Grid item xs={12} md={6} lg={3}>
             <Card sx={{ 
               height: '100%',
               border: `1px solid ${theme.palette.divider}`,
@@ -121,45 +123,7 @@ const Home: React.FC = () => {
             </Card>
           </Grid>
 
-          <Grid item xs={12} md={4}>
-            <Card sx={{ 
-              height: '100%',
-              border: `1px solid ${theme.palette.divider}`,
-              transition: 'box-shadow 0.3s',
-              '&:hover': {
-                boxShadow: theme.shadows[10]
-              }
-            }}>
-              <CardHeader
-                avatar={
-                  <Avatar sx={{ bgcolor: 'secondary.light' }}>
-                    <RadioIcon />
-                  </Avatar>
-                }
-                title={
-                  <Typography variant="h6">Social Listening</Typography>
-                }
-              />
-              <CardContent>
-                <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
-                  Monitor and analyze social media trends and conversations in real-time.
-                </Typography>
-                <Button 
-                  component={Link} 
-                  to="/marketing/social-listening"
-                  endIcon={<ChevronRightIcon />}
-                  sx={{ 
-                    '&:hover .MuiSvgIcon-root': { transform: 'translateX(4px)' },
-                    '& .MuiSvgIcon-root': { transition: 'transform 0.2s' }
-                  }}
-                >
-                  Learn More
-                </Button>
-              </CardContent>
-            </Card>
-          </Grid>
-
-          <Grid item xs={12} md={4}>
+          <Grid item xs={12} md={6} lg={3}>
             <Card sx={{ 
               height: '100%',
               border: `1px solid ${theme.palette.divider}`,
@@ -185,6 +149,98 @@ const Home: React.FC = () => {
                 <Button 
                   component={Link} 
                   to="/marketing/creative"
+                  endIcon={<ChevronRightIcon />}
+                  sx={{ 
+                    '&:hover .MuiSvgIcon-root': { transform: 'translateX(4px)' },
+                    '& .MuiSvgIcon-root': { transition: 'transform 0.2s' }
+                  }}
+                >
+                  Learn More
+                </Button>
+              </CardContent>
+            </Card>
+          </Grid>
+
+          <Grid item xs={12} md={6} lg={3}>
+            <Card sx={{ 
+              height: '100%',
+              border: `1px solid ${theme.palette.divider}`,
+              transition: 'box-shadow 0.3s',
+              '&:hover': {
+                boxShadow: theme.shadows[10]
+              }
+            }}>
+              <CardHeader
+                avatar={
+                  <Avatar sx={{ bgcolor: 'info.light' }}>
+                    <BrushIcon />
+                  </Avatar>
+                }
+                title={
+                  <Stack direction="row" spacing={1} alignItems="center">
+                    <Typography variant="h6">Creative Generation</Typography>
+                    <Chip
+                      label="Coming Soon"
+                      size="small"
+                      color="secondary"
+                      sx={{ height: 20, fontSize: '0.7rem' }}
+                    />
+                  </Stack>
+                }
+              />
+              <CardContent>
+                <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
+                  Produce compelling advertising copy, visuals, and video/script assets with AI.
+                </Typography>
+                <Button 
+                  component={Link} 
+                  to="/marketing/creative-generation"
+                  endIcon={<ChevronRightIcon />}
+                  sx={{ 
+                    '&:hover .MuiSvgIcon-root': { transform: 'translateX(4px)' },
+                    '& .MuiSvgIcon-root': { transition: 'transform 0.2s' }
+                  }}
+                >
+                  Learn More
+                </Button>
+              </CardContent>
+            </Card>
+          </Grid>
+
+          <Grid item xs={12} md={6} lg={3}>
+            <Card sx={{ 
+              height: '100%',
+              border: `1px solid ${theme.palette.divider}`,
+              transition: 'box-shadow 0.3s',
+              '&:hover': {
+                boxShadow: theme.shadows[10]
+              }
+            }}>
+              <CardHeader
+                avatar={
+                  <Avatar sx={{ bgcolor: 'secondary.light' }}>
+                    <RadioIcon />
+                  </Avatar>
+                }
+                title={
+                  <Stack direction="row" spacing={1} alignItems="center">
+                    <Typography variant="h6">Social Listening</Typography>
+                    <Chip
+                      label="Coming Soon"
+                      size="small"
+                      color="secondary"
+                      sx={{ height: 20, fontSize: '0.7rem' }}
+                    />
+                  </Stack>
+                }
+              />
+              <CardContent>
+                <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
+                  Monitor and analyze social media trends and conversations in real-time.
+                </Typography>
+                <Button 
+                  component={Link} 
+                  to="/marketing/social-listening"
                   endIcon={<ChevronRightIcon />}
                   sx={{ 
                     '&:hover .MuiSvgIcon-root': { transform: 'translateX(4px)' },

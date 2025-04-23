@@ -26,7 +26,8 @@ const Marketing: React.FC = () => {
     }}>
       <Routes>
         <Route path="/" element={<Home />} />
-        <Route path="/social-listening" element={<SocialListening />} />
+        <Route path="/social-listening" element={<NotFound />} />
+        <Route path="/creative-generation" element={<NotFound />} />
         <Route path="/research" element={<MarketResearch />} />
         <Route path="/research/:taskId" element={<MarketResearchDetail />} />
         <Route path="/market-research" element={<Navigate to="/marketing/research" replace />} />
