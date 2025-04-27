@@ -1,0 +1,31 @@
+import express, { Request, Response } from 'express';
+import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
+import {
+  createChatSession,
+  listUserSessions,
+  getChatSession,
+  sendMessage,
+  deleteChatSession
+} from '../controllers/chatbot';
+
+const router = express.Router();
+
+// All chatbot routes require authentication
+router.use(authenticateToken);
+
+// Create a new chat session
+router.post('/sessions', (req: Request, res: Response) => createChatSession(req as AuthenticatedRequest, res));
+
+// List all chat sessions for the current user
+router.get('/sessions', (req: Request, res: Response) => listUserSessions(req as AuthenticatedRequest, res));
+
+// Get a specific chat session
+router.get('/sessions/:sessionId', (req: Request, res: Response) => getChatSession(req as AuthenticatedRequest, res));
+
+// Send a message and get a response
+router.post('/sessions/:sessionId/messages', (req: Request, res: Response) => sendMessage(req as AuthenticatedRequest, res));
+
+// Delete a chat session
+router.delete('/sessions/:sessionId', (req: Request, res: Response) => deleteChatSession(req as AuthenticatedRequest, res));
+
+export default router; 

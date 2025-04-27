@@ -17,6 +17,7 @@ import AccountCircle from '@mui/icons-material/AccountCircle';
 import { useAuth } from '../contexts/AuthContext';
 import { Theme } from '@mui/material/styles';
 import logo from '../assets/logo.svg';
+import ChatSupport from './ChatSupport';
 
 export default function Layout() {
   const { user, logout } = useAuth();
@@ -256,18 +257,22 @@ export default function Layout() {
           py: 3,
           px: 2,
           mt: 'auto',
-          backgroundColor: (theme: Theme) =>
+          backgroundColor: (theme) =>
             theme.palette.mode === 'light'
-              ? theme.palette.grey[200]
-              : theme.palette.grey[800],
+              ? theme.palette.grey[100]
+              : theme.palette.grey[900],
         }}
       >
-        <Container maxWidth="sm">
+        <Container maxWidth="lg">
           <Typography variant="body2" color="text.secondary" align="center">
-            © {new Date().getFullYear()} AgentWeb. All rights reserved.
+            {'© '}
+            {new Date().getFullYear()}
+            {' AgentWeb. All rights reserved.'}
           </Typography>
         </Container>
       </Box>
+      
+      {user && <ChatSupport />}
     </Box>
   );
 } 
