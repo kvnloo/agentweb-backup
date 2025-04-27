@@ -191,7 +191,7 @@ const ChatSupport: React.FC = () => {
 URL: ${currentUrl}
 Title: ${pageTitle}
 Path: ${currentPath}
-Content: ${mainContent.substring(0, 8000).trim()}
+Content: ${mainContent.substring(0, 100000).trim()}
     `;
     
     console.log(`Captured page context: ${context.length} characters`);
@@ -233,6 +233,9 @@ Content: ${mainContent.substring(0, 8000).trim()}
       const trimmedMessage = message.trim();
       setMessage('');
       
+      // Create a copy of current session to restore if API call fails
+      const currentSession = { ...session };
+      
       // Optimistically update UI with properly typed message
       const updatedMessages: ChatMessage[] = [
         ...(session.messages || []),
@@ -250,10 +253,40 @@ Content: ${mainContent.substring(0, 8000).trim()}
         { headers: { Authorization: `Bearer ${token}` } }
       );
       
-      // Update with actual response from server
-      setSession(response.data.session);
+      // Check if the response contains valid session data
+      if (response.data && response.data.session) {
+        // Update with actual response from server
+        setSession(response.data.session);
+      } else if (response.data && response.data.response) {
+        // If we just got a response without session update, append it to our local session
+        const assistantMessage: ChatMessage = {
+          role: 'assistant',
+          content: response.data.response
+        };
+        setSession({
+          ...currentSession,
+          messages: [...updatedMessages, assistantMessage]
+        });
+      }
     } catch (error) {
       console.error('Error sending message:', error);
+      // Show error message to user
+      const assistantMessage: ChatMessage = {
+        role: 'assistant',
+        content: "I'm sorry, there was an error processing your message. Please try again."
+      };
+      
+      // Keep the user's message and add error response
+      if (session) {
+        setSession({
+          ...session,
+          messages: [
+            ...session.messages.filter(msg => msg.role !== 'user' || msg.content !== message.trim()),
+            { role: 'user', content: message.trim() },
+            assistantMessage
+          ]
+        });
+      }
     } finally {
       setIsLoading(false);
     }
@@ -436,35 +469,12 @@ Content: ${mainContent.substring(0, 8000).trim()}
                 </Alert>
               )}
 
-              {/* Page context indicator */}
-              {isContextCaptured && (
-                <Box sx={{ 
-                  mb: 2, 
-                  display: 'flex', 
-                  alignItems: 'center', 
-                  justifyContent: 'center',
-                  px: 2,
-                  py: 1,
-                  bgcolor: 'success.light',
-                  color: 'success.contrastText',
-                  borderRadius: 1,
-                  fontSize: '0.75rem'
-                }}>
-                  <DescriptionIcon sx={{ fontSize: 16, mr: 0.5 }} />
-                  <Typography variant="caption">
-                    I can answer questions about this page
-                  </Typography>
-                </Box>
-              )}
-
               {displayMessages.length === 0 ? (
                 <Box sx={{ textAlign: 'center', color: 'text.secondary', mt: 5 }}>
-                  <Typography>How can I help you today?</Typography>
-                  {isContextCaptured && (
-                    <Typography variant="body2" sx={{ mt: 1, fontSize: '0.85rem' }}>
-                      Ask me anything about this page!
-                    </Typography>
-                  )}
+                  <Typography variant="h6" sx={{ mb: 2 }}>How can I help you today?</Typography>
+                  <Typography variant="body2" sx={{ fontSize: '0.9rem', px: 3 }}>
+                    I can help answer general questions about AgentWeb, information on this page.
+                  </Typography>
                 </Box>
               ) : (
                 displayMessages.map((msg, index) => (
