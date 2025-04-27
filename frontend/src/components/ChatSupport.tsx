@@ -220,6 +220,31 @@ const ChatSupport: React.FC = () => {
             p: 2,
             bgcolor: 'grey.50'
           }}>
+            {/* Discord community notice */}
+            <Box sx={{ 
+              mb: 2,
+              textAlign: 'center'
+            }}>
+              <Button
+                variant="text" 
+                size="small"
+                href="https://discord.gg/ec7yR3yG" 
+                target="_blank"
+                startIcon={<img src="https://assets-global.website-files.com/6257adef93867e50d84d30e2/636e0a6a49cf127bf92de1e2_icon_clyde_blurple_RGB.png" alt="Discord" style={{ width: 16, height: 16 }} />}
+                sx={{ 
+                  color: '#5865F2',
+                  textTransform: 'none',
+                  fontSize: '0.85rem',
+                  fontWeight: 500,
+                  '&:hover': {
+                    bgcolor: 'rgba(88, 101, 242, 0.08)'
+                  }
+                }}
+              >
+                Join Discord for Community Support
+              </Button>
+            </Box>
+
             {displayMessages.length === 0 ? (
               <Box sx={{ textAlign: 'center', color: 'text.secondary', mt: 5 }}>
                 <Typography>How can I help you today?</Typography>
