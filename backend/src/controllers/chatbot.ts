@@ -6,7 +6,9 @@ import { chatbotDb, generateChatResponse } from '../services/chatbotService';
 export const createChatSession = async (req: AuthenticatedRequest, res: Response) => {
   try {
     const userId = req.user.userId;
-    const session = await chatbotDb.createChatSession(userId);
+    const { pageContext } = req.body;
+    
+    const session = await chatbotDb.createChatSession(userId, pageContext);
     
     res.status(201).json(session);
   } catch (error: any) {
@@ -54,7 +56,7 @@ export const getChatSession = async (req: AuthenticatedRequest, res: Response) =
 export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { sessionId } = req.params;
-    const { message } = req.body;
+    const { message, pageContext } = req.body;
     
     if (!message) {
       return res.status(400).json({ message: 'Message is required' });
@@ -70,8 +72,8 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
       return res.status(403).json({ message: 'Access denied' });
     }
     
-    // Generate response using Azure OpenAI
-    const response = await generateChatResponse(sessionId, message);
+    // Generate response using Azure OpenAI with page context
+    const response = await generateChatResponse(sessionId, message, pageContext);
     
     // Return the updated session with the new messages
     const updatedSession = await chatbotDb.getChatSession(sessionId);

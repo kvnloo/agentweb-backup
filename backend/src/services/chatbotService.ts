@@ -40,6 +40,7 @@ export interface ChatSession {
   messages: ChatMessage[];
   createdAt: string;
   updatedAt: string;
+  pageContext?: string; // Optional field for storing page context
 }
 
 class ChatbotDB {
@@ -50,7 +51,7 @@ class ChatbotDB {
     console.log(`ChatbotDB initialized with table: ${this.tableName}`);
   }
 
-  async createChatSession(userId: string): Promise<ChatSession> {
+  async createChatSession(userId: string, pageContext?: string): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
     
@@ -78,6 +79,19 @@ Be helpful, concise, and accurate. If you don't know the answer, suggest the use
       createdAt: timestamp,
       updatedAt: timestamp
     };
+
+    // Add page context if provided
+    if (pageContext) {
+      chatSession.pageContext = pageContext;
+      
+      // Add additional system message with context instructions
+      chatSession.messages.push({
+        role: 'system',
+        content: `The user is currently viewing a page with the following content. Use this information when relevant to answer their questions:
+        
+${pageContext}`
+      });
+    }
 
     const params = {
       TableName: this.tableName,
@@ -174,6 +188,38 @@ Be helpful, concise, and accurate. If you don't know the answer, suggest the use
       throw error;
     }
   }
+
+  async updatePageContext(sessionId: string, pageContext: string): Promise<ChatSession> {
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId
+      },
+      UpdateExpression: 'SET pageContext = :pageContext, updatedAt = :updatedAt',
+      ExpressionAttributeValues: {
+        ':pageContext': pageContext,
+        ':updatedAt': new Date().toISOString()
+      },
+      ReturnValues: 'ALL_NEW'
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      
+      // Add a system message with the new context
+      await this.addMessageToSession(sessionId, {
+        role: 'system',
+        content: `The user is now viewing a different page with the following content. Use this information when relevant to their questions:
+        
+${pageContext}`
+      });
+      
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error('Error updating page context:', error);
+      throw error;
+    }
+  }
 }
 
 // Initialize database
@@ -182,7 +228,8 @@ export const chatbotDb = new ChatbotDB();
 // Function to generate chat response
 export async function generateChatResponse(
   sessionId: string,
-  userMessage: string
+  userMessage: string,
+  pageContext?: string
 ): Promise<string> {
   try {
     // Add user message to session
@@ -197,11 +244,23 @@ export async function generateChatResponse(
       throw new Error('Chat session not found');
     }
 
+    // If new page context is provided and different from existing, update it
+    if (pageContext && pageContext !== session.pageContext) {
+      await chatbotDb.updatePageContext(sessionId, pageContext);
+      
+      // Refresh session to get updated messages with new context
+      const refreshedSession = await chatbotDb.getChatSession(sessionId);
+      if (refreshedSession) {
+        session.messages = refreshedSession.messages;
+        session.pageContext = pageContext;
+      }
+    }
+
     // Generate response using Azure OpenAI
     const response = await openai.chat.completions.create({
       model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
       messages: session.messages,
-      max_tokens: 500,
+      max_tokens: 800, // Increased token limit to handle longer responses with context
       temperature: 0.7
     });
 
