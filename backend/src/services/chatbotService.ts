@@ -480,7 +480,34 @@ Today's date is ${new Date().toISOString().split('T')[0]}.
 
 I will provide you with relevant information from our documentation to help answer questions. Please use this information when responding to user queries.
 
-Be helpful, concise, and accurate. If you don't know the answer, suggest the user join our Discord community for human support: https://discord.gg/ec7yR3yG`;
+Format your responses in HTML5 for direct rendering. Use:
+- <strong> for important points
+- <em> for emphasis
+- <code> for technical terms and commands
+- <ul> and <li> for lists
+- <pre> for code blocks
+- <a href="url" target="_blank"> for links
+- <table> for structured data
+
+Important formatting rules:
+1. Use minimal spacing - no extra blank lines
+2. Keep lists compact with minimal spacing
+3. Use single line breaks between list items
+4. Keep responses concise and well-structured
+5. Always include target="_blank" for links
+6. Use proper HTML5 semantic elements
+
+Example of good formatting:
+<p>To create a task in AgentWeb, follow these steps:</p>
+<ul>
+<li>Go to the <strong>Tasks</strong> page in AgentWeb</li>
+<li>Click the <strong>New Task</strong> button</li>
+<li>Enter your task instructions in plain English</li>
+<li>Adjust settings as needed</li>
+<li>Click <strong>Create</strong> to save</li>
+</ul>
+
+Be helpful, concise, and accurate. If you don't know the answer, suggest the user join our Discord community for human support: <a href="https://discord.gg/ec7yR3yG" target="_blank">Discord community</a>`;
 
 // Update generateChatResponse to use cached knowledge base
 export async function generateChatResponse(

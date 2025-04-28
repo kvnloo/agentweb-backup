@@ -449,14 +449,30 @@ const ChatSupport: React.FC = () => {
                           {msg.role === 'assistant' ? 'Support' : 'You'}
                         </Typography>
                       </Box>
-                      <Typography variant="body2" sx={{ 
-                        whiteSpace: 'pre-wrap',
-                        lineHeight: 1.5,
-                        fontWeight: msg.role === 'user' ? 400 : 400,
-                        letterSpacing: '0.1px'
-                      }}>
-                        {msg.content}
-                      </Typography>
+                      <Typography 
+                        variant="body2" 
+                        sx={{ 
+                          whiteSpace: 'pre-wrap',
+                          lineHeight: 1.5,
+                          fontWeight: msg.role === 'user' ? 400 : 400,
+                          letterSpacing: '0.1px',
+                          '& ul, & ol': {
+                            margin: '0',
+                            padding: '0 0 0 20px'
+                          },
+                          '& li': {
+                            margin: '0',
+                            padding: '0'
+                          },
+                          '& a': {
+                            color: msg.role === 'user' ? '#fff' : '#1976d2',
+                            textDecoration: 'underline'
+                          }
+                        }}
+                        dangerouslySetInnerHTML={{
+                          __html: msg.content
+                        }}
+                      />
                     </Box>
                   </Box>
                 ))
