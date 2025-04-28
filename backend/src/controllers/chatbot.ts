@@ -73,7 +73,7 @@ export const getChatSession = async (req: AuthenticatedRequest, res: Response) =
 export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
   try {
     const sessionId = req.params.sessionId;
-    const { message, pageContext } = req.body;
+    const { message, currentUrl, pageContext } = req.body;
     
     if (!message) {
       return res.status(400).json({ error: 'Message is required' });
@@ -93,7 +93,7 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
     
     try {
       // Generate response
-      const response = await generateChatResponse(sessionId, message, pageContext);
+      const response = await generateChatResponse(sessionId, message, currentUrl, pageContext);
       
       // Get updated session with the new messages
       const updatedSession = await chatbotDb.getChatSession(sessionId);

@@ -159,10 +159,13 @@ const ChatSupport: React.FC = () => {
       ];
       setSession({ ...session, messages: updatedMessages });
       
-      // Send to backend
+      // Send to backend with current URL
       const response = await axios.post(
         `${apiUrl}/api/chatbot/sessions/${session.sessionId}/messages`,
-        { message: trimmedMessage },
+        { 
+          message: trimmedMessage,
+          currentUrl: window.location.pathname
+        },
         { headers: { Authorization: `Bearer ${token}` } }
       );
       
@@ -224,7 +227,7 @@ const ChatSupport: React.FC = () => {
       console.log('Creating new chat session');
       const createResponse = await axios.post(
         `${apiUrl}/api/chatbot/sessions`, 
-        {},
+        { currentUrl: window.location.pathname },
         { headers: { Authorization: `Bearer ${token}` } }
       );
       setSession(createResponse.data);

@@ -417,6 +417,7 @@ export const chatbotDb = new ChatbotDB();
 export async function generateChatResponse(
   sessionId: string,
   userMessage: string,
+  currentUrl?: string,
   pageContext?: string
 ): Promise<string> {
   try {
@@ -441,9 +442,21 @@ export async function generateChatResponse(
         Object.assign(session, updatedSession);
       }
     }
-    
+
     // Get messages for OpenAI
     const messages = [...session.messages];
+    
+    // Add URL context to the system message if available
+    if (currentUrl) {
+      // Find the system message and update it with URL context
+      const systemMessageIndex = messages.findIndex(msg => msg.role === 'system');
+      if (systemMessageIndex !== -1) {
+        messages[systemMessageIndex] = {
+          ...messages[systemMessageIndex],
+          content: `${messages[systemMessageIndex].content}\n\nThe user is currently on the page: ${currentUrl}`
+        };
+      }
+    }
     
     // RAG: Retrieve relevant chunks based on user query
     let retrievalErrorOccurred = false;
@@ -482,7 +495,7 @@ export async function generateChatResponse(
     
     // Generate response using OpenAI
     const response = await openai.chat.completions.create({
-      model: 'gpt-4', // Use your actual model
+      model: `${process.env.AZURE_OPENAI_DEPLOYMENT}`,
       messages
     });
 
