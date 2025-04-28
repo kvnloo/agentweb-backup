@@ -29,10 +29,10 @@ const openai = new OpenAI({
 
 // Separate client for embeddings
 const embeddingsClient = new OpenAI({
-  apiKey: process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY || process.env.AZURE_OPENAI_API_KEY,
-  baseURL: `${process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT || process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT || 'text-embedding-3-large'}`,
-  defaultQuery: { 'api-version': process.env.AZURE_OPENAI_EMBEDDINGS_API_VERSION || process.env.AZURE_OPENAI_API_VERSION || '2024-08-01-preview' },
-  defaultHeaders: { 'api-key': process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY || process.env.AZURE_OPENAI_API_KEY }
+  apiKey: process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY,
+  baseURL: `${process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT || 'text-embedding-3-large'}`,
+  defaultQuery: { 'api-version': process.env.AZURE_OPENAI_EMBEDDINGS_API_VERSION || '2024-08-01-preview' },
+  defaultHeaders: { 'api-key': process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY }
 });
 
 // Interface for chat messages
@@ -245,19 +245,7 @@ class ChatbotDB {
       messages: [
         {
           role: 'system',
-          content: `You are a helpful customer support assistant for AgentWeb, a powerful web automation platform that allows users to create and manage web-based tasks using natural language instructions. 
-          
-Today's date is ${new Date().toISOString().split('T')[0]}.
-
-AgentWeb features:
-- Natural language task creation
-- Zero credential storage - credentials required per task execution
-- Isolated browser sessions for each task
-- Support for both single and recurring tasks
-- Real-time task monitoring and alerts
-- API Integration support
-
-Be helpful, concise, and accurate. If you don't know the answer, suggest the user join our Discord community for human support.`
+          content: systemMessage
         }
       ],
       createdAt: timestamp,
@@ -492,7 +480,7 @@ Today's date is ${new Date().toISOString().split('T')[0]}.
 
 I will provide you with relevant information from our documentation to help answer questions. Please use this information when responding to user queries.
 
-Be helpful, concise, and accurate. If you don't know the answer, suggest the user join our Discord community for human support.`;
+Be helpful, concise, and accurate. If you don't know the answer, suggest the user join our Discord community for human support: https://discord.gg/ec7yR3yG`;
 
 // Update generateChatResponse to use cached knowledge base
 export async function generateChatResponse(
