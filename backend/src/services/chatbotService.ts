@@ -29,10 +29,10 @@ const openai = new OpenAI({
 
 // Separate client for embeddings
 const embeddingsClient = new OpenAI({
-  apiKey: process.env.AZURE_OPENAI_API_KEY,
-  baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT || 'text-embedding-3-large'}`,
-  defaultQuery: { 'api-version': process.env.AZURE_OPENAI_API_VERSION || '2024-08-01-preview' },
-  defaultHeaders: { 'api-key': process.env.AZURE_OPENAI_API_KEY }
+  apiKey: process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY || process.env.AZURE_OPENAI_API_KEY,
+  baseURL: `${process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT || process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT || 'text-embedding-3-large'}`,
+  defaultQuery: { 'api-version': process.env.AZURE_OPENAI_EMBEDDINGS_API_VERSION || process.env.AZURE_OPENAI_API_VERSION || '2024-08-01-preview' },
+  defaultHeaders: { 'api-key': process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY || process.env.AZURE_OPENAI_API_KEY }
 });
 
 // Interface for chat messages
@@ -133,7 +133,7 @@ async function findRelevantChunks(
   try {
     // For simple semantic search, we'll use OpenAI embeddings
     const queryEmbeddingResponse = await embeddingsClient.embeddings.create({
-      model: 'text-embedding-3-large',
+      model: `${process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT}`,
       input: query,
       dimensions: 1536
     });
@@ -144,7 +144,7 @@ async function findRelevantChunks(
     const chunkEmbeddings = await Promise.all(
       chunks.map(async (chunk) => {
         const response = await embeddingsClient.embeddings.create({
-          model: 'text-embedding-3-large',
+          model: `${process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT}`,
           input: chunk.content,
           dimensions: 1536
         });
@@ -257,7 +257,7 @@ AgentWeb features:
 - Real-time task monitoring and alerts
 - API Integration support
 
-Be helpful, concise, and accurate. If you don't know the answer, suggest the user contact support via email at support@agentweb.pro.`
+Be helpful, concise, and accurate. If you don't know the answer, suggest the user join our Discord community for human support.`
         }
       ],
       createdAt: timestamp,
@@ -413,7 +413,88 @@ Be helpful, concise, and accurate. If you don't know the answer, suggest the use
 // Initialize database
 export const chatbotDb = new ChatbotDB();
 
-// Function to generate chat response
+// Helper function to fetch content from frontend URLs
+async function fetchContent(url: string): Promise<string> {
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch ${url}: ${response.statusText}`);
+    }
+    return await response.text();
+  } catch (error) {
+    console.error(`Error fetching ${url}:`, error);
+    return '';
+  }
+}
+
+// Helper function to extract content from HTML
+function extractContent(html: string): string {
+  // Remove script and style tags
+  const cleanHtml = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+                       .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '');
+  
+  // Extract text content from main content area
+  const mainContent = cleanHtml.match(/<main[^>]*>([\s\S]*?)<\/main>/i)?.[1] || cleanHtml;
+  
+  // Convert HTML to text
+  return mainContent
+    .replace(/<[^>]+>/g, ' ') // Remove HTML tags
+    .replace(/\s+/g, ' ')     // Normalize whitespace
+    .trim();
+}
+
+// Initialize knowledge base
+let knowledgeBase: ContextChunk[] = [];
+
+// Load and cache content from frontend URLs
+async function loadKnowledgeBase(): Promise<void> {
+  const baseUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+  const urls = [
+    `${baseUrl}/guide`,
+    `${baseUrl}/release`,
+    `${baseUrl}/api`
+  ];
+
+  const chunks: ContextChunk[] = [];
+  
+  for (const url of urls) {
+    try {
+      const html = await fetchContent(url);
+      const content = extractContent(html);
+      if (content) {
+        chunks.push(...splitIntoChunks(content));
+      }
+    } catch (error) {
+      console.error(`Error processing ${url}:`, error);
+    }
+  }
+
+  knowledgeBase = chunks;
+  console.log(`Loaded ${chunks.length} knowledge chunks from frontend pages`);
+}
+
+// Load knowledge base on startup and refresh periodically
+loadKnowledgeBase().catch(error => {
+  console.error('Error loading knowledge base:', error);
+});
+
+// Refresh knowledge base every hour
+setInterval(() => {
+  loadKnowledgeBase().catch(error => {
+    console.error('Error refreshing knowledge base:', error);
+  });
+}, 60 * 60 * 1000);
+
+// Update system message
+const systemMessage = `You are a helpful customer support assistant for AgentWeb, a powerful web automation platform that allows users to create and manage web-based tasks using natural language instructions. 
+
+Today's date is ${new Date().toISOString().split('T')[0]}.
+
+I will provide you with relevant information from our documentation to help answer questions. Please use this information when responding to user queries.
+
+Be helpful, concise, and accurate. If you don't know the answer, suggest the user join our Discord community for human support.`;
+
+// Update generateChatResponse to use cached knowledge base
 export async function generateChatResponse(
   sessionId: string,
   userMessage: string,
@@ -433,22 +514,11 @@ export async function generateChatResponse(
       throw new Error('Chat session not found');
     }
 
-    // If new page context is provided and different from existing, update it
-    if (pageContext && pageContext !== session.pageContext) {
-      await chatbotDb.updatePageContext(sessionId, pageContext);
-      // Re-fetch the session with updated context chunks
-      const updatedSession = await chatbotDb.getChatSession(sessionId);
-      if (updatedSession) {
-        Object.assign(session, updatedSession);
-      }
-    }
-
     // Get messages for OpenAI
     const messages = [...session.messages];
     
     // Add URL context to the system message if available
     if (currentUrl) {
-      // Find the system message and update it with URL context
       const systemMessageIndex = messages.findIndex(msg => msg.role === 'system');
       if (systemMessageIndex !== -1) {
         messages[systemMessageIndex] = {
@@ -458,11 +528,11 @@ export async function generateChatResponse(
       }
     }
     
-    // RAG: Retrieve relevant chunks based on user query
+    // RAG: Retrieve relevant chunks from cached knowledge base
     let retrievalErrorOccurred = false;
-    if (session.contextChunks && session.contextChunks.length > 0) {
+    if (knowledgeBase.length > 0) {
       try {
-        const relevantChunks = await findRelevantChunks(userMessage, session.contextChunks);
+        const relevantChunks = await findRelevantChunks(userMessage, knowledgeBase);
         
         if (relevantChunks.length > 0) {
           // Insert retrieved context right before the user's message
@@ -470,26 +540,20 @@ export async function generateChatResponse(
             .map(chunk => chunk.content)
             .join('\n\n');
             
-          // Find the index of the last user message (which we just added)
+          // Find the index of the last user message
           const lastUserMsgIndex = messages.map(m => m.role).lastIndexOf('user');
           
           // Insert the context right before the user's message
           if (lastUserMsgIndex > 0) {
             messages.splice(lastUserMsgIndex, 0, {
               role: 'system',
-              content: `Here is the relevant information from the page the user is viewing:\n\n${contextInfo}`
+              content: `Here is relevant information from our documentation:\n\n${contextInfo}`
             });
           }
         }
       } catch (error) {
         console.error('Error in context retrieval, continuing without context:', error);
         retrievalErrorOccurred = true;
-        
-        // Add a fallback system message
-        messages.push({
-          role: 'system',
-          content: 'Note: Unable to retrieve specific context for this query. Responding based on general knowledge.'
-        });
       }
     }
     
@@ -508,25 +572,9 @@ export async function generateChatResponse(
       content: assistantReply
     });
 
-    // If we had retrieval errors, add a note to help troubleshoot
-    if (retrievalErrorOccurred) {
-      console.log(`Chat response generated without context retrieval for session: ${sessionId}`);
-    }
-
     return assistantReply;
   } catch (error) {
     console.error('Error generating chat response:', error);
-    
-    // Add a system message explaining the error
-    try {
-      await chatbotDb.addMessageToSession(sessionId, {
-        role: 'assistant',
-        content: 'I apologize, but I encountered an error processing your request. Please try again or contact support if the issue persists.'
-      });
-    } catch (secondaryError) {
-      console.error('Failed to add error message to session:', secondaryError);
-    }
-    
     throw error;
   }
 } 
