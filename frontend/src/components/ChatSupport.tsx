@@ -34,32 +34,20 @@ const ChatSupport: React.FC = () => {
   const [message, setMessage] = useState('');
   const [session, setSession] = useState<ChatSession | null>(null);
   const [isLoading, setIsLoading] = useState(false);
-  const [pageContext, setPageContext] = useState<string>('');
-  const [isContextCaptured, setIsContextCaptured] = useState(false);
   const [currentPage, setCurrentPage] = useState<string>('');
   const [showPageNotification, setShowPageNotification] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3001';
 
-  // Capture current page context when opened
-  useEffect(() => {
-    if (isOpen && !isContextCaptured) {
-      capturePageContext();
-    }
-  }, [isOpen]);
-
-  // Update context and show notification when route changes
+  // Update page info when route changes
   useEffect(() => {
     if (isOpen) {
-      // Get improved page title and format path for display
       const pageTitle = getPageTitle(location.pathname);
       const currentPageInfo = pageTitle;
       
       // Only show notification if page has actually changed
       if (currentPage && currentPage !== currentPageInfo) {
-        // Add a navigation message directly to the chat
         if (session && session.sessionId) {
-          // Create an assistant message about the page change that will appear in the chat
           const updatedMessages = [
             ...(session.messages || []),
             {
@@ -75,18 +63,15 @@ const ChatSupport: React.FC = () => {
       }
       
       setCurrentPage(currentPageInfo);
-      capturePageContext();
     }
   }, [location.pathname, isOpen]);
 
   // Add page info when chat is first opened
   useEffect(() => {
     if (isOpen && session && session.sessionId && !currentPage) {
-      // Get page info for initial chat open
       const pageTitle = getPageTitle(location.pathname);
       const currentPageInfo = pageTitle;
       
-      // Add the current page info message
       const updatedMessages = [
         ...(session.messages || []),
         {
@@ -101,7 +86,7 @@ const ChatSupport: React.FC = () => {
       });
       
       setCurrentPage(currentPageInfo);
-      setShowPageNotification(true); // Show notification when chat opens
+      setShowPageNotification(true);
     }
   }, [isOpen, session]);
 
@@ -129,75 +114,6 @@ const ChatSupport: React.FC = () => {
       messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
   }, [session?.messages]);
-
-  const capturePageContext = () => {
-    // Get page metadata and set document title
-    const pageTitle = getPageTitle(location.pathname);
-    document.title = `AgentWeb - ${pageTitle}`;
-    
-    const currentUrl = window.location.href;
-    const currentPath = location.pathname;
-
-    // Recursive function to get all text from an element and its children
-    const extractTextRecursively = (element: Element): string => {
-      let text = '';
-      
-      // Process all child nodes
-      element.childNodes.forEach(node => {
-        // If it's a text node, get its text
-        if (node.nodeType === Node.TEXT_NODE && node.textContent) {
-          const trimmed = node.textContent.trim();
-          if (trimmed) {
-            text += trimmed + ' ';
-          }
-        } 
-        // If it's an element node, process it recursively
-        else if (node.nodeType === Node.ELEMENT_NODE) {
-          // Skip hidden elements
-          const el = node as Element;
-          const style = window.getComputedStyle(el);
-          if (style.display !== 'none' && style.visibility !== 'hidden') {
-            text += extractTextRecursively(el) + ' ';
-          }
-        }
-      });
-      
-      return text.trim();
-    };
-
-    // Extract content based on page type
-    let mainContent = '';
-    
-    // Special handling for tasks page
-    if (currentPath === '/tasks') {
-      // Get all task cards
-      const cards = document.querySelectorAll('.MuiCard-root');
-      if (cards && cards.length > 0) {
-        const cardTexts = Array.from(cards).map(card => extractTextRecursively(card));
-        mainContent = cardTexts.join('\n\n');
-      }
-    }
-    
-    // If no content found yet, try main element (which works for execution details and other pages)
-    if (!mainContent || mainContent.length < 100) {
-      const mainElement = document.querySelector('main');
-      if (mainElement) {
-        mainContent = extractTextRecursively(mainElement);
-      }
-    }
-    
-    // Combine all information into context
-    const context = `
-URL: ${currentUrl}
-Title: ${pageTitle}
-Path: ${currentPath}
-Content: ${mainContent.substring(0, 100000).trim()}
-    `;
-    
-    console.log(`Captured page context: ${context.length} characters`);
-    setPageContext(context);
-    setIsContextCaptured(true);
-  };
 
   const fetchOrCreateSession = async () => {
     try {
@@ -243,13 +159,10 @@ Content: ${mainContent.substring(0, 100000).trim()}
       ];
       setSession({ ...session, messages: updatedMessages });
       
-      // Send to backend with page context
+      // Send to backend
       const response = await axios.post(
         `${apiUrl}/api/chatbot/sessions/${session.sessionId}/messages`,
-        { 
-          message: trimmedMessage,
-          pageContext: pageContext 
-        },
+        { message: trimmedMessage },
         { headers: { Authorization: `Bearer ${token}` } }
       );
       
@@ -311,7 +224,7 @@ Content: ${mainContent.substring(0, 100000).trim()}
       console.log('Creating new chat session');
       const createResponse = await axios.post(
         `${apiUrl}/api/chatbot/sessions`, 
-        { pageContext: pageContext },
+        {},
         { headers: { Authorization: `Bearer ${token}` } }
       );
       setSession(createResponse.data);
@@ -567,7 +480,7 @@ Content: ${mainContent.substring(0, 100000).trim()}
                   value={message}
                   onChange={(e) => setMessage(e.target.value)}
                   onKeyPress={handleKeyPress}
-                  placeholder={isContextCaptured ? "Ask about this page or any other question..." : "Type your message here..."}
+                  placeholder="Type your message here..."
                   fullWidth
                   size="small"
                   multiline
