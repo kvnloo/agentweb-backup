@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import AWS from 'aws-sdk';
 import dotenv from 'dotenv';
 import path from 'path';
+import puppeteer from 'puppeteer';
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
@@ -404,11 +405,40 @@ export const chatbotDb = new ChatbotDB();
 // Helper function to fetch content from frontend URLs
 async function fetchContent(url: string): Promise<string> {
   try {
-    const response = await fetch(url);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch ${url}: ${response.statusText}`);
-    }
-    return await response.text();
+    const browser = await puppeteer.launch({
+      headless: true,
+      args: ['--no-sandbox']
+    });
+    
+    const page = await browser.newPage();
+    await page.goto(url, { waitUntil: 'networkidle0' });
+    
+    // Wait for React to render
+    await page.waitForSelector('main', { timeout: 5000 });
+    
+    // Get the rendered content
+    const content = await page.evaluate(() => {
+      const main = document.querySelector('main');
+      if (!main) return '';
+      
+      // Get all text nodes and their content
+      const walker = document.createTreeWalker(
+        main,
+        NodeFilter.SHOW_TEXT,
+        null
+      );
+      
+      let text = '';
+      let node;
+      while (node = walker.nextNode()) {
+        text += node.textContent + '\n';
+      }
+      
+      return text;
+    });
+    
+    await browser.close();
+    return content.trim();
   } catch (error) {
     console.error(`Error fetching ${url}:`, error);
     return '';
@@ -434,6 +464,23 @@ function extractContent(html: string): string {
 // Initialize knowledge base
 let knowledgeBase: ContextChunk[] = [];
 
+// Function to print knowledge base content
+function printKnowledgeBase(): void {
+  if (knowledgeBase.length === 0) {
+    console.log('Knowledge base is empty');
+    return;
+  }
+
+  console.log('\n=== Knowledge Base Content ===');
+  knowledgeBase.forEach((chunk, index) => {
+    console.log(`\nChunk ${index + 1} (${chunk.id}):`);
+    console.log('Source:', chunk.metadata?.source || 'unknown');
+    console.log('Content length:', chunk.content.length);
+    console.log('Content preview:', chunk.content.substring(0, 200) + '...');
+  });
+  console.log('\n============================\n');
+}
+
 // Load and cache content from frontend URLs
 async function loadKnowledgeBase(): Promise<void> {
   const baseUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
@@ -444,13 +491,39 @@ async function loadKnowledgeBase(): Promise<void> {
   ];
 
   const chunks: ContextChunk[] = [];
+  let chunkId = 0;
   
   for (const url of urls) {
     try {
-      const html = await fetchContent(url);
-      const content = extractContent(html);
+      const content = await fetchContent(url);
       if (content) {
-        chunks.push(...splitIntoChunks(content));
+        // Split content into smaller chunks (max 2000 chars per chunk)
+        const textChunks = content.match(/[^\.!\?]+[\.!\?]+/g) || [content];
+        let currentChunk = '';
+        
+        for (const sentence of textChunks) {
+          if ((currentChunk + sentence).length > 2000) {
+            if (currentChunk) {
+              chunks.push({
+                id: `chunk-${url}-${chunkId++}`,
+                content: currentChunk.trim(),
+                metadata: { source: url }
+              });
+            }
+            currentChunk = sentence;
+          } else {
+            currentChunk += ' ' + sentence;
+          }
+        }
+        
+        // Add the last chunk if not empty
+        if (currentChunk.trim()) {
+          chunks.push({
+            id: `chunk-${url}-${chunkId++}`,
+            content: currentChunk.trim(),
+            metadata: { source: url }
+          });
+        }
       }
     } catch (error) {
       console.error(`Error processing ${url}:`, error);
@@ -459,6 +532,7 @@ async function loadKnowledgeBase(): Promise<void> {
 
   knowledgeBase = chunks;
   console.log(`Loaded ${chunks.length} knowledge chunks from frontend pages`);
+  printKnowledgeBase();
 }
 
 // Load knowledge base on startup and refresh periodically

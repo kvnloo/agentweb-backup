@@ -12,6 +12,7 @@ import AddCircleOutline from '@mui/icons-material/AddCircleOutline';
 import DescriptionIcon from '@mui/icons-material/Description';
 import NavigationIcon from '@mui/icons-material/Navigation';
 import { getPageTitle } from '../utils/pageTitles';
+import { Chart } from 'chart.js/auto';
 
 interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
@@ -38,6 +39,7 @@ const ChatSupport: React.FC = () => {
   const [showPageNotification, setShowPageNotification] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+  const chartRefs = useRef<{ [key: string]: HTMLCanvasElement }>({});
 
   // Update page info when route changes
   useEffect(() => {
@@ -114,6 +116,18 @@ const ChatSupport: React.FC = () => {
       messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
   }, [session?.messages]);
+
+  useEffect(() => {
+    // Clean up charts when component unmounts
+    return () => {
+      Object.values(chartRefs.current).forEach(canvas => {
+        const chart = Chart.getChart(canvas);
+        if (chart) {
+          chart.destroy();
+        }
+      });
+    };
+  }, []);
 
   const fetchOrCreateSession = async () => {
     try {
@@ -241,6 +255,106 @@ const ChatSupport: React.FC = () => {
     }
   };
 
+  const renderChart = (content: string) => {
+    // Extract chart data from the content
+    const canvasMatch = content.match(/<canvas[^>]*>([\s\S]*?)<\/canvas>/);
+    if (!canvasMatch) return content;
+
+    const canvasHtml = canvasMatch[0];
+    const scriptMatch = content.match(/<script>([\s\S]*?)<\/script>/);
+    if (!scriptMatch) return content;
+
+    const scriptContent = scriptMatch[1];
+    const chartId = canvasMatch[0].match(/id="([^"]+)"/)?.[1] || 'chart-' + Math.random().toString(36).substr(2, 9);
+
+    // Create a new canvas with the same ID
+    const newCanvas = `<canvas id="${chartId}" width="600" height="300"></canvas>`;
+
+    // Replace the original canvas with our new one
+    let newContent = content.replace(canvasMatch[0], newCanvas);
+
+    // Remove the script tag since we'll handle the chart creation separately
+    newContent = newContent.replace(scriptMatch[0], '');
+
+    // Use setTimeout to ensure the canvas is in the DOM before creating the chart
+    setTimeout(() => {
+      const canvas = document.getElementById(chartId) as HTMLCanvasElement;
+      if (canvas) {
+        // Destroy any existing chart on this canvas
+        const existingChart = Chart.getChart(canvas);
+        if (existingChart) {
+          existingChart.destroy();
+        }
+
+        chartRefs.current[chartId] = canvas;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          try {
+            // Extract data from the script content
+            const labelsMatch = scriptContent.match(/const chartLabels = \[([\s\S]*?)\];/);
+            const dataMatch = scriptContent.match(/const chartData = \[([\s\S]*?)\];/);
+            
+            if (labelsMatch && dataMatch) {
+              // Clean and parse the arrays
+              const labels = labelsMatch[1]
+                .split(',')
+                .map(label => {
+                  // Extract just the date part before the comment
+                  const datePart = label.split('//')[0].trim();
+                  return datePart.replace(/"/g, '').replace(/'/g, '');
+                });
+              
+              const data = dataMatch[1]
+                .split(',')
+                .map(num => parseInt(num.trim(), 10));
+
+              // Create the chart using Chart.js
+              new Chart(ctx, {
+                type: 'line',
+                data: {
+                  labels: labels,
+                  datasets: [{
+                    label: 'Features Released',
+                    data: data,
+                    borderColor: '#1976d2',
+                    backgroundColor: '#1976d2',
+                    borderWidth: 2.5,
+                    pointRadius: 6,
+                    pointBackgroundColor: '#1976d2',
+                    pointBorderColor: '#fff',
+                    pointBorderWidth: 2,
+                    fill: false
+                  }]
+                },
+                options: {
+                  responsive: false,
+                  scales: {
+                    y: {
+                      beginAtZero: true,
+                      ticks: {
+                        stepSize: 1
+                      }
+                    },
+                    x: {
+                      ticks: {
+                        maxRotation: 30,
+                        minRotation: 30
+                      }
+                    }
+                  }
+                }
+              });
+            }
+          } catch (error) {
+            console.error('Error creating chart:', error);
+          }
+        }
+      }
+    }, 0);
+
+    return newContent;
+  };
+
   return (
     <>
       <Box sx={{ position: 'fixed', bottom: 16, right: 16, zIndex: 1050 }}>
@@ -270,7 +384,9 @@ const ChatSupport: React.FC = () => {
               boxShadow: 3,
               display: 'flex',
               flexDirection: 'column',
-              width: { xs: 320, md: 384 },
+              width: { xs: '100%', sm: 'auto' },
+              minWidth: { xs: 320, sm: 384 },
+              maxWidth: '90vw',
               height: 384,
               border: '1px solid',
               borderColor: 'divider'
@@ -326,7 +442,11 @@ const ChatSupport: React.FC = () => {
               flexGrow: 1, 
               overflowY: 'auto', 
               p: 2,
-              bgcolor: 'grey.50'
+              bgcolor: 'grey.50',
+              '& > *': {
+                maxWidth: '100%',
+                overflowX: 'auto'
+              }
             }}>
               {/* Discord community notice */}
               <Box sx={{ 
@@ -467,10 +587,25 @@ const ChatSupport: React.FC = () => {
                           '& a': {
                             color: msg.role === 'user' ? '#fff' : '#1976d2',
                             textDecoration: 'underline'
+                          },
+                          '& pre': {
+                            backgroundColor: msg.role === 'user' ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.05)',
+                            padding: '8px',
+                            borderRadius: '4px',
+                            overflowX: 'auto',
+                            margin: '4px 0',
+                            whiteSpace: 'pre-wrap',
+                            wordBreak: 'break-word'
+                          },
+                          '& code': {
+                            backgroundColor: msg.role === 'user' ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.05)',
+                            padding: '2px 4px',
+                            borderRadius: '4px',
+                            fontSize: '0.9em'
                           }
                         }}
                         dangerouslySetInnerHTML={{
-                          __html: msg.content
+                          __html: renderChart(msg.content)
                         }}
                       />
                     </Box>
