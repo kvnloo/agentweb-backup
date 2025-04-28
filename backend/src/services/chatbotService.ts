@@ -40,6 +40,12 @@ const embeddingsClient = new OpenAI({
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
   content: string;
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+    estimated_cost: number;
+  };
 }
 
 // Interface for chat sessions
@@ -583,6 +589,74 @@ Example of good formatting:
 
 Be helpful, concise, and accurate. If you don't know the answer, suggest the user join our Discord community for human support: <a href="https://discord.gg/ec7yR3yG" target="_blank">Discord community</a>`;
 
+// Helper function to calculate token cost
+function calculateCost(promptTokens: number, completionTokens: number, model: string): number {
+  // Azure OpenAI pricing per 1K tokens (as of 2024)
+  const prices = {
+    'gpt-4o': {
+      prompt: 0.025,
+      completion: 0.0125
+    },
+    'gpt-4.1': {
+      prompt: 0.02,
+      completion: 0.005
+    }
+  };
+  
+  // Get model pricing or return 0 if model not found
+  let pricing;
+  const modelLower = model.toLowerCase();
+  console.log(`Model: ${model}, modelLower: ${modelLower}`);
+  if (modelLower.includes('gpt-4o')) {
+    pricing = prices['gpt-4o'];
+  } else if (modelLower.includes('gpt-4.1')) {
+    pricing = prices['gpt-4.1'];
+  } else {
+    console.log(`Unknown model ${model}, cost calculation not available`);
+    return 0;
+  }
+  
+  return (
+    (promptTokens / 1000) * pricing.prompt +
+    (completionTokens / 1000) * pricing.completion
+  );
+}
+
+// Helper function to log token usage
+function logTokenUsage(response: OpenAI.Chat.ChatCompletion, context: string = '') {
+  const usage = response.usage;
+  if (!usage) return;
+
+  console.log(`Usage: ${usage}`);
+  const cost = calculateCost(
+    usage.prompt_tokens,
+    usage.completion_tokens,
+    response.model
+  );
+
+  console.log('\n=== Token Usage ===');
+  console.log('Model:', response.model);
+  console.log('Prompt tokens:', usage.prompt_tokens);
+  console.log('Completion tokens:', usage.completion_tokens);
+  console.log('Total tokens:', usage.total_tokens);
+  if (cost > 0) {
+    console.log('Estimated cost: $' + cost.toFixed(6));
+  } else {
+    console.log('Cost calculation not available for this model');
+  }
+  if (context) {
+    console.log('Context:', context);
+  }
+  console.log('==================\n');
+
+  return {
+    prompt_tokens: usage.prompt_tokens,
+    completion_tokens: usage.completion_tokens,
+    total_tokens: usage.total_tokens,
+    estimated_cost: cost
+  };
+}
+
 // Update generateChatResponse to use cached knowledge base
 export async function generateChatResponse(
   sessionId: string,
@@ -605,6 +679,7 @@ export async function generateChatResponse(
 
     // Get messages for OpenAI
     const messages = [...session.messages];
+    let contextInfo = '';
     
     // Add URL context to the system message if available
     if (currentUrl) {
@@ -625,7 +700,7 @@ export async function generateChatResponse(
         
         if (relevantChunks.length > 0) {
           // Insert retrieved context right before the user's message
-          const contextInfo = relevantChunks
+          contextInfo = relevantChunks
             .map(chunk => chunk.content)
             .join('\n\n');
             
@@ -652,13 +727,17 @@ export async function generateChatResponse(
       messages
     });
 
+    // Log and get usage data
+    const usageData = logTokenUsage(response, contextInfo ? `Used ${contextInfo.length} chars of context` : 'No context used');
+
     // Extract assistant's reply
     const assistantReply = response.choices[0]?.message?.content || 'I apologize, but I was unable to generate a response.';
 
-    // Add assistant's reply to the session
+    // Add assistant's reply to the session with usage data
     await chatbotDb.addMessageToSession(sessionId, {
       role: 'assistant',
-      content: assistantReply
+      content: assistantReply,
+      usage: usageData
     });
 
     return assistantReply;
