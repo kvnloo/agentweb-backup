@@ -42,7 +42,7 @@ interface MarketResearchTask {
 
 const MarketResearch: React.FC = () => {
   // Get auth context
-  const { user, token, isAuthenticated } = useAuth();
+  const { token, isAuthenticated } = useAuth();
   const navigate = useNavigate();
   
   // Research form state

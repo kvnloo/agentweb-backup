@@ -1,19 +1,25 @@
 import { useState, useEffect } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import { createMarketResearch, getMarketResearch, getAllMarketResearch } from '../services/marketingService';
-import { API_URL, buildApiUrl } from '../config';
 
-// Define the Task interface based on your application's data structure
+interface MarketResearchParams {
+  query: string;
+  targetMarket: string;
+  competitors: string[];
+}
+
 interface Task {
   taskId: string;
   status: string;
-  result?: any;
+  execution?: {
+    result?: string;
+    status?: string;
+  };
   createdAt: string;
   target?: string;
   industry?: string;
   competitors?: string[];
   audience?: string;
-  // Add other properties as needed
 }
 
 const MarketResearch = () => {
@@ -125,10 +131,9 @@ const MarketResearch = () => {
         .filter(c => c.length > 0);
       
       const params: MarketResearchParams = {
-        target,
-        industry,
-        competitors: competitorsList,
-        audience
+        query: target,
+        targetMarket: industry,
+        competitors: competitorsList
       };
       
       const response = await createMarketResearch(params, token);

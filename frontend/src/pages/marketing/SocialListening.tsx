@@ -10,7 +10,6 @@ import {
   Grid,
   Card,
   CardContent,
-  CardHeader,
   List,
   ListItem,
   ListItemText,
@@ -116,7 +115,7 @@ const ConnectedNetworks = () => {
 const SocialListening: React.FC = () => {
   const [tabValue, setTabValue] = useState(0);
 
-  const handleTabChange = (event: React.SyntheticEvent, newValue: number) => {
+  const handleTabChange = (_: React.SyntheticEvent, newValue: number) => {
     setTabValue(newValue);
   };
 

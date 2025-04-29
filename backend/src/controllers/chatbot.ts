@@ -30,9 +30,9 @@ export const listUserSessions = async (req: AuthenticatedRequest, res: Response)
 
     const sessions = await chatbotDb.getUserSessions(userId);
     
-    // Remove page context from response to reduce payload size
+    // Remove page content from response to reduce payload size
     const sanitizedSessions = sessions.map(session => {
-      const { pageContext, contextChunks, ...rest } = session;
+      const { pageContent, contextChunks, ...rest } = session;
       return rest;
     });
     

@@ -15,7 +15,6 @@ import {
 } from '@mui/material';
 import AccountCircle from '@mui/icons-material/AccountCircle';
 import { useAuth } from '../contexts/AuthContext';
-import { Theme } from '@mui/material/styles';
 import logo from '../assets/logo.svg';
 import ChatSupport from './ChatSupport';
 

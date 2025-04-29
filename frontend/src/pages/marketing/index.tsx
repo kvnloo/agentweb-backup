@@ -5,7 +5,6 @@ import { useTheme } from '@mui/material/styles';
 
 // Import actual components
 import Home from './Home';
-import SocialListening from './SocialListening';
 import NotFound from './NotFound';
 import MarketResearch from './MarketResearch';
 import MarketResearchDetail from './MarketResearchDetail';

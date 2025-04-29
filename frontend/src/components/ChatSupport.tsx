@@ -2,14 +2,13 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import { useLocation } from 'react-router-dom';
 import axios from 'axios';
-import { Button, Box, Typography, CircularProgress, TextField, IconButton, Tooltip, Chip, Alert } from '@mui/material';
+import { Button, Box, Typography, CircularProgress, TextField, IconButton, Alert } from '@mui/material';
 import ChatIcon from '@mui/icons-material/Chat';
 import CloseIcon from '@mui/icons-material/Close';
 import SendIcon from '@mui/icons-material/Send';
 import SmartToy from '@mui/icons-material/SmartToy';
 import Person from '@mui/icons-material/Person';
 import AddCircleOutline from '@mui/icons-material/AddCircleOutline';
-import DescriptionIcon from '@mui/icons-material/Description';
 import NavigationIcon from '@mui/icons-material/Navigation';
 import { getPageTitle } from '../utils/pageTitles';
 import { Chart } from 'chart.js/auto';
@@ -321,7 +320,6 @@ const ChatSupport: React.FC = () => {
     const canvasMatch = content.match(/<canvas[^>]*>([\s\S]*?)<\/canvas>/);
     if (!canvasMatch) return content;
 
-    const canvasHtml = canvasMatch[0];
     const scriptMatch = content.match(/<script>([\s\S]*?)<\/script>/);
     if (!scriptMatch) return content;
 
