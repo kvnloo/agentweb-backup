@@ -606,7 +606,6 @@ function calculateCost(promptTokens: number, completionTokens: number, model: st
   // Get model pricing or return 0 if model not found
   let pricing;
   const modelLower = model.toLowerCase();
-  console.log(`Model: ${model}, modelLower: ${modelLower}`);
   if (modelLower.includes('gpt-4o')) {
     pricing = prices['gpt-4o'];
   } else if (modelLower.includes('gpt-4.1')) {
@@ -627,27 +626,13 @@ function logTokenUsage(response: OpenAI.Chat.ChatCompletion, context: string = '
   const usage = response.usage;
   if (!usage) return;
 
-  console.log(`Usage: ${usage}`);
   const cost = calculateCost(
     usage.prompt_tokens,
     usage.completion_tokens,
     response.model
   );
 
-  console.log('\n=== Token Usage ===');
-  console.log('Model:', response.model);
-  console.log('Prompt tokens:', usage.prompt_tokens);
-  console.log('Completion tokens:', usage.completion_tokens);
-  console.log('Total tokens:', usage.total_tokens);
-  if (cost > 0) {
-    console.log('Estimated cost: $' + cost.toFixed(6));
-  } else {
-    console.log('Cost calculation not available for this model');
-  }
-  if (context) {
-    console.log('Context:', context);
-  }
-  console.log('==================\n');
+  console.log(`[Token Usage] Model: ${response.model} | Prompt: ${usage.prompt_tokens} | Completion: ${usage.completion_tokens} | Total: ${usage.total_tokens} | Cost: ${cost > 0 ? '$' + cost.toFixed(6) : 'N/A'}${context ? ` | Context: ${context}` : ''}`);
 
   return {
     prompt_tokens: usage.prompt_tokens,

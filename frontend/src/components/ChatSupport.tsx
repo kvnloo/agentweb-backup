@@ -13,6 +13,7 @@ import DescriptionIcon from '@mui/icons-material/Description';
 import NavigationIcon from '@mui/icons-material/Navigation';
 import { getPageTitle } from '../utils/pageTitles';
 import { Chart } from 'chart.js/auto';
+import { io, Socket } from 'socket.io-client';
 
 interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
@@ -38,8 +39,60 @@ const ChatSupport: React.FC = () => {
   const [currentPage, setCurrentPage] = useState<string>('');
   const [showPageNotification, setShowPageNotification] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const socketRef = useRef<Socket | null>(null);
   const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3001';
   const chartRefs = useRef<{ [key: string]: HTMLCanvasElement }>({});
+
+  // Initialize WebSocket connection
+  useEffect(() => {
+    if (token && isOpen) {
+      // Initialize socket connection
+      socketRef.current = io(apiUrl, {
+        auth: { token },
+        reconnection: true,
+        reconnectionAttempts: 5,
+        reconnectionDelay: 1000
+      });
+
+      // Handle connection events
+      socketRef.current.on('connect', () => {
+        console.log('WebSocket connected');
+      });
+
+      socketRef.current.on('connect_error', (error) => {
+        console.error('WebSocket connection error:', error);
+      });
+
+      socketRef.current.on('disconnect', (reason) => {
+        console.log('WebSocket disconnected:', reason);
+      });
+
+      // Handle chat events
+      socketRef.current.on('message', (data) => {
+        if (data.sessionId === session?.sessionId) {
+          setSession(prevSession => {
+            if (!prevSession) return null;
+            return {
+              ...prevSession,
+              messages: [...prevSession.messages, {
+                role: 'assistant',
+                content: data.content
+              }]
+            };
+          });
+          setIsLoading(false);
+        }
+      });
+
+      // Cleanup on unmount
+      return () => {
+        if (socketRef.current) {
+          socketRef.current.disconnect();
+          socketRef.current = null;
+        }
+      };
+    }
+  }, [token, isOpen, session?.sessionId]);
 
   // Update page info when route changes
   useEffect(() => {
@@ -169,34 +222,41 @@ const ChatSupport: React.FC = () => {
       // Optimistically update UI with properly typed message
       const updatedMessages: ChatMessage[] = [
         ...(session.messages || []),
-        { role: 'user' as const, content: trimmedMessage }
+        { role: 'user', content: trimmedMessage }
       ];
       setSession({ ...session, messages: updatedMessages });
       
-      // Send to backend with current URL
-      const response = await axios.post(
-        `${apiUrl}/api/chatbot/sessions/${session.sessionId}/messages`,
-        { 
+      // Send message through WebSocket if connected, otherwise fallback to HTTP
+      if (socketRef.current?.connected) {
+        socketRef.current.emit('message', {
+          sessionId: session.sessionId,
           message: trimmedMessage,
           currentUrl: window.location.pathname
-        },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      
-      // Check if the response contains valid session data
-      if (response.data && response.data.session) {
-        // Update with actual response from server
-        setSession(response.data.session);
-      } else if (response.data && response.data.response) {
-        // If we just got a response without session update, append it to our local session
-        const assistantMessage: ChatMessage = {
-          role: 'assistant',
-          content: response.data.response
-        };
-        setSession({
-          ...currentSession,
-          messages: [...updatedMessages, assistantMessage]
         });
+      } else {
+        // Fallback to HTTP
+        const response = await axios.post(
+          `${apiUrl}/api/chatbot/sessions/${session.sessionId}/messages`,
+          { 
+            message: trimmedMessage,
+            currentUrl: window.location.pathname
+          },
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        
+        if (response.data && response.data.session) {
+          setSession(response.data.session);
+        } else if (response.data && response.data.response) {
+          const assistantMessage: ChatMessage = {
+            role: 'assistant',
+            content: response.data.response
+          };
+          setSession({
+            ...currentSession,
+            messages: [...updatedMessages, assistantMessage]
+          });
+        }
+        setIsLoading(false);
       }
     } catch (error) {
       console.error('Error sending message:', error);
@@ -206,7 +266,6 @@ const ChatSupport: React.FC = () => {
         content: "I'm sorry, there was an error processing your message. Please try again."
       };
       
-      // Keep the user's message and add error response
       if (session) {
         setSession({
           ...session,
@@ -217,7 +276,6 @@ const ChatSupport: React.FC = () => {
           ]
         });
       }
-    } finally {
       setIsLoading(false);
     }
   };
