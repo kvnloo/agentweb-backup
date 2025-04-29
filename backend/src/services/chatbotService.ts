@@ -452,6 +452,22 @@ class ChatbotDB {
       throw error;
     }
   }
+
+  async getAllSessions(): Promise<ChatSession[]> {
+    const params = {
+      TableName: this.tableName,
+      // Note: In production, you might want to implement pagination
+      Limit: 1000 // Limit to latest 1000 sessions
+    };
+
+    try {
+      const result = await dynamodb.scan(params).promise();
+      return (result.Items || []) as ChatSession[];
+    } catch (error) {
+      console.error('Error getting all chat sessions:', error);
+      throw error;
+    }
+  }
 }
 
 // Initialize database

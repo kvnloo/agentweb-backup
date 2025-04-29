@@ -4,6 +4,7 @@ import { isAdmin } from '../middleware/admin';
 import { userDb, taskDb, subscriberDb } from '../services/db';
 import { waitlistDb } from '../services/waitlistDb';
 import { emailService } from '../services/emailService';
+import { chatbotDb, ChatSession } from '../services/chatbotService';
 
 const router = express.Router();
 
@@ -419,6 +420,24 @@ router.post('/announcements/send', async (req, res) => {
   } catch (error) {
     console.error('Error sending announcement:', error);
     res.status(500).json({ message: 'Error sending announcement' });
+  }
+});
+
+// Add the chat sessions route
+router.get('/chat-sessions', async (req, res) => {
+  try {
+    // Get all chat sessions from DynamoDB
+    const sessions = await chatbotDb.getAllSessions();
+    
+    // Sort sessions by updatedAt in descending order
+    sessions.sort((a: ChatSession, b: ChatSession) => {
+      return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+    });
+    
+    res.json(sessions);
+  } catch (error) {
+    console.error('Error fetching chat sessions:', error);
+    res.status(500).json({ message: 'Failed to fetch chat sessions' });
   }
 });
 
