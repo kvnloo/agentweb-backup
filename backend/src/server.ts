@@ -55,12 +55,19 @@ io.on('connection', (socket: Socket) => {
   });
 
   // Handle chat messages
-  socket.on('message', async (data: { sessionId: string; message: string; currentUrl?: string }) => {
+  socket.on('message', async (data: { 
+    sessionId: string; 
+    message: string; 
+    currentUrl?: string;
+    pageContent?: string;
+  }) => {
     try {
+      console.log('[WebSocket] Received message with pageContent length:', data.pageContent?.length);
       const response = await generateChatResponse(
         data.sessionId,
         data.message,
-        data.currentUrl
+        data.currentUrl,
+        data.pageContent
       );
 
       // Send response back to the client

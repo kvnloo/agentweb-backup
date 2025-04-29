@@ -219,6 +219,9 @@ const ChatSupport: React.FC = () => {
       // Create a copy of current session to restore if API call fails
       const currentSession = { ...session };
       
+      // Get current page content for RAG
+      const pageContent = document.querySelector('main')?.innerHTML || '';
+      
       // Optimistically update UI with properly typed message
       const updatedMessages: ChatMessage[] = [
         ...(session.messages || []),
@@ -231,7 +234,8 @@ const ChatSupport: React.FC = () => {
         socketRef.current.emit('message', {
           sessionId: session.sessionId,
           message: trimmedMessage,
-          currentUrl: window.location.pathname
+          currentUrl: window.location.pathname,
+          pageContent: pageContent
         });
       } else {
         // Fallback to HTTP
@@ -239,7 +243,8 @@ const ChatSupport: React.FC = () => {
           `${apiUrl}/api/chatbot/sessions/${session.sessionId}/messages`,
           { 
             message: trimmedMessage,
-            currentUrl: window.location.pathname
+            currentUrl: window.location.pathname,
+            pageContent: pageContent
           },
           { headers: { Authorization: `Bearer ${token}` } }
         );

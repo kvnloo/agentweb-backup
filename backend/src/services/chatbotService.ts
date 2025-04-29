@@ -55,74 +55,105 @@ export interface ChatSession {
   messages: ChatMessage[];
   createdAt: string;
   updatedAt: string;
-  pageContext?: string; // Full page context for storage
+  pageContent?: string; // Full page content for storage
   contextChunks?: ContextChunk[]; // Chunked context for RAG
 }
 
-// Interface for context chunks used in RAG
+// Interface for context chunks
 interface ContextChunk {
   id: string;
   content: string;
-  metadata?: {
-    source?: string;
-    section?: string;
+  metadata: {
+    source: string;
   };
 }
 
-// Helper function to split text into chunks
-function splitIntoChunks(text: string, maxChunkSize: number = 1000): ContextChunk[] {
-  if (!text) return [];
+// Helper function to split content into chunks
+function splitIntoChunks(content: string): ContextChunk[] {
+  // Clean the content first
+  const cleanContent = extractContent(content);
   
-  // Split by natural paragraph breaks first
-  const paragraphs = text.split(/\n\s*\n/);
   const chunks: ContextChunk[] = [];
-  
-  let currentChunk = '';
   let chunkId = 0;
   
+  // Split into paragraphs first
+  const paragraphs = cleanContent.split(/\n+/);
+  let currentChunk = '';
+  
   for (const paragraph of paragraphs) {
-    // If adding this paragraph would exceed the chunk size, create a new chunk
-    if (currentChunk.length + paragraph.length > maxChunkSize && currentChunk.length > 0) {
-      chunks.push({
-        id: `chunk-${chunkId++}`,
-        content: currentChunk.trim()
-      });
-      currentChunk = '';
-    }
-    
-    // If a single paragraph is longer than maxChunkSize, split it by sentences
-    if (paragraph.length > maxChunkSize) {
-      const sentences = paragraph.match(/[^.!?]+[.!?]+/g) || [paragraph];
+    // If adding this paragraph would exceed chunk size
+    if ((currentChunk + '\n' + paragraph).length > 2000) {
+      // If current chunk is not empty, save it
+      if (currentChunk.trim()) {
+        chunks.push({
+          id: `chunk-${chunkId++}`,
+          content: currentChunk.trim(),
+          metadata: { source: 'page-content' }
+        });
+      }
       
-      for (const sentence of sentences) {
-        if (currentChunk.length + sentence.length > maxChunkSize && currentChunk.length > 0) {
-          chunks.push({
-            id: `chunk-${chunkId++}`,
-            content: currentChunk.trim()
-          });
-          currentChunk = '';
-        }
+      // If paragraph itself is too long, split it into sentences
+      if (paragraph.length > 2000) {
+        const sentences = paragraph.match(/[^.!?]+[.!?]+/g) || [paragraph];
+        let sentenceChunk = '';
         
-        currentChunk += sentence + ' ';
-        
-        if (currentChunk.length >= maxChunkSize) {
-          chunks.push({
-            id: `chunk-${chunkId++}`,
-            content: currentChunk.trim()
-          });
-          currentChunk = '';
+        for (const sentence of sentences) {
+          if ((sentenceChunk + sentence).length > 2000) {
+            if (sentenceChunk.trim()) {
+              chunks.push({
+                id: `chunk-${chunkId++}`,
+                content: sentenceChunk.trim(),
+                metadata: { source: 'page-content' }
+              });
+            }
+            // If single sentence is too long, split by words
+            if (sentence.length > 2000) {
+              const words = sentence.split(/\s+/);
+              let wordChunk = '';
+              
+              for (const word of words) {
+                if ((wordChunk + ' ' + word).length > 2000) {
+                  if (wordChunk.trim()) {
+                    chunks.push({
+                      id: `chunk-${chunkId++}`,
+                      content: wordChunk.trim(),
+                      metadata: { source: 'page-content' }
+                    });
+                  }
+                  wordChunk = word;
+                } else {
+                  wordChunk += ' ' + word;
+                }
+              }
+              // Add remaining words if any
+              if (wordChunk.trim()) {
+                sentenceChunk = wordChunk;
+              }
+            } else {
+              sentenceChunk = sentence;
+            }
+          } else {
+            sentenceChunk += ' ' + sentence;
+          }
         }
+        // Add remaining sentences if any
+        if (sentenceChunk.trim()) {
+          currentChunk = sentenceChunk;
+        }
+      } else {
+        currentChunk = paragraph;
       }
     } else {
-      currentChunk += paragraph + '\n\n';
+      currentChunk += (currentChunk ? '\n' : '') + paragraph;
     }
   }
   
-  // Add the last chunk if it's not empty
-  if (currentChunk.trim().length > 0) {
+  // Add the last chunk if not empty
+  if (currentChunk.trim()) {
     chunks.push({
       id: `chunk-${chunkId++}`,
-      content: currentChunk.trim()
+      content: currentChunk.trim(),
+      metadata: { source: 'page-content' }
     });
   }
   
@@ -242,7 +273,7 @@ class ChatbotDB {
     console.log(`ChatbotDB initialized with table: ${this.tableName}`);
   }
 
-  async createChatSession(userId: string, pageContext?: string): Promise<ChatSession> {
+  async createChatSession(userId: string, pageContent?: string): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
     
@@ -259,18 +290,18 @@ class ChatbotDB {
       updatedAt: timestamp
     };
 
-    // Process page context if provided
-    if (pageContext) {
-      // Store the full context for reference
-      chatSession.pageContext = pageContext;
+    // Process page content if provided
+    if (pageContent) {
+      // Store the full content for reference
+      chatSession.pageContent = pageContent;
       
       // Create chunked version for RAG
-      chatSession.contextChunks = splitIntoChunks(pageContext);
+      chatSession.contextChunks = splitIntoChunks(pageContent);
       
-      // Add basic instruction about context, but don't include the full context
+      // Add basic instruction about content, but don't include the full content
       chatSession.messages.push({
         role: 'system',
-        content: `The user is viewing a page within the AgentWeb platform. Use relevant information from the page context when answering their questions.`
+        content: `The user is viewing a page within the AgentWeb platform. Use relevant information from the page content when answering their questions.`
       });
     }
 
@@ -370,18 +401,18 @@ class ChatbotDB {
     }
   }
 
-  async updatePageContext(sessionId: string, pageContext: string): Promise<ChatSession> {
-    // Create chunks for the new context
-    const contextChunks = splitIntoChunks(pageContext);
+  async updatePageContext(sessionId: string, pageContent: string): Promise<ChatSession> {
+    // Create chunks for the new content
+    const contextChunks = splitIntoChunks(pageContent);
     
     const params = {
       TableName: this.tableName,
       Key: {
         sessionId
       },
-      UpdateExpression: 'SET pageContext = :pageContext, contextChunks = :contextChunks, updatedAt = :updatedAt',
+      UpdateExpression: 'SET pageContent = :pageContent, contextChunks = :contextChunks, updatedAt = :updatedAt',
       ExpressionAttributeValues: {
-        ':pageContext': pageContext,
+        ':pageContent': pageContent,
         ':contextChunks': contextChunks,
         ':updatedAt': new Date().toISOString()
       },
@@ -391,7 +422,7 @@ class ChatbotDB {
     try {
       const result = await dynamodb.update(params).promise();
       
-      // Add a system message to indicate context change but don't include the full context
+      // Add a system message to indicate content change but don't include the full content
       await this.addMessageToSession(sessionId, {
         role: 'system',
         content: `The user has navigated to a different page within the AgentWeb platform.`
@@ -399,7 +430,7 @@ class ChatbotDB {
       
       return result.Attributes as ChatSession;
     } catch (error) {
-      console.error('Error updating page context:', error);
+      console.error('Error updating page content:', error);
       throw error;
     }
   }
@@ -648,9 +679,17 @@ export async function generateChatResponse(
   sessionId: string,
   userMessage: string,
   currentUrl?: string,
-  pageContext?: string
+  pageContent?: string
 ): Promise<string> {
   try {
+    console.log('[generateChatResponse] Starting with:', {
+      sessionId,
+      messageLength: userMessage.length,
+      currentUrl,
+      hasPageContent: !!pageContent,
+      pageContentLength: pageContent?.length
+    });
+
     // Add user message to session
     await chatbotDb.addMessageToSession(sessionId, {
       role: 'user',
@@ -667,47 +706,64 @@ export async function generateChatResponse(
     const messages = [...session.messages];
     let contextInfo = '';
     
-    // Add URL context to the system message if available
-    if (currentUrl) {
-      const systemMessageIndex = messages.findIndex(msg => msg.role === 'system');
-      if (systemMessageIndex !== -1) {
-        messages[systemMessageIndex] = {
-          ...messages[systemMessageIndex],
-          content: `${messages[systemMessageIndex].content}\n\nThe user is currently on the page: ${currentUrl}`
-        };
-      }
+    // Process page content if available
+    let combinedChunks: ContextChunk[] = [...knowledgeBase];
+    if (pageContent) {
+      console.log('[generateChatResponse] Processing page content:', {
+        originalLength: pageContent.length,
+        knowledgeBaseChunks: knowledgeBase.length
+      });
+      
+      const pageChunks = splitIntoChunks(pageContent);
+      console.log('[generateChatResponse] Created page chunks:', {
+        numChunks: pageChunks.length,
+        firstChunkPreview: pageChunks[0]?.content.substring(0, 100)
+      });
+      
+      combinedChunks = [...pageChunks, ...knowledgeBase];
     }
     
-    // RAG: Retrieve relevant chunks from cached knowledge base
+    // RAG: Retrieve relevant chunks
     let retrievalErrorOccurred = false;
-    if (knowledgeBase.length > 0) {
-      try {
-        const relevantChunks = await findRelevantChunks(userMessage, knowledgeBase);
-        
-        if (relevantChunks.length > 0) {
-          // Insert retrieved context right before the user's message
-          contextInfo = relevantChunks
-            .map(chunk => chunk.content)
-            .join('\n\n');
-            
-          // Find the index of the last user message
-          const lastUserMsgIndex = messages.map(m => m.role).lastIndexOf('user');
+    try {
+      console.log('[generateChatResponse] Finding relevant chunks from total:', combinedChunks.length);
+      const relevantChunks = await findRelevantChunks(userMessage, combinedChunks);
+      console.log('[generateChatResponse] Found relevant chunks:', {
+        count: relevantChunks.length,
+        sources: relevantChunks.map(c => c.metadata.source)
+      });
+      
+      if (relevantChunks.length > 0) {
+        // Insert retrieved context right before the user's message
+        contextInfo = relevantChunks
+          .map(chunk => `${chunk.content} (Source: ${chunk.metadata.source})`)
+          .join('\n\n');
           
-          // Insert the context right before the user's message
-          if (lastUserMsgIndex > 0) {
-            messages.splice(lastUserMsgIndex, 0, {
-              role: 'system',
-              content: `Here is relevant information from our documentation:\n\n${contextInfo}`
-            });
-          }
+        // Find the index of the last user message
+        const lastUserMsgIndex = messages.map(m => m.role).lastIndexOf('user');
+        
+        // Insert the context right before the user's message
+        if (lastUserMsgIndex > 0) {
+          console.log('[generateChatResponse] Inserting context before user message');
+          messages.splice(lastUserMsgIndex, 0, {
+            role: 'system',
+            content: `Here is relevant information from the current page and our documentation:\n\n${contextInfo}`
+          });
         }
-      } catch (error) {
-        console.error('Error in context retrieval, continuing without context:', error);
-        retrievalErrorOccurred = true;
+      } else {
+        console.log('[generateChatResponse] No relevant chunks found');
       }
+    } catch (error) {
+      console.error('[generateChatResponse] Error in context retrieval:', error);
+      retrievalErrorOccurred = true;
     }
     
     // Generate response using OpenAI
+    console.log('[generateChatResponse] Sending to OpenAI:', {
+      numMessages: messages.length,
+      hasContext: !!contextInfo
+    });
+    
     const response = await openai.chat.completions.create({
       model: `${process.env.AZURE_OPENAI_DEPLOYMENT}`,
       messages
@@ -728,7 +784,7 @@ export async function generateChatResponse(
 
     return assistantReply;
   } catch (error) {
-    console.error('Error generating chat response:', error);
+    console.error('[generateChatResponse] Error:', error);
     throw error;
   }
 } 
