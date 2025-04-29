@@ -63,7 +63,11 @@ const guideSections: GuideSection[] = [
           "  • Include specific output format requests (e.g., 'Output results as CSV file')",
           "  • Be clear about what data should be included in any output files",
           "- Interactive Mode: Toggle this on if you want the AI to ask for additional information during execution",
-          "- Deep Research Mode: Toggle this on for comprehensive research tasks using public web data (automatically enables email notifications)"
+          "- Deep Research Mode: Toggle this on for comprehensive research tasks using public web data (automatically enables email notifications)",
+          "Important Security Note:",
+          "- If your task requires the agent to log into a website, you MUST provide the login credentials on the Config page first",
+          "- Never provide passwords through Interactive Mode as they will appear in plaintext in the execution logs",
+          "- Website credentials are securely encrypted and managed through the Config page only"
         ]
       },
       {
