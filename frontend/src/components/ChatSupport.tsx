@@ -301,7 +301,6 @@ const ChatSupport: React.FC = () => {
   const createNewChatSession = async () => {
     try {
       setIsLoading(true);
-      console.log('Creating new chat session');
       const createResponse = await axios.post(
         `${apiUrl}/api/chatbot/sessions`, 
         { currentUrl: window.location.pathname },
@@ -310,7 +309,6 @@ const ChatSupport: React.FC = () => {
       setSession(createResponse.data);
       // Clear the message input when starting a new chat
       setMessage('');
-      console.log('Created new session:', createResponse.data.sessionId);
     } catch (error) {
       console.error('Error creating new chat session:', error);
     } finally {
@@ -426,10 +424,7 @@ const ChatSupport: React.FC = () => {
           <Button
             variant="contained"
             color="primary"
-            onClick={() => {
-              console.log('Opening chat window');
-              setIsOpen(true);
-            }}
+            onClick={() => setIsOpen(true)}
             sx={{ 
               borderRadius: '50%', 
               width: 56, 

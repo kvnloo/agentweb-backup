@@ -46,6 +46,17 @@ export interface ChatMessage {
     total_tokens: number;
     estimated_cost: number;
   };
+  metadata?: {
+    currentUrl?: string;
+    pageContentLength?: number;
+    knowledgeBaseChunks?: number;
+    pageChunks?: number;
+    relevantChunks?: {
+      count: number;
+      sources: string[];
+    };
+    timestamp: string;
+  };
 }
 
 // Interface for chat sessions
@@ -270,7 +281,6 @@ class ChatbotDB {
 
   constructor() {
     this.tableName = `${TABLE_PREFIX}AW-ChatSessions`;
-    console.log(`ChatbotDB initialized with table: ${this.tableName}`);
   }
 
   async createChatSession(userId: string, pageContent?: string): Promise<ChatSession> {
@@ -283,25 +293,28 @@ class ChatbotDB {
       messages: [
         {
           role: 'system',
-          content: systemMessage
+          content: systemMessage,
+          metadata: {
+            timestamp,
+            knowledgeBaseChunks: knowledgeBase.length
+          }
         }
       ],
       createdAt: timestamp,
       updatedAt: timestamp
     };
 
-    // Process page content if provided
     if (pageContent) {
-      // Store the full content for reference
       chatSession.pageContent = pageContent;
-      
-      // Create chunked version for RAG
       chatSession.contextChunks = splitIntoChunks(pageContent);
-      
-      // Add basic instruction about content, but don't include the full content
       chatSession.messages.push({
         role: 'system',
-        content: `The user is viewing a page within the AgentWeb platform. Use relevant information from the page content when answering their questions.`
+        content: `The user is viewing a page within the AgentWeb platform. Use relevant information from the page content when answering their questions.`,
+        metadata: {
+          timestamp,
+          pageContentLength: pageContent.length,
+          knowledgeBaseChunks: knowledgeBase.length
+        }
       });
     }
 
@@ -312,10 +325,35 @@ class ChatbotDB {
 
     try {
       await dynamodb.put(params).promise();
-      console.log(`Created chat session: ${sessionId} for user: ${userId}`);
       return chatSession;
     } catch (error) {
       console.error('Error creating chat session:', error);
+      throw error;
+    }
+  }
+
+  async addMessageToSession(
+    sessionId: string, 
+    message: ChatMessage
+  ): Promise<ChatSession> {
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId
+      },
+      UpdateExpression: 'SET messages = list_append(messages, :message), updatedAt = :updatedAt',
+      ExpressionAttributeValues: {
+        ':message': [message],
+        ':updatedAt': new Date().toISOString()
+      },
+      ReturnValues: 'ALL_NEW'
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error('Error adding message to session:', error);
       throw error;
     }
   }
@@ -359,32 +397,6 @@ class ChatbotDB {
     }
   }
 
-  async addMessageToSession(
-    sessionId: string, 
-    message: ChatMessage
-  ): Promise<ChatSession> {
-    const params = {
-      TableName: this.tableName,
-      Key: {
-        sessionId
-      },
-      UpdateExpression: 'SET messages = list_append(messages, :message), updatedAt = :updatedAt',
-      ExpressionAttributeValues: {
-        ':message': [message],
-        ':updatedAt': new Date().toISOString()
-      },
-      ReturnValues: 'ALL_NEW'
-    };
-
-    try {
-      const result = await dynamodb.update(params).promise();
-      return result.Attributes as ChatSession;
-    } catch (error) {
-      console.error('Error adding message to session:', error);
-      throw error;
-    }
-  }
-
   async deleteSession(sessionId: string): Promise<void> {
     const params = {
       TableName: this.tableName,
@@ -404,6 +416,7 @@ class ChatbotDB {
   async updatePageContext(sessionId: string, pageContent: string): Promise<ChatSession> {
     // Create chunks for the new content
     const contextChunks = splitIntoChunks(pageContent);
+    const timestamp = new Date().toISOString();
     
     const params = {
       TableName: this.tableName,
@@ -414,7 +427,7 @@ class ChatbotDB {
       ExpressionAttributeValues: {
         ':pageContent': pageContent,
         ':contextChunks': contextChunks,
-        ':updatedAt': new Date().toISOString()
+        ':updatedAt': timestamp
       },
       ReturnValues: 'ALL_NEW'
     };
@@ -422,10 +435,15 @@ class ChatbotDB {
     try {
       const result = await dynamodb.update(params).promise();
       
-      // Add a system message to indicate content change but don't include the full content
+      // Add a system message to indicate content change with metadata
       await this.addMessageToSession(sessionId, {
         role: 'system',
-        content: `The user has navigated to a different page within the AgentWeb platform.`
+        content: `The user has navigated to a different page within the AgentWeb platform.`,
+        metadata: {
+          timestamp,
+          pageContentLength: pageContent.length,
+          knowledgeBaseChunks: knowledgeBase.length
+        }
       });
       
       return result.Attributes as ChatSession;
@@ -682,18 +700,21 @@ export async function generateChatResponse(
   pageContent?: string
 ): Promise<string> {
   try {
-    console.log('[generateChatResponse] Starting with:', {
-      sessionId,
-      messageLength: userMessage.length,
+    const timestamp = new Date().toISOString();
+    
+    // Add user message to session with metadata
+    const userMessageMetadata = {
       currentUrl,
-      hasPageContent: !!pageContent,
-      pageContentLength: pageContent?.length
-    });
+      pageContentLength: pageContent?.length,
+      knowledgeBaseChunks: knowledgeBase.length,
+      pageChunks: pageContent ? splitIntoChunks(pageContent).length : 0,
+      timestamp
+    };
 
-    // Add user message to session
     await chatbotDb.addMessageToSession(sessionId, {
       role: 'user',
-      content: userMessage
+      content: userMessage,
+      metadata: userMessageMetadata
     });
 
     // Get updated session with history
@@ -708,33 +729,24 @@ export async function generateChatResponse(
     
     // Process page content if available
     let combinedChunks: ContextChunk[] = [...knowledgeBase];
+    let pageChunksCount = 0;
     if (pageContent) {
-      console.log('[generateChatResponse] Processing page content:', {
-        originalLength: pageContent.length,
-        knowledgeBaseChunks: knowledgeBase.length
-      });
-      
       const pageChunks = splitIntoChunks(pageContent);
-      console.log('[generateChatResponse] Created page chunks:', {
-        numChunks: pageChunks.length,
-        firstChunkPreview: pageChunks[0]?.content.substring(0, 100)
-      });
-      
+      pageChunksCount = pageChunks.length;
       combinedChunks = [...pageChunks, ...knowledgeBase];
     }
     
     // RAG: Retrieve relevant chunks
     let retrievalErrorOccurred = false;
+    let relevantChunksInfo: { count: number; sources: string[] } | undefined;
     try {
-      console.log('[generateChatResponse] Finding relevant chunks from total:', combinedChunks.length);
       const relevantChunks = await findRelevantChunks(userMessage, combinedChunks);
-      console.log('[generateChatResponse] Found relevant chunks:', {
+      relevantChunksInfo = {
         count: relevantChunks.length,
         sources: relevantChunks.map(c => c.metadata.source)
-      });
+      };
       
       if (relevantChunks.length > 0) {
-        // Insert retrieved context right before the user's message
         contextInfo = relevantChunks
           .map(chunk => `${chunk.content} (Source: ${chunk.metadata.source})`)
           .join('\n\n');
@@ -744,14 +756,15 @@ export async function generateChatResponse(
         
         // Insert the context right before the user's message
         if (lastUserMsgIndex > 0) {
-          console.log('[generateChatResponse] Inserting context before user message');
           messages.splice(lastUserMsgIndex, 0, {
             role: 'system',
-            content: `Here is relevant information from the current page and our documentation:\n\n${contextInfo}`
+            content: `Here is relevant information from the current page and our documentation:\n\n${contextInfo}`,
+            metadata: {
+              timestamp,
+              relevantChunks: relevantChunksInfo
+            }
           });
         }
-      } else {
-        console.log('[generateChatResponse] No relevant chunks found');
       }
     } catch (error) {
       console.error('[generateChatResponse] Error in context retrieval:', error);
@@ -759,14 +772,9 @@ export async function generateChatResponse(
     }
     
     // Generate response using OpenAI
-    console.log('[generateChatResponse] Sending to OpenAI:', {
-      numMessages: messages.length,
-      hasContext: !!contextInfo
-    });
-    
     const response = await openai.chat.completions.create({
       model: `${process.env.AZURE_OPENAI_DEPLOYMENT}`,
-      messages
+      messages: messages.map(({ role, content }) => ({ role, content })) // Only send role and content to OpenAI
     });
 
     // Log and get usage data
@@ -775,11 +783,21 @@ export async function generateChatResponse(
     // Extract assistant's reply
     const assistantReply = response.choices[0]?.message?.content || 'I apologize, but I was unable to generate a response.';
 
-    // Add assistant's reply to the session with usage data
+    // Add assistant's reply to the session with usage data and metadata
+    const assistantMessageMetadata = {
+      currentUrl,
+      pageContentLength: pageContent?.length,
+      knowledgeBaseChunks: knowledgeBase.length,
+      pageChunks: pageChunksCount,
+      relevantChunks: relevantChunksInfo,
+      timestamp
+    };
+
     await chatbotDb.addMessageToSession(sessionId, {
       role: 'assistant',
       content: assistantReply,
-      usage: usageData
+      usage: usageData,
+      metadata: assistantMessageMetadata
     });
 
     return assistantReply;

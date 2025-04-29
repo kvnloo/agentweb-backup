@@ -62,7 +62,6 @@ io.on('connection', (socket: Socket) => {
     pageContent?: string;
   }) => {
     try {
-      console.log('[WebSocket] Received message with pageContent length:', data.pageContent?.length);
       const response = await generateChatResponse(
         data.sessionId,
         data.message,
