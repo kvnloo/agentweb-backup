@@ -7,6 +7,17 @@ interface Release {
 
 const releases: Release[] = [
   {
+    date: "2025-04-29",
+    changes: [
+      "Introduced AI Customer Support Agent",
+      "- Context-aware support assistant powered by RAG technology",
+      "- Real-time access to product documentation and guides",
+      "- Page-specific help based on user's current location",
+      "- Integration with knowledge base for accurate responses",
+      "- Powered by the advanced GPT-4.1 model from OpenAI"
+    ]
+  },
+  {
     date: "2025-04-17",
     changes: [
       "Added Output As JSON option on Task Details page",
