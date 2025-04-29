@@ -565,7 +565,7 @@ const ChatSupport: React.FC = () => {
                 <Box sx={{ textAlign: 'center', color: 'text.secondary', mt: 5 }}>
                   <Typography variant="h6" sx={{ mb: 2 }}>How can I help you today?</Typography>
                   <Typography variant="body2" sx={{ fontSize: '0.9rem', px: 3 }}>
-                    I can help answer general questions about AgentWeb, information on this page.
+                    I can provide guidance using AgentWeb's documentation.
                   </Typography>
                 </Box>
               ) : (
