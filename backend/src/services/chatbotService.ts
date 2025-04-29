@@ -565,9 +565,9 @@ Format your responses in HTML5 for direct rendering. Use:
 - <em> for emphasis
 - <code> for technical terms and commands
 - <ul> and <li> for lists
-- <pre> for code blocks
+- <pre> for code blocks (max width 360px)
 - <a href="url" target="_blank"> for links
-- <table> for structured data
+- <table> for structured data (max width 360px)
 
 Important formatting rules:
 1. Use minimal spacing - no extra blank lines
@@ -576,6 +576,7 @@ Important formatting rules:
 4. Keep responses concise and well-structured
 5. Always include target="_blank" for links
 6. Use proper HTML5 semantic elements
+7. The chat window has a fixed width of 384px. Format your responses to fit within this constraint
 
 Example of good formatting:
 <p>To create a task in AgentWeb, follow these steps:</p>

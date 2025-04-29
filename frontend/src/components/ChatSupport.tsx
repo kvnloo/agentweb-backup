@@ -442,9 +442,7 @@ const ChatSupport: React.FC = () => {
               boxShadow: 3,
               display: 'flex',
               flexDirection: 'column',
-              width: { xs: '100%', sm: 'auto' },
-              minWidth: { xs: 320, sm: 384 },
-              maxWidth: '90vw',
+              width: '384px',
               height: 384,
               border: '1px solid',
               borderColor: 'divider'
@@ -630,17 +628,28 @@ const ChatSupport: React.FC = () => {
                       <Typography 
                         variant="body2" 
                         sx={{ 
-                          whiteSpace: 'pre-wrap',
-                          lineHeight: 1.5,
+                          whiteSpace: 'normal',
+                          lineHeight: 1.4,
                           fontWeight: msg.role === 'user' ? 400 : 400,
                           letterSpacing: '0.1px',
+                          '& p': {
+                            margin: 0,
+                            padding: 0,
+                            '& + p': {
+                              marginTop: '0.5em'
+                            }
+                          },
                           '& ul, & ol': {
-                            margin: '0',
-                            padding: '0 0 0 20px'
+                            margin: '0.25em 0',
+                            padding: '0 0 0 1.2em'
                           },
                           '& li': {
-                            margin: '0',
-                            padding: '0'
+                            margin: 0,
+                            padding: 0,
+                            lineHeight: 1.3
+                          },
+                          '& li + li': {
+                            marginTop: '0.1em'
                           },
                           '& a': {
                             color: msg.role === 'user' ? '#fff' : '#1976d2',
@@ -648,17 +657,17 @@ const ChatSupport: React.FC = () => {
                           },
                           '& pre': {
                             backgroundColor: msg.role === 'user' ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.05)',
-                            padding: '8px',
+                            padding: '0.5em',
                             borderRadius: '4px',
                             overflowX: 'auto',
-                            margin: '4px 0',
+                            margin: '0.25em 0',
                             whiteSpace: 'pre-wrap',
                             wordBreak: 'break-word'
                           },
                           '& code': {
                             backgroundColor: msg.role === 'user' ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.05)',
-                            padding: '2px 4px',
-                            borderRadius: '4px',
+                            padding: '0.15em 0.3em',
+                            borderRadius: '3px',
                             fontSize: '0.9em'
                           }
                         }}
