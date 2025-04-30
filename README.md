@@ -371,6 +371,89 @@ zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json .env.
    - Click "Apply"
    - Wait for the environment update to complete
 
+### Backend Deployment to AWS Elastic Beanstalk (Staging)
+
+This section describes how to deploy the backend to AWS Elastic Beanstalk for staging purposes.
+
+#### Prerequisites
+- AWS Account with Elastic Beanstalk permissions
+- AWS Management Console access
+
+#### 1. Use the production build package
+
+You can use the same build package created for production deployment:
+
+```bash
+# Reference the production build from the Backend Deployment section
+# The build should already exist at: builds/deploy_v${VERSION}.zip
+```
+
+If you haven't created the production build yet, follow the build instructions in the Backend Deployment section above.
+
+#### 2. Create a staging application in Elastic Beanstalk
+
+1. Go to AWS Management Console > Elastic Beanstalk
+2. Click "Create application"
+3. Enter application name (e.g., "agentweb-backend-stage")
+4. Choose "Node.js" as platform
+5. Upload the same versioned zip file used for production from `builds/deploy_v${VERSION}.zip`
+6. Click "Create application"
+
+#### 3. Configure environment variables
+
+1. In your environment, go to Configuration > Software
+2. Click "Edit"
+3. Add environment variables:
+   - AWS_REGION = us-west-2
+   - NODE_ENV = staging
+   - JWT_SECRET = <your-staging-jwt-secret>
+   - FRONTEND_URL = https://agentweb-frontend.lovable.app
+   - BACKEND_URL = https://api-stage.agentweb.pro
+   - SMTP_HOST = <your-smtp-host>
+   - SMTP_PORT = <your-smtp-port>
+   - SMTP_USER = <your-smtp-user>
+   - SMTP_PASS = <your-smtp-password>
+   - FROM_EMAIL = <your-from-email>
+   - SITE_DOMAIN = https://agentweb-frontend.lovable.app
+   - ADMIN_EMAIL = <your-admin-email>
+   - ADMIN_PASSWORD = <your-admin-password>
+4. Click "Apply"
+5. Wait for the environment update to complete
+
+#### 4. Configure domain name and HTTPS
+
+1. Set up DNS in Route 53:
+   - Go to AWS Route 53 console
+   - Select your hosted zone (e.g., agentweb.pro)
+   - Click "Create record"
+   - Name: api-stage (this will create api-stage.agentweb.pro)
+   - Type: A - IPv4 address
+   - Choose "Alias" option
+   - Route traffic to: Alias to Elastic Beanstalk environment
+   - Select your region and Elastic Beanstalk environment
+   - Click "Create records"
+
+2. Configure HTTPS in Elastic Beanstalk:
+   - In your environment, go to Configuration
+   - Under "Load balancer" (for load-balanced environments) or under "Network listener" (for single instances), click "Edit"
+   - Add listener on port 443 with protocol HTTPS
+   - Select your existing *.agentweb.pro certificate
+   - Save the configuration
+   - Wait for the environment update to complete
+
+After the changes propagate, both http://api-stage.agentweb.pro and https://api-stage.agentweb.pro should work properly.
+
+#### 5. Updating the staging deployment
+
+When you need to update your staging environment:
+
+1. Use the same updated production build package
+2. Go to your staging application environment in Elastic Beanstalk
+3. Click "Upload and deploy"
+4. Choose the same zip file used for production
+5. Enter a version label (e.g., "v0.22-stage")
+6. Click "Deploy"
+
 ### Agent Engine Deployment to Google Cloud VM
 
 This section describes how to deploy the agent-engine on a single Google Cloud VM instance, suitable for development, testing, or lower-scale production use.

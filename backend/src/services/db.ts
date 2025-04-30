@@ -243,6 +243,7 @@ class UserDB {
   }
 }
 
+// Initialize and export userDb instance
 export const userDb = new UserDB();
 
 export const taskDb = {

@@ -28,6 +28,7 @@ import Release from './pages/Release';
 import Guide from './pages/Guide';
 import Templates from './pages/Templates';
 import Api from './pages/Api';
+import Marketing from './pages/marketing';
 
 export default function App() {
   return (
@@ -161,6 +162,7 @@ export default function App() {
                         </PrivateRoute>
                       }
                     />
+                    <Route path="marketing/*" element={<Marketing />} />
                   </Route>
                 </Routes>
               </Box>

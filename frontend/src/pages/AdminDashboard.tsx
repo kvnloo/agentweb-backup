@@ -26,7 +26,8 @@ import {
   DialogContent,
   DialogActions,
   DialogContentText,
-  Tooltip
+  Tooltip,
+  IconButton
 } from '@mui/material';
 import { format } from 'date-fns';
 import { Link } from 'react-router-dom';
@@ -35,7 +36,8 @@ import { useAuth } from '../contexts/AuthContext';
 import { buildApiUrl } from '../config';
 import DOMPurify from 'dompurify';
 import {
-  Info as InfoIcon
+  Info as InfoIcon,
+  Close as CloseIcon
 } from '@mui/icons-material';
 
 interface TabPanelProps {
@@ -81,6 +83,179 @@ interface WaitlistEntry {
   requestReport?: boolean;
 }
 
+const ChatDialog = ({ session, open, onClose }: { session: any; open: boolean; onClose: () => void }) => {
+  return (
+    <Dialog
+      open={open}
+      onClose={onClose}
+      maxWidth="md"
+      fullWidth
+    >
+      <DialogTitle>
+        Chat Session Details
+        <IconButton
+          aria-label="close"
+          onClick={onClose}
+          sx={{ position: 'absolute', right: 8, top: 8 }}
+        >
+          <CloseIcon />
+        </IconButton>
+      </DialogTitle>
+      <DialogContent dividers>
+        {session && (
+          <>
+            <Typography variant="subtitle2" gutterBottom>
+              Session ID: {session.sessionId}
+            </Typography>
+            <Typography variant="subtitle2" gutterBottom>
+              User ID: <Link 
+                to={`/profile/${session.userId}`}
+                style={{ 
+                  color: '#1976d2',
+                  textDecoration: 'none'
+                }}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                {session.userId}
+              </Link>
+            </Typography>
+            <Box sx={{ mt: 2 }}>
+              {session.messages?.filter((msg: any) => msg.role !== 'system').map((msg: any, index: number) => (
+                <Box
+                  key={index}
+                  sx={{
+                    mb: 2,
+                    p: 2,
+                    borderRadius: 1,
+                    backgroundColor: 
+                      msg.role === 'user' ? 'grey.100' :
+                      msg.role === 'assistant' ? '#e3f2fd' :
+                      '#f3e5f5', // System messages get a light purple background
+                    color: 'text.primary',
+                    border: msg.role !== 'user' ? '1px solid' : 'none',
+                    borderColor: 
+                      msg.role === 'assistant' ? '#90caf9' :
+                      msg.role === 'system' ? '#ce93d8' : 'transparent',
+                    '& code': {
+                      backgroundColor: 'rgba(0, 0, 0, 0.04)',
+                      padding: '2px 4px',
+                      borderRadius: '4px',
+                      fontFamily: 'monospace'
+                    },
+                    '& pre': {
+                      maxWidth: '360px',
+                      overflow: 'auto',
+                      backgroundColor: 'rgba(0, 0, 0, 0.04)',
+                      padding: '8px',
+                      borderRadius: '4px',
+                      margin: '8px 0'
+                    },
+                    '& ul, & ol': {
+                      marginTop: '4px',
+                      marginBottom: '4px',
+                      paddingLeft: '20px'
+                    },
+                    '& li': {
+                      marginBottom: '2px'
+                    },
+                    '& p': {
+                      marginTop: '4px',
+                      marginBottom: '4px'
+                    },
+                    '& a': {
+                      color: '#1976d2',
+                      textDecoration: 'none',
+                      '&:hover': {
+                        textDecoration: 'underline'
+                      }
+                    },
+                    '& table': {
+                      maxWidth: '360px',
+                      borderCollapse: 'collapse',
+                      margin: '8px 0',
+                      '& th, & td': {
+                        border: '1px solid rgba(0, 0, 0, 0.12)',
+                        padding: '4px 8px'
+                      }
+                    }
+                  }}
+                >
+                  <Typography 
+                    variant="caption" 
+                    display="block" 
+                    gutterBottom
+                    sx={{
+                      color: 
+                        msg.role === 'assistant' ? '#1976d2' :
+                        msg.role === 'system' ? '#7b1fa2' : 
+                        'text.secondary',
+                      fontWeight: 'bold'
+                    }}
+                  >
+                    {msg.role.toUpperCase()}
+                    {msg.metadata?.timestamp && !isNaN(new Date(msg.metadata.timestamp).getTime()) && (
+                      <> - {new Date(msg.metadata.timestamp).toLocaleString()}</>
+                    )}
+                  </Typography>
+                  <Box
+                    sx={{
+                      '& > div': {
+                        overflow: 'auto',
+                        maxWidth: '100%'
+                      }
+                    }}
+                    dangerouslySetInnerHTML={{ 
+                      __html: DOMPurify.sanitize(msg.content, {
+                        ADD_TAGS: ['strong', 'em', 'code', 'ul', 'li', 'pre', 'a', 'table', 'tr', 'td', 'th', 'p'],
+                        ADD_ATTR: ['href', 'target']
+                      })
+                    }}
+                  />
+                  {msg.metadata && (
+                    <Box sx={{ mt: 1 }}>
+                      <Typography variant="caption" color="text.secondary">
+                        Metadata:
+                      </Typography>
+                      <pre style={{ 
+                        fontSize: '0.75rem', 
+                        margin: 0,
+                        padding: '8px',
+                        backgroundColor: 'rgba(0, 0, 0, 0.03)',
+                        borderRadius: '4px',
+                        overflowX: 'auto'
+                      }}>
+                        {JSON.stringify(msg.metadata, null, 2)}
+                      </pre>
+                    </Box>
+                  )}
+                  {msg.usage && (
+                    <Box sx={{ mt: 1 }}>
+                      <Typography variant="caption" color="text.secondary">
+                        Usage:
+                      </Typography>
+                      <pre style={{ 
+                        fontSize: '0.75rem', 
+                        margin: 0,
+                        padding: '8px',
+                        backgroundColor: 'rgba(0, 0, 0, 0.03)',
+                        borderRadius: '4px',
+                        overflowX: 'auto'
+                      }}>
+                        {JSON.stringify(msg.usage, null, 2)}
+                      </pre>
+                    </Box>
+                  )}
+                </Box>
+              ))}
+            </Box>
+          </>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+};
+
 export default function AdminDashboard() {
   const [tabValue, setTabValue] = useState(0);
   const [startDate, setStartDate] = useState<Date | null>(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000));
@@ -95,6 +270,9 @@ export default function AdminDashboard() {
   const [success, setSuccess] = useState('');
   const [selectedUser, setSelectedUser] = useState<any>(null);
   const [deactivateDialogOpen, setDeactivateDialogOpen] = useState(false);
+  const [chatSessions, setChatSessions] = useState<any[]>([]);
+  const [selectedSession, setSelectedSession] = useState<any>(null);
+  const [chatDialogOpen, setChatDialogOpen] = useState(false);
   const { token } = useAuth();
   
   const {
@@ -148,6 +326,12 @@ export default function AdminDashboard() {
       loadTasks();
     }
   }, [tabValue, token]);
+
+  useEffect(() => {
+    if (tabValue === 5) {
+      loadChatSessions();
+    }
+  }, [tabValue]);
 
   const handleTabChange = (_event: React.SyntheticEvent, newValue: number) => {
     setTabValue(newValue);
@@ -318,6 +502,26 @@ export default function AdminDashboard() {
     }
   };
 
+  const loadChatSessions = async () => {
+    try {
+      setLoading(true);
+      const response = await axios.get(
+        buildApiUrl('/api/admin/chat-sessions'),
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setChatSessions(response.data);
+    } catch (error: any) {
+      setError(error.response?.data?.message || 'Failed to load chat sessions');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleViewChat = (session: any) => {
+    setSelectedSession(session);
+    setChatDialogOpen(true);
+  };
+
   if (adminError) {
     return <Alert severity="error">{adminError}</Alert>;
   }
@@ -336,6 +540,7 @@ export default function AdminDashboard() {
             <Tab label="Users" {...a11yProps(2)} />
             <Tab label="Waitlist" {...a11yProps(3)} />
             <Tab label="Tasks" {...a11yProps(4)} />
+            <Tab label="Chat History" {...a11yProps(5)} />
           </Tabs>
         </Box>
 
@@ -924,6 +1129,62 @@ export default function AdminDashboard() {
             </Table>
           </TableContainer>
         </TabPanel>
+
+        <TabPanel value={tabValue} index={5}>
+          {error && (
+            <Alert severity="error" sx={{ mb: 3 }}>
+              {error}
+            </Alert>
+          )}
+          <TableContainer component={Paper}>
+            <Table>
+              <TableHead>
+                <TableRow>
+                  <TableCell>Session ID</TableCell>
+                  <TableCell>User</TableCell>
+                  <TableCell>Created At</TableCell>
+                  <TableCell>Last Updated</TableCell>
+                  <TableCell>Messages</TableCell>
+                  <TableCell>Actions</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {loading ? (
+                  <TableRow>
+                    <TableCell colSpan={6} align="center">
+                      <CircularProgress />
+                    </TableCell>
+                  </TableRow>
+                ) : (
+                  chatSessions.map((session) => (
+                    <TableRow key={session.sessionId}>
+                      <TableCell>{session.sessionId}</TableCell>
+                      <TableCell>{session.userId}</TableCell>
+                      <TableCell>{new Date(session.createdAt).toLocaleString()}</TableCell>
+                      <TableCell>{new Date(session.updatedAt).toLocaleString()}</TableCell>
+                      <TableCell>
+                        <Chip 
+                          label={session.messages?.length || 0} 
+                          color="primary"
+                          size="small"
+                        />
+                      </TableCell>
+                      <TableCell>
+                        <Button
+                          variant="outlined"
+                          size="small"
+                          onClick={() => handleViewChat(session)}
+                        >
+                          View Chat
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))
+                )}
+              </TableBody>
+            </Table>
+          </TableContainer>
+        </TabPanel>
       </Paper>
 
       {/* Deactivation Confirmation Dialog */}
@@ -955,6 +1216,13 @@ export default function AdminDashboard() {
           </Button>
         </DialogActions>
       </Dialog>
+
+      {/* Chat Dialog */}
+      <ChatDialog
+        session={selectedSession}
+        open={chatDialogOpen}
+        onClose={() => setChatDialogOpen(false)}
+      />
     </Container>
   );
 } 

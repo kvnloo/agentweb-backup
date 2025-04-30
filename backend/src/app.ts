@@ -9,6 +9,7 @@ import adminRoutes from './routes/admin';
 import configRouter from './routes/config';
 import workflowRoutes from './routes/workflows';
 import templateRoutes from './routes/templates';
+import chatbotRoutes from './routes/chatbot';
 
 const app = express();
 
@@ -38,6 +39,7 @@ app.use('/api/admin', adminRoutes);
 app.use('/api/config', configRouter);
 app.use('/api/workflows', workflowRoutes);
 app.use('/api/templates', templateRoutes);
+app.use('/api/chatbot', chatbotRoutes);
 
 // Health check endpoint
 app.get('/', (req, res) => {

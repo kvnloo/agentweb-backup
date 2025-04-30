@@ -131,6 +131,24 @@ def get_azure_openai_llm(model_name: str):
         logger.error("Please ensure all Azure OpenAI environment variables are set correctly.")
         sys.exit(1)
 
+def get_azure_openai_llm2(model_name: str):
+    """Initialize Azure OpenAI language model"""
+    try:
+        deployment_name = model_name # use model name as deployment name in Azure portal
+        
+        return AzureChatOpenAI(
+            model_name=model_name,
+            azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT2'),
+            azure_deployment=deployment_name,
+            api_key=os.getenv('AZURE_OPENAI_API_KEY2'),
+            api_version=os.getenv('AZURE_OPENAI_API_VERSION2', '2024-12-01-preview'),
+            temperature=0.0
+        )
+    except Exception as e:
+        logger.error(f"Error initializing Azure OpenAI: {e}")
+        logger.error("Please ensure all Azure OpenAI environment variables are set correctly.")
+        sys.exit(1)
+
 def get_azure_openai_llm_o1(model_name: str):
     """Initialize Azure OpenAI language model"""
     try:
@@ -270,7 +288,8 @@ def get_llm(full_llm_name: str) -> Tuple[Any, str]:
         "azure": {
             "openai": {
                 "gpt-4o": get_azure_openai_llm,
-                "o1-mini": get_azure_openai_llm_o1
+                "o1-mini": get_azure_openai_llm_o1,
+                "gpt-4.1": get_azure_openai_llm2
             }
         },
         "deepseek": {
