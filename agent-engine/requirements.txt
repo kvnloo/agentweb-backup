@@ -11,3 +11,4 @@ nest-asyncio>=1.6.0
 xmltodict
 facebook-business>=19.0.0
 cryptography>=42.0.0
+watchdog>=3.0.0
