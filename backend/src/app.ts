@@ -12,6 +12,7 @@ import templateRoutes from './routes/templates';
 import chatbotRoutes from './routes/chatbot';
 import guideRoutes from './routes/guide';
 import releaseRoutes from './routes/release';
+import apiDocsRoutes from './routes/api-docs';
 
 const app = express();
 
@@ -44,6 +45,7 @@ app.use('/api/templates', templateRoutes);
 app.use('/api/chatbot', chatbotRoutes);
 app.use('/api/guide', guideRoutes);
 app.use('/api/release', releaseRoutes);
+app.use('/api/docs', apiDocsRoutes);
 
 // Health check endpoint
 app.get('/', (req, res) => {
