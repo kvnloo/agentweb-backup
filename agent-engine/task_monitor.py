@@ -433,6 +433,7 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
         if not Path(filtered_activity_log).exists():
             with open(filtered_activity_log, 'w') as f:
                 f.write(f"Execution log initialized at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            logger.info(f"Created initial log file: {filtered_activity_log}")
         
         # Start the log sync manager to upload log files in real-time
         log_sync_manager = LogSyncManager(filtered_activity_log, user_id, execution_id)
