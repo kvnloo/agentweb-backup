@@ -24,7 +24,7 @@ export default function Api() {
       try {
         setLoading(true);
         const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3001';
-        const response = await axios.get(`${apiUrl}/api/docs`);
+        const response = await axios.get(`${apiUrl}/api/docs/api`);
         
         if (response.data.success) {
           setApiSections(response.data.data);

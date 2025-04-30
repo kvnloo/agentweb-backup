@@ -25,7 +25,7 @@ export default function Guide() {
       try {
         setLoading(true);
         const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3001';
-        const response = await axios.get(`${apiUrl}/api/guide`);
+        const response = await axios.get(`${apiUrl}/api/docs/guide`);
         
         if (response.data.success) {
           setGuideSections(response.data.data);

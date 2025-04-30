@@ -4,7 +4,7 @@ import { getGuide } from '../controllers/guide';
 const router = express.Router();
 
 /**
- * @route   GET /api/guide
+ * @route   GET /api/docs/guide
  * @desc    Get guide data
  * @access  Public
  */

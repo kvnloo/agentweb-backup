@@ -4,7 +4,7 @@ import { getReleases } from '../controllers/release';
 const router = express.Router();
 
 /**
- * @route   GET /api/release
+ * @route   GET /api/docs/release
  * @desc    Get release history data
  * @access  Public
  */

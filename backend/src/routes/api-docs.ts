@@ -4,7 +4,7 @@ import { getApiDocs } from '../controllers/api';
 const router = express.Router();
 
 /**
- * @route   GET /api/docs
+ * @route   GET /api/docs/api
  * @desc    Get API documentation
  * @access  Public
  */

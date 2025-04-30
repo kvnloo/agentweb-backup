@@ -17,7 +17,7 @@ export default function Release() {
       try {
         setLoading(true);
         const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3001';
-        const response = await axios.get(`${apiUrl}/api/release`);
+        const response = await axios.get(`${apiUrl}/api/docs/release`);
         
         if (response.data.success) {
           setReleases(response.data.data);
