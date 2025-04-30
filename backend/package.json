@@ -42,7 +42,6 @@
     "openai": "^4.83.0",
     "passport": "^0.7.0",
     "passport-google-oauth20": "^2.0.0",
-    "puppeteer": "^24.7.2",
     "reactflow": "^11.11.4",
     "socket.io": "^4.8.1",
     "typescript": "^5.3.3"

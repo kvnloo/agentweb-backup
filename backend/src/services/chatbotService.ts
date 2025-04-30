@@ -3,7 +3,10 @@ import { v4 as uuidv4 } from 'uuid';
 import AWS from 'aws-sdk';
 import dotenv from 'dotenv';
 import path from 'path';
-import puppeteer from 'puppeteer';
+import { getGuide } from '../controllers/guide';
+import { getReleases } from '../controllers/release';
+import { getApiDocs } from '../controllers/api';
+import { Request, Response } from 'express';
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
@@ -473,49 +476,6 @@ class ChatbotDB {
 // Initialize database
 export const chatbotDb = new ChatbotDB();
 
-// Helper function to fetch content from frontend URLs
-async function fetchContent(url: string): Promise<string> {
-  try {
-    const browser = await puppeteer.launch({
-      headless: true,
-      args: ['--no-sandbox']
-    });
-    
-    const page = await browser.newPage();
-    await page.goto(url, { waitUntil: 'networkidle0' });
-    
-    // Wait for React to render
-    await page.waitForSelector('main', { timeout: 5000 });
-    
-    // Get the rendered content
-    const content = await page.evaluate(() => {
-      const main = document.querySelector('main');
-      if (!main) return '';
-      
-      // Get all text nodes and their content
-      const walker = document.createTreeWalker(
-        main,
-        NodeFilter.SHOW_TEXT,
-        null
-      );
-      
-      let text = '';
-      let node;
-      while (node = walker.nextNode()) {
-        text += node.textContent + '\n';
-      }
-      
-      return text;
-    });
-    
-    await browser.close();
-    return content.trim();
-  } catch (error) {
-    console.error(`Error fetching ${url}:`, error);
-    return '';
-  }
-}
-
 // Helper function to extract content from HTML
 function extractContent(html: string): string {
   // Remove script and style tags
@@ -552,57 +512,114 @@ function printKnowledgeBase(): void {
   console.log('\n============================\n');
 }
 
-// Load and cache content from frontend URLs
+// Load and cache content from backend API controllers directly
 async function loadKnowledgeBase(): Promise<void> {
-  const baseUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-  const urls = [
-    `${baseUrl}/guide`,
-    `${baseUrl}/release`,
-    `${baseUrl}/api`
+  const endpoints = [
+    { controller: getGuide, source: 'guide' },
+    { controller: getReleases, source: 'release' },
+    { controller: getApiDocs, source: 'api' }
   ];
 
   const chunks: ContextChunk[] = [];
   let chunkId = 0;
   
-  for (const url of urls) {
+  for (const endpoint of endpoints) {
     try {
-      const content = await fetchContent(url);
-      if (content) {
-        // Split content into smaller chunks (max 2000 chars per chunk)
-        const textChunks = content.match(/[^\.!\?]+[\.!\?]+/g) || [content];
-        let currentChunk = '';
+      // Create a mock request and response to capture the controller output
+      interface MockResponse {
+        status: (code: number) => MockResponse;
+        json: (data: any) => MockResponse;
+        data: {
+          success: boolean;
+          data: any;
+        } | null;
+      }
+      
+      const mockResponse: MockResponse = {
+        status: function(code: number) { return this; },
+        json: function(data: any) { 
+          this.data = data;
+          return this; 
+        },
+        data: null
+      };
+      
+      // Call the controller function directly
+      await endpoint.controller({} as Request, mockResponse as unknown as Response);
+      
+      if (mockResponse.data && mockResponse.data.success && mockResponse.data.data) {
+        // Process the API response data
+        let content = '';
         
-        for (const sentence of textChunks) {
-          if ((currentChunk + sentence).length > 2000) {
-            if (currentChunk) {
-              chunks.push({
-                id: `chunk-${url}-${chunkId++}`,
-                content: currentChunk.trim(),
-                metadata: { source: url }
-              });
+        // Extract text content from the data structure
+        // The structure will depend on the specific API endpoint
+        if (endpoint.source === 'guide' || endpoint.source === 'api') {
+          // For guide and API endpoints that return sections
+          for (const section of mockResponse.data.data) {
+            content += `${section.title}\n`;
+            for (const paragraph of section.content) {
+              content += `${paragraph}\n`;
             }
-            currentChunk = sentence;
-          } else {
-            currentChunk += ' ' + sentence;
+            
+            // Process subsections if they exist
+            if (section.subsections) {
+              for (const subsection of section.subsections) {
+                content += `${subsection.title}\n`;
+                for (const paragraph of subsection.content) {
+                  content += `${paragraph}\n`;
+                }
+              }
+            }
+            content += '\n';
+          }
+        } else if (endpoint.source === 'release') {
+          // For release endpoint that returns release history
+          for (const release of mockResponse.data.data) {
+            content += `Release Date: ${release.date}\n`;
+            for (const change of release.changes) {
+              content += `${change}\n`;
+            }
+            content += '\n';
           }
         }
         
-        // Add the last chunk if not empty
-        if (currentChunk.trim()) {
-          chunks.push({
-            id: `chunk-${url}-${chunkId++}`,
-            content: currentChunk.trim(),
-            metadata: { source: url }
-          });
+        if (content) {
+          // Split content into smaller chunks (max 2000 chars per chunk)
+          const textChunks = content.match(/[^\.!\?]+[\.!\?]+/g) || [content];
+          let currentChunk = '';
+          
+          for (const sentence of textChunks) {
+            if ((currentChunk + sentence).length > 2000) {
+              if (currentChunk) {
+                chunks.push({
+                  id: `chunk-${endpoint.source}-${chunkId++}`,
+                  content: currentChunk.trim(),
+                  metadata: { source: endpoint.source }
+                });
+              }
+              currentChunk = sentence;
+            } else {
+              currentChunk += ' ' + sentence;
+            }
+          }
+          
+          // Add the last chunk if not empty
+          if (currentChunk.trim()) {
+            chunks.push({
+              id: `chunk-${endpoint.source}-${chunkId++}`,
+              content: currentChunk.trim(),
+              metadata: { source: endpoint.source }
+            });
+          }
         }
       }
     } catch (error) {
-      console.error(`Error processing ${url}:`, error);
+      console.error(`Error processing ${endpoint.source}:`, error);
     }
   }
 
   knowledgeBase = chunks;
-  console.log(`Loaded ${chunks.length} knowledge chunks from frontend pages`);
+  console.log(`Loaded ${chunks.length} knowledge chunks from controllers`);
   printKnowledgeBase();
 }
 
