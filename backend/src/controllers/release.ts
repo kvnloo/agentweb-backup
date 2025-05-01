@@ -8,6 +8,18 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-05-01",
+    changes: [
+      "Implemented near real-time task execution monitoring",
+      "- Execution log updates every 10 seconds on Execution Details page",
+      "- Provides near real-time visibility into task progress",
+      "- Enhances user experience with live execution updates",
+      "Updated Gemini 2.5 Pro model from experimental to preview status",
+      "- Resolves rate limit issues with the experimental model",
+      "- Improves stability and reliability for Gemini-powered tasks"
+    ]
+  },
+  {
     date: "2025-04-29",
     changes: [
       "Introduced AI Customer Support Agent",

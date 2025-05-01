@@ -302,6 +302,12 @@ class DeepResearchAgentWrapper:
             # Don't try to clean up asyncio tasks - this causes more problems than it solves
             pass
 
+    async def cleanup(self):
+        """Empty cleanup method required by task_monitor.py"""
+        logger.info(f"DeepResearchAgentWrapper cleanup for {self.execution_id}")
+        # Nothing to clean up here, but method is required by task_monitor.py
+        pass
+
 def main():
     """
     CLI entry point for deep research agent.

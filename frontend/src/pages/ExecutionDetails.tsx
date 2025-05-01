@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
   Container,
@@ -28,10 +28,12 @@ import ShareIcon from '@mui/icons-material/Share';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import ArchiveIcon from '@mui/icons-material/Archive';
 import UnarchiveIcon from '@mui/icons-material/Unarchive';
+import AutorenewIcon from '@mui/icons-material/Autorenew';
 import { useAuth } from '../contexts/AuthContext';
 import axios from 'axios';
 import { buildApiUrl } from '../config';
 import ScreenshotIcon from '@mui/icons-material/Screenshot';
+import React from 'react';
 
 interface TaskExecution {
   executionId: string;
@@ -122,27 +124,96 @@ export default function ExecutionDetails() {
   const [copySuccess, setCopySuccess] = useState(false);
   const [archiveDialogOpen, setArchiveDialogOpen] = useState(false);
   const [archiveAction, setArchiveAction] = useState<'archive' | 'unarchive'>('archive');
+  const [isAutoRefreshing, setIsAutoRefreshing] = useState(false);
+  const [iframeKey, setIframeKey] = useState(Date.now()); // Force iframe refresh
+  const iframeRef = React.useRef<HTMLIFrameElement>(null);
 
-  useEffect(() => {
-    const fetchExecution = async () => {
-      if (!taskId || !executionId) return;
-      
+  const refreshIframe = useCallback(() => {
+    // Update iframe key to force complete refresh
+    setIframeKey(Date.now());
+    
+    // Also try to reload the iframe content if we have a reference
+    if (iframeRef.current) {
       try {
-        const response = await axios.get(
-          buildApiUrl(`/api/tasks/${taskId}/executions/${executionId}`),
-          { headers: { Authorization: `Bearer ${token}` } }
-        );
-        setExecution(response.data);
-      } catch (error: any) {
-        console.error('Error fetching execution details:', error);
-        setError(error.response?.data?.message || 'Failed to fetch execution details');
-      } finally {
+        const iframe = iframeRef.current;
+        if (iframe.contentWindow) {
+          iframe.contentWindow.location.reload();
+        }
+      } catch (e) {
+        console.log('Iframe direct reload failed, using key refresh instead');
+      }
+    }
+  }, []);
+
+  const fetchExecution = useCallback(async () => {
+    if (!taskId || !executionId || !token) return;
+    
+    try {
+      console.log('Fetching execution data...', new Date().toLocaleTimeString());
+      const response = await axios.get(
+        buildApiUrl(`/api/tasks/${taskId}/executions/${executionId}`),
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setExecution(response.data);
+      
+      // If we're still loading, mark loading as complete
+      if (loading) {
         setLoading(false);
       }
-    };
+    } catch (error: any) {
+      console.error('Error fetching execution details:', error);
+      setError(error.response?.data?.message || 'Failed to fetch execution details');
+      setLoading(false);
+    }
+  }, [taskId, executionId, token, loading]);
 
+  // Function to fetch data and refresh iframe
+  const refreshAll = useCallback(() => {
     fetchExecution();
-  }, [taskId, executionId, token]);
+    refreshIframe();
+  }, [fetchExecution, refreshIframe]);
+
+  // Initial data load
+  useEffect(() => {
+    refreshAll();
+  }, [refreshAll]);
+
+  // Set up polling for running executions
+  useEffect(() => {
+    let intervalId: NodeJS.Timeout | null = null;
+    
+    // Only set up polling if the execution is in a running or pending state
+    if (execution && ['running', 'pending'].includes(execution.status.toLowerCase())) {
+      console.log('Setting up auto-refresh for running task...');
+      setIsAutoRefreshing(true);
+      
+      // Start polling every 10 seconds
+      intervalId = setInterval(() => {
+        console.log('Auto-refresh triggered');
+        refreshAll(); // Refresh both data and iframe
+      }, 10000);
+    } else {
+      setIsAutoRefreshing(false);
+    }
+    
+    // Cleanup function to clear interval when component unmounts
+    // or when execution status changes
+    return () => {
+      if (intervalId) {
+        console.log('Clearing auto-refresh interval');
+        clearInterval(intervalId);
+        setIsAutoRefreshing(false);
+      }
+    };
+  }, [execution?.status, refreshAll]);
+
+  // Refresh iframe when execution data changes (especially browser_use_log)
+  useEffect(() => {
+    if (execution) {
+      console.log('Execution data changed, refreshing iframe');
+      refreshIframe();
+    }
+  }, [execution?.browser_use_log, execution?.status, refreshIframe]);
 
   const handleFeedbackChange = async (feedback: 'accepted' | 'rejected' | null) => {
     if (!taskId || !executionId) return;
@@ -279,7 +350,23 @@ export default function ExecutionDetails() {
         <Typography variant="h4" component="h1" display="inline">
           Execution Details
         </Typography>
+        <Box sx={{ float: 'right', display: 'flex', alignItems: 'center' }}>
+          {isAutoRefreshing && (
+            <Tooltip title="Real-time updates active">
+              <AutorenewIcon color="info" sx={{ animation: 'spin 2s linear infinite' }} />
+            </Tooltip>
+          )}
+        </Box>
       </Box>
+
+      <style>
+        {`
+          @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+          }
+        `}
+      </style>
 
       <Paper sx={{ p: 4 }}>
         <Grid container spacing={3}>
@@ -461,6 +548,15 @@ export default function ExecutionDetails() {
             <Grid item xs={12}>
               <Typography variant="h6" gutterBottom>
                 Execution Log
+                {isAutoRefreshing && (
+                  <Tooltip title="Auto-refreshing">
+                    <AutorenewIcon 
+                      fontSize="small" 
+                      color="info" 
+                      sx={{ ml: 1, animation: 'spin 2s linear infinite', verticalAlign: 'middle' }} 
+                    />
+                  </Tooltip>
+                )}
               </Typography>
               <Box sx={{ position: 'relative' }}>
                 <Paper 
@@ -471,29 +567,53 @@ export default function ExecutionDetails() {
                     borderRadius: 1
                   }}
                 >
-                  <iframe
-                    src={execution.browser_use_log}
-                    style={{
-                      width: '100%',
-                      height: '500px',
-                      border: 'none',
-                      backgroundColor: 'white',
-                      overflow: 'auto'
-                    }}
-                    title="Execution Log"
-                  />
+                  {(() => {
+                    // Extract token from browser_use_log URL
+                    const urlRegex = new RegExp(`activities_${executionId}_([a-z0-9]{20})\\.log`);
+                    const match = urlRegex.exec(execution.browser_use_log);
+                    const logToken = match ? match[1] : '';
+                    
+                    // Create log URL with token
+                    const logUrl = buildApiUrl(`/api/tasks/${taskId}/executions/${executionId}/log?token=${logToken}`);
+                    
+                    return (
+                      <iframe
+                        ref={iframeRef}
+                        key={iframeKey}
+                        src={logUrl}
+                        style={{
+                          width: '100%',
+                          height: '500px',
+                          border: 'none',
+                          backgroundColor: 'white',
+                          overflow: 'auto'
+                        }}
+                        title="Execution Log"
+                      />
+                    );
+                  })()}
                 </Paper>
                 <Box sx={{ mt: 1, display: 'flex', justifyContent: 'space-between' }}>
-                  <Typography variant="caption" color="text.secondary">
-                    Note: HTML content in logs is escaped to prevent display issues.
-                  </Typography>
-                  <Link
-                    href={execution.browser_use_log}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    Open in new tab
-                  </Link>
+                  <div></div>
+                  {(() => {
+                    // Extract token from browser_use_log URL
+                    const urlRegex = new RegExp(`activities_${executionId}_([a-z0-9]{20})\\.log`);
+                    const match = urlRegex.exec(execution.browser_use_log);
+                    const logToken = match ? match[1] : '';
+                    
+                    // Create log URL with token
+                    const logUrl = buildApiUrl(`/api/tasks/${taskId}/executions/${executionId}/log?token=${logToken}`);
+                    
+                    return (
+                      <Link
+                        href={logUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        Open in new tab
+                      </Link>
+                    );
+                  })()}
                 </Box>
               </Box>
             </Grid>

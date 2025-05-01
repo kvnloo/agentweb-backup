@@ -558,32 +558,16 @@ export const getTaskExecution = async (req: AuthRequest, res: Response) => {
   }
 };
 
-export const getExecutionLog = async (req: AuthRequest, res: Response) => {
+export const getExecutionLog = async (req: Request, res: Response) => {
   try {
-    const userId = req.user?.userId;
-    if (!userId) {
-      return res.status(401).json({ message: 'Unauthorized' });
-    }
-
     const taskId = req.params.id;
     const executionId = req.params.executionId;
+    const logToken = req.query.token as string;
     
-    // Get the task to check permissions
-    const task = await taskDb.getTaskById(taskId);
-    if (!task) {
-      return res.status(404).json({ message: 'Task not found' });
+    if (!logToken) {
+      return res.status(400).json({ message: 'Log token is required' });
     }
-
-    // Check if user is admin or task owner
-    const user = await userDb.getUserById(userId);
-    if (!user) {
-      return res.status(401).json({ message: 'User not found' });
-    }
-
-    if (!user.isAdmin && task.userId !== userId) {
-      return res.status(403).json({ message: 'Access denied' });
-    }
-
+    
     // Get the execution
     const execution = await taskDb.getTaskExecutionById(executionId);
     if (!execution) {
@@ -599,20 +583,35 @@ export const getExecutionLog = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ message: 'Log file not found' });
     }
 
-    // Extract the S3 key from the URL
-    const url = new URL(execution.browser_use_log);
-    const s3Key = decodeURIComponent(url.pathname.substring(1)); // Remove leading slash
+    // Extract the token from the S3 URL to verify
+    const urlRegex = new RegExp(`activities_${executionId}_([a-z0-9]{20})\\.log`);
+    const match = urlRegex.exec(execution.browser_use_log);
+    
+    if (!match || match[1] !== logToken) {
+      return res.status(403).json({ message: 'Invalid log token' });
+    }
 
-    // Get the file from S3
-    const s3 = new AWS.S3();
-    const s3Object = await s3.getObject({
-      Bucket: process.env.AWS_S3_BUCKET_NAME || '',
-      Key: s3Key
-    }).promise();
-
-    // Set content type and send the file content
-    res.setHeader('Content-Type', 'text/plain');
-    res.send(s3Object.Body);
+    // Fetch the content directly from the URL
+    const fetch = require('node-fetch');
+    const response = await fetch(execution.browser_use_log);
+    
+    if (!response.ok) {
+      throw new Error(`Failed to fetch log from URL: ${response.status} ${response.statusText}`);
+    }
+    
+    const logContent = await response.text();
+    
+    // Set CORS headers for public access
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    
+    // Set caching headers
+    res.setHeader('Cache-Control', 'no-cache');
+    
+    // Send as HTML
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(logContent);
   } catch (error) {
     console.error('Error fetching execution log:', error);
     res.status(500).json({ message: 'Error fetching execution log' });

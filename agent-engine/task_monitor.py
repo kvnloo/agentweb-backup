@@ -18,7 +18,7 @@ import yaml
 import random
 from typing import Dict, Any, List, Optional
 from deep_research_agent import DeepResearchAgentWrapper  # Import the wrapper class
-from task_utils import upload_activity_log, upload_gif, check_new_information  # Import utility functions
+from task_utils import upload_activity_log, upload_gif, check_new_information, LogSyncManager, start_log_sync  # Import utility functions
 import subprocess
 import tempfile
 import shutil
@@ -26,6 +26,7 @@ import re
 import traceback
 import threading
 import resource
+from email_utils import get_task_subscribers
 
 # Increase file descriptor limit
 soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -293,7 +294,6 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                     email_notification_enabled = task.get('emailNotification', False)
                     
                     # Check if there are subscribers
-                    from email_utils import get_task_subscribers
                     subscribers = get_task_subscribers(execution['taskId'])
                     has_subscribers = len(subscribers) > 0
                     
@@ -411,6 +411,9 @@ def update_workflow_execution(workflow_execution_id: str, task_id: str, task_sta
         return False
 
 async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str, run_user_id: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False) -> Dict[str, Any]:
+    log_sync_manager = None
+    process = None
+    
     try:
         # Create necessary directories
         os.makedirs('prompts', exist_ok=True)
@@ -423,6 +426,17 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
         
         # Set up log file for this execution
         log_file = f'logs/execution_{execution_id}_web_agent.log'
+        filtered_activity_log = f'logs/execution_{execution_id}_browser_use.filtered.log'
+        
+        # Initialize filtered log file if it doesn't exist yet
+        # This ensures log syncing can start immediately
+        if not Path(filtered_activity_log).exists():
+            with open(filtered_activity_log, 'w') as f:
+                f.write(f"Execution log initialized at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            logger.info(f"Created initial log file: {filtered_activity_log}")
+        
+        # Start the log sync manager to upload log files in real-time
+        log_sync_manager = start_log_sync(filtered_activity_log, user_id, execution_id)
         
         # Build command with logging redirection
         cmd = [
@@ -457,64 +471,81 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
             env={**os.environ, 'PYTHONUNBUFFERED': '1'}  # Ensure unbuffered output
         )
         
-        stdout, stderr = await process.communicate()
+        # Set timeout based on complexity
+        timeout_seconds = int(os.getenv('COMPLEX_TASK_EXECUTION_TIMEOUT_SECONDS', '1800')) if is_complex_task else int(os.getenv('TASK_EXECUTION_TIMEOUT_SECONDS', '900'))
+        logger.info(f"Waiting for process with timeout of {timeout_seconds} seconds")
         
-        # Clean up prompt file
-        os.unlink(prompt_file)
-        
-        # Write both stdout and stderr to log file for debugging
-        with open(log_file, 'a') as f:
-            f.write("\n\n=== NEW EXECUTION AT " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " ===\n")
-            f.write("=== COMMAND ===\n")
-            f.write(" ".join(cmd) + "\n\n")
-            if stdout:
-                f.write("=== STDOUT ===\n")
-                f.write(stdout.decode())
-                f.write("\n")
-            if stderr:
-                f.write("=== STDERR ===\n")
-                f.write(stderr.decode())
-                f.write("\n")
-            f.write("=" * 80 + "\n")
-        
-        if process.returncode == 0:
-            try:
-                # Try to find the JSON output in stdout
-                output = stdout.decode()
-                # Split into lines and reverse to find the last JSON object
-                lines = output.split('\n')
-                for line in reversed(lines):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        result = json.loads(line)
-                        if isinstance(result, dict) and 'success' in result:
-                            logger.info(f"Successfully parsed result from web_agent.py")
-                            return result
-                    except json.JSONDecodeError:
-                        continue
+        try:
+            # Wait for process with timeout
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+            
+            # Clean up prompt file
+            os.unlink(prompt_file)
+            
+            # Write both stdout and stderr to log file for debugging
+            with open(log_file, 'a') as f:
+                f.write("\n\n=== NEW EXECUTION AT " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " ===\n")
+                f.write("=== COMMAND ===\n")
+                f.write(" ".join(cmd) + "\n\n")
+                if stdout:
+                    f.write("=== STDOUT ===\n")
+                    f.write(stdout.decode())
+                    f.write("\n")
+                if stderr:
+                    f.write("=== STDERR ===\n")
+                    f.write(stderr.decode())
+                    f.write("\n")
+                f.write("=" * 80 + "\n")
+            
+            if process.returncode == 0:
+                try:
+                    # Try to find the JSON output in stdout
+                    output = stdout.decode()
+                    # Split into lines and reverse to find the last JSON object
+                    lines = output.split('\n')
+                    for line in reversed(lines):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            result = json.loads(line)
+                            if isinstance(result, dict) and 'success' in result:
+                                logger.info(f"Successfully parsed result from web_agent.py")
+                                return result
+                        except json.JSONDecodeError:
+                            continue
+                    
+                    # If we get here, no valid JSON was found
+                    logger.error(f"No valid JSON found in output. Full output written to {log_file}")
+                    return {
+                        "success": False,
+                        "error": f"No valid JSON output found. Check {log_file} for details.",
+                        "llmName": llm_name
+                    }
+                except Exception as e:
+                    logger.error(f"Error parsing output: {e}")
+                    return {
+                        "success": False,
+                        "error": f"Failed to parse output: {str(e)}. Check {log_file} for details.",
+                        "llmName": llm_name
+                    }
+            else:
+                error_msg = stderr.decode() if stderr else "Unknown error"
+                logger.error(f"Process failed with error: {error_msg}")
+                return {
+                    "success": False,
+                    "error": f"Process error: {error_msg}. Check {log_file} for details.",
+                    "llmName": llm_name
+                }
                 
-                # If we get here, no valid JSON was found
-                logger.error(f"No valid JSON found in output. Full output written to {log_file}")
-                return {
-                    "success": False,
-                    "error": f"No valid JSON output found. Check {log_file} for details.",
-                    "llmName": llm_name
-                }
-            except Exception as e:
-                logger.error(f"Error parsing output: {e}")
-                return {
-                    "success": False,
-                    "error": f"Failed to parse output: {str(e)}. Check {log_file} for details.",
-                    "llmName": llm_name
-                }
-        else:
-            error_msg = stderr.decode() if stderr else "Unknown error"
-            logger.error(f"Process failed with error: {error_msg}")
+        except asyncio.TimeoutError:
+            # Task execution timed out
+            logger.error(f"Task execution timed out after {timeout_seconds} seconds")
+            if process:
+                process.kill()
             return {
                 "success": False,
-                "error": f"Process error: {error_msg}. Check {log_file} for details.",
+                "error": f"Task execution timed out after {timeout_seconds} seconds",
                 "llmName": llm_name
             }
             
@@ -526,10 +557,41 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
             "llmName": llm_name
         }
     finally:
-        if process:
+        # Safe cleanup with error handling
+        try:
+            # Stop log sync manager if it exists and is running
+            if 'log_sync_manager' in locals() and log_sync_manager is not None:
+                try:
+                    log_sync_manager.stop_watching()
+                except Exception as e:
+                    print(f"Error stopping log sync manager in run_web_agent_cli: {e}")
+                    
+            # Clean up process if it's still running
+            if 'process' in locals() and process is not None:
+                try:
+                    if process.returncode is None:
+                        logger.info("Process still running, attempting to terminate it")
+                        process.kill()
+                    try:
+                        # Wait for process without blocking indefinitely
+                        await asyncio.wait_for(process.wait(), timeout=3.0)
+                        logger.info("Process terminated successfully")
+                    except asyncio.TimeoutError:
+                        logger.warning("Timed out waiting for process to terminate after kill")
+                    except Exception as wait_e:
+                        # This is likely where the "Error cleaning up process" occurs
+                        # The error might happen if the process resource is already gone
+                        logger.warning(f"Non-critical error waiting for process: {wait_e}")
+                except Exception as e:
+                    # Don't just print, also log the error
+                    logger.warning(f"Error cleaning up process in run_web_agent_cli: {e}")
+                    # But continue execution since this is cleanup code
+        except Exception as final_e:
+            # Final catch-all error handling
+            print(f"Critical error during run_web_agent_cli cleanup: {final_e}")
             try:
-                process.kill()
-                await process.wait()
+                # Try logging if still available
+                logger.error(f"Critical error during run_web_agent_cli cleanup: {final_e}")
             except:
                 pass
 
@@ -544,8 +606,10 @@ async def execute_task(execution):
     prompt = None
     llm_names_tried = []
     research_task = None
-    web_agent_task = None
+    web_agent_task = None  # Keep this variable for cleanup
     agent = None
+    filtered_activity_log = None
+    log_sync_manager = None  # Initialize to None
     
     try:
         running_task_count += 1
@@ -670,8 +734,6 @@ async def execute_task(execution):
         context = f"You are executing this task at {datetime.now(timezone.utc).isoformat()}."
         prompt_with_context = f"{prompt}\n\n{context}"
 
-        filtered_activity_log = None
-
         # Try each LLM in sequence until one succeeds
         for llm_name in llm_names:
             try:
@@ -694,6 +756,12 @@ async def execute_task(execution):
                             execution_id=execution_id,
                             full_llm_name=llm_name
                         )
+                        
+                        # Set up log file path for deep research logs
+                        filtered_activity_log = f"logs/execution_{execution_id}_deep_activities.log"
+                        
+                        # Start real-time log syncing for deep research logs
+                        log_sync_manager = start_log_sync(filtered_activity_log, user_id, execution_id)
                         
                         # Define a function to run the research in a separate thread
                         def run_research_in_thread(agent, prompt, max_turns):
@@ -755,12 +823,9 @@ async def execute_task(execution):
                                 research_task.cancel()
                         
                         # Get the output file path from the result
-                        filtered_activity_log = result.get('output_file', None)
-                        if filtered_activity_log and os.path.exists(filtered_activity_log):
-                            logger.info(f"Found output file: {filtered_activity_log}")
-                        else:
-                            logger.warning(f"Output file not found or not specified in result")
-                            filtered_activity_log = None
+                        output_file = result.get('output_file', None)
+                        if filtered_activity_log != output_file:
+                            logger.error(f"Log file {output_file} is different from expected path {filtered_activity_log}. Log sync will not work.")
                             
                     except Exception as e:
                         logger.error(f"Error running deep research directly: {str(e)}")
@@ -772,58 +837,37 @@ async def execute_task(execution):
                 else:
                     # Run WebAgent via CLI for non-deep-research tasks
                     try:
-                        # Set timeout based on task complexity - 30 minutes for complex tasks, 15 minutes for regular tasks
+                        # Set parameters for web agent execution
                         is_complex = bool(task.get('isComplexTask', False)) if task else False
-                        timeout_seconds = int(os.getenv('COMPLEX_TASK_EXECUTION_TIMEOUT_SECONDS', '1800')) if is_complex else int(os.getenv('TASK_EXECUTION_TIMEOUT_SECONDS', '900'))
-                        logger.info(f"Running web agent with timeout of {timeout_seconds} seconds (Complex task: {is_complex})")
+                        is_interactive = bool(task.get('isInteractive', False)) if task else False
+                        extract_page_content = bool(task.get('extractPageContent', False)) if task else False
+                        validate_output = bool(task.get('validateOutput', False)) if task else False
                         
-                        # Create a task for running the web agent
-                        web_agent_task = asyncio.create_task(
-                            run_web_agent_cli(
-                                user_id,
-                                llm_name,
-                                prompt_with_context,
-                                execution_id,
-                                bool(task.get('isInteractive', False)) if task else False,
-                                task_id,
-                                gif_path,
-                                run_user_id,
-                                is_complex,
-                                bool(task.get('extractPageContent', False)) if task else False,
-                                bool(task.get('validateOutput', False)) if task else False,
-                                output_as_json
-                            )
+                        # Set filtered activity log path for later reference
+                        filtered_activity_log = f'logs/execution_{execution_id}_browser_use.filtered.log'
+                        
+                        # Run web agent directly
+                        result = await run_web_agent_cli(
+                            user_id,
+                            llm_name,
+                            prompt,
+                            execution_id,
+                            is_interactive,
+                            task_id,
+                            gif_path,
+                            run_user_id,
+                            is_complex,
+                            extract_page_content,
+                            validate_output,
+                            output_as_json
                         )
-                        
-                        # Wait for the web agent to complete with a timeout
-                        result = await asyncio.wait_for(web_agent_task, timeout=timeout_seconds)
-                        logger.info(f"Successfully completed web agent execution with {llm_name}")
-                        
-                    except asyncio.TimeoutError:
-                        # Task execution timed out
-                        logger.error(f"Task execution timed out after {timeout_seconds} seconds")
-                        result = {
-                            "success": False,
-                            "error": f"Task execution timed out after {timeout_seconds} seconds",
-                            "llm_name": llm_name
-                        }
-                        # Cancel the task to prevent it from continuing to run in the background
-                        web_agent_task.cancel()
-                        
                     except Exception as e:
-                        # Other errors
-                        logger.error(f"Error waiting for task execution: {str(e)}")
+                        logger.error(f"Error running web agent: {str(e)}")
                         result = {
                             "success": False,
-                            "error": f"Error waiting for task execution: {str(e)}",
-                            "llm_name": llm_name
+                            "error": f"Web agent error: {str(e)}",
+                            "llmName": llm_name
                         }
-                        # Cancel the task if it's still running
-                        if 'web_agent_task' in locals() and not web_agent_task.done():
-                            web_agent_task.cancel()
-                    
-                    # Upload browser-use log to S3 if it exists
-                    filtered_activity_log = f'logs/execution_{execution_id}_browser_use.filtered.log'
 
                 # Upload GIF if it exists
                 details_gif = None
@@ -878,11 +922,13 @@ async def execute_task(execution):
                 last_error = str(e)
                 logger.error(f"Error with LLM {llm_name}: {e}")
 
-        # Upload activity log if it exists
-        if filtered_activity_log and Path(filtered_activity_log).exists():
+        # Upload activity log only if it exists and we haven't been syncing it
+        if filtered_activity_log and Path(filtered_activity_log).exists() and ('log_sync_manager' not in locals() or log_sync_manager is None):
             upload_activity_log(filtered_activity_log, user_id, execution_id)
             Path(filtered_activity_log).unlink()
             logger.info(f"Deleted activity log file: {filtered_activity_log}")
+        # If we were syncing with log_sync_manager, don't delete the file,
+        # since log_sync_manager takes care of the final sync before stopping
         
         if not success:
             error_message = f"All LLMs failed. Last error: {last_error}"
@@ -929,37 +975,60 @@ async def execute_task(execution):
             except Exception as workflow_error:
                 logger.error(f"Error updating workflow execution after task error: {workflow_error}", exc_info=True)
     finally:
-        # Clean up tasks if they're still running
-        if research_task and not research_task.done():
-            research_task.cancel()
-            try:
-                await research_task
-            except:
-                pass
+        try:
+            # Stop log sync manager if it exists and is running
+            if 'log_sync_manager' in locals() and log_sync_manager is not None:
+                try:
+                    log_sync_manager.stop_watching()
+                except Exception as e:
+                    print(f"Error stopping log sync manager: {e}")
             
-        if web_agent_task and not web_agent_task.done():
-            web_agent_task.cancel()
-            try:
-                await web_agent_task
-            except:
-                pass
-            
-        # Clean up agent resources
-        if agent:
-            try:
-                await agent.cleanup()
-            except:
-                pass
+            # Clean up tasks if they're still running
+            if research_task and not research_task.done():
+                try:
+                    research_task.cancel()
+                    await research_task
+                except Exception as e:
+                    print(f"Error canceling research task: {e}")
+                    
+            # Clean up web_agent_task if it exists and is still running
+            if web_agent_task and not web_agent_task.done():
+                try:
+                    web_agent_task.cancel()
+                    await web_agent_task
+                except Exception as e:
+                    print(f"Error canceling web agent task: {e}")
+                    
+            # Clean up agent resources
+            if agent:
+                try:
+                    await agent.cleanup()
+                    logger.info(f"Agent cleanup completed for {execution_id}")
+                except Exception as e:
+                    print(f"Error during agent cleanup: {e}")
+                    try:
+                        logger.error(f"Error during agent cleanup: {e}")
+                    except:
+                        pass
 
-        running_task_count -= 1
-        # Check if user_id exists in the set before removing it
-        if user_id in running_user_ids:
-            running_user_ids.remove(user_id)
-        else:
-            logger.warning(f"User ID {user_id} not found in running_user_ids set during cleanup. There could be multiple tasks running for the same user which may cause issues for cookie management.")
-        # Remove task from tracking
-        running_task_ids.pop(execution_id, None)
-        logger.info(f"Task {execution_id} cleanup completed")
+            # Update running counters
+            running_task_count -= 1
+            if user_id in running_user_ids:
+                running_user_ids.remove(user_id)
+            running_task_ids.pop(execution_id, None)
+            try:
+                logger.info(f"Task {execution_id} cleanup completed")
+            except:
+                print(f"Task {execution_id} cleanup completed")
+                
+        except Exception as final_error:
+            # Last resort error handling
+            print(f"Critical error during task cleanup: {final_error}")
+            try:
+                # Try logging if still available
+                logger.error(f"Critical error during task cleanup: {final_error}")
+            except:
+                pass
 
 def get_pending_workflow_executions():
     try:

@@ -14,6 +14,18 @@ from aws_utils import get_dynamodb_resource, get_s3_client, get_bedrock_client
 from pydantic import SecretStr
 from langchain_aws import ChatBedrock
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
+import html
+import time
+import uuid
+import base64
+import xml.etree.ElementTree as ET
+import yaml
+import tempfile
+import threading
+import asyncio
+import datetime
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -312,7 +324,7 @@ def get_llm(full_llm_name: str) -> Tuple[Any, str]:
         "google": {
             "google": {
                 "gemini-2.0-flash": get_gemini_llm,
-                "gemini-2.5-pro-exp-03-25": get_gemini_llm,
+                "gemini-2.5-pro-preview-03-25": get_gemini_llm,
                 "gemini-2.0-flash-exp": get_gemini_llm
             }
         }
@@ -497,6 +509,201 @@ def upload_task_result_files(downloads_path: str, execution_id: str) -> List[Dic
             
     return result_files
 
+class LogSyncManager:
+    """Manages continuous syncing of log files to S3 using a simple polling approach"""
+    
+    def __init__(self, log_file: str, user_id: str, execution_id: str):
+        """Initialize the LogSyncManager
+        
+        Args:
+            log_file: Path to the log file
+            user_id: User ID
+            execution_id: Execution ID
+        """
+        self.log_file = log_file
+        self.user_id = user_id
+        self.execution_id = execution_id
+        self.should_stop = False
+        self.last_content_hash = None
+        self.s3_url = None
+        self.sync_thread = None
+        self.sync_interval = 30  # seconds between sync checks
+    
+    def start_watching(self) -> Optional[str]:
+        """Start syncing the log file periodically
+        
+        Returns:
+            Optional[str]: URL of the uploaded log file if successful, None otherwise
+        """
+        try:
+            log_path = Path(self.log_file)
+            if not log_path.exists():
+                # Create an empty placeholder file if it doesn't exist yet
+                os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
+                with open(self.log_file, 'w') as f:
+                    f.write(f"Log file initialized for execution {self.execution_id} at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                logger.info(f"Created placeholder log file: {self.log_file}")
+            
+            # Initial upload
+            self.s3_url = self.sync_log_file()
+            
+            # Start the sync thread
+            self.should_stop = False
+            self.sync_thread = threading.Thread(target=self._sync_loop)
+            self.sync_thread.daemon = True
+            self.sync_thread.start()
+            logger.info(f"Started log sync thread for file: {self.log_file}")
+            
+            return self.s3_url
+            
+        except Exception as e:
+            logger.error(f"Error starting log sync manager: {e}")
+            self.stop_watching()
+            return None
+    
+    def _sync_loop(self):
+        """Background thread that syncs the log file at regular intervals"""
+        try:
+            while not self.should_stop:
+                try:
+                    # Use multiple smaller sleep intervals instead of one long sleep
+                    # This allows the thread to respond to stop signals more quickly
+                    for _ in range(int(self.sync_interval * 2)):  # Split into half-second intervals
+                        if self.should_stop:
+                            break
+                        time.sleep(0.5)  # Sleep for half second at a time
+                    
+                    if not self.should_stop:
+                        logger.info(f"Checking log file after {self.sync_interval}s interval")
+                        self.sync_log_file()
+                except Exception as e:
+                    logger.error(f"Error in sync loop: {e}")
+                    # If there's an error, wait a bit and continue
+                    time.sleep(5)
+        except Exception as e:
+            logger.error(f"Fatal error in sync loop: {e}")
+    
+    def sync_log_file(self) -> Optional[str]:
+        """Sync the log file to S3 using upload_activity_log for consistency
+        
+        Returns:
+            Optional[str]: URL of the uploaded log file if successful, None otherwise
+        """
+        try:
+            if not Path(self.log_file).exists():
+                logger.warning(f"Log file does not exist during sync: {self.log_file}")
+                return None
+                
+            # Read the log file and calculate hash to avoid redundant uploads
+            try:
+                with open(self.log_file, 'r') as f:
+                    log_content = f.read()
+                    
+                # If file is empty, don't upload
+                if not log_content.strip():
+                    logger.debug("Log file is empty, skipping upload")
+                    return self.s3_url
+                    
+                content_hash = hashlib.md5(log_content.encode()).hexdigest()
+                
+                # Skip upload if content hasn't changed
+                if content_hash == self.last_content_hash and self.s3_url:
+                    logger.debug("Log content unchanged, skipping upload")
+                    return self.s3_url
+                    
+                logger.info(f"Log content changed (hash: {content_hash[:8]}), uploading to S3")
+                self.last_content_hash = content_hash
+            except Exception as read_error:
+                logger.error(f"Error reading log file: {read_error}")
+                # If we can't read the file, try to upload it anyway
+                logger.info("Attempting to upload despite read error")
+                
+            # Use the standard upload_activity_log function for consistency
+            url = upload_activity_log(self.log_file, self.user_id, self.execution_id)
+            
+            if url:
+                self.s3_url = url
+                logger.info(f"Successfully synced log to S3: {url}")
+            else:
+                logger.warning("Log sync completed but no URL was returned")
+            
+            return url
+            
+        except Exception as e:
+            logger.error(f"Error syncing log file to S3: {e}")
+            return None
+    
+    def stop_watching(self):
+        """Stop syncing the log file"""
+        try:
+            # Stop the sync thread
+            self.should_stop = True
+            
+            # Perform a final sync to ensure all content is uploaded
+            if Path(self.log_file).exists():
+                try:
+                    logger.info("Performing final log sync before stopping")
+                    self.sync_log_file()
+                except Exception as sync_error:
+                    # Use print as a fallback in case logging is shutting down
+                    print(f"Error during final sync: {sync_error}")
+            
+            # Wait for thread to finish if it's running
+            if self.sync_thread and self.sync_thread.is_alive():
+                try:
+                    # Use a shorter timeout to avoid hanging (2 seconds instead of 5)
+                    timeout = 2.0
+                    logger.info(f"Waiting up to {timeout}s for sync thread to complete...")
+                    self.sync_thread.join(timeout=timeout)
+                    
+                    # Check if thread is still alive after timeout
+                    if self.sync_thread.is_alive():
+                        logger.warning(f"Sync thread did not terminate within {timeout}s timeout")
+                        # We'll continue anyway since it's a daemon thread
+                    else:
+                        logger.info(f"Sync thread terminated successfully")
+                        
+                    logger.info(f"Stopped log sync thread for file: {self.log_file}")
+                except Exception as join_error:
+                    # Use print as a fallback in case logging is shutting down
+                    print(f"Error stopping sync thread: {join_error}")
+                
+        except Exception as e:
+            # Use print instead of logger to avoid issues during shutdown
+            print(f"Error stopping log file watcher: {e}")
+            try:
+                logger.error(f"Error stopping log file watcher: {e}")
+            except:
+                pass
+
+def start_log_sync(log_file_path: str, user_id: str, execution_id: str):
+    """Start real-time log syncing for the given log file
+    
+    Args:
+        log_file_path: Path to the log file to sync
+        user_id: User ID
+        execution_id: Execution ID
+        
+    Returns:
+        LogSyncManager instance
+    """
+    # Create logs directory if needed
+    os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
+    
+    # Initialize log file if it doesn't exist yet
+    if not Path(log_file_path).exists():
+        with open(log_file_path, 'w') as f:
+            f.write(f"Log file initialized at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        logger.info(f"Created initial log file: {log_file_path}")
+    
+    # Start the log sync manager to upload log files in real-time
+    log_sync_manager = LogSyncManager(log_file_path, user_id, execution_id)
+    log_url = log_sync_manager.start_watching()
+    if log_url:
+        logger.info(f"Started real-time log syncing to S3: {log_url}")
+        
+    return log_sync_manager
+
 def upload_activity_log(log_file: str, user_id: str, execution_id: str) -> Optional[str]:
     """Upload activity log file to S3 and update execution record
     
@@ -516,9 +723,31 @@ def upload_activity_log(log_file: str, user_id: str, execution_id: str) -> Optio
         s3_client = get_s3_client()
         s3_bucket = os.getenv('AWS_S3_BUCKET')
         
-        # Generate a random token for this upload
-        random_token = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=20))
-        s3_key = f"execution_logs/{user_id}/activities_{execution_id}_{random_token}.log"
+        # Check if there's already an S3 URL for this execution
+        table = get_dynamodb_resource().Table(f'{TABLE_PREFIX}AW-TaskExecutions')
+        execution_record = table.get_item(
+            Key={'executionId': execution_id},
+            ProjectionExpression='browser_use_log'
+        ).get('Item', {})
+        
+        existing_url = execution_record.get('browser_use_log')
+        s3_key = None
+        
+        # Extract s3_key from existing URL if available
+        if existing_url and existing_url.startswith(f"https://{s3_bucket}.s3.amazonaws.com/"):
+            s3_key = existing_url.replace(f"https://{s3_bucket}.s3.amazonaws.com/", "")
+            try:
+                logger.info(f"Reusing existing S3 destination: {s3_key}")
+            except:
+                print(f"Reusing existing S3 destination: {s3_key}")
+        else:
+            # Generate a random token for this upload
+            random_token = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=20))
+            s3_key = f"execution_logs/{user_id}/activities_{execution_id}_{random_token}.log"
+            try:
+                logger.info(f"Created new S3 destination: {s3_key}")
+            except:
+                print(f"Created new S3 destination: {s3_key}")
 
         # Read the log file and escape HTML content
         import html
@@ -532,6 +761,8 @@ def upload_activity_log(log_file: str, user_id: str, execution_id: str) -> Optio
 <html>
 <head>
     <meta charset="utf-8">
+    <meta http-equiv="refresh" content="60">
+    <title>Task Execution Log - {execution_id}</title>
     <style>
         pre {{
             white-space: pre-wrap;
@@ -540,10 +771,17 @@ def upload_activity_log(log_file: str, user_id: str, execution_id: str) -> Optio
             padding: 20px;
             margin: 0;
         }}
+        .timestamp {{
+            color: #777;
+            font-size: 0.8em;
+            margin-top: 20px;
+            text-align: right;
+        }}
     </style>
 </head>
 <body>
     <pre>{escaped_content}</pre>
+    <div class="timestamp">Last updated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
 </body>
 </html>"""
 
@@ -562,36 +800,53 @@ def upload_activity_log(log_file: str, user_id: str, execution_id: str) -> Optio
                 'ContentDisposition': 'inline'
             }
         )
-        logger.info(f"Uploaded activity log to S3: {s3_key}")
+        try:
+            logger.info(f"Uploaded activity log to S3: {s3_key}")
+        except:
+            print(f"Uploaded activity log to S3: {s3_key}")
         
         # Generate the URL
         url = f"https://{s3_bucket}.s3.amazonaws.com/{s3_key}"
         
-        # Update execution record with log URL
-        table = get_dynamodb_resource().Table(f'{TABLE_PREFIX}AW-TaskExecutions')
-        table.update_item(
-            Key={'executionId': execution_id},
-            UpdateExpression='SET browser_use_log = :log_url',
-            ExpressionAttributeValues={
-                ':log_url': url
-            }
-        )
+        # Update execution record with log URL if not already set
+        if not existing_url:
+            table.update_item(
+                Key={'executionId': execution_id},
+                UpdateExpression='SET browser_use_log = :log_url',
+                ExpressionAttributeValues={
+                    ':log_url': url
+                }
+            )
+            try:
+                logger.info(f"Updated execution record with log URL: {url}")
+            except:
+                print(f"Updated execution record with log URL: {url}")
         
         # Clean up temporary HTML file only
         Path(html_file).unlink()
-        logger.info("Cleaned up temporary HTML file")
+        try:
+            logger.debug("Cleaned up temporary HTML file")
+        except:
+            pass
         
         return url
         
     except Exception as e:
-        logger.error(f"Error uploading activity log: {e}")
+        try:
+            logger.error(f"Error uploading activity log: {e}")
+        except:
+            print(f"Error uploading activity log: {e}")
+            
         # Clean up any temporary files
         for temp_file in [log_file + '.html']:
             try:
                 if Path(temp_file).exists():
                     Path(temp_file).unlink()
             except Exception as cleanup_error:
-                logger.error(f"Error cleaning up temporary file {temp_file}: {cleanup_error}")
+                try:
+                    logger.error(f"Error cleaning up temporary file {temp_file}: {cleanup_error}")
+                except:
+                    print(f"Error cleaning up temporary file {temp_file}: {cleanup_error}")
         return None
 
 def upload_gif(gif_path: str) -> Optional[str]:

@@ -5,6 +5,7 @@ import sys
 import os
 import re
 import uuid
+import threading
 from typing import Dict, Any, Optional, List, Union
 import browser_use
 from browser_use import Agent, Controller
@@ -49,6 +50,101 @@ class IntegrationTestParams(BaseModel):
     app_names: List[str]
     python_code: str
 
+class LogFilterThread(threading.Thread):
+    """Thread that continuously filters the log file in real-time"""
+    
+    def __init__(self, 
+                 source_log_file: str, 
+                 filtered_log_file: str, 
+                 sensitive_data: List[str],
+                 llm_name: str):
+        """Initialize the log filter thread
+        
+        Args:
+            source_log_file: Path to the source log file
+            filtered_log_file: Path to the filtered log file
+            sensitive_data: List of sensitive data to redact
+            llm_name: Name of the LLM being used
+        """
+        super().__init__()
+        self.source_log_file = source_log_file
+        self.filtered_log_file = filtered_log_file
+        self.sensitive_data = sensitive_data
+        self.llm_name = llm_name
+        self.running = True
+        self.last_position = 0
+        self.daemon = True  # Make thread exit when main thread exits
+        
+        # Initialize filtered log file with header
+        if Path(filtered_log_file).exists():
+            # Add header for existing file
+            with open(filtered_log_file, 'a') as f:
+                f.write("\n\n")
+                f.write("="*80 + "\n")
+                f.write(f"New execution log at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Using LLM: {self.llm_name}\n")
+                f.write("="*80 + "\n\n")
+        else:
+            # Add header for new file
+            with open(filtered_log_file, 'w') as f:
+                f.write("="*80 + "\n")
+                f.write(f"Execution log started at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Using LLM: {self.llm_name}\n")
+                f.write("="*80 + "\n\n")
+        
+        # Log thread creation
+        logging.getLogger(__name__).info(f"Created log filter thread for {source_log_file}")
+    
+    def stop(self):
+        """Stop the thread"""
+        self.running = False
+        
+    def run(self):
+        """Run the thread - continuously filter the log file"""
+        logger = logging.getLogger(__name__)
+        logger.info("Starting log filter thread")
+        
+        while self.running:
+            try:
+                if not Path(self.source_log_file).exists():
+                    # Source log file doesn't exist yet, wait and try again
+                    time.sleep(1)
+                    continue
+                
+                # Get file size
+                file_size = Path(self.source_log_file).stat().st_size
+                
+                # If file size hasn't changed, wait and try again
+                if file_size <= self.last_position:
+                    time.sleep(1)
+                    continue
+                
+                # Read new content
+                with open(self.source_log_file, 'r') as f:
+                    f.seek(self.last_position)
+                    new_content = f.read()
+                
+                # Filter sensitive data
+                filtered_content = new_content
+                for val in self.sensitive_data:
+                    if val and len(val) > 3:  # Only replace if value is non-empty and reasonably long
+                        filtered_content = filtered_content.replace(val, '[REDACTED]')
+                
+                # Append to filtered log
+                with open(self.filtered_log_file, 'a') as f:
+                    f.write(filtered_content)
+                
+                # Update last position
+                self.last_position = file_size
+                
+            except Exception as e:
+                logger.error(f"Error in log filter thread: {e}")
+                
+            # Sleep briefly to avoid high CPU usage
+            time.sleep(0.5)
+        
+        logger.info("Log filter thread stopped")
+
 class WebAgent:
     def __init__(self, user_id=None, full_llm_name=None):
         logger.info(f"Initializing WebAgent for user {user_id}")
@@ -77,6 +173,7 @@ class WebAgent:
         self.sensitive_data = []  # List to store all credentials for log filtering
         self.cookie_tainted = False  # Flag to track if shared credentials were used
         self.run_user_id = None  # Added to store run_user_id
+        self.log_filter_thread = None
 
     def setup_execution_logging(self, execution_id: str):
         """Setup logging for the current execution"""
@@ -93,14 +190,56 @@ class WebAgent:
         browser_use_logger.addHandler(file_handler)
         self._log_handlers.append((browser_use_logger, file_handler))
         
+        # Set up the filtered log file
+        filtered_log = f'logs/execution_{execution_id}_browser_use.filtered.log'
+        
+        # Start the log filter thread
+        self.log_filter_thread = LogFilterThread(
+            source_log_file=log_file,
+            filtered_log_file=filtered_log,
+            sensitive_data=self.sensitive_data,
+            llm_name=self.llm_name
+        )
+        self.log_filter_thread.start()
+        
         return log_file
 
     def cleanup_logging(self):
         """Remove the execution-specific log handlers"""
+        # Stop the log filter thread if it's running
+        if self.log_filter_thread and self.log_filter_thread.is_alive():
+            try:
+                # First set the stop flag
+                self.log_filter_thread.stop()
+                
+                # Wait a short time for the thread to stop gracefully
+                timeout = 2.0
+                logger.info(f"Waiting up to {timeout}s for log filter thread to stop...")
+                self.log_filter_thread.join(timeout=timeout)
+                
+                # Check if thread actually stopped
+                if self.log_filter_thread.is_alive():
+                    logger.warning("Log filter thread did not stop within timeout period")
+                    # We'll continue anyway as it's a daemon thread
+                else:
+                    logger.info("Stopped log filter thread successfully")
+            except Exception as e:
+                logger.error(f"Error stopping log filter thread: {e}")
+                # Continue with cleanup even if there's an error
+        
+        # Remove log handlers
         for log, handler in self._log_handlers:
-            log.removeHandler(handler)
-            handler.close()
+            try:
+                log.removeHandler(handler)
+                handler.close()
+            except Exception as e:
+                logger.error(f"Error removing log handler: {e}")
+        
+        # Clear the handlers list
         self._log_handlers.clear()
+        
+        # Clear the reference to the log filter thread to help with garbage collection
+        self.log_filter_thread = None
 
     async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
@@ -1258,54 +1397,20 @@ Once the PR is approved and merged, this code will be available through the 'Run
                     logger.info(f"Deleted cookie file at local: {cookies_path}")
                 
                 await self.browser.close()
-            # Clean up logging handlers
+            
+            # Clean up logging handlers (which also stops the log filter thread)
             self.cleanup_logging()
 
-            # Filter and save browser-use log if it exists
+            # No need to filter and save browser-use log anymore, as it's now done in real-time
+            # But we should clean up the original unfiltered log file
             browser_use_log = f'logs/execution_{self.current_execution_id}_browser_use.log'
-            filtered_log = f'logs/execution_{self.current_execution_id}_browser_use.filtered.log'
             if Path(browser_use_log).exists():
                 try:
-                    # Read and filter the log file
-                    filtered_lines = []
-                    with open(browser_use_log, 'r') as f:
-                        for line in f:
-                            filtered_line = line
-                            for val in self.sensitive_data:
-                                filtered_line = filtered_line.replace(val, '[REDACTED]')
-                            filtered_lines.append(filtered_line)
-
-                    # Only write to filtered log if we have content to write
-                    if filtered_lines:
-                        file_exists = Path(filtered_log).exists()
-                        with open(filtered_log, 'a' if file_exists else 'w') as f:
-                            # Add separator if appending to existing file
-                            if file_exists:
-                                f.write("\n\n")
-                                f.write("="*80 + "\n")
-                                f.write(f"New execution log at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                                f.write(f"Using LLM: {self.llm_name}\n")
-                                f.write("="*80 + "\n\n")
-                            else:
-                                # Add header with LLM information for new file
-                                f.write("="*80 + "\n")
-                                f.write(f"Execution log started at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                                f.write(f"Using LLM: {self.llm_name}\n")
-                                f.write("="*80 + "\n\n")
-                            f.writelines(filtered_lines)
-                        logger.info("Created filtered log file")
-
                     # Remove the original unfiltered log file
                     Path(browser_use_log).unlink()
                     logger.info(f"Removed original unfiltered log file: {browser_use_log}")
                 except Exception as e:
-                    logger.error(f"Error filtering browser-use log: {e}")
-                    # If anything goes wrong, ensure both files are deleted
-                    if Path(browser_use_log).exists():
-                        Path(browser_use_log).unlink()
-                    if Path(filtered_log).exists():
-                        Path(filtered_log).unlink()
-                    logger.info("Removed log files after error")
+                    logger.error(f"Error removing original log file: {e}")
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
             raise
