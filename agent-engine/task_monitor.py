@@ -825,7 +825,7 @@ async def execute_task(execution):
                         # Get the output file path from the result
                         output_file = result.get('output_file', None)
                         if filtered_activity_log != output_file:
-                            logger.error(f"Log file path of the research {output_file} is different from expected path {filtered_activity_log}. Log sync will not work.")
+                            logger.error(f"Log file {output_file} is different from expected path {filtered_activity_log}. Log sync will not work.")
                             
                     except Exception as e:
                         logger.error(f"Error running deep research directly: {str(e)}")
