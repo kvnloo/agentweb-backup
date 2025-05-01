@@ -28,7 +28,6 @@ import ShareIcon from '@mui/icons-material/Share';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import ArchiveIcon from '@mui/icons-material/Archive';
 import UnarchiveIcon from '@mui/icons-material/Unarchive';
-import RefreshIcon from '@mui/icons-material/Refresh';
 import AutorenewIcon from '@mui/icons-material/Autorenew';
 import { useAuth } from '../contexts/AuthContext';
 import axios from 'axios';
@@ -354,21 +353,11 @@ export default function ExecutionDetails() {
           Execution Details
         </Typography>
         <Box sx={{ float: 'right', display: 'flex', alignItems: 'center' }}>
-          {lastRefreshed && (
-            <Typography variant="caption" color="text.secondary" sx={{ mr: 2 }}>
-              Last updated: {lastRefreshed.toLocaleTimeString()}
-            </Typography>
-          )}
           {isAutoRefreshing && (
             <Tooltip title="Real-time updates active">
-              <AutorenewIcon color="info" sx={{ mr: 1, animation: 'spin 2s linear infinite' }} />
+              <AutorenewIcon color="info" sx={{ animation: 'spin 2s linear infinite' }} />
             </Tooltip>
           )}
-          <Tooltip title="Refresh data">
-            <IconButton onClick={refreshAll} size="small">
-              <RefreshIcon />
-            </IconButton>
-          </Tooltip>
         </Box>
       </Box>
 
