@@ -509,26 +509,8 @@ def upload_task_result_files(downloads_path: str, execution_id: str) -> List[Dic
             
     return result_files
 
-class LogFileHandler(FileSystemEventHandler):
-    """File system event handler for log file changes"""
-    
-    def __init__(self, log_sync_manager, log_file_path):
-        self.log_sync_manager = log_sync_manager
-        self.log_file_path = log_file_path
-        self.last_size = 0
-        self.last_upload_time = 0
-        self.upload_interval = 60  # seconds between uploads (changed from 3 to 60)
-        
-    def on_modified(self, event):
-        if event.src_path == self.log_file_path:
-            current_time = time.time()
-            if current_time - self.last_upload_time >= self.upload_interval:
-                self.log_sync_manager.sync_log_file()
-                self.last_upload_time = current_time
-
-
 class LogSyncManager:
-    """Manages continuous syncing of log files to S3"""
+    """Manages continuous syncing of log files to S3 using a simple polling approach"""
     
     def __init__(self, log_file: str, user_id: str, execution_id: str):
         """Initialize the LogSyncManager
@@ -541,14 +523,14 @@ class LogSyncManager:
         self.log_file = log_file
         self.user_id = user_id
         self.execution_id = execution_id
-        self.observer = None
-        self.event_handler = None
         self.should_stop = False
         self.last_content_hash = None
         self.s3_url = None
+        self.sync_thread = None
+        self.sync_interval = 30  # seconds between sync checks
     
     def start_watching(self) -> Optional[str]:
-        """Start watching the log file for changes and upload initially
+        """Start syncing the log file periodically
         
         Returns:
             Optional[str]: URL of the uploaded log file if successful, None otherwise
@@ -565,19 +547,37 @@ class LogSyncManager:
             # Initial upload
             self.s3_url = self.sync_log_file()
             
-            # Start watching for changes
-            self.event_handler = LogFileHandler(self, self.log_file)
-            self.observer = Observer()
-            self.observer.schedule(self.event_handler, os.path.dirname(self.log_file), recursive=False)
-            self.observer.start()
-            logger.info(f"Started watching log file: {self.log_file}")
+            # Start the sync thread
+            self.should_stop = False
+            self.sync_thread = threading.Thread(target=self._sync_loop)
+            self.sync_thread.daemon = True
+            self.sync_thread.start()
+            logger.info(f"Started log sync thread for file: {self.log_file}")
             
             return self.s3_url
             
         except Exception as e:
-            logger.error(f"Error starting log file watcher: {e}")
+            logger.error(f"Error starting log sync manager: {e}")
             self.stop_watching()
             return None
+    
+    def _sync_loop(self):
+        """Background thread that syncs the log file at regular intervals"""
+        try:
+            while not self.should_stop:
+                try:
+                    # Sleep for the sync interval
+                    time.sleep(self.sync_interval)
+                    
+                    if not self.should_stop:
+                        logger.info(f"Checking log file after {self.sync_interval}s interval")
+                        self.sync_log_file()
+                except Exception as e:
+                    logger.error(f"Error in sync loop: {e}")
+                    # If there's an error, wait a bit and continue
+                    time.sleep(5)
+        except Exception as e:
+            logger.error(f"Fatal error in sync loop: {e}")
     
     def sync_log_file(self) -> Optional[str]:
         """Sync the log file to S3 using upload_activity_log for consistency
@@ -591,23 +591,37 @@ class LogSyncManager:
                 return None
                 
             # Read the log file and calculate hash to avoid redundant uploads
-            with open(self.log_file, 'r') as f:
-                log_content = f.read()
+            try:
+                with open(self.log_file, 'r') as f:
+                    log_content = f.read()
+                    
+                # If file is empty, don't upload
+                if not log_content.strip():
+                    logger.debug("Log file is empty, skipping upload")
+                    return self.s3_url
+                    
+                content_hash = hashlib.md5(log_content.encode()).hexdigest()
                 
-            content_hash = hashlib.md5(log_content.encode()).hexdigest()
-            
-            # Skip upload if content hasn't changed
-            if content_hash == self.last_content_hash and self.s3_url:
-                return self.s3_url
-                
-            self.last_content_hash = content_hash
+                # Skip upload if content hasn't changed
+                if content_hash == self.last_content_hash and self.s3_url:
+                    logger.debug("Log content unchanged, skipping upload")
+                    return self.s3_url
+                    
+                logger.info(f"Log content changed (hash: {content_hash[:8]}), uploading to S3")
+                self.last_content_hash = content_hash
+            except Exception as read_error:
+                logger.error(f"Error reading log file: {read_error}")
+                # If we can't read the file, try to upload it anyway
+                logger.info("Attempting to upload despite read error")
                 
             # Use the standard upload_activity_log function for consistency
             url = upload_activity_log(self.log_file, self.user_id, self.execution_id)
             
             if url:
                 self.s3_url = url
-                logger.debug(f"Synced activity log to S3 using upload_activity_log")
+                logger.info(f"Successfully synced log to S3: {url}")
+            else:
+                logger.warning("Log sync completed but no URL was returned")
             
             return url
             
@@ -616,8 +630,11 @@ class LogSyncManager:
             return None
     
     def stop_watching(self):
-        """Stop watching the log file for changes and perform a final sync"""
+        """Stop syncing the log file"""
         try:
+            # Stop the sync thread
+            self.should_stop = True
+            
             # Perform a final sync to ensure all content is uploaded
             if Path(self.log_file).exists():
                 try:
@@ -627,15 +644,14 @@ class LogSyncManager:
                     # Use print as a fallback in case logging is shutting down
                     print(f"Error during final sync: {sync_error}")
             
-            if self.observer:
+            # Wait for thread to finish if it's running
+            if self.sync_thread and self.sync_thread.is_alive():
                 try:
-                    self.observer.stop()
-                    self.observer.join()
-                    self.observer = None
-                    logger.info(f"Stopped watching log file: {self.log_file}")
-                except Exception as stop_error:
+                    self.sync_thread.join(timeout=5)
+                    logger.info(f"Stopped log sync thread for file: {self.log_file}")
+                except Exception as join_error:
                     # Use print as a fallback in case logging is shutting down
-                    print(f"Error stopping observer: {stop_error}")
+                    print(f"Error stopping sync thread: {join_error}")
                 
         except Exception as e:
             # Use print instead of logger to avoid issues during shutdown
