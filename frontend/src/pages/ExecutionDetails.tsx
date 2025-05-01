@@ -124,7 +124,6 @@ export default function ExecutionDetails() {
   const [copySuccess, setCopySuccess] = useState(false);
   const [archiveDialogOpen, setArchiveDialogOpen] = useState(false);
   const [archiveAction, setArchiveAction] = useState<'archive' | 'unarchive'>('archive');
-  const [lastRefreshed, setLastRefreshed] = useState<Date | null>(null);
   const [isAutoRefreshing, setIsAutoRefreshing] = useState(false);
   const [iframeKey, setIframeKey] = useState(Date.now()); // Force iframe refresh
   const iframeRef = React.useRef<HTMLIFrameElement>(null);
@@ -156,7 +155,6 @@ export default function ExecutionDetails() {
         { headers: { Authorization: `Bearer ${token}` } }
       );
       setExecution(response.data);
-      setLastRefreshed(new Date());
       
       // If we're still loading, mark loading as complete
       if (loading) {
