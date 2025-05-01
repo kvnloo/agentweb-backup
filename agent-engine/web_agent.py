@@ -209,18 +209,37 @@ class WebAgent:
         # Stop the log filter thread if it's running
         if self.log_filter_thread and self.log_filter_thread.is_alive():
             try:
+                # First set the stop flag
                 self.log_filter_thread.stop()
+                
                 # Wait a short time for the thread to stop gracefully
-                self.log_filter_thread.join(timeout=2)
-                logger.info("Stopped log filter thread")
+                timeout = 2.0
+                logger.info(f"Waiting up to {timeout}s for log filter thread to stop...")
+                self.log_filter_thread.join(timeout=timeout)
+                
+                # Check if thread actually stopped
+                if self.log_filter_thread.is_alive():
+                    logger.warning("Log filter thread did not stop within timeout period")
+                    # We'll continue anyway as it's a daemon thread
+                else:
+                    logger.info("Stopped log filter thread successfully")
             except Exception as e:
                 logger.error(f"Error stopping log filter thread: {e}")
+                # Continue with cleanup even if there's an error
         
         # Remove log handlers
         for log, handler in self._log_handlers:
-            log.removeHandler(handler)
-            handler.close()
+            try:
+                log.removeHandler(handler)
+                handler.close()
+            except Exception as e:
+                logger.error(f"Error removing log handler: {e}")
+        
+        # Clear the handlers list
         self._log_handlers.clear()
+        
+        # Clear the reference to the log filter thread to help with garbage collection
+        self.log_filter_thread = None
 
     async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""

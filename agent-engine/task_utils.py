@@ -566,8 +566,12 @@ class LogSyncManager:
         try:
             while not self.should_stop:
                 try:
-                    # Sleep for the sync interval
-                    time.sleep(self.sync_interval)
+                    # Use multiple smaller sleep intervals instead of one long sleep
+                    # This allows the thread to respond to stop signals more quickly
+                    for _ in range(int(self.sync_interval * 2)):  # Split into half-second intervals
+                        if self.should_stop:
+                            break
+                        time.sleep(0.5)  # Sleep for half second at a time
                     
                     if not self.should_stop:
                         logger.info(f"Checking log file after {self.sync_interval}s interval")
@@ -647,7 +651,18 @@ class LogSyncManager:
             # Wait for thread to finish if it's running
             if self.sync_thread and self.sync_thread.is_alive():
                 try:
-                    self.sync_thread.join(timeout=5)
+                    # Use a shorter timeout to avoid hanging (2 seconds instead of 5)
+                    timeout = 2.0
+                    logger.info(f"Waiting up to {timeout}s for sync thread to complete...")
+                    self.sync_thread.join(timeout=timeout)
+                    
+                    # Check if thread is still alive after timeout
+                    if self.sync_thread.is_alive():
+                        logger.warning(f"Sync thread did not terminate within {timeout}s timeout")
+                        # We'll continue anyway since it's a daemon thread
+                    else:
+                        logger.info(f"Sync thread terminated successfully")
+                        
                     logger.info(f"Stopped log sync thread for file: {self.log_file}")
                 except Exception as join_error:
                     # Use print as a fallback in case logging is shutting down

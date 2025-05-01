@@ -572,14 +572,31 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
             # Clean up process if it's still running
             if 'process' in locals() and process is not None:
                 try:
-                    process.kill()
-                    await process.wait()
+                    if process.returncode is None:
+                        logger.info("Process still running, attempting to terminate it")
+                        process.kill()
+                    try:
+                        # Wait for process without blocking indefinitely
+                        await asyncio.wait_for(process.wait(), timeout=3.0)
+                        logger.info("Process terminated successfully")
+                    except asyncio.TimeoutError:
+                        logger.warning("Timed out waiting for process to terminate after kill")
+                    except Exception as wait_e:
+                        # This is likely where the "Error cleaning up process" occurs
+                        # The error might happen if the process resource is already gone
+                        logger.warning(f"Non-critical error waiting for process: {wait_e}")
                 except Exception as e:
-                    print(f"Error cleaning up process in run_web_agent_cli: {e}")
-                    
+                    # Don't just print, also log the error
+                    logger.warning(f"Error cleaning up process in run_web_agent_cli: {e}")
+                    # But continue execution since this is cleanup code
         except Exception as final_e:
             # Final catch-all error handling
             print(f"Critical error during run_web_agent_cli cleanup: {final_e}")
+            try:
+                # Try logging if still available
+                logger.error(f"Critical error during run_web_agent_cli cleanup: {final_e}")
+            except:
+                pass
 
 async def execute_task(execution):
     global running_task_count, running_user_ids, running_task_ids
