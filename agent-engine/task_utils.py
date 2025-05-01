@@ -676,6 +676,34 @@ class LogSyncManager:
             except:
                 pass
 
+def start_log_sync(log_file_path: str, user_id: str, execution_id: str):
+    """Start real-time log syncing for the given log file
+    
+    Args:
+        log_file_path: Path to the log file to sync
+        user_id: User ID
+        execution_id: Execution ID
+        
+    Returns:
+        LogSyncManager instance
+    """
+    # Create logs directory if needed
+    os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
+    
+    # Initialize log file if it doesn't exist yet
+    if not Path(log_file_path).exists():
+        with open(log_file_path, 'w') as f:
+            f.write(f"Log file initialized at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        logger.info(f"Created initial log file: {log_file_path}")
+    
+    # Start the log sync manager to upload log files in real-time
+    log_sync_manager = LogSyncManager(log_file_path, user_id, execution_id)
+    log_url = log_sync_manager.start_watching()
+    if log_url:
+        logger.info(f"Started real-time log syncing to S3: {log_url}")
+        
+    return log_sync_manager
+
 def upload_activity_log(log_file: str, user_id: str, execution_id: str) -> Optional[str]:
     """Upload activity log file to S3 and update execution record
     

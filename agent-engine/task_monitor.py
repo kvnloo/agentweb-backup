@@ -18,7 +18,7 @@ import yaml
 import random
 from typing import Dict, Any, List, Optional
 from deep_research_agent import DeepResearchAgentWrapper  # Import the wrapper class
-from task_utils import upload_activity_log, upload_gif, check_new_information, LogSyncManager  # Import utility functions
+from task_utils import upload_activity_log, upload_gif, check_new_information, LogSyncManager, start_log_sync  # Import utility functions
 import subprocess
 import tempfile
 import shutil
@@ -26,6 +26,7 @@ import re
 import traceback
 import threading
 import resource
+from email_utils import get_task_subscribers
 
 # Increase file descriptor limit
 soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -293,7 +294,6 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                     email_notification_enabled = task.get('emailNotification', False)
                     
                     # Check if there are subscribers
-                    from email_utils import get_task_subscribers
                     subscribers = get_task_subscribers(execution['taskId'])
                     has_subscribers = len(subscribers) > 0
                     
@@ -436,10 +436,7 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
             logger.info(f"Created initial log file: {filtered_activity_log}")
         
         # Start the log sync manager to upload log files in real-time
-        log_sync_manager = LogSyncManager(filtered_activity_log, user_id, execution_id)
-        log_url = log_sync_manager.start_watching()
-        if log_url:
-            logger.info(f"Started real-time log syncing to S3: {log_url}")
+        log_sync_manager = start_log_sync(filtered_activity_log, user_id, execution_id)
         
         # Build command with logging redirection
         cmd = [
@@ -760,6 +757,12 @@ async def execute_task(execution):
                             full_llm_name=llm_name
                         )
                         
+                        # Set up log file path for deep research logs
+                        filtered_activity_log = f"logs/execution_{execution_id}_deep_activities.log"
+                        
+                        # Start real-time log syncing for deep research logs
+                        log_sync_manager = start_log_sync(filtered_activity_log, user_id, execution_id)
+                        
                         # Define a function to run the research in a separate thread
                         def run_research_in_thread(agent, prompt, max_turns):
                             try:
@@ -820,12 +823,9 @@ async def execute_task(execution):
                                 research_task.cancel()
                         
                         # Get the output file path from the result
-                        filtered_activity_log = result.get('output_file', None)
-                        if filtered_activity_log and os.path.exists(filtered_activity_log):
-                            logger.info(f"Found output file: {filtered_activity_log}")
-                        else:
-                            logger.warning(f"Output file not found or not specified in result")
-                            filtered_activity_log = None
+                        output_file = result.get('output_file', None)
+                        if filtered_activity_log != output_file:
+                            logger.error(f"Log file path of the research {output_file} is different from expected path {filtered_activity_log}. Log sync will not work.")
                             
                     except Exception as e:
                         logger.error(f"Error running deep research directly: {str(e)}")
@@ -866,7 +866,7 @@ async def execute_task(execution):
                         result = {
                             "success": False,
                             "error": f"Web agent error: {str(e)}",
-                            "llm_name": llm_name
+                            "llmName": llm_name
                         }
 
                 # Upload GIF if it exists
@@ -927,6 +927,8 @@ async def execute_task(execution):
             upload_activity_log(filtered_activity_log, user_id, execution_id)
             Path(filtered_activity_log).unlink()
             logger.info(f"Deleted activity log file: {filtered_activity_log}")
+        # If we were syncing with log_sync_manager, don't delete the file,
+        # since log_sync_manager takes care of the final sync before stopping
         
         if not success:
             error_message = f"All LLMs failed. Last error: {last_error}"
