@@ -922,13 +922,11 @@ async def execute_task(execution):
                 last_error = str(e)
                 logger.error(f"Error with LLM {llm_name}: {e}")
 
-        # Upload activity log only if it exists and we haven't been syncing it
-        if filtered_activity_log and Path(filtered_activity_log).exists() and ('log_sync_manager' not in locals() or log_sync_manager is None):
+        # Upload activity log last time and delete the file. We do this regardless of whether we were syncing with log_sync_manager or not.
+        if filtered_activity_log and Path(filtered_activity_log).exists():
             upload_activity_log(filtered_activity_log, user_id, execution_id)
             Path(filtered_activity_log).unlink()
-            logger.info(f"Deleted activity log file: {filtered_activity_log}")
-        # If we were syncing with log_sync_manager, don't delete the file,
-        # since log_sync_manager takes care of the final sync before stopping
+            logger.info(f"Deleted log file after stopping log_sync_manager: {filtered_activity_log}")
         
         if not success:
             error_message = f"All LLMs failed. Last error: {last_error}"
