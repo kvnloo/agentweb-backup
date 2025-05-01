@@ -471,29 +471,53 @@ export default function ExecutionDetails() {
                     borderRadius: 1
                   }}
                 >
-                  <iframe
-                    src={execution.browser_use_log}
-                    style={{
-                      width: '100%',
-                      height: '500px',
-                      border: 'none',
-                      backgroundColor: 'white',
-                      overflow: 'auto'
-                    }}
-                    title="Execution Log"
-                  />
+                  {(() => {
+                    // Extract token from browser_use_log URL
+                    const urlRegex = new RegExp(`activities_${executionId}_([a-z0-9]{20})\\.log`);
+                    const match = urlRegex.exec(execution.browser_use_log);
+                    const logToken = match ? match[1] : '';
+                    
+                    // Create log URL with token
+                    const logUrl = buildApiUrl(`/api/tasks/${taskId}/executions/${executionId}/log?token=${logToken}`);
+                    
+                    return (
+                      <iframe
+                        src={logUrl}
+                        style={{
+                          width: '100%',
+                          height: '500px',
+                          border: 'none',
+                          backgroundColor: 'white',
+                          overflow: 'auto'
+                        }}
+                        title="Execution Log"
+                      />
+                    );
+                  })()}
                 </Paper>
                 <Box sx={{ mt: 1, display: 'flex', justifyContent: 'space-between' }}>
                   <Typography variant="caption" color="text.secondary">
-                    Note: HTML content in logs is escaped to prevent display issues.
+                    Note: Log content is loaded directly from secure storage with auto-refresh.
                   </Typography>
-                  <Link
-                    href={execution.browser_use_log}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    Open in new tab
-                  </Link>
+                  {(() => {
+                    // Extract token from browser_use_log URL
+                    const urlRegex = new RegExp(`activities_${executionId}_([a-z0-9]{20})\\.log`);
+                    const match = urlRegex.exec(execution.browser_use_log);
+                    const logToken = match ? match[1] : '';
+                    
+                    // Create log URL with token
+                    const logUrl = buildApiUrl(`/api/tasks/${taskId}/executions/${executionId}/log?token=${logToken}`);
+                    
+                    return (
+                      <Link
+                        href={logUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        Open in new tab
+                      </Link>
+                    );
+                  })()}
                 </Box>
               </Box>
             </Grid>

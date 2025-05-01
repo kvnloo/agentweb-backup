@@ -17,6 +17,7 @@ type FileRequest = AuthenticatedRequest & {
 
 // Public routes (no authentication required)
 router.get('/execution/:executionId/token/:token', getExecutionWithToken);
+router.get('/:id/executions/:executionId/log', getExecutionLog);
 
 // All other task routes require authentication
 router.use(authenticateToken);
@@ -26,7 +27,6 @@ router.get('/', getTasks);
 router.get('/:id', getTask);
 router.get('/:id/executions', getTaskExecutions);
 router.get('/:id/executions/:executionId', getTaskExecution);
-router.get('/:id/executions/:executionId/log', getExecutionLog);
 router.get('/:id/executions/:executionId/share', generateShareToken);
 router.put('/:id', updateTask);
 router.delete('/:id', deleteTask);
