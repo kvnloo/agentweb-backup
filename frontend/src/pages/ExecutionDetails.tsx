@@ -607,9 +607,7 @@ export default function ExecutionDetails() {
                   })()}
                 </Paper>
                 <Box sx={{ mt: 1, display: 'flex', justifyContent: 'space-between' }}>
-                  <Typography variant="caption" color="text.secondary">
-                    Note: Log content is loaded directly from secure storage with auto-refresh.
-                  </Typography>
+                  <div></div>
                   {(() => {
                     // Extract token from browser_use_log URL
                     const urlRegex = new RegExp(`activities_${executionId}_([a-z0-9]{20})\\.log`);
