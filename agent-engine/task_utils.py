@@ -639,15 +639,6 @@ class LogSyncManager:
             # Stop the sync thread
             self.should_stop = True
             
-            # Perform a final sync to ensure all content is uploaded
-            if Path(self.log_file).exists():
-                try:
-                    logger.info("Performing final log sync before stopping")
-                    self.sync_log_file()
-                except Exception as sync_error:
-                    # Use print as a fallback in case logging is shutting down
-                    print(f"Error during final sync: {sync_error}")
-            
             # Wait for thread to finish if it's running
             if self.sync_thread and self.sync_thread.is_alive():
                 try:
