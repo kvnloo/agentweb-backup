@@ -258,6 +258,9 @@ export const taskDb = {
     isDeepResearch?: boolean;
     isComplexTask?: boolean;
     extractPageContent?: boolean;
+    validateOutput?: boolean;
+    outputAsJson?: boolean;
+    isAgenticDevMode?: boolean;
     emailNotification?: boolean;
     attachments?: TaskAttachment[];
   }) {
@@ -278,12 +281,13 @@ export const taskDb = {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Tasks`,
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, #epc, #vo',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, #epc, #vo, #adm',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
           '#epc': 'extractPageContent',
-          '#vo': 'validateOutput'
+          '#vo': 'validateOutput',
+          '#adm': 'isAgenticDevMode'
         }
       };
 
@@ -321,7 +325,7 @@ export const taskDb = {
         ExpressionAttributeValues: {
           ':userId': userId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #adm',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
@@ -329,7 +333,8 @@ export const taskDb = {
           '#sum': 'summary',
           '#epc': 'extractPageContent',
           '#vo': 'validateOutput',
-          '#oaj': 'outputAsJson'
+          '#oaj': 'outputAsJson',
+          '#adm': 'isAgenticDevMode'
         }
       };
 
@@ -369,7 +374,7 @@ export const taskDb = {
         Key: {
           taskId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #adm',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
@@ -382,7 +387,8 @@ export const taskDb = {
           '#ct': 'isComplexTask',
           '#epc': 'extractPageContent',
           '#vo': 'validateOutput',
-          '#oaj': 'outputAsJson'
+          '#oaj': 'outputAsJson',
+          '#adm': 'isAgenticDevMode'
         }
       };
 
@@ -406,6 +412,7 @@ export const taskDb = {
     extractPageContent: boolean;
     validateOutput: boolean;
     outputAsJson: boolean;
+    isAgenticDevMode: boolean;
     llmName: string;
     attachments: TaskAttachment[];
   }>) {

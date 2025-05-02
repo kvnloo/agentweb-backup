@@ -69,6 +69,7 @@ interface Task {
   extractPageContent?: boolean;  // New flag for extracting page content
   validateOutput?: boolean;  // Flag for validating agent output
   outputAsJson?: boolean;  // Flag for outputting result as JSON
+  isAgenticDevMode?: boolean;  // Flag for enabling agentic dev mode
   llmName?: string;
   attachments?: TaskAttachment[];
 }
@@ -1033,6 +1034,30 @@ export default function TaskDetails() {
     }
   };
 
+  // Add the Agentic Dev Mode toggle handler
+  const handleAgenticDevModeToggle = async () => {
+    try {
+      await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        { isAgenticDevMode: !task?.isAgenticDevMode },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      // Update the task state with the response from the server
+      const taskResponse = await axios.get(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+      
+      setTask(taskResponse.data);
+    } catch (error) {
+      console.error('Error updating Agentic Dev Mode setting:', error);
+      setError('Failed to update Agentic Dev Mode setting');
+    }
+  };
+
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
@@ -1320,6 +1345,20 @@ export default function TaskDetails() {
                         />
                       }
                       label="Output As JSON"
+                      sx={{ mt: 1, opacity: Boolean(task.isDeepResearch) ? 0.5 : 1 }}
+                    />
+                  </Tooltip>
+                  <Tooltip title="When enabled, the agent can access the current page's content and run JavaScript on the page, providing more developer-oriented capabilities.">
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          checked={task?.isAgenticDevMode || false}
+                          onChange={handleAgenticDevModeToggle}
+                          disabled={loading || Boolean(task.isDeepResearch)}
+                          color="primary"
+                        />
+                      }
+                      label="Agentic Dev Mode"
                       sx={{ mt: 1, opacity: Boolean(task.isDeepResearch) ? 0.5 : 1 }}
                     />
                   </Tooltip>
