@@ -752,7 +752,6 @@ def upload_activity_log(log_file: str, user_id: str, execution_id: str) -> Optio
 <html>
 <head>
     <meta charset="utf-8">
-    <meta http-equiv="refresh" content="60">
     <title>Task Execution Log - {execution_id}</title>
     <style>
         pre {{
@@ -769,6 +768,28 @@ def upload_activity_log(log_file: str, user_id: str, execution_id: str) -> Optio
             text-align: right;
         }}
     </style>
+    <script>
+        // Check URL for refresh parameter and set up refresh if needed
+        window.addEventListener('load', function() {{
+            // Parse URL parameters
+            const urlParams = new URLSearchParams(window.location.search);
+            const refreshInterval = urlParams.get('refresh');
+            
+            // If refresh parameter exists and is a number, set up refresh
+            if (refreshInterval && !isNaN(refreshInterval) && parseInt(refreshInterval) > 0) {{
+                const refreshValue = parseInt(refreshInterval);
+                console.log('Setting up refresh every ' + refreshValue + ' seconds');
+                
+                // Set up meta refresh
+                const metaRefresh = document.createElement('meta');
+                metaRefresh.setAttribute('http-equiv', 'refresh');
+                metaRefresh.setAttribute('content', refreshValue.toString());
+                document.head.appendChild(metaRefresh);
+            }} else {{
+                console.log('No refresh parameter found or invalid value, not refreshing');
+            }}
+        }});
+    </script>
 </head>
 <body>
     <pre>{escaped_content}</pre>

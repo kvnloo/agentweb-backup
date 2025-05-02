@@ -125,25 +125,8 @@ export default function ExecutionDetails() {
   const [archiveDialogOpen, setArchiveDialogOpen] = useState(false);
   const [archiveAction, setArchiveAction] = useState<'archive' | 'unarchive'>('archive');
   const [isAutoRefreshing, setIsAutoRefreshing] = useState(false);
-  const [iframeKey, setIframeKey] = useState(Date.now()); // Force iframe refresh
+  const [iframeKey] = useState(Date.now()); // Used only for initial rendering
   const iframeRef = React.useRef<HTMLIFrameElement>(null);
-
-  const refreshIframe = useCallback(() => {
-    // Update iframe key to force complete refresh
-    setIframeKey(Date.now());
-    
-    // Also try to reload the iframe content if we have a reference
-    if (iframeRef.current) {
-      try {
-        const iframe = iframeRef.current;
-        if (iframe.contentWindow) {
-          iframe.contentWindow.location.reload();
-        }
-      } catch (e) {
-        console.log('Iframe direct reload failed, using key refresh instead');
-      }
-    }
-  }, []);
 
   const fetchExecution = useCallback(async () => {
     if (!taskId || !executionId || !token) return;
@@ -167,16 +150,10 @@ export default function ExecutionDetails() {
     }
   }, [taskId, executionId, token, loading]);
 
-  // Function to fetch data and refresh iframe
-  const refreshAll = useCallback(() => {
-    fetchExecution();
-    refreshIframe();
-  }, [fetchExecution, refreshIframe]);
-
   // Initial data load
   useEffect(() => {
-    refreshAll();
-  }, [refreshAll]);
+    fetchExecution();
+  }, [fetchExecution]);
 
   // Set up polling for running executions
   useEffect(() => {
@@ -187,10 +164,10 @@ export default function ExecutionDetails() {
       console.log('Setting up auto-refresh for running task...');
       setIsAutoRefreshing(true);
       
-      // Start polling every 10 seconds
+      // Start polling every 10 seconds - only update execution data, not iframe
       intervalId = setInterval(() => {
         console.log('Auto-refresh triggered');
-        refreshAll(); // Refresh both data and iframe
+        fetchExecution(); // Only refresh the execution data, not the iframe
       }, 10000);
     } else {
       setIsAutoRefreshing(false);
@@ -205,15 +182,7 @@ export default function ExecutionDetails() {
         setIsAutoRefreshing(false);
       }
     };
-  }, [execution?.status, refreshAll]);
-
-  // Refresh iframe when execution data changes (especially browser_use_log)
-  useEffect(() => {
-    if (execution) {
-      console.log('Execution data changed, refreshing iframe');
-      refreshIframe();
-    }
-  }, [execution?.browser_use_log, execution?.status, refreshIframe]);
+  }, [execution?.status, fetchExecution]);
 
   const handleFeedbackChange = async (feedback: 'accepted' | 'rejected' | null) => {
     if (!taskId || !executionId) return;
@@ -549,7 +518,7 @@ export default function ExecutionDetails() {
               <Typography variant="h6" gutterBottom>
                 Execution Log
                 {isAutoRefreshing && (
-                  <Tooltip title="Auto-refreshing">
+                  <Tooltip title="Log auto-refreshes every 10 seconds while execution is running">
                     <AutorenewIcon 
                       fontSize="small" 
                       color="info" 
@@ -574,7 +543,12 @@ export default function ExecutionDetails() {
                     const logToken = match ? match[1] : '';
                     
                     // Create log URL with token
-                    const logUrl = buildApiUrl(`/api/tasks/${taskId}/executions/${executionId}/log?token=${logToken}`);
+                    let logUrl = buildApiUrl(`/api/tasks/${taskId}/executions/${executionId}/log?token=${logToken}`);
+                    
+                    // Add refresh parameter if task is running or pending
+                    if (execution && ['running', 'pending'].includes(execution.status.toLowerCase())) {
+                      logUrl += '&refresh=10';
+                    }
                     
                     return (
                       <iframe
@@ -602,7 +576,12 @@ export default function ExecutionDetails() {
                     const logToken = match ? match[1] : '';
                     
                     // Create log URL with token
-                    const logUrl = buildApiUrl(`/api/tasks/${taskId}/executions/${executionId}/log?token=${logToken}`);
+                    let logUrl = buildApiUrl(`/api/tasks/${taskId}/executions/${executionId}/log?token=${logToken}`);
+                    
+                    // Add refresh parameter if task is running or pending
+                    if (execution && ['running', 'pending'].includes(execution.status.toLowerCase())) {
+                      logUrl += '&refresh=10';
+                    }
                     
                     return (
                       <Link
