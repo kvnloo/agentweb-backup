@@ -8,6 +8,15 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-05-02",
+    changes: [
+      "Added Agentic Dev Mode to Task Details page",
+      "- Enables agents to access current page content",
+      "- Allows running JavaScript on the current page",
+      "- Enhances developer capabilities for advanced web automation tasks"
+    ]
+  },
+  {
     date: "2025-05-01",
     changes: [
       "Implemented near real-time task execution monitoring",
