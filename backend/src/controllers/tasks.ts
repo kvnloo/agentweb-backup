@@ -245,6 +245,10 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
       updates.status = req.body.status;
     }
 
+    if (req.body.isAgenticDevMode !== undefined) {
+      updates.isAgenticDevMode = Boolean(req.body.isAgenticDevMode);
+    }
+
     console.log('Updates to apply:', updates);
     
     // Check if we're unarchiving a task (changing status from 'archived' to 'active')

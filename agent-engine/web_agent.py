@@ -174,6 +174,7 @@ class WebAgent:
         self.cookie_tainted = False  # Flag to track if shared credentials were used
         self.run_user_id = None  # Added to store run_user_id
         self.log_filter_thread = None
+        self.is_agentic_dev_mode = False  # Initialize is_agentic_dev_mode property
 
     def setup_execution_logging(self, execution_id: str):
         """Setup logging for the current execution"""
@@ -241,17 +242,18 @@ class WebAgent:
         # Clear the reference to the log filter thread to help with garbage collection
         self.log_filter_thread = None
 
-    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False) -> Dict[str, Any]:
+    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
         log_file = None
         try:
             # Set class variables
             self.current_execution_id = execution_id
             self.current_task_id = task_id
-            self.generate_gif = generate_gif
             self.is_interactive = is_interactive
-
-            # Configure logging for this execution
+            self.generate_gif = generate_gif
+            self.is_agentic_dev_mode = is_agentic_dev_mode
+            
+            # Set up logging
             log_file = self.setup_execution_logging(execution_id)
             
             logger.info(f"Executing task with prompt: {prompt[:100]}...")
@@ -1292,6 +1294,38 @@ Once the PR is approved and merged, this code will be available through the 'Run
                     logger.error(f"Error asking user: {str(e)}")
                     return ActionResult(error=f"Error asking user: {str(e)}")
 
+        # Add agentic dev mode actions
+        if self.is_agentic_dev_mode:
+            @self.controller.registry.action('Get current page content')
+            async def get_current_page_content(browser: BrowserContext) -> ActionResult:
+                """Get the HTML content of the current page."""
+                try:
+                    page = await browser.get_current_page()
+                    content = await page.content()
+                    return ActionResult(extracted_content=content)
+                except Exception as e:
+                    logger.error(f"Error getting page content: {str(e)}")
+                    return ActionResult(error=f"Failed to get page content: {str(e)}")
+            
+            @self.controller.registry.action('Run JavaScript on current page')
+            async def run_javascript_on_current_page(script: str, browser: BrowserContext) -> ActionResult:
+                """Run JavaScript code on the current page and return the result."""
+                try:
+                    page = await browser.get_current_page()
+                    result = await page.evaluate(script)
+                    
+                    # Convert result to string if it's not already
+                    if not isinstance(result, str):
+                        try:
+                            result = json.dumps(result, default=str)
+                        except:
+                            result = str(result)
+                    
+                    return ActionResult(extracted_content=result)
+                except Exception as e:
+                    logger.error(f"Error running JavaScript: {str(e)}")
+                    return ActionResult(error=f"Failed to run JavaScript: {str(e)}")
+
     def _get_cookies_path(self):
         """Get the path to the user's cookies file"""
         if not self.user_id:
@@ -1435,6 +1469,7 @@ async def main():
     parser.add_argument('--extract-page-content', action='store_true', help='Extract page content as JSON files')
     parser.add_argument('--validate-output', action='store_true', help='Validate output from the agent')
     parser.add_argument('--output-as-json', action='store_true', help='Format output as valid JSON')
+    parser.add_argument('--agentic-dev-mode', action='store_true', help='Enable Agentic Dev Mode with access to page content and JavaScript execution')
     args = parser.parse_args()
 
     # Read prompt from file
@@ -1461,7 +1496,8 @@ async def main():
             is_complex_task=args.is_complex_task,
             extract_page_content=args.extract_page_content,
             validate_output=args.validate_output,
-            output_as_json=args.output_as_json
+            output_as_json=args.output_as_json,
+            is_agentic_dev_mode=args.agentic_dev_mode
         )
         print(json.dumps(result))
         sys.exit(0 if result["success"] else 1)
