@@ -296,3 +296,6 @@ def test_new_feature(self, mock_table):
     self.assertEqual(result, expected_result)
     mock_table.query.assert_called_once_with(...)
 ```
+
+# Upgrade a python package
+pip install --upgrade <package_name, e.g., browser use>
