@@ -2,12 +2,16 @@ import React, { createContext, useContext, useState, useCallback, useEffect } fr
 import axios from 'axios';
 import { API_URL, buildApiUrl } from '../config';
 
+// Define the possible user roles
+export type UserRole = 'partner' | 'customer';
+
 interface User {
   userId: string;
   email: string;
   isAdmin: boolean;
   isOAuthUser: boolean;
   createdAt: string;
+  role: UserRole;
 }
 
 interface AuthContextType {
@@ -20,6 +24,7 @@ interface AuthContextType {
   setToken: (token: string | null) => void;
   logout: () => void;
   isAuthenticated: () => boolean;
+  hasRole: (roles: UserRole | UserRole[]) => boolean;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -151,6 +156,23 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   }, []);
 
+  const hasRole = useCallback((roles: UserRole | UserRole[]): boolean => {
+    if (!user) return false;
+    
+    // Admin users have access to everything
+    if (user.isAdmin) return true;
+    
+    // Use 'partner' as default role if not defined
+    const userRole = user.role || 'partner';
+    
+    // Check if user has the specified role
+    if (Array.isArray(roles)) {
+      return roles.includes(userRole);
+    }
+    
+    return roles === userRole;
+  }, [user]);
+
   const value = {
     token,
     user,
@@ -160,7 +182,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     loginWithGoogle,
     setToken,
     logout,
-    isAuthenticated
+    isAuthenticated,
+    hasRole
   };
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

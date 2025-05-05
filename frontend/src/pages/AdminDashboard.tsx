@@ -27,7 +27,12 @@ import {
   DialogActions,
   DialogContentText,
   Tooltip,
-  IconButton
+  IconButton,
+  FormControl,
+  InputLabel,
+  MenuItem,
+  Select,
+  SelectChangeEvent
 } from '@mui/material';
 import { format } from 'date-fns';
 import { Link } from 'react-router-dom';
@@ -273,6 +278,8 @@ export default function AdminDashboard() {
   const [chatSessions, setChatSessions] = useState<any[]>([]);
   const [selectedSession, setSelectedSession] = useState<any>(null);
   const [chatDialogOpen, setChatDialogOpen] = useState(false);
+  const [roleDialogOpen, setRoleDialogOpen] = useState(false);
+  const [selectedUserRole, setSelectedUserRole] = useState<string>('');
   const { token } = useAuth();
   
   const {
@@ -285,7 +292,8 @@ export default function AdminDashboard() {
     loadAnalytics,
     updateWaitlistStatus,
     loading: adminLoading,
-    error: adminError
+    error: adminError,
+    setUsers
   } = useAdmin();
 
   useEffect(() => {
@@ -520,6 +528,49 @@ export default function AdminDashboard() {
   const handleViewChat = (session: any) => {
     setSelectedSession(session);
     setChatDialogOpen(true);
+  };
+
+  const handleRoleChange = (event: SelectChangeEvent) => {
+    setSelectedUserRole(event.target.value as string);
+  };
+
+  const handleRoleDialogOpen = (user: any) => {
+    setSelectedUser(user);
+    setSelectedUserRole(user.role || 'partner');
+    setRoleDialogOpen(true);
+  };
+
+  const handleRoleDialogClose = () => {
+    setRoleDialogOpen(false);
+  };
+
+  const handleUpdateRole = async () => {
+    try {
+      setLoading(true);
+      setError('');
+      
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/users/${selectedUser?.userId}/role`),
+        { role: selectedUserRole },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      
+      // Update user list
+      const updatedUsers = users.map(user => 
+        user.userId === selectedUser?.userId 
+          ? { ...user, role: selectedUserRole, isAdmin: selectedUserRole === 'admin' } 
+          : user
+      );
+      
+      setUsers(updatedUsers);
+      setSuccess('User role updated successfully');
+      setRoleDialogOpen(false);
+    } catch (err) {
+      console.error('Error updating user role:', err);
+      setError('Failed to update user role. Please try again.');
+    } finally {
+      setLoading(false);
+    }
   };
 
   if (adminError) {
@@ -793,9 +844,9 @@ export default function AdminDashboard() {
             <Table>
               <TableHead>
                 <TableRow>
-                  <TableCell>User ID</TableCell>
                   <TableCell>Email</TableCell>
-                  <TableCell>Created At</TableCell>
+                  <TableCell>Created</TableCell>
+                  <TableCell>Role</TableCell>
                   <TableCell>Tasks</TableCell>
                   <TableCell>Workflows</TableCell>
                   <TableCell>OAuth User</TableCell>
@@ -814,9 +865,20 @@ export default function AdminDashboard() {
                 ) : (
                   users.map((user) => (
                     <TableRow key={user.userId}>
-                      <TableCell>{user.userId}</TableCell>
                       <TableCell>{user.email}</TableCell>
                       <TableCell>{new Date(user.createdAt).toLocaleDateString()}</TableCell>
+                      <TableCell>
+                        <Chip 
+                          label={user.role || 'partner'}
+                          color={
+                            user.role === 'customer' ? 'success' :
+                            'primary' // Default to primary (partner) color
+                          }
+                          size="small"
+                          onClick={() => handleRoleDialogOpen(user)}
+                          sx={{ cursor: 'pointer' }}
+                        />
+                      </TableCell>
                       <TableCell>
                         <Chip 
                           label={user.taskCount || 0} 
@@ -1223,6 +1285,47 @@ export default function AdminDashboard() {
         open={chatDialogOpen}
         onClose={() => setChatDialogOpen(false)}
       />
+
+      {/* Add Role Dialog */}
+      <Dialog open={roleDialogOpen} onClose={handleRoleDialogClose}>
+        <DialogTitle>Update User Role</DialogTitle>
+        <DialogContent>
+          <Box sx={{ mt: 2 }}>
+            <Typography variant="body1" gutterBottom>
+              Update role for user: <strong>{selectedUser?.email}</strong>
+            </Typography>
+            <FormControl fullWidth sx={{ mt: 2 }}>
+              <InputLabel id="role-select-label">Role</InputLabel>
+              <Select
+                labelId="role-select-label"
+                value={selectedUserRole}
+                label="Role"
+                onChange={handleRoleChange}
+              >
+                <MenuItem value="partner">Partner</MenuItem>
+                <MenuItem value="customer">Customer</MenuItem>
+              </Select>
+            </FormControl>
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 2 }}>
+              <strong>Role access:</strong><br />
+              - Admin: Controlled by admin flag, not role<br />
+              - Partner (Default): Access to agent features (tasks, workflows)<br />
+              - Customer: Access to marketing features only
+            </Typography>
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleRoleDialogClose}>Cancel</Button>
+          <Button 
+            onClick={handleUpdateRole} 
+            variant="contained" 
+            color="primary"
+            disabled={loading}
+          >
+            {loading ? <CircularProgress size={24} /> : 'Update Role'}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Container>
   );
 } 

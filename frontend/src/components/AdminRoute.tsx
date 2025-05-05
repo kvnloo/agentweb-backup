@@ -9,7 +9,7 @@ interface AdminRouteProps {
 }
 
 export default function AdminRoute({ children }: AdminRouteProps) {
-  const { user, loading: authLoading } = useAuth();
+  const { user, loading: authLoading, hasRole } = useAuth();
   const { isAdmin } = useAdmin();
   const location = useLocation();
 
@@ -21,8 +21,19 @@ export default function AdminRoute({ children }: AdminRouteProps) {
     );
   }
 
+  // Check for admin access through isAdmin property
   if (!user || !isAdmin) {
     console.log('AdminRoute: Access denied', { user, isAdmin });
+    
+    // Redirect based on user role
+    if (user) {
+      if (hasRole('customer')) {
+        return <Navigate to="/marketing" replace />;
+      } else if (hasRole('partner')) {
+        return <Navigate to="/tasks" replace />;
+      }
+    }
+    
     return <Navigate to="/login" state={{ from: location }} replace />;
   }
 

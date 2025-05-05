@@ -49,6 +49,7 @@ interface User {
   isAdmin: boolean;
   isActive: boolean;
   createdAt: string;
+  role?: 'partner' | 'customer';
 }
 
 interface UserInteraction {
@@ -111,7 +112,14 @@ class UserDB {
     }
   }
 
-  async createUser(email: string, userId: string, password: string, isOAuthUser: boolean = false, isAdmin: boolean = false) {
+  async createUser(
+    email: string, 
+    userId: string, 
+    password: string, 
+    isOAuthUser: boolean = false, 
+    isAdmin: boolean = false,
+    role: 'partner' | 'customer' = 'partner'
+  ) {
     const params = {
       TableName: this.tableName,
       Item: {
@@ -121,7 +129,8 @@ class UserDB {
         isOAuthUser,
         isAdmin,
         isActive: true,
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(),
+        role // Always include role, default is 'partner'
       }
     };
 
@@ -239,6 +248,54 @@ class UserDB {
       return result.Attributes;
     } catch (error) {
       this.handleError(error, 'deactivateUser');
+    }
+  }
+
+  async updateUser(userId: string, updates: Partial<{
+    role: string;
+    isAdmin: boolean;
+    isActive: boolean;
+    email: string;
+  }>) {
+    try {
+      // First get the user
+      const user = await this.getUserById(userId);
+      if (!user) {
+        throw new Error('User not found');
+      }
+
+      // Create update expression and attribute values dynamically
+      const updateExpressionParts: string[] = [];
+      const expressionAttributeNames: Record<string, string> = {};
+      const expressionAttributeValues: Record<string, any> = {};
+
+      // Process each update field
+      Object.entries(updates).forEach(([key, value]) => {
+        updateExpressionParts.push(`#${key} = :${key}`);
+        expressionAttributeNames[`#${key}`] = key;
+        expressionAttributeValues[`:${key}`] = value;
+      });
+
+      if (updateExpressionParts.length === 0) {
+        return user; // Nothing to update
+      }
+
+      const params = {
+        TableName: this.tableName,
+        Key: {
+          email: user.email  // Use email as the primary key, matching the schema
+        },
+        UpdateExpression: `set ${updateExpressionParts.join(', ')}`,
+        ExpressionAttributeNames: expressionAttributeNames,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: 'ALL_NEW'
+      };
+
+      const result = await this.docClient.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      console.error('Error in updateUser:', error);
+      throw error;
     }
   }
 }

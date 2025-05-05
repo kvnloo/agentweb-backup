@@ -6,7 +6,7 @@ import { Profile } from 'passport-google-oauth20';
 
 export const register = async (req: Request, res: Response) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, role } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({ message: 'Email and password are required' });
@@ -21,15 +21,32 @@ export const register = async (req: Request, res: Response) => {
     const hashedPassword = await bcrypt.hash(password, 10);
     const userId = Date.now().toString();
 
+    // Validate role if provided, default to 'partner'
+    const validRoles = ['partner', 'customer'];
+    let userRole = 'partner'; // Default role
+    if (role && validRoles.includes(role)) {
+      userRole = role as 'partner' | 'customer';
+    }
+
     // Create user in DynamoDB
-    await userDb.createUser(email, userId, hashedPassword);
+    await userDb.createUser(email, userId, hashedPassword, false, false, userRole as 'partner' | 'customer');
 
     const token = jwt.sign(
-      { userId, email },
+      { userId, email, role: userRole },
       process.env.JWT_SECRET || 'your-secret-key'
     );
 
-    res.status(201).json({ token });
+    res.status(201).json({ 
+      token, 
+      user: {
+        userId,
+        email,
+        isAdmin: false,
+        role: userRole,
+        isOAuthUser: false,
+        createdAt: new Date().toISOString()
+      }
+    });
   } catch (error) {
     console.error('Error in register:', error);
     res.status(500).json({ message: 'Error creating user' });
@@ -59,8 +76,13 @@ export const login = async (req: Request, res: Response) => {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
+    // Token contains only userId, email, and role (if exists)
     const token = jwt.sign(
-      { userId: user.userId, email: user.email },
+      { 
+        userId: user.userId, 
+        email: user.email,
+        ...(user.role && { role: user.role })
+      },
       process.env.JWT_SECRET || 'your-secret-key'
     );
 
@@ -91,13 +113,25 @@ export const googleCallback = async (
     if (!user) {
       // Create new user if doesn't exist
       const userId = Date.now().toString();
-      await userDb.createUser(email, userId, '', true); // No password for OAuth users
-      user = { userId, email };
+      // Set 'partner' as default role for OAuth users
+      await userDb.createUser(email, userId, '', true, false, 'partner');
+      user = await userDb.getUserByEmail(email);
+      
+      if (!user) {
+        throw new Error('Failed to create user');
+      }
     }
 
-    // Generate JWT token
+    // Use the user's role or default to 'partner'
+    const userRole = user.role || 'partner';
+
+    // Generate JWT token with necessary data
     const token = jwt.sign(
-      { userId: user.userId, email: user.email },
+      { 
+        userId: user.userId, 
+        email: user.email,
+        role: userRole
+      },
       process.env.JWT_SECRET || 'your-secret-key'
     );
 

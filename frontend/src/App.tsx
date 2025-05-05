@@ -18,6 +18,8 @@ import OAuthCallback from './pages/OAuthCallback';
 import AdminDashboard from './pages/AdminDashboard';
 import PrivateRoute from './components/PrivateRoute';
 import AdminRoute from './components/AdminRoute';
+import PartnerRoute from './components/PartnerRoute';
+import CustomerRoute from './components/CustomerRoute';
 import Profile from './pages/Profile';
 import Config from './pages/Config';
 import Workflows from './pages/Workflows';
@@ -52,17 +54,17 @@ export default function App() {
                     <Route
                       path="tasks"
                       element={
-                        <PrivateRoute>
+                        <PartnerRoute>
                           <Tasks />
-                        </PrivateRoute>
+                        </PartnerRoute>
                       }
                     />
                     <Route
                       path="templates"
                       element={
-                        <PrivateRoute>
+                        <PartnerRoute>
                           <Templates />
-                        </PrivateRoute>
+                        </PartnerRoute>
                       }
                     />
                     <Route
@@ -76,25 +78,25 @@ export default function App() {
                     <Route
                       path="tasks/create"
                       element={
-                        <PrivateRoute>
+                        <PartnerRoute>
                           <CreateTask />
-                        </PrivateRoute>
+                        </PartnerRoute>
                       }
                     />
                     <Route
                       path="tasks/:taskId"
                       element={
-                        <PrivateRoute>
+                        <PartnerRoute>
                           <TaskDetails />
-                        </PrivateRoute>
+                        </PartnerRoute>
                       }
                     />
                     <Route
                       path="tasks/:taskId/executions/:executionId"
                       element={
-                        <PrivateRoute>
+                        <PartnerRoute>
                           <ExecutionDetails />
-                        </PrivateRoute>
+                        </PartnerRoute>
                       }
                     />
                     <Route
@@ -125,44 +127,51 @@ export default function App() {
                     <Route
                       path="workflows"
                       element={
-                        <PrivateRoute>
+                        <PartnerRoute>
                           <Workflows />
-                        </PrivateRoute>
+                        </PartnerRoute>
                       }
                     />
                     <Route
                       path="workflows/new"
                       element={
-                        <PrivateRoute>
+                        <PartnerRoute>
                           <WorkflowBuilder />
-                        </PrivateRoute>
+                        </PartnerRoute>
                       }
                     />
                     <Route
                       path="workflows/:id"
                       element={
-                        <PrivateRoute>
+                        <PartnerRoute>
                           <WorkflowDetails />
-                        </PrivateRoute>
+                        </PartnerRoute>
                       }
                     />
                     <Route
                       path="workflows/:id/edit"
                       element={
-                        <PrivateRoute>
+                        <PartnerRoute>
                           <WorkflowBuilder />
-                        </PrivateRoute>
+                        </PartnerRoute>
                       }
                     />
                     <Route
                       path="workflows/:id/run"
                       element={
-                        <PrivateRoute>
+                        <PartnerRoute>
                           <WorkflowRun />
-                        </PrivateRoute>
+                        </PartnerRoute>
                       }
                     />
-                    <Route path="marketing/*" element={<Marketing />} />
+                    <Route 
+                      path="marketing/*" 
+                      element={
+                        <CustomerRoute>
+                          <Marketing />
+                        </CustomerRoute>
+                      } 
+                    />
                   </Route>
                 </Routes>
               </Box>

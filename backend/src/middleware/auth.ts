@@ -7,7 +7,15 @@ export interface AuthenticatedRequest extends Request {
     userId: string;
     email: string;
     isAdmin: boolean;
+    role?: 'partner' | 'customer';
   };
+}
+
+export interface UserPayload {
+  userId: string;
+  email: string;
+  isAdmin: boolean;
+  role?: 'partner' | 'customer';
 }
 
 export async function authenticateToken(req: Request, res: Response, next: NextFunction) {
@@ -22,28 +30,27 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
     const decoded = jwt.verify(
       token,
       process.env.JWT_SECRET || 'your-secret-key'
-    ) as { userId: string; email: string };
+    ) as UserPayload;
 
-    // Check if user exists and is not deactivated
+    // Get the latest user data to ensure up-to-date permissions
     const user = await userDb.getUserById(decoded.userId);
+    
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    if (user.isActive === false) {
-      return res.status(403).json({ message: 'Account has been deactivated. Please contact support.' });
-    }
-
-    // Add user info to request
-    (req as AuthenticatedRequest).user = {
-      userId: decoded.userId,
-      email: decoded.email,
-      isAdmin: user.isAdmin || false
+    // Assign user properties to the request object
+    const authReq = req as AuthenticatedRequest;
+    authReq.user = {
+      userId: user.userId,
+      email: user.email,
+      isAdmin: user.isAdmin || false,
+      role: user.role || 'partner' // Use 'partner' as default
     };
-    
+
     next();
   } catch (error) {
-    return res.status(403).json({ message: 'Invalid token' });
+    return res.status(401).json({ message: 'Invalid token' });
   }
 }
 

@@ -15,6 +15,7 @@ interface AdminContextType {
   loading: boolean;
   error: string | null;
   isAdmin: boolean;
+  setUsers: React.Dispatch<React.SetStateAction<any[]>>;
 }
 
 const AdminContext = createContext<AdminContextType | undefined>(undefined);
@@ -121,7 +122,8 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     updateWaitlistStatus,
     loading,
     error,
-    isAdmin: user?.isAdmin || false
+    isAdmin: user?.isAdmin || false,
+    setUsers
   };
 
   return <AdminContext.Provider value={value}>{children}</AdminContext.Provider>;

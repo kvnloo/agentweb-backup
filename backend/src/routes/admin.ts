@@ -441,4 +441,45 @@ router.get('/chat-sessions', async (req, res) => {
   }
 });
 
+// Add a route to update user role
+router.put('/users/:userId/role', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { role } = req.body;
+    
+    // Validate role
+    const validRoles = ['partner', 'customer'];
+    
+    // Check if role is empty string (to reset to default 'partner')
+    if (role === '') {
+      // Set role back to default 'partner'
+      await userDb.updateUser(userId, { 
+        role: 'partner'
+      });
+      return res.status(200).json({ message: 'User role reset to default partner role' });
+    }
+    
+    // Check for valid role value
+    if (role && !validRoles.includes(role)) {
+      return res.status(400).json({ message: 'Invalid role. Must be one of: partner, customer' });
+    }
+    
+    // Get the user
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    
+    // Update user in DynamoDB
+    await userDb.updateUser(userId, { 
+      role
+    });
+    
+    res.status(200).json({ message: 'User role updated successfully' });
+  } catch (error) {
+    console.error('Error updating user role:', error);
+    res.status(500).json({ message: 'Error updating user role' });
+  }
+});
+
 export default router; 

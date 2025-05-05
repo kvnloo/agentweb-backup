@@ -11,7 +11,7 @@ import {
   CircularProgress,
   Alert
 } from '@mui/material';
-import { useAuth } from '../contexts/AuthContext';
+import { useAuth, UserRole } from '../contexts/AuthContext';
 import { useParams } from 'react-router-dom';
 import { useState, useEffect } from 'react';
 import axios, { AxiosError } from 'axios';
@@ -24,6 +24,7 @@ interface User {
   isAdmin: boolean;
   isOAuthUser: boolean;
   createdAt: string;
+  role?: UserRole;
   [key: string]: any; // Allow for additional properties
 }
 
@@ -148,6 +149,11 @@ export default function Profile() {
                         sx={{ mr: 1 }}
                       />
                     )}
+                    <Chip
+                      label={profileUser.role || 'Partner'}
+                      color="success"
+                      sx={{ mr: 1, textTransform: 'capitalize' }}
+                    />
                     {profileUser.isOAuthUser ? (
                       <Chip
                         label="Google Account"
