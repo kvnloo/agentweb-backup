@@ -1,0 +1,210 @@
+
+import { useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Label } from "@/components/ui/label";
+import { PlusCircle, Trash2, Save } from "lucide-react";
+import { toast } from "@/components/ui/use-toast";
+
+interface Account {
+  id: string;
+  service: string;
+  username: string;
+  password: string;
+  url: string;
+}
+
+const Settings = () => {
+  const [accounts, setAccounts] = useState<Account[]>([
+    { id: "1", service: "Twitter", username: "marketingops", password: "********", url: "https://twitter.com" },
+    { id: "2", service: "LinkedIn", username: "marketing.team", password: "********", url: "https://linkedin.com" }
+  ]);
+  
+  const [newAccount, setNewAccount] = useState<Omit<Account, "id">>({
+    service: "",
+    username: "",
+    password: "",
+    url: ""
+  });
+  
+  const handleAddAccount = () => {
+    if (!newAccount.service || !newAccount.username || !newAccount.password) {
+      toast({
+        title: "Error",
+        description: "Please fill in all required fields",
+        variant: "destructive"
+      });
+      return;
+    }
+    
+    const newId = (accounts.length + 1).toString();
+    setAccounts([...accounts, { ...newAccount, id: newId }]);
+    setNewAccount({ service: "", username: "", password: "", url: "" });
+    
+    toast({
+      title: "Success",
+      description: "Account added successfully",
+    });
+  };
+  
+  const handleDeleteAccount = (id: string) => {
+    setAccounts(accounts.filter(account => account.id !== id));
+    toast({
+      title: "Account Removed",
+      description: "The account has been removed successfully.",
+    });
+  };
+
+  const handleSavePreferences = () => {
+    toast({
+      title: "Preferences Saved",
+      description: "Your preferences have been updated successfully.",
+    });
+  };
+
+  return (
+    <div className="w-full space-y-6">
+      <div className="space-y-2">
+        <h1 className="text-3xl font-bold">Settings</h1>
+        <p className="text-muted-foreground">Manage your account and preferences</p>
+      </div>
+
+      <Tabs defaultValue="accounts" className="w-full">
+        <TabsList className="mb-4">
+          <TabsTrigger value="accounts">Connected Accounts</TabsTrigger>
+          <TabsTrigger value="preferences">Preferences</TabsTrigger>
+        </TabsList>
+        
+        <TabsContent value="accounts" className="space-y-6">
+          <Card>
+            <CardHeader>
+              <CardTitle>Add New Account</CardTitle>
+              <CardDescription>Add services for the agent to access</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                <div className="space-y-2">
+                  <Label htmlFor="service">Service</Label>
+                  <Input 
+                    id="service" 
+                    placeholder="Twitter, LinkedIn, etc."
+                    value={newAccount.service}
+                    onChange={(e) => setNewAccount({...newAccount, service: e.target.value})}
+                  />
+                </div>
+                
+                <div className="space-y-2">
+                  <Label htmlFor="username">Username</Label>
+                  <Input 
+                    id="username" 
+                    placeholder="Username or Email"
+                    value={newAccount.username}
+                    onChange={(e) => setNewAccount({...newAccount, username: e.target.value})}
+                  />
+                </div>
+                
+                <div className="space-y-2">
+                  <Label htmlFor="password">Password</Label>
+                  <Input 
+                    id="password" 
+                    type="password" 
+                    placeholder="Password"
+                    value={newAccount.password}
+                    onChange={(e) => setNewAccount({...newAccount, password: e.target.value})}
+                  />
+                </div>
+                
+                <div className="space-y-2">
+                  <Label htmlFor="url">URL</Label>
+                  <Input 
+                    id="url" 
+                    type="url" 
+                    placeholder="https://example.com"
+                    value={newAccount.url}
+                    onChange={(e) => setNewAccount({...newAccount, url: e.target.value})}
+                  />
+                </div>
+              </div>
+            </CardContent>
+            <CardFooter>
+              <Button onClick={handleAddAccount}>
+                <PlusCircle className="mr-2 h-4 w-4" />
+                Add Account
+              </Button>
+            </CardFooter>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Connected Accounts</CardTitle>
+              <CardDescription>Accounts the agent can access</CardDescription>
+            </CardHeader>
+            <CardContent>
+              {accounts.length === 0 ? (
+                <p className="text-center text-muted-foreground py-4">No accounts connected yet.</p>
+              ) : (
+                <div className="space-y-4">
+                  {accounts.map((account) => (
+                    <div key={account.id} className="flex items-center justify-between p-4 border rounded-lg">
+                      <div>
+                        <h3 className="font-medium">{account.service}</h3>
+                        <p className="text-sm text-muted-foreground">{account.username}</p>
+                        <p className="text-sm text-muted-foreground">
+                          {account.url ? (
+                            <a href={account.url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">
+                              {account.url.replace(/(^\w+:|^)\/\//, '')}
+                            </a>
+                          ) : (
+                            "No URL provided"
+                          )}
+                        </p>
+                      </div>
+                      <Button variant="ghost" size="icon" onClick={() => handleDeleteAccount(account.id)}>
+                        <Trash2 className="h-4 w-4 text-destructive" />
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+        
+        <TabsContent value="preferences" className="space-y-4">
+          <Card>
+            <CardHeader>
+              <CardTitle>User Preferences</CardTitle>
+              <CardDescription>Customize your experience</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="name">Display Name</Label>
+                <Input id="name" placeholder="Your Name" />
+              </div>
+              
+              <div className="space-y-2">
+                <Label htmlFor="email-notifications">Email Notifications</Label>
+                <div className="flex items-center space-x-2">
+                  <input type="checkbox" id="email-notifications" className="h-4 w-4" />
+                  <Label htmlFor="email-notifications" className="text-sm font-normal">
+                    Receive email notifications for completed tasks
+                  </Label>
+                </div>
+              </div>
+            </CardContent>
+            <CardFooter>
+              <Button onClick={handleSavePreferences}>
+                <Save className="mr-2 h-4 w-4" />
+                Save Preferences
+              </Button>
+            </CardFooter>
+          </Card>
+        </TabsContent>
+      </Tabs>
+    </div>
+  );
+};
+
+export default Settings;
