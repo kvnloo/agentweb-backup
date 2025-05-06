@@ -255,12 +255,13 @@ const ChatSupport: React.FC = () => {
           sessionId: session.sessionId,
           message: trimmedMessage,
           currentUrl: window.location.pathname,
-          pageContext: pageContent
+          pageContext: pageContent,
+          portal: 'customer'
         });
       } else {
         // HTTP fallback
         const response = await axios.post(
-          buildApiUrl(`/api/chatbot/sessions/${session.sessionId}/messages`),
+          buildApiUrl(`/api/chatbot/sessions/${session.sessionId}/messages?portal=customer`),
           { 
             message: trimmedMessage,
             currentUrl: window.location.pathname,
@@ -322,8 +323,11 @@ const ChatSupport: React.FC = () => {
     try {
       setIsLoading(true);
       const createResponse = await axios.post(
-        buildApiUrl('/api/chatbot/sessions'), 
-        { currentUrl: window.location.pathname },
+        buildApiUrl('/api/chatbot/sessions?portal=customer'),
+        { 
+          currentUrl: window.location.pathname,
+          pageContext: document.querySelector('main')?.innerHTML || ''
+        },
         { headers: { Authorization: `Bearer ${token}` } }
       );
       setSession(createResponse.data);

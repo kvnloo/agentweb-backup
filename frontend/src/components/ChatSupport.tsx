@@ -301,8 +301,11 @@ const ChatSupport: React.FC = () => {
     try {
       setIsLoading(true);
       const createResponse = await axios.post(
-        `${apiUrl}/api/chatbot/sessions`, 
-        { currentUrl: window.location.pathname },
+        `${apiUrl}/api/chatbot/sessions?portal=partner`,
+        { 
+          currentUrl: window.location.pathname,
+          pageContext: document.querySelector('main')?.innerHTML || ''
+        },
         { headers: { Authorization: `Bearer ${token}` } }
       );
       setSession(createResponse.data);

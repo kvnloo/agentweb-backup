@@ -88,6 +88,19 @@ interface WaitlistEntry {
   requestReport?: boolean;
 }
 
+// Define ChatSession interface for the frontend, including portalType
+interface AdminChatSession {
+  sessionId: string;
+  userId: string;
+  messages: any[]; // Keeping messages as any for now, as per existing ChatDialog
+  createdAt: string;
+  updatedAt: string;
+  pageContent?: string;
+  contextChunks?: any[];
+  portalType?: 'customer' | 'partner';
+  // Add other fields if the backend sends more for the session list
+}
+
 const ChatDialog = ({ session, open, onClose }: { session: any; open: boolean; onClose: () => void }) => {
   return (
     <Dialog
@@ -275,8 +288,8 @@ export default function AdminDashboard() {
   const [success, setSuccess] = useState('');
   const [selectedUser, setSelectedUser] = useState<any>(null);
   const [deactivateDialogOpen, setDeactivateDialogOpen] = useState(false);
-  const [chatSessions, setChatSessions] = useState<any[]>([]);
-  const [selectedSession, setSelectedSession] = useState<any>(null);
+  const [chatSessions, setChatSessions] = useState<AdminChatSession[]>([]);
+  const [selectedSession, setSelectedSession] = useState<AdminChatSession | null>(null);
   const [chatDialogOpen, setChatDialogOpen] = useState(false);
   const [roleDialogOpen, setRoleDialogOpen] = useState(false);
   const [selectedUserRole, setSelectedUserRole] = useState<string>('');
@@ -525,7 +538,7 @@ export default function AdminDashboard() {
     }
   };
 
-  const handleViewChat = (session: any) => {
+  const handleViewChat = (session: AdminChatSession) => {
     setSelectedSession(session);
     setChatDialogOpen(true);
   };
@@ -1203,10 +1216,11 @@ export default function AdminDashboard() {
               <TableHead>
                 <TableRow>
                   <TableCell>Session ID</TableCell>
-                  <TableCell>User</TableCell>
+                  <TableCell>User ID</TableCell>
+                  <TableCell>Portal Type</TableCell>
                   <TableCell>Created At</TableCell>
-                  <TableCell>Last Updated</TableCell>
-                  <TableCell>Messages</TableCell>
+                  <TableCell>Updated At</TableCell>
+                  <TableCell>Message Count</TableCell>
                   <TableCell>Actions</TableCell>
                 </TableRow>
               </TableHead>
@@ -1220,10 +1234,29 @@ export default function AdminDashboard() {
                 ) : (
                   chatSessions.map((session) => (
                     <TableRow key={session.sessionId}>
-                      <TableCell>{session.sessionId}</TableCell>
-                      <TableCell>{session.userId}</TableCell>
-                      <TableCell>{new Date(session.createdAt).toLocaleString()}</TableCell>
-                      <TableCell>{new Date(session.updatedAt).toLocaleString()}</TableCell>
+                      <TableCell component="th" scope="row">
+                        <Tooltip title={session.sessionId}>
+                          <span>{`${session.sessionId.substring(0, 8)}...`}</span>
+                        </Tooltip>
+                      </TableCell>
+                      <TableCell>
+                        <Link to={`/profile/${session.userId}`} style={{ textDecoration: 'none' }}>
+                          {session.userId}
+                        </Link>
+                      </TableCell>
+                      <TableCell>
+                        {session.portalType ? (
+                          <Chip 
+                            label={session.portalType.charAt(0).toUpperCase() + session.portalType.slice(1)}
+                            color={session.portalType === 'customer' ? 'secondary' : 'primary'}
+                            size="small"
+                          />
+                        ) : (
+                          <Chip label="Partner" color="primary" size="small" />
+                        )}
+                      </TableCell>
+                      <TableCell>{format(new Date(session.createdAt), 'Pp')}</TableCell>
+                      <TableCell>{format(new Date(session.updatedAt), 'Pp')}</TableCell>
                       <TableCell>
                         <Chip 
                           label={session.messages?.length || 0} 

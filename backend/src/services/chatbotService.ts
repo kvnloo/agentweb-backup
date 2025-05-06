@@ -6,6 +6,7 @@ import path from 'path';
 import { getGuide } from '../controllers/guide';
 import { getReleases } from '../controllers/release';
 import { getApiDocs } from '../controllers/api';
+import { getUserGuide } from '../controllers/user-guide';
 import { Request, Response } from 'express';
 
 // Load environment variables from .env file
@@ -59,6 +60,7 @@ export interface ChatMessage {
       sources: string[];
     };
     timestamp: string;
+    portalType?: 'customer' | 'partner';
   };
 }
 
@@ -71,6 +73,7 @@ export interface ChatSession {
   updatedAt: string;
   pageContent?: string; // Full page content for storage
   contextChunks?: ContextChunk[]; // Chunked context for RAG
+  portalType?: 'customer' | 'partner'; // Added portalType to session
 }
 
 // Interface for context chunks
@@ -286,7 +289,7 @@ class ChatbotDB {
     this.tableName = `${TABLE_PREFIX}AW-ChatSessions`;
   }
 
-  async createChatSession(userId: string, pageContent?: string): Promise<ChatSession> {
+  async createChatSession(userId: string, pageContent?: string, portalType?: 'customer' | 'partner'): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
     
@@ -299,12 +302,14 @@ class ChatbotDB {
           content: systemMessage,
           metadata: {
             timestamp,
-            knowledgeBaseChunks: knowledgeBase.length
+            knowledgeBaseChunks: knowledgeBase.length,
+            portalType
           }
         }
       ],
       createdAt: timestamp,
-      updatedAt: timestamp
+      updatedAt: timestamp,
+      portalType
     };
 
     if (pageContent) {
@@ -517,7 +522,8 @@ async function loadKnowledgeBase(): Promise<void> {
   const endpoints = [
     { controller: getGuide, source: 'guide' },
     { controller: getReleases, source: 'release' },
-    { controller: getApiDocs, source: 'api' }
+    { controller: getApiDocs, source: 'api' },
+    { controller: getUserGuide, source: 'user-guide' }
   ];
 
   const chunks: ContextChunk[] = [];
@@ -548,11 +554,8 @@ async function loadKnowledgeBase(): Promise<void> {
       await endpoint.controller({} as Request, mockResponse as unknown as Response);
       
       if (mockResponse.data && mockResponse.data.success && mockResponse.data.data) {
-        // Process the API response data
         let content = '';
         
-        // Extract text content from the data structure
-        // The structure will depend on the specific API endpoint
         if (endpoint.source === 'guide' || endpoint.source === 'api') {
           // For guide and API endpoints that return sections
           for (const section of mockResponse.data.data) {
@@ -560,8 +563,24 @@ async function loadKnowledgeBase(): Promise<void> {
             for (const paragraph of section.content) {
               content += `${paragraph}\n`;
             }
-            
             // Process subsections if they exist
+            if (section.subsections) {
+              for (const subsection of section.subsections) {
+                content += `${subsection.title}\n`;
+                for (const paragraph of subsection.content) {
+                  content += `${paragraph}\n`;
+                }
+              }
+            }
+            content += '\n';
+          }
+        } else if (endpoint.source === 'user-guide') {
+          // For user-guide endpoint, structure is same as guide/api
+          for (const section of mockResponse.data.data) {
+            content += `${section.title}\n`;
+            for (const paragraph of section.content) {
+              content += `${paragraph}\n`;
+            }
             if (section.subsections) {
               for (const subsection of section.subsections) {
                 content += `${subsection.title}\n`;
@@ -582,6 +601,7 @@ async function loadKnowledgeBase(): Promise<void> {
             content += '\n';
           }
         }
+        // NOTE: No default 'else' case, so if source is unrecognized, 'content' remains empty.
         
         if (content) {
           // Split content into smaller chunks (max 2000 chars per chunk)
@@ -730,7 +750,8 @@ export async function generateChatResponse(
   sessionId: string,
   userMessage: string,
   currentUrl?: string,
-  pageContent?: string
+  pageContent?: string,
+  portalType: 'customer' | 'partner' = 'partner'
 ): Promise<string> {
   try {
     const timestamp = new Date().toISOString();
@@ -741,7 +762,8 @@ export async function generateChatResponse(
       pageContentLength: pageContent?.length,
       knowledgeBaseChunks: knowledgeBase.length,
       pageChunks: pageContent ? splitIntoChunks(pageContent).length : 0,
-      timestamp
+      timestamp,
+      portalType
     };
 
     await chatbotDb.addMessageToSession(sessionId, {
@@ -759,17 +781,30 @@ export async function generateChatResponse(
     // Get messages for OpenAI
     const messages = [...session.messages];
     let contextInfo = '';
-    
-    // Process page content if available
-    let combinedChunks: ContextChunk[] = [...knowledgeBase];
+
+    let activeKnowledgeBase: ContextChunk[];
+    let combinedChunks: ContextChunk[];
     let pageChunksCount = 0;
-    if (pageContent) {
-      const pageChunks = splitIntoChunks(pageContent);
-      pageChunksCount = pageChunks.length;
-      combinedChunks = [...pageChunks, ...knowledgeBase];
+
+    if (portalType === 'customer') {
+      activeKnowledgeBase = knowledgeBase.filter(chunk => chunk.metadata.source === 'user-guide');
+      combinedChunks = [...activeKnowledgeBase]; // Only user-guide for customers
+      // pageContent is ignored for RAG for customer portal
+    } else { // Partner portal (or default)
+      activeKnowledgeBase = knowledgeBase.filter(chunk => 
+        chunk.metadata.source === 'guide' || 
+        chunk.metadata.source === 'release' || 
+        chunk.metadata.source === 'api'
+      );
+      combinedChunks = [...activeKnowledgeBase]; // Start with partner-specific KB
+      if (pageContent) {
+        const pageChunksResult = splitIntoChunks(pageContent);
+        pageChunksCount = pageChunksResult.length;
+        combinedChunks = [...pageChunksResult, ...combinedChunks]; // Prepend page chunks for partner
+      }
     }
     
-    // RAG: Retrieve relevant chunks
+    // RAG: Retrieve relevant chunks from combinedChunks
     let retrievalErrorOccurred = false;
     let relevantChunksInfo: { count: number; sources: string[] } | undefined;
     try {
@@ -820,10 +855,11 @@ export async function generateChatResponse(
     const assistantMessageMetadata = {
       currentUrl,
       pageContentLength: pageContent?.length,
-      knowledgeBaseChunks: knowledgeBase.length,
+      knowledgeBaseChunks: activeKnowledgeBase.length,
       pageChunks: pageChunksCount,
       relevantChunks: relevantChunksInfo,
-      timestamp
+      timestamp,
+      portalType
     };
 
     await chatbotDb.addMessageToSession(sessionId, {
