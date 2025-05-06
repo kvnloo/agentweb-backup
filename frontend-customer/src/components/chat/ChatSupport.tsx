@@ -322,7 +322,7 @@ const ChatSupport: React.FC = () => {
       <div className="bg-[#7E69AB] text-white py-3 px-4 flex justify-between items-center shrink-0">
         <div className="flex items-center">
           <Bot className="mr-2 h-5 w-5" />
-          <h3 className="text-sm font-medium">Customer Support</h3>
+          <h3 className="text-sm font-medium">Emma</h3>
         </div>
         <div className="flex items-center gap-2">
           <Button
@@ -375,9 +375,9 @@ const ChatSupport: React.FC = () => {
 
         {displayMessages.length === 0 ? (
           <div className="text-center text-gray-500 mt-10">
-            <h4 className="text-base font-medium mb-2">How can I help you today?</h4>
+            <h4 className="text-base font-medium mb-2">Your 24/7 marketing operator.</h4>
             <p className="text-sm px-6">
-              I can provide <strong>guidance about using the Customer Portal</strong> and <strong>answer questions about your current page</strong>.
+              Ask Emma to run market research, plan and optimize campaigns, or track performance metrics.
             </p>
           </div>
         ) : (
@@ -399,7 +399,7 @@ const ChatSupport: React.FC = () => {
                     : <User className="h-4 w-4 mr-1.5 opacity-70" />
                   }
                   <span className="text-xs font-semibold tracking-wide">
-                    {msg.role === 'assistant' ? 'Support' : 'You'}
+                    {msg.role === 'assistant' ? 'Emma' : 'You'}
                   </span>
                 </div>
                 <div 
