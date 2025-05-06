@@ -135,8 +135,15 @@ export const googleCallback = async (
       process.env.JWT_SECRET || 'your-secret-key'
     );
 
-    // Pass token to callback
-    done(null, { token });
+    // Pass token and user details to callback
+    // This ensures the user object in the request will have all necessary properties
+    done(null, { 
+      token,
+      userId: user.userId,
+      email: user.email,
+      role: userRole,
+      isAdmin: user.isAdmin || false
+    });
   } catch (error) {
     console.error('Error in Google callback:', error);
     done(error);

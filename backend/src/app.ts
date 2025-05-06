@@ -19,6 +19,7 @@ const corsOptions = {
   origin: [
     'https://agentweb.pro',
     'http://localhost:5173', // Keep local development
+    'http://localhost:5174', // Added for customer frontend
     process.env.FRONTEND_URL || 'http://localhost:5173'
   ],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],

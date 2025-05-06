@@ -1,11 +1,15 @@
 import { useState } from "react";
-import { Link, useLocation } from "react-router-dom";
-import { Home, FileText, Settings, ChevronLeft, ChevronRight } from "lucide-react";
+import { Link, useLocation, useNavigate } from "react-router-dom";
+import { Home, FileText, Settings, ChevronLeft, ChevronRight, Bell } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { useAuth } from "@/contexts/AuthContext";
+import UserProfileDropdown from "./UserProfileDropdown";
 
 const Layout = ({ children }: { children: React.ReactNode }) => {
   const location = useLocation();
+  const navigate = useNavigate();
+  const { user } = useAuth();
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [activeItem, setActiveItem] = useState<string | null>(null);
 
@@ -125,6 +129,22 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
 
       {/* Main content */}
       <main className="flex-1 overflow-auto bg-white dark:bg-[#1A1F2C]">
+        {/* Header */}
+        <header className="border-b border-[#D6BCFA] bg-white dark:bg-white h-14 px-4 flex items-center justify-between">
+          <div className="flex items-center">
+            <h1 className="text-xl font-semibold text-gray-900 dark:text-gray-900">
+              {/* Dynamic title based on active item */}
+              {categories.flatMap(category => category.items).find(item => item.id === activeItem)?.label || "Dashboard"}
+            </h1>
+          </div>
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" size="icon" className="text-[#7E69AB]">
+              <Bell size={20} />
+            </Button>
+            <UserProfileDropdown />
+          </div>
+        </header>
+
         <div className="container mx-auto p-6">
           {children}
         </div>

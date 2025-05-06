@@ -7,10 +7,16 @@ declare global {
       email: string;
       accessToken?: string;
       token?: string;
+      role?: string;
+    }
+    
+    interface AuthInfo {
+      portal?: string;
     }
   }
 }
 
 export interface AuthRequest extends Request {
   user?: Express.User;
+  authInfo?: Express.AuthInfo;
 } 

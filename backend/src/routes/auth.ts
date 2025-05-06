@@ -47,10 +47,18 @@ router.post('/register', register);
 router.post('/login', login);
 
 // Google OAuth routes
-router.get('/google', passport.authenticate('google', {
-  scope: ['profile', 'email'],
-  session: false
-}));
+router.get('/google', (req, res, next) => {
+  // Create a state parameter to pass through the OAuth flow
+  const portalType = req.query.portal as string | undefined;
+  const state = portalType ? JSON.stringify({ portal: portalType }) : undefined;
+  
+  // Use the state in the passport authenticate call
+  passport.authenticate('google', {
+    scope: ['profile', 'email'],
+    session: false,
+    state
+  })(req, res, next);
+});
 
 router.get('/google/callback',
   passport.authenticate('google', { session: false }),
@@ -59,12 +67,44 @@ router.get('/google/callback',
     if (!req.user) {
       return res.status(401).json({ error: 'Authentication failed' });
     }
+    
+    // Extract portal type from the state parameter
+    let portalType: string | undefined;
+    const stateParam = req.query.state as string | undefined;
+    
+    if (stateParam) {
+      try {
+        const stateObj = JSON.parse(stateParam);
+        portalType = stateObj.portal;
+      } catch (e) {
+        console.error('Error parsing state parameter:', e);
+      }
+    }
+    
+    let frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+    
+    // If portal type is 'customer', redirect to customer frontend
+    if (portalType === 'customer') {
+      // Check if the user has the customer role
+      if (req.user.role !== 'customer') {
+        return res.status(403).json({
+          error: 'Access denied',
+          message: 'Only customer accounts can access the customer portal'
+        });
+      }
+      
+      // Use the customer frontend URL
+      frontendUrl = 'http://localhost:5174'; // Customer frontend URL
+    }
+    
     console.log('OAuth Callback - Redirecting to frontend:', {
-      frontendUrl: process.env.FRONTEND_URL || 'http://localhost:5173',
-      token: !!req.user.token || !!req.user.accessToken
+      frontendUrl,
+      token: !!req.user.token || !!req.user.accessToken,
+      portalType
     });
+    
     const token = req.user.accessToken || req.user.token;  // Try both possible token locations
-    res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/oauth-callback?token=${token}`);
+    res.redirect(`${frontendUrl}/oauth-callback?token=${token}`);
   }
 );
 
