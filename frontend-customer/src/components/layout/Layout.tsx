@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/contexts/AuthContext";
 import UserProfileDropdown from "./UserProfileDropdown";
+import ChatSupport from "../chat/ChatSupport";
 
 const Layout = ({ children }: { children: React.ReactNode }) => {
   const location = useLocation();
@@ -148,6 +149,9 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
         <div className="container mx-auto p-6">
           {children}
         </div>
+        
+        {/* Chat Support */}
+        <ChatSupport />
       </main>
     </div>
   );
