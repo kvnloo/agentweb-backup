@@ -53,10 +53,10 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
 
   return (
     <div className="flex min-h-screen bg-white dark:bg-[#1A1F2C]">
-      {/* Sidebar */}
+      {/* Sidebar (Left Nav) */}
       <aside 
         className={cn(
-          "flex flex-col border-r border-[#D6BCFA] bg-white dark:bg-white transition-all duration-300",
+          "flex flex-col border-r border-[#D6BCFA] bg-white dark:bg-white transition-all duration-300 shrink-0",
           isCollapsed ? "w-[60px]" : "w-[240px]"
         )}
       >
@@ -128,13 +128,12 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
         </div>
       </aside>
 
-      {/* Main content */}
-      <main className="flex-1 overflow-auto bg-white dark:bg-[#1A1F2C]">
+      {/* Main Content Area */}
+      <main className="flex-1 flex flex-col overflow-auto bg-gray-50 dark:bg-[#10141F]">
         {/* Header */}
-        <header className="border-b border-[#D6BCFA] bg-white dark:bg-white h-14 px-4 flex items-center justify-between">
+        <header className="border-b border-[#D6BCFA] bg-white dark:bg-white h-14 px-4 flex items-center justify-between shrink-0">
           <div className="flex items-center">
             <h1 className="text-xl font-semibold text-gray-900 dark:text-gray-900">
-              {/* Dynamic title based on active item */}
               {categories.flatMap(category => category.items).find(item => item.id === activeItem)?.label || "Dashboard"}
             </h1>
           </div>
@@ -146,13 +145,16 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
           </div>
         </header>
 
-        <div className="container mx-auto p-6">
+        {/* Page Children - make it scrollable independently */}
+        <div className="flex-1 container mx-auto p-6 overflow-y-auto">
           {children}
         </div>
-        
-        {/* Chat Support */}
-        <ChatSupport />
       </main>
+
+      {/* Right Chat Panel */}
+      <aside className="w-96 shrink-0 border-l border-[#D6BCFA] bg-white dark:bg-white flex flex-col">
+        <ChatSupport />
+      </aside>
     </div>
   );
 };

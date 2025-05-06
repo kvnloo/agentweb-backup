@@ -10,7 +10,7 @@ export const createChatSession = async (req: AuthenticatedRequest, res: Response
       return res.status(401).json({ error: 'User not authenticated' });
     }
 
-    const { pageContext } = req.body; // pageContext is for initial RAG, not portal type
+    const { pageContext, pageIdentifier } = req.body; // Extract pageIdentifier from body
     const portalQuery = req.query.portal as string | undefined;
 
     let portalType: 'customer' | 'partner' = 'partner'; // Default to partner
@@ -22,7 +22,12 @@ export const createChatSession = async (req: AuthenticatedRequest, res: Response
       console.warn(`Invalid portal type in createChatSession query: ${portalQuery}, defaulting to partner.`);
     }
 
-    const session = await chatbotDb.createChatSession(userId, pageContext, portalType);
+    // Validate pageIdentifier if needed (e.g., ensure it's a string)
+    if (pageIdentifier && typeof pageIdentifier !== 'string') {
+      return res.status(400).json({ error: 'Invalid pageIdentifier format' });
+    }
+
+    const session = await chatbotDb.createChatSession(userId, pageContext, portalType, pageIdentifier);
     
     res.status(201).json(session);
   } catch (error) {

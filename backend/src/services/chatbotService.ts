@@ -61,6 +61,7 @@ export interface ChatMessage {
     };
     timestamp: string;
     portalType?: 'customer' | 'partner';
+    pageIdentifier?: string;
   };
 }
 
@@ -74,6 +75,7 @@ export interface ChatSession {
   pageContent?: string; // Full page content for storage
   contextChunks?: ContextChunk[]; // Chunked context for RAG
   portalType?: 'customer' | 'partner'; // Added portalType to session
+  pageIdentifier?: string; // Added pageIdentifier for page-specific sessions
 }
 
 // Interface for context chunks
@@ -289,7 +291,7 @@ class ChatbotDB {
     this.tableName = `${TABLE_PREFIX}AW-ChatSessions`;
   }
 
-  async createChatSession(userId: string, pageContent?: string, portalType?: 'customer' | 'partner'): Promise<ChatSession> {
+  async createChatSession(userId: string, pageContent?: string, portalType?: 'customer' | 'partner', pageIdentifier?: string): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
     
@@ -299,29 +301,34 @@ class ChatbotDB {
       messages: [
         {
           role: 'system',
-          content: systemMessage,
+          content: systemMessage, // General system message
           metadata: {
             timestamp,
             knowledgeBaseChunks: knowledgeBase.length,
-            portalType
+            portalType,
+            pageIdentifier // Add pageIdentifier to initial system message metadata
           }
         }
       ],
       createdAt: timestamp,
       updatedAt: timestamp,
-      portalType
+      portalType, 
+      pageIdentifier // Store pageIdentifier at the session level
     };
 
     if (pageContent) {
-      chatSession.pageContent = pageContent;
+      chatSession.pageContent = pageContent; 
       chatSession.contextChunks = splitIntoChunks(pageContent);
+      // Optional: Add a more specific system message if pageContent and pageIdentifier are present
       chatSession.messages.push({
         role: 'system',
-        content: `The user is viewing a page within the AgentWeb platform. Use relevant information from the page content when answering their questions.`,
+        content: `Context initialized for page: ${pageIdentifier || 'current page'}. Use relevant information from the page content.`,
         metadata: {
           timestamp,
           pageContentLength: pageContent.length,
-          knowledgeBaseChunks: knowledgeBase.length
+          knowledgeBaseChunks: knowledgeBase.length,
+          portalType,
+          pageIdentifier
         }
       });
     }
