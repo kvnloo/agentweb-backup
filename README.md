@@ -210,12 +210,12 @@ npm run dev
 
 1. Install dependencies:
 ```bash
-cd frontend
+cd partner-portal
 npm install
 ```
 
 2. Configure environment variables:
-- Create a `.env` file in the `frontend` directory:
+- Create a `.env` file in the `partner-portal` directory:
 ```
 VITE_API_URL=http://localhost:3001
 ```
@@ -269,7 +269,7 @@ npm run create-admin
 │   │   ├── services/    # Database and business logic
 │   │   └── utils/       # Utility functions
 │   └── scripts/         # Database setup scripts
-└── frontend/
+└── partner-portal/
     └── src/
         ├── components/  # React components
         ├── contexts/    # React contexts
@@ -297,7 +297,7 @@ ADMIN_PASSWORD=your_admin_password
 ```
 
 Frontend Production:
-- Create a `.env` file in the `frontend` directory:
+- Create a `.env` file in the `partner-portal` directory:
 ```
 VITE_API_URL=https://agentweb.pro
 ```
@@ -312,7 +312,7 @@ VITE_API_URL=https://agentweb.pro
 
 1. Build the production version and create deployment package:
 ```bash
-cd frontend && \
+cd partner-portal && \
 VITE_API_URL=https://api.agentweb.pro \
 VITE_DEBUG=false \
 VITE_LIST_FULL_LLM_NAMES="azure->openai->gpt-4o,aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0,openai->openai->gpt-4o,aws->anthropic->us.anthropic.claude-3-7-sonnet-20250219-v1:0,google->google->gemini-2.0-flash,google->google->gemini-2.5-pro-preview-03-25" \
