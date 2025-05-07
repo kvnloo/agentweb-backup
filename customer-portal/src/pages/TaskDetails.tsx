@@ -1,0 +1,308 @@
+import React, { useEffect, useState, useRef } from 'react';
+import { useParams, useNavigate, Link } from 'react-router-dom';
+import axios from 'axios';
+import { useAuth } from '@/contexts/AuthContext';
+import { buildApiUrl } from '@/config';
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Loader2, AlertCircle, Play, CheckCircle, RotateCcw, Clock } from 'lucide-react';
+import { toast } from "@/components/ui/use-toast";
+
+// Define Execution Status type
+type ExecutionStatus = 'pending' | 'running' | 'completed' | 'failed' | 'queued';
+
+// Define Execution interface
+interface Execution {
+  executionId: string;
+  status: ExecutionStatus;
+  startedAt?: string;
+  completedAt?: string;
+  resultSummary?: string;
+  resultLink?: string; // Link to full results if applicable
+  error?: string; // Error message if failed
+}
+
+// Update TaskDetail interface
+interface TaskDetail extends Task {
+  parameterValues?: Record<string, string>;
+  executions?: Execution[]; // Use the defined Execution interface
+  resultSummary?: string; // Overall task result summary might still be useful
+  resultLink?: string;    // Overall task result link
+}
+
+// Base Task interface (can be moved to a shared types file)
+interface Task {
+  taskId: string;
+  name: string;
+  status: ExecutionStatus | 'archived'; // Use ExecutionStatus here too
+  createdAt: string;
+  updatedAt?: string;
+  prompt?: string;
+}
+
+// Helper to get status badge variant (can be moved to utils)
+const getExecutionStatusBadge = (status?: ExecutionStatus) => {
+  if (!status) return <Badge variant="secondary">Unknown</Badge>;
+  switch (status) {
+    case 'completed':
+      return <Badge className="bg-green-100 text-green-800 border-green-200 hover:bg-green-200"><CheckCircle className="h-3 w-3 mr-1" /> Completed</Badge>;
+    case 'running':
+      return <Badge className="bg-blue-100 text-blue-800 border-blue-200 hover:bg-blue-200"><RotateCcw className="h-3 w-3 mr-1 animate-spin" /> Running</Badge>;
+    case 'failed':
+      return <Badge className="bg-red-100 text-red-800 border-red-200 hover:bg-red-200"><AlertCircle className="h-3 w-3 mr-1" /> Failed</Badge>;
+    case 'queued':
+    case 'pending':
+      return <Badge className="bg-gray-100 text-gray-800 border-gray-200 hover:bg-gray-200"><Clock className="h-3 w-3 mr-1" /> Queued</Badge>; 
+    default:
+      return <Badge variant="secondary">{status}</Badge>; 
+  }
+};
+
+// Helper for Task status (might differ slightly, e.g., no spin for task pending)
+const getTaskStatusBadge = (status: Task['status']) => {
+  if (status === 'archived') return <Badge variant="outline">Archived</Badge>;
+  // Use execution badge for other statuses, but maybe without spin for pending?
+  if (status === 'running') return getExecutionStatusBadge(status);
+  if (status === 'pending' || status === 'queued') return <Badge className="bg-gray-100 text-gray-800 border-gray-200 hover:bg-gray-200"><Clock className="h-3 w-3 mr-1" /> Queued</Badge>; 
+  return getExecutionStatusBadge(status as ExecutionStatus); // Reuse logic for completed/failed
+};
+
+// Helper function for formatting dates (can be moved to utils later)
+const formatDate = (dateStr?: string) => {
+  if (!dateStr) return 'N/A';
+  try {
+    return new Date(dateStr).toLocaleString();
+  } catch (e) {
+    return 'Invalid Date';
+  }
+};
+
+const TaskDetailsPage: React.FC = () => {
+  const { taskId } = useParams<{ taskId: string }>();
+  const { token } = useAuth();
+  const navigate = useNavigate();
+  const [task, setTask] = useState<TaskDetail | null>(null);
+  const [executions, setExecutions] = useState<Execution[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [isRunning, setIsRunning] = useState(false);
+
+  // Refs to hold the latest state for the interval callback
+  const executionsRef = useRef<Execution[]>(executions);
+  const taskRef = useRef<TaskDetail | null>(task);
+
+  // Update refs whenever state changes
+  useEffect(() => {
+    executionsRef.current = executions;
+  }, [executions]);
+
+  useEffect(() => {
+    taskRef.current = task;
+  }, [task]);
+
+  const fetchTaskAndExecutions = async () => {
+    if (!token || !taskId) {
+      setError("Task ID or authentication token missing.");
+      setLoading(false);
+      return;
+    }
+    // Only set initial loading true
+    if (!taskRef.current) { // Check ref instead of state
+      setLoading(true);
+    }
+    setError(null);
+    try {
+      const taskResponse = await axios.get(buildApiUrl(`/api/tasks/${taskId}`), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const taskData = taskResponse.data as TaskDetail;
+      setTask(taskData); // This triggers the taskRef update effect
+
+      const executionsResponse = await axios.get(buildApiUrl(`/api/tasks/${taskId}/executions`), {
+         headers: { Authorization: `Bearer ${token}` },
+      });
+      const sortedExecutions = (executionsResponse.data as Execution[]).sort((a, b) => 
+        new Date(b.startedAt || 0).getTime() - new Date(a.startedAt || 0).getTime()
+      );
+      setExecutions(sortedExecutions); // This triggers the executionsRef update effect
+
+    } catch (err: any) {
+      console.error("Failed to fetch task data:", err);
+      setError(err.response?.data?.message || "Failed to load task data.");
+      setTask(null);
+      setExecutions([]);
+    } finally {
+      // Ensure loading is false even if initial check was skipped
+      setLoading(false); 
+    }
+  };
+
+  useEffect(() => {
+    fetchTaskAndExecutions(); // Initial fetch
+    
+    const intervalId = setInterval(() => {
+      // Read latest state from refs inside the interval
+      const currentExecutions = executionsRef.current;
+      const latestExecution = currentExecutions.length > 0 ? currentExecutions[0] : null;
+      
+      const shouldPoll = latestExecution && 
+                         ['running', 'pending', 'queued'].includes(latestExecution.status);
+
+      if (shouldPoll) {
+        console.log('Polling: Latest execution is active (via ref), fetching updates...');
+        fetchTaskAndExecutions(); 
+      }
+    }, 5000); 
+
+    return () => clearInterval(intervalId);
+  }, [taskId, token]); // Keep dependencies minimal
+
+  const handleRunTask = async () => {
+    if (!token || !taskId) {
+      toast({ title: "Error", description: "Cannot run task. Missing ID or token.", variant: "destructive" });
+      return;
+    }
+    setIsRunning(true);
+    try {
+      await axios.post(buildApiUrl(`/api/tasks/${taskId}/execute`), {}, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      toast({ title: "Success", description: "Task execution started." });
+      fetchTaskAndExecutions(); 
+    } catch (err: any) {
+      console.error("Failed to run task:", err);
+      toast({ 
+        title: "Error Running Task", 
+        description: err.response?.data?.message || "Could not start task execution.",
+        variant: "destructive" 
+      });
+    } finally {
+      setIsRunning(false);
+    }
+  };
+
+  if (loading && !task) {
+     return <div className="flex justify-center items-center h-64"><Loader2 className="h-8 w-8 animate-spin text-primary" /></div>;
+  }
+
+  if (error || !task) {
+    return (
+      <Alert variant="destructive">
+        <AlertCircle className="h-4 w-4" />
+        <AlertTitle>Error Loading Task</AlertTitle>
+        <AlertDescription>{error || "Task not found."}</AlertDescription>
+      </Alert>
+    );
+  }
+
+  return (
+    <div className="container mx-auto py-8 space-y-6">
+      <Button variant="outline" size="sm" onClick={() => navigate('/tasks')} >
+        &larr; Back to Tasks
+      </Button>
+
+      <Card>
+        <CardHeader>
+          <div className="flex justify-between items-start gap-2">
+            <CardTitle className="text-2xl font-bold">{task.name}</CardTitle>
+            {getTaskStatusBadge(task.status)} 
+          </div>
+          <CardDescription>
+            Task ID: {task.taskId} | Created: {formatDate(task.createdAt)}
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {task.prompt && (
+            <div>
+              <h3 className="font-semibold mb-1">Prompt:</h3>
+              <p className="text-sm bg-gray-50 dark:bg-gray-800 p-3 rounded whitespace-pre-wrap font-mono">
+                {task.prompt}
+              </p>
+            </div>
+          )}
+          <div className="pt-4 border-t">
+            {(() => { 
+              const latestExecution = executions.length > 0 ? executions[0] : null;
+              const isTaskActive = ['running', 'pending', 'queued'].includes(task.status);
+              const isLatestExecutionActive = latestExecution && ['running', 'pending', 'queued'].includes(latestExecution.status);
+              const isDisabled = isRunning || isTaskActive || isLatestExecutionActive;
+              
+              return (
+                <>
+                  <Button 
+                    onClick={handleRunTask} 
+                    disabled={isDisabled}
+                  >
+                    {isRunning ? (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" /> 
+                    ) : (
+                      <Play className="mr-2 h-4 w-4" />
+                    )}
+                    Run Task
+                  </Button>
+                  {isDisabled && !isRunning && (
+                    <p className="text-xs text-muted-foreground mt-1">
+                      {isTaskActive 
+                        ? "Task is currently running or queued."
+                        : isLatestExecutionActive 
+                        ? "The latest execution is currently running or queued."
+                        : ""} 
+                    </p>
+                  )}
+                </>
+              );
+            })()}
+          </div>
+        </CardContent>
+      </Card>
+
+      <div>
+        <h2 className="text-2xl font-semibold mb-4">Executions</h2>
+        {executions && executions.length > 0 ? (
+          <div className="space-y-4">
+            {executions.map((exec) => (
+              <Card key={exec.executionId} className="bg-slate-50 dark:bg-slate-800/50">
+                <CardHeader className="pb-2">
+                  <div className="flex justify-between items-center gap-2">
+                    <CardDescription>Execution ID: {exec.executionId}</CardDescription>
+                    {getExecutionStatusBadge(exec.status)} 
+                  </div>
+                </CardHeader>
+                <CardContent className="space-y-1 text-sm">
+                  {exec.startedAt && (
+                    <p>Started: {formatDate(exec.startedAt)}</p>
+                  )}
+                  {exec.completedAt && (
+                    <p>Completed: {formatDate(exec.completedAt)}</p>
+                  )}
+                  {exec.status === 'failed' && exec.error && (
+                    <Alert variant="destructive" className="mt-2 p-2 text-xs">
+                      <AlertCircle className="h-3 w-3" />
+                      <AlertDescription>{exec.error}</AlertDescription>
+                    </Alert>
+                  )}
+                  {exec.resultSummary && (
+                    <p className="pt-2 mt-2 border-t border-dashed">Summary: {exec.resultSummary}</p>
+                  )}
+                  {exec.resultLink && (
+                    <Button variant="link" size="sm" asChild className="p-0 h-auto mt-1">
+                      <Link to={exec.resultLink} target="_blank" rel="noopener noreferrer">
+                        View Full Result
+                      </Link>
+                    </Button>
+                  )}
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+        ) : (
+          <p className="text-muted-foreground">No executions found for this task.</p>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default TaskDetailsPage; 

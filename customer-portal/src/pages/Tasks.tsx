@@ -6,6 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { Badge } from '@/components/ui/badge';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Loader2, AlertCircle } from 'lucide-react';
+import { Link } from 'react-router-dom';
 
 // Define the Task interface based on expected backend structure
 interface Task {
@@ -97,31 +98,31 @@ const TasksPage: React.FC = () => {
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
           {tasks.map((task) => (
-            <Card key={task.taskId} className="hover:shadow-lg transition-shadow duration-200">
-              <CardHeader>
-                <CardTitle className="text-xl truncate" title={task.name}>{task.name}</CardTitle>
-                <Badge variant={getStatusBadgeVariant(task.status)} className="capitalize">
-                  {task.status}
-                </Badge>
-              </CardHeader>
-              <CardContent>
-                <p className="text-sm text-muted-foreground mb-1">
-                  Created: {new Date(task.createdAt).toLocaleDateString()} {new Date(task.createdAt).toLocaleTimeString()}
-                </p>
-                {task.updatedAt && task.status !== 'running' && task.status !== 'pending' && task.status !== 'queued' && (
-                  <p className="text-sm text-muted-foreground">
-                    Last Updated: {new Date(task.updatedAt).toLocaleDateString()} {new Date(task.updatedAt).toLocaleTimeString()}
+            <Link to={`/tasks/${task.taskId}`} key={task.taskId} className="no-underline">
+              <Card className="hover:shadow-lg transition-shadow duration-200 h-full flex flex-col">
+                <CardHeader>
+                  <CardTitle className="text-xl truncate" title={task.name}>{task.name}</CardTitle>
+                  <Badge variant={getStatusBadgeVariant(task.status)} className="capitalize w-fit">
+                    {task.status}
+                  </Badge>
+                </CardHeader>
+                <CardContent className="flex-grow">
+                  <p className="text-sm text-muted-foreground mb-1">
+                    Created: {new Date(task.createdAt).toLocaleDateString()} {new Date(task.createdAt).toLocaleTimeString()}
                   </p>
-                )}
-                {task.prompt && (
-                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-2 line-clamp-2" title={task.prompt}>
-                        <strong>Prompt:</strong> {task.prompt}
+                  {task.updatedAt && task.status !== 'running' && task.status !== 'pending' && task.status !== 'queued' && (
+                    <p className="text-sm text-muted-foreground">
+                      Last Updated: {new Date(task.updatedAt).toLocaleDateString()} {new Date(task.updatedAt).toLocaleTimeString()}
                     </p>
-                )}
-                {/* Future: Add button for View Details -> opens a modal or navigates */}
-                {/* <Button variant="outline" size="sm" className="mt-4 w-full">View Details</Button> */}
-              </CardContent>
-            </Card>
+                  )}
+                  {task.prompt && (
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-2 pt-2 border-t line-clamp-3" title={task.prompt}>
+                          {task.prompt}
+                      </p>
+                  )}
+                </CardContent>
+              </Card>
+            </Link>
           ))}
         </div>
       )}

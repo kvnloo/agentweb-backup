@@ -7,13 +7,13 @@ import Layout from "@/components/layout/Layout";
 import Dashboard from "@/pages/Dashboard";
 import Settings from "@/pages/Settings";
 import NotFound from "@/pages/NotFound";
-import MarketResearchReport from "@/pages/MarketResearchReport";
 import Login from "@/pages/Login";
 import Register from "@/pages/Register";
 import OAuthCallback from "@/pages/OAuthCallback";
 import ProtectedRoute from "@/components/auth/ProtectedRoute";
 import { AuthProvider } from "@/contexts/AuthContext";
 import TasksPage from "@/pages/Tasks.tsx";
+import TaskDetailsPage from "@/pages/TaskDetails.tsx";
 
 const queryClient = new QueryClient();
 
@@ -52,10 +52,10 @@ const App = () => (
                 </Layout>
               </ProtectedRoute>
             } />
-            <Route path="/market-research-report" element={
+            <Route path="/tasks/:taskId" element={
               <ProtectedRoute>
                 <Layout>
-                  <MarketResearchReport />
+                  <TaskDetailsPage />
                 </Layout>
               </ProtectedRoute>
             } />
