@@ -32,7 +32,9 @@ import {
   InputLabel,
   MenuItem,
   Select,
-  SelectChangeEvent
+  SelectChangeEvent,
+  FormControlLabel,
+  Checkbox
 } from '@mui/material';
 import { format } from 'date-fns';
 import { Link } from 'react-router-dom';
@@ -42,7 +44,11 @@ import { buildApiUrl } from '../config';
 import DOMPurify from 'dompurify';
 import {
   Info as InfoIcon,
-  Close as CloseIcon
+  Close as CloseIcon,
+  Handshake as HandshakeIcon,
+  Person as PersonIcon,
+  Edit as EditIcon,
+  PersonOff as PersonOffIcon
 } from '@mui/icons-material';
 
 interface TabPanelProps {
@@ -99,6 +105,33 @@ interface AdminChatSession {
   contextChunks?: any[];
   portalType?: 'customer' | 'partner';
   // Add other fields if the backend sends more for the session list
+}
+
+interface User {
+  userId: string;
+  email: string;
+  isAdmin: boolean;
+  isActive: boolean;
+  createdAt: string;
+  role?: 'partner' | 'customer'; // For single role from API
+  roles?: ('partner' | 'customer')[];
+  taskCount?: number;
+  workflowCount?: number;
+  isOAuthUser?: boolean; // Ensured from API structure
+}
+
+// Define an interface for the task data shown in the admin tasks tab
+interface AdminTask {
+  taskId: string;
+  name: string;
+  prompt: string;
+  userId: string;
+  createdAt: string;
+  latestRunStatus?: string;
+  latestRunTime?: string | null;
+  completedRuns?: number;
+  totalRuns?: number;
+  [key: string]: any; // Allow other properties if necessary
 }
 
 const ChatDialog = ({ session, open, onClose }: { session: any; open: boolean; onClose: () => void }) => {
@@ -278,21 +311,21 @@ export default function AdminDashboard() {
   const [tabValue, setTabValue] = useState(0);
   const [startDate, setStartDate] = useState<Date | null>(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000));
   const [endDate, setEndDate] = useState<Date | null>(new Date());
-  const [tasks, setTasks] = useState<any[]>([]);
-  const [orderBy, setOrderBy] = useState<keyof any>('latestRunTime');
+  const [tasks, setTasks] = useState<AdminTask[]>([]);
+  const [orderBy, setOrderBy] = useState<string>('latestRunTime');
   const [order, setOrder] = useState<'asc' | 'desc'>('desc');
   const [message, setMessage] = useState('');
   const [title, setTitle] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
-  const [selectedUser, setSelectedUser] = useState<any>(null);
+  const [selectedUser, setSelectedUser] = useState<User | null>(null);
   const [deactivateDialogOpen, setDeactivateDialogOpen] = useState(false);
   const [chatSessions, setChatSessions] = useState<AdminChatSession[]>([]);
   const [selectedSession, setSelectedSession] = useState<AdminChatSession | null>(null);
   const [chatDialogOpen, setChatDialogOpen] = useState(false);
   const [roleDialogOpen, setRoleDialogOpen] = useState(false);
-  const [selectedUserRole, setSelectedUserRole] = useState<string>('');
+  const [selectedUserRoles, setSelectedUserRoles] = useState<('partner' | 'customer')[]>([]);
   const { token } = useAuth();
   
   const {
@@ -306,7 +339,7 @@ export default function AdminDashboard() {
     updateWaitlistStatus,
     loading: adminLoading,
     error: adminError,
-    setUsers
+    setUsers: setContextUsers,
   } = useAdmin();
 
   useEffect(() => {
@@ -337,7 +370,7 @@ export default function AdminDashboard() {
             }
           }
         );
-        setTasks(response.data);
+        setTasks(response.data as AdminTask[]);
       } catch (error) {
         console.error('Error loading tasks:', error);
       }
@@ -406,42 +439,34 @@ export default function AdminDashboard() {
     }
   };
 
-  const handleSort = (property: keyof any) => {
+  const handleSort = (property: string) => {
     const isAsc = orderBy === property && order === 'asc';
     setOrder(isAsc ? 'desc' : 'asc');
     setOrderBy(property);
   };
 
-  const sortedTasks = React.useMemo(() => {
+  const sortedAdminTasks = React.useMemo(() => {
     return [...tasks].sort((a, b) => {
+      const aVal = a[orderBy];
+      const bVal = b[orderBy];
+
       if (orderBy === 'createdAt' || orderBy === 'latestRunTime') {
-        // For date fields, handle null values and sort by date
-        const aValue = a[orderBy] ? new Date(a[orderBy]).getTime() : 0;
-        const bValue = b[orderBy] ? new Date(b[orderBy]).getTime() : 0;
-        
-        return order === 'asc' 
-          ? aValue - bValue
-          : bValue - aValue;
+        const aDate = aVal ? new Date(aVal).getTime() : 0;
+        const bDate = bVal ? new Date(bVal).getTime() : 0;
+        return order === 'asc' ? aDate - bDate : bDate - aDate;
       } else if (orderBy === 'completedRuns') {
-        // For completedRuns, sort by completion ratio
-        const aRatio = a.totalRuns > 0 ? (a.completedRuns / a.totalRuns) : 0;
-        const bRatio = b.totalRuns > 0 ? (b.completedRuns / b.totalRuns) : 0;
-        
-        return order === 'asc'
-          ? aRatio - bRatio
-          : bRatio - aRatio;
+        const aRatio = a.totalRuns && a.totalRuns > 0 ? (a.completedRuns || 0) / a.totalRuns : 0;
+        const bRatio = b.totalRuns && b.totalRuns > 0 ? (b.completedRuns || 0) / b.totalRuns : 0;
+        return order === 'asc' ? aRatio - bRatio : bRatio - aRatio;
       }
       
-      const aValue = a[orderBy]?.toString().toLowerCase() ?? '';
-      const bValue = b[orderBy]?.toString().toLowerCase() ?? '';
-      
-      return order === 'asc'
-        ? aValue.localeCompare(bValue)
-        : bValue.localeCompare(aValue);
+      const aStr = String(aVal ?? '').toLowerCase();
+      const bStr = String(bVal ?? '').toLowerCase();
+      return order === 'asc' ? aStr.localeCompare(bStr) : bStr.localeCompare(aStr);
     });
   }, [tasks, order, orderBy]);
 
-  const SortLabel = ({ property, label }: { property: keyof any; label: string }) => (
+  const SortLabel = ({ property, label }: { property: string; label: string }) => (
     <Box
       sx={{
         display: 'flex',
@@ -543,13 +568,24 @@ export default function AdminDashboard() {
     setChatDialogOpen(true);
   };
 
-  const handleRoleChange = (event: SelectChangeEvent) => {
-    setSelectedUserRole(event.target.value as string);
+  const handleRoleCheckboxChange = (role: 'partner' | 'customer') => {
+    setSelectedUserRoles(prevRoles => 
+      prevRoles.includes(role)
+        ? prevRoles.filter(r => r !== role)
+        : [...prevRoles, role]
+    );
   };
 
-  const handleRoleDialogOpen = (user: any) => {
+  const handleRoleDialogOpen = (user: User) => {
     setSelectedUser(user);
-    setSelectedUserRole(user.role || 'partner');
+    // Initialize roles for the dialog based on user.roles, then user.role, then default to ['partner']
+    if (user.roles && user.roles.length > 0) {
+      setSelectedUserRoles(user.roles);
+    } else if (user.role) {
+      setSelectedUserRoles([user.role]);
+    } else {
+      setSelectedUserRoles(['partner']); // Default for dialog if no role specified
+    }
     setRoleDialogOpen(true);
   };
 
@@ -562,25 +598,19 @@ export default function AdminDashboard() {
       setLoading(true);
       setError('');
       
-      const response = await axios.put(
+      await axios.put(
         buildApiUrl(`/api/admin/users/${selectedUser?.userId}/role`),
-        { role: selectedUserRole },
+        { roles: selectedUserRoles },
         { headers: { Authorization: `Bearer ${token}` } }
       );
       
-      // Update user list
-      const updatedUsers = users.map(user => 
-        user.userId === selectedUser?.userId 
-          ? { ...user, role: selectedUserRole, isAdmin: selectedUserRole === 'admin' } 
-          : user
-      );
+      await loadUsers();
       
-      setUsers(updatedUsers);
-      setSuccess('User role updated successfully');
+      setSuccess('User roles updated successfully');
       setRoleDialogOpen(false);
     } catch (err) {
-      console.error('Error updating user role:', err);
-      setError('Failed to update user role. Please try again.');
+      console.error('Error updating user roles:', err);
+      setError('Failed to update user roles. Please try again.');
     } finally {
       setLoading(false);
     }
@@ -859,7 +889,7 @@ export default function AdminDashboard() {
                 <TableRow>
                   <TableCell>Email</TableCell>
                   <TableCell>Created</TableCell>
-                  <TableCell>Role</TableCell>
+                  <TableCell>Roles</TableCell>
                   <TableCell>Tasks</TableCell>
                   <TableCell>Workflows</TableCell>
                   <TableCell>OAuth User</TableCell>
@@ -876,62 +906,85 @@ export default function AdminDashboard() {
                     </TableCell>
                   </TableRow>
                 ) : (
-                  users.map((user) => (
-                    <TableRow key={user.userId}>
-                      <TableCell>{user.email}</TableCell>
-                      <TableCell>{new Date(user.createdAt).toLocaleDateString()}</TableCell>
-                      <TableCell>
-                        <Chip 
-                          label={user.role || 'partner'}
-                          color={
-                            user.role === 'customer' ? 'success' :
-                            'primary' // Default to primary (partner) color
-                          }
-                          size="small"
-                          onClick={() => handleRoleDialogOpen(user)}
-                          sx={{ cursor: 'pointer' }}
-                        />
-                      </TableCell>
-                      <TableCell>
-                        <Chip 
-                          label={user.taskCount || 0} 
-                          size="small"
-                          color={user.taskCount > 0 ? 'primary' : 'default'}
-                        />
-                      </TableCell>
-                      <TableCell>
-                        <Chip 
-                          label={user.workflowCount || 0} 
-                          size="small"
-                          color={user.workflowCount > 0 ? 'primary' : 'default'}
-                        />
-                      </TableCell>
-                      <TableCell>{user.isOAuthUser ? 'Yes' : 'No'}</TableCell>
-                      <TableCell>{user.isAdmin ? 'Yes' : 'No'}</TableCell>
-                      <TableCell>
-                        <Chip 
-                          label={user.isActive === false ? 'Inactive' : 'Active'} 
-                          color={user.isActive === false ? 'error' : 'success'}
-                          size="small"
-                        />
-                      </TableCell>
-                      <TableCell>
-                        {!user.isAdmin && user.isActive !== false && (
-                          <Button
-                            variant="outlined"
-                            color="error"
+                  users.map((user) => {
+                    // Determine roles to display, defaulting non-admins to ['partner'] if no roles assigned
+                    const displayRoles = user.roles && user.roles.length > 0 
+                      ? user.roles 
+                      : !user.isAdmin ? ['partner'] : [];
+                    
+                    return (
+                      <TableRow key={user.userId}>
+                        <TableCell>{user.email}</TableCell>
+                        <TableCell>{new Date(user.createdAt).toLocaleDateString()}</TableCell>
+                        <TableCell>
+                          <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
+                            {displayRoles.map((role: 'partner' | 'customer') => (
+                              <Chip
+                                key={role}
+                                label={role.charAt(0).toUpperCase() + role.slice(1)}
+                                size="small"
+                                color={role === 'partner' ? 'primary' : 'secondary'}
+                                icon={role === 'partner' ? <HandshakeIcon fontSize="small"/> : <PersonIcon fontSize="small"/>}
+                                sx={{ 
+                                  height: 'auto', // Ensure icon doesn't overly stretch chip
+                                  '& .MuiChip-label': { py: '1px' } // Adjust padding if needed
+                                }}
+                              />
+                            ))}
+                          </Box>
+                        </TableCell>
+                        <TableCell>
+                          <Chip 
+                            label={user.taskCount || 0} 
                             size="small"
-                            onClick={() => {
-                              setSelectedUser(user);
-                              setDeactivateDialogOpen(true);
-                            }}
-                          >
-                            Deactivate
-                          </Button>
-                        )}
-                      </TableCell>
-                    </TableRow>
-                  ))
+                            color={user.taskCount > 0 ? 'primary' : 'default'}
+                          />
+                        </TableCell>
+                        <TableCell>
+                          <Chip 
+                            label={user.workflowCount || 0} 
+                            size="small"
+                            color={user.workflowCount > 0 ? 'primary' : 'default'}
+                          />
+                        </TableCell>
+                        <TableCell>{user.isOAuthUser ? 'Yes' : 'No'}</TableCell>
+                        <TableCell>{user.isAdmin ? 'Yes' : 'No'}</TableCell>
+                        <TableCell>
+                          <Chip 
+                            label={user.isActive === false ? 'Inactive' : 'Active'} 
+                            color={user.isActive === false ? 'error' : 'success'}
+                            size="small"
+                          />
+                        </TableCell>
+                        <TableCell>
+                          <Box sx={{ display: 'flex', gap: 1 }}>
+                            <Button
+                              variant="outlined"
+                              size="small"
+                              onClick={() => handleRoleDialogOpen(user)}
+                              startIcon={<EditIcon />}
+                            >
+                              Manage Roles
+                            </Button>
+                            {!user.isAdmin && user.isActive !== false && (
+                              <Button
+                                variant="outlined"
+                                color="error"
+                                size="small"
+                                onClick={() => {
+                                  setSelectedUser(user);
+                                  setDeactivateDialogOpen(true);
+                                }}
+                                startIcon={<PersonOffIcon />}
+                              >
+                                Deactivate
+                              </Button>
+                            )}
+                          </Box>
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })
                 )}
               </TableBody>
             </Table>
@@ -1148,7 +1201,7 @@ export default function AdminDashboard() {
                     </TableCell>
                   </TableRow>
                 ) : (
-                  sortedTasks.map((task) => (
+                  sortedAdminTasks.map((task) => (
                     <TableRow key={task.taskId}>
                       <TableCell>{task.taskId}</TableCell>
                       <TableCell>{task.name}</TableCell>
@@ -1178,9 +1231,9 @@ export default function AdminDashboard() {
                       </TableCell>
                       <TableCell>
                         {task.completedRuns || 0}/{task.totalRuns || 0}
-                        {task.totalRuns > 0 && (
+                        {task.totalRuns != null && task.totalRuns > 0 && (
                           <Box component="span" sx={{ ml: 1 }}>
-                            ({Math.round((task.completedRuns / task.totalRuns) * 100)}%)
+                            ({Math.round(((task.completedRuns || 0) / task.totalRuns) * 100)}%)
                           </Box>
                         )}
                       </TableCell>
@@ -1321,31 +1374,31 @@ export default function AdminDashboard() {
 
       {/* Add Role Dialog */}
       <Dialog open={roleDialogOpen} onClose={handleRoleDialogClose}>
-        <DialogTitle>Update User Role</DialogTitle>
+        <DialogTitle>Update User Roles</DialogTitle>
         <DialogContent>
-          <Box sx={{ mt: 2 }}>
-            <Typography variant="body1" gutterBottom>
-              Update role for user: <strong>{selectedUser?.email}</strong>
-            </Typography>
-            <FormControl fullWidth sx={{ mt: 2 }}>
-              <InputLabel id="role-select-label">Role</InputLabel>
-              <Select
-                labelId="role-select-label"
-                value={selectedUserRole}
-                label="Role"
-                onChange={handleRoleChange}
-              >
-                <MenuItem value="partner">Partner</MenuItem>
-                <MenuItem value="customer">Customer</MenuItem>
-              </Select>
-            </FormControl>
-            <Typography variant="body2" color="text.secondary" sx={{ mt: 2 }}>
-              <strong>Role access:</strong><br />
-              - Admin: Controlled by admin flag, not role<br />
-              - Partner (Default): Access to agent features (tasks, workflows)<br />
-              - Customer: Access to marketing features only
-            </Typography>
-          </Box>
+          <DialogContentText sx={{ mb: 2 }}>
+            Select roles for user: {selectedUser?.email}
+          </DialogContentText>
+          <FormControlLabel
+            control={
+              <Checkbox
+                checked={selectedUserRoles.includes('partner')}
+                onChange={() => handleRoleCheckboxChange('partner')}
+                name="partnerRole"
+              />
+            }
+            label="Partner Portal Access"
+          />
+          <FormControlLabel
+            control={
+              <Checkbox
+                checked={selectedUserRoles.includes('customer')}
+                onChange={() => handleRoleCheckboxChange('customer')}
+                name="customerRole"
+              />
+            }
+            label="Customer Portal Access"
+          />
         </DialogContent>
         <DialogActions>
           <Button onClick={handleRoleDialogClose}>Cancel</Button>
@@ -1355,7 +1408,7 @@ export default function AdminDashboard() {
             color="primary"
             disabled={loading}
           >
-            {loading ? <CircularProgress size={24} /> : 'Update Role'}
+            {loading ? <CircularProgress size={24} /> : 'Update Roles'}
           </Button>
         </DialogActions>
       </Dialog>

@@ -6,14 +6,15 @@ import { Box, CircularProgress, Typography, Alert } from '@mui/material';
 export default function OAuthCallback() {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
-  const { setToken } = useAuth();
-  const [error, setError] = useState<string | null>(null);
+  const { setToken, loginError, clearLoginError } = useAuth();
+  const [processingError, setProcessingError] = useState<string | null>(null);
 
   useEffect(() => {
+    clearLoginError();
     const handleOAuthCallback = async () => {
       const token = searchParams.get('token');
       if (!token) {
-        setError('No authentication token received');
+        setProcessingError('No authentication token received. Redirecting to login...');
         setTimeout(() => navigate('/login'), 3000);
         return;
       }
@@ -21,15 +22,17 @@ export default function OAuthCallback() {
       try {
         await setToken(token);
         navigate('/tasks');
-      } catch (error) {
-        console.error('Error in OAuth callback:', error);
-        setError('Failed to complete authentication');
+      } catch (error: any) {
+        console.error('Error in OAuth callback:', error.message);
+        if (!loginError) {
+          setProcessingError(error.message || 'Failed to complete authentication. Redirecting to login...');
+        }
         setTimeout(() => navigate('/login'), 3000);
       }
     };
 
     handleOAuthCallback();
-  }, [searchParams, navigate, setToken]);
+  }, [searchParams, navigate, setToken, clearLoginError]);
 
   return (
     <Box
@@ -42,9 +45,13 @@ export default function OAuthCallback() {
         gap: 2
       }}
     >
-      {error ? (
+      {loginError ? (
         <Alert severity="error" sx={{ mb: 2 }}>
-          {error}
+          {loginError}
+        </Alert>
+      ) : processingError ? (
+        <Alert severity="error" sx={{ mb: 2 }}>
+          {processingError}
         </Alert>
       ) : (
         <>

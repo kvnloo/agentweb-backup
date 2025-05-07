@@ -24,7 +24,7 @@ interface User {
   isAdmin: boolean;
   isOAuthUser: boolean;
   createdAt: string;
-  role?: UserRole;
+  roles?: ('partner' | 'customer')[];
   [key: string]: any; // Allow for additional properties
 }
 
@@ -149,11 +149,14 @@ export default function Profile() {
                         sx={{ mr: 1 }}
                       />
                     )}
-                    <Chip
-                      label={profileUser.role || 'Partner'}
-                      color="success"
-                      sx={{ mr: 1, textTransform: 'capitalize' }}
-                    />
+                    {(profileUser.roles && profileUser.roles.length > 0 ? profileUser.roles : ['partner']).map((role) => (
+                      <Chip
+                        key={role}
+                        label={role.charAt(0).toUpperCase() + role.slice(1)}
+                        color={role === 'customer' ? 'success' : 'info'}
+                        sx={{ mr: 1, textTransform: 'capitalize' }}
+                      />
+                    ))}
                     {profileUser.isOAuthUser ? (
                       <Chip
                         label="Google Account"

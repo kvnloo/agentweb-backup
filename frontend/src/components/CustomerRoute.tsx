@@ -4,34 +4,35 @@ import { useAuth } from '../contexts/AuthContext';
 import { CircularProgress, Box } from '@mui/material';
 
 interface CustomerRouteProps {
-  children: React.ReactNode;
+  children: React.ReactElement;
 }
 
-export default function CustomerRoute({ children }: CustomerRouteProps) {
-  const { user, loading, hasRole } = useAuth();
+const CustomerRoute: React.FC<CustomerRouteProps> = ({ children }) => {
+  const { user, loadingAuth } = useAuth();
   const location = useLocation();
 
-  if (loading) {
+  if (loadingAuth) {
     return (
-      <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
+      <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh' }}>
         <CircularProgress />
       </Box>
     );
   }
 
-  // If not logged in, redirect to login
   if (!user) {
     return <Navigate to="/login" state={{ from: location }} replace />;
   }
 
-  // Check if user has customer role or is admin
-  const isCustomer = user.isAdmin || user.role === 'customer';
-  
+  // User must have 'customer' role or be an admin
+  const isCustomer = user.isAdmin || (user.roles && user.roles.includes('customer'));
+
   if (!isCustomer) {
-    console.log('CustomerRoute: Access denied', { user, role: user?.role });
-    return <Navigate to="/" replace />;
+    // Redirect to a general access denied page or tasks page if they are a partner but not customer
+    // For now, redirecting to tasks, assuming non-customers might be partners.
+    return <Navigate to="/tasks" state={{ from: location }} replace />;
   }
 
-  console.log('CustomerRoute: Access granted', { user, role: user?.role });
-  return <>{children}</>;
-} 
+  return children;
+};
+
+export default CustomerRoute; 

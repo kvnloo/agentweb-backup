@@ -49,7 +49,7 @@ interface User {
   isAdmin: boolean;
   isActive: boolean;
   createdAt: string;
-  role?: 'partner' | 'customer';
+  roles?: ('partner' | 'customer')[];
 }
 
 interface UserInteraction {
@@ -119,20 +119,31 @@ class UserDB {
     password: string, 
     isOAuthUser: boolean = false, 
     isAdmin: boolean = false,
-    role: 'partner' | 'customer' = 'partner'
+    roles: ('partner' | 'customer')[] = ['partner'],
+    displayName?: string,
+    googleId?: string
   ) {
+    const itemToCreate: any = {
+      userId,
+      email,
+      password,
+      isOAuthUser,
+      isAdmin,
+      isActive: true,
+      createdAt: new Date().toISOString(),
+      roles
+    };
+
+    if (displayName) {
+      itemToCreate.displayName = displayName;
+    }
+    if (googleId) {
+      itemToCreate.googleId = googleId;
+    }
+
     const params = {
       TableName: this.tableName,
-      Item: {
-        userId,
-        email,
-        password,
-        isOAuthUser,
-        isAdmin,
-        isActive: true,
-        createdAt: new Date().toISOString(),
-        role // Always include role, default is 'partner'
-      }
+      Item: itemToCreate
     };
 
     await this.docClient.put(params).promise();
@@ -253,7 +264,7 @@ class UserDB {
   }
 
   async updateUser(userId: string, updates: Partial<{
-    role: string;
+    roles: ('partner' | 'customer')[];
     isAdmin: boolean;
     isActive: boolean;
     email: string;

@@ -22,16 +22,18 @@ export const hasRole = (allowedRoles: string[]) => async (req: AuthRequest, res:
       return next();
     }
     
-    // Get the user's role, defaulting to 'partner' if not set
-    const userRole = user.role || 'partner';
-    console.log('Role middleware - user role:', { userId, role: userRole });
+    // Get the user's roles, defaulting to ['partner'] if not set or empty
+    const userRoles = (user.roles && user.roles.length > 0 ? user.roles : ['partner']) as ('partner' | 'customer')[];
+    console.log('Role middleware - user roles:', { userId, roles: userRoles });
     
-    // Check if user's role is in the allowed roles
-    if (!allowedRoles.includes(userRole)) {
+    // Check if any of user's roles are in the allowed roles
+    const hasPermission = userRoles.some(role => allowedRoles.includes(role));
+    
+    if (!hasPermission) {
       return res.status(403).json({ 
         message: 'Access denied. Required role not found.', 
         requiredRoles: allowedRoles,
-        userRole: userRole
+        userRoles: userRoles
       });
     }
 

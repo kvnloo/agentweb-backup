@@ -6,7 +6,7 @@ import { Profile } from 'passport-google-oauth20';
 
 export const register = async (req: Request, res: Response) => {
   try {
-    const { email, password, role } = req.body;
+    const { email, password, roles: reqRoles } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({ message: 'Email and password are required' });
@@ -21,18 +21,19 @@ export const register = async (req: Request, res: Response) => {
     const hashedPassword = await bcrypt.hash(password, 10);
     const userId = Date.now().toString();
 
-    // Validate role if provided, default to 'partner'
-    const validRoles = ['partner', 'customer'];
-    let userRole = 'partner'; // Default role
-    if (role && validRoles.includes(role)) {
-      userRole = role as 'partner' | 'customer';
+    // Validate roles if provided, default to ['partner']
+    const validRolesSet = new Set(['partner', 'customer']);
+    let userRoles: ('partner' | 'customer')[] = ['partner']; // Default roles
+
+    if (reqRoles && Array.isArray(reqRoles) && reqRoles.length > 0 && reqRoles.every(r => validRolesSet.has(r))) {
+      userRoles = reqRoles as ('partner' | 'customer')[]; // Explicitly cast reqRoles
     }
 
     // Create user in DynamoDB
-    await userDb.createUser(email, userId, hashedPassword, false, false, userRole as 'partner' | 'customer');
+    await userDb.createUser(email, userId, hashedPassword, false, false, userRoles);
 
     const token = jwt.sign(
-      { userId, email, role: userRole },
+      { userId, email, roles: userRoles },
       process.env.JWT_SECRET || 'your-secret-key'
     );
 
@@ -42,7 +43,7 @@ export const register = async (req: Request, res: Response) => {
         userId,
         email,
         isAdmin: false,
-        role: userRole,
+        roles: userRoles,
         isOAuthUser: false,
         createdAt: new Date().toISOString()
       }
@@ -76,12 +77,12 @@ export const login = async (req: Request, res: Response) => {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
-    // Token contains only userId, email, and role (if exists)
+    // Token contains only userId, email, and roles (if exists)
     const token = jwt.sign(
       { 
         userId: user.userId, 
         email: user.email,
-        ...(user.role && { role: user.role })
+        ...(user.roles && { roles: user.roles })
       },
       process.env.JWT_SECRET || 'your-secret-key'
     );
@@ -96,56 +97,70 @@ export const login = async (req: Request, res: Response) => {
 };
 
 export const googleCallback = async (
+  req: Request,
   accessToken: string,
   refreshToken: string,
   profile: Profile,
-  done: (error: any, user?: any) => void
+  done: (error: any, user?: any, info?: any) => void
 ) => {
   try {
-    const email = profile.emails?.[0]?.value;
+    if (!profile) {
+      return done(new Error('Google profile was not received'), null);
+    }
+    
+    const email = profile.emails && profile.emails[0] ? profile.emails[0].value : null;
+    
     if (!email) {
-      return done(new Error('No email found in Google profile'));
+      console.error('No email found in Google profile. Profile received:', JSON.stringify(profile, null, 2));
+      return done(new Error('No email found in Google profile. Please ensure your Google account has a primary email and permissions are granted.'), null);
     }
 
-    // Check if user exists
     let user = await userDb.getUserByEmail(email);
     
+    const portalOrigin = req.query.state as string || 'partner';
+
     if (!user) {
-      // Create new user if doesn't exist
       const userId = Date.now().toString();
-      // Set 'partner' as default role for OAuth users
-      await userDb.createUser(email, userId, '', true, false, 'partner');
+      const defaultRolesForNewOAuthUser: ('partner' | 'customer')[] = portalOrigin === 'customer' ? ['customer'] : ['partner'];
+      
+      console.log(`New OAuth user from ${portalOrigin} portal. Assigning roles: ${defaultRolesForNewOAuthUser.join(', ')}`);
+      
+      await userDb.createUser(email, userId, '', true, false, defaultRolesForNewOAuthUser, profile.displayName, profile.id);
       user = await userDb.getUserByEmail(email);
       
       if (!user) {
-        throw new Error('Failed to create user');
+        return done(new Error('Failed to create or find user after creation attempt.'), null);
       }
+    } else {
+      // User exists. Optionally, update their Google ID or display name if changed.
+      // if (user.googleId !== profile.id || user.displayName !== profile.displayName) {
+      //   await userDb.updateUser(user.userId, { googleId: profile.id, displayName: profile.displayName });
+      // }
     }
 
-    // Use the user's role or default to 'partner'
-    const userRole = user.role || 'partner';
+    const userRoles = user.roles && user.roles.length > 0 
+                      ? user.roles 
+                      : (portalOrigin === 'customer' ? ['customer'] : ['partner']);
 
-    // Generate JWT token with necessary data
     const token = jwt.sign(
       { 
         userId: user.userId, 
         email: user.email,
-        role: userRole
+        roles: userRoles,
+        isAdmin: user.isAdmin || false
       },
       process.env.JWT_SECRET || 'your-secret-key'
     );
 
-    // Pass token and user details to callback
-    // This ensures the user object in the request will have all necessary properties
     done(null, { 
       token,
       userId: user.userId,
       email: user.email,
-      role: userRole,
+      roles: userRoles,
       isAdmin: user.isAdmin || false
     });
   } catch (error) {
-    console.error('Error in Google callback:', error);
-    done(error);
+    console.error('Error in Google callback processing:', error);
+    done(error, null);
   }
 }; 

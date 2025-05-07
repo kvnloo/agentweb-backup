@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate, Link as RouterLink } from 'react-router-dom';
 import {
   Container,
@@ -16,17 +16,21 @@ import GoogleSignInButton from '../components/GoogleSignInButton';
 export default function Login() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [error, setError] = useState('');
-  const { login } = useAuth();
+  const { login, loginError, clearLoginError } = useAuth();
   const navigate = useNavigate();
+
+  useEffect(() => {
+    clearLoginError();
+  }, [clearLoginError]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    clearLoginError();
     try {
-      await login(email, password);
+      await login(email, password, 'partner');
       navigate('/tasks');
-    } catch (err) {
-      setError('Invalid email or password');
+    } catch (err: any) {
+      console.error("Login page catch:", err.message);
     }
   };
 
@@ -41,15 +45,15 @@ export default function Login() {
         }}
       >
         <Typography component="h1" variant="h5">
-          Sign in
+          Sign in to Partner Portal
         </Typography>
         <Box sx={{ mt: 1, width: '100%' }}>
           <GoogleSignInButton />
           <Divider sx={{ my: 2 }}>OR</Divider>
           <Box component="form" onSubmit={handleSubmit}>
-            {error && (
+            {loginError && (
               <Alert severity="error" sx={{ mb: 2 }}>
-                {error}
+                {loginError}
               </Alert>
             )}
             <TextField

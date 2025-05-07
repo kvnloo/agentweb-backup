@@ -7,7 +7,7 @@ export interface AuthenticatedRequest extends Request {
     userId: string;
     email: string;
     isAdmin: boolean;
-    role?: 'partner' | 'customer';
+    roles?: ('partner' | 'customer')[];
   };
 }
 
@@ -15,7 +15,7 @@ export interface UserPayload {
   userId: string;
   email: string;
   isAdmin: boolean;
-  role?: 'partner' | 'customer';
+  roles?: ('partner' | 'customer')[];
 }
 
 export async function authenticateToken(req: Request, res: Response, next: NextFunction) {
@@ -45,7 +45,7 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
       userId: user.userId,
       email: user.email,
       isAdmin: user.isAdmin || false,
-      role: user.role || 'partner' // Use 'partner' as default
+      roles: (user.roles && user.roles.length > 0 ? user.roles : ['partner']) as ('partner' | 'customer')[] // Use roles array, default if empty
     };
 
     next();

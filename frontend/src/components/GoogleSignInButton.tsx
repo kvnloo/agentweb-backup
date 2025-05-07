@@ -8,7 +8,7 @@ export default function GoogleSignInButton() {
 
   const handleGoogleSignIn = async () => {
     try {
-      await loginWithGoogle();
+      await loginWithGoogle('partner');
       navigate('/tasks');
     } catch (error) {
       console.error('Google sign-in failed:', error);

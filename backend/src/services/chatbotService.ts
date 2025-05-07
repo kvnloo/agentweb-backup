@@ -284,7 +284,7 @@ function keywordBasedChunkRetrieval(
   return scoredChunks.slice(0, maxChunks).map(item => item.chunk);
 }
 
-class ChatbotDB {
+export class ChatbotDB {
   private tableName: string;
 
   constructor() {
@@ -649,7 +649,7 @@ async function loadKnowledgeBase(): Promise<void> {
 
   knowledgeBase = chunks;
   console.log(`Loaded ${chunks.length} knowledge chunks from controllers`);
-  printKnowledgeBase();
+  //printKnowledgeBase();
 }
 
 // Load knowledge base on startup and refresh periodically

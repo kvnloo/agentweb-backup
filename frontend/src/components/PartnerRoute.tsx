@@ -13,30 +13,20 @@ export default function PartnerRoute({ children }: PartnerRouteProps) {
 
   if (loading) {
     return (
-      <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
+      <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh' }}>
         <CircularProgress />
       </Box>
     );
   }
 
-  // If not logged in, redirect to login
   if (!user) {
     return <Navigate to="/login" state={{ from: location }} replace />;
   }
 
-  // Check if user has partner role or is admin (or no role, default to partner)
-  const isPartner = user.isAdmin || user.role === 'partner' || !user.role;
-  
-  if (!isPartner) {
-    console.log('PartnerRoute: Access denied', { user, role: user?.role });
-    
-    // Redirect based on user role
-    if (hasRole('customer')) {
-      return <Navigate to="/marketing" replace />;
-    }
-    return <Navigate to="/" replace />;
+  if (!hasRole('partner')) {
+    console.warn('Access denied to partner route for user:', user.email);
+    return <Navigate to="/" state={{ from: location }} replace />;
   }
 
-  console.log('PartnerRoute: Access granted', { user, role: user?.role });
   return <>{children}</>;
 } 

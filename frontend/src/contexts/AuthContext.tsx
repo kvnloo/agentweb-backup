@@ -11,20 +11,22 @@ interface User {
   isAdmin: boolean;
   isOAuthUser: boolean;
   createdAt: string;
-  role: UserRole;
+  roles: ('partner' | 'customer')[];
 }
 
 interface AuthContextType {
   token: string | null;
   user: User | null;
   loading: boolean;
-  login: (email: string, password: string) => Promise<void>;
+  loginError: string | null;
+  login: (email: string, password: string, targetPortal?: UserRole) => Promise<void>;
   register: (email: string, password: string) => Promise<void>;
-  loginWithGoogle: () => Promise<void>;
+  loginWithGoogle: (targetPortal?: UserRole) => Promise<void>;
   setToken: (token: string | null) => void;
   logout: () => void;
   isAuthenticated: () => boolean;
-  hasRole: (roles: UserRole | UserRole[]) => boolean;
+  hasRole: (rolesToCheck: UserRole | UserRole[]) => boolean;
+  clearLoginError: () => void;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -42,6 +44,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [token, setTokenState] = useState<string | null>(localStorage.getItem('token'));
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loginError, setLoginError] = useState<string | null>(null);
 
   useEffect(() => {
     const initializeAuth = async () => {
@@ -68,7 +71,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     initializeAuth();
   }, []);
 
-  const login = async (email: string, password: string) => {
+  const clearLoginError = () => {
+    setLoginError(null);
+  };
+
+  const login = async (email: string, password: string, targetPortal?: UserRole) => {
+    setLoginError(null);
     try {
       setLoading(true);
       const response = await axios.post(buildApiUrl('/api/auth/login'), {
@@ -76,20 +84,43 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         password
       });
       const { token: newToken, user: userData } = response.data;
+
+      if (targetPortal) {
+        const effectiveRoles = (userData.roles && userData.roles.length > 0) ? userData.roles : ['partner'];
+        let hasTargetRole = effectiveRoles.includes(targetPortal);
+        if (userData.isAdmin) hasTargetRole = true;
+
+        if (!hasTargetRole) {
+          setLoginError(`Access denied. You do not have the required role for the ${targetPortal} portal.`);
+          localStorage.removeItem('token');
+          setTokenState(null);
+          setUser(null);
+          throw new Error(`Role check failed for ${targetPortal} portal.`);
+        }
+      }
+
       setTokenState(newToken);
       setUser(userData);
       localStorage.setItem('token', newToken);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Login error:', error);
+      if (!loginError && error.message !== `Role check failed for ${targetPortal} portal.`) {
+         setLoginError(error.response?.data?.message || error.message || 'Login failed. Please try again.');
+      }
       throw error;
     } finally {
       setLoading(false);
     }
   };
 
-  const loginWithGoogle = async () => {
+  const loginWithGoogle = async (targetPortal?: UserRole) => {
+    setLoginError(null);
     try {
-      // Redirect to Google OAuth endpoint
+      if (targetPortal) {
+        localStorage.setItem('oauthTargetPortal', targetPortal);
+      } else {
+        localStorage.removeItem('oauthTargetPortal');
+      }
       const googleAuthUrl = buildApiUrl('/api/auth/google');
       console.log('Redirecting to Google OAuth:', {
         apiUrl: API_URL,
@@ -97,6 +128,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       });
       window.location.href = googleAuthUrl;
     } catch (error) {
+      setLoginError('Google sign-in failed to initiate.');
       throw new Error('Google sign in failed');
     }
   };
@@ -128,17 +160,34 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const isAuthenticated = () => !!token;
 
   const setToken = useCallback(async (newToken: string | null) => {
+    setLoginError(null);
     try {
       if (newToken) {
-        // Get user data using the token
         const response = await axios.get(buildApiUrl('/api/auth/me'), {
           headers: {
             Authorization: `Bearer ${newToken}`
           }
         });
+        const userData: User = response.data;
+
+        const targetPortal = localStorage.getItem('oauthTargetPortal') as UserRole | null;
+        if (targetPortal) {
+          localStorage.removeItem('oauthTargetPortal');
+
+          const effectiveRoles = (userData.roles && userData.roles.length > 0) ? userData.roles : ['partner'];
+          let hasTargetRole = effectiveRoles.includes(targetPortal);
+          if (userData.isAdmin) hasTargetRole = true;
+
+          if (!hasTargetRole) {
+            setLoginError(`Access denied. You do not have the required role for the ${targetPortal} portal.`);
+            setUser(null);
+            setTokenState(null);
+            localStorage.removeItem('token');
+            throw new Error(`Role check failed for ${targetPortal} portal after OAuth.`);
+          }
+        }
         
-        // Set both user data and token
-        setUser(response.data);
+        setUser(userData);
         setTokenState(newToken);
         localStorage.setItem('token', newToken);
       } else {
@@ -148,42 +197,38 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     } catch (error) {
       console.error('Error fetching user data:', error);
-      // On error, clear everything
       setUser(null);
       setTokenState(null);
       localStorage.removeItem('token');
-      throw error; // Re-throw to handle in the component
+      throw error;
     }
   }, []);
 
-  const hasRole = useCallback((roles: UserRole | UserRole[]): boolean => {
+  const hasRole = useCallback((rolesToCheck: UserRole | UserRole[]): boolean => {
     if (!user) return false;
     
-    // Admin users have access to everything
     if (user.isAdmin) return true;
     
-    // Use 'partner' as default role if not defined
-    const userRole = user.role || 'partner';
+    const currentUserRoles = (user.roles && user.roles.length > 0) ? user.roles : ['partner'];
     
-    // Check if user has the specified role
-    if (Array.isArray(roles)) {
-      return roles.includes(userRole);
-    }
+    const rolesToMatch = Array.isArray(rolesToCheck) ? rolesToCheck : [rolesToCheck];
     
-    return roles === userRole;
+    return currentUserRoles.some(userRole => rolesToMatch.includes(userRole as UserRole));
   }, [user]);
 
   const value = {
     token,
     user,
     loading,
+    loginError,
     login,
     register,
     loginWithGoogle,
     setToken,
     logout,
     isAuthenticated,
-    hasRole
+    hasRole,
+    clearLoginError
   };
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

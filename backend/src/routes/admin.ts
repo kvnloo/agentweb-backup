@@ -445,26 +445,24 @@ router.get('/chat-sessions', async (req, res) => {
 router.put('/users/:userId/role', async (req, res) => {
   try {
     const { userId } = req.params;
-    const { role } = req.body;
+    const { roles } = req.body; // Expect an array of roles
     
-    // Validate role
-    const validRoles = ['partner', 'customer'];
+    // Validate roles
+    const validRolesSet = new Set(['partner', 'customer']);
     
-    // Check if role is empty string (to reset to default 'partner')
-    if (role === '') {
-      // Set role back to default 'partner'
-      await userDb.updateUser(userId, { 
-        role: 'partner'
+    if (!Array.isArray(roles) || roles.some(r => !validRolesSet.has(r))) {
+      return res.status(400).json({ 
+        message: 'Invalid roles. Must be an array containing only: partner, customer' 
       });
-      return res.status(200).json({ message: 'User role reset to default partner role' });
     }
-    
-    // Check for valid role value
-    if (role && !validRoles.includes(role)) {
-      return res.status(400).json({ message: 'Invalid role. Must be one of: partner, customer' });
-    }
-    
-    // Get the user
+
+    // If roles array is empty, default to ['partner'] or handle as an error, based on desired logic.
+    // For now, let's assume an empty array means removing all specific portal access, which might not be desired.
+    // A common default might be ['partner'] if the array is empty, or the frontend should ensure it's not empty.
+    // Let's proceed assuming frontend sends at least one valid role if user should have access.
+    // If roles is empty, it implies no specific portal access. This is a valid state.
+
+    // Get the user to ensure they exist (optional, updateUser will also check)
     const user = await userDb.getUserById(userId);
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
@@ -472,14 +470,17 @@ router.put('/users/:userId/role', async (req, res) => {
     
     // Update user in DynamoDB
     await userDb.updateUser(userId, { 
-      role
+      roles // Pass the array of roles
     });
     
-    res.status(200).json({ message: 'User role updated successfully' });
+    res.status(200).json({ message: 'User roles updated successfully' });
   } catch (error) {
-    console.error('Error updating user role:', error);
-    res.status(500).json({ message: 'Error updating user role' });
+    console.error('Error updating user roles:', error);
+    res.status(500).json({ message: 'Error updating user roles' });
   }
 });
+
+// Get system analytics
+// ... existing code ...
 
 export default router; 
