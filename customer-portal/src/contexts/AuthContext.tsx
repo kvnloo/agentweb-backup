@@ -7,7 +7,7 @@ export type UserRole = 'customer' | 'partner';
 interface User {
   userId: string;
   email: string;
-  role: UserRole;
+  roles: UserRole[];
   isAdmin: boolean;
 }
 
@@ -53,10 +53,11 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         });
         
         const userData = response.data;
+        if (!userData.roles) userData.roles = [];
         
-        // Only allow users with customer role
-        if (userData.role !== 'customer') {
-          setError('Access denied: Only customer accounts can access this portal');
+        // Allow admin or users with customer role
+        if (!userData.isAdmin && !userData.roles.includes('customer')) {
+          setError('Access denied: You do not have permission to access this portal.');
           localStorage.removeItem('token');
           setTokenState(null);
           setUser(null);
@@ -86,10 +87,11 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       });
 
       const { token: newToken, user: userData } = response.data;
+      if (!userData.roles) userData.roles = [];
       
-      // Only allow users with customer role
-      if (userData.role !== 'customer') {
-        setError('Access denied: Only customer accounts can access this portal');
+      // Allow admin or users with customer role
+      if (!userData.isAdmin && !userData.roles.includes('customer')) {
+        setError('Access denied: You do not have permission to access this portal.');
         return;
       }
       
@@ -117,14 +119,15 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       const response = await axios.post(buildApiUrl('/api/auth/register'), {
         email,
         password,
-        role: 'customer', // Force customer role for this frontend
+        roles: ['customer'],
       });
 
       const { token: newToken, user: userData } = response.data;
+      if (!userData.roles) userData.roles = [];
       
-      // Double check that user has customer role
-      if (userData.role !== 'customer') {
-        setError('Access denied: Only customer accounts can be created here');
+      // Allow admin or users with customer role (though register here implies customer)
+      if (!userData.isAdmin && !userData.roles.includes('customer')) {
+        setError('Access denied: Account created without customer role.');
         return;
       }
       
@@ -168,12 +171,17 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       });
       
       const userData = response.data;
+      if (!userData.roles) userData.roles = [];
       
-      // Only allow users with customer role
-      if (userData.role !== 'customer') {
-        setError('Access denied: Only customer accounts can access this portal');
+      // Allow admin or users with customer role
+      if (!userData.isAdmin && !userData.roles.includes('customer')) {
+        setError('Access denied: You do not have permission to access this portal.');
         setLoading(false);
-        throw new Error('Access denied: Only customer accounts can access this portal');
+        // Clear token and user if access is denied
+        localStorage.removeItem('token');
+        setTokenState(null);
+        setUser(null);
+        throw new Error('Access denied: You do not have permission to access this portal.');
       }
       
       // Store the token and user data

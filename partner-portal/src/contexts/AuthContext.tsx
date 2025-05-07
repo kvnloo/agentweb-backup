@@ -22,7 +22,7 @@ interface AuthContextType {
   login: (email: string, password: string, targetPortal?: UserRole) => Promise<void>;
   register: (email: string, password: string) => Promise<void>;
   loginWithGoogle: (targetPortal?: UserRole) => Promise<void>;
-  setToken: (token: string | null) => void;
+  setToken: (token: string | null) => Promise<void>;
   logout: () => void;
   isAuthenticated: () => boolean;
   hasRole: (rolesToCheck: UserRole | UserRole[]) => boolean;
@@ -50,13 +50,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const initializeAuth = async () => {
       const storedToken = localStorage.getItem('token');
       if (storedToken) {
+        setLoading(true);
         try {
           const response = await axios.get(buildApiUrl('/api/auth/me'), {
-            headers: {
-              Authorization: `Bearer ${storedToken}`
-            }
+            headers: { Authorization: `Bearer ${storedToken}` }
           });
-          setUser(response.data);
+          const userData: User = response.data;
+          if (!userData.roles) userData.roles = [];
+          setUser(userData);
           setTokenState(storedToken);
         } catch (error) {
           console.error('Error initializing auth:', error);
@@ -64,26 +65,28 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           setTokenState(null);
           setUser(null);
         }
+        setLoading(false);
+      } else {
+        setLoading(false);
       }
-      setLoading(false);
     };
-
     initializeAuth();
   }, []);
 
-  const clearLoginError = () => {
+  const clearLoginError = useCallback(() => {
     setLoginError(null);
-  };
+  }, []);
 
   const login = async (email: string, password: string, targetPortal?: UserRole) => {
-    setLoginError(null);
+    setLoading(true);
+    clearLoginError();
     try {
-      setLoading(true);
       const response = await axios.post(buildApiUrl('/api/auth/login'), {
         email,
         password
       });
       const { token: newToken, user: userData } = response.data;
+      if (!userData.roles) userData.roles = [];
 
       if (targetPortal) {
         const effectiveRoles = (userData.roles && userData.roles.length > 0) ? userData.roles : ['partner'];
@@ -99,12 +102,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
       }
 
-      setTokenState(newToken);
-      setUser(userData);
       localStorage.setItem('token', newToken);
+      setUser(userData);
+      setTokenState(newToken);
     } catch (error: any) {
       console.error('Login error:', error);
-      if (!loginError && error.message !== `Role check failed for ${targetPortal} portal.`) {
+      if (!loginError && !error.message?.startsWith('Role check failed')) {
          setLoginError(error.response?.data?.message || error.message || 'Login failed. Please try again.');
       }
       throw error;
@@ -113,106 +116,103 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
-  const loginWithGoogle = async (targetPortal?: UserRole) => {
-    setLoginError(null);
+  const loginWithGoogle = useCallback(async (targetPortal?: UserRole) => {
+    clearLoginError();
     try {
-      if (targetPortal) {
-        localStorage.setItem('oauthTargetPortal', targetPortal);
-      } else {
-        localStorage.removeItem('oauthTargetPortal');
-      }
-      const googleAuthUrl = buildApiUrl('/api/auth/google');
-      console.log('Redirecting to Google OAuth:', {
-        apiUrl: API_URL,
-        fullUrl: googleAuthUrl
-      });
-      window.location.href = googleAuthUrl;
+      const portalHint = targetPortal || 'partner';
+      localStorage.setItem('oauthTargetPortal', portalHint);
+      window.location.href = `${buildApiUrl('/api/auth/google')}?portal=${portalHint}`;
     } catch (error) {
       setLoginError('Google sign-in failed to initiate.');
-      throw new Error('Google sign in failed');
+      console.error('Google sign-in failed to initiate:', error);
     }
-  };
+  }, [clearLoginError]);
 
-  const register = async (email: string, password: string) => {
+  const register = useCallback(async (email: string, password: string) => {
+    setLoading(true);
+    clearLoginError();
     try {
-      setLoading(true);
       const response = await axios.post(buildApiUrl('/api/auth/register'), {
         email,
         password,
+        roles: ['partner']
       });
       const { token: newToken, user: userData } = response.data;
-      setTokenState(newToken);
-      setUser(userData);
+      if (!userData.roles) userData.roles = [];
+      
       localStorage.setItem('token', newToken);
-    } catch (error) {
-      throw new Error('Registration failed');
+      setUser(userData);
+      setTokenState(newToken);
+    } catch (error: any) {
+      setLoginError(error.response?.data?.message || 'Registration failed');
+      console.error('Registration error:', error);
+      throw error;
     } finally {
       setLoading(false);
     }
-  };
+  }, [clearLoginError]);
 
-  const logout = () => {
+  const logout = useCallback(() => {
     setTokenState(null);
     setUser(null);
     localStorage.removeItem('token');
-  };
+    localStorage.removeItem('oauthTargetPortal');
+    clearLoginError();
+  }, [clearLoginError]);
 
-  const isAuthenticated = () => !!token;
+  const isAuthenticated = useCallback(() => !!token && !!user, [token, user]);
 
   const setToken = useCallback(async (newToken: string | null) => {
-    setLoginError(null);
-    try {
-      if (newToken) {
-        const response = await axios.get(buildApiUrl('/api/auth/me'), {
-          headers: {
-            Authorization: `Bearer ${newToken}`
-          }
-        });
-        const userData: User = response.data;
-
-        const targetPortal = localStorage.getItem('oauthTargetPortal') as UserRole | null;
-        if (targetPortal) {
-          localStorage.removeItem('oauthTargetPortal');
-
-          const effectiveRoles = (userData.roles && userData.roles.length > 0) ? userData.roles : ['partner'];
-          let hasTargetRole = effectiveRoles.includes(targetPortal);
-          if (userData.isAdmin) hasTargetRole = true;
-
-          if (!hasTargetRole) {
-            setLoginError(`Access denied. You do not have the required role for the ${targetPortal} portal.`);
-            setUser(null);
-            setTokenState(null);
-            localStorage.removeItem('token');
-            throw new Error(`Role check failed for ${targetPortal} portal after OAuth.`);
-          }
-        }
-        
-        setUser(userData);
-        setTokenState(newToken);
-        localStorage.setItem('token', newToken);
-      } else {
-        setUser(null);
-        setTokenState(null);
-        localStorage.removeItem('token');
-      }
-    } catch (error) {
-      console.error('Error fetching user data:', error);
-      setUser(null);
-      setTokenState(null);
-      localStorage.removeItem('token');
-      throw error;
+    clearLoginError();
+    if (!newToken) {
+        logout();
+        return;
     }
-  }, []);
+    setLoading(true);
+    try {
+      const response = await axios.get(buildApiUrl('/api/auth/me'), {
+        headers: { Authorization: `Bearer ${newToken}` }
+      });
+      const userData: User = response.data;
+      if (!userData.roles) userData.roles = [];
+
+      const targetPortal = localStorage.getItem('oauthTargetPortal') as UserRole | null;
+      localStorage.removeItem('oauthTargetPortal');
+
+      if (targetPortal) {
+        const effectiveRoles = (userData.roles && userData.roles.length > 0) ? userData.roles : ['partner'];
+        let hasTargetRole = effectiveRoles.includes(targetPortal);
+        if (userData.isAdmin) hasTargetRole = true;
+
+        if (!hasTargetRole) {
+          setLoginError(`Access denied. Required role missing for ${targetPortal} portal after OAuth.`);
+          setTokenState(null);
+          setUser(null);
+          localStorage.removeItem('token');
+          setLoading(false);
+          return;
+        }
+      }
+      
+      localStorage.setItem('token', newToken);
+      setUser(userData);
+      setTokenState(newToken);
+    } catch (error) {
+      console.error('Error fetching user data in setToken:', error);
+      logout();
+      if (!loginError) {
+        setLoginError('Session validation failed. Please log in again.');
+      }
+    } finally {
+      setLoading(false);
+    }
+  }, [clearLoginError, logout]);
 
   const hasRole = useCallback((rolesToCheck: UserRole | UserRole[]): boolean => {
     if (!user) return false;
-    
     if (user.isAdmin) return true;
-    
     const currentUserRoles = (user.roles && user.roles.length > 0) ? user.roles : ['partner'];
-    
     const rolesToMatch = Array.isArray(rolesToCheck) ? rolesToCheck : [rolesToCheck];
-    
     return currentUserRoles.some(userRole => rolesToMatch.includes(userRole as UserRole));
   }, [user]);
 

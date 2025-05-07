@@ -578,13 +578,11 @@ export default function AdminDashboard() {
 
   const handleRoleDialogOpen = (user: User) => {
     setSelectedUser(user);
-    // Initialize roles for the dialog based on user.roles, then user.role, then default to ['partner']
+    // Initialize roles for the dialog based SOLELY on user.roles
     if (user.roles && user.roles.length > 0) {
       setSelectedUserRoles(user.roles);
-    } else if (user.role) {
-      setSelectedUserRoles([user.role]);
     } else {
-      setSelectedUserRoles(['partner']); // Default for dialog if no role specified
+      setSelectedUserRoles([]); // Default to empty array if no roles are present
     }
     setRoleDialogOpen(true);
   };
@@ -907,10 +905,12 @@ export default function AdminDashboard() {
                   </TableRow>
                 ) : (
                   users.map((user) => {
-                    // Determine roles to display, defaulting non-admins to ['partner'] if no roles assigned
-                    const displayRoles = user.roles && user.roles.length > 0 
-                      ? user.roles 
-                      : !user.isAdmin ? ['partner'] : [];
+                    // Determine roles to display, SOLELY from roles array.
+                    let displayRoles: ('partner' | 'customer')[] = [];
+                    if (user.roles && user.roles.length > 0) {
+                      displayRoles = user.roles; // Use the array if present and not empty
+                    }
+                    // If user.roles is empty or undefined, displayRoles remains [], meaning no roles will be shown.
                     
                     return (
                       <TableRow key={user.userId}>

@@ -32,8 +32,9 @@ export const register = async (req: Request, res: Response) => {
     // Create user in DynamoDB
     await userDb.createUser(email, userId, hashedPassword, false, false, userRoles);
 
+    // JWT includes roles array
     const token = jwt.sign(
-      { userId, email, roles: userRoles },
+      { userId, email, roles: userRoles, isAdmin: false }, // Include isAdmin=false for clarity
       process.env.JWT_SECRET || 'your-secret-key'
     );
 
@@ -43,7 +44,7 @@ export const register = async (req: Request, res: Response) => {
         userId,
         email,
         isAdmin: false,
-        roles: userRoles,
+        roles: userRoles, // Send roles array
         isOAuthUser: false,
         createdAt: new Date().toISOString()
       }
@@ -77,17 +78,16 @@ export const login = async (req: Request, res: Response) => {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
-    // Token contains only userId, email, and roles (if exists)
-    const token = jwt.sign(
-      { 
-        userId: user.userId, 
-        email: user.email,
-        ...(user.roles && { roles: user.roles })
-      },
-      process.env.JWT_SECRET || 'your-secret-key'
-    );
+    // Ensure JWT uses roles array (prefer over single role if both exist)
+    const jwtPayload = { 
+      userId: user.userId, 
+      email: user.email,
+      roles: user.roles || [], // Use roles array, default to empty if undefined
+      isAdmin: user.isAdmin || false
+    };
+    const token = jwt.sign(jwtPayload, process.env.JWT_SECRET || 'your-secret-key');
 
-    // Don't send sensitive information
+    // Return user object (which might still have both role/roles from DB)
     const { password: _, ...userWithoutPassword } = user;
     res.json({ token, user: userWithoutPassword });
   } catch (error) {
@@ -125,6 +125,7 @@ export const googleCallback = async (
       
       console.log(`New OAuth user from ${portalOrigin} portal. Assigning roles: ${defaultRolesForNewOAuthUser.join(', ')}`);
       
+      // Pass roles array to createUser
       await userDb.createUser(email, userId, '', true, false, defaultRolesForNewOAuthUser, profile.displayName, profile.id);
       user = await userDb.getUserByEmail(email);
       
@@ -138,25 +139,28 @@ export const googleCallback = async (
       // }
     }
 
+    // Prioritize roles array from DB, default based on origin if necessary
     const userRoles = user.roles && user.roles.length > 0 
                       ? user.roles 
                       : (portalOrigin === 'customer' ? ['customer'] : ['partner']);
 
+    // Generate JWT token with roles array
     const token = jwt.sign(
       { 
         userId: user.userId, 
         email: user.email,
-        roles: userRoles,
+        roles: userRoles, // Use the determined roles array
         isAdmin: user.isAdmin || false
       },
       process.env.JWT_SECRET || 'your-secret-key'
     );
 
+    // Pass object containing roles array to done callback
     done(null, { 
       token,
       userId: user.userId,
       email: user.email,
-      roles: userRoles,
+      roles: userRoles, // Pass roles array
       isAdmin: user.isAdmin || false
     });
   } catch (error) {
