@@ -25,7 +25,11 @@ import {
   Alert,
   CircularProgress,
   Chip,
-  Stack
+  Stack,
+  InputLabel,
+  Select,
+  MenuItem,
+  FormControl
 } from '@mui/material';
 import { 
   Edit as EditIcon, 
@@ -38,6 +42,17 @@ import {
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
 import { buildApiUrl } from '../config';
+
+// Define supported categories
+const SUPPORTED_CATEGORIES = [
+  'Market Research',
+  'Creative Research',
+  'Social Listening',
+  'Productivity',
+  'Life',
+  'Data Analysis',
+  'Custom' // Allows free text input
+];
 
 interface Template {
   templateId: string;
@@ -53,6 +68,7 @@ interface Template {
   userId: string;
   createdAt: string;
   updatedAt: string;
+  category?: string; // Added category
 }
 
 // Helper function to extract parameters from prompt
@@ -74,6 +90,8 @@ export default function Templates() {
   const [currentTemplate, setCurrentTemplate] = useState<Template | null>(null);
   const [publishLoading, setPublishLoading] = useState<string | null>(null);
   const [selectedNameParameter, setSelectedNameParameter] = useState<string | null>(null);
+  const [category, setCategory] = useState(''); // Added category state for form
+  const [customCategory, setCustomCategory] = useState(''); // Added for custom category input
   
   // Form state
   const [name, setName] = useState('');
@@ -149,6 +167,13 @@ export default function Templates() {
       setIsDeepResearch(template.isDeepResearch);
       setIsComplexTask(template.isComplexTask);
       setSelectedNameParameter(template.nameParameter);
+      setCategory(template.category || ''); // Set category from template
+      if (template.category && !SUPPORTED_CATEGORIES.includes(template.category)) {
+        setCustomCategory(template.category); // If existing category is custom
+        setCategory('Custom');
+      } else {
+        setCustomCategory('');
+      }
     } else {
       setCurrentTemplate(null);
       setName('');
@@ -158,6 +183,8 @@ export default function Templates() {
       setIsDeepResearch(false);
       setIsComplexTask(false);
       setSelectedNameParameter(null);
+      setCategory(''); // Reset category for new template
+      setCustomCategory('');
     }
     setOpenEditDialog(true);
   };
@@ -166,6 +193,8 @@ export default function Templates() {
     setOpenEditDialog(false);
     setCurrentTemplate(null);
     setSelectedNameParameter(null);
+    setCategory('');
+    setCustomCategory('');
   };
 
   const handleSubmit = async () => {
@@ -175,6 +204,8 @@ export default function Templates() {
         return;
       }
       
+      const finalCategory = category === 'Custom' ? customCategory : category;
+
       const templateData: any = {
         name,
         description,
@@ -182,7 +213,8 @@ export default function Templates() {
         isInteractive,
         isDeepResearch,
         isComplexTask,
-        nameParameter: selectedNameParameter
+        nameParameter: selectedNameParameter,
+        category: finalCategory || undefined // Send finalCategory or undefined
       };
 
       // Check if we're updating an existing template (has a valid templateId)
@@ -273,6 +305,7 @@ export default function Templates() {
             <TableRow>
               <TableCell>Name</TableCell>
               <TableCell>Description</TableCell>
+              <TableCell>Category</TableCell>
               <TableCell>Parameters</TableCell>
               <TableCell>Status</TableCell>
               <TableCell>Created</TableCell>
@@ -307,6 +340,9 @@ export default function Templates() {
                   )}
                 </TableCell>
                 <TableCell>{template.description || '-'}</TableCell>
+                <TableCell>
+                  {template.category ? <Chip label={template.category} size="small" /> : '-'}
+                </TableCell>
                 <TableCell>
                   {template.parameters && template.parameters.length > 0 ? (
                     <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
@@ -431,6 +467,33 @@ export default function Templates() {
             value={name}
             onChange={(e) => setName(e.target.value)}
           />
+          <FormControl fullWidth margin="dense">
+            <InputLabel id="category-select-label">Category</InputLabel>
+            <Select
+              labelId="category-select-label"
+              value={category}
+              label="Category"
+              onChange={(e) => setCategory(e.target.value as string)}
+            >
+              <MenuItem value=""><em>(None)</em></MenuItem>
+              {SUPPORTED_CATEGORIES.map(cat => (
+                <MenuItem key={cat} value={cat}>{cat}</MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          {category === 'Custom' && (
+            <TextField
+              margin="dense"
+              label="Custom Category Name"
+              type="text"
+              fullWidth
+              variant="outlined"
+              value={customCategory}
+              onChange={(e) => setCustomCategory(e.target.value)}
+              required
+            />
+          )}
           <TextField
             margin="normal"
             fullWidth

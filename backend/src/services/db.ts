@@ -82,6 +82,7 @@ interface TaskTemplate {
   published: boolean;
   createdAt: string;
   updatedAt: string;
+  category?: string;
 }
 
 interface UserWithCounts extends User {
