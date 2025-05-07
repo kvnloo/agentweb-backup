@@ -2,24 +2,40 @@ import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import { toast } from "@/components/ui/use-toast";
-import { TemplateModal, Template } from "@/components/TemplateModal";
-import { templates } from "@/data/templates";
+import { TemplateModal, Template as FrontendTemplate } from "@/components/TemplateModal";
 import { Message } from "@/types/chat";
 import { MessageList } from "@/components/chat/MessageList";
 import { PromptForm } from "@/components/chat/PromptForm";
 import { TemplateSection } from "@/components/templates/TemplateSection";
+import axios from 'axios';
+import { Info } from 'lucide-react';
+
+// Structure from backend (TaskTemplate)
+interface FetchedTemplate {
+  templateId: string;
+  name: string;
+  description: string;
+  prompt: string;
+  parameters: string[]; // Array of parameter names
+  category?: string;
+  // other fields like isInteractive, published, etc., might exist but are not used in current mapping
+}
 
 const Dashboard = () => {
   const navigate = useNavigate();
-  const { user } = useAuth();
+  const { user, token } = useAuth(); 
   const [prompt, setPrompt] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [isTemplateOpen, setIsTemplateOpen] = useState(true);
-  const [activeCategory, setActiveCategory] = useState("market-research");
+  const [activeCategory, setActiveCategory] = useState("Market Research");
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const [selectedTemplate, setSelectedTemplate] = useState<Template | null>(null);
+  const [selectedTemplate, setSelectedTemplate] = useState<FrontendTemplate | null>(null);
+
+  const [allFetchedTemplates, setAllFetchedTemplates] = useState<FetchedTemplate[]>([]);
+  const [groupedTemplates, setGroupedTemplates] = useState<Record<string, FrontendTemplate[]>>({});
+  const [isLoadingTemplates, setIsLoadingTemplates] = useState(true);
+  const [templateError, setTemplateError] = useState<string | null>(null);
   
-  // Create a welcome message with user information
   useEffect(() => {
     if (user && messages.length === 0) {
       const welcomeMessage: Message = {
@@ -31,12 +47,65 @@ const Dashboard = () => {
       setMessages([welcomeMessage]);
     }
   }, [user, messages.length]);
+
+  useEffect(() => {
+    const fetchTemplatesFromApi = async () => {
+      setIsLoadingTemplates(true);
+      setTemplateError(null);
+      try {
+        // TODO: Replace with buildApiUrl if available for frontend-customer
+        // Or ensure backend URL is correctly sourced from an env variable for production
+        const response = await axios.get('http://localhost:3001/api/templates', {
+          // Conditionally add Auth header if token exists. 
+          // For public templates, this might not be strictly needed if endpoint is public.
+          ...(token && { headers: { Authorization: `Bearer ${token}` } }),
+        });
+        const data: FetchedTemplate[] = response.data;
+        // Filter out templates without a category, as per user request
+        setAllFetchedTemplates(data.filter(t => t.category)); 
+      } catch (err) {
+        console.error("Failed to fetch templates:", err);
+        setTemplateError("Failed to load templates. Please try again later.");
+        setAllFetchedTemplates([]);
+      } finally {
+        setIsLoadingTemplates(false);
+      }
+    };
+
+    fetchTemplatesFromApi();
+  }, [token]);
+
+  useEffect(() => {
+    const newGroupedTemplates: Record<string, FrontendTemplate[]> = {};
+    allFetchedTemplates.forEach((ft) => {
+      // This check is technically redundant if allFetchedTemplates is already filtered,
+      // but good for safety if the filtering logic changes.
+      if (ft.category) { 
+        if (!newGroupedTemplates[ft.category]) {
+          newGroupedTemplates[ft.category] = [];
+        }
+        newGroupedTemplates[ft.category].push({
+          id: ft.templateId,
+          title: ft.name,
+          description: ft.description,
+          category: ft.category, // Category is guaranteed here due to prior filter
+          promptTemplate: ft.prompt,
+          parameters: ft.parameters?.map(paramName => ({
+            id: paramName,       
+            name: paramName,     
+            required: false // Default as per TemplateParameter interface
+          })) || [],
+          icon: <Info size={24} /> // Default icon as per FrontendTemplate interface
+        });
+      }
+    });
+    setGroupedTemplates(newGroupedTemplates);
+  }, [allFetchedTemplates]);
   
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     
     if (prompt.trim()) {
-      // Add user message
       const userMessage: Message = {
         id: Date.now().toString(),
         content: prompt,
@@ -47,7 +116,6 @@ const Dashboard = () => {
       setMessages([...messages, userMessage]);
       setPrompt("");
 
-      // Simulate AI response for demonstration
       setTimeout(() => {
         const aiMessage: Message = {
           id: (Date.now() + 1).toString(),
@@ -60,16 +128,14 @@ const Dashboard = () => {
     }
   };
 
-  const handleTemplateClick = (template: Template) => {
+  const handleTemplateClick = (template: FrontendTemplate) => {
     setSelectedTemplate(template);
     setIsModalOpen(true);
   };
   
-  const handleTemplateSubmit = (template: Template, paramValues: Record<string, string>) => {
-    // Generate a prompt based on the template and parameter values
+  const handleTemplateSubmit = (template: FrontendTemplate, paramValues: Record<string, string>) => {
     let promptText = template.promptTemplate || template.description;
     
-    // Replace parameter placeholders in the prompt with actual values
     if (template.parameters) {
       template.parameters.forEach(param => {
         const value = paramValues[param.id] || `[${param.name}]`;
@@ -77,7 +143,6 @@ const Dashboard = () => {
       });
     }
     
-    // Set the generated prompt in the textarea
     setPrompt(promptText || template.description);
     
     toast({
@@ -85,7 +150,6 @@ const Dashboard = () => {
       description: `${template.title} template with your parameters has been loaded`,
     });
     
-    // If this is a market research template, navigate to the report page
     if (activeCategory === "market-research") {
       navigate("/market-research-report");
     }
@@ -93,7 +157,6 @@ const Dashboard = () => {
   
   return (
     <div className="flex flex-col gap-6 w-full h-full">
-      {/* Welcome section */}
       <div className="flex flex-col gap-2">
         <h1 className="text-2xl font-bold">
           Welcome to your Customer Portal
@@ -105,14 +168,11 @@ const Dashboard = () => {
         )}
       </div>
       
-      {/* Main container with proper height */}
       <div className="flex flex-col flex-1 rounded-lg bg-white border border-gray-200 shadow-sm overflow-hidden">
-        {/* Messages area */}
         <div className="flex-1 overflow-hidden">
           <MessageList messages={messages} />
         </div>
         
-        {/* Input area */}
         <div className="border-t border-[#D6BCFA] bg-[#F3EFFD]">
           <PromptForm 
             prompt={prompt} 
@@ -122,19 +182,19 @@ const Dashboard = () => {
             setIsTemplateOpen={setIsTemplateOpen}
           />
 
-          {/* Template section */}
           <TemplateSection 
             isTemplateOpen={isTemplateOpen}
             setIsTemplateOpen={setIsTemplateOpen}
             activeCategory={activeCategory}
             setActiveCategory={setActiveCategory}
-            templates={templates}
+            templates={groupedTemplates}
+            isLoading={isLoadingTemplates}
+            error={templateError}
             onSelectTemplate={handleTemplateClick}
           />
         </div>
       </div>
 
-      {/* Template Parameter Modal */}
       <TemplateModal 
         isOpen={isModalOpen} 
         setIsOpen={setIsModalOpen}

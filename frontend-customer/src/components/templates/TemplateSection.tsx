@@ -1,4 +1,3 @@
-
 import { Collapsible, CollapsibleContent } from "@/components/ui/collapsible";
 import { Separator } from "@/components/ui/separator";
 import { CategoryTabs } from "./CategoryTabs";
@@ -12,6 +11,8 @@ interface TemplateSectionProps {
   setActiveCategory: (categoryId: string) => void;
   templates: Record<string, Template[]>;
   onSelectTemplate: (template: Template) => void;
+  isLoading?: boolean;
+  error?: string | null;
 }
 
 export const TemplateSection = ({ 
@@ -20,15 +21,17 @@ export const TemplateSection = ({
   activeCategory,
   setActiveCategory,
   templates,
-  onSelectTemplate
+  onSelectTemplate,
+  isLoading,
+  error
 }: TemplateSectionProps) => {
   const categories = [
-    { id: "market-research", label: "Market Research" },
-    { id: "creative-research", label: "Creative Research" },
-    { id: "social-listening", label: "Social Listening", comingSoon: true },
-    { id: "productivity", label: "Productivity" },
-    { id: "life", label: "Life", comingSoon: true },
-    { id: "data-analysis", label: "Data Analysis", comingSoon: true },
+    { id: "Market Research", label: "Market Research" },
+    { id: "Creative Research", label: "Creative Research" },
+    { id: "Social Listening", label: "Social Listening", comingSoon: true },
+    { id: "Productivity", label: "Productivity" },
+    { id: "Life", label: "Life", comingSoon: true },
+    { id: "Data Analysis", label: "Data Analysis", comingSoon: true },
   ];
   
   return (
@@ -41,11 +44,15 @@ export const TemplateSection = ({
             activeCategory={activeCategory} 
             setActiveCategory={setActiveCategory} 
           />
-          <TemplateGrid 
-            templates={templates[activeCategory] || []} 
-            categoryId={activeCategory}
-            onSelectTemplate={onSelectTemplate}
-          />
+          {isLoading && <p>Loading templates...</p>}
+          {error && <p className="text-destructive">Error: {error}</p>}
+          {!isLoading && !error && (
+            <TemplateGrid 
+              templates={templates[activeCategory] || []} 
+              categoryId={activeCategory}
+              onSelectTemplate={onSelectTemplate}
+            />
+          )}
         </div>
       </CollapsibleContent>
     </Collapsible>
