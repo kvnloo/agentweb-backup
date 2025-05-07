@@ -1,4 +1,3 @@
-
 import { Button } from "@/components/ui/button";
 import { Template } from "@/components/TemplateModal";
 
@@ -14,9 +13,9 @@ export const TemplateGrid = ({ templates, categoryId, onSelectTemplate }: Templa
       {templates?.map((template) => (
         <div 
           key={template.id} 
-          className="rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden cursor-pointer hover:border-primary/50 dark:hover:border-primary/50 hover:shadow-md transition-all"
+          className="flex flex-col rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden cursor-pointer hover:border-primary/50 dark:hover:border-primary/50 hover:shadow-md transition-all"
         >
-          <div className="p-4">
+          <div className="p-4 flex-grow">
             <div className="flex items-center gap-2 mb-2">
               <div className="rounded-full bg-gray-100 dark:bg-gray-800 p-1.5">
                 {template.icon}
