@@ -37,7 +37,9 @@ const TasksPage: React.FC = () => {
         const response = await axios.get(buildApiUrl('/api/tasks'), {
           headers: { Authorization: `Bearer ${token}` },
         });
-        setTasks(response.data as Task[]); // Assuming backend returns an array of Task
+        // Filter out archived tasks before setting state
+        const activeTasks = (response.data as Task[]).filter(task => task.status !== 'archived');
+        setTasks(activeTasks);
       } catch (err: any) {
         console.error("Failed to fetch tasks:", err);
         setError(err.response?.data?.message || "Failed to load tasks. Please try again later.");
