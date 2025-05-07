@@ -13,6 +13,7 @@ import Register from "@/pages/Register";
 import OAuthCallback from "@/pages/OAuthCallback";
 import ProtectedRoute from "@/components/auth/ProtectedRoute";
 import { AuthProvider } from "@/contexts/AuthContext";
+import TasksPage from "@/pages/Tasks.tsx";
 
 const queryClient = new QueryClient();
 
@@ -41,6 +42,13 @@ const App = () => (
               <ProtectedRoute>
                 <Layout>
                   <Settings />
+                </Layout>
+              </ProtectedRoute>
+            } />
+            <Route path="/tasks" element={
+              <ProtectedRoute>
+                <Layout>
+                  <TasksPage />
                 </Layout>
               </ProtectedRoute>
             } />

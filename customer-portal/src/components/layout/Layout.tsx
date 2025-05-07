@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { Home, FileText, Settings, ChevronLeft, ChevronRight, Bell } from "lucide-react";
+import { Home, FileText, Settings, ChevronLeft, ChevronRight, Bell, Activity } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/contexts/AuthContext";
@@ -22,9 +22,9 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
       ]
     },
     {
-      title: "RESOURCES",
+      title: "ACTIVITIES",
       items: [
-        { icon: FileText, label: "Reports", path: "/market-research-report", id: "market-research" },
+        { icon: Activity, label: "Tasks", path: "/tasks", id: "tasks" },
       ]
     },
     {
