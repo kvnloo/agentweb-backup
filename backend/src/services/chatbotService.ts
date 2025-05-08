@@ -471,19 +471,30 @@ export class ChatbotDB {
   }
 
   async getAllSessions(): Promise<ChatSession[]> {
-    const params = {
-      TableName: this.tableName,
-      // Note: In production, you might want to implement pagination
-      Limit: 1000 // Limit to latest 1000 sessions
-    };
+    let allSessions: ChatSession[] = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined = undefined;
 
-    try {
-      const result = await dynamodb.scan(params).promise();
-      return (result.Items || []) as ChatSession[];
-    } catch (error) {
-      console.error('Error getting all chat sessions:', error);
-      throw error;
-    }
+    do {
+      const params: AWS.DynamoDB.DocumentClient.ScanInput = {
+        TableName: this.tableName,
+        ExclusiveStartKey: lastEvaluatedKey,
+        // Consider if a smaller limit per scan iteration is better for performance/memory
+        // Limit: 1000 // Optional: Limit items per scan call, but loop will get all
+      };
+
+      try {
+        const result = await dynamodb.scan(params).promise();
+        if (result.Items) {
+          allSessions = allSessions.concat(result.Items as ChatSession[]);
+        }
+        lastEvaluatedKey = result.LastEvaluatedKey;
+      } catch (error) {
+        console.error('Error getting all chat sessions during scan:', error);
+        throw error; // Or handle more gracefully
+      }
+    } while (lastEvaluatedKey);
+
+    return allSessions;
   }
 }
 
@@ -831,23 +842,26 @@ export async function generateChatResponse(
     let activeKnowledgeBase: ContextChunk[];
     let combinedChunks: ContextChunk[];
     let pageChunksCount = 0;
+    let pageChunksResult: ContextChunk[] = [];
+
+    // Calculate page chunks if pageContent exists, regardless of portal type
+    if (pageContent) {
+      pageChunksResult = splitIntoChunks(pageContent);
+      pageChunksCount = pageChunksResult.length;
+    }
 
     if (portalType === 'customer') {
       activeKnowledgeBase = knowledgeBase.filter(chunk => chunk.metadata.source === 'user-guide');
-      combinedChunks = [...activeKnowledgeBase]; // Only user-guide for customers
-      // pageContent is ignored for RAG for customer portal
+      // Combine user-guide chunks with page chunks
+      combinedChunks = [...pageChunksResult, ...activeKnowledgeBase]; 
     } else { // Partner portal (or default)
       activeKnowledgeBase = knowledgeBase.filter(chunk => 
         chunk.metadata.source === 'guide' || 
         chunk.metadata.source === 'release' || 
         chunk.metadata.source === 'api'
       );
-      combinedChunks = [...activeKnowledgeBase]; // Start with partner-specific KB
-      if (pageContent) {
-        const pageChunksResult = splitIntoChunks(pageContent);
-        pageChunksCount = pageChunksResult.length;
-        combinedChunks = [...pageChunksResult, ...combinedChunks]; // Prepend page chunks for partner
-      }
+      // Combine partner KB chunks with page chunks
+      combinedChunks = [...pageChunksResult, ...activeKnowledgeBase];
     }
     
     // RAG: Retrieve relevant chunks from combinedChunks
