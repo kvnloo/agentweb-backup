@@ -7,7 +7,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Loader2, AlertCircle, Play, CheckCircle, RotateCcw, Clock, ArrowLeft, XCircle, History, X } from 'lucide-react';
+import { Loader2, AlertCircle, Play, CheckCircle, RotateCcw, Clock, ArrowLeft, XCircle, History, X, Folder } from 'lucide-react';
 import { toast } from "@/components/ui/use-toast";
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -48,6 +48,9 @@ interface Task {
   createdAt: string;
   updatedAt?: string;
   prompt?: string;
+  category?: string;
+  description?: string;
+  templateId?: string;
 }
 
 // Helper to get status badge variant (can be moved to utils)
@@ -253,21 +256,37 @@ const TaskDetailsPage: React.FC = () => {
 
       <Card>
         <CardHeader>
-          <div className="flex justify-between items-start gap-2">
+          <div className="flex justify-between items-start gap-2 mb-2">
             <CardTitle className="text-2xl font-bold">{task.name}</CardTitle>
             {getTaskStatusBadge(task.status)} 
           </div>
-          <CardDescription>
+          <CardDescription className="text-xs text-muted-foreground">
             Task ID: {task.taskId} | Created: {formatDate(task.createdAt)}
           </CardDescription>
+          {task.category && (
+            <div className="mt-2">
+              <Badge variant="secondary">
+                  <Folder className="mr-1.5 h-3.5 w-3.5" />
+                  {task.category}
+              </Badge>
+            </div>
+          )}
         </CardHeader>
         <CardContent className="space-y-4">
+          {task.description && (
+            <div className="pb-4 border-b">
+              <h3 className="font-semibold mb-1 text-sm">Description:</h3>
+              <p className="text-sm text-muted-foreground">
+                {task.description}
+              </p>
+            </div>
+          )}
           {task.prompt && (
             <div>
-              <h3 className="font-semibold mb-1">Prompt:</h3>
-              <p className="text-sm bg-gray-50 dark:bg-gray-800 p-3 rounded whitespace-pre-wrap font-mono">
+              <h3 className="font-semibold mb-1 text-sm">Prompt:</h3>
+              <pre className="text-sm bg-gray-50 dark:bg-gray-800 p-3 rounded whitespace-pre-wrap font-mono text-xs">
                 {task.prompt}
-              </p>
+              </pre>
             </div>
           )}
           <div className="pt-4 border-t">

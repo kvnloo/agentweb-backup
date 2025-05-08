@@ -398,7 +398,7 @@ export const taskDb = {
         ExpressionAttributeValues: {
           ':userId': userId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #adm',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #adm, category, description, templateId',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
@@ -447,7 +447,7 @@ export const taskDb = {
         Key: {
           taskId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #adm',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #adm, category, description, templateId',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',

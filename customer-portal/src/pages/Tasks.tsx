@@ -2,10 +2,9 @@ import React, { useEffect, useState } from 'react';
 import axios from 'axios';
 import { useAuth } from '@/contexts/AuthContext';
 import { buildApiUrl } from '@/config';
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
-import { Loader2, AlertCircle } from 'lucide-react';
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Loader2, AlertCircle, ChevronRight, FolderOpen } from 'lucide-react';
 import { Link } from 'react-router-dom';
 
 // Define the Task interface based on expected backend structure
@@ -16,17 +15,18 @@ interface Task {
   createdAt: string;
   updatedAt?: string;
   prompt?: string;
-  // Add other fields as necessary, e.g., resultSummary, resultLink, etc.
+  category?: string;
+  description?: string;
 }
 
 const TasksPage: React.FC = () => {
   const { token } = useAuth();
-  const [tasks, setTasks] = useState<Task[]>([]);
+  const [groupedTasks, setGroupedTasks] = useState<Record<string, Task[]>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    const fetchTasks = async () => {
+    const fetchTasksAndGroup = async () => {
       if (!token) {
         setError("Authentication token not found. Please log in.");
         setLoading(false);
@@ -38,9 +38,32 @@ const TasksPage: React.FC = () => {
         const response = await axios.get(buildApiUrl('/api/tasks'), {
           headers: { Authorization: `Bearer ${token}` },
         });
-        // Filter out archived tasks before setting state
+        
         const activeTasks = (response.data as Task[]).filter(task => task.status !== 'archived');
-        setTasks(activeTasks);
+        
+        const groups: Record<string, Task[]> = {};
+        activeTasks.forEach(task => {
+          const categoryName = task.category?.trim() ? task.category.trim() : 'Other';
+          if (!groups[categoryName]) {
+            groups[categoryName] = [];
+          }
+          groups[categoryName].push(task);
+        });
+
+        // Optional: Sort categories (e.g., 'Other' last)
+        const sortedCategoryNames = Object.keys(groups).sort((a, b) => {
+          if (a === 'Other') return 1;
+          if (b === 'Other') return -1;
+          return a.localeCompare(b);
+        });
+        
+        const sortedGroupedTasks: Record<string, Task[]> = {};
+        sortedCategoryNames.forEach(name => {
+            sortedGroupedTasks[name] = groups[name];
+        });
+
+        setGroupedTasks(sortedGroupedTasks);
+
       } catch (err: any) {
         console.error("Failed to fetch tasks:", err);
         setError(err.response?.data?.message || "Failed to load tasks. Please try again later.");
@@ -49,7 +72,7 @@ const TasksPage: React.FC = () => {
       }
     };
 
-    fetchTasks();
+    fetchTasksAndGroup();
   }, [token]);
 
   const getStatusBadgeVariant = (status: Task['status']) => {
@@ -62,6 +85,12 @@ const TasksPage: React.FC = () => {
       case 'archived': return 'outline';
       default: return 'secondary';
     }
+  };
+
+  const formatDate = (dateString: string) => {
+    return new Date(dateString).toLocaleDateString(undefined, {
+        year: 'numeric', month: 'short', day: 'numeric'
+    });
   };
 
   if (loading) {
@@ -83,46 +112,59 @@ const TasksPage: React.FC = () => {
     );
   }
 
+  const categoryOrder = Object.keys(groupedTasks);
+  const hasTasks = categoryOrder.some(categoryName => groupedTasks[categoryName].length > 0);
+
   return (
     <div className="container mx-auto py-8">
       <h1 className="text-3xl font-bold mb-8 text-gray-800 dark:text-white">My Tasks</h1>
       
-      {tasks.length === 0 ? (
+      {!hasTasks ? (
         <div className="bg-white dark:bg-gray-800 shadow rounded-lg p-6 text-center">
           <p className="text-gray-600 dark:text-gray-300">
-            You haven't created any tasks yet.
+            You haven't created any active tasks yet.
           </p>
-          {/* Optional: Add a button/link to go to Dashboard to create tasks */}
-          {/* <Button asChild className="mt-4"><Link to="/">Create a Task</Link></Button> */}
         </div>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {tasks.map((task) => (
-            <Link to={`/tasks/${task.taskId}`} key={task.taskId} className="no-underline">
-              <Card className="hover:shadow-lg transition-shadow duration-200 h-full flex flex-col">
-                <CardHeader>
-                  <CardTitle className="text-xl truncate" title={task.name}>{task.name}</CardTitle>
-                  <Badge variant={getStatusBadgeVariant(task.status)} className="capitalize w-fit">
-                    {task.status}
-                  </Badge>
-                </CardHeader>
-                <CardContent className="flex-grow">
-                  <p className="text-sm text-muted-foreground mb-1">
-                    Created: {new Date(task.createdAt).toLocaleDateString()} {new Date(task.createdAt).toLocaleTimeString()}
-                  </p>
-                  {task.updatedAt && task.status !== 'running' && task.status !== 'pending' && task.status !== 'queued' && (
-                    <p className="text-sm text-muted-foreground">
-                      Last Updated: {new Date(task.updatedAt).toLocaleDateString()} {new Date(task.updatedAt).toLocaleTimeString()}
-                    </p>
-                  )}
-                  {task.prompt && (
-                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-2 pt-2 border-t line-clamp-3" title={task.prompt}>
-                          {task.prompt}
-                      </p>
-                  )}
-                </CardContent>
-              </Card>
-            </Link>
+        <div className="space-y-8">
+          {categoryOrder.map((categoryName) => (
+            groupedTasks[categoryName].length > 0 && (
+              <section key={categoryName}>
+                <h2 className="text-2xl font-semibold mb-4 flex items-center text-gray-700 dark:text-gray-300">
+                  <FolderOpen className="mr-3 h-6 w-6 text-primary" /> 
+                  {categoryName}
+                </h2>
+                <ul className="bg-white dark:bg-gray-800 shadow rounded-lg divide-y divide-gray-200 dark:divide-gray-700">
+                  {groupedTasks[categoryName].map((task) => (
+                    <li key={task.taskId}>
+                      <Link 
+                        to={`/tasks/${task.taskId}`} 
+                        className="block hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors duration-150 p-4"
+                      >
+                        <div className="flex items-center justify-between">
+                          <div className="flex-1 min-w-0">
+                            <p className="text-md font-medium text-primary truncate" title={task.name}>
+                              {task.name}
+                            </p>
+                            <p className="text-xs text-muted-foreground">
+                              Created: {formatDate(task.createdAt)}
+                            </p>
+                            {task.description && (
+                                <p className="text-sm text-gray-600 dark:text-gray-400 mt-1 line-clamp-2" title={task.description}>
+                                    {task.description}
+                                </p>
+                            )}
+                          </div>
+                          <div className="flex items-center space-x-3 ml-4">
+                            <ChevronRight className="h-5 w-5 text-gray-400 dark:text-gray-500" />
+                          </div>
+                        </div>
+                      </Link>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            )
           ))}
         </div>
       )}
