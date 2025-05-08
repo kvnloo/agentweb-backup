@@ -335,6 +335,7 @@ export const taskDb = {
     category?: string;
     description?: string;
     llmName?: string | null;
+    templateId?: string;
   }) {
     try {
       const params = {

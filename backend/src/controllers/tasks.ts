@@ -98,7 +98,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           createdAt: new Date().toISOString(),
           llmName: req.body.llmName || null,
           category: category || template.category,
-          description: description || template.description
+          description: description || template.description,
+          templateId: templateId
         };
 
         const createdTask = await taskDb.createTask(task);
