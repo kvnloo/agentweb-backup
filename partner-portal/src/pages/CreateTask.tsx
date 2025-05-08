@@ -45,6 +45,7 @@ interface Template {
   isComplexTask: boolean;
   published: boolean;
   userId: string;
+  category?: string;
 }
 
 export default function CreateTask() {
@@ -199,12 +200,14 @@ export default function CreateTask() {
         emailNotification
       };
       
-      // If a template is selected, include its ID and parameter values
-      if (selectedTemplate) {
-        taskData.templateId = selectedTemplate;
+      // If a template is selected, include its ID, parameter values, category, and description
+      if (selectedTemplateObj) {
+        taskData.templateId = selectedTemplateObj.templateId;
         if (Object.keys(parameterValues).length > 0) {
           taskData.parameterValues = parameterValues;
         }
+        taskData.category = selectedTemplateObj.category;
+        taskData.description = selectedTemplateObj.description;
       }
 
       await axios.post(
