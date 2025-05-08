@@ -29,9 +29,6 @@ export const TemplateSection = ({
     { id: "Market Research", label: "Market Research" },
     { id: "Creative Research", label: "Creative Research" },
     { id: "Social Listening", label: "Social Listening", comingSoon: true },
-    { id: "Productivity", label: "Productivity" },
-    { id: "Life", label: "Life", comingSoon: true },
-    { id: "Data Analysis", label: "Data Analysis", comingSoon: true },
   ];
   
   return (

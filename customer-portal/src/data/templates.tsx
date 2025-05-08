@@ -167,20 +167,5 @@ export const templates: Record<string, Template[]> = {
       ],
       promptTemplate: "Conduct social listening for [brand name] over the [time period] period across [social platforms]. Compare mentions and sentiment against competitors [main competitors]. Track related keywords [related keywords] and provide sentiment analysis [sentiment analysis]. Deliver insights on brand perception, emerging trends, and recommendation for engagement strategy."
     }
-  ],
-  "productivity": [
-    {
-      id: "13",
-      title: "API Stats Information",
-      description: "This template helps you get an overview of the API integrated to the platform",
-      category: "productivity",
-      icon: <Code className="h-5 w-5" />,
-      parameters: [
-        { id: "api_name", name: "API name", required: true }
-      ],
-      promptTemplate: "Generate a comprehensive statistical report for the [API name] integration. Include usage metrics, performance statistics, error rates, and integration health. Provide recommendations for optimization based on current usage patterns."
-    }
-  ],
-  "life": [],
-  "data-analysis": []
+  ]
 };
