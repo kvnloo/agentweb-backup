@@ -14,7 +14,6 @@ import ProtectedRoute from "@/components/auth/ProtectedRoute";
 import { AuthProvider } from "@/contexts/AuthContext";
 import TasksPage from "@/pages/Tasks.tsx";
 import TaskDetailsPage from "@/pages/TaskDetails.tsx";
-import ExecutionDetailPopupPage from "@/pages/ExecutionDetailPopup.tsx";
 
 const queryClient = new QueryClient();
 
@@ -30,9 +29,6 @@ const App = () => (
             <Route path="/login" element={<Login />} />
             <Route path="/register" element={<Register />} />
             <Route path="/oauth-callback" element={<OAuthCallback />} />
-            
-            {/* Route for the execution detail popup - public but relies on sessionStorage */}
-            <Route path="/execution-popup" element={<ExecutionDetailPopupPage />} />
             
             {/* Protected routes */}
             <Route path="/" element={

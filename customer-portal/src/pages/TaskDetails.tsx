@@ -3,12 +3,15 @@ import { useParams, useNavigate, Link } from 'react-router-dom';
 import axios from 'axios';
 import { useAuth } from '@/contexts/AuthContext';
 import { buildApiUrl } from '@/config';
-import { Card, CardContent, CardHeader, CardTitle, CardDescription, CardFooter } from '@/components/ui/card';
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Loader2, AlertCircle, Play, CheckCircle, RotateCcw, Clock, ArrowLeft, XCircle, History } from 'lucide-react';
+import { Loader2, AlertCircle, Play, CheckCircle, RotateCcw, Clock, ArrowLeft, XCircle, History, X } from 'lucide-react';
 import { toast } from "@/components/ui/use-toast";
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import { Separator } from '@/components/ui/separator';
 
 // Define Execution Status type
 type ExecutionStatus = 'pending' | 'running' | 'completed' | 'failed' | 'queued';
@@ -17,37 +20,31 @@ type ExecutionStatus = 'pending' | 'running' | 'completed' | 'failed' | 'queued'
 interface Execution {
   executionId: string;
   status: ExecutionStatus;
-  startedAt?: string; // Will be called startTime from API
   completedAt?: string;
-  resultSummary?: string; // This might be derived from 'result' or a separate field
-  resultLink?: string; // Link to full results if applicable - maybe browser_use_log?
-  error?: string; // Error message if failed
+  error?: string;
   
   // Fields from API response
-  startTime: string; // Note: API uses startTime, UI used startedAt. Standardizing to startTime.
+  startTime: string;
   taskId: string;
   llmName?: string;
-  userId?: string; // Assuming it might be useful contextually, though not directly displayed.
-  details_gif?: string;
-  outputAsJson?: boolean;
+  userId?: string;
   prompt: string;
   result: string;
-  browser_use_log?: string;
 }
 
 // Update TaskDetail interface
 interface TaskDetail extends Task {
   parameterValues?: Record<string, string>;
-  executions?: Execution[]; // Use the defined Execution interface
-  resultSummary?: string; // Overall task result summary might still be useful
-  resultLink?: string;    // Overall task result link
+  executions?: Execution[];
+  resultSummary?: string;
+  resultLink?: string;
 }
 
-// Base Task interface (can be moved to a shared types file)
+// Base Task interface
 interface Task {
   taskId: string;
   name: string;
-  status: ExecutionStatus | 'archived'; // Use ExecutionStatus here too
+  status: ExecutionStatus | 'archived';
   createdAt: string;
   updatedAt?: string;
   prompt?: string;
@@ -102,17 +99,19 @@ const formatDate = (dateStr?: string) => {
   }
 };
 
-const SESSION_STORAGE_KEY = 'currentExecutionPopupData'; // Key for sessionStorage
-
 const TaskDetailsPage: React.FC = () => {
   const { taskId } = useParams<{ taskId: string }>();
-  const { token, user } = useAuth();
+  const { token } = useAuth();
   const navigate = useNavigate();
   const [task, setTask] = useState<TaskDetail | null>(null);
   const [executions, setExecutions] = useState<Execution[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(false);
+
+  const [selectedExecutionDetail, setSelectedExecutionDetail] = useState<Execution | null>(null);
+  const [isDetailFrameOpen, setIsDetailFrameOpen] = useState(false);
+  const detailFrameRef = useRef<HTMLDivElement>(null);
 
   const executionsRef = useRef<Execution[]>(executions);
   const taskRef = useRef<TaskDetail | null>(task);
@@ -179,6 +178,25 @@ const TaskDetailsPage: React.FC = () => {
     return () => clearInterval(intervalId);
   }, [taskId, token]);
 
+  // Click outside handler for the floating frame
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (detailFrameRef.current && !detailFrameRef.current.contains(event.target as Node)) {
+        setIsDetailFrameOpen(false);
+      }
+    };
+
+    if (isDetailFrameOpen) {
+      document.addEventListener('mousedown', handleClickOutside);
+    } else {
+      document.removeEventListener('mousedown', handleClickOutside);
+    }
+
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [isDetailFrameOpen]);
+
   const handleRunTask = async () => {
     if (!token || !taskId) {
       toast({ title: "Error", description: "Cannot run task. Missing ID or token.", variant: "destructive" });
@@ -204,25 +222,14 @@ const TaskDetailsPage: React.FC = () => {
   };
 
   const handleExecutionClick = (execution: Execution) => {
-    try {
-      sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(execution));
-      // Open a new window. Adjust features string as needed.
-      // Common features: 'width=800,height=700,resizable,scrollbars'
-      const popup = window.open('/execution-popup', '_blank', 'width=800,height=700,scrollbars=yes,resizable=yes');
-      if (popup) {
-        popup.focus(); // Bring the new window to the front
-      } else {
-        toast({
-          title: "Popup Blocked",
-          description: "Please allow popups for this site to view execution details.",
-          variant: "destructive"
-        });
-      }
-    } catch (e) {
-      console.error("Error opening execution popup or setting sessionStorage:", e);
-      toast({ title: "Error", description: "Could not open execution details.", variant: "destructive" });
-    }
+    setSelectedExecutionDetail(execution);
+    setIsDetailFrameOpen(true);
   };
+
+  const closeDetailFrame = () => {
+    setIsDetailFrameOpen(false);
+    setSelectedExecutionDetail(null);
+  }
 
   if (loading && !task) {
      return <div className="flex justify-center items-center h-64"><Loader2 className="h-8 w-8 animate-spin text-primary" /></div>;
@@ -239,9 +246,9 @@ const TaskDetailsPage: React.FC = () => {
   }
 
   return (
-    <div className="container mx-auto py-8 space-y-6">
+    <div className="container mx-auto py-8 space-y-6 relative">
       <Button variant="outline" size="sm" onClick={() => navigate('/tasks')} >
-        &larr; Back to Tasks
+        <ArrowLeft className="mr-2 h-4 w-4" /> Back to Tasks
       </Button>
 
       <Card>
@@ -307,7 +314,7 @@ const TaskDetailsPage: React.FC = () => {
               <Card 
                 key={exec.executionId} 
                 className="bg-slate-50 dark:bg-slate-800/50 hover:shadow-md transition-shadow cursor-pointer"
-                onClick={() => handleExecutionClick(exec)} // Make card clickable
+                onClick={() => handleExecutionClick(exec)}
               >
                 <CardHeader className="pb-2">
                   <div className="flex justify-between items-center gap-2">
@@ -328,12 +335,7 @@ const TaskDetailsPage: React.FC = () => {
                       <AlertDescription>{exec.error}</AlertDescription>
                     </Alert>
                   )}
-                  {exec.resultSummary && (
-                    <p className="pt-2 mt-2 border-t border-dashed">Summary: {exec.resultSummary}</p>
-                  )}
-                  {/* Removed the direct link to exec.resultLink as the whole card is clickable now */}
-                  {/* We can add a small button/icon for "View Details" if preferred over whole card click */}
-                  {!exec.resultSummary && exec.result && (
+                  {exec.result && (
                      <p className="pt-2 mt-2 border-t border-dashed">
                        Result: {exec.result.substring(0, 100)}{exec.result.length > 100 ? '...' : ''}
                      </p>
@@ -346,6 +348,61 @@ const TaskDetailsPage: React.FC = () => {
           <p className="text-muted-foreground">No executions found for this task.</p>
         )}
       </div>
+
+      {/* Floating Detail Frame */}
+      {isDetailFrameOpen && selectedExecutionDetail && (
+        <>
+          {/* Backdrop for click-outside-to-close */}
+          <div 
+            className="fixed inset-0 bg-black/30 z-40 backdrop-blur-sm"
+            onClick={closeDetailFrame} 
+          />
+          <div 
+            ref={detailFrameRef}
+            className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[90vw] max-w-2xl max-h-[85vh] bg-card border shadow-2xl rounded-lg flex flex-col p-0"
+          >
+            <div className="flex items-center justify-between p-4 border-b">
+              <h3 className="text-lg font-semibold">Execution: {selectedExecutionDetail.executionId}</h3>
+              <Button variant="ghost" size="icon" onClick={closeDetailFrame} className="rounded-full">
+                <X className="h-5 w-5" />
+              </Button>
+            </div>
+            <div className="p-4 space-y-3 overflow-y-auto flex-grow">
+              <div>
+                <h4 className="font-semibold text-sm mb-0.5">Details</h4>
+                <p className="text-xs">Task ID: {selectedExecutionDetail.taskId}</p>
+                <p className="text-xs">Status: {selectedExecutionDetail.status}</p>
+                {selectedExecutionDetail.llmName && <p className="text-xs">LLM: {selectedExecutionDetail.llmName}</p>}
+              </div>
+              <Separator/>
+              <div>
+                <h4 className="font-semibold text-sm mb-0.5">Timings</h4>
+                <p className="text-xs">Started: {formatDate(selectedExecutionDetail.startTime)}</p>
+                <p className="text-xs">Completed: {formatDate(selectedExecutionDetail.completedAt)}</p>
+              </div>
+              <Separator/>
+              <div>
+                <h4 className="font-semibold text-sm mb-0.5">Prompt</h4>
+                <pre className="bg-muted p-2 rounded-md text-xs whitespace-pre-wrap break-words max-h-40 overflow-y-auto">
+                  {selectedExecutionDetail.prompt}
+                </pre>
+              </div>
+              <Separator/>
+              <div>
+                <h4 className="font-semibold text-sm mb-0.5">Result</h4>
+                <div className="prose prose-sm dark:prose-invert max-w-none p-2 rounded-md bg-muted text-xs">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {selectedExecutionDetail.result}
+                  </ReactMarkdown>
+                </div>
+              </div>
+            </div>
+            <div className="p-4 border-t flex justify-end">
+                <Button variant="outline" onClick={closeDetailFrame}>Close</Button>
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 };
