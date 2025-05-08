@@ -1,13 +1,13 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import axios from 'axios';
 import { useAuth } from '@/contexts/AuthContext';
 import { buildApiUrl } from '@/config';
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
+import { Card, CardContent, CardHeader, CardTitle, CardDescription, CardFooter } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Loader2, AlertCircle, Play, CheckCircle, RotateCcw, Clock } from 'lucide-react';
+import { Loader2, AlertCircle, Play, CheckCircle, RotateCcw, Clock, ArrowLeft, XCircle, History } from 'lucide-react';
 import { toast } from "@/components/ui/use-toast";
 
 // Define Execution Status type
@@ -17,11 +17,22 @@ type ExecutionStatus = 'pending' | 'running' | 'completed' | 'failed' | 'queued'
 interface Execution {
   executionId: string;
   status: ExecutionStatus;
-  startedAt?: string;
+  startedAt?: string; // Will be called startTime from API
   completedAt?: string;
-  resultSummary?: string;
-  resultLink?: string; // Link to full results if applicable
+  resultSummary?: string; // This might be derived from 'result' or a separate field
+  resultLink?: string; // Link to full results if applicable - maybe browser_use_log?
   error?: string; // Error message if failed
+  
+  // Fields from API response
+  startTime: string; // Note: API uses startTime, UI used startedAt. Standardizing to startTime.
+  taskId: string;
+  llmName?: string;
+  userId?: string; // Assuming it might be useful contextually, though not directly displayed.
+  details_gif?: string;
+  outputAsJson?: boolean;
+  prompt: string;
+  result: string;
+  browser_use_log?: string;
 }
 
 // Update TaskDetail interface
@@ -73,15 +84,29 @@ const getTaskStatusBadge = (status: Task['status']) => {
 const formatDate = (dateStr?: string) => {
   if (!dateStr) return 'N/A';
   try {
-    return new Date(dateStr).toLocaleString();
+    // Attempt to handle various date string formats
+    const date = new Date(dateStr);
+    if (isNaN(date.getTime())) { // Check if date is invalid
+        // Try to parse if it's a string that looks like ISO but might miss 'T' or 'Z'
+        const parts = dateStr.match(/(\d{4})-(\d{2})-(\d{2})[T ]?(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?([Zz]|([+-])(\d{2}):?(\d{2}))?/);
+        if (parts) {
+            const isoStr = `${parts[1]}-${parts[2]}-${parts[3]}T${parts[4]}:${parts[5]}:${parts[6]}${parts[7] || 'Z'}`;
+            const parsedDate = new Date(isoStr);
+            if (!isNaN(parsedDate.getTime())) return parsedDate.toLocaleString();
+        }
+        return 'Invalid Date';
+    }
+    return date.toLocaleString();
   } catch (e) {
     return 'Invalid Date';
   }
 };
 
+const SESSION_STORAGE_KEY = 'currentExecutionPopupData'; // Key for sessionStorage
+
 const TaskDetailsPage: React.FC = () => {
   const { taskId } = useParams<{ taskId: string }>();
-  const { token } = useAuth();
+  const { token, user } = useAuth();
   const navigate = useNavigate();
   const [task, setTask] = useState<TaskDetail | null>(null);
   const [executions, setExecutions] = useState<Execution[]>([]);
@@ -89,11 +114,9 @@ const TaskDetailsPage: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(false);
 
-  // Refs to hold the latest state for the interval callback
   const executionsRef = useRef<Execution[]>(executions);
   const taskRef = useRef<TaskDetail | null>(task);
 
-  // Update refs whenever state changes
   useEffect(() => {
     executionsRef.current = executions;
   }, [executions]);
@@ -108,8 +131,7 @@ const TaskDetailsPage: React.FC = () => {
       setLoading(false);
       return;
     }
-    // Only set initial loading true
-    if (!taskRef.current) { // Check ref instead of state
+    if (!taskRef.current) {
       setLoading(true);
     }
     setError(null);
@@ -118,15 +140,15 @@ const TaskDetailsPage: React.FC = () => {
         headers: { Authorization: `Bearer ${token}` },
       });
       const taskData = taskResponse.data as TaskDetail;
-      setTask(taskData); // This triggers the taskRef update effect
+      setTask(taskData);
 
       const executionsResponse = await axios.get(buildApiUrl(`/api/tasks/${taskId}/executions`), {
          headers: { Authorization: `Bearer ${token}` },
       });
       const sortedExecutions = (executionsResponse.data as Execution[]).sort((a, b) => 
-        new Date(b.startedAt || 0).getTime() - new Date(a.startedAt || 0).getTime()
+        new Date(b.startTime || 0).getTime() - new Date(a.startTime || 0).getTime()
       );
-      setExecutions(sortedExecutions); // This triggers the executionsRef update effect
+      setExecutions(sortedExecutions);
 
     } catch (err: any) {
       console.error("Failed to fetch task data:", err);
@@ -134,16 +156,14 @@ const TaskDetailsPage: React.FC = () => {
       setTask(null);
       setExecutions([]);
     } finally {
-      // Ensure loading is false even if initial check was skipped
       setLoading(false); 
     }
   };
 
   useEffect(() => {
-    fetchTaskAndExecutions(); // Initial fetch
+    fetchTaskAndExecutions();
     
     const intervalId = setInterval(() => {
-      // Read latest state from refs inside the interval
       const currentExecutions = executionsRef.current;
       const latestExecution = currentExecutions.length > 0 ? currentExecutions[0] : null;
       
@@ -157,7 +177,7 @@ const TaskDetailsPage: React.FC = () => {
     }, 5000); 
 
     return () => clearInterval(intervalId);
-  }, [taskId, token]); // Keep dependencies minimal
+  }, [taskId, token]);
 
   const handleRunTask = async () => {
     if (!token || !taskId) {
@@ -180,6 +200,27 @@ const TaskDetailsPage: React.FC = () => {
       });
     } finally {
       setIsRunning(false);
+    }
+  };
+
+  const handleExecutionClick = (execution: Execution) => {
+    try {
+      sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(execution));
+      // Open a new window. Adjust features string as needed.
+      // Common features: 'width=800,height=700,resizable,scrollbars'
+      const popup = window.open('/execution-popup', '_blank', 'width=800,height=700,scrollbars=yes,resizable=yes');
+      if (popup) {
+        popup.focus(); // Bring the new window to the front
+      } else {
+        toast({
+          title: "Popup Blocked",
+          description: "Please allow popups for this site to view execution details.",
+          variant: "destructive"
+        });
+      }
+    } catch (e) {
+      console.error("Error opening execution popup or setting sessionStorage:", e);
+      toast({ title: "Error", description: "Could not open execution details.", variant: "destructive" });
     }
   };
 
@@ -263,7 +304,11 @@ const TaskDetailsPage: React.FC = () => {
         {executions && executions.length > 0 ? (
           <div className="space-y-4">
             {executions.map((exec) => (
-              <Card key={exec.executionId} className="bg-slate-50 dark:bg-slate-800/50">
+              <Card 
+                key={exec.executionId} 
+                className="bg-slate-50 dark:bg-slate-800/50 hover:shadow-md transition-shadow cursor-pointer"
+                onClick={() => handleExecutionClick(exec)} // Make card clickable
+              >
                 <CardHeader className="pb-2">
                   <div className="flex justify-between items-center gap-2">
                     <CardDescription>Execution ID: {exec.executionId}</CardDescription>
@@ -271,8 +316,8 @@ const TaskDetailsPage: React.FC = () => {
                   </div>
                 </CardHeader>
                 <CardContent className="space-y-1 text-sm">
-                  {exec.startedAt && (
-                    <p>Started: {formatDate(exec.startedAt)}</p>
+                  {exec.startTime && (
+                    <p>Started: {formatDate(exec.startTime)}</p>
                   )}
                   {exec.completedAt && (
                     <p>Completed: {formatDate(exec.completedAt)}</p>
@@ -286,12 +331,12 @@ const TaskDetailsPage: React.FC = () => {
                   {exec.resultSummary && (
                     <p className="pt-2 mt-2 border-t border-dashed">Summary: {exec.resultSummary}</p>
                   )}
-                  {exec.resultLink && (
-                    <Button variant="link" size="sm" asChild className="p-0 h-auto mt-1">
-                      <Link to={exec.resultLink} target="_blank" rel="noopener noreferrer">
-                        View Full Result
-                      </Link>
-                    </Button>
+                  {/* Removed the direct link to exec.resultLink as the whole card is clickable now */}
+                  {/* We can add a small button/icon for "View Details" if preferred over whole card click */}
+                  {!exec.resultSummary && exec.result && (
+                     <p className="pt-2 mt-2 border-t border-dashed">
+                       Result: {exec.result.substring(0, 100)}{exec.result.length > 100 ? '...' : ''}
+                     </p>
                   )}
                 </CardContent>
               </Card>
