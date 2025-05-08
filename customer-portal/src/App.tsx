@@ -14,6 +14,7 @@ import ProtectedRoute from "@/components/auth/ProtectedRoute";
 import { AuthProvider } from "@/contexts/AuthContext";
 import TasksPage from "@/pages/Tasks.tsx";
 import TaskDetailsPage from "@/pages/TaskDetails.tsx";
+import GuidePage from "@/pages/GuidePage.tsx";
 
 const queryClient = new QueryClient();
 
@@ -56,6 +57,13 @@ const App = () => (
               <ProtectedRoute>
                 <Layout>
                   <TaskDetailsPage />
+                </Layout>
+              </ProtectedRoute>
+            } />
+            <Route path="/guide" element={
+              <ProtectedRoute>
+                <Layout>
+                  <GuidePage />
                 </Layout>
               </ProtectedRoute>
             } />

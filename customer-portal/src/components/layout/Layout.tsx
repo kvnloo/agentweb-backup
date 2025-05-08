@@ -28,6 +28,12 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
       ]
     },
     {
+      title: "DOCUMENTS",
+      items: [
+        { icon: FileText, label: "User Guide", path: "/guide", id: "guide" },
+      ]
+    },
+    {
       title: "ACCOUNT",
       items: [
         { icon: Settings, label: "Settings", path: "/settings", id: "settings" },
