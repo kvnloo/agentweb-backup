@@ -250,6 +250,21 @@ const TaskDetailsPage: React.FC = () => {
 
   return (
     <div className="container mx-auto py-8 space-y-6 relative">
+      {/* Hidden divs for the full result of each execution */}
+      {executions.map((exec, index) => (
+        exec.result && (
+          <div 
+            key={`hidden-exec-result-${exec.executionId || index}`} 
+            id={`full-exec-result-${exec.executionId || index}`} 
+            className="hidden-execution-result"
+            style={{ display: 'none' }} 
+            aria-hidden="true"
+          >
+            {exec.result}
+          </div>
+        )
+      ))}
+
       <Button variant="outline" size="sm" onClick={() => navigate('/tasks')} >
         <ArrowLeft className="mr-2 h-4 w-4" /> Back to Tasks
       </Button>
