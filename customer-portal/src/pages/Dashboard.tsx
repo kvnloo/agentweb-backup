@@ -51,18 +51,6 @@ const Dashboard = () => {
   const [templateError, setTemplateError] = useState<string | null>(null);
   
   useEffect(() => {
-    if (user && messages.length === 0) {
-      const welcomeMessage: Message = {
-        id: "welcome",
-        content: `Welcome back, ${user.email.split('@')[0]}! How can I assist you today?`,
-        sender: "ai",
-        timestamp: new Date(),
-      };
-      setMessages([welcomeMessage]);
-    }
-  }, [user, messages.length]);
-
-  useEffect(() => {
     const fetchTemplatesFromApi = async () => {
       setIsLoadingTemplates(true);
       setTemplateError(null);
@@ -117,26 +105,69 @@ const Dashboard = () => {
     setGroupedTemplates(newGroupedTemplates);
   }, [allFetchedTemplates]);
   
-  const handleChatSubmit = (e: React.FormEvent) => {
+  // This function will now handle creating a task from the main dashboard prompt
+  const handleCreateTaskFromDashboardPrompt = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (promptTextState.trim()) {
-      const userMessage: Message = {
-        id: Date.now().toString(),
-        content: promptTextState,
-        sender: "user",
-        timestamp: new Date(),
-      };
-      setMessages([...messages, userMessage]);
-      setPromptTextState("");
-      setTimeout(() => {
-        const aiMessage: Message = {
-          id: (Date.now() + 1).toString(),
-          content: `I'll help you with your request about "${promptTextState.substring(0, 30)}${promptTextState.length > 30 ? '...' : ''}"`,
-          sender: "ai",
-          timestamp: new Date(),
-        };
-        setMessages(prev => [...prev, aiMessage]);
-      }, 1000);
+    const promptContent = promptTextState;
+
+    if (!user || !token) {
+      toast({
+        title: "Error",
+        description: "User not authenticated. Please log in again.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    if (!promptContent.trim()) {
+      toast({
+        title: "Input Required",
+        description: "Please enter task details or a question.",
+        variant: "default", // Changed to default as it's informational
+      });
+      return;
+    }
+
+    // Generate a name for the task
+    const taskName = `Task: ${promptContent.substring(0, 50)}${promptContent.length > 50 ? '...' : ''}`;
+
+    const taskPayload = {
+      name: taskName,
+      prompt: promptContent,
+      isInteractive: false,
+      isDeepResearch: false,
+      isComplexTask: false,
+      emailNotification: false, 
+      extractPageContent: false,
+      category: "General", 
+      description: "Task created from dashboard prompt.",
+      parameterValues: {}, 
+    };
+
+    console.log("Attempting to create direct task from dashboard prompt with payload:", taskPayload);
+    setPromptTextState(""); // Clear input immediately
+
+    try {
+      const response = await axios.post(buildApiUrl('/api/tasks'), taskPayload, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      console.log("Direct task creation API response:", response.data);
+
+      toast({
+        title: "Task Created Successfully",
+        description: `Task "${taskName}" has been created. You will be redirected.`,
+      });
+      
+      navigate("/tasks"); // Navigate after success
+
+    } catch (error: any) {
+      console.error("Direct task creation failed:", error);
+      const errorMessageText = error.response?.data?.message || "Could not create the task. Please try again.";
+      toast({
+        title: "Task Creation Failed",
+        description: errorMessageText,
+        variant: "destructive",
+      });
     }
   };
 
@@ -249,17 +280,22 @@ const Dashboard = () => {
       </div>
       
       <div className="flex flex-col flex-1 rounded-lg bg-white border border-gray-200 shadow-sm overflow-hidden">
-        <div className="flex-1 overflow-hidden">
-          <MessageList messages={messages} />
-        </div>
+        {/* Conditionally render the MessageList container only if there are messages */}
+        {messages.length > 0 && (
+          <div className="flex-1 overflow-hidden">
+            <MessageList messages={messages} />
+          </div>
+        )}
         
         <div className="border-t border-[#D6BCFA] bg-[#F3EFFD]">
           <PromptForm 
             prompt={promptTextState} 
             setPrompt={setPromptTextState} 
-            onSubmit={handleChatSubmit} 
+            onSubmit={handleCreateTaskFromDashboardPrompt} 
             isTemplateOpen={isTemplateOpen}
             setIsTemplateOpen={setIsTemplateOpen}
+            placeholder="Enter your prompt to create a new task"
+            buttonText="Create Task"
           />
 
           <TemplateSection 

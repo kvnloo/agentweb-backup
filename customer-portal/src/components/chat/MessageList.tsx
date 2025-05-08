@@ -1,4 +1,3 @@
-
 import { cn } from "@/lib/utils";
 import { Message } from "@/types/chat";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -30,21 +29,8 @@ export const MessageList = ({ messages }: MessageListProps) => {
               </div>
             </div>
           ))}
-          {messages.length === 0 && <EmptyState />}
         </div>
       </ScrollArea>
-    </div>
-  );
-};
-
-const EmptyState = () => {
-  return (
-    <div className="flex flex-col items-center justify-center h-full text-center text-gray-700 py-20">
-      <div className="w-16 h-16 rounded-full agent-gradient flex items-center justify-center mb-4">
-        <span className="text-white text-2xl font-bold">E</span>
-      </div>
-      <h2 className="text-xl font-semibold text-gray-700">Emma</h2>
-      <p className="max-w-sm mt-2">Your 24/7 marketing operator. Ask Emma to run market research, plan and optimize campaigns, or track performance metrics.</p>
     </div>
   );
 };

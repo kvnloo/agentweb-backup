@@ -1,4 +1,3 @@
-
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Send, ChevronDown, ChevronUp } from "lucide-react";
@@ -10,6 +9,8 @@ interface PromptFormProps {
   onSubmit: (e: React.FormEvent) => void;
   isTemplateOpen: boolean;
   setIsTemplateOpen: (isOpen: boolean) => void;
+  placeholder?: string;
+  buttonText?: string;
 }
 
 export const PromptForm = ({ 
@@ -17,16 +18,18 @@ export const PromptForm = ({
   setPrompt, 
   onSubmit,
   isTemplateOpen,
-  setIsTemplateOpen
+  setIsTemplateOpen,
+  placeholder,
+  buttonText
 }: PromptFormProps) => {
   return (
     <form onSubmit={onSubmit} className="p-4">
       <div className="relative">
         <Textarea
-          placeholder="Enter your task details or question..."
+          placeholder={placeholder || "Enter your task details or question..."}
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
-          className="resize-none p-4 min-h-[180px] bg-white border-[#D6BCFA] rounded-lg"
+          className="resize-none p-4 min-h-[180px] bg-white border-[#D6BCFA] rounded-lg text-gray-900"
         />
       </div>
       <div className="flex justify-between mt-4">
@@ -44,7 +47,7 @@ export const PromptForm = ({
           className="bg-[#9b87f5] hover:bg-[#7E69AB] text-white"
         >
           <Send className="h-4 w-4 mr-2" />
-          Submit
+          {buttonText || "Submit"}
         </Button>
       </div>
     </form>
