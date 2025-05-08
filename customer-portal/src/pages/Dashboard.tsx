@@ -205,6 +205,8 @@ const Dashboard = () => {
       isDeepResearch: templateData.isDeepResearch || false,
       isComplexTask: templateData.isComplexTask || false,
       emailNotification: emailNotification,
+      category: templateData.category,
+      description: templateData.description,
     };
 
     console.log("Attempting to create task with payload:", taskPayload);

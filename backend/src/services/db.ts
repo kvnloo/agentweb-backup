@@ -332,6 +332,9 @@ export const taskDb = {
     isAgenticDevMode?: boolean;
     emailNotification?: boolean;
     attachments?: TaskAttachment[];
+    category?: string;
+    description?: string;
+    llmName?: string | null;
   }) {
     try {
       const params = {

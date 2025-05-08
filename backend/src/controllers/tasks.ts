@@ -25,7 +25,19 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const { name, prompt, isInteractive, isDeepResearch, emailNotification, templateId, parameterValues, isComplexTask, extractPageContent } = req.body;
+    const { 
+      name, 
+      prompt, 
+      isInteractive, 
+      isDeepResearch, 
+      emailNotification, 
+      templateId, 
+      parameterValues, 
+      isComplexTask, 
+      extractPageContent, 
+      category,
+      description
+    } = req.body;
     
     // If templateId is provided, fetch the template and use its values
     if (templateId) {
@@ -84,7 +96,9 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           isComplexTask: isComplexTask !== undefined ? Boolean(isComplexTask) : template.isComplexTask,
           extractPageContent: extractPageContent !== undefined ? Boolean(extractPageContent) : template.extractPageContent,
           createdAt: new Date().toISOString(),
-          llmName: req.body.llmName || null
+          llmName: req.body.llmName || null,
+          category: category || template.category,
+          description: description || template.description
         };
 
         const createdTask = await taskDb.createTask(task);
@@ -112,7 +126,9 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       isComplexTask: Boolean(isComplexTask),  // Convert to boolean
       extractPageContent: extractPageContent ?? isDeepResearch,  // Convert to boolean
       createdAt: new Date().toISOString(),
-      llmName: req.body.llmName || null
+      llmName: req.body.llmName || null,
+      category: category,
+      description: description
     };
 
     const createdTask = await taskDb.createTask(task);
