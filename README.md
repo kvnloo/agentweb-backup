@@ -333,6 +333,29 @@ zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json
 
 Note: Environment variables must be set during build time for the frontend, as Vite replaces them at build time. Runtime environment variables in Elastic Beanstalk are not used by the frontend application.
 
+### Customer Portal Deployment
+
+1. Build the production version and create deployment package:
+```bash
+cd customer-portal && \
+VITE_API_URL=https://api.agentweb.pro \
+VITE_DEBUG=false \
+npm run build && \
+VERSION="0.1" && \
+mkdir -p builds && \
+zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json server.js
+```
+
+2. Create a new application in Elastic Beanstalk:
+   - Go to AWS Management Console > Elastic Beanstalk
+   - Click "Create application"
+   - Enter application name (e.g., "agentweb-customer-portal")
+   - Choose "Node.js" as platform
+   - Upload the versioned zip file from `builds/deploy_v${VERSION}.zip`
+   - Click "Create application"
+
+Note: Environment variables must be set during build time for the frontend, as Vite replaces them at build time. Runtime environment variables in Elastic Beanstalk are not used by the frontend application.
+
 ### Backend Deployment
 
 1. Build the backend and create deployment package:

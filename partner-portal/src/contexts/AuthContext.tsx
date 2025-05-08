@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useCallback, useEffect } from 'react';
 import axios from 'axios';
-import { API_URL, buildApiUrl } from '../config';
+import { buildApiUrl } from '../config';
 
 // Define the possible user roles
 export type UserRole = 'partner' | 'customer';

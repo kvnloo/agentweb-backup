@@ -11,7 +11,7 @@ import {
   CircularProgress,
   Alert
 } from '@mui/material';
-import { useAuth, UserRole } from '../contexts/AuthContext';
+import { useAuth } from '../contexts/AuthContext';
 import { useParams } from 'react-router-dom';
 import { useState, useEffect } from 'react';
 import axios, { AxiosError } from 'axios';

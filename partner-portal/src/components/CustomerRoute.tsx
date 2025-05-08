@@ -8,10 +8,10 @@ interface CustomerRouteProps {
 }
 
 const CustomerRoute: React.FC<CustomerRouteProps> = ({ children }) => {
-  const { user, loadingAuth } = useAuth();
+  const { user, loading } = useAuth();
   const location = useLocation();
 
-  if (loadingAuth) {
+  if (loading) {
     return (
       <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh' }}>
         <CircularProgress />

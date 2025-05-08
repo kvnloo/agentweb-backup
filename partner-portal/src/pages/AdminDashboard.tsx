@@ -28,11 +28,6 @@ import {
   DialogContentText,
   Tooltip,
   IconButton,
-  FormControl,
-  InputLabel,
-  MenuItem,
-  Select,
-  SelectChangeEvent,
   FormControlLabel,
   Checkbox
 } from '@mui/material';
@@ -329,7 +324,7 @@ export default function AdminDashboard() {
   const { token } = useAuth();
   
   const {
-    users,
+    users: contextUsers,
     waitlist,
     taskAnalytics,
     userAnalytics,
@@ -339,7 +334,6 @@ export default function AdminDashboard() {
     updateWaitlistStatus,
     loading: adminLoading,
     error: adminError,
-    setUsers: setContextUsers,
   } = useAdmin();
 
   useEffect(() => {
@@ -904,7 +898,7 @@ export default function AdminDashboard() {
                     </TableCell>
                   </TableRow>
                 ) : (
-                  users.map((user) => {
+                  contextUsers.map((user) => {
                     // Determine roles to display, SOLELY from roles array.
                     let displayRoles: ('partner' | 'customer')[] = [];
                     if (user.roles && user.roles.length > 0) {
@@ -1042,7 +1036,7 @@ export default function AdminDashboard() {
                   </TableRow>
                 ) : (
                   waitlist.map((entry: WaitlistEntry) => {
-                    const userExists = users.some(user => user.email === entry.email);
+                    const userExists = contextUsers.some(user => user.email === entry.email);
                     return (
                       <TableRow key={entry.email}>
                         <TableCell>{entry.email}</TableCell>
