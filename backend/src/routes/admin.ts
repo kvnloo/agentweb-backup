@@ -441,4 +441,46 @@ router.get('/chat-sessions', async (req, res) => {
   }
 });
 
+// Add a route to update user role
+router.put('/users/:userId/role', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { roles } = req.body; // Expect an array of roles
+    
+    // Validate roles
+    const validRolesSet = new Set(['partner', 'customer']);
+    
+    if (!Array.isArray(roles) || roles.some(r => !validRolesSet.has(r))) {
+      return res.status(400).json({ 
+        message: 'Invalid roles. Must be an array containing only: partner, customer' 
+      });
+    }
+
+    // If roles array is empty, default to ['partner'] or handle as an error, based on desired logic.
+    // For now, let's assume an empty array means removing all specific portal access, which might not be desired.
+    // A common default might be ['partner'] if the array is empty, or the frontend should ensure it's not empty.
+    // Let's proceed assuming frontend sends at least one valid role if user should have access.
+    // If roles is empty, it implies no specific portal access. This is a valid state.
+
+    // Get the user to ensure they exist (optional, updateUser will also check)
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    
+    // Update user in DynamoDB
+    await userDb.updateUser(userId, { 
+      roles // Pass the array of roles
+    });
+    
+    res.status(200).json({ message: 'User roles updated successfully' });
+  } catch (error) {
+    console.error('Error updating user roles:', error);
+    res.status(500).json({ message: 'Error updating user roles' });
+  }
+});
+
+// Get system analytics
+// ... existing code ...
+
 export default router; 

@@ -21,7 +21,7 @@ export const createTemplate = async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const { name, description, prompt, isInteractive, isDeepResearch, nameParameter } = req.body;
+    const { name, description, prompt, isInteractive, isDeepResearch, nameParameter, category } = req.body;
     
     if (!name || !prompt) {
       return res.status(400).json({ message: 'Name and prompt are required' });
@@ -49,10 +49,11 @@ export const createTemplate = async (req: AuthRequest, res: Response) => {
       isDeepResearch: Boolean(isDeepResearch),
       published: false, // New templates are not published by default
       createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
+      updatedAt: new Date().toISOString(),
+      category: category || undefined // Add category, default to undefined if not provided
     };
 
-    const createdTemplate = await taskTemplateDb.createTemplate(template);
+    const createdTemplate = await taskTemplateDb.createTemplate(template as any); // Cast to any for now if TaskTemplate type in db.ts isn't updated by this model yet
     res.status(201).json(createdTemplate);
   } catch (error) {
     console.error('Error in createTemplate:', error);
@@ -159,11 +160,12 @@ export const updateTemplate = async (req: AuthRequest, res: Response) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    const { name, description, prompt, isInteractive, isDeepResearch, published, nameParameter } = req.body;
+    const { name, description, prompt, isInteractive, isDeepResearch, published, nameParameter, category } = req.body;
     
     const updates: any = {};
     if (name !== undefined) updates.name = name;
     if (description !== undefined) updates.description = description;
+    if (category !== undefined) updates.category = category;
     
     // If prompt is updated, extract parameters
     if (prompt !== undefined) {

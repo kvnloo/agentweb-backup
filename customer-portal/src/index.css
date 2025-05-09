@@ -1,0 +1,118 @@
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 250 100% 99%;
+    --foreground: 222 47% 11%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+
+    --primary: 260 100% 70%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 260 60% 96%;
+    --secondary-foreground: 222 47% 11%; 
+
+    --muted: 260 40% 96%;
+    --muted-foreground: 215 16% 47%;
+
+    --accent: 260 40% 96%;
+    --accent-foreground: 222 47% 11%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 260 32% 91%;
+    --input: 260 32% 91%;
+    --ring: 260 83% 63%;
+
+    --radius: 0.5rem;
+  }
+
+  .dark {
+    --background: 222 47% 11%;
+    --foreground: 210 40% 98%;
+
+    --card: 222 47% 11%;
+    --card-foreground: 210 40% 98%;
+
+    --popover: 222 47% 11%;
+    --popover-foreground: 210 40% 98%;
+
+    --primary: 260 91% 70%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 260 32% 17%;
+    --secondary-foreground: 210 40% 98%;
+
+    --muted: 260 32% 17%;
+    --muted-foreground: 215 20% 75%;
+
+    --accent: 260 32% 17%;
+    --accent-foreground: 210 40% 98%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 260 32% 17%;
+    --input: 260 32% 17%;
+    --ring: 260 76% 60%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-white text-foreground dark:bg-[#1A1F2C];
+    font-feature-settings: "ss01", "ss02", "cv01", "cv02", "cv03";
+  }
+
+  html {
+    @apply scroll-smooth;
+  }
+}
+
+@layer utilities {
+  .scrollbar-none {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
+
+  .glass-morphism {
+    @apply backdrop-blur-xl bg-white/5 border border-white/10 shadow-[0_4px_12px_-2px_rgba(0,0,0,0.3)];
+  }
+  
+  .neo-blur {
+    @apply backdrop-blur-2xl bg-black/40 border border-white/10;
+  }
+  
+  .text-gradient {
+    @apply bg-gradient-to-br from-white via-white/90 to-white/70 bg-clip-text text-transparent;
+  }
+  
+  .text-gradient-primary {
+    @apply bg-gradient-to-br from-primary via-primary/80 to-primary/60 bg-clip-text text-transparent;
+  }
+  
+  .agent-gradient {
+    @apply bg-gradient-to-r from-[#9b87f5] to-[#7E69AB];
+  }
+  
+  .agent-button {
+    @apply bg-[#9b87f5] text-white hover:bg-[#7E69AB] transition-colors;
+  }
+}

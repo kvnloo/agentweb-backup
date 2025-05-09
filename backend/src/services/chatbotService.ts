@@ -6,6 +6,7 @@ import path from 'path';
 import { getGuide } from '../controllers/guide';
 import { getReleases } from '../controllers/release';
 import { getApiDocs } from '../controllers/api';
+import { getUserGuide } from '../controllers/user-guide';
 import { Request, Response } from 'express';
 
 // Load environment variables from .env file
@@ -59,6 +60,8 @@ export interface ChatMessage {
       sources: string[];
     };
     timestamp: string;
+    portalType?: 'customer' | 'partner';
+    pageIdentifier?: string;
   };
 }
 
@@ -71,6 +74,8 @@ export interface ChatSession {
   updatedAt: string;
   pageContent?: string; // Full page content for storage
   contextChunks?: ContextChunk[]; // Chunked context for RAG
+  portalType?: 'customer' | 'partner'; // Added portalType to session
+  pageIdentifier?: string; // Added pageIdentifier for page-specific sessions
 }
 
 // Interface for context chunks
@@ -279,44 +284,53 @@ function keywordBasedChunkRetrieval(
   return scoredChunks.slice(0, maxChunks).map(item => item.chunk);
 }
 
-class ChatbotDB {
+export class ChatbotDB {
   private tableName: string;
 
   constructor() {
     this.tableName = `${TABLE_PREFIX}AW-ChatSessions`;
   }
 
-  async createChatSession(userId: string, pageContent?: string): Promise<ChatSession> {
+  async createChatSession(userId: string, pageContent?: string, portalType?: 'customer' | 'partner', pageIdentifier?: string): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
     
+    const selectedSystemMessage = portalType === 'customer' ? emmaSystemMessage : partnerSystemMessage;
+
     const chatSession: ChatSession = {
       sessionId,
       userId,
       messages: [
         {
           role: 'system',
-          content: systemMessage,
+          content: selectedSystemMessage, // Use selected system message
           metadata: {
             timestamp,
-            knowledgeBaseChunks: knowledgeBase.length
+            knowledgeBaseChunks: knowledgeBase.length, // This will be total, pre-filtering
+            portalType,
+            pageIdentifier 
           }
         }
       ],
       createdAt: timestamp,
-      updatedAt: timestamp
+      updatedAt: timestamp,
+      portalType, 
+      pageIdentifier 
     };
 
     if (pageContent) {
-      chatSession.pageContent = pageContent;
+      chatSession.pageContent = pageContent; 
       chatSession.contextChunks = splitIntoChunks(pageContent);
+      // Optional: Add a more specific system message if pageContent and pageIdentifier are present
       chatSession.messages.push({
         role: 'system',
-        content: `The user is viewing a page within the AgentWeb platform. Use relevant information from the page content when answering their questions.`,
+        content: `Context initialized for page: ${pageIdentifier || 'current page'}. Use relevant information from the page content.`,
         metadata: {
           timestamp,
           pageContentLength: pageContent.length,
-          knowledgeBaseChunks: knowledgeBase.length
+          knowledgeBaseChunks: knowledgeBase.length,
+          portalType,
+          pageIdentifier
         }
       });
     }
@@ -457,19 +471,30 @@ class ChatbotDB {
   }
 
   async getAllSessions(): Promise<ChatSession[]> {
-    const params = {
-      TableName: this.tableName,
-      // Note: In production, you might want to implement pagination
-      Limit: 1000 // Limit to latest 1000 sessions
-    };
+    let allSessions: ChatSession[] = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined = undefined;
 
-    try {
-      const result = await dynamodb.scan(params).promise();
-      return (result.Items || []) as ChatSession[];
-    } catch (error) {
-      console.error('Error getting all chat sessions:', error);
-      throw error;
-    }
+    do {
+      const params: AWS.DynamoDB.DocumentClient.ScanInput = {
+        TableName: this.tableName,
+        ExclusiveStartKey: lastEvaluatedKey,
+        // Consider if a smaller limit per scan iteration is better for performance/memory
+        // Limit: 1000 // Optional: Limit items per scan call, but loop will get all
+      };
+
+      try {
+        const result = await dynamodb.scan(params).promise();
+        if (result.Items) {
+          allSessions = allSessions.concat(result.Items as ChatSession[]);
+        }
+        lastEvaluatedKey = result.LastEvaluatedKey;
+      } catch (error) {
+        console.error('Error getting all chat sessions during scan:', error);
+        throw error; // Or handle more gracefully
+      }
+    } while (lastEvaluatedKey);
+
+    return allSessions;
   }
 }
 
@@ -517,7 +542,8 @@ async function loadKnowledgeBase(): Promise<void> {
   const endpoints = [
     { controller: getGuide, source: 'guide' },
     { controller: getReleases, source: 'release' },
-    { controller: getApiDocs, source: 'api' }
+    { controller: getApiDocs, source: 'api' },
+    { controller: getUserGuide, source: 'user-guide' }
   ];
 
   const chunks: ContextChunk[] = [];
@@ -548,11 +574,8 @@ async function loadKnowledgeBase(): Promise<void> {
       await endpoint.controller({} as Request, mockResponse as unknown as Response);
       
       if (mockResponse.data && mockResponse.data.success && mockResponse.data.data) {
-        // Process the API response data
         let content = '';
         
-        // Extract text content from the data structure
-        // The structure will depend on the specific API endpoint
         if (endpoint.source === 'guide' || endpoint.source === 'api') {
           // For guide and API endpoints that return sections
           for (const section of mockResponse.data.data) {
@@ -560,8 +583,24 @@ async function loadKnowledgeBase(): Promise<void> {
             for (const paragraph of section.content) {
               content += `${paragraph}\n`;
             }
-            
             // Process subsections if they exist
+            if (section.subsections) {
+              for (const subsection of section.subsections) {
+                content += `${subsection.title}\n`;
+                for (const paragraph of subsection.content) {
+                  content += `${paragraph}\n`;
+                }
+              }
+            }
+            content += '\n';
+          }
+        } else if (endpoint.source === 'user-guide') {
+          // For user-guide endpoint, structure is same as guide/api
+          for (const section of mockResponse.data.data) {
+            content += `${section.title}\n`;
+            for (const paragraph of section.content) {
+              content += `${paragraph}\n`;
+            }
             if (section.subsections) {
               for (const subsection of section.subsections) {
                 content += `${subsection.title}\n`;
@@ -582,6 +621,7 @@ async function loadKnowledgeBase(): Promise<void> {
             content += '\n';
           }
         }
+        // NOTE: No default 'else' case, so if source is unrecognized, 'content' remains empty.
         
         if (content) {
           // Split content into smaller chunks (max 2000 chars per chunk)
@@ -620,7 +660,7 @@ async function loadKnowledgeBase(): Promise<void> {
 
   knowledgeBase = chunks;
   console.log(`Loaded ${chunks.length} knowledge chunks from controllers`);
-  printKnowledgeBase();
+  //printKnowledgeBase();
 }
 
 // Load knowledge base on startup and refresh periodically
@@ -635,12 +675,11 @@ setInterval(() => {
   });
 }, 60 * 60 * 1000);
 
-// Update system message
-const systemMessage = `You are a helpful customer support assistant for AgentWeb, a powerful web automation platform that allows users to create and manage web-based tasks using natural language instructions. 
+const partnerSystemMessage = `You are a helpful customer support assistant for AgentWeb, a powerful web automation platform that allows users to create and manage web-based tasks using natural language instructions. 
 
 Today's date is ${new Date().toISOString().split('T')[0]}.
 
-I will provide you with relevant information from our documentation to help answer questions. Please use this information when responding to user queries.
+I will provide you with relevant information from our documentation (Partner Guide, API Docs, Release Notes) to help answer questions. Please use this information when responding to user queries.
 
 Format your responses in HTML5 for direct rendering. Use:
 - <strong> for important points
@@ -670,7 +709,45 @@ Example of good formatting:
 <li>Click <strong>Create</strong> to save</li>
 </ul>
 
-Be helpful, concise, and accurate. If you don't know the answer, suggest the user join our Discord community for human support: <a href="https://discord.gg/ec7yR3yG" target="_blank">Discord community</a>`;
+Be helpful, concise, and accurate. If you don't know the answer, suggest the user join our Discord community for human support: <a href="${process.env.DISCORD_INVITE_URL || 'https://discord.gg/yUCuSxHH'}" target="_blank">Discord community</a>`;
+
+const emmaSystemMessage = `You are Emma, a helpful 24/7 marketing operator assistant for AgentWeb's Customer Portal. AgentWeb is a powerful web automation platform.
+
+Your primary functions are to help users with market research, campaign planning and optimization, and tracking performance metrics. 
+
+Today's date is ${new Date().toISOString().split('T')[0]}.
+
+I will provide you with relevant information from the Customer Portal User Guide to help answer questions. Please use this information when responding to user queries.
+
+When appropriate, you can suggest users explore specific features of the portal mentioned in the guide.
+
+Format your responses in HTML5 for direct rendering. Use:
+- <strong> for important points
+- <em> for emphasis
+- <code> for technical terms and commands
+- <ul> and <li> for lists
+- <pre> for code blocks (max width 360px)
+- <a href="url" target="_blank"> for links
+- <table> for structured data (max width 360px)
+
+Important formatting rules:
+1. Use minimal spacing - no extra blank lines
+2. Keep lists compact with minimal spacing
+3. Use single line breaks between list items
+4. Keep responses concise and well-structured
+5. Always include target="_blank" for links
+6. Use proper HTML5 semantic elements
+7. The chat window has a fixed width of 384px. Format your responses to fit within this constraint
+
+Example of good formatting:
+<p>To get started with market research, you can ask me things like:</p>
+<ul>
+<li>"Emma, research the latest trends in sustainable packaging."</li>
+<li>"Emma, help me plan a social media campaign for a new product launch."</li>
+<li>"Emma, what are the key performance metrics for my current email campaign?"</li>
+</ul>
+
+Be helpful, concise, and accurate. If you don't know the answer or the request is outside your marketing operator functions, suggest the user join our Discord community for human support: <a href="${process.env.DISCORD_INVITE_URL || 'https://discord.gg/yUCuSxHH'}" target="_blank">Discord community</a>`;
 
 // Helper function to calculate token cost
 function calculateCost(promptTokens: number, completionTokens: number, model: string): number {
@@ -730,7 +807,8 @@ export async function generateChatResponse(
   sessionId: string,
   userMessage: string,
   currentUrl?: string,
-  pageContent?: string
+  pageContent?: string,
+  portalType: 'customer' | 'partner' = 'partner'
 ): Promise<string> {
   try {
     const timestamp = new Date().toISOString();
@@ -741,7 +819,8 @@ export async function generateChatResponse(
       pageContentLength: pageContent?.length,
       knowledgeBaseChunks: knowledgeBase.length,
       pageChunks: pageContent ? splitIntoChunks(pageContent).length : 0,
-      timestamp
+      timestamp,
+      portalType
     };
 
     await chatbotDb.addMessageToSession(sessionId, {
@@ -759,17 +838,33 @@ export async function generateChatResponse(
     // Get messages for OpenAI
     const messages = [...session.messages];
     let contextInfo = '';
-    
-    // Process page content if available
-    let combinedChunks: ContextChunk[] = [...knowledgeBase];
+
+    let activeKnowledgeBase: ContextChunk[];
+    let combinedChunks: ContextChunk[];
     let pageChunksCount = 0;
+    let pageChunksResult: ContextChunk[] = [];
+
+    // Calculate page chunks if pageContent exists, regardless of portal type
     if (pageContent) {
-      const pageChunks = splitIntoChunks(pageContent);
-      pageChunksCount = pageChunks.length;
-      combinedChunks = [...pageChunks, ...knowledgeBase];
+      pageChunksResult = splitIntoChunks(pageContent);
+      pageChunksCount = pageChunksResult.length;
+    }
+
+    if (portalType === 'customer') {
+      activeKnowledgeBase = knowledgeBase.filter(chunk => chunk.metadata.source === 'user-guide');
+      // Combine user-guide chunks with page chunks
+      combinedChunks = [...pageChunksResult, ...activeKnowledgeBase]; 
+    } else { // Partner portal (or default)
+      activeKnowledgeBase = knowledgeBase.filter(chunk => 
+        chunk.metadata.source === 'guide' || 
+        chunk.metadata.source === 'release' || 
+        chunk.metadata.source === 'api'
+      );
+      // Combine partner KB chunks with page chunks
+      combinedChunks = [...pageChunksResult, ...activeKnowledgeBase];
     }
     
-    // RAG: Retrieve relevant chunks
+    // RAG: Retrieve relevant chunks from combinedChunks
     let retrievalErrorOccurred = false;
     let relevantChunksInfo: { count: number; sources: string[] } | undefined;
     try {
@@ -820,10 +915,11 @@ export async function generateChatResponse(
     const assistantMessageMetadata = {
       currentUrl,
       pageContentLength: pageContent?.length,
-      knowledgeBaseChunks: knowledgeBase.length,
+      knowledgeBaseChunks: activeKnowledgeBase.length,
       pageChunks: pageChunksCount,
       relevantChunks: relevantChunksInfo,
-      timestamp
+      timestamp,
+      portalType
     };
 
     await chatbotDb.addMessageToSession(sessionId, {

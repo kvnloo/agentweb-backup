@@ -49,6 +49,7 @@ interface User {
   isAdmin: boolean;
   isActive: boolean;
   createdAt: string;
+  roles?: ('partner' | 'customer')[];
 }
 
 interface UserInteraction {
@@ -81,6 +82,7 @@ interface TaskTemplate {
   published: boolean;
   createdAt: string;
   updatedAt: string;
+  category?: string;
 }
 
 interface UserWithCounts extends User {
@@ -111,18 +113,37 @@ class UserDB {
     }
   }
 
-  async createUser(email: string, userId: string, password: string, isOAuthUser: boolean = false, isAdmin: boolean = false) {
+  async createUser(
+    email: string, 
+    userId: string, 
+    password: string, 
+    isOAuthUser: boolean = false, 
+    isAdmin: boolean = false,
+    roles: ('partner' | 'customer')[] = ['partner'],
+    displayName?: string,
+    googleId?: string
+  ) {
+    const itemToCreate: any = {
+      userId,
+      email,
+      password,
+      isOAuthUser,
+      isAdmin,
+      isActive: true,
+      createdAt: new Date().toISOString(),
+      roles
+    };
+
+    if (displayName) {
+      itemToCreate.displayName = displayName;
+    }
+    if (googleId) {
+      itemToCreate.googleId = googleId;
+    }
+
     const params = {
       TableName: this.tableName,
-      Item: {
-        userId,
-        email,
-        password,
-        isOAuthUser,
-        isAdmin,
-        isActive: true,
-        createdAt: new Date().toISOString()
-      }
+      Item: itemToCreate
     };
 
     await this.docClient.put(params).promise();
@@ -241,6 +262,54 @@ class UserDB {
       this.handleError(error, 'deactivateUser');
     }
   }
+
+  async updateUser(userId: string, updates: Partial<{
+    roles: ('partner' | 'customer')[];
+    isAdmin: boolean;
+    isActive: boolean;
+    email: string;
+  }>) {
+    try {
+      // First get the user
+      const user = await this.getUserById(userId);
+      if (!user) {
+        throw new Error('User not found');
+      }
+
+      // Create update expression and attribute values dynamically
+      const updateExpressionParts: string[] = [];
+      const expressionAttributeNames: Record<string, string> = {};
+      const expressionAttributeValues: Record<string, any> = {};
+
+      // Process each update field
+      Object.entries(updates).forEach(([key, value]) => {
+        updateExpressionParts.push(`#${key} = :${key}`);
+        expressionAttributeNames[`#${key}`] = key;
+        expressionAttributeValues[`:${key}`] = value;
+      });
+
+      if (updateExpressionParts.length === 0) {
+        return user; // Nothing to update
+      }
+
+      const params = {
+        TableName: this.tableName,
+        Key: {
+          email: user.email  // Use email as the primary key, matching the schema
+        },
+        UpdateExpression: `set ${updateExpressionParts.join(', ')}`,
+        ExpressionAttributeNames: expressionAttributeNames,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: 'ALL_NEW'
+      };
+
+      const result = await this.docClient.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      console.error('Error in updateUser:', error);
+      throw error;
+    }
+  }
 }
 
 // Initialize and export userDb instance
@@ -263,6 +332,10 @@ export const taskDb = {
     isAgenticDevMode?: boolean;
     emailNotification?: boolean;
     attachments?: TaskAttachment[];
+    category?: string;
+    description?: string;
+    llmName?: string | null;
+    templateId?: string;
   }) {
     try {
       const params = {
@@ -325,7 +398,7 @@ export const taskDb = {
         ExpressionAttributeValues: {
           ':userId': userId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #adm',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #adm, category, description, templateId',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
@@ -374,7 +447,7 @@ export const taskDb = {
         Key: {
           taskId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #adm',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #adm, category, description, templateId',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',

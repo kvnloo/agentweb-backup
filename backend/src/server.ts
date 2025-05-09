@@ -60,13 +60,16 @@ io.on('connection', (socket: Socket) => {
     message: string; 
     currentUrl?: string;
     pageContent?: string;
+    portal?: 'customer' | 'partner';
   }) => {
     try {
+      const portalType = data.portal || 'partner';
       const response = await generateChatResponse(
         data.sessionId,
         data.message,
         data.currentUrl,
-        data.pageContent
+        data.pageContent,
+        portalType
       );
 
       // Send response back to the client

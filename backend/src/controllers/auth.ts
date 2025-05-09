@@ -6,7 +6,7 @@ import { Profile } from 'passport-google-oauth20';
 
 export const register = async (req: Request, res: Response) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, roles: reqRoles } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({ message: 'Email and password are required' });
@@ -21,15 +21,34 @@ export const register = async (req: Request, res: Response) => {
     const hashedPassword = await bcrypt.hash(password, 10);
     const userId = Date.now().toString();
 
-    // Create user in DynamoDB
-    await userDb.createUser(email, userId, hashedPassword);
+    // Validate roles if provided, default to ['partner']
+    const validRolesSet = new Set(['partner', 'customer']);
+    let userRoles: ('partner' | 'customer')[] = ['partner']; // Default roles
 
+    if (reqRoles && Array.isArray(reqRoles) && reqRoles.length > 0 && reqRoles.every(r => validRolesSet.has(r))) {
+      userRoles = reqRoles as ('partner' | 'customer')[]; // Explicitly cast reqRoles
+    }
+
+    // Create user in DynamoDB
+    await userDb.createUser(email, userId, hashedPassword, false, false, userRoles);
+
+    // JWT includes roles array
     const token = jwt.sign(
-      { userId, email },
+      { userId, email, roles: userRoles, isAdmin: false }, // Include isAdmin=false for clarity
       process.env.JWT_SECRET || 'your-secret-key'
     );
 
-    res.status(201).json({ token });
+    res.status(201).json({ 
+      token, 
+      user: {
+        userId,
+        email,
+        isAdmin: false,
+        roles: userRoles, // Send roles array
+        isOAuthUser: false,
+        createdAt: new Date().toISOString()
+      }
+    });
   } catch (error) {
     console.error('Error in register:', error);
     res.status(500).json({ message: 'Error creating user' });
@@ -59,12 +78,16 @@ export const login = async (req: Request, res: Response) => {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
-    const token = jwt.sign(
-      { userId: user.userId, email: user.email },
-      process.env.JWT_SECRET || 'your-secret-key'
-    );
+    // Ensure JWT uses roles array (prefer over single role if both exist)
+    const jwtPayload = { 
+      userId: user.userId, 
+      email: user.email,
+      roles: user.roles || [], // Use roles array, default to empty if undefined
+      isAdmin: user.isAdmin || false
+    };
+    const token = jwt.sign(jwtPayload, process.env.JWT_SECRET || 'your-secret-key');
 
-    // Don't send sensitive information
+    // Return user object (which might still have both role/roles from DB)
     const { password: _, ...userWithoutPassword } = user;
     res.json({ token, user: userWithoutPassword });
   } catch (error) {
@@ -74,37 +97,74 @@ export const login = async (req: Request, res: Response) => {
 };
 
 export const googleCallback = async (
+  req: Request,
   accessToken: string,
   refreshToken: string,
   profile: Profile,
-  done: (error: any, user?: any) => void
+  done: (error: any, user?: any, info?: any) => void
 ) => {
   try {
-    const email = profile.emails?.[0]?.value;
+    if (!profile) {
+      return done(new Error('Google profile was not received'), null);
+    }
+    
+    const email = profile.emails && profile.emails[0] ? profile.emails[0].value : null;
+    
     if (!email) {
-      return done(new Error('No email found in Google profile'));
+      console.error('No email found in Google profile. Profile received:', JSON.stringify(profile, null, 2));
+      return done(new Error('No email found in Google profile. Please ensure your Google account has a primary email and permissions are granted.'), null);
     }
 
-    // Check if user exists
     let user = await userDb.getUserByEmail(email);
     
+    const portalOrigin = req.query.state as string || 'partner';
+
     if (!user) {
-      // Create new user if doesn't exist
       const userId = Date.now().toString();
-      await userDb.createUser(email, userId, '', true); // No password for OAuth users
-      user = { userId, email };
+      const defaultRolesForNewOAuthUser: ('partner' | 'customer')[] = portalOrigin === 'customer' ? ['customer'] : ['partner'];
+      
+      console.log(`New OAuth user from ${portalOrigin} portal. Assigning roles: ${defaultRolesForNewOAuthUser.join(', ')}`);
+      
+      // Pass roles array to createUser
+      await userDb.createUser(email, userId, '', true, false, defaultRolesForNewOAuthUser, profile.displayName, profile.id);
+      user = await userDb.getUserByEmail(email);
+      
+      if (!user) {
+        return done(new Error('Failed to create or find user after creation attempt.'), null);
+      }
+    } else {
+      // User exists. Optionally, update their Google ID or display name if changed.
+      // if (user.googleId !== profile.id || user.displayName !== profile.displayName) {
+      //   await userDb.updateUser(user.userId, { googleId: profile.id, displayName: profile.displayName });
+      // }
     }
 
-    // Generate JWT token
+    // Prioritize roles array from DB, default based on origin if necessary
+    const userRoles = user.roles && user.roles.length > 0 
+                      ? user.roles 
+                      : (portalOrigin === 'customer' ? ['customer'] : ['partner']);
+
+    // Generate JWT token with roles array
     const token = jwt.sign(
-      { userId: user.userId, email: user.email },
+      { 
+        userId: user.userId, 
+        email: user.email,
+        roles: userRoles, // Use the determined roles array
+        isAdmin: user.isAdmin || false
+      },
       process.env.JWT_SECRET || 'your-secret-key'
     );
 
-    // Pass token to callback
-    done(null, { token });
+    // Pass object containing roles array to done callback
+    done(null, { 
+      token,
+      userId: user.userId,
+      email: user.email,
+      roles: userRoles, // Pass roles array
+      isAdmin: user.isAdmin || false
+    });
   } catch (error) {
-    console.error('Error in Google callback:', error);
-    done(error);
+    console.error('Error in Google callback processing:', error);
+    done(error, null);
   }
 }; 

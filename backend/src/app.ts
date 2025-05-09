@@ -17,9 +17,11 @@ const app = express();
 // CORS configuration
 const corsOptions = {
   origin: [
-    'https://agentweb.pro',
-    'http://localhost:5173', // Keep local development
-    process.env.FRONTEND_URL || 'http://localhost:5173'
+    'https://agentweb.pro', // Main Production Partner URL
+    process.env.FRONTEND_URL || 'http://localhost:5173', // Partner Portal (Deployed or Local)
+    process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174' // Customer Portal (Deployed or Local)
+    // Hardcoded 'https://app.agentweb.pro' and explicit localhost URLs previously listed
+    // are now covered by the environment variables and their fallbacks.
   ],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
@@ -28,7 +30,8 @@ const corsOptions = {
 
 // Middleware
 app.use(cors(corsOptions));
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(passport.initialize());
 
 // Routes

@@ -10,8 +10,24 @@ export const createChatSession = async (req: AuthenticatedRequest, res: Response
       return res.status(401).json({ error: 'User not authenticated' });
     }
 
-    const { pageContext } = req.body;
-    const session = await chatbotDb.createChatSession(userId, pageContext);
+    const { pageContext, pageIdentifier } = req.body; // Extract pageIdentifier from body
+    const portalQuery = req.query.portal as string | undefined;
+
+    let portalType: 'customer' | 'partner' = 'partner'; // Default to partner
+    if (portalQuery === 'customer') {
+      portalType = 'customer';
+    } else if (portalQuery === 'partner') {
+      portalType = 'partner';
+    } else if (portalQuery) {
+      console.warn(`Invalid portal type in createChatSession query: ${portalQuery}, defaulting to partner.`);
+    }
+
+    // Validate pageIdentifier if needed (e.g., ensure it's a string)
+    if (pageIdentifier && typeof pageIdentifier !== 'string') {
+      return res.status(400).json({ error: 'Invalid pageIdentifier format' });
+    }
+
+    const session = await chatbotDb.createChatSession(userId, pageContext, portalType, pageIdentifier);
     
     res.status(201).json(session);
   } catch (error) {
@@ -74,6 +90,17 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
   try {
     const sessionId = req.params.sessionId;
     const { message, currentUrl, pageContext } = req.body;
+    const portal = req.query.portal as string | undefined;
+
+    let portalType: 'customer' | 'partner' = 'partner'; // Default to partner
+    if (portal === 'customer') {
+      portalType = 'customer';
+    } else if (portal === 'partner') {
+      portalType = 'partner';
+    } else if (portal) {
+      // Optional: handle invalid portal query param, or let it default to partner
+      console.warn(`Invalid portal type received: ${portal}, defaulting to partner.`);
+    }
     
     if (!message) {
       return res.status(400).json({ error: 'Message is required' });
@@ -93,7 +120,7 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
     
     try {
       // Generate response
-      const response = await generateChatResponse(sessionId, message, currentUrl, pageContext);
+      const response = await generateChatResponse(sessionId, message, currentUrl, pageContext, portalType);
       
       // Get updated session with the new messages
       const updatedSession = await chatbotDb.getChatSession(sessionId);
