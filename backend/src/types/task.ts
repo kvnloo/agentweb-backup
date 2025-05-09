@@ -14,5 +14,6 @@ export interface Task {
   extractPageContent?: boolean;  // Whether to extract JSON content from pages
   validateOutput?: boolean;  // Whether to validate output from the agent
   outputAsJson?: boolean;  // Whether the agent should output the result in JSON format
+  outputAsHtml?: boolean;
   llmName?: string;  // The preferred LLM to try first for this task
 } 
