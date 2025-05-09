@@ -46,6 +46,8 @@ interface Template {
   published: boolean;
   userId: string;
   category?: string;
+  outputAsJson?: boolean;
+  outputAsHtml?: boolean;
 }
 
 export default function CreateTask() {
@@ -54,6 +56,8 @@ export default function CreateTask() {
   const [isInteractive, setIsInteractive] = useState(false);
   const [isDeepResearch, setIsDeepResearch] = useState(false);
   const [isComplexTask, setIsComplexTask] = useState(false);
+  const [outputAsJson, setOutputAsJson] = useState(false);
+  const [outputAsHtml, setOutputAsHtml] = useState(false);
   const [error, setError] = useState('');
   const [selectedTemplate, setSelectedTemplate] = useState('');
   const [templates, setTemplates] = useState<Template[]>([]);
@@ -92,6 +96,8 @@ export default function CreateTask() {
       setIsInteractive(false);
       setIsDeepResearch(false);
       setIsComplexTask(false);
+      setOutputAsJson(false);
+      setOutputAsHtml(false);
       setCurrentTemplateParams([]);
       setParameterValues({});
       return;
@@ -109,6 +115,8 @@ export default function CreateTask() {
       setIsInteractive(false);
       setIsDeepResearch(false);
       setIsComplexTask(false);
+      setOutputAsJson(false);
+      setOutputAsHtml(false);
       setCurrentTemplateParams([]);
       return;
     }
@@ -122,6 +130,8 @@ export default function CreateTask() {
       setIsInteractive(template.isInteractive);
       setIsDeepResearch(template.isDeepResearch);
       setIsComplexTask(template.isComplexTask);
+      setOutputAsJson(template.outputAsJson || false);
+      setOutputAsHtml(template.outputAsHtml || false);
       
       // Set current template parameters
       setCurrentTemplateParams(template.parameters || []);
@@ -159,6 +169,8 @@ export default function CreateTask() {
       setIsInteractive(false);
       setIsDeepResearch(false);
       setIsComplexTask(false);
+      setOutputAsJson(false);
+      setOutputAsHtml(false);
       setCurrentTemplateParams([]);
       setParameterValues({});
     }
@@ -197,7 +209,13 @@ export default function CreateTask() {
         isInteractive: selectedTemplateObj ? selectedTemplateObj.isInteractive : isInteractive,
         isDeepResearch: selectedTemplateObj ? selectedTemplateObj.isDeepResearch : isDeepResearch,
         isComplexTask: selectedTemplateObj ? selectedTemplateObj.isComplexTask : isComplexTask,
-        emailNotification
+        emailNotification,
+        outputAsJson: selectedTemplateObj && outputAsJson === (selectedTemplateObj.outputAsJson || false) 
+                        ? (selectedTemplateObj.outputAsJson || false) 
+                        : outputAsJson,
+        outputAsHtml: selectedTemplateObj && outputAsHtml === (selectedTemplateObj.outputAsHtml || false)
+                        ? (selectedTemplateObj.outputAsHtml || false)
+                        : outputAsHtml,
       };
       
       // If a template is selected, include its ID, parameter values, category, and description
@@ -520,11 +538,19 @@ export default function CreateTask() {
                         <Chip label="Deep Research" size="small" />
                       )}
                       {getSelectedTemplate()?.isComplexTask && (
-                        <Chip label="Complex Task" size="small" />
+                        <Chip label="Complex Task" size="small" color="info" variant="outlined" />
                       )}
                       {getSelectedTemplate()?.isDeepResearch && (
                         <Chip label="Email Notifications" size="small" />
                       )}
+                      {/* START: Read-only display for Template tab */}
+                      {getSelectedTemplate()?.outputAsJson && (
+                        <Chip label="Output as JSON" size="small" color="info" variant="outlined" />
+                      )}
+                      {getSelectedTemplate()?.outputAsHtml && (
+                        <Chip label="Output as HTML5" size="small" color="info" variant="outlined" />
+                      )}
+                      {/* END: Read-only display for Template tab */}
                     </Box>
                   </Box>
                 </CardContent>
@@ -616,6 +642,24 @@ export default function CreateTask() {
                   Deep Research Mode is enabled. When you run this task, it will use advanced AI to perform comprehensive research on your topic using public web data only. Currently does not use your uploads or web accounts (Config), but will support these in the future. Email notifications are automatically enabled for Deep Research tasks. Interactive Mode and Complex Task options are not applicable for Deep Research tasks.
                 </Alert>
               )}
+              <Box sx={{ mt: 2, display: 'flex', flexDirection: 'column', gap: 1 }}>
+                <Tooltip title="Output as JSON"
+                  sx={{ opacity: isDeepResearch ? 0.5 : 1 }}
+                >
+                  <FormControlLabel
+                    control={<Switch checked={outputAsJson} onChange={(e) => { setOutputAsJson(e.target.checked); if (e.target.checked) setOutputAsHtml(false); }} />}
+                    label="Output as JSON"
+                  />
+                </Tooltip>
+                <Tooltip title="Output as HTML5"
+                  sx={{ opacity: isDeepResearch ? 0.5 : 1 }}
+                >
+                  <FormControlLabel
+                    control={<Switch checked={outputAsHtml} onChange={(e) => { setOutputAsHtml(e.target.checked); if (e.target.checked) setOutputAsJson(false); }} />}
+                    label="Output as HTML5"
+                  />
+                </Tooltip>
+              </Box>
             </>
           )}
 

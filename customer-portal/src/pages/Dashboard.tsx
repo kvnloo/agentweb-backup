@@ -23,6 +23,8 @@ interface FetchedTemplate {
   isInteractive?: boolean;    // Added
   isDeepResearch?: boolean;   // Added
   isComplexTask?: boolean;    // Added
+  outputAsJson?: boolean;   // Added
+  outputAsHtml?: boolean;   // Added
 }
 
 // Define a new interface that correctly combines FrontendTemplateDef with additional fields
@@ -31,6 +33,8 @@ interface DisplayTemplate extends FrontendTemplateDef {
   isInteractive?: boolean;
   isDeepResearch?: boolean;
   isComplexTask?: boolean;
+  outputAsJson?: boolean;   // Added
+  outputAsHtml?: boolean;   // Added
   // Ensure promptTemplate is part of DisplayTemplate if used directly from it later
   // FrontendTemplateDef already has promptTemplate?: string;
 }
@@ -98,6 +102,8 @@ const Dashboard = () => {
           isInteractive: ft.isInteractive,
           isDeepResearch: ft.isDeepResearch,
           isComplexTask: ft.isComplexTask,
+          outputAsJson: ft.outputAsJson,
+          outputAsHtml: ft.outputAsHtml,
         };
         newGroupedTemplates[ft.category].push(displayTemplate);
       }
@@ -238,6 +244,8 @@ const Dashboard = () => {
       emailNotification: emailNotification,
       category: templateData.category,
       description: templateData.description,
+      outputAsJson: templateData.outputAsJson || false,
+      outputAsHtml: templateData.outputAsHtml || false,
     };
 
     console.log("Attempting to create task with payload:", taskPayload);
