@@ -270,11 +270,11 @@ const Dashboard = () => {
     <div className="flex flex-col gap-6 w-full h-full">
       <div className="flex flex-col gap-2">
         <h1 className="text-2xl font-bold">
-          Welcome to your Customer Portal
+          Welcome to Your Customer Portal
         </h1>
         {user && (
           <p className="text-gray-600">
-            Hello, <span className="font-medium">{user.email.split('@')[0]}</span>. Access your market research resources and more from this dashboard.
+            Hi, <span className="font-medium">{user.email.split('@')[0]}</span>. Dive into your personalized dashboard to explore data-driven market insights, creative research and strategic tools—all in one place.
           </p>
         )}
       </div>
