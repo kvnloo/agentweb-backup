@@ -709,7 +709,7 @@ Example of good formatting:
 <li>Click <strong>Create</strong> to save</li>
 </ul>
 
-Be helpful, concise, and accurate. If you don't know the answer, suggest the user join our Discord community for human support: <a href="https://discord.gg/ec7yR3yG" target="_blank">Discord community</a>`;
+Be helpful, concise, and accurate. If you don't know the answer, suggest the user join our Discord community for human support: <a href="${process.env.DISCORD_INVITE_URL || 'https://discord.gg/yUCuSxHH'}" target="_blank">Discord community</a>`;
 
 const emmaSystemMessage = `You are Emma, a helpful 24/7 marketing operator assistant for AgentWeb's Customer Portal. AgentWeb is a powerful web automation platform.
 
@@ -747,7 +747,7 @@ Example of good formatting:
 <li>"Emma, what are the key performance metrics for my current email campaign?"</li>
 </ul>
 
-Be helpful, concise, and accurate. If you don't know the answer or the request is outside your marketing operator functions, suggest the user join our Discord community for human support: <a href="https://discord.gg/ec7yR3yG" target="_blank">Discord community</a>`;
+Be helpful, concise, and accurate. If you don't know the answer or the request is outside your marketing operator functions, suggest the user join our Discord community for human support: <a href="${process.env.DISCORD_INVITE_URL || 'https://discord.gg/yUCuSxHH'}" target="_blank">Discord community</a>`;
 
 // Helper function to calculate token cost
 function calculateCost(promptTokens: number, completionTokens: number, model: string): number {

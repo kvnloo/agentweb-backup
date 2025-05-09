@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { useAuth } from "@/contexts/AuthContext";
 import UserProfileDropdown from "./UserProfileDropdown";
 import ChatSupport from "../chat/ChatSupport";
+import { DISCORD_INVITE_URL } from "@/config";
 
 const Layout = ({ children }: { children: React.ReactNode }) => {
   const location = useLocation();
@@ -120,6 +121,18 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
             </div>
           ))}
         </div>
+
+        {/* Public Beta Notice */}
+        {!isCollapsed && (
+          <div className="px-4 py-2 text-xs text-gray-500 dark:text-gray-400 border-t border-[#D6BCFA] dark:border-[#7E69AB]">
+            <p className="mb-1">
+              Customer Portal is in <strong className="font-semibold">Public Beta</strong>.
+            </p>
+            <p>
+              Join our <a href={DISCORD_INVITE_URL} target="_blank" rel="noopener noreferrer" className="text-[#7E69AB] hover:underline">Discord community</a> to report bugs or share feedback.
+            </p>
+          </div>
+        )}
 
         {/* Collapse button */}
         <div className="border-t border-[#D6BCFA] dark:border-[#7E69AB] p-2">

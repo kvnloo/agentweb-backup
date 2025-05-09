@@ -13,6 +13,7 @@ import NavigationIcon from '@mui/icons-material/Navigation';
 import { getPageTitle } from '../utils/pageTitles';
 import { Chart } from 'chart.js/auto';
 import { io, Socket } from 'socket.io-client';
+import { DISCORD_INVITE_URL } from '../config';
 
 interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
@@ -513,8 +514,9 @@ const ChatSupport: React.FC = () => {
                 <Button
                   variant="text" 
                   size="small"
-                  href="https://discord.gg/ec7yR3yG" 
+                  href={DISCORD_INVITE_URL} 
                   target="_blank"
+                  rel="noopener noreferrer"
                   startIcon={<img src="https://assets-global.website-files.com/6257adef93867e50d84d30e2/636e0a6a49cf127bf92de1e2_icon_clyde_blurple_RGB.png" alt="Discord" style={{ width: 16, height: 16 }} />}
                   sx={{ 
                     color: '#5865F2',

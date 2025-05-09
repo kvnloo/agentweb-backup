@@ -13,10 +13,17 @@ import {
   Bot, 
   User, 
   PlusCircle, 
-  Navigation 
+  Navigation,
+  Avatar,
+  AvatarFallback,
+  AvatarImage
 } from 'lucide-react';
 import { Alert, AlertDescription } from '../ui/alert';
 import { io, Socket } from 'socket.io-client';
+import { DISCORD_INVITE_URL } from "@/config";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import ReactMarkdown from 'react-markdown';
+import { AvatarFallback as NewAvatarFallback, AvatarImage as NewAvatarImage } from "@/components/ui/avatar";
 
 interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
@@ -341,7 +348,7 @@ const ChatSupport: React.FC = () => {
       <div className="flex-1 overflow-y-auto p-3 bg-gray-50 dark:bg-gray-800">
         <div className="mb-2 text-center">
           <a
-            href="https://discord.gg/ec7yR3yG" 
+            href={DISCORD_INVITE_URL}
             target="_blank"
             rel="noopener noreferrer"
             className="text-xs text-[#5865F2] inline-flex items-center hover:underline"
