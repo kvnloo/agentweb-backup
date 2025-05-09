@@ -127,10 +127,7 @@ const ChangelogPage: React.FC = () => {
         {changelogEntries.map((entry, entryIndex) => (
           <Card key={entryIndex} className="overflow-hidden">
             <CardHeader className="bg-gray-50 dark:bg-gray-800 py-4 px-6">
-              <div className="flex justify-between items-center mb-1">
-                <CardTitle className="text-xl font-semibold text-gray-800 dark:text-gray-100">
-                  Release Update
-                </CardTitle>
+              <div className="flex justify-start items-center mb-1">
                 <p className="text-sm text-gray-500 dark:text-gray-400">
                   {new Date(entry.date).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}
                 </p>
@@ -140,13 +137,14 @@ const ChangelogPage: React.FC = () => {
             <CardContent className="p-6 pt-4 space-y-1.5">
               {entry.changes && Array.isArray(entry.changes) && entry.changes.map((changeText, index) => {
                 const isSubItem = changeText.startsWith('- ');
-                // Extract the actual text, removing the "- " prefix from sub-items.
                 const textContent = isSubItem ? changeText.substring(2) : changeText;
 
                 return (
                   <div key={index} className={`flex items-start text-gray-700 dark:text-gray-300 ${isSubItem ? 'ml-5' : 'ml-0'}`}>
-                    <span className="mr-2 flex-shrink-0">•</span>
-                    <div className="prose prose-sm dark:prose-invert max-w-none leading-relaxed">
+                    {isSubItem && (
+                      <span className="mr-2 flex-shrink-0">•</span>
+                    )}
+                    <div className={`prose prose-sm dark:prose-invert max-w-none leading-relaxed ${!isSubItem && !isSubItem ? 'font-medium' : ''}`}>
                       <ReactMarkdown remarkPlugins={[remarkGfm]}>
                         {textContent}
                       </ReactMarkdown>
