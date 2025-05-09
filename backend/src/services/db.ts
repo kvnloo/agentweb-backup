@@ -79,6 +79,8 @@ interface TaskTemplate {
   isDeepResearch: boolean;
   isComplexTask?: boolean;
   extractPageContent?: boolean;
+  outputAsJson?: boolean;
+  outputAsHtml?: boolean;
   published: boolean;
   createdAt: string;
   updatedAt: string;
@@ -329,6 +331,7 @@ export const taskDb = {
     extractPageContent?: boolean;
     validateOutput?: boolean;
     outputAsJson?: boolean;
+    outputAsHtml?: boolean;
     isAgenticDevMode?: boolean;
     emailNotification?: boolean;
     attachments?: TaskAttachment[];
@@ -398,7 +401,7 @@ export const taskDb = {
         ExpressionAttributeValues: {
           ':userId': userId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #adm, category, description, templateId',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, #adm, category, description, templateId',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
@@ -407,6 +410,7 @@ export const taskDb = {
           '#epc': 'extractPageContent',
           '#vo': 'validateOutput',
           '#oaj': 'outputAsJson',
+          '#oah': 'outputAsHtml',
           '#adm': 'isAgenticDevMode'
         }
       };
@@ -447,7 +451,7 @@ export const taskDb = {
         Key: {
           taskId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #adm, category, description, templateId',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
@@ -461,6 +465,7 @@ export const taskDb = {
           '#epc': 'extractPageContent',
           '#vo': 'validateOutput',
           '#oaj': 'outputAsJson',
+          '#oah': 'outputAsHtml',
           '#adm': 'isAgenticDevMode'
         }
       };
@@ -485,39 +490,70 @@ export const taskDb = {
     extractPageContent: boolean;
     validateOutput: boolean;
     outputAsJson: boolean;
+    outputAsHtml: boolean;
     isAgenticDevMode: boolean;
-    llmName: string;
+    llmName: string | null;
     attachments: TaskAttachment[];
   }>) {
     try {
-      const updateExpressions: string[] = [];
+      const setClauses: string[] = [];
+      const removeClauses: string[] = [];
       const expressionAttributeNames: { [key: string]: string } = {};
       const expressionAttributeValues: { [key: string]: any } = {};
 
       Object.entries(updates).forEach(([key, value]) => {
-        updateExpressions.push(`#${key} = :${key}`);
-        expressionAttributeNames[`#${key}`] = key;
-        expressionAttributeValues[`:${key}`] = value;
+        if (value === null) { // Attribute to be removed
+          removeClauses.push(`#${key}`);
+          expressionAttributeNames[`#${key}`] = key;
+        } else if (value !== undefined) { // Attribute to be set/updated
+          setClauses.push(`#${key} = :${key}`);
+          expressionAttributeNames[`#${key}`] = key;
+          expressionAttributeValues[`:${key}`] = value;
+        }
       });
 
-      const params = {
+      if (setClauses.length === 0 && removeClauses.length === 0) {
+        console.warn(`[db.ts] updateTask called for taskId ${taskId} with no effective update operations. Returning current task attributes.`);
+        // Optionally, you might want to fetch and return the current task if no updates are made.
+        const currentTaskAttributes = await this.getTaskById(taskId);
+        return currentTaskAttributes;
+      }
+
+      let updateExpression = '';
+      if (setClauses.length > 0) {
+        updateExpression += `SET ${setClauses.join(', ')}`;
+      }
+      if (removeClauses.length > 0) {
+        if (updateExpression.length > 0) {
+          updateExpression += ' '; // Add space if SET clauses exist
+        }
+        updateExpression += `REMOVE ${removeClauses.join(', ')}`;
+      }
+
+      const params: AWS.DynamoDB.DocumentClient.UpdateItemInput = {
         TableName: `${TABLE_PREFIX}AW-Tasks`,
-        Key: {
-          taskId
-        },
-        UpdateExpression: `SET ${updateExpressions.join(', ')}`,
-        ExpressionAttributeNames: expressionAttributeNames,
-        ExpressionAttributeValues: expressionAttributeValues,
+        Key: { taskId },
+        UpdateExpression: updateExpression,
         ReturnValues: 'ALL_NEW'
       };
 
-      console.log('DynamoDB update params:', JSON.stringify(params, null, 2));
+      if (Object.keys(expressionAttributeNames).length > 0) {
+        params.ExpressionAttributeNames = expressionAttributeNames;
+      }
+      
+      // ExpressionAttributeValues should only be added if there are value placeholders (i.e., if setClauses is not empty)
+      // This also means expressionAttributeValues will not be empty if setClauses is not empty.
+      if (Object.keys(expressionAttributeValues).length > 0) {
+        params.ExpressionAttributeValues = expressionAttributeValues;
+      }
+      
+      console.log(`[db.ts] DynamoDB updateTask params for taskId ${taskId}:`, JSON.stringify(params, null, 2)); // Added log
 
       const result = await dynamodb.update(params).promise();
-      console.log('DynamoDB update result:', result);
+      console.log('[db.ts] DynamoDB updateTask result:', result);
       return result.Attributes;
     } catch (error) {
-      console.error('Error in updateTask:', error);
+      console.error(`[db.ts] Error in updateTask for taskId ${taskId}:`, error);
       handleDynamoDbError(error, 'updateTask');
     }
   },

@@ -32,6 +32,7 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
       title: "DOCUMENTS",
       items: [
         { icon: FileText, label: "User Guide", path: "/guide", id: "guide" },
+        { icon: FileText, label: "Changelog", path: "/changelog", id: "changelog" }
       ]
     },
     {

@@ -410,7 +410,7 @@ def update_workflow_execution(workflow_execution_id: str, task_id: str, task_sta
         logger.error(f"Error updating workflow execution: {e}")
         return False
 
-async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str, run_user_id: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False) -> Dict[str, Any]:
+async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str, run_user_id: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False) -> Dict[str, Any]:
     log_sync_manager = None
     process = None
     
@@ -463,6 +463,8 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
             cmd.append('--output-as-json')
         if is_agentic_dev_mode:
             cmd.append('--agentic-dev-mode')
+        if output_as_html:
+            cmd.append('--output-as-html')
         
         # Run command with output redirection
         logger.info(f"Running command: {' '.join(cmd)}")
@@ -745,6 +747,7 @@ async def execute_task(execution):
                 gif_path = f"agent_history_{execution_id}_{random_suffix}.gif"
 
                 output_as_json = bool(task.get('outputAsJson', False)) if task else False
+                output_as_html = bool(task.get('outputAsHtml', False)) if task else False
                 
                 # Run appropriate agent based on task type
                 if is_deep_research:
@@ -863,7 +866,8 @@ async def execute_task(execution):
                             extract_page_content,
                             validate_output,
                             output_as_json,
-                            is_agentic_dev_mode
+                            is_agentic_dev_mode,
+                            output_as_html
                         )
                     except Exception as e:
                         logger.error(f"Error running web agent: {str(e)}")

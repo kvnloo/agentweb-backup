@@ -463,7 +463,7 @@ export default function ExecutionDetails() {
                   {execution.error}
                 </Typography>
               ) : execution.result ? (
-                execution.outputAsJson ? (
+                (execution.outputAsJson || execution.result.trim().startsWith('{') || execution.result.trim().startsWith('[')) ? (
                   formatJsonIfValid(execution.result)
                 ) : (
                   <Typography 
@@ -478,7 +478,7 @@ export default function ExecutionDetails() {
                   </Typography>
                 )
               ) : (
-                <Typography variant="body1">No result available</Typography>
+                <Typography color="textSecondary">No result available</Typography>
               )}
             </Paper>
           </Grid>

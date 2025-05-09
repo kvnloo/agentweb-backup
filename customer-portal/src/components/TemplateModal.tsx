@@ -1,4 +1,3 @@
-
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -29,6 +28,9 @@ export interface Template {
   promptPreview?: string;
   promptTemplate?: string;
   researchType?: string;
+  isComplexTask?: boolean;
+  outputAsJson?: boolean;
+  outputAsHtml?: boolean;
 }
 
 interface TemplateModalProps {
@@ -136,11 +138,23 @@ export const TemplateModal = ({
                     {template.promptTemplate}
                   </div>
                   
-                  {template.researchType && (
-                    <div className="mt-2">
-                      <p className="font-medium">Task Settings:</p>
-                      <p>{template.researchType}</p>
-                      <p>Email Notifications</p>
+                  {(template.researchType || template.isComplexTask || template.outputAsJson || template.outputAsHtml) && (
+                    <div className="mt-4">
+                      <p className="font-medium mb-1">Task Settings:</p>
+                      <div className="space-y-0.5 text-xs">
+                        {template.researchType && (
+                          <p><span className="font-semibold">Mode:</span> {template.researchType} (Email notifications will be sent)</p>
+                        )}
+                        {template.isComplexTask && (
+                          <p><span className="font-semibold">Complex Task:</span> Enabled</p>
+                        )}
+                        {template.outputAsJson && (
+                          <p><span className="font-semibold">Output Format:</span> JSON</p>
+                        )}
+                        {template.outputAsHtml && (
+                          <p><span className="font-semibold">Output Format:</span> HTML5</p>
+                        )}
+                      </div>
                     </div>
                   )}
                 </div>

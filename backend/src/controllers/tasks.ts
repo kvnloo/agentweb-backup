@@ -36,7 +36,9 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       isComplexTask, 
       extractPageContent, 
       category,
-      description
+      description,
+      outputAsJson,
+      outputAsHtml
     } = req.body;
     
     // If templateId is provided, fetch the template and use its values
@@ -95,6 +97,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           isDeepResearch: isDeepResearch !== undefined ? Boolean(isDeepResearch) : template.isDeepResearch,
           isComplexTask: isComplexTask !== undefined ? Boolean(isComplexTask) : template.isComplexTask,
           extractPageContent: extractPageContent !== undefined ? Boolean(extractPageContent) : template.extractPageContent,
+          outputAsJson: outputAsJson !== undefined ? Boolean(outputAsJson) : template.outputAsJson,
+          outputAsHtml: outputAsHtml !== undefined ? Boolean(outputAsHtml) : template.outputAsHtml,
           createdAt: new Date().toISOString(),
           llmName: req.body.llmName || null,
           category: category || template.category,
@@ -126,6 +130,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       isDeepResearch: Boolean(isDeepResearch),  // Convert to boolean
       isComplexTask: Boolean(isComplexTask),  // Convert to boolean
       extractPageContent: extractPageContent ?? isDeepResearch,  // Convert to boolean
+      outputAsJson: Boolean(outputAsJson),
+      outputAsHtml: Boolean(outputAsHtml),
       createdAt: new Date().toISOString(),
       llmName: req.body.llmName || null,
       category: category,
@@ -246,18 +252,27 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
       updates.extractPageContent = Boolean(req.body.extractPageContent);
     }
 
-    if (req.body.validateOutput !== undefined) {
-      updates.validateOutput = Boolean(req.body.validateOutput);
-    }
-
+    // Handle outputAsJson and outputAsHtml mutual exclusivity
     if (req.body.outputAsJson !== undefined) {
       updates.outputAsJson = Boolean(req.body.outputAsJson);
+      if (updates.outputAsJson) {
+        updates.outputAsHtml = false; // If JSON is true, HTML must be false
+      }
+    }
+    if (req.body.outputAsHtml !== undefined) {
+      updates.outputAsHtml = Boolean(req.body.outputAsHtml);
+      if (updates.outputAsHtml) {
+        updates.outputAsJson = false; // If HTML is true, JSON must be false
+      }
     }
 
     if (req.body.llmName !== undefined) {
       updates.llmName = req.body.llmName || null;  // Convert empty string to null
     }
-    
+    if (req.body.validateOutput !== undefined) {
+      updates.validateOutput = Boolean(req.body.validateOutput);
+    }
+
     if (req.body.status !== undefined) {
       updates.status = req.body.status;
     }
@@ -265,8 +280,6 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
     if (req.body.isAgenticDevMode !== undefined) {
       updates.isAgenticDevMode = Boolean(req.body.isAgenticDevMode);
     }
-
-    console.log('Updates to apply:', updates);
     
     // Check if we're unarchiving a task (changing status from 'archived' to 'active')
     const isUnarchiving = task.status === 'archived' && updates.status === 'active';
@@ -296,7 +309,6 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
     
     // Get and return the updated task
     const updatedTask = await taskDb.getTaskById(taskId);
-    console.log('Updated task:', updatedTask);
 
     res.json(updatedTask);
   } catch (error) {

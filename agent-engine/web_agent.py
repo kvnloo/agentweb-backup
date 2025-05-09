@@ -175,6 +175,7 @@ class WebAgent:
         self.run_user_id = None  # Added to store run_user_id
         self.log_filter_thread = None
         self.is_agentic_dev_mode = False  # Initialize is_agentic_dev_mode property
+        self.output_as_html = False # Initialize output_as_html property
 
     def setup_execution_logging(self, execution_id: str):
         """Setup logging for the current execution"""
@@ -242,7 +243,7 @@ class WebAgent:
         # Clear the reference to the log filter thread to help with garbage collection
         self.log_filter_thread = None
 
-    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False) -> Dict[str, Any]:
+    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
         log_file = None
         try:
@@ -252,6 +253,7 @@ class WebAgent:
             self.is_interactive = is_interactive
             self.generate_gif = generate_gif
             self.is_agentic_dev_mode = is_agentic_dev_mode
+            self.output_as_html = output_as_html
             
             # Set up logging
             log_file = self.setup_execution_logging(execution_id)
@@ -273,6 +275,8 @@ class WebAgent:
             # Add JSON output instruction if enabled
             if output_as_json:
                 prompt = f"{prompt}\n\nRequirement: Output result as JSON instead of free text."
+            elif self.output_as_html:
+                prompt = f"{prompt}\n\nRequirement: The final output for this task MUST be in well-formatted HTML5. You MUST use the 'Write file' action to save this HTML content into a file with an .html extension."
 
             # Create task
             self.task = prompt
@@ -1456,26 +1460,28 @@ Once the PR is approved and merged, this code will be available through the 'Run
         return self.agent.action_history
 
 async def main():
-    parser = argparse.ArgumentParser(description='Web Agent for task automation')
-    parser.add_argument('--task_id', required=True, help='Task ID')
-    parser.add_argument('--prompt_file', required=True, help='File containing the task prompt')
-    parser.add_argument('--user_id', required=True, help='User ID')
-    parser.add_argument('--llm_name', required=True, help='Full LLM name in format platform->provider->model')
-    parser.add_argument('--execution_id', required=True, help='Execution ID')
-    parser.add_argument('--gif_path', required=True, help='Path for the GIF output')
+    parser = argparse.ArgumentParser(description='Run the web agent.')
+    parser.add_argument('--user_id', required=True, help='User ID for this execution')
+    parser.add_argument('--llm_name', required=True, help='Full LLM name (e.g., azure->openai->gpt-4o)')
+    parser.add_argument('--execution_id', required=True, help='Execution ID for logging and context')
+    parser.add_argument('--task_id', required=True, help='Task ID for context and tracking')
+    parser.add_argument('--prompt_file', required=True, help='Path to the file containing the prompt')
+    parser.add_argument('--gif_path', help='Path to save the execution GIF')
     parser.add_argument('--interactive', action='store_true', help='Enable interactive mode')
-    parser.add_argument('--run_user_id', help='ID of the user who ran the task if different from owner')
-    parser.add_argument('--is_complex_task', action='store_true', help='Enable complex task mode with 100 steps')
-    parser.add_argument('--extract-page-content', action='store_true', help='Extract page content as JSON files')
-    parser.add_argument('--validate-output', action='store_true', help='Validate output from the agent')
-    parser.add_argument('--output-as-json', action='store_true', help='Format output as valid JSON')
-    parser.add_argument('--agentic-dev-mode', action='store_true', help='Enable Agentic Dev Mode with access to page content and JavaScript execution')
+    parser.add_argument('--run_user_id', help='User ID of the user who initiated the run, if different from task owner')
+    parser.add_argument('--is_complex_task', action='store_true', help='Flag for complex tasks allowing more steps')
+    parser.add_argument('--extract-page-content', action='store_true', help='Enable extraction of page content as JSON')
+    parser.add_argument('--validate-output', action='store_true', help='Enable validation of agent output')
+    parser.add_argument('--output-as-json', action='store_true', help='Output result as JSON')
+    parser.add_argument('--agentic-dev-mode', action='store_true', help='Enable agentic dev mode features')
+    parser.add_argument('--output-as-html', action='store_true', help='Output result as HTML5')
+
     args = parser.parse_args()
 
     # Read prompt from file
     try:
         with open(args.prompt_file, 'r') as f:
-            prompt = f.read()
+            prompt_content = f.read()
     except Exception as e:
         print(json.dumps({
             "success": False,
@@ -1488,7 +1494,7 @@ async def main():
     agent.run_user_id = args.run_user_id  # Set run_user_id
     try:
         result = await agent.execute_task(
-            prompt,
+            prompt_content,
             execution_id=args.execution_id,
             is_interactive=args.interactive,
             task_id=args.task_id,
@@ -1497,7 +1503,8 @@ async def main():
             extract_page_content=args.extract_page_content,
             validate_output=args.validate_output,
             output_as_json=args.output_as_json,
-            is_agentic_dev_mode=args.agentic_dev_mode
+            is_agentic_dev_mode=args.agentic_dev_mode,
+            output_as_html=args.output_as_html
         )
         print(json.dumps(result))
         sys.exit(0 if result["success"] else 1)

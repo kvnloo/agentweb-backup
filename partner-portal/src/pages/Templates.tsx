@@ -69,6 +69,8 @@ interface Template {
   createdAt: string;
   updatedAt: string;
   category?: string; // Added category
+  outputAsJson?: boolean; // Added for JSON output
+  outputAsHtml?: boolean; // Added for HTML output
 }
 
 // Helper function to extract parameters from prompt
@@ -100,6 +102,8 @@ export default function Templates() {
   const [isInteractive, setIsInteractive] = useState(false);
   const [isDeepResearch, setIsDeepResearch] = useState(false);
   const [isComplexTask, setIsComplexTask] = useState(false);
+  const [outputAsJson, setOutputAsJson] = useState(false); // New state for JSON output
+  const [outputAsHtml, setOutputAsHtml] = useState(false); // New state for HTML output
   
   const { token, user } = useAuth();
   const navigate = useNavigate();
@@ -168,6 +172,8 @@ export default function Templates() {
       setIsComplexTask(template.isComplexTask);
       setSelectedNameParameter(template.nameParameter);
       setCategory(template.category || ''); // Set category from template
+      setOutputAsJson(template.outputAsJson || false); // Set outputAsJson
+      setOutputAsHtml(template.outputAsHtml || false); // Set outputAsHtml
       if (template.category && !SUPPORTED_CATEGORIES.includes(template.category)) {
         setCustomCategory(template.category); // If existing category is custom
         setCategory('Custom');
@@ -185,6 +191,8 @@ export default function Templates() {
       setSelectedNameParameter(null);
       setCategory(''); // Reset category for new template
       setCustomCategory('');
+      setOutputAsJson(false); // Reset outputAsJson
+      setOutputAsHtml(false); // Reset outputAsHtml
     }
     setOpenEditDialog(true);
   };
@@ -214,7 +222,9 @@ export default function Templates() {
         isDeepResearch,
         isComplexTask,
         nameParameter: selectedNameParameter,
-        category: finalCategory || undefined // Send finalCategory or undefined
+        category: finalCategory || undefined, // Send finalCategory or undefined
+        outputAsJson: outputAsJson, // Add outputAsJson to template data
+        outputAsHtml: outputAsHtml  // Add outputAsHtml to template data
       };
 
       // Check if we're updating an existing template (has a valid templateId)
@@ -617,10 +627,17 @@ export default function Templates() {
                     disabled={isDeepResearch}
                   />
                 }
-                label="Complex Task"
-                sx={{ opacity: isDeepResearch ? 0.5 : 1 }}
+                label="Complex Task (more steps)"
               />
             </Tooltip>
+            <FormControlLabel
+              control={<Switch checked={outputAsJson} onChange={(e) => { setOutputAsJson(e.target.checked); if (e.target.checked) setOutputAsHtml(false); }} />}
+              label="Output as JSON"
+            />
+            <FormControlLabel
+              control={<Switch checked={outputAsHtml} onChange={(e) => { setOutputAsHtml(e.target.checked); if (e.target.checked) setOutputAsJson(false); }} />}
+              label="Output as HTML5"
+            />
           </Box>
           
         </DialogContent>

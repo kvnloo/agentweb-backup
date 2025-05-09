@@ -23,6 +23,8 @@ interface FetchedTemplate {
   isInteractive?: boolean;    // Added
   isDeepResearch?: boolean;   // Added
   isComplexTask?: boolean;    // Added
+  outputAsJson?: boolean;   // Added
+  outputAsHtml?: boolean;   // Added
 }
 
 // Define a new interface that correctly combines FrontendTemplateDef with additional fields
@@ -31,6 +33,8 @@ interface DisplayTemplate extends FrontendTemplateDef {
   isInteractive?: boolean;
   isDeepResearch?: boolean;
   isComplexTask?: boolean;
+  outputAsJson?: boolean;   // Added
+  outputAsHtml?: boolean;   // Added
   // Ensure promptTemplate is part of DisplayTemplate if used directly from it later
   // FrontendTemplateDef already has promptTemplate?: string;
 }
@@ -98,6 +102,8 @@ const Dashboard = () => {
           isInteractive: ft.isInteractive,
           isDeepResearch: ft.isDeepResearch,
           isComplexTask: ft.isComplexTask,
+          outputAsJson: ft.outputAsJson,
+          outputAsHtml: ft.outputAsHtml,
         };
         newGroupedTemplates[ft.category].push(displayTemplate);
       }
@@ -238,6 +244,8 @@ const Dashboard = () => {
       emailNotification: emailNotification,
       category: templateData.category,
       description: templateData.description,
+      outputAsJson: templateData.outputAsJson || false,
+      outputAsHtml: templateData.outputAsHtml || false,
     };
 
     console.log("Attempting to create task with payload:", taskPayload);
@@ -270,11 +278,11 @@ const Dashboard = () => {
     <div className="flex flex-col gap-6 w-full h-full">
       <div className="flex flex-col gap-2">
         <h1 className="text-2xl font-bold">
-          Welcome to your Customer Portal
+          Welcome to Your Customer Portal
         </h1>
         {user && (
           <p className="text-gray-600">
-            Hello, <span className="font-medium">{user.email.split('@')[0]}</span>. Access your market research resources and more from this dashboard.
+            Hi, <span className="font-medium">{user.email.split('@')[0]}</span>. Dive into your personalized dashboard to explore data-driven market insights, creative research and strategic tools—all in one place.
           </p>
         )}
       </div>

@@ -112,10 +112,6 @@ const TaskDetailsPage: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(false);
 
-  const [selectedExecutionDetail, setSelectedExecutionDetail] = useState<Execution | null>(null);
-  const [isDetailFrameOpen, setIsDetailFrameOpen] = useState(false);
-  const detailFrameRef = useRef<HTMLDivElement>(null);
-
   const executionsRef = useRef<Execution[]>(executions);
   const taskRef = useRef<TaskDetail | null>(task);
 
@@ -181,25 +177,6 @@ const TaskDetailsPage: React.FC = () => {
     return () => clearInterval(intervalId);
   }, [taskId, token]);
 
-  // Click outside handler for the floating frame
-  useEffect(() => {
-    const handleClickOutside = (event: MouseEvent) => {
-      if (detailFrameRef.current && !detailFrameRef.current.contains(event.target as Node)) {
-        setIsDetailFrameOpen(false);
-      }
-    };
-
-    if (isDetailFrameOpen) {
-      document.addEventListener('mousedown', handleClickOutside);
-    } else {
-      document.removeEventListener('mousedown', handleClickOutside);
-    }
-
-    return () => {
-      document.removeEventListener('mousedown', handleClickOutside);
-    };
-  }, [isDetailFrameOpen]);
-
   const handleRunTask = async () => {
     if (!token || !taskId) {
       toast({ title: "Error", description: "Cannot run task. Missing ID or token.", variant: "destructive" });
@@ -225,14 +202,10 @@ const TaskDetailsPage: React.FC = () => {
   };
 
   const handleExecutionClick = (execution: Execution) => {
-    setSelectedExecutionDetail(execution);
-    setIsDetailFrameOpen(true);
+    if (task) { // Ensure task is available to get taskId
+      navigate(`/tasks/${task.taskId}/executions/${execution.executionId}/result`);
+    }
   };
-
-  const closeDetailFrame = () => {
-    setIsDetailFrameOpen(false);
-    setSelectedExecutionDetail(null);
-  }
 
   if (loading && !task) {
      return <div className="flex justify-center items-center h-64"><Loader2 className="h-8 w-8 animate-spin text-primary" /></div>;
@@ -382,61 +355,6 @@ const TaskDetailsPage: React.FC = () => {
           <p className="text-muted-foreground">No executions found for this task.</p>
         )}
       </div>
-
-      {/* Floating Detail Frame */}
-      {isDetailFrameOpen && selectedExecutionDetail && (
-        <>
-          {/* Backdrop for click-outside-to-close */}
-          <div 
-            className="fixed inset-0 bg-black/30 z-40 backdrop-blur-sm"
-            onClick={closeDetailFrame} 
-          />
-          <div 
-            ref={detailFrameRef}
-            className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[90vw] max-w-2xl max-h-[85vh] bg-card border shadow-2xl rounded-lg flex flex-col p-0"
-          >
-            <div className="flex items-center justify-between p-4 border-b">
-              <h3 className="text-lg font-semibold">Execution: {selectedExecutionDetail.executionId}</h3>
-              <Button variant="ghost" size="icon" onClick={closeDetailFrame} className="rounded-full">
-                <X className="h-5 w-5" />
-              </Button>
-            </div>
-            <div className="p-4 space-y-3 overflow-y-auto flex-grow">
-              <div>
-                <h4 className="font-semibold text-sm mb-0.5">Details</h4>
-                <p className="text-xs">Task ID: {selectedExecutionDetail.taskId}</p>
-                <p className="text-xs">Status: {selectedExecutionDetail.status}</p>
-                {selectedExecutionDetail.llmName && <p className="text-xs">LLM: {selectedExecutionDetail.llmName}</p>}
-              </div>
-              <Separator/>
-              <div>
-                <h4 className="font-semibold text-sm mb-0.5">Timings</h4>
-                <p className="text-xs">Started: {formatDate(selectedExecutionDetail.startTime)}</p>
-                <p className="text-xs">Completed: {formatDate(selectedExecutionDetail.completedAt)}</p>
-              </div>
-              <Separator/>
-              <div>
-                <h4 className="font-semibold text-sm mb-0.5">Prompt</h4>
-                <pre className="bg-muted p-2 rounded-md text-xs whitespace-pre-wrap break-words max-h-40 overflow-y-auto">
-                  {selectedExecutionDetail.prompt}
-                </pre>
-              </div>
-              <Separator/>
-              <div>
-                <h4 className="font-semibold text-sm mb-0.5">Result</h4>
-                <div className="prose prose-sm dark:prose-invert max-w-none p-2 rounded-md bg-muted text-xs">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                    {selectedExecutionDetail.result}
-                  </ReactMarkdown>
-                </div>
-              </div>
-            </div>
-            <div className="p-4 border-t flex justify-end">
-                <Button variant="outline" onClick={closeDetailFrame}>Close</Button>
-            </div>
-          </div>
-        </>
-      )}
     </div>
   );
 };

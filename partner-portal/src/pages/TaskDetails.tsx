@@ -69,6 +69,7 @@ interface Task {
   extractPageContent?: boolean;  // New flag for extracting page content
   validateOutput?: boolean;  // Flag for validating agent output
   outputAsJson?: boolean;  // Flag for outputting result as JSON
+  outputAsHtml?: boolean; // New flag for outputting result as HTML5
   isAgenticDevMode?: boolean;  // Flag for enabling agentic dev mode
   llmName?: string;
   attachments?: TaskAttachment[];
@@ -1012,25 +1013,62 @@ export default function TaskDetails() {
 
   // Add JSON output toggle handler
   const handleJsonOutputToggle = async () => {
+    if (!task) return;
+    
     try {
+      const newOutputAsJson = !task.outputAsJson;
+      const updates: any = { outputAsJson: newOutputAsJson };
+      // If turning JSON on, turn HTML off
+      if (newOutputAsJson && task.outputAsHtml) {
+        updates.outputAsHtml = false;
+      }
+      
       await axios.put(
         buildApiUrl(`/api/tasks/${taskId}`),
-        { outputAsJson: !task?.outputAsJson },
+        updates,
         { headers: { Authorization: `Bearer ${token}` } }
       );
 
-      // Update the task state with the response from the server
+      // Update the task state with the response
       const taskResponse = await axios.get(
         buildApiUrl(`/api/tasks/${taskId}`),
-        {
-          headers: { Authorization: `Bearer ${token}` }
-        }
+        { headers: { Authorization: `Bearer ${token}` } }
       );
       
       setTask(taskResponse.data);
-    } catch (error) {
-      console.error('Error updating JSON output setting:', error);
-      setError('Failed to update Output As JSON setting');
+    } catch (error: any) {
+      console.error('Error updating JSON output mode:', error);
+      setError(error.response?.data?.message || 'Failed to update JSON output mode');
+    }
+  };
+
+  const handleOutputAsHtmlToggle = async () => {
+    if (!task) return;
+    
+    try {
+      const newOutputAsHtml = !task.outputAsHtml;
+      const updates: any = { outputAsHtml: newOutputAsHtml };
+      // If turning HTML on, turn JSON off
+      if (newOutputAsHtml && task.outputAsJson) {
+        updates.outputAsJson = false;
+      }
+      
+      await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        updates,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      // Update the task state with the response
+      const taskResponse = await axios.get(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      
+      setTask(taskResponse.data);
+    } catch (error: any) {
+      console.error('Error updating HTML output mode:', error);
+      setError(error.response?.data?.message || 'Failed to update HTML output mode');
     }
   };
 
@@ -1334,18 +1372,32 @@ export default function TaskDetails() {
                       sx={{ mt: 1, opacity: Boolean(task.isDeepResearch) ? 0.5 : 1 }}
                     />
                   </Tooltip>
-                  <Tooltip title="When enabled, the agent will output the result in JSON format. If the agent fails to produce valid JSON, the task will fail.">
+                  <Tooltip title="When enabled, the agent will output its final result in JSON format. This is useful for structured data extraction.">
                     <FormControlLabel
                       control={
                         <Switch
-                          checked={task?.outputAsJson || false}
+                          checked={Boolean(task.outputAsJson)}
                           onChange={handleJsonOutputToggle}
-                          disabled={loading || Boolean(task.isDeepResearch)}
                           color="primary"
+                          disabled={Boolean(task.isDeepResearch)}
                         />
                       }
-                      label="Output As JSON"
-                      sx={{ mt: 1, opacity: Boolean(task.isDeepResearch) ? 0.5 : 1 }}
+                      label="Output as JSON"
+                      sx={{ opacity: Boolean(task.isDeepResearch) ? 0.5 : 1 }}
+                    />
+                  </Tooltip>
+                  <Tooltip title="When enabled, the agent will output its final result in HTML5 format. This is useful for rich text or formatted content.">
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          checked={Boolean(task.outputAsHtml)}
+                          onChange={handleOutputAsHtmlToggle}
+                          color="primary"
+                          disabled={Boolean(task.isDeepResearch)}
+                        />
+                      }
+                      label="Output as HTML5"
+                      sx={{ opacity: Boolean(task.isDeepResearch) ? 0.5 : 1 }}
                     />
                   </Tooltip>
                   <Tooltip title="When enabled, the agent can access the current page's content and run JavaScript on the page, providing more developer-oriented capabilities.">

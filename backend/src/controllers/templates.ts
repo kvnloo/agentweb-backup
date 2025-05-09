@@ -21,7 +21,7 @@ export const createTemplate = async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const { name, description, prompt, isInteractive, isDeepResearch, nameParameter, category } = req.body;
+    const { name, description, prompt, isInteractive, isDeepResearch, nameParameter, category, outputAsJson, outputAsHtml, isComplexTask } = req.body;
     
     if (!name || !prompt) {
       return res.status(400).json({ message: 'Name and prompt are required' });
@@ -48,6 +48,9 @@ export const createTemplate = async (req: AuthRequest, res: Response) => {
       isInteractive: Boolean(isInteractive),
       isDeepResearch: Boolean(isDeepResearch),
       published: false, // New templates are not published by default
+      outputAsJson: outputAsJson ? true : (outputAsHtml ? false : false), // Handle mutual exclusivity
+      outputAsHtml: outputAsHtml ? true : (outputAsJson ? false : false), // Handle mutual exclusivity
+      isComplexTask: Boolean(isComplexTask), // Added isComplexTask
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       category: category || undefined // Add category, default to undefined if not provided
@@ -160,7 +163,7 @@ export const updateTemplate = async (req: AuthRequest, res: Response) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    const { name, description, prompt, isInteractive, isDeepResearch, published, nameParameter, category } = req.body;
+    const { name, description, prompt, isInteractive, isDeepResearch, isComplexTask, published, nameParameter, category, outputAsJson, outputAsHtml } = req.body;
     
     const updates: any = {};
     if (name !== undefined) updates.name = name;
@@ -197,6 +200,22 @@ export const updateTemplate = async (req: AuthRequest, res: Response) => {
     
     if (isInteractive !== undefined) updates.isInteractive = Boolean(isInteractive);
     if (isDeepResearch !== undefined) updates.isDeepResearch = Boolean(isDeepResearch);
+    if (isComplexTask !== undefined) updates.isComplexTask = Boolean(isComplexTask);
+    
+    // Handle outputAsJson and outputAsHtml mutual exclusivity
+    if (outputAsJson !== undefined) {
+      updates.outputAsJson = Boolean(outputAsJson);
+      if (updates.outputAsJson) {
+        updates.outputAsHtml = false; // If JSON is true, HTML must be false
+      }
+    }
+    // Check outputAsHtml only if outputAsJson wasn't set to true in this update
+    if (outputAsHtml !== undefined && updates.outputAsJson !== true) {
+      updates.outputAsHtml = Boolean(outputAsHtml);
+      if (updates.outputAsHtml) {
+        updates.outputAsJson = false; // If HTML is true, JSON must be false
+      }
+    }
     
     // Only allow admins to update the published status
     if (published !== undefined && user.isAdmin) {
