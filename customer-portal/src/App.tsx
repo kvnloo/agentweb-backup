@@ -16,6 +16,7 @@ import TasksPage from "@/pages/Tasks.tsx";
 import TaskDetailsPage from "@/pages/TaskDetails.tsx";
 import GuidePage from "@/pages/GuidePage.tsx";
 import ExecutionResultPage from "@/pages/ExecutionResultPage.tsx";
+import ChangelogPage from "@/pages/ChangelogPage.tsx";
 
 const queryClient = new QueryClient();
 
@@ -72,6 +73,13 @@ const App = () => (
               <ProtectedRoute>
                 <Layout>
                   <GuidePage />
+                </Layout>
+              </ProtectedRoute>
+            } />
+            <Route path="/changelog" element={
+              <ProtectedRoute>
+                <Layout>
+                  <ChangelogPage />
                 </Layout>
               </ProtectedRoute>
             } />
