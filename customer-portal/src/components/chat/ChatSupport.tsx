@@ -13,10 +13,7 @@ import {
   Bot, 
   User, 
   PlusCircle, 
-  Navigation,
-  Avatar,
-  AvatarFallback,
-  AvatarImage
+  Navigation
 } from 'lucide-react';
 import { Alert, AlertDescription } from '../ui/alert';
 import { io, Socket } from 'socket.io-client';
@@ -24,6 +21,7 @@ import { DISCORD_INVITE_URL } from "@/config";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import ReactMarkdown from 'react-markdown';
 import { AvatarFallback as NewAvatarFallback, AvatarImage as NewAvatarImage } from "@/components/ui/avatar";
+import DOMPurify from 'dompurify';
 
 interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
@@ -409,12 +407,13 @@ const ChatSupport: React.FC = () => {
                     {msg.role === 'assistant' ? 'Emma' : 'You'}
                   </span>
                 </div>
-                <div 
-                  className="text-sm whitespace-normal leading-relaxed"
-                  dangerouslySetInnerHTML={{
-                    __html: msg.content
-                  }}
-                />
+                <div className="text-sm whitespace-normal leading-relaxed prose dark:prose-invert prose-sm max-w-full">
+                  {msg.role === 'assistant' ? (
+                    <div dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(msg.content, { USE_PROFILES: { html: true } }) }} />
+                  ) : (
+                    <div dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(msg.content, { USE_PROFILES: { html: true } }) }} />
+                  )}
+                </div>
               </div>
             </div>
           ))
