@@ -13,7 +13,7 @@ import * as authController from '../controllers/auth';
 const router = express.Router();
 
 // Define Frontend URLs based on environment or defaults
-const PARTNER_FRONTEND_URL = process.env.PARTNER_FRONTEND_URL || 'http://localhost:5173';
+const PARTNER_FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 const CUSTOMER_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
 
 console.log('OAuth Configuration:', {
