@@ -12,6 +12,9 @@ import templateRoutes from './routes/templates';
 import chatbotRoutes from './routes/chatbot';
 import docsRoutes from './routes/docs';
 
+// Import the new controller
+import { viewExternalFile } from './controllers/filesController';
+
 const app = express();
 
 // CORS configuration
@@ -34,6 +37,10 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(passport.initialize());
 
+// Create a new router for file-related routes
+const fileRoutes = express.Router();
+fileRoutes.get('/view-external', viewExternalFile);
+
 // Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/tasks', taskRoutes);
@@ -45,6 +52,7 @@ app.use('/api/workflows', workflowRoutes);
 app.use('/api/templates', templateRoutes);
 app.use('/api/chatbot', chatbotRoutes);
 app.use('/api/docs', docsRoutes);
+app.use('/api/files', fileRoutes); // Add the new file routes
 
 // Health check endpoint
 app.get('/', (req, res) => {
