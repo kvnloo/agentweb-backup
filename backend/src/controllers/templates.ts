@@ -160,7 +160,7 @@ export const updateTemplate = async (req: AuthRequest, res: Response) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    const { name, description, prompt, isInteractive, isDeepResearch, published, nameParameter, category } = req.body;
+    const { name, description, prompt, isInteractive, isDeepResearch, isComplexTask, published, nameParameter, category } = req.body;
     
     const updates: any = {};
     if (name !== undefined) updates.name = name;
@@ -197,6 +197,7 @@ export const updateTemplate = async (req: AuthRequest, res: Response) => {
     
     if (isInteractive !== undefined) updates.isInteractive = Boolean(isInteractive);
     if (isDeepResearch !== undefined) updates.isDeepResearch = Boolean(isDeepResearch);
+    if (isComplexTask !== undefined) updates.isComplexTask = Boolean(isComplexTask);
     
     // Only allow admins to update the published status
     if (published !== undefined && user.isAdmin) {
