@@ -188,7 +188,7 @@ const ExecutionResultPage = () => {
           {htmlContent ? (
             <div dangerouslySetInnerHTML={{ __html: htmlContent }} />
           ) : execution?.result ? (
-            <div className="prose prose-sm dark:prose-invert max-w-none p-1 rounded-md bg-muted">
+            <div className="prose prose-sm dark:prose-invert max-w-none p-1 rounded-md">
               <ReactMarkdown remarkPlugins={[remarkGfm]}>
                 {execution.result}
               </ReactMarkdown>
