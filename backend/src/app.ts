@@ -19,13 +19,31 @@ const app = express();
 
 // CORS configuration
 const corsOptions = {
-  origin: [
-    'https://agentweb.pro', // Main Production Partner URL
-    process.env.FRONTEND_URL || 'http://localhost:5173', // Partner Portal (Deployed or Local)
-    process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174' // Customer Portal (Deployed or Local)
-    // Hardcoded 'https://app.agentweb.pro' and explicit localhost URLs previously listed
-    // are now covered by the environment variables and their fallbacks.
-  ],
+  origin: function (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) {
+    const allowedOrigins = [
+      /^https:\/\/[a-zA-Z0-9\-]+\.agentweb\.pro$/, // Allow any subdomain of agentweb.pro
+      'https://agentweb.pro', // Main Production Partner URL
+      process.env.FRONTEND_URL || 'http://localhost:5173', // Partner Portal (Deployed or Local)
+      process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174' // Customer Portal (Deployed or Local)
+    ];
+
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+
+    // Check if the origin matches any allowed pattern or string
+    const isAllowed = allowedOrigins.some(allowedOrigin => {
+      if (allowedOrigin instanceof RegExp) {
+        return allowedOrigin.test(origin);
+      }
+      return origin === allowedOrigin;
+    });
+
+    if (isAllowed) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true

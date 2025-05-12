@@ -14,11 +14,29 @@ const server = http.createServer(app);
 // Initialize Socket.IO with CORS settings
 const io = new Server(server, {
   cors: {
-    origin: [
-      'https://agentweb.pro',
-      'http://localhost:5173',
-      process.env.FRONTEND_URL || 'http://localhost:5173'
-    ],
+    origin: function (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) {
+      const allowedOrigins = [
+        /^https:\/\/[a-zA-Z0-9\-]+\.agentweb\.pro$/,
+        'https://agentweb.pro',
+        'http://localhost:5173',
+        process.env.FRONTEND_URL || 'http://localhost:5173'
+      ];
+
+      if (!origin) return callback(null, true);
+
+      const isAllowed = allowedOrigins.some(allowedOrigin => {
+        if (allowedOrigin instanceof RegExp) {
+          return allowedOrigin.test(origin);
+        }
+        return origin === allowedOrigin;
+      });
+
+      if (isAllowed) {
+        callback(null, true);
+      } else {
+        callback(new Error('Not allowed by CORS'));
+      }
+    },
     methods: ['GET', 'POST'],
     credentials: true
   },
