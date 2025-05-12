@@ -213,22 +213,9 @@ const Dashboard = () => {
     // --- End Debugging --- 
 
     let taskName = templateData.title;
-    // If nameParameter is specified and has a value provided by the user
+    // If nameParameter is specified and has a value provided by the user, append it.
     if (templateData.nameParameter && paramValues[templateData.nameParameter]) {
-      // Construct the placeholder, e.g., "[Company Name]"
-      const placeholder = `[${templateData.nameParameter}]`;
-      // Create a regex to find the placeholder globally
-      const placeholderRegex = new RegExp(`\\[${templateData.nameParameter}\\]`, 'g');
-      
-      // Check if the placeholder exists in the original template title
-      if (taskName.includes(placeholder)) {
-        // If yes, replace the placeholder with the user's value
-        taskName = taskName.replace(placeholderRegex, paramValues[templateData.nameParameter]);
-      } else {
-        // Optional: If placeholder NOT in title, maybe append as fallback?
-        // Current decision: Use original title if placeholder isn't found.
-        // taskName = `${templateData.title} - ${paramValues[templateData.nameParameter]}`; // Old append logic
-      }
+        taskName = `${templateData.title} - ${paramValues[templateData.nameParameter]}`;
     }
     // If nameParameter is not set, or user didn't provide value, taskName remains the original template title.
 
