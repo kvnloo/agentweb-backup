@@ -73,6 +73,7 @@ interface Task {
   isAgenticDevMode?: boolean;  // Flag for enabling agentic dev mode
   llmName?: string;
   attachments?: TaskAttachment[];
+  selectedLLMs?: string[];
 }
 
 interface TaskAttachment {
@@ -1433,7 +1434,10 @@ export default function TaskDetails() {
                       <MenuItem value="">
                         <em>System Default Order</em>
                       </MenuItem>
-                      {getLLMsForTask(Boolean(task.isDeepResearch)).map((llm: string) => (
+                      {( (task && task.selectedLLMs && task.selectedLLMs.length > 0) 
+                          ? task.selectedLLMs 
+                          : getLLMsForTask(Boolean(task?.isDeepResearch)) 
+                       ).map((llm: string) => (
                         <MenuItem key={llm} value={llm}>
                           {llm}
                         </MenuItem>

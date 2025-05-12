@@ -37,11 +37,14 @@ import {
   Add as AddIcon,
   Public as PublicIcon,
   PublicOff as PublicOffIcon,
-  AdminPanelSettings as AdminIcon
+  AdminPanelSettings as AdminIcon,
+  ArrowUpward as ArrowUpwardIcon,
+  ArrowDownward as ArrowDownwardIcon
 } from '@mui/icons-material';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
 import { buildApiUrl } from '../config';
+import { AVAILABLE_LLMS } from '../config';
 
 // Define supported categories
 const SUPPORTED_CATEGORIES = [
@@ -71,6 +74,7 @@ interface Template {
   category?: string; // Added category
   outputAsJson?: boolean; // Added for JSON output
   outputAsHtml?: boolean; // Added for HTML output
+  selectedLLMs?: string[]; // Added for LLM selection
 }
 
 // Helper function to extract parameters from prompt
@@ -104,6 +108,7 @@ export default function Templates() {
   const [isComplexTask, setIsComplexTask] = useState(false);
   const [outputAsJson, setOutputAsJson] = useState(false); // New state for JSON output
   const [outputAsHtml, setOutputAsHtml] = useState(false); // New state for HTML output
+  const [selectedLLMs, setSelectedLLMs] = useState<string[]>([]); // New state for selected LLMs
   
   const { token, user } = useAuth();
   const navigate = useNavigate();
@@ -174,6 +179,7 @@ export default function Templates() {
       setCategory(template.category || ''); // Set category from template
       setOutputAsJson(template.outputAsJson || false); // Set outputAsJson
       setOutputAsHtml(template.outputAsHtml || false); // Set outputAsHtml
+      setSelectedLLMs(template.selectedLLMs || []); // Set selectedLLMs
       if (template.category && !SUPPORTED_CATEGORIES.includes(template.category)) {
         setCustomCategory(template.category); // If existing category is custom
         setCategory('Custom');
@@ -193,6 +199,7 @@ export default function Templates() {
       setCustomCategory('');
       setOutputAsJson(false); // Reset outputAsJson
       setOutputAsHtml(false); // Reset outputAsHtml
+      setSelectedLLMs([]); // Reset selectedLLMs
     }
     setOpenEditDialog(true);
   };
@@ -203,6 +210,7 @@ export default function Templates() {
     setSelectedNameParameter(null);
     setCategory('');
     setCustomCategory('');
+    setSelectedLLMs([]); // Clear selected LLMs on close
   };
 
   const handleSubmit = async () => {
@@ -224,7 +232,8 @@ export default function Templates() {
         nameParameter: selectedNameParameter,
         category: finalCategory || undefined, // Send finalCategory or undefined
         outputAsJson: outputAsJson, // Add outputAsJson to template data
-        outputAsHtml: outputAsHtml  // Add outputAsHtml to template data
+        outputAsHtml: outputAsHtml,  // Add outputAsHtml to template data
+        selectedLLMs: selectedLLMs // Add selectedLLMs to template data
       };
 
       // Check if we're updating an existing template (has a valid templateId)
@@ -262,6 +271,18 @@ export default function Templates() {
     } catch (err) {
       setError(currentTemplate ? 'Failed to update template' : 'Failed to create template');
       console.error(err);
+    }
+  };
+
+  const handleMoveLLM = (index: number, direction: 'up' | 'down') => {
+    if (direction === 'up' && index > 0) {
+      const newLLMs = [...selectedLLMs];
+      [newLLMs[index - 1], newLLMs[index]] = [newLLMs[index], newLLMs[index - 1]];
+      setSelectedLLMs(newLLMs);
+    } else if (direction === 'down' && index < selectedLLMs.length - 1) {
+      const newLLMs = [...selectedLLMs];
+      [newLLMs[index + 1], newLLMs[index]] = [newLLMs[index], newLLMs[index + 1]];
+      setSelectedLLMs(newLLMs);
     }
   };
 
@@ -527,6 +548,69 @@ export default function Templates() {
             onChange={(e) => setPrompt(e.target.value)}
             helperText="The task instructions in natural language. You can include parameters in the format [parameter_name] that users will be prompted to fill in when creating a task from this template."
           />
+          
+          {/* LLM Selection */}
+          <FormControl fullWidth margin="normal">
+            <InputLabel id="llm-select-label">Allowed LLMs (Optional)</InputLabel>
+            <Select
+              labelId="llm-select-label"
+              id="llm-select"
+              multiple
+              value={selectedLLMs}
+              onChange={(event) => setSelectedLLMs(event.target.value as string[])}
+              label="Allowed LLMs (Optional)"
+              renderValue={(selected) => (
+                <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
+                  {(selected as string[]).map((value) => (
+                    <Chip key={value} label={value.split('->').pop() || value} /> // Display only the model name part
+                  ))}
+                </Box>
+              )}
+            >
+              {AVAILABLE_LLMS.map((llm: string) => {
+                const [provider, vendor, modelName] = llm.split('->');
+                const displayName = modelName || llm; // Fallback to full name if parsing fails
+                return (
+                  <MenuItem 
+                    key={llm} 
+                    value={llm}
+                    selected={selectedLLMs.includes(llm)}
+                  >
+                    {`${displayName} (${provider}/${vendor})`}
+                  </MenuItem>
+                );
+              })}
+            </Select>
+            <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5 }}>
+              Select specific LLMs to be available for tasks created from this template. If none are selected, all allowed LLMs for the task type will be available.
+            </Typography>
+          </FormControl>
+          
+          {/* UI for reordering selected LLMs */} 
+          {selectedLLMs.length > 0 && (
+            <Box sx={{ mt: 2, p: 2, border: '1px solid', borderColor: 'divider', borderRadius: 1 }}>
+              <Typography variant="subtitle2" gutterBottom>
+                Selected LLMs Order (Drag to reorder coming soon)
+              </Typography>
+              {selectedLLMs.map((llm, index) => {
+                const [,, modelName] = llm.split('->');
+                const displayName = modelName || llm;
+                return (
+                  <Box key={llm} sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 1, p: 1, backgroundColor: 'action.hover', borderRadius: 1}}>
+                    <Typography variant="body2">{`${index + 1}. ${displayName}`}</Typography>
+                    <Box>
+                      <IconButton size="small" onClick={() => handleMoveLLM(index, 'up')} disabled={index === 0}>
+                        <ArrowUpwardIcon fontSize="inherit" />
+                      </IconButton>
+                      <IconButton size="small" onClick={() => handleMoveLLM(index, 'down')} disabled={index === selectedLLMs.length - 1}>
+                        <ArrowDownwardIcon fontSize="inherit" />
+                      </IconButton>
+                    </Box>
+                  </Box>
+                );
+              })}
+            </Box>
+          )}
           
           {/* Display detected parameters */}
           {prompt && (

@@ -21,7 +21,7 @@ export const createTemplate = async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const { name, description, prompt, isInteractive, isDeepResearch, nameParameter, category, outputAsJson, outputAsHtml, isComplexTask } = req.body;
+    const { name, description, prompt, isInteractive, isDeepResearch, nameParameter, category, outputAsJson, outputAsHtml, isComplexTask, selectedLLMs } = req.body;
     
     if (!name || !prompt) {
       return res.status(400).json({ message: 'Name and prompt are required' });
@@ -53,7 +53,8 @@ export const createTemplate = async (req: AuthRequest, res: Response) => {
       isComplexTask: Boolean(isComplexTask), // Added isComplexTask
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      category: category || undefined // Add category, default to undefined if not provided
+      category: category || undefined, // Add category, default to undefined if not provided
+      selectedLLMs: selectedLLMs || [] // Add selectedLLMs, default to empty array
     };
 
     const createdTemplate = await taskTemplateDb.createTemplate(template as any); // Cast to any for now if TaskTemplate type in db.ts isn't updated by this model yet
@@ -163,7 +164,7 @@ export const updateTemplate = async (req: AuthRequest, res: Response) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    const { name, description, prompt, isInteractive, isDeepResearch, isComplexTask, published, nameParameter, category, outputAsJson, outputAsHtml } = req.body;
+    const { name, description, prompt, isInteractive, isDeepResearch, isComplexTask, published, nameParameter, category, outputAsJson, outputAsHtml, selectedLLMs } = req.body;
     
     const updates: any = {};
     if (name !== undefined) updates.name = name;
@@ -210,12 +211,9 @@ export const updateTemplate = async (req: AuthRequest, res: Response) => {
       }
     }
     // Check outputAsHtml only if outputAsJson wasn't set to true in this update
-    if (outputAsHtml !== undefined && updates.outputAsJson !== true) {
-      updates.outputAsHtml = Boolean(outputAsHtml);
-      if (updates.outputAsHtml) {
-        updates.outputAsJson = false; // If HTML is true, JSON must be false
-      }
-    }
+    if (outputAsHtml !== undefined) updates.outputAsHtml = outputAsHtml ? true : (updates.outputAsJson === undefined ? template.outputAsJson : updates.outputAsJson) ? false : false;
+    
+    if (selectedLLMs !== undefined) updates.selectedLLMs = selectedLLMs;
     
     // Only allow admins to update the published status
     if (published !== undefined && user.isAdmin) {

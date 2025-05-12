@@ -15,16 +15,26 @@ conda env create -f environment.yml
 conda activate agent-engine
 ```
 
-2. Make the agent script executable:
-```bash
-chmod +x web_agent.py
-```
-
 ### Alternative Setup (pip)
 
 You can install dependencies directly with pip:
 ```bash
 pip install -r requirements.txt
+```
+
+## Running the Agent Engine
+
+The main entry point for the agent engine is `task_monitor.py`. This script handles all task execution, scheduling, and monitoring:
+
+```bash
+# Make sure you're in the agent-engine directory
+cd agent-engine
+
+# Activate the conda environment if not already activated
+conda activate agent-engine
+
+# Start the agent engine
+python task_monitor.py
 ```
 
 ## Testing Gemini Integration

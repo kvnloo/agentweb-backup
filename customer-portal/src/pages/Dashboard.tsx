@@ -25,6 +25,7 @@ interface FetchedTemplate {
   isComplexTask?: boolean;    // Added
   outputAsJson?: boolean;   // Added
   outputAsHtml?: boolean;   // Added
+  selectedLLMs?: string[];  // Added for template LLM selection
 }
 
 // Define a new interface that correctly combines FrontendTemplateDef with additional fields
@@ -35,6 +36,7 @@ interface DisplayTemplate extends FrontendTemplateDef {
   isComplexTask?: boolean;
   outputAsJson?: boolean;   // Added
   outputAsHtml?: boolean;   // Added
+  selectedLLMs?: string[];  // Added for template LLM selection
   // Ensure promptTemplate is part of DisplayTemplate if used directly from it later
   // FrontendTemplateDef already has promptTemplate?: string;
 }
@@ -104,6 +106,7 @@ const Dashboard = () => {
           isComplexTask: ft.isComplexTask,
           outputAsJson: ft.outputAsJson,
           outputAsHtml: ft.outputAsHtml,
+          selectedLLMs: ft.selectedLLMs, // Map selectedLLMs
         };
         newGroupedTemplates[ft.category].push(displayTemplate);
       }
@@ -210,28 +213,20 @@ const Dashboard = () => {
     // --- End Debugging --- 
 
     let taskName = templateData.title;
-    // If nameParameter is specified and has a value provided by the user
+    // If nameParameter is specified and has a value provided by the user, append it.
     if (templateData.nameParameter && paramValues[templateData.nameParameter]) {
-      // Construct the placeholder, e.g., "[Company Name]"
-      const placeholder = `[${templateData.nameParameter}]`;
-      // Create a regex to find the placeholder globally
-      const placeholderRegex = new RegExp(`\\[${templateData.nameParameter}\\]`, 'g');
-      
-      // Check if the placeholder exists in the original template title
-      if (taskName.includes(placeholder)) {
-        // If yes, replace the placeholder with the user's value
-        taskName = taskName.replace(placeholderRegex, paramValues[templateData.nameParameter]);
-      } else {
-        // Optional: If placeholder NOT in title, maybe append as fallback?
-        // Current decision: Use original title if placeholder isn't found.
-        // taskName = `${templateData.title} - ${paramValues[templateData.nameParameter]}`; // Old append logic
-      }
+        taskName = `${templateData.title} - ${paramValues[templateData.nameParameter]}`;
     }
     // If nameParameter is not set, or user didn't provide value, taskName remains the original template title.
 
     console.log(`Final Task Name Generated: ${taskName}`);
 
     const emailNotification = templateData.isDeepResearch || false;
+
+    // --- Log templateData just before creating payload ---
+    console.log("Template data before creating payload:", templateData);
+    console.log("Selected LLMs in templateData:", templateData.selectedLLMs);
+    // --- End log ---
 
     const taskPayload = {
       templateId: templateData.id,
@@ -246,6 +241,7 @@ const Dashboard = () => {
       description: templateData.description,
       outputAsJson: templateData.outputAsJson || false,
       outputAsHtml: templateData.outputAsHtml || false,
+      selectedLLMs: templateData.selectedLLMs,
     };
 
     console.log("Attempting to create task with payload:", taskPayload);

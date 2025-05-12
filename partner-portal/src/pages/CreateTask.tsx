@@ -198,34 +198,29 @@ export default function CreateTask() {
         ? getPreviewPrompt() 
         : prompt;
       
-      // Get the template if selected
-      const selectedTemplateObj = selectedTemplate 
-        ? templates.find(t => t.templateId === selectedTemplate) 
-        : null;
-      
+      const finalName = selectedTemplate 
+        ? getPreviewTaskName() 
+        : name;
+
       const taskData: any = {
-        name: selectedTemplateObj ? selectedTemplateObj.name : name,
+        name: finalName,
         prompt: finalPrompt,
-        isInteractive: selectedTemplateObj ? selectedTemplateObj.isInteractive : isInteractive,
-        isDeepResearch: selectedTemplateObj ? selectedTemplateObj.isDeepResearch : isDeepResearch,
-        isComplexTask: selectedTemplateObj ? selectedTemplateObj.isComplexTask : isComplexTask,
+        isInteractive: isInteractive,
+        isDeepResearch: isDeepResearch,
+        isComplexTask: isComplexTask,
+        outputAsJson: outputAsJson,
+        outputAsHtml: outputAsHtml,
         emailNotification,
-        outputAsJson: selectedTemplateObj && outputAsJson === (selectedTemplateObj.outputAsJson || false) 
-                        ? (selectedTemplateObj.outputAsJson || false) 
-                        : outputAsJson,
-        outputAsHtml: selectedTemplateObj && outputAsHtml === (selectedTemplateObj.outputAsHtml || false)
-                        ? (selectedTemplateObj.outputAsHtml || false)
-                        : outputAsHtml,
+        // Only include templateId if a template is selected AND we are on the template tab
+        templateId: tabValue === 0 && selectedTemplate ? selectedTemplate : undefined,
+        // Pass parameterValues only if a template is selected AND we are on the template tab
+        parameterValues: tabValue === 0 && selectedTemplate && currentTemplateParams.length > 0 ? parameterValues : undefined,
       };
       
       // If a template is selected, include its ID, parameter values, category, and description
-      if (selectedTemplateObj) {
-        taskData.templateId = selectedTemplateObj.templateId;
-        if (Object.keys(parameterValues).length > 0) {
-          taskData.parameterValues = parameterValues;
-        }
-        taskData.category = selectedTemplateObj.category;
-        taskData.description = selectedTemplateObj.description;
+      if (selectedTemplate) {
+        taskData.category = templates.find(t => t.templateId === selectedTemplate)?.category;
+        taskData.description = templates.find(t => t.templateId === selectedTemplate)?.description;
       }
 
       await axios.post(

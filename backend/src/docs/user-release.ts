@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-05-12',
+    changes: [
+      'Template Enhancements with LLM selection',
+      '- Aadmin can select a list of LLMs to use when defining a template','- Tasks created using this template would use the selected LLMs to run',
+      '- Best for tasks with better-performing LLMs'
+    ],
+  },
+  {
     date: '2025-05-09',
     changes: [
       'Improvements and bug fixes',
