@@ -129,7 +129,7 @@ const ChangelogPage: React.FC = () => {
             <CardHeader className="bg-gray-50 dark:bg-gray-800 py-4 px-6">
               <div className="flex justify-start items-center mb-1">
                 <p className="text-sm text-gray-500 dark:text-gray-400">
-                  {new Date(entry.date).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}
+                  {new Date(entry.date).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' })}
                 </p>
               </div>
               <Separator className="my-2" />

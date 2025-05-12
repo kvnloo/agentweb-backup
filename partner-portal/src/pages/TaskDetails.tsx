@@ -51,7 +51,7 @@ import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
 import ScheduleForm from '../components/ScheduleForm';
 import ScheduleList from '../components/ScheduleList';
-import { buildApiUrl, getLLMsForTask, AVAILABLE_LLMS } from '../config';
+import { buildApiUrl, getLLMsForTask } from '../config';
 
 interface Task {
   taskId: string;
