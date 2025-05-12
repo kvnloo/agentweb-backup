@@ -141,6 +141,25 @@ const ExecutionResultPage = () => {
               }
             }
 
+            // Ensure links in the HTML open in a new tab
+            try {
+              const parser = new DOMParser();
+              // Parse the potentially style-injected HTML
+              const tempDoc = parser.parseFromString(sanitizedHtml, 'text/html'); 
+              const links = tempDoc.querySelectorAll('a');
+              links.forEach(link => {
+                const href = link.getAttribute('href');
+                if (href && !href.startsWith('#')) {
+                  link.setAttribute('target', '_blank');
+                  link.setAttribute('rel', 'noopener');
+                }
+              });
+              // Re-serialize the *entire modified document* to preserve head/styles
+              sanitizedHtml = tempDoc.documentElement.outerHTML;
+            } catch (domError) {
+              console.error("Error processing HTML links:", domError);
+            }
+
             setHtmlContent(sanitizedHtml);
           } catch (fileError: any) {
             console.error('Error fetching HTML file content:', fileError);
@@ -215,10 +234,10 @@ const ExecutionResultPage = () => {
               srcDoc={htmlContent} 
               title="Execution Result HTML"
               style={{ width: '100%', height: '600px', border: 'none' }}
-              sandbox="allow-same-origin"
+              sandbox="allow-same-origin allow-scripts allow-popups"
             />
           ) : execution?.result ? (
-            <div className="prose prose-sm dark:prose-invert max-w-none p-1 rounded-md">
+            <div className="prose dark:prose-invert max-w-none p-4 rounded-md bg-muted dark:bg-slate-900/50">
               <ReactMarkdown remarkPlugins={[remarkGfm]}>
                 {execution.result}
               </ReactMarkdown>
