@@ -715,14 +715,19 @@ async def execute_task(execution):
         
         # Use different LLM list for deep research tasks
         if is_deep_research:
-            env_llm_names = os.getenv('DEEP_RESEARCH_LLM_NAMES', 'azure->openai->o1-mini,azure->openai->gpt-4o')
-            logger.info(f"Using deep research LLM list: {env_llm_names}")
+            default_llm_names = os.getenv('DEEP_RESEARCH_LLM_NAMES', 'azure->openai->o1-mini,azure->openai->gpt-4o').split(',')
+            logger.info(f"Using deep research LLM list: {default_llm_names}")
         else:
-            env_llm_names = os.getenv('LIST_FULL_LLM_NAMES', 'azure->openai->gpt-4o,aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0,openai->openai->gpt-4o')
-            logger.info(f"Using standard LLM list: {env_llm_names}")
+            default_llm_names = os.getenv('LIST_FULL_LLM_NAMES', 'azure->openai->gpt-4o,aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0,openai->openai->gpt-4o').split(',')
+            logger.info(f"Using default LLM list: {default_llm_names}")
+
+            # Override for standard tasks if selectedLLMs is specified
+            if task and task.get('selectedLLMs') and isinstance(task['selectedLLMs'], list) and len(task['selectedLLMs']) > 0:
+                logger.info(f"Standard task override: Using selectedLLMs {task['selectedLLMs']} instead of default list.")
+                default_llm_names = task['selectedLLMs'] # Replace the list
             
         # Add each non-empty name if not already in the list
-        for name in env_llm_names.split(','):
+        for name in default_llm_names:
             name = name.strip()
             if name and name not in llm_names:
                 llm_names.append(name)
