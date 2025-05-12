@@ -11,6 +11,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/use-toast";
+import { Badge } from "@/components/ui/badge";
 
 export interface TemplateParameter {
   id: string;
@@ -31,6 +32,7 @@ export interface Template {
   isComplexTask?: boolean;
   outputAsJson?: boolean;
   outputAsHtml?: boolean;
+  selectedLLMs?: string[];
 }
 
 interface TemplateModalProps {
@@ -154,6 +156,20 @@ export const TemplateModal = ({
                         {template.outputAsHtml && (
                           <p><span className="font-semibold">Output Format:</span> HTML5</p>
                         )}
+                      </div>
+                    </div>
+                  )}
+                  
+                  {/* Display Selected LLMs */}
+                  {template.selectedLLMs && template.selectedLLMs.length > 0 && (
+                    <div className="mt-4">
+                      <p className="font-medium mb-1">LLMs to use:</p>
+                      <div className="flex flex-wrap gap-1">
+                        {template.selectedLLMs.map(llm => (
+                          <Badge key={llm} variant="secondary">
+                            {llm.split('->').pop() || llm} 
+                          </Badge>
+                        ))}
                       </div>
                     </div>
                   )}

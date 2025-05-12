@@ -25,6 +25,7 @@ interface FetchedTemplate {
   isComplexTask?: boolean;    // Added
   outputAsJson?: boolean;   // Added
   outputAsHtml?: boolean;   // Added
+  selectedLLMs?: string[];  // Added for template LLM selection
 }
 
 // Define a new interface that correctly combines FrontendTemplateDef with additional fields
@@ -35,6 +36,7 @@ interface DisplayTemplate extends FrontendTemplateDef {
   isComplexTask?: boolean;
   outputAsJson?: boolean;   // Added
   outputAsHtml?: boolean;   // Added
+  selectedLLMs?: string[];  // Added for template LLM selection
   // Ensure promptTemplate is part of DisplayTemplate if used directly from it later
   // FrontendTemplateDef already has promptTemplate?: string;
 }
@@ -104,6 +106,7 @@ const Dashboard = () => {
           isComplexTask: ft.isComplexTask,
           outputAsJson: ft.outputAsJson,
           outputAsHtml: ft.outputAsHtml,
+          selectedLLMs: ft.selectedLLMs, // Map selectedLLMs
         };
         newGroupedTemplates[ft.category].push(displayTemplate);
       }
