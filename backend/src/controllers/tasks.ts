@@ -38,7 +38,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       category,
       description,
       outputAsJson,
-      outputAsHtml
+      outputAsHtml,
+      selectedLLMs
     } = req.body;
     
     // If templateId is provided, fetch the template and use its values
@@ -85,7 +86,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           llmName: req.body.llmName || null,
           category: category || template.category,
           description: description || template.description,
-          templateId: templateId
+          templateId: templateId,
+          selectedLLMs: selectedLLMs || template.selectedLLMs || null
         };
 
         const createdTask = await taskDb.createTask(task);
@@ -117,7 +119,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       createdAt: new Date().toISOString(),
       llmName: req.body.llmName || null,
       category: category,
-      description: description
+      description: description,
+      selectedLLMs: selectedLLMs || null
     };
 
     const createdTask = await taskDb.createTask(task);

@@ -223,6 +223,11 @@ const Dashboard = () => {
 
     const emailNotification = templateData.isDeepResearch || false;
 
+    // --- Log templateData just before creating payload ---
+    console.log("Template data before creating payload:", templateData);
+    console.log("Selected LLMs in templateData:", templateData.selectedLLMs);
+    // --- End log ---
+
     const taskPayload = {
       templateId: templateData.id,
       name: taskName,
@@ -236,6 +241,7 @@ const Dashboard = () => {
       description: templateData.description,
       outputAsJson: templateData.outputAsJson || false,
       outputAsHtml: templateData.outputAsHtml || false,
+      selectedLLMs: templateData.selectedLLMs,
     };
 
     console.log("Attempting to create task with payload:", taskPayload);
