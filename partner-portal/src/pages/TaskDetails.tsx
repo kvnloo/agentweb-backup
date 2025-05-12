@@ -51,7 +51,7 @@ import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
 import ScheduleForm from '../components/ScheduleForm';
 import ScheduleList from '../components/ScheduleList';
-import { buildApiUrl, getLLMsForTask } from '../config';
+import { buildApiUrl, getLLMsForTask, AVAILABLE_LLMS } from '../config';
 
 interface Task {
   taskId: string;
@@ -73,6 +73,7 @@ interface Task {
   isAgenticDevMode?: boolean;  // Flag for enabling agentic dev mode
   llmName?: string;
   attachments?: TaskAttachment[];
+  selectedLLMs?: string[];
 }
 
 interface TaskAttachment {
@@ -1433,7 +1434,10 @@ export default function TaskDetails() {
                       <MenuItem value="">
                         <em>System Default Order</em>
                       </MenuItem>
-                      {getLLMsForTask(Boolean(task.isDeepResearch)).map((llm: string) => (
+                      {( (task && task.selectedLLMs && task.selectedLLMs.length > 0) 
+                          ? task.selectedLLMs 
+                          : getLLMsForTask(Boolean(task?.isDeepResearch)) 
+                       ).map((llm: string) => (
                         <MenuItem key={llm} value={llm}>
                           {llm}
                         </MenuItem>

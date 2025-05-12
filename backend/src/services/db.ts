@@ -85,6 +85,7 @@ interface TaskTemplate {
   createdAt: string;
   updatedAt: string;
   category?: string;
+  selectedLLMs?: string[];
 }
 
 interface UserWithCounts extends User {
@@ -339,6 +340,7 @@ export const taskDb = {
     description?: string;
     llmName?: string | null;
     templateId?: string;
+    selectedLLMs?: string[];
   }) {
     try {
       const params = {
@@ -451,7 +453,7 @@ export const taskDb = {
         Key: {
           taskId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
@@ -494,6 +496,7 @@ export const taskDb = {
     isAgenticDevMode: boolean;
     llmName: string | null;
     attachments: TaskAttachment[];
+    selectedLLMs?: string[];
   }>) {
     try {
       const setClauses: string[] = [];

@@ -56,47 +56,29 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           return res.status(403).json({ message: 'Access denied to this template' });
         }
         
-        // Get the template prompt and substitute parameters if provided
-        let finalPrompt = template.prompt;
-        
-        // If the template has parameters and parameter values are provided
-        if (template.parameters && template.parameters.length > 0 && parameterValues) {
-          // Substitute each parameter with its value
-          template.parameters.forEach(param => {
-            const paramValue = parameterValues[param];
-            if (paramValue) {
-              // Replace all occurrences of [param] with the provided value
-              const paramRegex = new RegExp(`\\[${param}\\]`, 'g');
-              finalPrompt = finalPrompt.replace(paramRegex, paramValue);
-            }
-          });
-        }
-        
-        // For deep research tasks, email notification is automatically enabled
+        // Frontend already processes name and prompt with parameters.
+        // Values from req.body (name, prompt, isInteractive, etc.) are used directly or as overrides.
+
+        // For deep research tasks, email notification is automatically enabled or taken from request.
         const finalEmailNotification = emailNotification !== undefined 
           ? emailNotification 
           : isDeepResearch !== undefined 
             ? isDeepResearch 
             : template.isDeepResearch;
         
-        // Create task name with nameParameter if specified
-        let finalName = name || template.name;
-        if (template.nameParameter && parameterValues && parameterValues[template.nameParameter]) {
-          finalName = `${finalName} - ${parameterValues[template.nameParameter]}`;
-        }
-        
-        // Create task using template values, but allow overrides from request body
+        // Create task using template values, allowing overrides from request body for most fields.
+        // name and prompt from req.body are already fully processed by the frontend.
         const task = {
           taskId: Date.now().toString(),
           userId,
-          name: finalName,
-          prompt: finalPrompt || prompt,
+          name: name, // Use name from req.body (already processed by frontend)
+          prompt: prompt, // Use prompt from req.body (already processed by frontend)
           status: 'active',
           emailNotification: finalEmailNotification,
           isInteractive: isInteractive !== undefined ? Boolean(isInteractive) : template.isInteractive,
           isDeepResearch: isDeepResearch !== undefined ? Boolean(isDeepResearch) : template.isDeepResearch,
           isComplexTask: isComplexTask !== undefined ? Boolean(isComplexTask) : template.isComplexTask,
-          extractPageContent: extractPageContent !== undefined ? Boolean(extractPageContent) : template.extractPageContent,
+          extractPageContent: extractPageContent !== undefined ? Boolean(extractPageContent) : template.extractPageContent, // Uses template.extractPageContent if extractPageContent is undefined in req.body
           outputAsJson: outputAsJson !== undefined ? Boolean(outputAsJson) : template.outputAsJson,
           outputAsHtml: outputAsHtml !== undefined ? Boolean(outputAsHtml) : template.outputAsHtml,
           createdAt: new Date().toISOString(),
