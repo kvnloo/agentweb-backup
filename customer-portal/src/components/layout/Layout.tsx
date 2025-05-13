@@ -7,6 +7,7 @@ import { useAuth } from "@/contexts/AuthContext";
 import UserProfileDropdown from "./UserProfileDropdown";
 import ChatSupport from "../chat/ChatSupport";
 import { DISCORD_INVITE_URL } from "@/config";
+import AgentWebLogo from "@/assets/AgentWeb-Logo-189x62.svg";
 
 const Layout = ({ children }: { children: React.ReactNode }) => {
   const location = useLocation();
@@ -72,17 +73,12 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
         <div className="flex h-14 items-center px-4 border-b border-[#D6BCFA] dark:border-[#7E69AB]">
           {!isCollapsed && (
             <Link to="/" className="flex items-center gap-2">
-              <div className="h-8 w-8 rounded-md agent-gradient flex items-center justify-center">
-                <span className="text-white font-bold">A</span>
-              </div>
-              <span className="text-xl font-semibold text-gray-900 dark:text-gray-900">Customer Portal</span>
+              <img src={AgentWebLogo} alt="AgentWeb Logo" className="h-8" />
             </Link>
           )}
           {isCollapsed && (
             <div className="w-full flex justify-center">
-              <div className="h-8 w-8 rounded-md agent-gradient flex items-center justify-center">
-                <span className="text-white font-bold">A</span>
-              </div>
+              <img src={AgentWebLogo} alt="AgentWeb Logo" className="h-8" />
             </div>
           )}
         </div>

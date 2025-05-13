@@ -5,7 +5,6 @@ import { AdapterDateFns } from '@mui/x-date-pickers/AdapterDateFns';
 import { AuthProvider } from './contexts/AuthContext';
 import { AdminProvider } from './contexts/AdminContext';
 import theme from './theme';
-import Home from './pages/Home';
 import Login from './pages/Login';
 import Register from './pages/Register';
 import Tasks from './pages/Tasks';
@@ -31,6 +30,15 @@ import Guide from './pages/Guide';
 import Templates from './pages/Templates';
 import Api from './pages/Api';
 import Marketing from './pages/marketing';
+import { useEffect } from 'react';
+
+const RedirectToAgentWeb = () => {
+  useEffect(() => {
+    window.location.href = 'https://www.agentweb.pro';
+  }, []);
+
+  return null;
+};
 
 export default function App() {
   return (
@@ -43,7 +51,7 @@ export default function App() {
               <Box sx={{ display: 'flex', flexDirection: 'column', minHeight: '100vh' }}>
                 <Routes>
                   <Route path="/" element={<Layout />}>
-                    <Route index element={<Home />} />
+                    <Route index element={<RedirectToAgentWeb />} />
                     <Route path="login" element={<Login />} />
                     <Route path="register" element={<Register />} />
                     <Route path="oauth-callback" element={<OAuthCallback />} />

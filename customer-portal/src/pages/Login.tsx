@@ -9,6 +9,7 @@ import { AlertCircle } from 'lucide-react';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import GoogleSignInButton from '@/components/auth/GoogleSignInButton';
 import { Separator } from '@/components/ui/separator';
+import AgentWebLogo from "@/assets/AgentWeb-Logo-189x62.svg";
 
 const Login = () => {
   const [email, setEmail] = useState('');
@@ -36,9 +37,7 @@ const Login = () => {
       <Card className="w-full max-w-md">
         <CardHeader className="space-y-1">
           <div className="flex justify-center mb-4">
-            <div className="h-12 w-12 rounded-md agent-gradient flex items-center justify-center">
-              <span className="text-white font-bold text-2xl">A</span>
-            </div>
+            <img src={AgentWebLogo} alt="AgentWeb Logo" className="h-10" />
           </div>
           <CardTitle className="text-2xl font-bold text-center">Customer Portal</CardTitle>
           <CardDescription className="text-center">
