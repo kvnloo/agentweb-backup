@@ -48,6 +48,7 @@ interface Template {
   category?: string;
   outputAsJson?: boolean;
   outputAsHtml?: boolean;
+  useSharedBrowser?: boolean;
 }
 
 export default function CreateTask() {
@@ -58,6 +59,7 @@ export default function CreateTask() {
   const [isComplexTask, setIsComplexTask] = useState(false);
   const [outputAsJson, setOutputAsJson] = useState(false);
   const [outputAsHtml, setOutputAsHtml] = useState(false);
+  const [useSharedBrowser, setUseSharedBrowser] = useState(false);
   const [error, setError] = useState('');
   const [selectedTemplate, setSelectedTemplate] = useState('');
   const [templates, setTemplates] = useState<Template[]>([]);
@@ -98,6 +100,7 @@ export default function CreateTask() {
       setIsComplexTask(false);
       setOutputAsJson(false);
       setOutputAsHtml(false);
+      setUseSharedBrowser(false);
       setCurrentTemplateParams([]);
       setParameterValues({});
       return;
@@ -117,6 +120,7 @@ export default function CreateTask() {
       setIsComplexTask(false);
       setOutputAsJson(false);
       setOutputAsHtml(false);
+      setUseSharedBrowser(false);
       setCurrentTemplateParams([]);
       return;
     }
@@ -132,6 +136,7 @@ export default function CreateTask() {
       setIsComplexTask(template.isComplexTask);
       setOutputAsJson(template.outputAsJson || false);
       setOutputAsHtml(template.outputAsHtml || false);
+      setUseSharedBrowser(template.useSharedBrowser || false);
       
       // Set current template parameters
       setCurrentTemplateParams(template.parameters || []);
@@ -171,6 +176,7 @@ export default function CreateTask() {
       setIsComplexTask(false);
       setOutputAsJson(false);
       setOutputAsHtml(false);
+      setUseSharedBrowser(false);
       setCurrentTemplateParams([]);
       setParameterValues({});
     }
@@ -210,6 +216,7 @@ export default function CreateTask() {
         isComplexTask: isComplexTask,
         outputAsJson: outputAsJson,
         outputAsHtml: outputAsHtml,
+        useSharedBrowser: useSharedBrowser,
         emailNotification,
         // Only include templateId if a template is selected AND we are on the template tab
         templateId: tabValue === 0 && selectedTemplate ? selectedTemplate : undefined,
@@ -544,6 +551,10 @@ export default function CreateTask() {
                       )}
                       {getSelectedTemplate()?.outputAsHtml && (
                         <Chip label="Output as HTML5" size="small" color="info" variant="outlined" />
+                      )}
+                      {/* Display Use Shared Browser from template */}
+                      {getSelectedTemplate()?.useSharedBrowser && (
+                        <Chip label="Use Shared Browser" size="small" color="info" variant="outlined" />
                       )}
                       {/* END: Read-only display for Template tab */}
                     </Box>

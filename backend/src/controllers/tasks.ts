@@ -39,7 +39,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       description,
       outputAsJson,
       outputAsHtml,
-      selectedLLMs
+      selectedLLMs,
+      useSharedBrowser
     } = req.body;
     
     // If templateId is provided, fetch the template and use its values
@@ -82,6 +83,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           extractPageContent: extractPageContent !== undefined ? Boolean(extractPageContent) : template.extractPageContent, // Uses template.extractPageContent if extractPageContent is undefined in req.body
           outputAsJson: outputAsJson !== undefined ? Boolean(outputAsJson) : template.outputAsJson,
           outputAsHtml: outputAsHtml !== undefined ? Boolean(outputAsHtml) : template.outputAsHtml,
+          useSharedBrowser: useSharedBrowser !== undefined ? Boolean(useSharedBrowser) : template.useSharedBrowser,
           createdAt: new Date().toISOString(),
           llmName: req.body.llmName || null,
           category: category || template.category,
@@ -116,6 +118,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       extractPageContent: extractPageContent ?? isDeepResearch,  // Convert to boolean
       outputAsJson: Boolean(outputAsJson),
       outputAsHtml: Boolean(outputAsHtml),
+      useSharedBrowser: Boolean(useSharedBrowser),
       createdAt: new Date().toISOString(),
       llmName: req.body.llmName || null,
       category: category,
