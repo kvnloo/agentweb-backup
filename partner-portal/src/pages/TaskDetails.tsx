@@ -74,6 +74,7 @@ interface Task {
   llmName?: string;
   attachments?: TaskAttachment[];
   selectedLLMs?: string[];
+  useSharedBrowser?: boolean; // Flag for using shared browser
 }
 
 interface TaskAttachment {
@@ -369,6 +370,7 @@ export default function TaskDetails() {
   const [newOwnerEmail, setNewOwnerEmail] = useState('');
   const [ownerChangeError, setOwnerChangeError] = useState('');
   const [ownerChangeSuccess, setOwnerChangeSuccess] = useState('');
+  const [useSharedBrowser, setUseSharedBrowser] = useState<boolean>(false);
 
   const isAdminRoute = location.pathname.startsWith('/admin/');
   const showActions = !isAdminRoute || (task && user && task.userId === user.userId);
@@ -1097,6 +1099,26 @@ export default function TaskDetails() {
     }
   };
 
+  // Handler for "Use Shared Browser" toggle and dropdown
+  const handleUseSharedBrowserToggle = async () => {
+    if (!task || !token) return;
+    const newUseSharedBrowser = !useSharedBrowser;
+    try {
+      await axios.put(buildApiUrl(`/api/tasks/${task.taskId}`), 
+        { useSharedBrowser: newUseSharedBrowser },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setUseSharedBrowser(newUseSharedBrowser);
+      setTask(prevTask => prevTask ? { ...prevTask, useSharedBrowser: newUseSharedBrowser } : null);
+      setError(''); // Clear previous errors
+    } catch (err) {
+      console.error('Failed to update useSharedBrowser mode:', err);
+      setError('Failed to update shared browser setting. Please try again.');
+      // Revert UI change on error
+      setUseSharedBrowser(!newUseSharedBrowser);
+    }
+  };
+
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
@@ -1413,6 +1435,12 @@ export default function TaskDetails() {
                       }
                       label="Agentic Dev Mode"
                       sx={{ mt: 1, opacity: Boolean(task.isDeepResearch) ? 0.5 : 1 }}
+                    />
+                  </Tooltip>
+                  <Tooltip title="Enable to use a shared browser session for this task. This will use the website configs shared publicly.">
+                    <FormControlLabel
+                      control={<Switch checked={useSharedBrowser} onChange={handleUseSharedBrowserToggle} />}
+                      label="Use Shared Browser"
                     />
                   </Tooltip>
                 </Box>

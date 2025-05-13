@@ -237,6 +237,10 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
       updates.extractPageContent = Boolean(req.body.extractPageContent);
     }
 
+    if (req.body.useSharedBrowser !== undefined) {
+      updates.useSharedBrowser = Boolean(req.body.useSharedBrowser);
+    }
+
     // Handle outputAsJson and outputAsHtml mutual exclusivity
     if (req.body.outputAsJson !== undefined) {
       updates.outputAsJson = Boolean(req.body.outputAsJson);
