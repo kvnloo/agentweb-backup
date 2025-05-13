@@ -33,6 +33,7 @@ export interface Template {
   outputAsJson?: boolean;
   outputAsHtml?: boolean;
   selectedLLMs?: string[];
+  useSharedBrowser?: boolean;
 }
 
 interface TemplateModalProps {
@@ -155,6 +156,9 @@ export const TemplateModal = ({
                         )}
                         {template.outputAsHtml && (
                           <p><span className="font-semibold">Output Format:</span> HTML5</p>
+                        )}
+                        {template.useSharedBrowser && (
+                          <p><span className="font-semibold">Shared Browser:</span> Enabled</p>
                         )}
                       </div>
                     </div>
