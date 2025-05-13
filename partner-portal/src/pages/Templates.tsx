@@ -75,6 +75,7 @@ interface Template {
   outputAsJson?: boolean; // Added for JSON output
   outputAsHtml?: boolean; // Added for HTML output
   selectedLLMs?: string[]; // Added for LLM selection
+  useSharedBrowser?: boolean; // ADDED: Flag for using shared browser
 }
 
 // Helper function to extract parameters from prompt
@@ -109,6 +110,7 @@ export default function Templates() {
   const [outputAsJson, setOutputAsJson] = useState(false); // New state for JSON output
   const [outputAsHtml, setOutputAsHtml] = useState(false); // New state for HTML output
   const [selectedLLMs, setSelectedLLMs] = useState<string[]>([]); // New state for selected LLMs
+  const [useSharedBrowser, setUseSharedBrowser] = useState(false); // ADDED: State for the toggle
   
   const { token, user } = useAuth();
   const navigate = useNavigate();
@@ -180,6 +182,7 @@ export default function Templates() {
       setOutputAsJson(template.outputAsJson || false); // Set outputAsJson
       setOutputAsHtml(template.outputAsHtml || false); // Set outputAsHtml
       setSelectedLLMs(template.selectedLLMs || []); // Set selectedLLMs
+      setUseSharedBrowser(template.useSharedBrowser || false); // ADDED: Set useSharedBrowser state
       if (template.category && !SUPPORTED_CATEGORIES.includes(template.category)) {
         setCustomCategory(template.category); // If existing category is custom
         setCategory('Custom');
@@ -200,6 +203,7 @@ export default function Templates() {
       setOutputAsJson(false); // Reset outputAsJson
       setOutputAsHtml(false); // Reset outputAsHtml
       setSelectedLLMs([]); // Reset selectedLLMs
+      setUseSharedBrowser(false); // ADDED: Reset useSharedBrowser state
     }
     setOpenEditDialog(true);
   };
@@ -233,7 +237,8 @@ export default function Templates() {
         category: finalCategory || undefined, // Send finalCategory or undefined
         outputAsJson: outputAsJson, // Add outputAsJson to template data
         outputAsHtml: outputAsHtml,  // Add outputAsHtml to template data
-        selectedLLMs: selectedLLMs // Add selectedLLMs to template data
+        selectedLLMs: selectedLLMs, // Add selectedLLMs to template data
+        useSharedBrowser: useSharedBrowser // ADDED: Add useSharedBrowser to template data
       };
 
       // Check if we're updating an existing template (has a valid templateId)
@@ -717,10 +722,17 @@ export default function Templates() {
             <FormControlLabel
               control={<Switch checked={outputAsJson} onChange={(e) => { setOutputAsJson(e.target.checked); if (e.target.checked) setOutputAsHtml(false); }} />}
               label="Output as JSON"
+              disabled={isDeepResearch}
             />
             <FormControlLabel
               control={<Switch checked={outputAsHtml} onChange={(e) => { setOutputAsHtml(e.target.checked); if (e.target.checked) setOutputAsJson(false); }} />}
               label="Output as HTML5"
+              disabled={isDeepResearch}
+            />
+            <FormControlLabel
+              control={<Switch checked={useSharedBrowser} onChange={(e) => setUseSharedBrowser(e.target.checked)} />}
+              label="Use Shared Browser"
+              disabled={isDeepResearch}
             />
           </Box>
           

@@ -86,6 +86,7 @@ interface TaskTemplate {
   updatedAt: string;
   category?: string;
   selectedLLMs?: string[];
+  useSharedBrowser?: boolean;
 }
 
 interface UserWithCounts extends User {

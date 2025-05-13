@@ -21,8 +21,9 @@ export const createTemplate = async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const { name, description, prompt, isInteractive, isDeepResearch, nameParameter, category, outputAsJson, outputAsHtml, isComplexTask, selectedLLMs } = req.body;
-    
+
+    const { name, description, prompt, isInteractive, isDeepResearch, nameParameter, category, outputAsJson, outputAsHtml, isComplexTask, selectedLLMs, useSharedBrowser } = req.body;
+
     if (!name || !prompt) {
       return res.status(400).json({ message: 'Name and prompt are required' });
     }
@@ -51,6 +52,7 @@ export const createTemplate = async (req: AuthRequest, res: Response) => {
       outputAsJson: outputAsJson ? true : (outputAsHtml ? false : false), // Handle mutual exclusivity
       outputAsHtml: outputAsHtml ? true : (outputAsJson ? false : false), // Handle mutual exclusivity
       isComplexTask: Boolean(isComplexTask), // Added isComplexTask
+      useSharedBrowser: Boolean(useSharedBrowser), // ADDED useSharedBrowser
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       category: category || undefined, // Add category, default to undefined if not provided
@@ -164,8 +166,8 @@ export const updateTemplate = async (req: AuthRequest, res: Response) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    const { name, description, prompt, isInteractive, isDeepResearch, isComplexTask, published, nameParameter, category, outputAsJson, outputAsHtml, selectedLLMs } = req.body;
-    
+    const { name, description, prompt, isInteractive, isDeepResearch, isComplexTask, published, nameParameter, category, outputAsJson, outputAsHtml, selectedLLMs, useSharedBrowser } = req.body;
+
     const updates: any = {};
     if (name !== undefined) updates.name = name;
     if (description !== undefined) updates.description = description;
@@ -214,6 +216,7 @@ export const updateTemplate = async (req: AuthRequest, res: Response) => {
     if (outputAsHtml !== undefined) updates.outputAsHtml = outputAsHtml ? true : (updates.outputAsJson === undefined ? template.outputAsJson : updates.outputAsJson) ? false : false;
     
     if (selectedLLMs !== undefined) updates.selectedLLMs = selectedLLMs;
+    if (useSharedBrowser !== undefined) updates.useSharedBrowser = Boolean(useSharedBrowser); // ADDED useSharedBrowser
     
     // Only allow admins to update the published status
     if (published !== undefined && user.isAdmin) {
