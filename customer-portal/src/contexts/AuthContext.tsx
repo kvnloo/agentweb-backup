@@ -1,8 +1,12 @@
 import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
 import { buildApiUrl } from '@/config';
 import axios from 'axios';
+import { useLocation } from 'react-router-dom';
 
 export type UserRole = 'customer' | 'partner';
+
+// Define waitlist error code type
+export type WaitlistErrorCode = 'not_in_waitlist' | 'not_invited';
 
 interface User {
   userId: string;
@@ -22,6 +26,8 @@ interface AuthContextType {
   setToken: (token: string) => Promise<void>;
   logout: () => void;
   error: string | null;
+  errorCode: WaitlistErrorCode | null;
+  landingSiteUrl: string | null;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -39,6 +45,18 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const [token, setTokenState] = useState<string | null>(localStorage.getItem('token'));
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<WaitlistErrorCode | null>(null);
+  const [landingSiteUrl, setLandingSiteUrl] = useState<string | null>(null);
+  
+  // Get current location to reset errors on route change
+  const location = useLocation();
+
+  // Clear errors on route change
+  useEffect(() => {
+    setError(null);
+    setErrorCode(null);
+    setLandingSiteUrl(null);
+  }, [location.pathname]);
 
   useEffect(() => {
     const verifyToken = async () => {
@@ -79,6 +97,8 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const login = async (email: string, password: string) => {
     setLoading(true);
     setError(null);
+    setErrorCode(null);
+    setLandingSiteUrl(null);
     
     try {
       const response = await axios.post(buildApiUrl('/api/auth/login'), {
@@ -100,11 +120,19 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       setUser(userData);
     } catch (err: any) {
       console.error('Login failed:', err);
+      
       if (err.response?.status === 403) {
         setError('Access denied: Only customer accounts can access this portal');
+      } else if (err.response?.data?.message) {
+        setError(err.response.data.message);
       } else {
-        setError(err.response?.data?.message || 'Authentication failed. Please check your credentials.');
+        setError('Authentication failed. Please check your credentials.');
       }
+      
+      if (err.response?.data?.code) {
+        setErrorCode(err.response.data.code as WaitlistErrorCode);
+      }
+      
       throw err;
     } finally {
       setLoading(false);
@@ -114,6 +142,8 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const register = async (email: string, password: string) => {
     setLoading(true);
     setError(null);
+    setErrorCode(null);
+    setLandingSiteUrl(null);
     
     try {
       const response = await axios.post(buildApiUrl('/api/auth/register'), {
@@ -136,7 +166,25 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       setUser(userData);
     } catch (err: any) {
       console.error('Registration failed:', err);
-      setError(err.response?.data?.message || 'Registration failed. Please try again.');
+      
+      if (err.response?.data?.message) {
+        setError(err.response.data.message);
+      } else {
+        setError('Registration failed. Please try again.');
+      }
+      
+      if (err.response?.data?.code) {
+        setErrorCode(err.response.data.code as WaitlistErrorCode);
+      }
+      
+      if (err.response?.data?.code === 'not_in_waitlist') {
+        const message = err.response?.data?.message || '';
+        const match = message.match(/at\s(.+)$/);
+        if (match && match[1]) {
+          setLandingSiteUrl(match[1].trim());
+        }
+      }
+      
       throw err;
     } finally {
       setLoading(false);
@@ -145,6 +193,9 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
   const loginWithGoogle = async () => {
     setError(null);
+    setErrorCode(null);
+    setLandingSiteUrl(null);
+    
     try {
       // Redirect to Google OAuth endpoint
       const googleAuthUrl = buildApiUrl('/api/auth/google');
@@ -153,9 +204,19 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       // Add a customer role parameter to indicate this is from the customer portal
       const redirectUrl = `${googleAuthUrl}?portal=customer`;
       window.location.href = redirectUrl;
-    } catch (error) {
+    } catch (error: any) {
       console.error('Google sign in failed:', error);
-      setError('Google sign in failed. Please try again.');
+      
+      if (error.response?.data?.message) {
+        setError(error.response.data.message);
+      } else {
+        setError('Google sign in failed. Please try again.');
+      }
+      
+      if (error.response?.data?.code) {
+        setErrorCode(error.response.data.code as WaitlistErrorCode);
+      }
+      
       throw error;
     }
   };
@@ -163,6 +224,8 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const setToken = async (newToken: string) => {
     setLoading(true);
     setError(null);
+    setErrorCode(null);
+    setLandingSiteUrl(null);
     
     try {
       // Verify the token and get user data
@@ -190,7 +253,17 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       setUser(userData);
     } catch (err: any) {
       console.error('Token validation failed:', err);
-      setError(err.response?.data?.message || 'Authentication failed. Please try again.');
+      
+      if (err.response?.data?.message) {
+        setError(err.response.data.message);
+      } else {
+        setError('Authentication failed. Please try again.');
+      }
+      
+      if (err.response?.data?.code) {
+        setErrorCode(err.response.data.code as WaitlistErrorCode);
+      }
+      
       throw err;
     } finally {
       setLoading(false);
@@ -216,6 +289,8 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         setToken,
         logout,
         error,
+        errorCode,
+        landingSiteUrl,
       }}
     >
       {children}

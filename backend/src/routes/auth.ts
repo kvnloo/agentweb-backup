@@ -85,11 +85,37 @@ const googleAuthFinalHandler = (req: Request, res: Response) => {
 router.get('/google/callback', 
   (req: Request, res: Response, next: NextFunction) => {
     const state = req.query.state as string;
+    
+    // Custom error handler for Google authentication
+    const authHandler = (err: any, user: any, info: any) => {
+      if (err) {
+        // Get appropriate frontend URL based on state
+        const frontendUrl = state === 'customer' ? CUSTOMER_FRONTEND_URL : PARTNER_FRONTEND_URL;
+        
+        // Handle structured errors with specific error codes
+        if (err.code && err.message) {
+          return res.redirect(`${frontendUrl}/oauth-callback?error=${encodeURIComponent(err.message)}&code=${err.code}`);
+        }
+        
+        // Handle regular error message
+        const errorMsg = err.message || 'Authentication failed';
+        return res.redirect(`${frontendUrl}/oauth-callback?error=${encodeURIComponent(errorMsg)}`);
+      }
+      
+      if (!user) {
+        const frontendUrl = state === 'customer' ? CUSTOMER_FRONTEND_URL : PARTNER_FRONTEND_URL;
+        return res.redirect(`${frontendUrl}/oauth-callback?error=Authentication failed. Please try again.`);
+      }
+      
+      // Set user on request and continue to next handler
+      req.user = user;
+      next();
+    };
+    
     passport.authenticate('google', { 
-        failureRedirect: `/login?portal_type=${state || 'partner'}&error=google_auth_failed`,
-        session: false,
-        state: state
-    })(req, res, next);
+      session: false,
+      state: state
+    })(req, res, authHandler);
   },
   googleAuthFinalHandler
 );
