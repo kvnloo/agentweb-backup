@@ -7,11 +7,12 @@ import { waitlistDb } from '../services/waitlistDb';
 
 export const register = async (req: Request, res: Response) => {
   try {
-    const { email, password, roles: reqRoles } = req.body;
+    let { email, password, roles: reqRoles } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({ message: 'Email and password are required' });
     }
+    email = email.toLowerCase();
 
     // Check if user exists
     const existingUser = await userDb.getUserByEmail(email);
@@ -76,15 +77,20 @@ export const register = async (req: Request, res: Response) => {
 
 export const login = async (req: Request, res: Response) => {
   try {
-    const { email, password } = req.body;
+    let { email, password } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({ message: 'Email and password are required' });
     }
+    email = email.toLowerCase();
 
     const user = await userDb.getUserByEmail(email);
     if (!user) {
-      return res.status(401).json({ message: 'Invalid credentials' });
+      // Return specific error for user not found
+      return res.status(404).json({ 
+        message: 'User not found. Please create an account to continue.',
+        code: 'user_not_found' 
+      });
     }
 
     // Check if user is deactivated
@@ -127,12 +133,13 @@ export const googleCallback = async (
       return done(new Error('Google profile was not received'), null);
     }
     
-    const email = profile.emails && profile.emails[0] ? profile.emails[0].value : null;
+    let email = profile.emails && profile.emails[0] ? profile.emails[0].value : null;
     
     if (!email) {
       console.error('No email found in Google profile. Profile received:', JSON.stringify(profile, null, 2));
       return done(new Error('No email found in Google profile. Please ensure your Google account has a primary email and permissions are granted.'), null);
     }
+    email = email.toLowerCase();
 
     let user = await userDb.getUserByEmail(email);
     

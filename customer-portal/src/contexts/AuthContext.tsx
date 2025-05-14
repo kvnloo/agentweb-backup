@@ -6,7 +6,7 @@ import { useLocation } from 'react-router-dom';
 export type UserRole = 'customer' | 'partner';
 
 // Define waitlist error code type
-export type WaitlistErrorCode = 'not_in_waitlist' | 'not_invited';
+export type WaitlistErrorCode = 'not_in_waitlist' | 'not_invited' | 'user_not_found';
 
 interface User {
   userId: string;
@@ -121,7 +121,10 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     } catch (err: any) {
       console.error('Login failed:', err);
       
-      if (err.response?.status === 403) {
+      if (err.response?.data?.code === 'user_not_found') {
+        setError(err.response.data.message);
+        setErrorCode('user_not_found');
+      } else if (err.response?.status === 403) {
         setError('Access denied: Only customer accounts can access this portal');
       } else if (err.response?.data?.message) {
         setError(err.response.data.message);
@@ -129,7 +132,8 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         setError('Authentication failed. Please check your credentials.');
       }
       
-      if (err.response?.data?.code) {
+      // Set error code if it was not specifically handled above but exists in response
+      if (!errorCode && err.response?.data?.code) {
         setErrorCode(err.response.data.code as WaitlistErrorCode);
       }
       

@@ -5,7 +5,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
-import { AlertCircle } from 'lucide-react';
+import { AlertCircle, ExternalLink } from 'lucide-react';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import GoogleSignInButton from '@/components/auth/GoogleSignInButton';
 import { Separator } from '@/components/ui/separator';
@@ -15,7 +15,7 @@ const Login = () => {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const { login, error } = useAuth();
+  const { login, error, errorCode } = useAuth();
   const navigate = useNavigate();
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -31,6 +31,22 @@ const Login = () => {
       setIsLoading(false);
     }
   };
+
+  const getErrorMessage = () => {
+    if (!error) return null;
+
+    if (errorCode === 'user_not_found') {
+      return (
+        <>
+          {error} <Link to="/register" className="text-blue-600 hover:underline">Sign up here.</Link>
+        </>
+      );
+    }
+    
+    return error;
+  };
+
+  const errorMessage = getErrorMessage();
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-[#F3EFFD] p-4">
@@ -82,10 +98,12 @@ const Login = () => {
                 />
               </div>
               
-              {error && (
+              {errorMessage && (
                 <Alert variant="destructive">
                   <AlertCircle className="h-4 w-4" />
-                  <AlertDescription>{error}</AlertDescription>
+                  <AlertDescription className="ml-2">
+                    {errorMessage}
+                  </AlertDescription>
                 </Alert>
               )}
               
