@@ -43,19 +43,19 @@ export const emailService = {
           <p>We're excited to have you join our platform. Your waitlist application has been approved!</p>
           <p>To get started, please click the button below to create your account:</p>
           <div style="text-align: center; margin: 30px 0;">
-            <a href="${process.env.FRONTEND_URL}/register?email=${encodeURIComponent(email)}" 
+            <a href="${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/register?email=${encodeURIComponent(email)}" 
                style="background-color: #1976d2; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px;">
               Create Your Account
             </a>
           </div>
           <p>If the button doesn't work, you can copy and paste this link into your browser:</p>
-          <p>${process.env.FRONTEND_URL}/register?email=${encodeURIComponent(email)}</p>
+          <p>${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/register?email=${encodeURIComponent(email)}</p>
           
           <h3>Getting Started with AgentWeb</h3>
           <p>Check out these resources to help you get the most out of AgentWeb:</p>
           <ul>
-            <li><a href="${process.env.FRONTEND_URL}/release">Release Notes</a> - Learn about our latest features and updates</li>
-            <li><a href="${process.env.FRONTEND_URL}/guide">User Guide</a> - Detailed instructions on how to create and manage your web automation tasks</li>
+            <li><a href="${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/changelog">Release Notes</a> - Learn about our latest features and updates</li>
+            <li><a href="${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/guide">User Guide</a> - Detailed instructions on how to create and manage your web automation tasks</li>
           </ul>
           
           <p>If you have any questions or need assistance, please reply to this email or contact our support team at support@agentweb.pro.</p>
