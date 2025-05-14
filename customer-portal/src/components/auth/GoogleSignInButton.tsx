@@ -20,7 +20,7 @@ const GoogleSignInButton = () => {
       type="button"
       variant="outline"
       onClick={handleGoogleSignIn}
-      className="w-full border-[#E2E8F0] bg-white text-gray-700 hover:bg-gray-50"
+      className="w-full border-[#E2E8F0] bg-white text-gray-700 hover:bg-gray-50 hover:text-gray-900"
     >
       <svg
         className="mr-2 h-4 w-4"
