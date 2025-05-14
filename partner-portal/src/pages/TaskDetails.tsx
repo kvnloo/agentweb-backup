@@ -74,6 +74,7 @@ interface Task {
   llmName?: string;
   attachments?: TaskAttachment[];
   selectedLLMs?: string[];
+  useSharedBrowser?: boolean; // Flag for using shared browser
 }
 
 interface TaskAttachment {
@@ -1097,6 +1098,25 @@ export default function TaskDetails() {
     }
   };
 
+  // Handler for "Use Shared Browser" toggle and dropdown
+  const handleUseSharedBrowserToggle = async () => {
+    if (!task || !token) return;
+    const newUseSharedBrowserValue = !(task?.useSharedBrowser || false); // Calculate new value based on task state
+    try {
+      await axios.put(buildApiUrl(`/api/tasks/${task.taskId}`), 
+        { useSharedBrowser: newUseSharedBrowserValue },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      await fetchTask(); // Re-fetch task data to update UI from source of truth
+      setError(''); // Clear previous errors
+    } catch (err) {
+      console.error('Failed to update useSharedBrowser mode:', err);
+      setError('Failed to update shared browser setting. Please try again.');
+      // No need to revert UI change as it's bound to task state which hasn't changed on backend error
+      // setUseSharedBrowser(!newUseSharedBrowser);
+    }
+  };
+
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
@@ -1413,6 +1433,12 @@ export default function TaskDetails() {
                       }
                       label="Agentic Dev Mode"
                       sx={{ mt: 1, opacity: Boolean(task.isDeepResearch) ? 0.5 : 1 }}
+                    />
+                  </Tooltip>
+                  <Tooltip title="Enable to use a shared browser session for this task. This will use the website configs shared publicly.">
+                    <FormControlLabel
+                      control={<Switch checked={task?.useSharedBrowser || false} onChange={handleUseSharedBrowserToggle} />}
+                      label="Use Shared Browser"
                     />
                   </Tooltip>
                 </Box>

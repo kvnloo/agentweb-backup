@@ -410,7 +410,7 @@ def update_workflow_execution(workflow_execution_id: str, task_id: str, task_sta
         logger.error(f"Error updating workflow execution: {e}")
         return False
 
-async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str, run_user_id: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False) -> Dict[str, Any]:
+async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str, run_user_id: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False) -> Dict[str, Any]:
     log_sync_manager = None
     process = None
     
@@ -465,6 +465,8 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
             cmd.append('--agentic-dev-mode')
         if output_as_html:
             cmd.append('--output-as-html')
+        if use_shared_browser:
+            cmd.append('--use-shared-browser')
         
         # Run command with output redirection
         logger.info(f"Running command: {' '.join(cmd)}")
@@ -853,6 +855,7 @@ async def execute_task(execution):
                         extract_page_content = bool(task.get('extractPageContent', False)) if task else False
                         validate_output = bool(task.get('validateOutput', False)) if task else False
                         is_agentic_dev_mode = bool(task.get('isAgenticDevMode', False)) if task else False
+                        use_shared_browser = bool(task.get('useSharedBrowser', False)) if task else False
                         
                         # Set filtered activity log path for later reference
                         filtered_activity_log = f'logs/execution_{execution_id}_browser_use.filtered.log'
@@ -872,7 +875,8 @@ async def execute_task(execution):
                             validate_output,
                             output_as_json,
                             is_agentic_dev_mode,
-                            output_as_html
+                            output_as_html,
+                            use_shared_browser
                         )
                     except Exception as e:
                         logger.error(f"Error running web agent: {str(e)}")

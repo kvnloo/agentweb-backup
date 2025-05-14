@@ -156,11 +156,12 @@ class WebAgent:
         self.task = None
         self.action_history = []
         self.user_id = user_id
+        self.use_shared_browser = False
         self.context_dir = Path('context')
         self.context_dir.mkdir(exist_ok=True)
         self.attachments_dir = Path('attachments')
         self.attachments_dir.mkdir(exist_ok=True)
-        self.cookie_sync = CookieSync() if user_id else None
+        self.cookie_sync = CookieSync() if self.user_id else None
         self.is_interactive = False  # Initialize interactive mode flag
         self.current_execution_id = None
         self.current_task_id = None
@@ -171,7 +172,6 @@ class WebAgent:
         self._log_handlers = []  # Store log handlers for cleanup
         self.generate_gif = None
         self.sensitive_data = []  # List to store all credentials for log filtering
-        self.cookie_tainted = False  # Flag to track if shared credentials were used
         self.run_user_id = None  # Added to store run_user_id
         self.log_filter_thread = None
         self.is_agentic_dev_mode = False  # Initialize is_agentic_dev_mode property
@@ -243,7 +243,7 @@ class WebAgent:
         # Clear the reference to the log filter thread to help with garbage collection
         self.log_filter_thread = None
 
-    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False) -> Dict[str, Any]:
+    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
         log_file = None
         try:
@@ -254,7 +254,7 @@ class WebAgent:
             self.generate_gif = generate_gif
             self.is_agentic_dev_mode = is_agentic_dev_mode
             self.output_as_html = output_as_html
-            
+            self.use_shared_browser = use_shared_browser
             # Set up logging
             log_file = self.setup_execution_logging(execution_id)
             
@@ -456,50 +456,56 @@ class WebAgent:
     def _register_actions(self):
         @self.controller.registry.action('Get login credentials by domain')
         def get_login_credentials(domain: str) -> ActionResult:
-            """Get login credentials for a domain from the database"""
+            """Get login credentials for a domain based on use_shared_browser mode."""
             if not self.user_id:
                 return ActionResult(error="User ID not provided")
             if not domain:
                 return ActionResult(error=f"Please provide a domain")
-            logger.info(f"Getting login credentials for domain {domain} under user {self.user_id}")
+
+            logger.info(f"Getting login credentials for domain {domain} under user {self.user_id}, use_shared_browser: {self.use_shared_browser}")
                 
             table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
-            # First get user's own configs and configs shared directly with them
-            response = table.query(
-                KeyConditionExpression='userId = :userId',
-                FilterExpression='website = :website',
-                ExpressionAttributeValues={
-                    ':userId': self.user_id,
-                    ':website': domain
-                }
-            )
+            items = []
 
-            items = response.get('Items', [])
-            if not items:
-                # If no direct matches, check for publicly shared configs
+            if self.use_shared_browser:
+                # Fetch ONLY publicly shared website configurations
+                logger.info(f"use_shared_browser is True. Fetching only publicly shared credentials for domain: {domain}")
                 public_response = table.query(
                     IndexName='ShareWithEveryoneIndex',
                     KeyConditionExpression='shareWithEveryone = :shareWithEveryone',
-                    FilterExpression='website = :website AND userId <> :userId',
+                    FilterExpression='website = :website AND (attribute_not_exists(isApiConfig) OR isApiConfig = :isApiFalse)',
                     ExpressionAttributeValues={
                         ':shareWithEveryone': 1,
                         ':website': domain,
-                        ':userId': self.user_id
+                        ':isApiFalse': False
                     }
                 )
                 items.extend(public_response.get('Items', []))
+                # For public credentials, sharedBy will typically be the original owner, not relevant for decryption by current user_id directly
+                # Decrypt with self.user_id, assuming public means any user can use it with their "session" context
+            else:
+                # Fetch ONLY user's own website configurations (not shared to them by others)
+                logger.info(f"use_shared_browser is False. Fetching only user's own credentials for domain: {domain}")
+                user_response = table.query(
+                    KeyConditionExpression='userId = :userId',
+                    FilterExpression='website = :website AND (attribute_not_exists(isApiConfig) OR isApiConfig = :isApiFalse)',
+                    ExpressionAttributeValues={
+                        ':userId': self.user_id,
+                        ':website': domain,
+                        ':isApiFalse': False
+                    }
+                )
+                items.extend(user_response.get('Items', []))
 
             if not items:
-                # If still no credentials found, get all available domains for the user
+                # If no credentials found, get all available domains for the user based on the current mode
                 available_domains = set()
+                # This call to get_all_configs respects use_shared_browser internally
+                all_mode_visible_configs = get_all_configs(self.user_id, use_shared_browser=self.use_shared_browser)
                 
-                # Get all configurations for the user
-                all_configs = get_all_configs(self.user_id)
-                
-                # Filter for website configurations and extract unique domains
-                for config in all_configs:
-                    if 'website' in config and config['website']:
-                        available_domains.add(config['website'])
+                for config_item in all_mode_visible_configs:
+                    if config_item.get('website') and not config_item.get('isApiConfig'):
+                        available_domains.add(config_item['website'])
                 
                 domains_text = ""
                 if available_domains:
@@ -508,33 +514,30 @@ class WebAgent:
                 return ActionResult(error=f"No credentials found for domain: {domain}.{domains_text}")
 
             try:
-                # Sort items by priority:
-                # 1. User's own account (no sharedBy)
-                # 2. Directly shared account (has sharedBy)
-                # 3. Publicly shared configs are already filtered to exclude user's own configs
-                sorted_items = sorted(items, key=lambda x: (
-                    0 if not x.get('sharedBy') else 1
-                ))
-
-                config = sorted_items[0]
-                shared_by = config.get('sharedBy')
+                # In shared browser mode, any publicly shared config is fine. We'll pick the first.
+                # In user-own mode, there should ideally be only one.
+                # The previous complex sorting logic for combining user/shared/public is no longer needed due to stricter separation.
+                config_to_use = items[0] 
                 
+                # 'sharedBy' is relevant for decryption if present, even for public items if the decryption key depends on original owner.
+                # However, decrypt_password uses self.user_id if shared_by is None.
+                # For public items, if they are truly public, their decryption should not depend on a specific 'sharedBy' that isn't the current user.
+                # If use_shared_browser is True, we might need a way to decrypt public credentials that don't rely on self.user_id or a specific sharedBy.
+                # For now, we assume decrypt_password can handle it or that public creds are stored differently.
+                # Let's pass config_to_use.get('sharedBy') as is.
+                shared_by_for_decryption = config_to_use.get('sharedBy')
+
                 # Get the encrypted password from either encryptedPassword or legacy password field
-                encrypted_password = config.get('encryptedPassword') or config.get('password')
+                encrypted_password = config_to_use.get('encryptedPassword') or config_to_use.get('password')
                 if not encrypted_password:
-                    logger.warning(f"No password found for {config.get('website')}")
-                    return ActionResult(error=f"No password found for {config.get('website')}")
+                    logger.warning(f"No password found for {config_to_use.get('website')}")
+                    return ActionResult(error=f"No password found for {config_to_use.get('website')}")
                     
-                decrypted_password = decrypt_password(encrypted_password, self.user_id, shared_by)
-
-                if shared_by and shared_by != self.user_id:
-                    logger.info(f"Using shared credentials for {domain} - shared by user: {shared_by}")
-                    # Mark cookies as tainted since we're using shared credentials
-                    self.cookie_tainted = True
-                    logger.info("Cookies marked as tainted - will not be uploaded to S3")
+                decrypted_password = decrypt_password(encrypted_password, self.user_id, shared_by_for_decryption)
                 
-                return ActionResult(extracted_content=f"username: {config['username']}, password: {decrypted_password}")
+                return ActionResult(extracted_content=f"username: {config_to_use['username']}, password: {decrypted_password}")
             except Exception as e:
+                logger.error(f"Error processing credentials for domain {domain}: {str(e)}")
                 return ActionResult(error=f"Error getting credentials: {str(e)}")
                 
         @self.controller.registry.action('Get integration instructions')
@@ -1334,7 +1337,10 @@ Once the PR is approved and merged, this code will be available through the 'Run
         """Get the path to the user's cookies file"""
         if not self.user_id:
             return None
-        return str(self.context_dir / f"{self.user_id}_cookies.json")
+        if self.use_shared_browser:
+            return str(self.context_dir / f"shared_cookies.json")
+        else:
+            return str(self.context_dir / f"{self.user_id}_cookies.json")
 
     def _get_downloads_path(self):
         """Get the path to the downloads directory"""
@@ -1353,7 +1359,11 @@ Once the PR is approved and merged, this code will be available through the 'Run
         cookies_path = self._get_cookies_path()
         if cookies_path and self.cookie_sync:
             # Try to download cookies from S3 before starting
-            self.cookie_sync.download_cookies(self.user_id, cookies_path)
+            effective_user_id_for_download = "SHARED_USER_ID" if self.use_shared_browser else self.user_id
+            if not effective_user_id_for_download: # Should only happen if self.user_id is None and not shared_browser
+                 logger.warning("Cannot download cookies: user_id is None and not in shared browser mode.")
+            else:
+                self.cookie_sync.download_cookies(effective_user_id_for_download, cookies_path)
             
         # Configure downloads path
         downloads_path = self._get_downloads_path()
@@ -1380,7 +1390,7 @@ Once the PR is approved and merged, this code will be available through the 'Run
         if self.user_id:
             try:
                 # Get all configurations for the user
-                all_configs = get_all_configs(self.user_id)
+                all_configs = get_all_configs(self.user_id, use_shared_browser=self.use_shared_browser)
                 
                 for config in all_configs:
                     try:
@@ -1424,13 +1434,14 @@ Once the PR is approved and merged, this code will be available through the 'Run
                 # Save cookies before closing
                 cookies_path = self._get_cookies_path()
                 if cookies_path:
-                    if self.cookie_sync and not self.cookie_tainted:
-                        # Only upload cookies if they're not tainted by shared credentials
-                        self.cookie_sync.upload_cookies(self.user_id, cookies_path)
+                    if self.cookie_sync:
+                        # Upload cookies
+                        effective_user_id_for_upload = "SHARED_USER_ID" if self.use_shared_browser else self.user_id
+                        if not effective_user_id_for_upload:
+                            logger.warning("Cannot upload cookies: user_id is None and not in shared browser mode.")
+                        else:
+                            self.cookie_sync.upload_cookies(effective_user_id_for_upload, cookies_path)
                         logger.info("Cookies uploaded to S3")
-                    elif self.cookie_tainted:
-                        logger.info("Skipping cookie upload - cookies are tainted from using shared credentials")
-                        
                     Path(cookies_path).unlink(missing_ok=True)
                     logger.info(f"Deleted cookie file at local: {cookies_path}")
                 
@@ -1475,6 +1486,7 @@ async def main():
     parser.add_argument('--output-as-json', action='store_true', help='Output result as JSON')
     parser.add_argument('--agentic-dev-mode', action='store_true', help='Enable agentic dev mode features')
     parser.add_argument('--output-as-html', action='store_true', help='Output result as HTML5')
+    parser.add_argument('--use-shared-browser', action='store_true', help='Use shared browser')
 
     args = parser.parse_args()
 
@@ -1504,7 +1516,8 @@ async def main():
             validate_output=args.validate_output,
             output_as_json=args.output_as_json,
             is_agentic_dev_mode=args.agentic_dev_mode,
-            output_as_html=args.output_as_html
+            output_as_html=args.output_as_html,
+            use_shared_browser=args.use_shared_browser
         )
         print(json.dumps(result))
         sys.exit(0 if result["success"] else 1)

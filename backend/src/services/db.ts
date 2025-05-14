@@ -86,6 +86,7 @@ interface TaskTemplate {
   updatedAt: string;
   category?: string;
   selectedLLMs?: string[];
+  useSharedBrowser?: boolean;
 }
 
 interface UserWithCounts extends User {
@@ -341,6 +342,7 @@ export const taskDb = {
     llmName?: string | null;
     templateId?: string;
     selectedLLMs?: string[];
+    useSharedBrowser?: boolean;
   }) {
     try {
       const params = {
@@ -453,7 +455,7 @@ export const taskDb = {
         Key: {
           taskId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
@@ -497,6 +499,7 @@ export const taskDb = {
     llmName: string | null;
     attachments: TaskAttachment[];
     selectedLLMs?: string[];
+    useSharedBrowser?: boolean;
   }>) {
     try {
       const setClauses: string[] = [];

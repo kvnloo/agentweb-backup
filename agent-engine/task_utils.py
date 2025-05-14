@@ -1688,56 +1688,53 @@ def fetch_api_credentials(user_id: str, app_names=None):
         logger.error(f"Error fetching API credentials: {str(e)}")
         return None, None 
 
-def get_all_configs(user_id: str) -> List[Dict[str, Any]]:
+def get_all_configs(user_id: str, use_shared_browser: bool = False) -> List[Dict[str, Any]]:
     """
-    Get all configurations (website and API) for a user.
+    Get configurations for a user based on the use_shared_browser flag.
     
-    This function fetches all configurations available to a user, including:
-    - User's own configs
-    - Configs shared directly with the user
-    - Publicly shared configs
+    If use_shared_browser is True, it only fetches all publicly shared configurations (website and API).
+    If use_shared_browser is False, it fetches only the user's own configurations (website and API).
     
     Args:
         user_id: The user ID to fetch configurations for
+        use_shared_browser: Flag to indicate if running in shared browser mode
         
     Returns:
         A list of configuration dictionaries
     """
     if not user_id:
-        logger.error("User ID not provided")
+        logger.error("User ID not provided for get_all_configs")
         return []
         
     try:
-        # Initialize empty list to store configs
         all_configs = []
-        
-        # Get DynamoDB table
         table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
+
+        if use_shared_browser:
+            logger.info(f"Fetching ALL publicly shared configurations, including user's own if public (use_shared_browser mode for user {user_id})")
+            # Fetch all publicly shared configs (website and API)
+            # regardless of who owns them.
+            public_response = table.query(
+                IndexName='ShareWithEveryoneIndex',
+                KeyConditionExpression='shareWithEveryone = :shareWithEveryone',
+                ExpressionAttributeValues={
+                    ':shareWithEveryone': 1
+                }
+            )
+            all_configs.extend(public_response.get('Items', []))
+            logger.info(f"Retrieved {len(all_configs)} publicly shared configurations in use_shared_browser mode.")
+        else:
+            logger.info(f"Fetching USER'S OWN configurations for user {user_id} (standard mode, no public shared configs).")
+            # Fetch only the user's own configs (website and API).
+            response = table.query(
+                KeyConditionExpression='userId = :userId',
+                ExpressionAttributeValues={
+                    ':userId': user_id
+                }
+            )
+            all_configs.extend(response.get('Items', []))
+            logger.info(f"Retrieved {len(all_configs)} of user's own configurations for user {user_id}.")
         
-        # First get user's own configs and configs shared directly with them
-        response = table.query(
-            KeyConditionExpression='userId = :userId',
-            ExpressionAttributeValues={
-                ':userId': user_id
-            }
-        )
-        
-        all_configs.extend(response.get('Items', []))
-        
-        # Get publicly shared configs from other users
-        public_response = table.query(
-            IndexName='ShareWithEveryoneIndex',
-            KeyConditionExpression='shareWithEveryone = :shareWithEveryone',
-            FilterExpression='userId <> :userId',
-            ExpressionAttributeValues={
-                ':shareWithEveryone': 1,
-                ':userId': user_id
-            }
-        )
-        
-        all_configs.extend(public_response.get('Items', []))
-        
-        logger.info(f"Retrieved {len(all_configs)} configurations for user {user_id}")
         return all_configs
         
     except Exception as e:

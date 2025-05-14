@@ -16,4 +16,5 @@ export interface Task {
   outputAsJson?: boolean;  // Whether the agent should output the result in JSON format
   outputAsHtml?: boolean;
   llmName?: string;  // The preferred LLM to try first for this task
+  useSharedBrowser?: boolean; // Whether the task should use a shared browser session
 } 
