@@ -87,6 +87,7 @@ interface WaitlistEntry {
   useCaseCategories?: string[];
   useCaseDescription?: string;
   requestReport?: boolean;
+  supportNote?: string;
 }
 
 // Define ChatSession interface for the frontend, including portalType
@@ -321,6 +322,9 @@ export default function AdminDashboard() {
   const [chatDialogOpen, setChatDialogOpen] = useState(false);
   const [roleDialogOpen, setRoleDialogOpen] = useState(false);
   const [selectedUserRoles, setSelectedUserRoles] = useState<('partner' | 'customer')[]>([]);
+  const [editingNoteEmail, setEditingNoteEmail] = useState<string | null>(null);
+  const [currentNoteText, setCurrentNoteText] = useState('');
+  const [noteEditLoading, setNoteEditLoading] = useState(false);
   const { token } = useAuth();
   
   const {
@@ -334,6 +338,7 @@ export default function AdminDashboard() {
     updateWaitlistStatus,
     loading: adminLoading,
     error: adminError,
+    updateWaitlistSupportNote,
   } = useAdmin();
 
   useEffect(() => {
@@ -605,6 +610,36 @@ export default function AdminDashboard() {
       setError('Failed to update user roles. Please try again.');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleEditNoteClick = (email: string, currentNote: string) => {
+    setEditingNoteEmail(email);
+    setCurrentNoteText(currentNote);
+  };
+
+  const handleCancelEditNote = () => {
+    setEditingNoteEmail(null);
+    setCurrentNoteText('');
+  };
+
+  const handleSaveNote = async () => {
+    if (!editingNoteEmail) return;
+
+    setNoteEditLoading(true);
+    try {
+      // Use the context function to update the waitlist support note
+      await updateWaitlistSupportNote(editingNoteEmail, currentNoteText);
+      setSuccess('Support note updated successfully');
+      handleCancelEditNote(); // Close dialog and clear state
+    } catch (error: any) {
+      // The context function already sets a generic error, 
+      // but we can set a more specific one or rely on the context's error handling.
+      // For now, let AdminContext's error handling take precedence or be shown.
+      // setError(error.response?.data?.message || 'Failed to update support note');
+      console.error('Failed to save support note:', error); // Keep console log for debugging
+    } finally {
+      setNoteEditLoading(false);
     }
   };
 
@@ -1023,6 +1058,7 @@ export default function AdminDashboard() {
                   <TableCell>Use Case Description</TableCell>
                   <TableCell>Last Invited</TableCell>
                   <TableCell>Request Report</TableCell>
+                  <TableCell>Support Note</TableCell>
                   <TableCell>Status</TableCell>
                   <TableCell>Actions</TableCell>
                 </TableRow>
@@ -1105,10 +1141,41 @@ export default function AdminDashboard() {
                         </TableCell>
                         <TableCell>
                           <Chip 
-                            label={entry.requestReport ? 'Yes' : 'No'} 
+                            label={typeof entry.requestReport === 'boolean' ? 
+                              (entry.requestReport ? 'Yes' : 'No') : 
+                              'N/A'} 
                             size="small"
-                            color={entry.requestReport ? 'primary' : 'default'}
+                            color={
+                              entry.requestReport === true ? 'primary' : 
+                              entry.requestReport === false ? 'default' : 
+                              'error'
+                            }
                           />
+                        </TableCell>
+                        <TableCell>
+                          <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', minHeight: '40px' }}>
+                            <Tooltip title={entry.supportNote || 'No note'} placement="top-start">
+                              <Typography 
+                                variant="body2"
+                                sx={{ 
+                                  flexGrow: 1,
+                                  maxWidth: 220, // Adjusted width
+                                  overflow: 'hidden',
+                                  textOverflow: 'ellipsis',
+                                  whiteSpace: 'nowrap',
+                                  pr: 0.5 // Padding before button
+                                }}
+                              >
+                                {entry.supportNote || '-'}
+                              </Typography>
+                            </Tooltip>
+                            <IconButton 
+                              onClick={() => handleEditNoteClick(entry.email, entry.supportNote || '')} 
+                              size="small"
+                            >
+                              <EditIcon fontSize="small" />
+                            </IconButton>
+                          </Box>
                         </TableCell>
                         <TableCell>
                           <Chip 
@@ -1403,6 +1470,43 @@ export default function AdminDashboard() {
             disabled={loading}
           >
             {loading ? <CircularProgress size={24} /> : 'Update Roles'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Support Note Edit Dialog */}
+      <Dialog open={Boolean(editingNoteEmail)} onClose={handleCancelEditNote} fullWidth maxWidth="sm">
+        <DialogTitle>
+          Edit Support Note for {editingNoteEmail}
+          <IconButton
+            aria-label="close"
+            onClick={handleCancelEditNote}
+            sx={{ position: 'absolute', right: 8, top: 8 }}
+            disabled={noteEditLoading}
+          >
+            <CloseIcon />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent dividers>
+          <TextField
+            autoFocus
+            margin="dense"
+            label="Support Note"
+            type="text"
+            fullWidth
+            multiline
+            rows={4}
+            value={currentNoteText}
+            onChange={(e) => setCurrentNoteText(e.target.value)}
+            disabled={noteEditLoading}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleCancelEditNote} disabled={noteEditLoading}>
+            Cancel
+          </Button>
+          <Button onClick={handleSaveNote} variant="contained" disabled={noteEditLoading}>
+            {noteEditLoading ? <CircularProgress size={24} /> : 'Save'}
           </Button>
         </DialogActions>
       </Dialog>

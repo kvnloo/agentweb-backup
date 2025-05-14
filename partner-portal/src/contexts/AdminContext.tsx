@@ -12,6 +12,7 @@ interface AdminContextType {
   loadWaitlist: () => Promise<void>;
   loadAnalytics: (startDate: string, endDate: string) => Promise<void>;
   updateWaitlistStatus: (email: string, status: string) => Promise<void>;
+  updateWaitlistSupportNote: (email: string, supportNote: string) => Promise<void>;
   loading: boolean;
   error: string | null;
   isAdmin: boolean;
@@ -111,6 +112,20 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
   }, [api, loadWaitlist]);
 
+  const updateWaitlistSupportNote = useCallback(async (email: string, supportNote: string) => {
+    try {
+      setLoading(true);
+      await api.put(`/api/admin/waitlist/${email}/support-note`, { supportNote });
+      await loadWaitlist();
+      setError(null);
+    } catch (err: any) {
+      setError(err.response?.data?.message || 'Failed to update support note');
+      throw err;
+    } finally {
+      setLoading(false);
+    }
+  }, [api, loadWaitlist]);
+
   const value = {
     users,
     waitlist,
@@ -120,6 +135,7 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     loadWaitlist,
     loadAnalytics,
     updateWaitlistStatus,
+    updateWaitlistSupportNote,
     loading,
     error,
     isAdmin: user?.isAdmin || false,

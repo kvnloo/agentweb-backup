@@ -31,6 +31,7 @@ interface WaitlistEntry {
   requestReport?: boolean;
   useCaseCategories?: string[];
   useCaseDescription?: string;
+  supportNote?: string;
 }
 
 // Helper function to handle DynamoDB errors
@@ -56,7 +57,8 @@ export const waitlistDb = {
         companyName: entry.companyName,
         requestReport: entry.requestReport || false,
         useCaseCategories: entry.useCaseCategories || [],
-        useCaseDescription: entry.useCaseDescription || ''
+        useCaseDescription: entry.useCaseDescription || '',
+        supportNote: entry.supportNote || ''
       },
       ConditionExpression: 'attribute_not_exists(email)'
     };
@@ -117,6 +119,27 @@ export const waitlistDb = {
       ExpressionAttributeValues: {
         ':status': status,
         ...(invitedAt && { ':invitedAt': invitedAt })
+      },
+      ReturnValues: 'ALL_NEW'
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as WaitlistEntry;
+    } catch (error) {
+      return handleDynamoError(error);
+    }
+  },
+
+  async updateSupportNote(email: string, supportNote: string) {
+    const params = {
+      TableName: `${TABLE_PREFIX}AW-Waitlist`,
+      Key: {
+        email: email.toLowerCase()
+      },
+      UpdateExpression: 'SET supportNote = :supportNote',
+      ExpressionAttributeValues: {
+        ':supportNote': supportNote
       },
       ReturnValues: 'ALL_NEW'
     };
