@@ -130,36 +130,24 @@ export const googleCallback = async (
   profile: Profile,
   done: (error: any, user?: any, info?: any) => void
 ) => {
-  console.log('[DEBUG] googleCallback: Received profile:', JSON.stringify(profile, null, 2));
-  console.log('[DEBUG] googleCallback: AccessToken received:', !!accessToken);
-  console.log('[DEBUG] googleCallback: RefreshToken received:', !!refreshToken);
-  console.log('[DEBUG] googleCallback: req.query.state (portalOrigin):', req.query.state);
-
   try {
     if (!profile) {
-      console.error('[ERROR] googleCallback: Google profile was not received.');
       return done(new Error('Google profile was not received'), null);
     }
     
     let email = profile.emails && profile.emails[0] ? profile.emails[0].value : null;
-    console.log('[DEBUG] googleCallback: Extracted raw email:', email);
     
     if (!email) {
-      console.error('[ERROR] googleCallback: No email found in Google profile.');
       return done(new Error('No email found in Google profile. Please ensure your Google account has a primary email and permissions are granted.'), null);
     }
     email = email.toLowerCase();
-    console.log('[DEBUG] googleCallback: Lowercased email:', email);
 
     let user = await userDb.getUserByEmail(email);
-    console.log('[DEBUG] googleCallback: User from DB by email:', user ? { userId: user.userId, email: user.email, roles: user.roles } : null);
     
     const portalOrigin = req.query.state as string || 'partner';
 
     if (!user) {
-      console.log(`[DEBUG] googleCallback: User not found for ${email}. Attempting to create new user for portal: ${portalOrigin}`);
       const waitlistEntry = await waitlistDb.getByEmail(email);
-      console.log('[DEBUG] googleCallback: Waitlist entry for new user:', waitlistEntry);
       
       if (!waitlistEntry) {
         const landingSiteUrl = process.env.LANDING_SITE_URL || 'https://agentweb.pro';
@@ -168,51 +156,41 @@ export const googleCallback = async (
           message: `Please join our waitlist first at ${landingSiteUrl}`,
           code: 'not_in_waitlist'
         };
-        console.warn('[WARN] googleCallback: New user not on waitlist:', errorObj);
         return done(errorObj, null);
       }
       
       if (waitlistEntry.status !== 'invited') {
         const errorObj = {
           statusCode: 403,
-          message: "Your account is on our waitlist but hasn't been invited yet. Please look out for an invitation email.",
+          message: "Your account is on our waitlist but hasn\'t been invited yet. Please look out for an invitation email.",
           code: 'not_invited'
         };
-        console.warn('[WARN] googleCallback: New user on waitlist but not invited:', errorObj);
         return done(errorObj, null);
       }
 
       const userId = Date.now().toString();
       const defaultRolesForNewOAuthUser: ('partner' | 'customer')[] = portalOrigin === 'customer' ? ['customer'] : ['partner'];
       
-      console.log(`[DEBUG] googleCallback: Creating new OAuth user. UserID: ${userId}, Roles: ${defaultRolesForNewOAuthUser.join(', ')}, DisplayName: ${profile.displayName}`);
       await userDb.createUser(email, userId, '', true, false, defaultRolesForNewOAuthUser, profile.displayName, profile.id);
       user = await userDb.getUserByEmail(email);
-      console.log('[DEBUG] googleCallback: New user fetched from DB after creation:', user ? { userId: user.userId, email: user.email, roles: user.roles } : 'FETCH FAILED');
       
       if (!user) {
-        console.error('[ERROR] googleCallback: Failed to create or find user after creation attempt.');
         return done(new Error('Failed to create or find user after creation attempt.'), null);
       }
-    } else {
-      console.log(`[DEBUG] googleCallback: Existing user found for ${email}. UserID: ${user.userId}`);
-    }
+    } 
 
-    console.log(`[DEBUG] googleCallback: Checking roles for user ${user.email} for portalOrigin ${portalOrigin}. User roles: ${user.roles}`);
     if (portalOrigin === 'customer' && (!user.roles || !user.roles.includes('customer'))) {
       const errorObj = {
         statusCode: 403,
         message: 'Access denied: Your account does not have permission to access this customer portal.',
         code: 'invalid_role'
       };
-      console.warn('[WARN] googleCallback: User role check failed for customer portal:', errorObj);
       return done(errorObj, null);
     }
 
     const userRoles = user.roles && user.roles.length > 0 
                       ? user.roles 
                       : (portalOrigin === 'customer' ? ['customer'] : ['partner']);
-    console.log('[DEBUG] googleCallback: Final userRoles to be used in token:', userRoles);
 
     const tokenPayload = { 
       userId: user.userId, 
@@ -220,9 +198,7 @@ export const googleCallback = async (
       roles: userRoles,
       isAdmin: user.isAdmin || false
     };
-    console.log('[DEBUG] googleCallback: JWT Payload to be signed:', tokenPayload);
     const token = jwt.sign(tokenPayload, process.env.JWT_SECRET || 'your-secret-key');
-    console.log('[DEBUG] googleCallback: JWT generated successfully.');
 
     const resultUserObject = { 
       token,
@@ -231,11 +207,9 @@ export const googleCallback = async (
       roles: userRoles,
       isAdmin: user.isAdmin || false
     };
-    console.log('[DEBUG] googleCallback: Calling done() with success. User object:', resultUserObject);
     done(null, resultUserObject);
 
   } catch (error: any) {
-    console.error('[FATAL] googleCallback: Unhandled exception:', error.message, error.stack);
     let formattedError = error;
     if (error instanceof Error) {
       formattedError = {
@@ -244,7 +218,6 @@ export const googleCallback = async (
         code: 'server_error'
       };
     }
-    console.error('[FATAL] googleCallback: Calling done() with formatted error:', formattedError);
     done(formattedError, null);
   }
 }; 

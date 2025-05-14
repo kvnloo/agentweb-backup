@@ -16,11 +16,11 @@ const router = express.Router();
 const PARTNER_FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 const CUSTOMER_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
 
-console.log('OAuth Configuration:', {
-  backendUrl: process.env.BACKEND_URL || 'http://localhost:3001',
-  partnerFrontendUrl: PARTNER_FRONTEND_URL,
-  customerFrontendUrl: CUSTOMER_FRONTEND_URL
-});
+// console.log('OAuth Configuration:', {
+//   backendUrl: process.env.BACKEND_URL || 'http://localhost:3001',
+//   partnerFrontendUrl: PARTNER_FRONTEND_URL,
+//   customerFrontendUrl: CUSTOMER_FRONTEND_URL
+// });
 
 passport.use(new GoogleStrategy({
   clientID: process.env.GOOGLE_CLIENT_ID!,
@@ -64,14 +64,7 @@ router.get('/google', (req: Request, res: Response, next: NextFunction) => {
 });
 
 const googleAuthFinalHandler = (req: Request, res: Response) => {
-    console.log('[DEBUG] googleAuthFinalHandler: Entered. req.user exists:', !!req.user);
-    if (req.user) {
-        console.log('[DEBUG] googleAuthFinalHandler: req.user content:', JSON.stringify(req.user, null, 2));
-    }
-    console.log('[DEBUG] googleAuthFinalHandler: req.query.state (portalState):', req.query.state);
-
     if (!req.user) {
-        console.error('[ERROR] googleAuthFinalHandler: Google authentication failed - req.user is not populated after passport.authenticate.');
         const failureRedirectPortal = req.query.state === 'customer' ? CUSTOMER_FRONTEND_URL : PARTNER_FRONTEND_URL;
         return res.redirect(`${failureRedirectPortal}/oauth-callback?error=${encodeURIComponent('Google authentication session error. Please try again.')}&code=session_error`);
     }
@@ -80,41 +73,27 @@ const googleAuthFinalHandler = (req: Request, res: Response) => {
     const portalState = req.query.state as string;
     const targetFrontendUrl = portalState === 'customer' ? CUSTOMER_FRONTEND_URL : PARTNER_FRONTEND_URL;
 
-    console.log('[DEBUG] googleAuthFinalHandler: userAuthInfo from req.user:', JSON.stringify(userAuthInfo, null, 2));
-    console.log('[DEBUG] googleAuthFinalHandler: Determined targetFrontendUrl:', targetFrontendUrl);
-
     if (!userAuthInfo || !userAuthInfo.token) {
-        console.error('[ERROR] googleAuthFinalHandler: User authenticated but no token found in userAuthInfo. UserAuthInfo:', JSON.stringify(userAuthInfo, null, 2));
         return res.redirect(`${targetFrontendUrl}/oauth-callback?error=${encodeURIComponent('Authentication token is missing after Google auth. Please try again.')}&code=token_missing`);
     }
 
-    console.log(`[INFO] googleAuthFinalHandler: Redirecting to ${portalState} portal: ${targetFrontendUrl} with token.`);
     res.redirect(`${targetFrontendUrl}/oauth-callback?token=${userAuthInfo.token}`);
 };
 
 router.get('/google/callback', 
   (req: Request, res: Response, next: NextFunction) => {
     const state = req.query.state as string;
-    console.log(`[DEBUG] /google/callback route handler: Entered. State from query: ${state}`);
     
     const customPassportAuthCallback = (err: any, user: any, info: any, status: any) => {
-      console.log('[DEBUG] customPassportAuthCallback: Invoked.');
-      console.log('[DEBUG] customPassportAuthCallback: Error:', err ? JSON.stringify(err, Object.getOwnPropertyNames(err)) : 'null_or_undefined');
-      console.log('[DEBUG] customPassportAuthCallback: User:', user ? { userId: user.userId, email: user.email, tokenExists: !!user.token, roles: user.roles } : 'null_or_undefined');
-      console.log('[DEBUG] customPassportAuthCallback: Info:', JSON.stringify(info, null, 2));
-      console.log('[DEBUG] customPassportAuthCallback: Status:', JSON.stringify(status, null, 2));
-
       const frontendUrl = state === 'customer' ? CUSTOMER_FRONTEND_URL : PARTNER_FRONTEND_URL;
 
       if (err) {
-        console.error('[ERROR] customPassportAuthCallback: Error condition. Redirecting.', err);
         const errMsg = err.message || 'Authentication failed due to an error.';
         const errCode = err.code || 'auth_error';
         return res.redirect(`${frontendUrl}/oauth-callback?error=${encodeURIComponent(errMsg)}&code=${errCode}`);
       }
       
       if (!user) {
-        console.error('[ERROR] customPassportAuthCallback: No user returned from strategy. Redirecting.');
         let errMsg = 'Authentication failed: No user details received.';
         let errCode = 'no_user_in_passport_cb';
         if (info && typeof info === 'object' && info.message) {
@@ -125,10 +104,7 @@ router.get('/google/callback',
         return res.redirect(`${frontendUrl}/oauth-callback?error=${encodeURIComponent(errMsg)}&code=${errCode}`);
       }
       
-      console.log('[DEBUG] customPassportAuthCallback: User is valid. Setting req.user.');
       req.user = user; 
-
-      console.log('[DEBUG] customPassportAuthCallback: Calling route next() to proceed to googleAuthFinalHandler.');
       next(); 
     };
     
