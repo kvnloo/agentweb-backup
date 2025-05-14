@@ -5,8 +5,15 @@ import { useLocation } from 'react-router-dom';
 
 export type UserRole = 'customer' | 'partner';
 
-// Define waitlist error code type
-export type WaitlistErrorCode = 'not_in_waitlist' | 'not_invited' | 'user_not_found';
+// Define general auth error codes type
+export type AuthErrorCode = 
+  'not_in_waitlist' 
+  | 'not_invited' 
+  | 'user_not_found' 
+  | 'invalid_credentials' 
+  | 'account_deactivated' 
+  | 'server_error' 
+  | 'access_denied'; // For general access issues
 
 interface User {
   userId: string;
@@ -26,7 +33,7 @@ interface AuthContextType {
   setToken: (token: string) => Promise<void>;
   logout: () => void;
   error: string | null;
-  errorCode: WaitlistErrorCode | null;
+  errorCode: AuthErrorCode | null;
   landingSiteUrl: string | null;
 }
 
@@ -45,7 +52,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const [token, setTokenState] = useState<string | null>(localStorage.getItem('token'));
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [errorCode, setErrorCode] = useState<WaitlistErrorCode | null>(null);
+  const [errorCode, setErrorCode] = useState<AuthErrorCode | null>(null);
   const [landingSiteUrl, setLandingSiteUrl] = useState<string | null>(null);
   
   // Get current location to reset errors on route change
@@ -62,8 +69,12 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     const verifyToken = async () => {
       if (!token) {
         setLoading(false);
+        setUser(null); // Ensure user is null if no token
         return;
       }
+      setLoading(true); // Set loading true before verification attempt
+      setError(null);   // Clear previous errors
+      setErrorCode(null);
 
       try {
         const response = await axios.get(buildApiUrl('/api/auth/me'), {
@@ -71,28 +82,50 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         });
         
         const userData = response.data;
+        if (!userData || !userData.userId || !userData.email) {
+          console.error('Invalid user data from /api/auth/me during initial load:', userData);
+          setError('Failed to load user data. Session may be invalid.');
+          setErrorCode('server_error');
+          localStorage.removeItem('token'); // Clear bad token
+          setTokenState(null);
+          setUser(null);
+          return; // Exit early
+        }
+        
         if (!userData.roles) userData.roles = [];
         
-        // Allow admin or users with customer role
         if (!userData.isAdmin && !userData.roles.includes('customer')) {
-          setError('Access denied: You do not have permission to access this portal.');
+          setError('Access denied: Your account does not have permission to access this customer portal.');
+          setErrorCode('access_denied');
           localStorage.removeItem('token');
           setTokenState(null);
           setUser(null);
         } else {
           setUser(userData);
         }
-      } catch (err) {
-        console.error('Token verification failed:', err);
-        localStorage.removeItem('token');
+      } catch (err: any) {
+        console.error('Token verification failed during initial load:', err);
+        let message = 'Session validation failed. Please log in again.';
+        let code: AuthErrorCode | null = 'server_error';
+
+        if (err.response?.data) {
+          message = err.response.data.message || message;
+          code = (err.response.data.code as AuthErrorCode) || code;
+        } else if (err.message) {
+          message = err.message; // Could be a network error or other client-side issue
+        }
+        setError(message);
+        if (code) setErrorCode(code);
+        localStorage.removeItem('token'); // Critical: remove invalid token
         setTokenState(null);
+        setUser(null);
       } finally {
         setLoading(false);
       }
     };
 
     verifyToken();
-  }, [token]);
+  }, [token]); // Dependency array remains [token]
 
   const login = async (email: string, password: string) => {
     setLoading(true);
@@ -109,10 +142,11 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       const { token: newToken, user: userData } = response.data;
       if (!userData.roles) userData.roles = [];
       
-      // Allow admin or users with customer role
       if (!userData.isAdmin && !userData.roles.includes('customer')) {
         setError('Access denied: You do not have permission to access this portal.');
-        return;
+        setErrorCode('access_denied');
+        // Do not proceed to set token or user if access is denied here
+        throw new Error('Access denied: You do not have permission to access this portal.'); 
       }
       
       localStorage.setItem('token', newToken);
@@ -120,24 +154,22 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       setUser(userData);
     } catch (err: any) {
       console.error('Login failed:', err);
-      
-      if (err.response?.data?.code === 'user_not_found') {
-        setError(err.response.data.message);
-        setErrorCode('user_not_found');
-      } else if (err.response?.status === 403) {
-        setError('Access denied: Only customer accounts can access this portal');
-      } else if (err.response?.data?.message) {
-        setError(err.response.data.message);
-      } else {
-        setError('Authentication failed. Please check your credentials.');
+      let message = 'Authentication failed. Please try again.';
+      let code: AuthErrorCode | null = null;
+
+      if (err.response?.data) {
+        message = err.response.data.message || message;
+        code = err.response.data.code as AuthErrorCode || null;
+      } else if (err.message === 'Access denied: You do not have permission to access this portal.') {
+        // Handle the error thrown locally for role denial
+        message = err.message;
+        code = 'access_denied';
       }
       
-      // Set error code if it was not specifically handled above but exists in response
-      if (!errorCode && err.response?.data?.code) {
-        setErrorCode(err.response.data.code as WaitlistErrorCode);
-      }
+      setError(message);
+      if (code) setErrorCode(code);
       
-      throw err;
+      throw err; 
     } finally {
       setLoading(false);
     }
@@ -146,8 +178,8 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const register = async (email: string, password: string) => {
     setLoading(true);
     setError(null);
-    setErrorCode(null);
-    setLandingSiteUrl(null);
+    setErrorCode(null); 
+    setLandingSiteUrl(null); 
     
     try {
       const response = await axios.post(buildApiUrl('/api/auth/register'), {
@@ -159,10 +191,10 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       const { token: newToken, user: userData } = response.data;
       if (!userData.roles) userData.roles = [];
       
-      // Allow admin or users with customer role (though register here implies customer)
       if (!userData.isAdmin && !userData.roles.includes('customer')) {
         setError('Access denied: Account created without customer role.');
-        return;
+        setErrorCode('access_denied');
+        throw new Error('Access denied: Account created without customer role.');
       }
       
       localStorage.setItem('token', newToken);
@@ -170,25 +202,27 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       setUser(userData);
     } catch (err: any) {
       console.error('Registration failed:', err);
-      
-      if (err.response?.data?.message) {
-        setError(err.response.data.message);
-      } else {
-        setError('Registration failed. Please try again.');
-      }
-      
-      if (err.response?.data?.code) {
-        setErrorCode(err.response.data.code as WaitlistErrorCode);
-      }
-      
-      if (err.response?.data?.code === 'not_in_waitlist') {
-        const message = err.response?.data?.message || '';
-        const match = message.match(/at\s(.+)$/);
-        if (match && match[1]) {
-          setLandingSiteUrl(match[1].trim());
+      let message = 'Registration failed. Please try again.';
+      let code: AuthErrorCode | null = null;
+
+      if (err.response?.data) {
+        message = err.response.data.message || message;
+        code = err.response.data.code as AuthErrorCode || null;
+
+        if (code === 'not_in_waitlist') {
+          const msg = err.response?.data?.message || '';
+          const urlMatch = msg.match(/at\s(.+)$/);
+          if (urlMatch && urlMatch[1]) {
+            setLandingSiteUrl(urlMatch[1].trim());
+          }
         }
+      } else if (err.message === 'Access denied: Account created without customer role.'){
+        message = err.message;
+        code = 'access_denied';
       }
       
+      setError(message);
+      if (code) setErrorCode(code);
       throw err;
     } finally {
       setLoading(false);
@@ -218,7 +252,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       }
       
       if (error.response?.data?.code) {
-        setErrorCode(error.response.data.code as WaitlistErrorCode);
+        setErrorCode(error.response.data.code as AuthErrorCode);
       }
       
       throw error;
@@ -232,43 +266,63 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     setLandingSiteUrl(null);
     
     try {
-      // Verify the token and get user data
       const response = await axios.get(buildApiUrl('/api/auth/me'), {
         headers: { Authorization: `Bearer ${newToken}` },
       });
       
       const userData = response.data;
-      if (!userData.roles) userData.roles = [];
+      if (!userData || !userData.userId || !userData.email) {
+        console.error('Invalid user data received from /api/auth/me:', userData);
+        setError('Invalid user data received after authentication.');
+        setErrorCode('server_error'); // Or a new specific code like 'invalid_user_data'
+        throw new Error('Invalid user data received after authentication.');
+      }
       
-      // Allow admin or users with customer role
+      if (!userData.roles) userData.roles = []; // Ensure roles array exists
+      
       if (!userData.isAdmin && !userData.roles.includes('customer')) {
-        setError('Access denied: You do not have permission to access this portal.');
-        setLoading(false);
-        // Clear token and user if access is denied
+        setError('Access denied: Your account does not have permission to access this customer portal.');
+        setErrorCode('access_denied');
+        // No need to setLoading(false) here, finally block will do it.
+        // Clear token and user immediately
         localStorage.removeItem('token');
         setTokenState(null);
         setUser(null);
-        throw new Error('Access denied: You do not have permission to access this portal.');
+        throw new Error('Access denied: Your account does not have permission to access this customer portal.');
       }
       
-      // Store the token and user data
       localStorage.setItem('token', newToken);
       setTokenState(newToken);
       setUser(userData);
     } catch (err: any) {
-      console.error('Token validation failed:', err);
-      
-      if (err.response?.data?.message) {
-        setError(err.response.data.message);
-      } else {
-        setError('Authentication failed. Please try again.');
+      console.error('Error in setToken (validating /api/auth/me or role check):', err);
+      let message = 'Authentication token validation failed. Please try again.';
+      let code: AuthErrorCode | null = 'server_error'; // Default to server_error
+
+      if (err.message && err.message.startsWith('Access denied')) {
+        // This catches the error thrown explicitly for role denial
+        message = err.message;
+        code = 'access_denied';
+      } else if (err.response?.data) {
+        // Error from axios request to /api/auth/me
+        message = err.response.data.message || message;
+        code = (err.response.data.code as AuthErrorCode) || code;
+      } else if (err.message) {
+        // Other JS errors that might occur
+        message = err.message;
       }
       
-      if (err.response?.data?.code) {
-        setErrorCode(err.response.data.code as WaitlistErrorCode);
-      }
+      setError(message);
+      if (code) setErrorCode(code);
       
-      throw err;
+      // Critical: Clear potentially bad token if validation failed for reasons other than explicit role denial
+      // If it was role denial, token was already cleared above.
+      if (code !== 'access_denied') {
+        localStorage.removeItem('token');
+        setTokenState(null);
+        setUser(null);
+      }
+      throw err; 
     } finally {
       setLoading(false);
     }
