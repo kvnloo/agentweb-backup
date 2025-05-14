@@ -370,7 +370,6 @@ export default function TaskDetails() {
   const [newOwnerEmail, setNewOwnerEmail] = useState('');
   const [ownerChangeError, setOwnerChangeError] = useState('');
   const [ownerChangeSuccess, setOwnerChangeSuccess] = useState('');
-  const [useSharedBrowser, setUseSharedBrowser] = useState<boolean>(false);
 
   const isAdminRoute = location.pathname.startsWith('/admin/');
   const showActions = !isAdminRoute || (task && user && task.userId === user.userId);

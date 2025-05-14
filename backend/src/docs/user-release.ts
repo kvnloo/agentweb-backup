@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-05-14',
+    changes: [
+      'Supported Use Shared Browser for tasks',
+      '- When enabled, the agent will use shared browser sessions to execute tasks',
+      '- It allows access to more account-protected data in a secure way.',
+      '- Also available through template configuration'
+    ],
+  },
+  {
     date: '2025-05-12',
     changes: [
       'Template Enhancements with LLM selection',
