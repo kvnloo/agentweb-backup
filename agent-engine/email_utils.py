@@ -42,7 +42,7 @@ def get_task_subscribers(task_id):
         logger.error(f"Failed to get task subscribers: {e}")
         return []
 
-def send_task_notification(to_email, task_name, task_id, execution_status, execution_id=None, result=None, error=None, new_info_summary=None):
+def send_task_notification(to_email, task_name, task_id, execution_status, execution_id=None, result=None, error=None, new_info_summary=None, llm_name=None):
     """
     Send an email notification about task completion.
     """
@@ -74,6 +74,8 @@ def send_task_notification(to_email, task_name, task_id, execution_status, execu
 
         View task details: {site_domain}/tasks/{task_id}
 """
+        if llm_name:
+            body += f"LLM Used: {llm_name}\n"
         if result:
             body += f"\nResult:\n{result}"
         if error:
@@ -94,7 +96,7 @@ def send_task_notification(to_email, task_name, task_id, execution_status, execu
         logger.error(f"Failed to send email notification: {e}")
         return False
 
-def send_task_results(to_email, task_name, task_id, execution_status, result=None, error=None, start_time=None, end_time=None, new_info_summary=None, result_files=None):
+def send_task_results(to_email, task_name, task_id, execution_status, result=None, error=None, start_time=None, end_time=None, new_info_summary=None, result_files=None, llm_name=None):
     """
     Send a detailed task results email to subscribers.
     Sends content as HTML only.
@@ -183,6 +185,7 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
       <p><strong>Status:</strong> {execution_status.upper()}</p>
       <p><strong>Started:</strong> {start_time_str}</p>
       <p><strong>Completed:</strong> {end_time_str}</p>
+      {f'<p><strong>LLM Used:</strong> {llm_name}</p>' if llm_name else ''}
       {duration_str}
     </div>
 """
@@ -228,7 +231,7 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
         logger.error(f"Failed to send task results email (HTML only): {e}", exc_info=True)
         return False
 
-def notify_task_subscribers(task_id, task_name, execution_status, execution_id=None, result=None, error=None, start_time=None, end_time=None, new_info_summary=None, result_files=None):
+def notify_task_subscribers(task_id, task_name, execution_status, execution_id=None, result=None, error=None, start_time=None, end_time=None, new_info_summary=None, result_files=None, llm_name=None):
     """
     Send detailed task results to all subscribers.
     """
@@ -246,7 +249,8 @@ def notify_task_subscribers(task_id, task_name, execution_status, execution_id=N
             start_time,
             end_time,
             new_info_summary,
-            result_files=result_files
+            result_files=result_files,
+            llm_name=llm_name
         )
         
         if success:

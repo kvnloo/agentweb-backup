@@ -337,7 +337,8 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                                 execution_id=execution_id,
                                 result=result,
                                 error=error,
-                                new_info_summary=new_info_summary
+                                new_info_summary=new_info_summary,
+                                llm_name=llm_name # Pass llm_name
                             )
                         else:
                             logger.error(f"User email not found for userId: {task['userId']}")
@@ -355,7 +356,8 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                             start_time=start_time,
                             end_time=end_time,
                             new_info_summary=new_info_summary,
-                            result_files=execution.get('result_files', [])
+                            result_files=execution.get('result_files', []),
+                            llm_name=llm_name
                         )
     except ClientError as e:
         logger.error(f"Error updating execution status: {e}")
