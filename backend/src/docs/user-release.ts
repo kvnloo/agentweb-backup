@@ -9,6 +9,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2025-05-14',
     changes: [
+      'Improved customer login/register',
+      '- Get customer login/register work with waitlist',
+      '- Improved error message when login/register fails',
       'Supported Use Shared Browser for tasks',
       '- When enabled, the agent will use shared browser sessions to execute tasks',
       '- It allows access to more account-protected data in a secure way.',

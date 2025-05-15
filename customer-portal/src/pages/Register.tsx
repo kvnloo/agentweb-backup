@@ -5,7 +5,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
-import { AlertCircle } from 'lucide-react';
+import { AlertCircle, ExternalLink } from 'lucide-react';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import GoogleSignInButton from '@/components/auth/GoogleSignInButton';
 import { Separator } from '@/components/ui/separator';
@@ -17,7 +17,7 @@ const Register = () => {
   const [confirmPassword, setConfirmPassword] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [formError, setFormError] = useState('');
-  const { error, register } = useAuth();
+  const { error, register, errorCode, landingSiteUrl } = useAuth();
   const navigate = useNavigate();
 
   // Pre-fill email from URL params
@@ -49,6 +49,61 @@ const Register = () => {
     }
   };
 
+  // Format the error message for display
+  const getErrorMessage = () => {
+    if (formError) {
+      return formError;
+    }
+    
+    if (error) {
+      // For waitlist errors with URLs
+      if (errorCode === 'not_in_waitlist' && landingSiteUrl) {
+        return (
+          <>
+            Please join our waitlist first at{' '}
+            <a 
+              href={landingSiteUrl} 
+              target="_blank" 
+              rel="noopener noreferrer" 
+              className="text-blue-600 hover:underline inline-flex items-center"
+            >
+              {landingSiteUrl} <ExternalLink className="h-3 w-3 ml-1" />
+            </a>
+          </>
+        );
+      }
+      
+      // For invitation pending errors
+      if (errorCode === 'not_invited') {
+        const discordInviteLink = "https://discord.gg/yUCuSxHH";
+        
+        return (
+          <>
+            <span className="font-semibold">Waitlist Status:</span> You're on our waitlist but not yet invited. 
+            Thanks for the waiting and we will send you an email when it is ready. 
+            You can also join our{' '}
+            <a 
+              href={discordInviteLink}
+              target="_blank" 
+              rel="noopener noreferrer" 
+              className="text-blue-600 hover:underline inline-flex items-center"
+            >
+              Discord Community <ExternalLink className="h-3 w-3 ml-1" />
+            </a>
+            {' '}for human support.
+          </>
+        );
+      }
+      
+      // For any other errors, show them directly
+      return error;
+    }
+    
+    return null;
+  };
+
+  const errorMessage = getErrorMessage();
+
   return (
     <div className="flex min-h-screen items-center justify-center bg-[#F3EFFD] p-4">
       <Card className="w-full max-w-md">
@@ -71,7 +126,7 @@ const Register = () => {
               <Separator className="w-full" />
             </div>
             <div className="relative flex justify-center text-xs uppercase">
-              <span className="bg-white px-2 text-muted-foreground">Or continue with</span>
+              <span className="bg-card px-2 text-muted-foreground">Or continue with</span>
             </div>
           </div>
           
@@ -110,10 +165,12 @@ const Register = () => {
                 />
               </div>
               
-              {(formError || error) && (
+              {errorMessage && (
                 <Alert variant="destructive">
                   <AlertCircle className="h-4 w-4" />
-                  <AlertDescription>{formError || error}</AlertDescription>
+                  <AlertDescription className="ml-2">
+                    {errorMessage}
+                  </AlertDescription>
                 </Alert>
               )}
               

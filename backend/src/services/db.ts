@@ -129,7 +129,7 @@ class UserDB {
   ) {
     const itemToCreate: any = {
       userId,
-      email,
+      email: email.toLowerCase(),
       password,
       isOAuthUser,
       isAdmin,
@@ -159,7 +159,7 @@ class UserDB {
       IndexName: 'EmailIndex',
       KeyConditionExpression: 'email = :email',
       ExpressionAttributeValues: {
-        ':email': email
+        ':email': email.toLowerCase()
       }
     };
 

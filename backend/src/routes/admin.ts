@@ -122,6 +122,33 @@ router.put('/waitlist/:email/status', async (req, res) => {
   }
 });
 
+// Update waitlist entry support note
+router.put('/waitlist/:email/support-note', async (req, res) => {
+  try {
+    const { email } = req.params;
+    const { supportNote } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ message: 'Email is required' });
+    }
+    
+    // supportNote can be an empty string, so we don't check for its existence specifically, just that the body field is present.
+    if (typeof supportNote === 'undefined') {
+        return res.status(400).json({ message: 'supportNote field is required in the body' });
+    }
+
+    const entry = await waitlistDb.updateSupportNote(email, supportNote);
+    if (!entry) {
+      return res.status(404).json({ message: 'Waitlist entry not found or failed to update' });
+    }
+
+    res.json(entry);
+  } catch (error) {
+    console.error('Error updating waitlist support note:', error);
+    res.status(500).json({ message: 'Error updating support note' });
+  }
+});
+
 // Resend invitation email
 router.post('/waitlist/resend-invitation', async (req, res) => {
   try {

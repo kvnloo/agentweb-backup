@@ -3,19 +3,39 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { userDb } from '../services/db';
 import { Profile } from 'passport-google-oauth20';
+import { waitlistDb } from '../services/waitlistDb';
 
 export const register = async (req: Request, res: Response) => {
   try {
-    const { email, password, roles: reqRoles } = req.body;
+    let { email, password, roles: reqRoles } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({ message: 'Email and password are required' });
     }
+    email = email.toLowerCase();
 
     // Check if user exists
     const existingUser = await userDb.getUserByEmail(email);
     if (existingUser) {
       return res.status(400).json({ message: 'User already exists' });
+    }
+
+    // Check waitlist status
+    const waitlistEntry = await waitlistDb.getByEmail(email);
+    
+    if (!waitlistEntry) {
+      const landingSiteUrl = process.env.LANDING_SITE_URL || 'https://agentweb.pro';
+      return res.status(403).json({ 
+        message: `Please join our waitlist first at ${landingSiteUrl}`,
+        code: 'not_in_waitlist'
+      });
+    }
+    
+    if (waitlistEntry.status !== 'invited') {
+      return res.status(403).json({ 
+        message: 'Your account is on our waitlist but hasn\'t been invited yet. Please look out for an invitation email.',
+        code: 'not_invited'
+      });
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
@@ -57,42 +77,49 @@ export const register = async (req: Request, res: Response) => {
 
 export const login = async (req: Request, res: Response) => {
   try {
-    const { email, password } = req.body;
+    let { email, password } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({ message: 'Email and password are required' });
     }
+    email = email.toLowerCase();
 
     const user = await userDb.getUserByEmail(email);
     if (!user) {
-      return res.status(401).json({ message: 'Invalid credentials' });
+      return res.status(404).json({ 
+        message: 'User not found. Please create an account to continue.',
+        code: 'user_not_found' 
+      });
     }
 
-    // Check if user is deactivated
     if (user.isActive === false) {
-      return res.status(403).json({ message: 'Account has been deactivated. Please contact support.' });
+      return res.status(403).json({ 
+        message: 'Account has been deactivated. Please contact support.',
+        code: 'account_deactivated' 
+      });
     }
 
     const isValidPassword = await bcrypt.compare(password, user.password);
     if (!isValidPassword) {
-      return res.status(401).json({ message: 'Invalid credentials' });
+      return res.status(401).json({ 
+        message: 'Invalid credentials. Please check your email and password.',
+        code: 'invalid_credentials' 
+      });
     }
 
-    // Ensure JWT uses roles array (prefer over single role if both exist)
     const jwtPayload = { 
       userId: user.userId, 
       email: user.email,
-      roles: user.roles || [], // Use roles array, default to empty if undefined
+      roles: user.roles || [],
       isAdmin: user.isAdmin || false
     };
     const token = jwt.sign(jwtPayload, process.env.JWT_SECRET || 'your-secret-key');
 
-    // Return user object (which might still have both role/roles from DB)
     const { password: _, ...userWithoutPassword } = user;
     res.json({ token, user: userWithoutPassword });
   } catch (error) {
     console.error('Error in login:', error);
-    res.status(500).json({ message: 'Error logging in' });
+    res.status(500).json({ message: 'Error logging in', code: 'server_error' });
   }
 };
 
@@ -108,63 +135,89 @@ export const googleCallback = async (
       return done(new Error('Google profile was not received'), null);
     }
     
-    const email = profile.emails && profile.emails[0] ? profile.emails[0].value : null;
+    let email = profile.emails && profile.emails[0] ? profile.emails[0].value : null;
     
     if (!email) {
-      console.error('No email found in Google profile. Profile received:', JSON.stringify(profile, null, 2));
       return done(new Error('No email found in Google profile. Please ensure your Google account has a primary email and permissions are granted.'), null);
     }
+    email = email.toLowerCase();
 
     let user = await userDb.getUserByEmail(email);
     
     const portalOrigin = req.query.state as string || 'partner';
 
     if (!user) {
+      const waitlistEntry = await waitlistDb.getByEmail(email);
+      
+      if (!waitlistEntry) {
+        const landingSiteUrl = process.env.LANDING_SITE_URL || 'https://agentweb.pro';
+        const errorObj = {
+          statusCode: 403,
+          message: `Please join our waitlist first at ${landingSiteUrl}`,
+          code: 'not_in_waitlist'
+        };
+        return done(errorObj, null);
+      }
+      
+      if (waitlistEntry.status !== 'invited') {
+        const errorObj = {
+          statusCode: 403,
+          message: "Your account is on our waitlist but hasn\'t been invited yet. Please look out for an invitation email.",
+          code: 'not_invited'
+        };
+        return done(errorObj, null);
+      }
+
       const userId = Date.now().toString();
       const defaultRolesForNewOAuthUser: ('partner' | 'customer')[] = portalOrigin === 'customer' ? ['customer'] : ['partner'];
       
-      console.log(`New OAuth user from ${portalOrigin} portal. Assigning roles: ${defaultRolesForNewOAuthUser.join(', ')}`);
-      
-      // Pass roles array to createUser
       await userDb.createUser(email, userId, '', true, false, defaultRolesForNewOAuthUser, profile.displayName, profile.id);
       user = await userDb.getUserByEmail(email);
       
       if (!user) {
         return done(new Error('Failed to create or find user after creation attempt.'), null);
       }
-    } else {
-      // User exists. Optionally, update their Google ID or display name if changed.
-      // if (user.googleId !== profile.id || user.displayName !== profile.displayName) {
-      //   await userDb.updateUser(user.userId, { googleId: profile.id, displayName: profile.displayName });
-      // }
+    } 
+
+    if (portalOrigin === 'customer' && (!user.roles || !user.roles.includes('customer'))) {
+      const errorObj = {
+        statusCode: 403,
+        message: 'Access denied: Your account does not have permission to access this customer portal.',
+        code: 'invalid_role'
+      };
+      return done(errorObj, null);
     }
 
-    // Prioritize roles array from DB, default based on origin if necessary
     const userRoles = user.roles && user.roles.length > 0 
                       ? user.roles 
                       : (portalOrigin === 'customer' ? ['customer'] : ['partner']);
 
-    // Generate JWT token with roles array
-    const token = jwt.sign(
-      { 
-        userId: user.userId, 
-        email: user.email,
-        roles: userRoles, // Use the determined roles array
-        isAdmin: user.isAdmin || false
-      },
-      process.env.JWT_SECRET || 'your-secret-key'
-    );
+    const tokenPayload = { 
+      userId: user.userId, 
+      email: user.email,
+      roles: userRoles,
+      isAdmin: user.isAdmin || false
+    };
+    const token = jwt.sign(tokenPayload, process.env.JWT_SECRET || 'your-secret-key');
 
-    // Pass object containing roles array to done callback
-    done(null, { 
+    const resultUserObject = { 
       token,
       userId: user.userId,
       email: user.email,
-      roles: userRoles, // Pass roles array
+      roles: userRoles,
       isAdmin: user.isAdmin || false
-    });
-  } catch (error) {
-    console.error('Error in Google callback processing:', error);
-    done(error, null);
+    };
+    done(null, resultUserObject);
+
+  } catch (error: any) {
+    let formattedError = error;
+    if (error instanceof Error) {
+      formattedError = {
+        statusCode: 500,
+        message: error.message || 'An unexpected error occurred during Google authentication.',
+        code: 'server_error'
+      };
+    }
+    done(formattedError, null);
   }
 }; 
