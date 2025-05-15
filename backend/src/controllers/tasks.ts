@@ -779,8 +779,10 @@ export const sendExecutionEmail = async (req: AuthRequest, res: Response) => {
 
     // Prepare email content
     const siteDomain = process.env.FRONTEND_URL || 'http://localhost:5173';
+    const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+    const landingSiteUrl = process.env.LANDING_SITE_URL || 'https://agentweb.pro';
     const taskUrl = `${siteDomain}/tasks/${taskId}`;
-    const executionUrl = `${siteDomain}/tasks/${taskId}/executions/${executionId}`;
+    const executionUrl = `${customerFrontendUrl}/tasks/${taskId}/executions/${executionId}/result`;
 
     // Create execution start/end time strings
     const startTime = execution.startTime ? new Date(execution.startTime).toLocaleString() : 'Not available';
@@ -1016,11 +1018,6 @@ export const sendExecutionEmail = async (req: AuthRequest, res: Response) => {
                 </table>
               </div>
               
-              <div class="section">
-                <h3>Prompt</h3>
-                <div class="pre-content">${execution.prompt || 'No prompt available'}</div>
-              </div>
-              
               ${execution.result ? `
               <div class="section">
                 <h3>Results Summary</h3>
@@ -1047,7 +1044,7 @@ export const sendExecutionEmail = async (req: AuthRequest, res: Response) => {
             </div>
             <div class="footer">
               <p>This email was sent from AgentWeb. You can reply directly to this email if you have any questions.</p>
-              <p>View <a href="${taskUrl}">task details</a> or go to <a href="${siteDomain}">AgentWeb</a>.</p>
+              <p>View <a href="${customerFrontendUrl}/tasks/${taskId}">task details</a> or go to <a href="${landingSiteUrl}">AgentWeb</a>.</p>
             </div>
           </div>
         </body>
