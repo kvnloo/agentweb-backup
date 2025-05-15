@@ -786,6 +786,65 @@ export const sendExecutionEmail = async (req: AuthRequest, res: Response) => {
     const startTime = execution.startTime ? new Date(execution.startTime).toLocaleString() : 'Not available';
     const completedTime = execution.completedAt ? new Date(execution.completedAt).toLocaleString() : 'Not available';
     
+    // Calculate execution duration if both start and end times are available
+    let durationStr = '';
+    if (execution.startTime && execution.completedAt) {
+      const start = new Date(execution.startTime).getTime();
+      const end = new Date(execution.completedAt).getTime();
+      const durationMs = end - start;
+      const durationMinutes = Math.floor(durationMs / 60000);
+      const durationSeconds = Math.floor((durationMs % 60000) / 1000);
+      
+      if (durationMinutes > 0) {
+        durationStr = `<p><strong>Duration:</strong> ${durationMinutes} minutes ${durationSeconds} seconds</p>`;
+      } else {
+        durationStr = `<p><strong>Duration:</strong> ${durationSeconds} seconds</p>`;
+      }
+    }
+    
+    // Fetch HTML content from result_files
+    let htmlContentFromFile = '';
+    if (execution.result_files && execution.result_files.length > 0) {
+      for (const file of execution.result_files) {
+        if ((file.is_html || file.view_type === 'html') && file.url) {
+          try {
+            // Import fetch
+            const fetch = require('node-fetch');
+            const response = await fetch(file.url);
+            
+            if (response.ok) {
+              const fetchedHtmlContent = await response.text();
+              htmlContentFromFile = `
+                <div class="html-result">
+                  <h3>HTML Result File:</h3>
+                  ${fetchedHtmlContent}
+                </div>
+              `;
+              console.log(`Successfully fetched HTML content from ${file.url}`);
+              break; // Use the first HTML file found
+            } else {
+              console.error(`Failed to fetch HTML content from ${file.url}: ${response.statusText}`);
+              htmlContentFromFile = `
+                <div class="html-result">
+                  <h3>HTML Result File:</h3>
+                  <p><i>Error fetching HTML content: ${response.statusText}</i></p>
+                </div>
+              `;
+            }
+          } catch (error) {
+            console.error(`Error fetching HTML content from ${file.url}:`, error);
+            htmlContentFromFile = `
+              <div class="html-result">
+                <h3>HTML Result File:</h3>
+                <p><i>Error fetching HTML content</i></p>
+              </div>
+            `;
+          }
+          break; // Process only the first HTML file found, even if error
+        }
+      }
+    }
+    
     // Create HTML content for the email
     const html = `
       <!DOCTYPE html>
@@ -798,9 +857,13 @@ export const sendExecutionEmail = async (req: AuthRequest, res: Response) => {
               font-family: Arial, sans-serif;
               line-height: 1.6;
               color: #333;
-              max-width: 800px;
-              margin: 0 auto;
+              margin: 0;
+              padding: 0;
+              background-color: #fff;
+            }
+            .container {
               padding: 20px;
+              background-color: #fdfdfd;
             }
             .header {
               background-color: #1976d2;
@@ -826,6 +889,8 @@ export const sendExecutionEmail = async (req: AuthRequest, res: Response) => {
             .section h3 {
               margin-top: 0;
               color: #1976d2;
+              border-bottom: 2px solid #ecf0f1;
+              padding-bottom: 8px;
             }
             .details-table {
               width: 100%;
@@ -869,6 +934,22 @@ export const sendExecutionEmail = async (req: AuthRequest, res: Response) => {
               overflow-x: auto;
               white-space: pre-wrap;
               word-break: break-word;
+              font-family: monospace;
+              font-size: 0.9em;
+            }
+            .html-result {
+              border: 1px solid #ddd;
+              padding: 10px;
+              margin-top: 15px;
+              border-radius: 5px;
+              overflow: auto;
+            }
+            .html-result h3 {
+              margin-top: 0;
+              font-size: 1.2em;
+              border-bottom: 2px solid #ecf0f1;
+              padding-bottom: 8px;
+              color: #34495e;
             }
             .footer {
               text-align: center;
@@ -888,80 +969,86 @@ export const sendExecutionEmail = async (req: AuthRequest, res: Response) => {
           </style>
         </head>
         <body>
-          <div class="header">
-            <h2 style="margin:0;padding:0;font-size:24px;">Task Execution Details: ${task.name}</h2>
-          </div>
-          <div class="content">
-            <div class="section">
-              <h3>Task Information</h3>
-              <table class="details-table">
-                <tr>
-                  <th>Task Name</th>
-                  <td>${task.name}</td>
-                </tr>
-                <tr>
-                  <th>Task ID</th>
-                  <td>${taskId}</td>
-                </tr>
-                <tr>
-                  <th>Execution ID</th>
-                  <td>${executionId}</td>
-                </tr>
-                <tr>
-                  <th>Status</th>
-                  <td>
-                    <span class="status status-${execution.status.toLowerCase()}">${execution.status}</span>
-                  </td>
-                </tr>
-                <tr>
-                  <th>Started</th>
-                  <td>${startTime}</td>
-                </tr>
-                <tr>
-                  <th>Completed</th>
-                  <td>${completedTime}</td>
-                </tr>
-                ${execution.llmName ? `
-                <tr>
-                  <th>LLM Used</th>
-                  <td>${execution.llmName}</td>
-                </tr>` : ''}
-              </table>
+          <div class="container">
+            <div class="header">
+              <h2 style="margin:0;padding:0;font-size:24px;">Task Run Results: ${task.name}</h2>
             </div>
-            
-            <div class="section">
-              <h3>Prompt</h3>
-              <div class="pre-content">${execution.prompt || 'No prompt available'}</div>
-            </div>
-            
-            <div class="section">
-              <h3>Result</h3>
-              <div class="pre-content">
-                ${execution.error 
-                  ? `<span style="color:#c62828">${execution.error}</span>` 
-                  : execution.result 
-                    ? execution.result
-                    : 'No result available'}
+            <div class="content">
+              <div class="section">
+                <h3>Task Information</h3>
+                <table class="details-table">
+                  <tr>
+                    <th>Task Name</th>
+                    <td>${task.name}</td>
+                  </tr>
+                  <tr>
+                    <th>Task ID</th>
+                    <td>${taskId}</td>
+                  </tr>
+                  <tr>
+                    <th>Execution ID</th>
+                    <td>${executionId}</td>
+                  </tr>
+                  <tr>
+                    <th>Status</th>
+                    <td>
+                      <span class="status status-${execution.status.toLowerCase()}">${execution.status.toUpperCase()}</span>
+                    </td>
+                  </tr>
+                  <tr>
+                    <th>Started</th>
+                    <td>${startTime}</td>
+                  </tr>
+                  <tr>
+                    <th>Completed</th>
+                    <td>${completedTime}</td>
+                  </tr>
+                  ${execution.llmName ? `
+                  <tr>
+                    <th>LLM Used</th>
+                    <td>${execution.llmName}</td>
+                  </tr>` : ''}
+                  ${durationStr ? `
+                  <tr>
+                    <th>Duration</th>
+                    <td>${durationStr.replace(/<\/?p>|<\/?strong>/g, '')}</td>
+                  </tr>` : ''}
+                </table>
+              </div>
+              
+              <div class="section">
+                <h3>Prompt</h3>
+                <div class="pre-content">${execution.prompt || 'No prompt available'}</div>
+              </div>
+              
+              ${execution.result ? `
+              <div class="section">
+                <h3>Results Summary</h3>
+                <div class="pre-content">${execution.result}</div>
+              </div>
+              ` : ''}
+              
+              ${execution.error ? `
+              <div class="section">
+                <h3>Error Details</h3>
+                <div class="pre-content" style="color:#c62828">${execution.error}</div>
+              </div>
+              ` : ''}
+              
+              ${htmlContentFromFile ? `
+              <div class="section">
+                ${htmlContentFromFile}
+              </div>
+              ` : ''}
+              
+              <div class="section" style="text-align: center;">
+                <a href="${executionUrl}" class="button">View Full Details</a>
               </div>
             </div>
-            
-            ${execution.result_files && execution.result_files.length > 0 ? `
-            <div class="section">
-              <h3>Result Files</h3>
-              <ul>
-                ${execution.result_files.map((file: { url: string; filename: string }) => `
-                  <li><a href="${file.url}">${file.filename}</a></li>
-                `).join('')}
-              </ul>
-            </div>` : ''}
-            
-            <div class="section" style="text-align: center;">
-              <a href="${executionUrl}" class="button">View Full Details</a>
+            <div class="footer">
+              <p>This email was sent from AgentWeb. You can reply directly to this email if you have any questions.</p>
+              <p>View <a href="${taskUrl}">task details</a> or go to <a href="${siteDomain}">AgentWeb</a>.</p>
             </div>
-          </div>
-          <div class="footer">
-            <p>This email was sent from AgentWeb. Please do not reply to this email.</p>
-            <p>View <a href="${taskUrl}">task details</a> or go to <a href="${siteDomain}">AgentWeb</a>.</p>
           </div>
         </body>
       </html>
@@ -973,8 +1060,8 @@ export const sendExecutionEmail = async (req: AuthRequest, res: Response) => {
     // Send the email
     await emailService.sendEmail(
       email,
-      `AgentWeb - Task Execution Details: ${task.name}`,
-      `Task: ${task.name}\nStatus: ${execution.status}\nView details: ${executionUrl}`,
+      `AgentWeb - Task Run Results: ${task.name}`,
+      `Task: ${task.name}\nStatus: ${execution.status.toUpperCase()}\nView details: ${executionUrl}`,
       html
     );
     
