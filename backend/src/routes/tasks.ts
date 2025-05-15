@@ -1,5 +1,5 @@
 import express, { Request, RequestHandler, Response } from 'express';
-import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction, getTaskExecution, getExecutionLog, generateShareToken, getExecutionWithToken } from '../controllers/tasks';
+import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction, getTaskExecution, getExecutionLog, generateShareToken, getExecutionWithToken, sendExecutionEmail } from '../controllers/tasks';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { taskDb, subscriberDb } from '../services/db';
 import multer from 'multer';
@@ -28,6 +28,7 @@ router.get('/:id', getTask);
 router.get('/:id/executions', getTaskExecutions);
 router.get('/:id/executions/:executionId', getTaskExecution);
 router.get('/:id/executions/:executionId/share', generateShareToken);
+router.post('/:id/executions/:executionId/email', sendExecutionEmail);
 router.put('/:id', updateTask);
 router.delete('/:id', deleteTask);
 router.post('/:id/execute', executeTask);

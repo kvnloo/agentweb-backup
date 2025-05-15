@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from datetime import datetime
 from aws_utils import get_dynamodb_resource
 from task_utils import check_new_information
+import requests # Added for fetching HTML content
 
 # Load environment variables
 load_dotenv()
@@ -41,7 +42,7 @@ def get_task_subscribers(task_id):
         logger.error(f"Failed to get task subscribers: {e}")
         return []
 
-def send_task_notification(to_email, task_name, task_id, execution_status, execution_id=None, result=None, error=None, new_info_summary=None):
+def send_task_notification(to_email, task_name, task_id, execution_status, execution_id=None, result=None, error=None, new_info_summary=None, llm_name=None):
     """
     Send an email notification about task completion.
     """
@@ -73,6 +74,8 @@ def send_task_notification(to_email, task_name, task_id, execution_status, execu
 
         View task details: {site_domain}/tasks/{task_id}
 """
+        if llm_name:
+            body += f"LLM Used: {llm_name}\n"
         if result:
             body += f"\nResult:\n{result}"
         if error:
@@ -93,9 +96,11 @@ def send_task_notification(to_email, task_name, task_id, execution_status, execu
         logger.error(f"Failed to send email notification: {e}")
         return False
 
-def send_task_results(to_email, task_name, task_id, execution_status, result=None, error=None, start_time=None, end_time=None, new_info_summary=None):
+def send_task_results(to_email, task_name, task_id, execution_status, result=None, error=None, start_time=None, end_time=None, new_info_summary=None, result_files=None, llm_name=None):
     """
     Send a detailed task results email to subscribers.
+    Sends content as HTML only.
+    Includes HTML content if available in result_files.
     """
     try:
         smtp_host = os.getenv('SMTP_HOST', 'smtp.gmail.com')
@@ -106,85 +111,127 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
         site_domain = os.getenv('SITE_DOMAIN', 'http://localhost:3000')
 
         if not all([smtp_user, smtp_pass, to_email]):
-            logger.error("Missing email configuration")
+            logger.error("Missing email configuration for send_task_results")
             return False
 
-        msg = MIMEMultipart()
-        msg['From'] = from_email
-        msg['Reply-To'] = 'support@agentweb.pro'
-        msg['To'] = to_email
-        
-        # Modify subject if new information was found
+        subject_prefix = "Task Run Results:"
+        subject = f"{subject_prefix} {task_name}"
         if new_info_summary:
-            msg['Subject'] = f"Task Run Results: {task_name} [NEW: {new_info_summary}]"
-        else:
-            msg['Subject'] = f"Task Run Results: {task_name}"
+            subject = f"{subject_prefix} {task_name} [NEW: {new_info_summary}]"
 
-        # Format timestamps if provided
         start_time_str = f"{start_time.strftime('%B %d, %Y at %I:%M %p UTC')}" if start_time else "Not available"
         end_time_str = f"{end_time.strftime('%B %d, %Y at %I:%M %p UTC')}" if end_time else "Not available"
         
-        # Calculate duration if both timestamps are available
         duration_str = ""
         if start_time and end_time:
             duration = end_time - start_time
             minutes = duration.total_seconds() / 60
-            if minutes < 1:
-                duration_str = f"Duration: {int(duration.total_seconds())} seconds"
-            else:
-                duration_str = f"Duration: {int(minutes)} minutes"
+            duration_value = f"{int(duration.total_seconds())} seconds" if minutes < 1 else f"{int(minutes)} minutes"
+            duration_str = f"<p><strong>Duration:</strong> {duration_value}</p>"
 
-        # Create a detailed and formatted email body
-        body = f"""
-Task Run Results for "{task_name}"
-{'=' * (18 + len(task_name))}
 
-Status: {execution_status.upper()}
-Started: {start_time_str}
-Completed: {end_time_str}
-{duration_str}
+        # --- Fetch HTML content from result_files ---
+        html_content_from_file_section = ""
+        if result_files:
+            for file_info in result_files:
+                if file_info.get('view_type') == 'html' and file_info.get('url'):
+                    try:
+                        response = requests.get(file_info['url'], timeout=10)
+                        response.raise_for_status() # Raise an exception for HTTP errors
+                        fetched_html_content = response.text
+                        html_content_from_file_section = f"""<div class="html-result">
+    <h3>HTML Result File:</h3>
+    {fetched_html_content}
+</div>"""
+                        logger.info(f"Successfully fetched HTML content from {file_info['url']}")
+                        break # Use the first HTML file found
+                    except requests.RequestException as e:
+                        logger.error(f"Failed to fetch HTML content from {file_info['url']}: {e}")
+                        html_content_from_file_section = f"""<div class="html-result">
+    <h3>HTML Result File:</h3>
+    <p><i>Error fetching HTML content from {file_info['url']}: {e}</i></p>
+</div>"""
+                    except Exception as e: # Catch any other unexpected errors
+                        logger.error(f"Unexpected error fetching HTML content from {file_info['url']}: {e}")
+                        html_content_from_file_section = f"""<div class="html-result">
+    <h3>HTML Result File:</h3>
+    <p><i>Unexpected error fetching HTML content from {file_info['url']}.</i></p>
+</div>"""
+                    break # Process only the first HTML file found, even if error
 
+        # --- Construct HTML Body ---
+        html_body_content = f"""<html>
+<head>
+  <style>
+    body {{ font-family: sans-serif; margin: 0; padding: 0; color: #333; background-color: #fff; }}
+    .container {{ /* max-width: 800px; margin: auto; */ padding: 20px; /* border: 1px solid #ddd; border-radius: 8px; */ background-color: #fdfdfd; }}
+    .header {{ font-size: 1.5em; font-weight: bold; margin-bottom: 15px; color: #2c3e50; }}
+    .details {{ margin-bottom: 20px; padding: 15px; border: 1px solid #eee; background-color: #f9f9f9; border-radius: 5px; }}
+    .details p {{ margin: 5px 0; }}
+    .section {{ margin-top: 20px; }}
+    .section h3 {{ font-size: 1.2em; margin-top: 0; border-bottom: 2px solid #ecf0f1; padding-bottom: 8px; color: #34495e; }}
+    pre {{ white-space: pre-wrap; word-wrap: break-word; background: #ecf0f1; padding: 15px; border-radius: 5px; font-size: 0.9em; color: #555; }}
+    .html-result {{ border: 1px solid #ddd; padding: 10px; margin-top: 15px; border-radius: 5px; }}
+    .html-result h3 {{ margin-top:0; }}
+    .footer {{ margin-top: 25px; font-size: 0.9em; color: #7f8c8d; }}
+    a {{ color: #3498db; text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">Task Run Results for "{task_name}"</div>
+    <div class="details">
+      <p><strong>Status:</strong> {execution_status.upper()}</p>
+      <p><strong>Started:</strong> {start_time_str}</p>
+      <p><strong>Completed:</strong> {end_time_str}</p>
+      {f'<p><strong>LLM Used:</strong> {llm_name}</p>' if llm_name else ''}
+      {duration_str}
+    </div>
 """
         if result:
-            body += f"""
-Results Summary:
----------------
-{result}
+            html_body_content += f"""<div class="section">
+    <h3>Results Summary:</h3>
+    <pre>{result}</pre>
+</div>"""
+        if error:
+            html_body_content += f"""<div class="section">
+    <h3>Error Details:</h3>
+    <pre>{error}</pre>
+</div>"""
+        
+        html_body_content += html_content_from_file_section
+
+        html_body_content += f"""
+    <div class="footer">
+      <p>View complete task details and history: <a href="{site_domain}/tasks/{task_id}">{site_domain}/tasks/{task_id}</a></p>
+      <hr>
+      <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>
+    </div>
+  </div>
+</body></html>
 """
         
-        if error:
-            body += f"""
-Error Details:
--------------
-{error}
-"""
-
-        body += f"""
-
-View complete task details and history:
-{site_domain}/tasks/{task_id}
-
----
-This is an automated message from AgentWeb.
-You are receiving this email because you are subscribed to updates for this task.
-"""
-
-        msg.attach(MIMEText(body, 'plain'))
-
+        msg = MIMEText(html_body_content, 'html')
+        msg['Subject'] = subject
+        msg['From'] = from_email
+        msg['Reply-To'] = 'support@agentweb.pro'
+        msg['To'] = to_email
+        
         # Send email
         with smtplib.SMTP(smtp_host, smtp_port) as server:
             server.starttls()
             server.login(smtp_user, smtp_pass)
             server.send_message(msg)
 
-        logger.info(f"Sent task run results to subscriber: {to_email}")
+        logger.info(f"Sent task run results (HTML only) to subscriber: {to_email}")
         return True
 
     except Exception as e:
-        logger.error(f"Failed to send task results email: {e}")
+        logger.error(f"Failed to send task results email (HTML only): {e}", exc_info=True)
         return False
 
-def notify_task_subscribers(task_id, task_name, execution_status, execution_id=None, result=None, error=None, start_time=None, end_time=None, new_info_summary=None):
+def notify_task_subscribers(task_id, task_name, execution_status, execution_id=None, result=None, error=None, start_time=None, end_time=None, new_info_summary=None, result_files=None, llm_name=None):
     """
     Send detailed task results to all subscribers.
     """
@@ -201,7 +248,9 @@ def notify_task_subscribers(task_id, task_name, execution_status, execution_id=N
             error,
             start_time,
             end_time,
-            new_info_summary
+            new_info_summary,
+            result_files=result_files,
+            llm_name=llm_name
         )
         
         if success:

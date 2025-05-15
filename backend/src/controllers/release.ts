@@ -8,6 +8,16 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-05-15",
+    changes: [
+      "Enhanced Email Notifications",
+      "- Updated email notifications to display HTML file content directly in the email",
+      "- Added email feature in Execution Details of Partner Portal",
+      "- Makes it easier to share task results with clients or team members",
+      "- Useful for sending leads detailed results of task runs to help convert them"
+    ]
+  },
+  {
     date: "2025-05-02",
     changes: [
       "Added Agentic Dev Mode to Task Details page",
