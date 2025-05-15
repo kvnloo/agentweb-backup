@@ -21,6 +21,7 @@ import {
 import DeleteIcon from '@mui/icons-material/Delete';
 import AddIcon from '@mui/icons-material/Add';
 import ShareIcon from '@mui/icons-material/Share';
+import AdminPanelSettingsIcon from '@mui/icons-material/AdminPanelSettings';
 import { useAuth } from '../contexts/AuthContext';
 import axios from 'axios';
 import { buildApiUrl } from '../config';
@@ -61,7 +62,7 @@ const isApiConfiguration = (config: Config): boolean => {
 };
 
 export default function Config() {
-  const { token } = useAuth();
+  const { token, user } = useAuth();
   const [configs, setConfigs] = useState<Config[]>([]);
   const [sharedConfigs, setSharedConfigs] = useState<Config[]>([]);
   const [openDialog, setOpenDialog] = useState(false);
@@ -81,6 +82,9 @@ export default function Config() {
     integrationDocLink: '',
   });
   const [error, setError] = useState('');
+  const [deleteError, setDeleteError] = useState('');
+  const [openDeleteConfirmDialog, setOpenDeleteConfirmDialog] = useState(false);
+  const [configToDelete, setConfigToDelete] = useState<string>('');
   const [fieldError, setFieldError] = useState('');
   const [shareError, setShareError] = useState('');
   const [shareSuccess, setShareSuccess] = useState('');
@@ -221,6 +225,26 @@ export default function Config() {
     setOpenShareDialog(true);
     setShareError('');
     setShareSuccess('');
+  };
+
+  const handleAdminDeleteConfig = async (configId: string) => {
+    try {
+      setDeleteError('');
+      await axios.delete(buildApiUrl(`/api/admin/configs/${configId}`), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      fetchConfigs();
+      setOpenDeleteConfirmDialog(false);
+    } catch (err) {
+      console.error('Error deleting public config:', err);
+      setDeleteError('Failed to delete public configuration');
+    }
+  };
+
+  const handleOpenDeleteConfirm = (configId: string) => {
+    setConfigToDelete(configId);
+    setOpenDeleteConfirmDialog(true);
+    setDeleteError('');
   };
 
   return (
@@ -388,10 +412,30 @@ export default function Config() {
             <Typography variant="h6" gutterBottom>
               Shared with Me
             </Typography>
+            {deleteError && (
+              <Alert severity="error" sx={{ mb: 2 }}>
+                {deleteError}
+              </Alert>
+            )}
             <List>
               {sharedConfigs.length > 0 ? 
                 sharedConfigs.map((config) => (
-                  <ListItem key={config.configId} divider>
+                  <ListItem 
+                    key={config.configId} 
+                    divider
+                    secondaryAction={
+                      user?.isAdmin && config.shareWithEveryone ? (
+                        <IconButton
+                          edge="end"
+                          aria-label="admin-delete"
+                          onClick={() => handleOpenDeleteConfirm(config.configId)}
+                          color="error"
+                        >
+                          <AdminPanelSettingsIcon />
+                        </IconButton>
+                      ) : undefined
+                    }
+                  >
                     <ListItemText
                       primary={
                         <Box component="div" sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
@@ -657,6 +701,45 @@ export default function Config() {
                 Share with User
               </Button>
             )}
+          </DialogActions>
+        </Dialog>
+
+        {/* Admin Delete Confirmation Dialog */}
+        <Dialog 
+          open={openDeleteConfirmDialog} 
+          onClose={() => {
+            setOpenDeleteConfirmDialog(false);
+            setConfigToDelete('');
+            setDeleteError('');
+          }}
+        >
+          <DialogTitle>Delete Public Configuration</DialogTitle>
+          <DialogContent>
+            <Typography>
+              Are you sure you want to delete this public configuration? This action cannot be undone.
+            </Typography>
+            {deleteError && (
+              <Alert severity="error" sx={{ mt: 2 }}>
+                {deleteError}
+              </Alert>
+            )}
+          </DialogContent>
+          <DialogActions>
+            <Button 
+              onClick={() => {
+                setOpenDeleteConfirmDialog(false);
+                setConfigToDelete('');
+                setDeleteError('');
+              }}
+            >
+              Cancel
+            </Button>
+            <Button 
+              onClick={() => handleAdminDeleteConfig(configToDelete)}
+              color="error"
+            >
+              Delete
+            </Button>
           </DialogActions>
         </Dialog>
       </Box>
