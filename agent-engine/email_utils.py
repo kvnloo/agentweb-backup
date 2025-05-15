@@ -161,8 +161,8 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
         html_body_content = f"""<html>
 <head>
   <style>
-    body {{ font-family: sans-serif; margin: 20px; color: #333; }}
-    .container {{ max-width: 800px; margin: auto; padding: 20px; border: 1px solid #ddd; border-radius: 8px; background-color: #fdfdfd; }}
+    body {{ font-family: sans-serif; margin: 0; padding: 0; color: #333; background-color: #fff; }}
+    .container {{ /* max-width: 800px; margin: auto; */ padding: 20px; /* border: 1px solid #ddd; border-radius: 8px; */ background-color: #fdfdfd; }}
     .header {{ font-size: 1.5em; font-weight: bold; margin-bottom: 15px; color: #2c3e50; }}
     .details {{ margin-bottom: 20px; padding: 15px; border: 1px solid #eee; background-color: #f9f9f9; border-radius: 5px; }}
     .details p {{ margin: 5px 0; }}
