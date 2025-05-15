@@ -733,4 +733,254 @@ export const getExecutionWithToken = async (req: Request, res: Response) => {
     console.error('Error fetching execution with token:', error);
     res.status(500).json({ message: 'Error fetching execution' });
   }
+};
+
+export const sendExecutionEmail = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const taskId = req.params.id;
+    const executionId = req.params.executionId;
+    const { email } = req.body;
+    
+    if (!email) {
+      return res.status(400).json({ message: 'Email address is required' });
+    }
+    
+    // Get the task to check permissions
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Check if user is admin or task owner
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Get the execution
+    const execution = await taskDb.getTaskExecutionById(executionId);
+    if (!execution) {
+      return res.status(404).json({ message: 'Execution not found' });
+    }
+
+    // Verify the execution belongs to the task
+    if (execution.taskId !== taskId) {
+      return res.status(404).json({ message: 'Execution not found for this task' });
+    }
+
+    // Prepare email content
+    const siteDomain = process.env.FRONTEND_URL || 'http://localhost:5173';
+    const taskUrl = `${siteDomain}/tasks/${taskId}`;
+    const executionUrl = `${siteDomain}/tasks/${taskId}/executions/${executionId}`;
+
+    // Create execution start/end time strings
+    const startTime = execution.startTime ? new Date(execution.startTime).toLocaleString() : 'Not available';
+    const completedTime = execution.completedAt ? new Date(execution.completedAt).toLocaleString() : 'Not available';
+    
+    // Create HTML content for the email
+    const html = `
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <style>
+            body {
+              font-family: Arial, sans-serif;
+              line-height: 1.6;
+              color: #333;
+              max-width: 800px;
+              margin: 0 auto;
+              padding: 20px;
+            }
+            .header {
+              background-color: #1976d2;
+              color: white;
+              padding: 20px;
+              text-align: center;
+              border-radius: 4px 4px 0 0;
+            }
+            .content {
+              padding: 20px;
+              background: #fff;
+              border: 1px solid #ddd;
+              border-radius: 0 0 4px 4px;
+            }
+            .section {
+              margin-bottom: 20px;
+              padding-bottom: 20px;
+              border-bottom: 1px solid #eee;
+            }
+            .section:last-child {
+              border-bottom: none;
+            }
+            .section h3 {
+              margin-top: 0;
+              color: #1976d2;
+            }
+            .details-table {
+              width: 100%;
+              border-collapse: collapse;
+              margin-bottom: 20px;
+            }
+            .details-table th, .details-table td {
+              padding: 8px;
+              text-align: left;
+              border-bottom: 1px solid #ddd;
+            }
+            .details-table th {
+              background-color: #f5f5f5;
+            }
+            .status {
+              padding: 4px 8px;
+              border-radius: 4px;
+              font-weight: bold;
+              display: inline-block;
+            }
+            .status-completed {
+              background-color: #e8f5e9;
+              color: #2e7d32;
+            }
+            .status-failed {
+              background-color: #ffebee;
+              color: #c62828;
+            }
+            .status-running {
+              background-color: #e3f2fd;
+              color: #1565c0;
+            }
+            .status-pending {
+              background-color: #fff8e1;
+              color: #f57f17;
+            }
+            .pre-content {
+              background-color: #f5f5f5;
+              padding: 15px;
+              border-radius: 4px;
+              overflow-x: auto;
+              white-space: pre-wrap;
+              word-break: break-word;
+            }
+            .footer {
+              text-align: center;
+              margin-top: 20px;
+              color: #666;
+              font-size: 0.9em;
+            }
+            .button {
+              display: inline-block;
+              padding: 10px 20px;
+              background-color: #1976d2;
+              color: white;
+              text-decoration: none;
+              border-radius: 4px;
+              font-weight: bold;
+            }
+          </style>
+        </head>
+        <body>
+          <div class="header">
+            <h2 style="margin:0;padding:0;font-size:24px;">Task Execution Details: ${task.name}</h2>
+          </div>
+          <div class="content">
+            <div class="section">
+              <h3>Task Information</h3>
+              <table class="details-table">
+                <tr>
+                  <th>Task Name</th>
+                  <td>${task.name}</td>
+                </tr>
+                <tr>
+                  <th>Task ID</th>
+                  <td>${taskId}</td>
+                </tr>
+                <tr>
+                  <th>Execution ID</th>
+                  <td>${executionId}</td>
+                </tr>
+                <tr>
+                  <th>Status</th>
+                  <td>
+                    <span class="status status-${execution.status.toLowerCase()}">${execution.status}</span>
+                  </td>
+                </tr>
+                <tr>
+                  <th>Started</th>
+                  <td>${startTime}</td>
+                </tr>
+                <tr>
+                  <th>Completed</th>
+                  <td>${completedTime}</td>
+                </tr>
+                ${execution.llmName ? `
+                <tr>
+                  <th>LLM Used</th>
+                  <td>${execution.llmName}</td>
+                </tr>` : ''}
+              </table>
+            </div>
+            
+            <div class="section">
+              <h3>Prompt</h3>
+              <div class="pre-content">${execution.prompt || 'No prompt available'}</div>
+            </div>
+            
+            <div class="section">
+              <h3>Result</h3>
+              <div class="pre-content">
+                ${execution.error 
+                  ? `<span style="color:#c62828">${execution.error}</span>` 
+                  : execution.result 
+                    ? execution.result
+                    : 'No result available'}
+              </div>
+            </div>
+            
+            ${execution.result_files && execution.result_files.length > 0 ? `
+            <div class="section">
+              <h3>Result Files</h3>
+              <ul>
+                ${execution.result_files.map((file: { url: string; filename: string }) => `
+                  <li><a href="${file.url}">${file.filename}</a></li>
+                `).join('')}
+              </ul>
+            </div>` : ''}
+            
+            <div class="section" style="text-align: center;">
+              <a href="${executionUrl}" class="button">View Full Details</a>
+            </div>
+          </div>
+          <div class="footer">
+            <p>This email was sent from AgentWeb. Please do not reply to this email.</p>
+            <p>View <a href="${taskUrl}">task details</a> or go to <a href="${siteDomain}">AgentWeb</a>.</p>
+          </div>
+        </body>
+      </html>
+    `;
+
+    // Import emailService
+    const { emailService } = require('../services/emailService');
+    
+    // Send the email
+    await emailService.sendEmail(
+      email,
+      `AgentWeb - Task Execution Details: ${task.name}`,
+      `Task: ${task.name}\nStatus: ${execution.status}\nView details: ${executionUrl}`,
+      html
+    );
+    
+    res.json({ message: `Execution details sent to ${email}` });
+  } catch (error) {
+    console.error('Error sending execution email:', error);
+    res.status(500).json({ message: 'Error sending execution email' });
+  }
 }; 

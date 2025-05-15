@@ -29,6 +29,7 @@ import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import ArchiveIcon from '@mui/icons-material/Archive';
 import UnarchiveIcon from '@mui/icons-material/Unarchive';
 import AutorenewIcon from '@mui/icons-material/Autorenew';
+import EmailIcon from '@mui/icons-material/Email';
 import { useAuth } from '../contexts/AuthContext';
 import axios from 'axios';
 import { buildApiUrl } from '../config';
@@ -127,6 +128,13 @@ export default function ExecutionDetails() {
   const [isAutoRefreshing, setIsAutoRefreshing] = useState(false);
   const [iframeKey] = useState(Date.now()); // Used only for initial rendering
   const iframeRef = React.useRef<HTMLIFrameElement>(null);
+
+  // Email dialog state
+  const [emailDialogOpen, setEmailDialogOpen] = useState(false);
+  const [emailAddress, setEmailAddress] = useState('');
+  const [sendingEmail, setSendingEmail] = useState(false);
+  const [emailError, setEmailError] = useState('');
+  const [emailSuccess, setEmailSuccess] = useState(false);
 
   const fetchExecution = useCallback(async () => {
     if (!taskId || !executionId || !token) return;
@@ -382,6 +390,11 @@ export default function ExecutionDetails() {
                     disabled={shareLoading}
                   >
                     <ShareIcon />
+                  </IconButton>
+                </Tooltip>
+                <Tooltip title="Email execution details">
+                  <IconButton onClick={() => setEmailDialogOpen(true)}>
+                    <EmailIcon />
                   </IconButton>
                 </Tooltip>
                 <Tooltip title={execution.feedback ? `Current: ${execution.feedback}` : 'Set feedback'}>
@@ -737,6 +750,89 @@ export default function ExecutionDetails() {
             onClick={handleArchiveToggle}
           >
             {archiveAction === 'archive' ? 'Archive' : 'Unarchive'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Email Dialog */}
+      <Dialog open={emailDialogOpen} onClose={() => setEmailDialogOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>Send Execution Details via Email</DialogTitle>
+        <DialogContent>
+          {emailError && (
+            <Alert severity="error" sx={{ mb: 2 }}>
+              {emailError}
+            </Alert>
+          )}
+          {emailSuccess && (
+            <Alert severity="success" sx={{ mb: 2 }}>
+              Execution details sent successfully!
+            </Alert>
+          )}
+          <Typography variant="body2" sx={{ mb: 2 }}>
+            Enter an email address to send the execution details to:
+          </Typography>
+          <TextField
+            autoFocus
+            margin="dense"
+            id="email"
+            label="Email Address"
+            type="email"
+            fullWidth
+            value={emailAddress}
+            onChange={(e) => setEmailAddress(e.target.value)}
+            error={!!emailError}
+            disabled={sendingEmail || emailSuccess}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => {
+            setEmailDialogOpen(false);
+            // Reset states when dialog is closed
+            setEmailError('');
+            setEmailSuccess(false);
+            setEmailAddress('');
+          }}>
+            Close
+          </Button>
+          <Button 
+            onClick={async () => {
+              if (!emailAddress.trim()) {
+                setEmailError('Please enter an email address');
+                return;
+              }
+              
+              // Simple email validation
+              const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+              if (!emailRegex.test(emailAddress)) {
+                setEmailError('Please enter a valid email address');
+                return;
+              }
+              
+              try {
+                setSendingEmail(true);
+                setEmailError('');
+                
+                await axios.post(
+                  buildApiUrl(`/api/tasks/${taskId}/executions/${executionId}/email`),
+                  { email: emailAddress },
+                  { headers: { Authorization: `Bearer ${token}` } }
+                );
+                
+                setEmailSuccess(true);
+                // Clear the email address after successful send
+                setEmailAddress('');
+              } catch (error: any) {
+                console.error('Error sending email:', error);
+                setEmailError(error.response?.data?.message || 'Failed to send email');
+              } finally {
+                setSendingEmail(false);
+              }
+            }} 
+            variant="contained" 
+            color="primary"
+            disabled={sendingEmail || emailSuccess || !emailAddress.trim()}
+          >
+            {sendingEmail ? <CircularProgress size={24} /> : "Send"}
           </Button>
         </DialogActions>
       </Dialog>
