@@ -5,6 +5,7 @@ import { userDb, taskDb, subscriberDb } from '../services/db';
 import { waitlistDb } from '../services/waitlistDb';
 import { emailService } from '../services/emailService';
 import { chatbotDb, ChatSession } from '../services/chatbotService';
+import { DynamoDB } from 'aws-sdk';
 
 const router = express.Router();
 
@@ -507,7 +508,57 @@ router.put('/users/:userId/role', async (req, res) => {
   }
 });
 
-// Get system analytics
-// ... existing code ...
+// Admin delete a configuration (typically a publicly shared one)
+router.delete('/configs/:configId', async (req, res) => {
+  const { configId } = req.params;
+  const dynamodb = new DynamoDB.DocumentClient(); // Ensure dynamodb client is available
+  const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+  const tableName = `${TABLE_PREFIX}AW-Configs`;
+
+  try {
+    // Step 1: Find the config by configId to get its owner (userId)
+    const queryParams = {
+      TableName: tableName,
+      IndexName: 'ConfigIdIndex', // Assuming GSI on configId
+      KeyConditionExpression: 'configId = :configId',
+      ExpressionAttributeValues: {
+        ':configId': configId,
+      },
+    };
+
+    const queryResult = await dynamodb.query(queryParams).promise();
+
+    if (!queryResult.Items || queryResult.Items.length === 0) {
+      return res.status(404).json({ message: 'Configuration not found' });
+    }
+
+    const configToDelete = queryResult.Items[0];
+    const ownerUserId = configToDelete.userId;
+
+    // Optional: Check if it's actually a public config if desired
+    // if (!configToDelete.shareWithEveryone) {
+    //   return res.status(403).json({ message: 'Configuration is not publicly shared. Admin can only delete public configs via this route.' });
+    // }
+
+    // Step 2: Delete the config using its primary key (userId, configId)
+    await dynamodb.delete({
+      TableName: tableName,
+      Key: {
+        userId: ownerUserId, // The actual owner's userId
+        configId: configId,
+      },
+    }).promise();
+
+    res.status(204).send();
+  } catch (error) {
+    console.error(`Error deleting config ${configId} by admin:`, error);
+    res.status(500).json({ message: 'Failed to delete configuration by admin' });
+  }
+});
+
+// Get chatbot analytics summary
+router.get('/analytics/chatbot-summary', async (req, res) => {
+  // ... existing code ...
+});
 
 export default router; 
