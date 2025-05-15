@@ -354,7 +354,8 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                             error=error,
                             start_time=start_time,
                             end_time=end_time,
-                            new_info_summary=new_info_summary
+                            new_info_summary=new_info_summary,
+                            result_files=execution.get('result_files', [])
                         )
     except ClientError as e:
         logger.error(f"Error updating execution status: {e}")
