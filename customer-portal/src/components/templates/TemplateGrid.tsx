@@ -36,11 +36,11 @@ export const TemplateGrid = ({ templates, categoryId, onSelectTemplate }: Templa
               </div>
             )}
           </div>
-          <div className="border-t border-gray-100 dark:border-gray-800 p-2 bg-[#D6BCFA] dark:bg-[#D6BCFA]">
+          <div className="border-t border-gray-100 dark:border-gray-800 p-2 bg-primary dark:bg-primary hover:bg-primary/90 dark:hover:bg-primary/80">
             <Button 
-              variant="ghost" 
-              size="sm" 
-              className="w-full justify-start text-xs text-white dark:text-white hover:text-white hover:bg-[#D6BCFA]/80 dark:hover:bg-[#D6BCFA]/80 dark:hover:text-white"
+              variant="ghost"
+              size="sm"
+              className="w-full justify-start text-xs text-primary-foreground dark:text-primary-foreground hover:bg-transparent dark:hover:bg-transparent"
               onClick={() => onSelectTemplate(template)}
             >
               Use template

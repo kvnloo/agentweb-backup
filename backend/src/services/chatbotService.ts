@@ -7,6 +7,7 @@ import { getGuide } from '../controllers/guide';
 import { getReleases } from '../controllers/release';
 import { getApiDocs } from '../controllers/api';
 import { getUserGuide } from '../controllers/user-guide';
+import { getUserReleaseNotes } from '../controllers/docsController';
 import { Request, Response } from 'express';
 
 // Load environment variables from .env file
@@ -543,7 +544,8 @@ async function loadKnowledgeBase(): Promise<void> {
     { controller: getGuide, source: 'guide' },
     { controller: getReleases, source: 'release' },
     { controller: getApiDocs, source: 'api' },
-    { controller: getUserGuide, source: 'user-guide' }
+    { controller: getUserGuide, source: 'user-guide' },
+    { controller: getUserReleaseNotes, source: 'user-release' }
   ];
 
   const chunks: ContextChunk[] = [];
@@ -574,16 +576,14 @@ async function loadKnowledgeBase(): Promise<void> {
       await endpoint.controller({} as Request, mockResponse as unknown as Response);
       
       if (mockResponse.data && mockResponse.data.success && mockResponse.data.data) {
-        let content = '';
-        
+        let content = ''; 
+
         if (endpoint.source === 'guide' || endpoint.source === 'api') {
-          // For guide and API endpoints that return sections
           for (const section of mockResponse.data.data) {
             content += `${section.title}\n`;
             for (const paragraph of section.content) {
               content += `${paragraph}\n`;
             }
-            // Process subsections if they exist
             if (section.subsections) {
               for (const subsection of section.subsections) {
                 content += `${subsection.title}\n`;
@@ -595,7 +595,6 @@ async function loadKnowledgeBase(): Promise<void> {
             content += '\n';
           }
         } else if (endpoint.source === 'user-guide') {
-          // For user-guide endpoint, structure is same as guide/api
           for (const section of mockResponse.data.data) {
             content += `${section.title}\n`;
             for (const paragraph of section.content) {
@@ -611,8 +610,15 @@ async function loadKnowledgeBase(): Promise<void> {
             }
             content += '\n';
           }
+        } else if (endpoint.source === 'user-release') {
+          for (const release of mockResponse.data.data) {
+            content += `Release Date: ${release.date}\n`;
+            for (const change of release.changes) {
+              content += `${change}\n`;
+            }
+            content += '\n';
+          }
         } else if (endpoint.source === 'release') {
-          // For release endpoint that returns release history
           for (const release of mockResponse.data.data) {
             content += `Release Date: ${release.date}\n`;
             for (const change of release.changes) {
@@ -621,7 +627,6 @@ async function loadKnowledgeBase(): Promise<void> {
             content += '\n';
           }
         }
-        // NOTE: No default 'else' case, so if source is unrecognized, 'content' remains empty.
         
         if (content) {
           // Split content into smaller chunks (max 2000 chars per chunk)
@@ -851,8 +856,11 @@ export async function generateChatResponse(
     }
 
     if (portalType === 'customer') {
-      activeKnowledgeBase = knowledgeBase.filter(chunk => chunk.metadata.source === 'user-guide');
-      // Combine user-guide chunks with page chunks
+      activeKnowledgeBase = knowledgeBase.filter(chunk => 
+        chunk.metadata.source === 'user-guide' || 
+        chunk.metadata.source === 'user-release'
+      );
+      // Combine user-guide and user-release chunks with page chunks
       combinedChunks = [...pageChunksResult, ...activeKnowledgeBase]; 
     } else { // Partner portal (or default)
       activeKnowledgeBase = knowledgeBase.filter(chunk => 

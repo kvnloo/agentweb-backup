@@ -94,7 +94,7 @@ export const TemplateModal = ({
             </DialogDescription>
           </DialogHeader>
 
-          <div className="py-4">
+          <div className="py-4 max-h-[60vh] overflow-y-auto">
             {template.parameters && template.parameters.length > 0 ? (
               <div className="space-y-4">
                 <h3 className="text-sm font-medium">Template Parameters</h3>
@@ -135,11 +135,6 @@ export const TemplateModal = ({
                       Will include parameters when provided
                     </p>
                   )}
-                  
-                  <p className="font-medium mt-2">Task Prompt:</p>
-                  <div className="bg-gray-50 dark:bg-gray-800 p-3 rounded text-xs whitespace-pre-wrap">
-                    {template.promptTemplate}
-                  </div>
                   
                   {(template.researchType || template.isComplexTask || template.outputAsJson || template.outputAsHtml) && (
                     <div className="mt-4">

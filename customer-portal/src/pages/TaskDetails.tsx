@@ -269,15 +269,7 @@ const TaskDetailsPage: React.FC = () => {
               </p>
             </div>
           )}
-          {task.prompt && (
-            <div>
-              <h3 className="font-semibold mb-1 text-sm">Prompt:</h3>
-              <pre className="text-sm bg-gray-50 dark:bg-gray-800 p-3 rounded whitespace-pre-wrap font-mono text-xs">
-                {task.prompt}
-              </pre>
-            </div>
-          )}
-          <div className="pt-4 border-t">
+          <div className={`pt-4 ${task.description ? '' : 'border-t'}`}>
             {(() => { 
               const latestExecution = executions.length > 0 ? executions[0] : null;
               const isTaskActive = ['running', 'pending', 'queued'].includes(task.status);
