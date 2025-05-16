@@ -136,11 +136,6 @@ export const TemplateModal = ({
                     </p>
                   )}
                   
-                  <p className="font-medium mt-2">Task Prompt:</p>
-                  <div className="bg-gray-50 dark:bg-gray-800 p-3 rounded text-xs whitespace-pre-wrap">
-                    {template.promptTemplate}
-                  </div>
-                  
                   {(template.researchType || template.isComplexTask || template.outputAsJson || template.outputAsHtml) && (
                     <div className="mt-4">
                       <p className="font-medium mb-1">Task Settings:</p>
