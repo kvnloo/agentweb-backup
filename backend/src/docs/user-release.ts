@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-05-16',
+    changes: [
+      'Improved Dashboard UI',
+      '- Made "Use Template" window scrollable for long content',
+      '- Enhanced visibility of the "Use Template" button on template cards'
+    ],
+  },
+  {
     date: '2025-05-14',
     changes: [
       'Improved customer login/register',
