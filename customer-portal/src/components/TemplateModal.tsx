@@ -94,7 +94,7 @@ export const TemplateModal = ({
             </DialogDescription>
           </DialogHeader>
 
-          <div className="py-4">
+          <div className="py-4 max-h-[60vh] overflow-y-auto">
             {template.parameters && template.parameters.length > 0 ? (
               <div className="space-y-4">
                 <h3 className="text-sm font-medium">Template Parameters</h3>
