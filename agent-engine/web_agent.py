@@ -43,6 +43,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 global_use_vision = True
+global_tool_calling_method_for_azure: Optional[str] = "function_calling"
 
 controller = Controller()
 
@@ -1415,17 +1416,26 @@ Once the PR is approved and merged, this code will be available through the 'Run
                 gif_path.unlink()
             logger.info(f"GIF will be generated at: {self.generate_gif}")
 
-        self.agent = Agent(
-            task=self.task,
-            llm=self.llm,
-            controller=self.controller,
-            browser=self.browser,
-            use_vision=global_use_vision,
-            max_failures=5,  # Increase max retries
-            retry_delay=60,   # retry delay in seconds
-            generate_gif=self.generate_gif,  # Pass GIF path from task_monitor
-            validate_output=validate_output  # Pass validate_output parameter
-        )
+        agent_kwargs = {
+            "task": self.task,
+            "llm": self.llm,
+            "controller": self.controller,
+            "browser": self.browser,
+            "use_vision": global_use_vision,
+            "max_failures": 5,
+            "retry_delay": 60,
+            "generate_gif": self.generate_gif,
+            "validate_output": validate_output
+        }
+
+        # Conditionally add tool_calling_method for Azure OpenAI LLMs
+        # self.llm_name is available from __init__ (e.g., "azure->openai->gpt-4o")
+        if self.llm_name and "azure->openai" in self.llm_name.lower() and global_tool_calling_method_for_azure:
+            agent_kwargs["tool_calling_method"] = global_tool_calling_method_for_azure
+            logger.info(f"Using tool_calling_method '{global_tool_calling_method_for_azure}' for Azure OpenAI LLM.")
+        
+        self.agent = Agent(**agent_kwargs)
+        logger.info("Agent initialized successfully.")
 
     async def cleanup(self):
         """Clean up browser resources and sync cookies"""
