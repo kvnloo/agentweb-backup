@@ -9,7 +9,7 @@ import sys
 import logging
 import asyncio
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
 from pydantic import SecretStr, BaseModel
 from browser_use import Agent, ActionResult, Controller
@@ -17,7 +17,9 @@ from browser_use.browser.browser import Browser, BrowserConfig
 from browser_use.browser.context import BrowserContextConfig, BrowserContext
 import re # Added for sanitize_filename
 import random # Added for sanitize_filename fallback
-# import uuid # No longer needed as uuid isn't used for filename
+import base64 # Ensure base64 is imported at the top level
+import mimetypes # For guessing mime type from file extension
+import httpx # For fetching URL for base64 encoding if needed
 
 # Configure logging
 logging.basicConfig(
@@ -205,8 +207,66 @@ def test_with_browser_use(model_name="gemini-2.0-flash"):
     """Wrapper to run the async browser-use test"""
     return asyncio.run(test_with_browser_use_async(model_name))
 
+async def get_image_input_content() -> Optional[Dict[str, Any]]:
+    """Prompts user for an image input (path or URL) and returns the content dict for HumanMessage."""
+    image_input_str = input("Provide input image path or URL (or press Enter to skip): ").strip()
+    if not image_input_str:
+        return None
+
+    if image_input_str.startswith(("http://", "https://")):
+        try:
+            logger.info(f"Fetching image from URL: {image_input_str}")
+            async with httpx.AsyncClient() as client: 
+                response = await client.get(image_input_str, timeout=10.0)
+            response.raise_for_status() 
+            image_data = response.content
+            mime_type = response.headers.get("content-type", "image/png") 
+            
+            # Adjust MIME type for API compatibility if it's SVG or doesn't fit pattern
+            if not re.match(r"^image/\w{2,4}$", mime_type):
+                logger.warning(f"Original MIME type \'{mime_type}\' might not be API compatible. Defaulting to image/png for data URI.")
+                api_mime_type = "image/png"
+            else:
+                api_mime_type = mime_type
+
+            encoded_image = base64.b64encode(image_data).decode("utf-8")
+            image_uri = f"data:{api_mime_type};base64,{encoded_image}"
+            logger.info(f"Successfully fetched image from URL. Original MIME: {mime_type}, Used for URI: {api_mime_type}")
+            return {"type": "image_url", "image_url": {"url": image_uri}}
+        except Exception as e:
+            logger.error(f"Failed to fetch or encode image from URL \'{image_input_str}\': {e}. Using URL directly as fallback.")
+            # Fallback: let the API try to handle the direct URL if our processing fails
+            return {"type": "image_url", "image_url": {"url": image_input_str}}
+    elif Path(image_input_str).is_file():
+        try:
+            image_path = Path(image_input_str)
+            with open(image_path, "rb") as f:
+                image_data = f.read()
+            encoded_image = base64.b64encode(image_data).decode("utf-8")
+            mime_type, _ = mimetypes.guess_type(image_path)
+            if mime_type is None:
+                mime_type = "image/png" 
+                logger.warning(f"Could not guess MIME type for {image_path}, defaulting to {mime_type}")
+            
+            # Adjust MIME type for API compatibility
+            if not re.match(r"^image/\w{2,4}$", mime_type):
+                logger.warning(f"Original MIME type \'{mime_type}\' for local file might not be API compatible. Defaulting to image/png for data URI.")
+                api_mime_type = "image/png"
+            else:
+                api_mime_type = mime_type
+
+            image_uri = f"data:{api_mime_type};base64,{encoded_image}"
+            logger.info(f"Successfully loaded local image: {image_path}. Original MIME: {mime_type}, Used for URI: {api_mime_type}")
+            return {"type": "image_url", "image_url": {"url": image_uri}}
+        except Exception as e:
+            logger.error(f"Failed to read or encode local image file \'{image_input_str}\': {e}")
+            return None
+    else:
+        logger.warning(f"Invalid image path or URL: {image_input_str}")
+        return None
+
 async def test_gemini_aigc(model_id="models/gemini-2.0-flash-preview-image-generation"):
-    """Test the Google Gemini image generation (AIGC) integration interactively."""
+    """Test the Google Gemini image generation (AIGC) integration interactively, with image input support."""
     load_dotenv()
     api_key = os.getenv('GEMINI_API_KEY')
     if not api_key:
@@ -216,60 +276,70 @@ async def test_gemini_aigc(model_id="models/gemini-2.0-flash-preview-image-gener
     logger.info(f"Starting interactive Gemini AIGC test with model: {model_id}")
 
     try:
-        from langchain_core.messages import AIMessage
+        from langchain_core.messages import AIMessage, HumanMessage
         from langchain_google_genai import ChatGoogleGenerativeAI
-        import base64
-
+        
         images_dir = Path("generated_images")
         images_dir.mkdir(parents=True, exist_ok=True)
 
         chat = ChatGoogleGenerativeAI(
             model=model_id,
             api_key=SecretStr(api_key),
-            temperature=0.7, # Slightly higher temp for more diverse generations
+            temperature=0.7, 
         )
 
-        initial_prompt_text = input("Enter your initial image prompt (e.g., 'A futuristic cityscape at sunset'): ").strip()
+        initial_prompt_text = input("Enter your initial text prompt (e.g., 'Make the cat wear a party hat'): ").strip()
         if not initial_prompt_text:
-            logger.warning("No initial prompt provided. Exiting AIGC test.")
+            logger.warning("No initial text prompt provided. Exiting AIGC test.")
             return False
-            
-        current_prompt_text = initial_prompt_text
-        # Sanitize the entire initial prompt for the base filename part
-        base_prompt_snippet = sanitize_filename(initial_prompt_text)
-        if not base_prompt_snippet or base_prompt_snippet == "image": # Ensure meaningful snippet
-             base_prompt_snippet = "prompt_image"
+        
+        current_text_prompt = initial_prompt_text
+        current_input_image_content = await get_image_input_content()
+
+        base_prompt_snippet = sanitize_filename(current_text_prompt) 
+        if not base_prompt_snippet or base_prompt_snippet == "image":
+             base_prompt_snippet = "aigc_image"
 
         iteration_count = 0
 
         while True:
             iteration_count += 1
-            logger.info(f"Image generation attempt {iteration_count} for prompt: '{current_prompt_text}'")
+            logger.info(f"Image generation attempt {iteration_count} for text prompt: '{current_text_prompt}'" + 
+                        (f" with input image." if current_input_image_content else " (text only)."))
 
-            user_message = {
-                "role": "user",
-                "content": current_prompt_text,
-            }
+            message_content_list = []
+            message_content_list.append({"type": "text", "text": current_text_prompt})
+            if current_input_image_content:
+                message_content_list.append(current_input_image_content)
             
-            response = None # Initialize response
+            # User message for Langchain needs to be a list of HumanMessage or string,
+            # for multimodal input, it's more complex with HumanMessage containing list of dicts.
+            # For simplicity with invoke, we will pass the structured list content.
+            # The ChatGoogleGenerativeAI model internally handles construction of HumanMessage.
+            
+            response = None 
             try:
+                # Langchain's ChatGoogleGenerativeAI invoke method can take a list of messages,
+                # or a string. For multimodal, a HumanMessage with list content is typical.
+                
+                user_llm_message = HumanMessage(content=message_content_list)
+                
                 response = chat.invoke(
-                    [user_message],
+                    [user_llm_message],
                     generation_config=dict(response_modalities=["TEXT", "IMAGE"])
                 )
                 logger.info("Response received from AIGC model.")
             except Exception as e:
-                logger.error(f"Error invoking LLM for image generation: {e}")
-                retry_input = input("Failed to get response from model. Retry? (yes/no/quit): ").strip().lower()
+                logger.error(f"Error invoking LLM: {e}")
+                retry_input = input("Retry? (yes/no/quit): ").strip().lower()
                 if retry_input in ["no", "n", "quit", "q"]:
-                    return False # End test on error if user doesn't want to retry
+                    return False 
                 elif retry_input in ["yes", "y"]:
-                    iteration_count -=1 # Decrement to retry the same iteration number
+                    iteration_count -=1 
                     continue 
-                else: # Invalid input on retry prompt
-                    logger.warning("Invalid input for retry. Exiting.")
+                else: 
+                    logger.warning("Invalid input. Exiting.")
                     return False
-
 
             def _get_image_base64(response_msg: Optional[AIMessage]) -> Optional[str]:
                 if response_msg is None or not hasattr(response_msg, 'content') or not isinstance(response_msg.content, list):
@@ -291,101 +361,82 @@ async def test_gemini_aigc(model_id="models/gemini-2.0-flash-preview-image-gener
             image_base64_data = _get_image_base64(response)
 
             if image_base64_data:
-                logger.info("Image data received successfully.")
+                logger.info("Output image data received.")
                 try:
                     decoded_image_data = base64.b64decode(image_base64_data)
-                    
-                    file_ext = "png" # Default extension
-                    # Try to get actual extension from data URI
+                    file_ext = "png" 
                     if response and hasattr(response, 'content') and isinstance(response.content, list):
                         for block in response.content:
                              if isinstance(block, dict) and block.get("type") == "image_url" and block.get("image_url"):
                                 image_url_dict = block["image_url"]
                                 if isinstance(image_url_dict, dict) and "url" in image_url_dict:
-                                    data_uri_parts = image_url_dict["url"].split(';')[0] # e.g., "data:image/jpeg"
+                                    data_uri_parts = image_url_dict["url"].split(';')[0] 
                                     if data_uri_parts.startswith("data:image/"):
                                         potential_ext = data_uri_parts.split('/')[-1]
-                                        if potential_ext and re.match(r"^[a-zA-Z0-9]+$", potential_ext): # Basic check for valid extension chars
+                                        if potential_ext and re.match(r"^[a-zA-Z0-9]+$", potential_ext):
                                             file_ext = potential_ext
-                                    break # Found the image block
-
+                                    break 
                     image_filename = f"{base_prompt_snippet}_v{iteration_count}.{file_ext}"
                     image_path = images_dir / image_filename
-                    with open(image_path, "wb") as f:
-                        f.write(decoded_image_data)
+                    with open(image_path, "wb") as f: f.write(decoded_image_data)
                     logger.info(f"Generated image saved to: {image_path}")
 
                     user_feedback_action = ""
-                    while True: # Inner loop for user satisfaction
-                        user_input = input(f"Image saved as {image_filename}. Are you satisfied? (yes/no/quit): ").strip().lower()
-                        if user_input in ["yes", "y"]:
-                            user_feedback_action = "satisfied"
-                            break
-                        elif user_input in ["quit", "q"]:
-                            user_feedback_action = "quit"
-                            break
+                    while True: 
+                        user_input = input(f"Image {image_filename} saved. Satisfied? (yes/no/quit): ").strip().lower()
+                        if user_input in ["yes", "y"]: user_feedback_action = "satisfied"; break
+                        elif user_input in ["quit", "q"]: user_feedback_action = "quit"; break
                         elif user_input in ["no", "n"]:
-                            feedback = input("Feedback to improve (or type 'new' for new prompt, 'quit'): ").strip()
-                            if feedback.lower() == 'quit':
-                                user_feedback_action = "quit"
-                                break
-                            elif feedback.lower() == 'new':
-                                new_prompt = input("Enter new initial prompt: ").strip()
-                                if new_prompt:
-                                    initial_prompt_text = new_prompt # This is the new base for feedback
-                                    current_prompt_text = initial_prompt_text
-                                    base_prompt_snippet = sanitize_filename(initial_prompt_text)
-                                    if not base_prompt_snippet or base_prompt_snippet == "image":
-                                        base_prompt_snippet = "prompt_image"
-                                    iteration_count = 0 # Reset for new prompt idea, will be 1 on next loop
-                                    user_feedback_action = "regenerate_new"
-                                else: 
-                                    logger.info("Empty new prompt, continuing with current image or quitting.")
-                                    # Let them re-evaluate the current image or quit
-                                    print("No new prompt entered. Please rate the current image again or quit.")
-                                    continue # Go back to "Are you satisfied?"
-                                break # Exit feedback loop, go to outer loop check
-                            elif feedback: # User provided feedback for current prompt
-                                current_prompt_text = initial_prompt_text + ". Additional feedback: " + feedback
-                                user_feedback_action = "regenerate_feedback"
-                                break # Exit feedback loop, go to outer loop check
-                            else: # Empty feedback
-                                print("No feedback provided. Please provide feedback, or type 'new' or 'quit'.")
-                        else: # Invalid input for satisfaction
-                            print("Invalid input. Please enter 'yes', 'no', or 'quit'.")
+                            feedback_text = input("Feedback for text prompt (or Enter to keep current '{current_text_prompt}'): ").strip()
+                            if feedback_text: current_text_prompt = feedback_text
+                            
+                            change_image_input_prompt = "Change input image?"
+                            if current_input_image_content:
+                                change_image_input_prompt += " (current: set, options: yes/no/remove, Enter to keep): "
+                            else:
+                                change_image_input_prompt += " (current: none, options: yes/no, Enter to keep none): "
+                            
+                            change_image_input = input(change_image_input_prompt).strip().lower()
+
+                            if change_image_input == 'yes':
+                                current_input_image_content = await get_image_input_content()
+                            elif change_image_input == 'remove' and current_input_image_content: # only allow remove if image exists
+                                current_input_image_content = None
+                                logger.info("Input image removed for next generation.")
+                            # If 'no' or Enter, or 'remove' when no image, current_input_image_content remains unchanged
+                            elif change_image_input == 'no':
+                                logger.info("Input image kept as is.")
+                            elif not change_image_input: # Enter pressed
+                                logger.info("Input image kept as is / no change.")
+                            else:
+                                logger.warning(f"Invalid input '{change_image_input}' for image change. Keeping current image setting.")
+
+
+                            user_feedback_action = "regenerate_feedback"; break
+                        else: print("Invalid input. Please enter 'yes', 'no', or 'quit'.")
                     
-                    if user_feedback_action == "satisfied":
-                        logger.info("User satisfied. Ending AIGC session for this prompt.")
-                        return True # Successfully generated and user is happy
-                    elif user_feedback_action == "quit":
-                        logger.info("User chose to quit. Ending AIGC session.")
-                        return True # User quit, considered a graceful exit for the test
-                    # If "regenerate_new" or "regenerate_feedback", the outer loop continues
-                    elif user_feedback_action in ["regenerate_new", "regenerate_feedback"]:
-                        continue
+                    if user_feedback_action == "satisfied": logger.info("User satisfied."); return True
+                    elif user_feedback_action == "quit": logger.info("User quit."); return True
+                    elif user_feedback_action == "regenerate_feedback": continue
 
                 except Exception as e:
-                    logger.error(f"Failed to decode or save image: {e}")
-                    if input("Error processing image. Quit session? (yes/no): ").strip().lower() in ["yes", "y"]:
-                        return False # End test on error if user confirms
-            else: # No image_base64_data
-                logger.error("Failed to generate image in this attempt (no image data in response).")
-                retry_input = input("Retry with current prompt? (yes/no/quit): ").strip().lower()
+                    logger.error(f"Failed to process/save image: {e}")
+                    if input("Quit session due to error? (yes/no): ").strip().lower() in ["yes", "y"]:
+                        return False
+            else: 
+                logger.error("Failed to generate image (no image data in response).")
+                retry_input = input("Retry with current prompt & image? (yes/no/quit): ").strip().lower()
                 if retry_input not in ["yes", "y"]:
-                    logger.info("User chose not to retry or quit. Ending AIGC session.")
-                    return False # End test if user doesn't want to retry failure
-                else: # yes to retry
-                    iteration_count -= 1 # Decrement to retry the same iteration number for the same prompt
-                    continue
+                    logger.info("Not retrying. Ending session."); return False
+                else: iteration_count -= 1; continue
         
-        logger.info("Interactive AIGC test finished (loop exited unexpectedly or user quit).")
-        return True # Default return if loop finishes
-
+        logger.info("Interactive AIGC test finished.")
+        return True
     except ImportError:
-        logger.error("langchain_google_genai or other necessary packages are not installed.")
+        logger.error("Required packages (e.g., langchain_google_genai, httpx) not installed.")
         return False
     except Exception as e:
-        logger.error(f"Error testing Gemini AIGC: {e}")
+        logger.error(f"Error in AIGC test: {e}")
         import traceback
         logger.error(traceback.format_exc())
         return False
@@ -395,26 +446,26 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description='Test Google Gemini integration')
     parser.add_argument('--browser-use', action='store_true', help='Test with browser-use for web automation')
-    parser.add_argument('--model', type=str, default="gemini-2.0-flash", help='Model name to use (default: gemini-2.0-flash)')
-    parser.add_argument('--aigc', action='store_true', help='Test Gemini AIGC (image generation)') # New argument
+    parser.add_argument('--model', type=str, default="gemini-2.0-flash", help='Model name to use for basic or browser-use tests (default: gemini-2.0-flash)')
+    parser.add_argument('--aigc', action='store_true', help='Run interactive Gemini AIGC (image generation) test') 
+    parser.add_argument('--aigc_model', type=str, default="models/gemini-2.0-flash-preview-image-generation", help='Model name for AIGC test (default: models/gemini-2.0-flash-preview-image-generation)')
     args = parser.parse_args()
     
-    if args.browser_use:
+    if args.aigc: # Prioritize AIGC if flag is set
+        success = asyncio.run(test_gemini_aigc(model_id=args.aigc_model)) 
+        if success:
+            print("\nGemini AIGC test completed.")
+        else:
+            print("\nGemini AIGC test failed or exited early.")
+    elif args.browser_use:
         success = test_with_browser_use(args.model)
         if success:
             print("\nBrowser-use test completed successfully!")
         else:
             print("\nBrowser-use test failed. Please check the logs for details.")
-    elif args.aigc: # New condition for AIGC test
-        # For async functions called from sync context in __main__
-        success = asyncio.run(test_gemini_aigc()) 
-        if success:
-            print("\nGemini AIGC test completed successfully!")
-        else:
-            print("\nGemini AIGC test failed. Please check the logs for details.")
     else:
         success = test_gemini(args.model)
         if success:
-            print("\nTest completed successfully!")
+            print("\nBasic test completed successfully!")
         else:
             print("\nTest failed. Please check the logs for details.") 
