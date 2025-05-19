@@ -14,4 +14,5 @@ context/
 
 # User files
 attachments/
-downloads/ 
+downloads/
+generated_images/ 

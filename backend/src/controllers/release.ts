@@ -8,9 +8,18 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-05-19",
+    changes: [
+      "Added new models for task runs",
+      "- OpenAI GPT-4.1 from Azure",
+      "- Google Gemini Pro 2.5 Preview 05-06",
+      "Fixed bugs"
+    ]
+  },
+  {
     date: "2025-05-15",
     changes: [
-      "Enhanced Email Notifications",
+      "Enhanced email notifications",
       "- Updated email notifications to display HTML file content directly in the email",
       "- Added email feature in Execution Details of Partner Portal",
       "- Makes it easier to share task results with clients or team members",
