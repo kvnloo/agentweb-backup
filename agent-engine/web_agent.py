@@ -286,7 +286,10 @@ class WebAgent:
             await self.setup(validate_output)
 
             # Set max_steps based on task complexity
-            max_steps = 100 if is_complex_task else 25
+            if is_complex_task:
+                max_steps = int(os.getenv('MAX_COMPLEX_TASK_STEPS', '100'))
+            else:
+                max_steps = 25
             
             logger.info(f"Running agent with max_steps={max_steps} (Complex Task: {is_complex_task})")
             result = await self.agent.run(max_steps=max_steps)
