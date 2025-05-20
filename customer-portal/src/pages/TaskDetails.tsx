@@ -31,6 +31,8 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Separator } from "@/components/ui/separator";
 import { TaskScheduler } from "@/components/tasks/TaskScheduler";
+import { Switch } from "@/components/ui/switch";
+import { Label } from "@/components/ui/label";
 
 // Define Execution Status type
 type ExecutionStatus =
@@ -54,6 +56,17 @@ interface Execution {
   userId?: string;
   prompt: string;
   result: string;
+  userInteractions?: Interaction[];
+}
+
+// Add Interaction type for userInteractions
+interface Interaction {
+  id: string;
+  question: string;
+  response?: string;
+  status: "pending" | "answered";
+  timestamp: number;
+  screenshot_url?: string;
 }
 
 // Update TaskDetail interface
@@ -62,6 +75,8 @@ interface TaskDetail extends Task {
   executions?: Execution[];
   resultSummary?: string;
   resultLink?: string;
+  isInteractive?: boolean;
+  isDeepResearch?: boolean;
 }
 
 // Base Task interface
@@ -161,6 +176,7 @@ const TaskDetailsPage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(false);
+  const [isUpdatingInteractive, setIsUpdatingInteractive] = useState(false);
 
   const executionsRef = useRef<Execution[]>(executions);
   const taskRef = useRef<TaskDetail | null>(task);
@@ -292,6 +308,158 @@ const TaskDetailsPage: React.FC = () => {
     }
   };
 
+  const handleInteractiveModeToggle = async () => {
+    if (!task) return;
+    setIsUpdatingInteractive(true);
+    try {
+      const newValue = !task.isInteractive;
+      await axios.put(
+        buildApiUrl(`/api/tasks/${task.taskId}`),
+        { isInteractive: newValue },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setTask({ ...task, isInteractive: newValue });
+      toast({ title: "Success", description: "Co-Pilot Mode updated." });
+    } catch (err) {
+      toast({
+        title: "Error",
+        description: "Failed to update Co-Pilot Mode.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsUpdatingInteractive(false);
+    }
+  };
+
+  const UserInteractionDialog = ({ execution, onRespond }) => {
+    const [response, setResponse] = useState("");
+    const [selectedInteraction, setSelectedInteraction] = useState(null);
+    const [error, setError] = useState("");
+    if (!execution.userInteractions?.length || execution.status !== "running")
+      return null;
+    const pendingCount = execution.userInteractions.filter(
+      (i) => i.status === "pending"
+    ).length;
+    const handleRespond = async () => {
+      if (!selectedInteraction || !response.trim()) return;
+      try {
+        await onRespond(
+          execution.executionId,
+          selectedInteraction.id,
+          response.trim()
+        );
+        setResponse("");
+        setSelectedInteraction(null);
+        setError("");
+      } catch (err) {
+        setError("Failed to send response");
+      }
+    };
+    return (
+      <div className="rounded border p-4 my-4 bg-muted">
+        <div className="flex items-center justify-between mb-2">
+          <span className="font-semibold">Agent Questions</span>
+          <span>
+            <span
+              className={`inline-block px-2 py-1 rounded text-xs ${
+                pendingCount > 0
+                  ? "bg-yellow-200 text-yellow-800"
+                  : "bg-green-200 text-green-800"
+              }`}
+            >
+              {pendingCount > 0 ? `${pendingCount} Pending` : "All Answered"}
+            </span>
+          </span>
+        </div>
+        <ul className="space-y-4">
+          {execution.userInteractions.map((interaction, idx) => (
+            <li key={interaction.id} className="border-b pb-2 last:border-b-0">
+              <div className="font-medium mb-1">{interaction.question}</div>
+              {interaction.screenshot_url && (
+                <img
+                  src={interaction.screenshot_url}
+                  alt="Screenshot"
+                  className="max-w-xs mb-2 border rounded"
+                />
+              )}
+              {interaction.response ? (
+                <div className="bg-green-50 text-green-800 rounded px-2 py-1 text-sm">
+                  {interaction.response}
+                </div>
+              ) : interaction.status === "pending" ? (
+                selectedInteraction?.id === interaction.id ? (
+                  <div>
+                    <textarea
+                      className="w-full border rounded p-2 mb-2"
+                      rows={2}
+                      value={response}
+                      onChange={(e) => setResponse(e.target.value)}
+                    />
+                    {error && (
+                      <div className="text-red-600 text-xs mb-1">{error}</div>
+                    )}
+                    <div className="flex gap-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => {
+                          setSelectedInteraction(null);
+                          setResponse("");
+                          setError("");
+                        }}
+                      >
+                        Cancel
+                      </Button>
+                      <Button
+                        variant="default"
+                        size="sm"
+                        onClick={handleRespond}
+                        disabled={!response.trim()}
+                      >
+                        Send Response
+                      </Button>
+                    </div>
+                  </div>
+                ) : (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setSelectedInteraction(interaction)}
+                  >
+                    Respond
+                  </Button>
+                )
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      </div>
+    );
+  };
+
+  const handleUserResponse = async (
+    executionId,
+    interactionId,
+    userResponse
+  ) => {
+    try {
+      await axios.put(
+        buildApiUrl(
+          `/api/tasks/${task?.taskId}/executions/${executionId}/interactions/${interactionId}`
+        ),
+        { response: userResponse },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      fetchTaskAndExecutions();
+    } catch (err) {
+      toast({
+        title: "Error",
+        description: "Failed to send response.",
+        variant: "destructive",
+      });
+    }
+  };
+
   if (loading && !task) {
     return (
       <div className="flex justify-center items-center h-64">
@@ -309,6 +477,9 @@ const TaskDetailsPage: React.FC = () => {
       </Alert>
     );
   }
+
+  // Define latestExecution for use in CardContent
+  const latestExecution = executions.length > 0 ? executions[0] : null;
 
   return (
     <div className="container mx-auto py-8 space-y-6 relative">
@@ -361,8 +532,6 @@ const TaskDetailsPage: React.FC = () => {
           )}
           <div className={`pt-4 ${task.description ? "" : "border-t"}`}>
             {(() => {
-              const latestExecution =
-                executions.length > 0 ? executions[0] : null;
               const isTaskActive = ["running", "pending", "queued"].includes(
                 task.status
               );
@@ -399,6 +568,37 @@ const TaskDetailsPage: React.FC = () => {
           </div>
           {/* Scheduling Section */}
           <TaskScheduler taskId={task.taskId} />
+          {/* Interactive Mode Toggle */}
+          <div className="flex items-center gap-2 mb-2">
+            <Switch
+              id="interactive-mode"
+              checked={!!task.isInteractive}
+              onCheckedChange={handleInteractiveModeToggle}
+              disabled={isUpdatingInteractive || !!task.isDeepResearch}
+            />
+            <Label htmlFor="interactive-mode">Co-Pilot Mode</Label>
+            {isUpdatingInteractive && (
+              <span className="text-xs text-muted-foreground ml-2">
+                Updating...
+              </span>
+            )}
+          </div>
+          {/* User Interaction Dialog for latest running execution */}
+          {(() => {
+            if (
+              latestExecution &&
+              latestExecution.status === "running" &&
+              latestExecution.userInteractions?.length > 0
+            ) {
+              return (
+                <UserInteractionDialog
+                  execution={latestExecution}
+                  onRespond={handleUserResponse}
+                />
+              );
+            }
+            return null;
+          })()}
         </CardContent>
       </Card>
 
