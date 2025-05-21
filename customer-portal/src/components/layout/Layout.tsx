@@ -77,11 +77,11 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
   });
 
   return (
-    <div className="flex min-h-screen bg-white dark:bg-[#1A1F2C]">
+    <div className="flex h-screen overflow-hidden bg-white dark:bg-[#1A1F2C]">
       {/* Sidebar (Left Nav) */}
       <aside
         className={cn(
-          "flex flex-col bg-white dark:bg-[#1B2549] transition-all duration-300 shrink-0",
+          "flex flex-col h-screen bg-white dark:bg-[#1B2549] transition-all duration-300 shrink-0",
           isCollapsed ? "w-[60px]" : "w-[240px]"
         )}
       >
@@ -180,7 +180,7 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
       </aside>
 
       {/* Main Content Area */}
-      <main className="flex-1 flex flex-col overflow-auto bg-gray-50 dark:bg-[#10141F]">
+      <main className="flex-1 flex flex-col h-screen overflow-auto bg-gray-50 dark:bg-[#10141F]">
         {/* Header */}
         <header className="bg-white dark:bg-[#1B2549] h-14 px-4 flex items-center justify-between shrink-0">
           {/* Gradient bar */}
@@ -211,7 +211,7 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
       </main>
 
       {/* Right Chat Panel */}
-      <aside className="w-96 shrink-0 border-l border-[#D6BCFA] bg-white dark:bg-white flex flex-col">
+      <aside className="w-96 h-screen shrink-0 border-l border-[#D6BCFA] bg-white dark:bg-white flex flex-col">
         <ChatSupport />
       </aside>
     </div>
