@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-05-21',
+    changes: [
+      'Support co-pilot mode and schedule for tasks.',
+      '- With co-pilot, the agent will ask the user for necessary input when running a task.',
+      '- The user can schedule to run a task daily, weekly, or monthly.',
+    ],
+  },
+  {
     date: '2025-05-16',
     changes: [
       'Improved Dashboard UI',
