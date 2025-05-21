@@ -17,9 +17,10 @@ export const TemplateGrid = ({
       {templates?.map((template) => (
         <div
           key={template.id}
-          className="flex flex-col rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden cursor-pointer hover:border-primary/50 dark:hover:border-primary/50 hover:shadow-md transition-all"
+          className="relative flex flex-col rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden cursor-pointer hover:border-primary/50 dark:hover:border-primary/50 hover:shadow-[0_0_25px_8px_rgba(122,105,153,0.4)] hover:-translate-y-1 transition-all duration-300 ease-in-out"
         >
-          <div className="p-4 flex-grow">
+          <div className="absolute top-0 left-0 bottom-0 w-1 agent-gradient rounded-l-lg"></div>
+          <div className="p-4 flex-grow pl-3">
             <div className="flex items-center gap-2 mb-2">
               <div className="rounded-full bg-gray-100 dark:bg-gray-800 p-1.5">
                 {template.icon}
@@ -47,11 +48,9 @@ export const TemplateGrid = ({
               </div>
             )}
           </div>
-          <div className="border-t border-gray-100 dark:border-gray-800 p-2 bg-primary dark:bg-primary hover:bg-primary/90 dark:hover:bg-primary/80">
+          <div className="border-t border-gray-100 dark:border-gray-800 p-2 bg-transparent dark:bg-transparent">
             <Button
-              variant="ghost"
-              size="sm"
-              className="w-full justify-start text-xs text-primary-foreground dark:text-primary-foreground hover:bg-transparent dark:hover:bg-transparent"
+              className="w-full justify-start text-xs use-template-button"
               onClick={() => onSelectTemplate(template)}
             >
               Use template

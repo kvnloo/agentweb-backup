@@ -1,4 +1,3 @@
-
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -18,7 +17,7 @@
     --primary-foreground: 0 0% 100%;
 
     --secondary: 260 60% 96%;
-    --secondary-foreground: 222 47% 11%; 
+    --secondary-foreground: 222 47% 11%;
 
     --muted: 260 40% 96%;
     --muted-foreground: 215 16% 47%;
@@ -46,8 +45,8 @@
     --popover: 222 47% 11%;
     --popover-foreground: 210 40% 98%;
 
-    --primary: 260 91% 70%;
-    --primary-foreground: 0 0% 100%;
+    --primary: 100 59 126; /* Hex: #643B7E - AgentWeb brand gradient start */
+    --primary-foreground: 255 255 255; /* White */
 
     --secondary: 260 32% 17%;
     --secondary-foreground: 210 40% 98%;
@@ -55,8 +54,8 @@
     --muted: 260 32% 17%;
     --muted-foreground: 215 20% 75%;
 
-    --accent: 260 32% 17%;
-    --accent-foreground: 210 40% 98%;
+    --accent: 111 61 253; /* Hex: #6F3DFD - AgentWeb brand gradient end */
+    --accent-foreground: 255 255 255; /* White */
 
     --destructive: 0 84% 60%;
     --destructive-foreground: 210 40% 98%;
@@ -87,7 +86,7 @@
     -ms-overflow-style: none;
     scrollbar-width: none;
   }
-  
+
   .scrollbar-none::-webkit-scrollbar {
     display: none;
   }
@@ -95,24 +94,41 @@
   .glass-morphism {
     @apply backdrop-blur-xl bg-white/5 border border-white/10 shadow-[0_4px_12px_-2px_rgba(0,0,0,0.3)];
   }
-  
+
   .neo-blur {
     @apply backdrop-blur-2xl bg-black/40 border border-white/10;
   }
-  
+
   .text-gradient {
     @apply bg-gradient-to-br from-white via-white/90 to-white/70 bg-clip-text text-transparent;
   }
-  
+
   .text-gradient-primary {
     @apply bg-gradient-to-br from-primary via-primary/80 to-primary/60 bg-clip-text text-transparent;
   }
-  
+
   .agent-gradient {
-    @apply bg-gradient-to-r from-[#9b87f5] to-[#7E69AB];
+    @apply bg-gradient-to-r from-[--primary] to-[--accent]; /* Use CSS variables for main brand gradient */
   }
-  
+
   .agent-button {
-    @apply bg-[#9b87f5] text-white hover:bg-[#7E69AB] transition-colors;
+    @apply agent-gradient text-primary-foreground font-bold hover:opacity-90 transition-opacity rounded-md px-4 py-2;
+  }
+
+  .use-template-button {
+    @apply template-button-gradient text-white font-bold rounded-md px-4 py-2 transition-all duration-300 ease-in-out;
+    @apply hover:text-white hover:-translate-y-0.5 hover:shadow-[0_0_20px_5px_rgba(236,172,95,0.5)];
+  }
+
+  .sidebar-active-button {
+    @apply template-button-gradient text-white font-bold rounded-md px-4 py-2 transition-all duration-300 ease-in-out;
+  }
+
+  .tab-gradient {
+    @apply bg-gradient-to-r from-[#7A6999] to-[#ECAC5F];
+  }
+
+  .template-button-gradient {
+    @apply bg-gradient-to-r from-[#7A6999] to-[#ECAC5F];
   }
 }

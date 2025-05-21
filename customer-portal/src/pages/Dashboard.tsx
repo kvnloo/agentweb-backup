@@ -312,16 +312,23 @@ const Dashboard = () => {
   };
 
   return (
-    <div className="flex flex-col gap-6 w-full h-full">
-      <div className="flex flex-col gap-2">
-        <h1 className="text-2xl font-bold">Welcome to Your Customer Portal</h1>
-        {user && (
-          <p className="text-gray-300">
-            Hi, <span className="font-medium">{user.email.split("@")[0]}</span>.
-            Dive into your personalized dashboard to explore data-driven market
-            insights, creative research and strategic tools—all in one place.
-          </p>
-        )}
+    <div className="p-6 space-y-6">
+      <div className="space-y-1">
+        <h1 className="text-4xl font-extrabold text-gray-900 dark:text-[rgba(255,255,255,0.85)]">
+          Welcome to Your Customer Portal
+        </h1>
+        <div className="h-0.5 w-1/4 agent-gradient rounded-full"></div>
+        <p className="text-gray-500 dark:text-[rgba(255,255,255,0.7)]">
+          {user && (
+            <>
+              Hi,{" "}
+              <span className="font-medium">{user.email.split("@")[0]}</span>.
+              Dive into your personalized dashboard to explore data-driven
+              market insights, creative research and strategic tools—all in one
+              place.
+            </>
+          )}
+        </p>
       </div>
 
       <div className="flex flex-col flex-1 rounded-lg border overflow-hidden">

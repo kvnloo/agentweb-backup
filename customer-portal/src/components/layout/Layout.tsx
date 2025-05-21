@@ -119,7 +119,7 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
                     className={cn(
                       "flex items-center py-2 px-2 rounded-md text-sm font-medium transition-colors",
                       activeItem === item.id
-                        ? "bg-[#F3EFFD] text-[#7E69AB] dark:agent-gradient dark:text-white"
+                        ? "sidebar-active-button text-[#7E69AB] dark:text-dark"
                         : "text-gray-600 hover:bg-[#F3EFFD] hover:text-[#7E69AB] dark:text-[rgba(255,255,255,0.85)] dark:hover:bg-[rgba(255,255,255,0.1)] dark:hover:text-white"
                     )}
                   >
