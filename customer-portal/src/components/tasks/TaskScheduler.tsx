@@ -152,13 +152,26 @@ export const TaskScheduler: React.FC<TaskSchedulerProps> = ({ taskId }) => {
               <SelectValue placeholder="Frequency" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="daily">Daily</SelectItem>
-              <SelectItem value="weekly">Weekly</SelectItem>
-              <SelectItem value="monthly">Monthly</SelectItem>
+              <SelectItem value="daily" className="select-item-hover-gradient">
+                Daily
+              </SelectItem>
+              <SelectItem value="weekly" className="select-item-hover-gradient">
+                Weekly
+              </SelectItem>
+              <SelectItem
+                value="monthly"
+                className="select-item-hover-gradient"
+              >
+                Monthly
+              </SelectItem>
             </SelectContent>
           </Select>
         </div>
-        <Button type="submit" disabled={isSubmitting || !frequency}>
+        <Button
+          type="submit"
+          disabled={isSubmitting || !frequency}
+          className="use-template-button"
+        >
           {isSubmitting ? (
             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
           ) : null}
@@ -217,8 +230,8 @@ export const TaskScheduler: React.FC<TaskSchedulerProps> = ({ taskId }) => {
                 </TableCell>
                 <TableCell>
                   <Button
-                    variant="ghost"
                     size="icon"
+                    className="secondary-button"
                     onClick={() => handleDelete(schedule.scheduleId)}
                   >
                     <Trash2 className="h-4 w-4 text-destructive" />

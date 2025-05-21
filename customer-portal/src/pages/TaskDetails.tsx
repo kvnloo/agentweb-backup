@@ -482,7 +482,11 @@ const TaskDetailsPage: React.FC = () => {
               <div className="text-red-600 text-xs mb-1">{currentError}</div>
             )}
             <div className="flex gap-2">
-              <Button variant="outline" size="sm" onClick={handleCancel}>
+              <Button
+                className="secondary-button"
+                size="sm"
+                onClick={handleCancel}
+              >
                 Cancel
               </Button>
               <Button
@@ -490,6 +494,7 @@ const TaskDetailsPage: React.FC = () => {
                 size="sm"
                 onClick={handleDialogSubmit}
                 disabled={!dialogInputValue.trim()}
+                className="use-template-button"
               >
                 Send Response
               </Button>
@@ -537,7 +542,11 @@ const TaskDetailsPage: React.FC = () => {
           )
       )}
 
-      <Button variant="outline" size="sm" onClick={() => navigate("/tasks")}>
+      <Button
+        className="secondary-button"
+        size="sm"
+        onClick={() => navigate("/tasks")}
+      >
         <ArrowLeft className="mr-2 h-4 w-4" /> Back to Tasks
       </Button>
 
@@ -583,7 +592,11 @@ const TaskDetailsPage: React.FC = () => {
 
               return (
                 <>
-                  <Button onClick={handleRunTask} disabled={isDisabled}>
+                  <Button
+                    onClick={handleRunTask}
+                    disabled={isDisabled}
+                    className="use-template-button"
+                  >
                     {isRunning ? (
                       <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                     ) : (
@@ -627,6 +640,7 @@ const TaskDetailsPage: React.FC = () => {
             !selectedInteraction && (
               <div className="my-4">
                 <Button
+                  className="use-template-button"
                   onClick={() => {
                     const firstPending = latestExecution.userInteractions?.find(
                       (i) => i.status === "pending"

@@ -1,9 +1,5 @@
 import React, { useState } from "react";
-import { 
-  Dialog, 
-  DialogContent, 
-  DialogHeader
-} from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogHeader } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 
@@ -13,13 +9,40 @@ import { TaskDetailsSection } from "@/components/tasks/TaskDetailsSection";
 import { LLMSelector } from "@/components/tasks/LLMSelector";
 import { TaskOptionsSelector } from "@/components/tasks/TaskOptionsSelector";
 import { TaskScheduler } from "@/components/tasks/TaskScheduler";
-import { SubscriberManager, TaskSubscriber } from "@/components/tasks/SubscriberManager";
-import { ExecutionHistory, TaskExecution } from "@/components/tasks/ExecutionHistory";
+import {
+  SubscriberManager,
+  TaskSubscriber,
+} from "@/components/tasks/SubscriberManager";
+import {
+  ExecutionHistory,
+  TaskExecution,
+} from "@/components/tasks/ExecutionHistory";
 import { TaskActions } from "@/components/tasks/TaskActions";
 
 // Re-export types properly for isolatedModules mode
 export type { TaskSubscriber };
 export type { TaskExecution };
+
+// Define a type for the task updates
+export interface TaskUpdates {
+  title?: string;
+  description?: string;
+  options?: {
+    emailMe?: boolean;
+    interactiveMode?: boolean;
+    performDeepResearch?: boolean;
+    complexTask?: boolean;
+    extractPageContent?: boolean;
+    validateOutput?: boolean;
+    outputAsJSON?: boolean;
+  };
+  schedule?: {
+    frequency?: string;
+    enabled?: boolean;
+  };
+  subscribers?: TaskSubscriber[];
+  preferred_llm?: string;
+}
 
 export interface TaskDetailProps {
   task: {
@@ -44,27 +67,27 @@ export interface TaskDetailProps {
       extractPageContent: boolean;
       validateOutput: boolean;
       outputAsJSON: boolean;
-    }
+    };
   };
   isOpen: boolean;
   onClose: () => void;
   onRunTask: (taskId: string) => void;
   onArchiveTask: (taskId: string) => void;
-  onUpdateTask: (taskId: string, updates: any) => void;
+  onUpdateTask: (taskId: string, updates: TaskUpdates) => void;
 }
 
-const TaskDetailModal: React.FC<TaskDetailProps> = ({ 
-  task, 
-  isOpen, 
+const TaskDetailModal: React.FC<TaskDetailProps> = ({
+  task,
+  isOpen,
   onClose,
   onRunTask,
   onArchiveTask,
-  onUpdateTask
+  onUpdateTask,
 }) => {
   const [isEditing, setIsEditing] = useState(false);
   const [editedTitle, setEditedTitle] = useState(task.title);
   const [editedDescription, setEditedDescription] = useState(task.description);
-  
+
   // Initialize options with defaults or from task
   const [options, setOptions] = useState({
     emailMe: task.options?.emailMe || false,
@@ -73,20 +96,24 @@ const TaskDetailModal: React.FC<TaskDetailProps> = ({
     complexTask: task.options?.complexTask || false,
     extractPageContent: task.options?.extractPageContent || false,
     validateOutput: task.options?.validateOutput || false,
-    outputAsJSON: task.options?.outputAsJSON || false
+    outputAsJSON: task.options?.outputAsJSON || false,
   });
-  
+
   // Initialize schedule with defaults or from task
   const [schedule, setSchedule] = useState({
     frequency: task.schedule?.frequency || "",
-    enabled: task.schedule?.enabled || false
+    enabled: task.schedule?.enabled || false,
   });
-  
+
   // Initialize subscribers
-  const [subscribers, setSubscribers] = useState<TaskSubscriber[]>(task.subscribers || []);
-  
+  const [subscribers, setSubscribers] = useState<TaskSubscriber[]>(
+    task.subscribers || []
+  );
+
   // Initialize preferred LLM
-  const [preferredLLM, setPreferredLLM] = useState(task.preferred_llm || "gpt-4o");
+  const [preferredLLM, setPreferredLLM] = useState(
+    task.preferred_llm || "gpt-4o"
+  );
 
   // Mock execution data if none provided
   const executions = task.executions || [];
@@ -97,14 +124,14 @@ const TaskDetailModal: React.FC<TaskDetailProps> = ({
       startedAt: task.created,
       completedAt: task.completed || task.created,
       prompt: task.description,
-      result: "Task completed successfully."
+      result: "Task completed successfully.",
     });
   }
 
   const toggleOption = (option: keyof typeof options) => {
     setOptions({
       ...options,
-      [option]: !options[option]
+      [option]: !options[option],
     });
   };
 
@@ -115,7 +142,7 @@ const TaskDetailModal: React.FC<TaskDetailProps> = ({
       options,
       schedule,
       subscribers,
-      preferred_llm: preferredLLM
+      preferred_llm: preferredLLM,
     });
     setIsEditing(false);
     toast.success("Task updated successfully");
@@ -125,7 +152,7 @@ const TaskDetailModal: React.FC<TaskDetailProps> = ({
     <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="max-w-4xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
-          <TaskHeader 
+          <TaskHeader
             title={task.title}
             status={task.status}
             isEditing={isEditing}
@@ -148,23 +175,20 @@ const TaskDetailModal: React.FC<TaskDetailProps> = ({
           {isEditing && (
             <div className="mt-6 space-y-6">
               {/* Preferred LLM */}
-              <LLMSelector 
+              <LLMSelector
                 preferredLLM={preferredLLM}
                 onLLMChange={setPreferredLLM}
               />
-              
+
               {/* Task Options */}
-              <TaskOptionsSelector 
+              <TaskOptionsSelector
                 options={options}
                 onToggleOption={toggleOption}
               />
-              
+
               {/* Schedule Task */}
-              <TaskScheduler 
-                schedule={schedule}
-                onScheduleChange={setSchedule}
-              />
-              
+              <TaskScheduler taskId={task.id} />
+
               {/* Subscribers */}
               <SubscriberManager
                 subscribers={subscribers}
@@ -175,8 +199,18 @@ const TaskDetailModal: React.FC<TaskDetailProps> = ({
 
           {isEditing && (
             <div className="flex justify-end mt-6">
-              <Button onClick={handleSaveChanges} className="mr-2">Save Changes</Button>
-              <Button variant="outline" onClick={() => setIsEditing(false)}>Cancel</Button>
+              <Button
+                onClick={handleSaveChanges}
+                className="mr-2 use-template-button"
+              >
+                Save Changes
+              </Button>
+              <Button
+                className="secondary-button"
+                onClick={() => setIsEditing(false)}
+              >
+                Cancel
+              </Button>
             </div>
           )}
 

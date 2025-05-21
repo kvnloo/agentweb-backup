@@ -35,8 +35,7 @@ export const PromptForm = ({
       <div className="flex justify-between mt-4">
         <Button
           variant="outline"
-          type="button"
-          className="text-gray-200 hover:bg-[#F3EFFD] hover:text-gray-900"
+          className="text-gray-200 border-[#9b87f5] hover:bg-[#F3EFFD] h0"
           onClick={() => setIsTemplateOpen(!isTemplateOpen)}
         >
           Templates{" "}

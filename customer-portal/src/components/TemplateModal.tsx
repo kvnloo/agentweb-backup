@@ -215,7 +215,7 @@ export const TemplateModal = ({
 
           <DialogFooter>
             <Button
-              variant="outline"
+              className="secondary-button"
               type="button"
               onClick={() => setIsOpen(false)}
             >
@@ -223,7 +223,7 @@ export const TemplateModal = ({
             </Button>
             <Button
               type="submit"
-              className="bg-primary hover:bg-primary/90 text-white"
+              className="use-template-button hover:bg-primary/90 text-white"
             >
               Use Template
             </Button>

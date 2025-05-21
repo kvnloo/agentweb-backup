@@ -1,6 +1,6 @@
-import { Button } from '@/components/ui/button';
-import { useAuth } from '@/contexts/AuthContext';
-import { useNavigate } from 'react-router-dom';
+import { Button } from "@/components/ui/button";
+import { useAuth } from "@/contexts/AuthContext";
+import { useNavigate } from "react-router-dom";
 
 const GoogleSignInButton = () => {
   const { loginWithGoogle } = useAuth();
@@ -9,16 +9,15 @@ const GoogleSignInButton = () => {
   const handleGoogleSignIn = async () => {
     try {
       await loginWithGoogle();
-      navigate('/');
+      navigate("/");
     } catch (error) {
-      console.error('Google sign-in failed:', error);
+      console.error("Google sign-in failed:", error);
     }
   };
 
   return (
     <Button
       type="button"
-      variant="outline"
       onClick={handleGoogleSignIn}
       className="w-full border-[#E2E8F0] bg-white text-gray-700 hover:bg-gray-50 hover:text-gray-900"
     >
@@ -42,4 +41,4 @@ const GoogleSignInButton = () => {
   );
 };
 
-export default GoogleSignInButton; 
+export default GoogleSignInButton;

@@ -45,7 +45,7 @@
     --popover: 222 47% 11%;
     --popover-foreground: 210 40% 98%;
 
-    --primary: 100 59 126; /* Hex: #643B7E - AgentWeb brand gradient start */
+    --primary: 279 37% 55%; /* Hex: #643B7E - AgentWeb brand gradient start */
     --primary-foreground: 255 255 255; /* White */
 
     --secondary: 260 32% 17%;
@@ -54,7 +54,7 @@
     --muted: 260 32% 17%;
     --muted-foreground: 215 20% 75%;
 
-    --accent: 111 61 253; /* Hex: #6F3DFD - AgentWeb brand gradient end */
+    --accent: 256 98% 61%; /* Hex: #6F3DFD - AgentWeb brand gradient end */
     --accent-foreground: 255 255 255; /* White */
 
     --destructive: 0 84% 60%;
@@ -130,5 +130,51 @@
 
   .template-button-gradient {
     @apply bg-gradient-to-r from-[#7A6999] to-[#ECAC5F];
+  }
+
+  .select-item-hover-gradient:hover {
+    @apply template-button-gradient text-white;
+  }
+
+  .select-item-hover-gradient[data-highlighted] {
+    @apply template-button-gradient text-white;
+  }
+
+  .switch-gradient-off {
+    @apply bg-gradient-to-r from-[#7A6999] to-[#7A6999];
+  }
+
+  .switch-gradient-on {
+    @apply bg-gradient-to-r from-[#ECAC5F] to-[#ECAC5F];
+  }
+
+  .switch-active-gradient {
+    @apply switch-gradient-off;
+  }
+
+  .switch-active-gradient[data-state="checked"] {
+    @apply switch-gradient-on !important; /* Use !important to ensure override if needed */
+  }
+
+  .secondary-button {
+    @apply border bg-transparent border-slate-700 text-slate-300;
+  }
+
+  .secondary-button:hover {
+    @apply bg-gradient-to-r from-[#7A6999] to-[#ECAC5F] text-white hover:shadow-[0_0_20px_5px_rgba(236,172,95,0.5)];
+  }
+
+  .aw-outline-button {
+    @apply border border-[hsl(var(--border))] bg-transparent text-[hsl(var(--foreground))];
+  }
+  .aw-outline-button:hover {
+    @apply border-[hsl(var(--primary))] text-[hsl(var(--primary))] bg-primary/10; /* Using primary color with low opacity for background */
+  }
+
+  .aw-ghost-button {
+    @apply text-[hsl(var(--foreground))]; /* Base text color, background is implicitly transparent */
+  }
+  .aw-ghost-button:hover {
+    @apply bg-[hsl(var(--accent))] text-[hsl(var(--accent-foreground))];
   }
 }
