@@ -1,6 +1,14 @@
 import { useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { Home, FileText, Settings, ChevronLeft, ChevronRight, Bell, Activity } from "lucide-react";
+import {
+  Home,
+  FileText,
+  Settings,
+  ChevronLeft,
+  ChevronRight,
+  Bell,
+  Activity,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/contexts/AuthContext";
@@ -17,60 +25,68 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
   const [activeItem, setActiveItem] = useState<string | null>(null);
 
   const categories = [
-    { 
+    {
       title: "OVERVIEW",
-      items: [
-        { icon: Home, label: "Dashboard", path: "/", id: "dashboard" },
-      ]
+      items: [{ icon: Home, label: "Dashboard", path: "/", id: "dashboard" }],
     },
     {
       title: "ACTIVITIES",
-      items: [
-        { icon: Activity, label: "Tasks", path: "/tasks", id: "tasks" },
-      ]
+      items: [{ icon: Activity, label: "Tasks", path: "/tasks", id: "tasks" }],
     },
     {
       title: "DOCUMENTS",
       items: [
         { icon: FileText, label: "User Guide", path: "/guide", id: "guide" },
-        { icon: FileText, label: "Changelog", path: "/changelog", id: "changelog" }
-      ]
+        {
+          icon: FileText,
+          label: "Changelog",
+          path: "/changelog",
+          id: "changelog",
+        },
+      ],
     },
     {
       title: "ACCOUNT",
       items: [
-        { icon: Settings, label: "Settings", path: "/settings", id: "settings" },
-      ]
-    }
+        {
+          icon: Settings,
+          label: "Settings",
+          path: "/settings",
+          id: "settings",
+        },
+      ],
+    },
   ];
-  
+
   // Initialize the active item based on pathname when component mounts
   useState(() => {
     // Find the item that matches the current path
     for (const category of categories) {
-      const matchingItem = category.items.find(item => item.path === location.pathname);
+      const matchingItem = category.items.find(
+        (item) => item.path === location.pathname
+      );
       if (matchingItem) {
         setActiveItem(matchingItem.id);
         break;
       }
     }
     // Default to dashboard if on home path
-    if (location.pathname === '/' && !activeItem) {
-      setActiveItem('dashboard');
+    if (location.pathname === "/" && !activeItem) {
+      setActiveItem("dashboard");
     }
   });
 
   return (
-    <div className="flex min-h-screen bg-white dark:bg-[#1A1F2C]">
+    <div className="flex h-screen overflow-hidden bg-white dark:bg-[#1A1F2C]">
       {/* Sidebar (Left Nav) */}
-      <aside 
+      <aside
         className={cn(
-          "flex flex-col border-r border-[#D6BCFA] bg-white dark:bg-white transition-all duration-300 shrink-0",
+          "flex flex-col h-screen bg-white dark:bg-[#1B2549] transition-all duration-300 shrink-0",
           isCollapsed ? "w-[60px]" : "w-[240px]"
         )}
       >
         {/* Logo section */}
-        <div className="flex h-14 items-center px-4 border-b border-[#D6BCFA] dark:border-[#7E69AB]">
+        <div className="flex h-14 items-center px-4">
           {!isCollapsed && (
             <Link to="/" className="flex items-center gap-2">
               <img src={AgentWebLogo} alt="AgentWeb Logo" className="h-8" />
@@ -89,7 +105,7 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
             <div key={categoryIndex} className="mb-4">
               {!isCollapsed && (
                 <div className="px-4 py-1">
-                  <p className="text-xs font-semibold text-[#7E69AB] dark:text-[#7E69AB] tracking-wider">
+                  <p className="text-xs font-semibold text-[#7E69AB] dark:text-[rgba(255,255,255,0.7)] tracking-wider">
                     {category.title}
                   </p>
                 </div>
@@ -103,11 +119,16 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
                     className={cn(
                       "flex items-center py-2 px-2 rounded-md text-sm font-medium transition-colors",
                       activeItem === item.id
-                        ? "bg-[#F3EFFD] text-[#7E69AB] dark:bg-[#F3EFFD] dark:text-[#7E69AB]"
-                        : "text-gray-600 hover:bg-[#F3EFFD] hover:text-[#7E69AB] dark:text-gray-600 dark:hover:bg-[#F3EFFD] dark:hover:text-[#7E69AB]"
+                        ? "sidebar-active-button text-[#7E69AB] dark:text-dark"
+                        : "text-gray-600 hover:bg-[#F3EFFD] hover:text-[#7E69AB] dark:text-[rgba(255,255,255,0.85)] dark:hover:bg-[rgba(255,255,255,0.1)] dark:hover:text-white"
                     )}
                   >
-                    <item.icon className={cn("h-5 w-5", isCollapsed ? "mx-auto" : "mr-3")} />
+                    <item.icon
+                      className={cn(
+                        "h-5 w-5",
+                        isCollapsed ? "mx-auto" : "mr-3"
+                      )}
+                    />
                     {!isCollapsed && <span>{item.label}</span>}
                     {activeItem === item.id && !isCollapsed && (
                       <div className="absolute left-0 h-6 w-1 agent-gradient rounded-r-full" />
@@ -121,40 +142,62 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
 
         {/* Public Beta Notice */}
         {!isCollapsed && (
-          <div className="px-4 py-2 text-xs text-gray-500 dark:text-gray-400 border-t border-[#D6BCFA] dark:border-[#7E69AB]">
+          <div className="px-4 py-2 text-xs text-gray-500 dark:text-[rgba(255,255,255,0.7)] border-t border-[#D6BCFA] dark:border-[rgba(255,255,255,0.1)]">
             <p className="mb-1">
-              Customer Portal is in <strong className="font-semibold">Public Beta</strong>.
+              Customer Portal is in{" "}
+              <strong className="font-semibold">Public Beta</strong>.
             </p>
             <p>
-              Join our <a href={DISCORD_INVITE_URL} target="_blank" rel="noopener noreferrer" className="text-[#7E69AB] hover:underline">Discord community</a> to report bugs or share feedback.
+              Join our{" "}
+              <a
+                href={DISCORD_INVITE_URL}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-[#7E69AB] dark:text-purple-light hover:underline"
+              >
+                Discord community
+              </a>{" "}
+              to report bugs or share feedback.
             </p>
           </div>
         )}
 
         {/* Collapse button */}
-        <div className="border-t border-[#D6BCFA] dark:border-[#7E69AB] p-2">
+        <div className="border-t border-[#D6BCFA] dark:border-[rgba(255,255,255,0.1)] p-2">
           <Button
             variant="ghost"
             size="sm"
-            className="w-full flex justify-center text-[#7E69AB] hover:bg-[#F3EFFD] hover:text-[#7E69AB] dark:text-[#7E69AB] dark:hover:bg-[#F3EFFD] dark:hover:text-[#7E69AB]"
+            className="w-full flex justify-center text-[#7E69AB] hover:bg-[#F3EFFD] hover:text-[#7E69AB] dark:text-[rgba(255,255,255,0.85)] dark:hover:bg-[rgba(255,255,255,0.1)] dark:hover:text-white"
             onClick={() => setIsCollapsed(!isCollapsed)}
           >
-            {isCollapsed ? <ChevronRight size={18} /> : <ChevronLeft size={18} />}
+            {isCollapsed ? (
+              <ChevronRight size={18} />
+            ) : (
+              <ChevronLeft size={18} />
+            )}
           </Button>
         </div>
       </aside>
 
       {/* Main Content Area */}
-      <main className="flex-1 flex flex-col overflow-auto bg-gray-50 dark:bg-[#10141F]">
+      <main className="flex-1 flex flex-col h-screen overflow-auto bg-gray-50 dark:bg-[#10141F]">
         {/* Header */}
-        <header className="border-b border-[#D6BCFA] bg-white dark:bg-white h-14 px-4 flex items-center justify-between shrink-0">
+        <header className="bg-white dark:bg-[#1B2549] h-14 px-4 flex items-center justify-between shrink-0">
+          {/* Gradient bar */}
+          <div className="absolute top-0 left-0 right-0 h-[2px] agent-gradient"></div>
           <div className="flex items-center">
-            <h1 className="text-xl font-semibold text-gray-900 dark:text-gray-900">
-              {categories.flatMap(category => category.items).find(item => item.id === activeItem)?.label || "Dashboard"}
+            <h1 className="text-xl font-semibold text-gray-900 dark:text-[rgba(255,255,255,0.85)]">
+              {categories
+                .flatMap((category) => category.items)
+                .find((item) => item.id === activeItem)?.label || "Dashboard"}
             </h1>
           </div>
           <div className="flex items-center gap-2">
-            <Button variant="ghost" size="icon" className="text-[#7E69AB]">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="text-[#7E69AB] dark:text-[rgba(255,255,255,0.85)]"
+            >
               <Bell size={20} />
             </Button>
             <UserProfileDropdown />
@@ -168,7 +211,7 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
       </main>
 
       {/* Right Chat Panel */}
-      <aside className="w-96 shrink-0 border-l border-[#D6BCFA] bg-white dark:bg-white flex flex-col">
+      <aside className="w-96 h-screen shrink-0 border-l border-[#D6BCFA] bg-white dark:bg-white flex flex-col">
         <ChatSupport />
       </aside>
     </div>

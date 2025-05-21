@@ -1,30 +1,33 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { useAuth } from '../../contexts/AuthContext';
-import { useLocation } from 'react-router-dom';
-import axios from 'axios';
-import { buildApiUrl } from '../../config';
-import { Button } from '../ui/button';
-import { Textarea } from '../ui/textarea';
-import { getPageTitle } from '../../utils/pageTitles';
-import { 
-  MessageSquare, 
-  X as CloseIcon, 
-  Send as SendIcon, 
-  Bot, 
-  User, 
-  PlusCircle, 
-  Navigation
-} from 'lucide-react';
-import { Alert, AlertDescription } from '../ui/alert';
-import { io, Socket } from 'socket.io-client';
+import React, { useState, useEffect, useRef } from "react";
+import { useAuth } from "../../contexts/AuthContext";
+import { useLocation } from "react-router-dom";
+import axios from "axios";
+import { buildApiUrl } from "../../config";
+import { Button } from "../ui/button";
+import { Textarea } from "../ui/textarea";
+import { getPageTitle } from "../../utils/pageTitles";
+import {
+  MessageSquare,
+  X as CloseIcon,
+  Send as SendIcon,
+  Bot,
+  User,
+  PlusCircle,
+  Navigation,
+} from "lucide-react";
+import { Alert, AlertDescription } from "../ui/alert";
+import { io, Socket } from "socket.io-client";
 import { DISCORD_INVITE_URL } from "@/config";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import ReactMarkdown from 'react-markdown';
-import { AvatarFallback as NewAvatarFallback, AvatarImage as NewAvatarImage } from "@/components/ui/avatar";
-import DOMPurify from 'dompurify';
+import ReactMarkdown from "react-markdown";
+import {
+  AvatarFallback as NewAvatarFallback,
+  AvatarImage as NewAvatarImage,
+} from "@/components/ui/avatar";
+import DOMPurify from "dompurify";
 
 interface ChatMessage {
-  role: 'system' | 'user' | 'assistant';
+  role: "system" | "user" | "assistant";
   content: string;
 }
 
@@ -36,28 +39,28 @@ interface ChatSession {
   updatedAt: string;
   pageContext?: string;
   pageIdentifier?: string;
-  portalType?: 'customer' | 'partner';
+  portalType?: "customer" | "partner";
 }
 
 const ChatSupport: React.FC = () => {
   const { token } = useAuth();
   const location = useLocation();
-  const [message, setMessage] = useState('');
+  const [message, setMessage] = useState("");
   const [session, setSession] = useState<ChatSession | null>(null);
   const [isLoading, setIsLoading] = useState(false);
-  const [currentPage, setCurrentPage] = useState<string>('');
+  const [currentPage, setCurrentPage] = useState<string>("");
   const [showPageNotification, setShowPageNotification] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const socketRef = useRef<Socket | null>(null);
   const [socketConnected, setSocketConnected] = useState(false);
   const [useWebSockets, setUseWebSockets] = useState(false);
   const [reconnectAttempts, setReconnectAttempts] = useState(0);
-  const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+  const apiUrl = import.meta.env.VITE_API_URL || "http://localhost:3001";
 
   // Initialize WebSocket connection
   useEffect(() => {
     let attemptCount = 0;
-    
+
     if (token && useWebSockets) {
       try {
         socketRef.current = io(apiUrl, {
@@ -65,23 +68,25 @@ const ChatSupport: React.FC = () => {
           reconnection: true,
           reconnectionAttempts: 3,
           reconnectionDelay: 1000,
-          timeout: 5000
+          timeout: 5000,
         });
 
-        socketRef.current.on('connect', () => {
-          console.log('WebSocket connected');
+        socketRef.current.on("connect", () => {
+          console.log("WebSocket connected");
           setSocketConnected(true);
           setReconnectAttempts(0);
           attemptCount = 0;
         });
 
-        socketRef.current.on('connect_error', (error) => {
-          console.error('WebSocket connection error:', error);
+        socketRef.current.on("connect_error", (error) => {
+          console.error("WebSocket connection error:", error);
           setSocketConnected(false);
           attemptCount += 1;
           setReconnectAttempts(attemptCount);
           if (attemptCount >= 3) {
-            console.log('Falling back to HTTP-only mode after 3 failed attempts');
+            console.log(
+              "Falling back to HTTP-only mode after 3 failed attempts"
+            );
             setUseWebSockets(false);
             if (socketRef.current) {
               socketRef.current.disconnect();
@@ -90,18 +95,21 @@ const ChatSupport: React.FC = () => {
           }
         });
 
-        socketRef.current.on('disconnect', (reason) => {
-          console.log('WebSocket disconnected:', reason);
+        socketRef.current.on("disconnect", (reason) => {
+          console.log("WebSocket disconnected:", reason);
           setSocketConnected(false);
         });
 
-        socketRef.current.on('message', (data) => {
+        socketRef.current.on("message", (data) => {
           if (data.sessionId === session?.sessionId) {
-            setSession(prevSession => {
+            setSession((prevSession) => {
               if (!prevSession) return null;
               return {
                 ...prevSession,
-                messages: [...prevSession.messages, { role: 'assistant', content: data.content }]
+                messages: [
+                  ...prevSession.messages,
+                  { role: "assistant", content: data.content },
+                ],
               };
             });
             setIsLoading(false);
@@ -115,7 +123,7 @@ const ChatSupport: React.FC = () => {
           }
         };
       } catch (error) {
-        console.error('Error setting up WebSocket:', error);
+        console.error("Error setting up WebSocket:", error);
         setUseWebSockets(false);
       }
     }
@@ -125,12 +133,15 @@ const ChatSupport: React.FC = () => {
   useEffect(() => {
     const pageTitle = getPageTitle(location.pathname);
     const currentPageInfo = pageTitle;
-    
+
     if (currentPage && currentPage !== currentPageInfo) {
       if (session && session.sessionId) {
         const updatedMessages = [
           ...(session.messages || []),
-          { role: 'assistant' as const, content: `📍 You are on page: ${currentPageInfo}` }
+          {
+            role: "assistant" as const,
+            content: `📍 You are on page: ${currentPageInfo}`,
+          },
         ];
         setSession({ ...session, messages: updatedMessages });
       }
@@ -140,12 +151,20 @@ const ChatSupport: React.FC = () => {
 
   // Add page info when chat is first available (session exists and page info not yet set for current session)
   useEffect(() => {
-    if (session && session.sessionId && session.pageIdentifier === location.pathname && !currentPage) {
+    if (
+      session &&
+      session.sessionId &&
+      session.pageIdentifier === location.pathname &&
+      !currentPage
+    ) {
       const pageTitle = getPageTitle(location.pathname);
       const currentPageInfo = pageTitle;
       const updatedMessages = [
         ...(session.messages || []),
-        { role: 'assistant' as const, content: `📍 You are on page: ${currentPageInfo}` }
+        {
+          role: "assistant" as const,
+          content: `📍 You are on page: ${currentPageInfo}`,
+        },
       ];
       setSession({ ...session, messages: updatedMessages });
       setCurrentPage(currentPageInfo);
@@ -155,7 +174,7 @@ const ChatSupport: React.FC = () => {
 
   // Create or get existing chat session when token or pathname changes
   useEffect(() => {
-    if (token) { 
+    if (token) {
       fetchOrCreateSession(); // Always fetch/create when token is present and path might have changed
     }
   }, [token, location.pathname]);
@@ -163,7 +182,10 @@ const ChatSupport: React.FC = () => {
   // Manage page title when chat is opened/closed
   useEffect(() => {
     if (session) {
-      document.title = `Chat Support - Customer Portal (${session.sessionId.substring(0, 8)}...)`;
+      document.title = `Chat Support - Customer Portal (${session.sessionId.substring(
+        0,
+        8
+      )}...)`;
     } else {
       document.title = `Customer Portal - ${getPageTitle(location.pathname)}`;
     }
@@ -172,7 +194,7 @@ const ChatSupport: React.FC = () => {
   // Scroll to bottom of messages
   useEffect(() => {
     if (messagesEndRef.current) {
-      messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
+      messagesEndRef.current.scrollIntoView({ behavior: "smooth" });
     }
   }, [session?.messages]);
 
@@ -181,15 +203,19 @@ const ChatSupport: React.FC = () => {
       setIsLoading(true);
       const currentPathname = location.pathname;
 
-      const sessionsResponse = await axios.get(buildApiUrl('/api/chatbot/sessions'), {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      
+      const sessionsResponse = await axios.get(
+        buildApiUrl("/api/chatbot/sessions"),
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
       if (sessionsResponse.data && sessionsResponse.data.length > 0) {
         const sortedSessions = [...sessionsResponse.data].sort(
-          (a: ChatSession, b: ChatSession) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+          (a: ChatSession, b: ChatSession) =>
+            new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
         );
-        
+
         // Filter for sessions matching the current pageIdentifier
         const pageSpecificSessions = sortedSessions.filter(
           (s: ChatSession) => s.pageIdentifier === currentPathname
@@ -204,7 +230,7 @@ const ChatSupport: React.FC = () => {
         await createNewChatSession(currentPathname); // Pass currentPathname to create new session for this page
       }
     } catch (error) {
-      console.error('Error fetching or creating chat session:', error);
+      console.error("Error fetching or creating chat session:", error);
     } finally {
       setIsLoading(false);
     }
@@ -212,76 +238,81 @@ const ChatSupport: React.FC = () => {
 
   const sendMessage = async () => {
     if (!message.trim() || !session || isLoading) return;
-    
+
     try {
       setIsLoading(true);
       const trimmedMessage = message.trim();
-      setMessage('');
-      
+      setMessage("");
+
       // Create a copy of current session to restore if API call fails
       const currentSession = { ...session };
-      
+
       // Get current page content for RAG
-      const pageContent = document.querySelector('main')?.innerHTML || '';
-      
+      const pageContent = document.querySelector("main")?.innerHTML || "";
+
       // Optimistically update UI with properly typed message
       const updatedMessages: ChatMessage[] = [
         ...(session.messages || []),
-        { role: 'user', content: trimmedMessage }
+        { role: "user", content: trimmedMessage },
       ];
       setSession({ ...session, messages: updatedMessages });
-      
+
       // Send message through WebSocket if connected, otherwise fallback to HTTP
       if (useWebSockets && socketRef.current?.connected) {
-        socketRef.current.emit('message', {
+        socketRef.current.emit("message", {
           sessionId: session.sessionId,
           message: trimmedMessage,
           currentUrl: window.location.pathname,
           pageContext: pageContent,
-          portal: 'customer'
+          portal: "customer",
         });
       } else {
         // HTTP fallback
         const response = await axios.post(
-          buildApiUrl(`/api/chatbot/sessions/${session.sessionId}/messages?portal=customer`),
-          { 
+          buildApiUrl(
+            `/api/chatbot/sessions/${session.sessionId}/messages?portal=customer`
+          ),
+          {
             message: trimmedMessage,
             currentUrl: window.location.pathname,
-            pageContext: pageContent
+            pageContext: pageContent,
           },
           { headers: { Authorization: `Bearer ${token}` } }
         );
-        
+
         if (response.data && response.data.session) {
           setSession(response.data.session);
         } else if (response.data && response.data.response) {
           const assistantMessage: ChatMessage = {
-            role: 'assistant',
-            content: response.data.response
+            role: "assistant",
+            content: response.data.response,
           };
           setSession({
             ...currentSession,
-            messages: [...updatedMessages, assistantMessage]
+            messages: [...updatedMessages, assistantMessage],
           });
         }
         setIsLoading(false);
       }
     } catch (error) {
-      console.error('Error sending message:', error);
+      console.error("Error sending message:", error);
       // Show error message to user
       const assistantMessage: ChatMessage = {
-        role: 'assistant',
-        content: "I'm sorry, there was an error processing your message. Please try again."
+        role: "assistant",
+        content:
+          "I'm sorry, there was an error processing your message. Please try again.",
       };
-      
+
       if (session) {
         setSession({
           ...session,
           messages: [
-            ...session.messages.filter(msg => msg.role !== 'user' || msg.content !== message.trim()),
-            { role: 'user', content: message.trim() },
-            assistantMessage
-          ]
+            ...session.messages.filter(
+              (msg) => msg.role !== "user" || msg.content !== message.trim()
+            ),
+            { role: "user", content: message.trim() },
+            assistantMessage,
+          ],
         });
       }
       setIsLoading(false);
@@ -289,34 +320,35 @@ const ChatSupport: React.FC = () => {
   };
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       sendMessage();
     }
   };
 
   // Filter out system messages for display, but keep navigation messages
-  const displayMessages = session?.messages.filter(msg => 
-    msg.role !== 'system' || msg.content.startsWith('📍')
-  ) || [];
+  const displayMessages =
+    session?.messages.filter(
+      (msg) => msg.role !== "system" || msg.content.startsWith("📍")
+    ) || [];
 
   // Modify createNewChatSession to accept pageIdentifier
   const createNewChatSession = async (pageIdentifier: string) => {
     try {
       setIsLoading(true);
       const createResponse = await axios.post(
-        buildApiUrl('/api/chatbot/sessions?portal=customer'), 
-        { 
+        buildApiUrl("/api/chatbot/sessions?portal=customer"),
+        {
           currentUrl: pageIdentifier, // currentUrl can be the pageIdentifier too
-          pageContext: document.querySelector('main')?.innerHTML || '',
-          pageIdentifier: pageIdentifier // Send pageIdentifier in the body
+          pageContext: document.querySelector("main")?.innerHTML || "",
+          pageIdentifier: pageIdentifier, // Send pageIdentifier in the body
         },
         { headers: { Authorization: `Bearer ${token}` } }
       );
       setSession(createResponse.data);
-      setMessage('');
+      setMessage("");
     } catch (error) {
-      console.error('Error creating new chat session:', error);
+      console.error("Error creating new chat session:", error);
     } finally {
       setIsLoading(false);
     }
@@ -351,7 +383,11 @@ const ChatSupport: React.FC = () => {
             rel="noopener noreferrer"
             className="text-xs text-[#5865F2] inline-flex items-center hover:underline"
           >
-            <img src="https://assets-global.website-files.com/6257adef93867e50d84d30e2/636e0a6a49cf127bf92de1e2_icon_clyde_blurple_RGB.png" alt="Discord" className="w-4 h-4 mr-1" />
+            <img
+              src="https://assets-global.website-files.com/6257adef93867e50d84d30e2/636e0a6a49cf127bf92de1e2_icon_clyde_blurple_RGB.png"
+              alt="Discord"
+              className="w-4 h-4 mr-1"
+            />
             Join Discord for Community Support
           </a>
         </div>
@@ -363,12 +399,12 @@ const ChatSupport: React.FC = () => {
               <div>
                 <p className="text-xs font-medium">You are now on:</p>
                 <div className="mt-1 text-xs bg-gray-100 p-2 rounded text-gray-800 max-h-[60px] overflow-auto">
-                  {currentPage || 'Home Page'}
+                  {currentPage || "Home Page"}
                 </div>
               </div>
-              <Button 
-                variant="ghost" 
-                size="sm" 
+              <Button
+                variant="ghost"
+                size="sm"
                 className="h-5 w-5 p-0 ml-auto -mt-1 -mr-1"
                 onClick={() => setShowPageNotification(false)}
               >
@@ -380,38 +416,62 @@ const ChatSupport: React.FC = () => {
 
         {displayMessages.length === 0 ? (
           <div className="text-center text-gray-500 mt-10">
-            <h4 className="text-base font-medium mb-2">Your 24/7 marketing operator.</h4>
+            <h4 className="text-base font-medium mb-2">
+              Your 24/7 marketing operator.
+            </h4>
             <p className="text-sm px-6">
-              Ask Emma to run market research, plan and optimize campaigns, or track performance metrics.
+              Ask Emma to run market research, plan and optimize campaigns, or
+              track performance metrics.
             </p>
           </div>
         ) : (
           displayMessages.map((msg, index) => (
             <div
               key={index}
-              className={`mb-3 ${msg.role === 'user' ? 'text-right' : 'text-left'} animate-in fade-in slide-in-from-bottom-5`}
+              className={`mb-3 ${
+                msg.role === "user" ? "text-right" : "text-left"
+              } animate-in fade-in slide-in-from-bottom-5`}
             >
               <div
                 className={`inline-block p-3 rounded-lg max-w-[85%] shadow-sm
-                  ${msg.role === 'user' 
-                    ? 'bg-[#7E69AB] text-white rounded-br-none' 
-                    : 'bg-white text-gray-800 border border-gray-100 rounded-bl-none'}
+                  ${
+                    msg.role === "user"
+                      ? "bg-[#7E69AB] text-white rounded-br-none"
+                      : "bg-white text-gray-800 border border-gray-100 rounded-bl-none"
+                  }
                 `}
               >
-                <div className={`flex items-center mb-1.5 pb-1.5 border-b ${msg.role === 'user' ? 'border-white/20' : 'border-gray-100'}`}>
-                  {msg.role === 'assistant' 
-                    ? <Bot className="h-4 w-4 mr-1.5 opacity-70" /> 
-                    : <User className="h-4 w-4 mr-1.5 opacity-70" />
-                  }
+                <div
+                  className={`flex items-center mb-1.5 pb-1.5 border-b ${
+                    msg.role === "user" ? "border-white/20" : "border-gray-100"
+                  }`}
+                >
+                  {msg.role === "assistant" ? (
+                    <Bot className="h-4 w-4 mr-1.5 opacity-70" />
+                  ) : (
+                    <User className="h-4 w-4 mr-1.5 opacity-70" />
+                  )}
                   <span className="text-xs font-semibold tracking-wide">
-                    {msg.role === 'assistant' ? 'Emma' : 'You'}
+                    {msg.role === "assistant" ? "Emma" : "You"}
                   </span>
                 </div>
                 <div className="text-sm whitespace-normal leading-relaxed prose dark:prose-invert prose-sm max-w-full">
-                  {msg.role === 'assistant' ? (
-                    <div dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(msg.content, { USE_PROFILES: { html: true } }) }} />
+                  {msg.role === "assistant" ? (
+                    <div
+                      dangerouslySetInnerHTML={{
+                        __html: DOMPurify.sanitize(msg.content, {
+                          USE_PROFILES: { html: true },
+                        }),
+                      }}
+                    />
                   ) : (
-                    <div dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(msg.content, { USE_PROFILES: { html: true } }) }} />
+                    <div
+                      dangerouslySetInnerHTML={{
+                        __html: DOMPurify.sanitize(msg.content, {
+                          USE_PROFILES: { html: true },
+                        }),
+                      }}
+                    />
                   )}
                 </div>
               </div>
@@ -440,7 +500,7 @@ const ChatSupport: React.FC = () => {
             size="icon"
             onClick={sendMessage}
             disabled={isLoading || !message.trim() || !session}
-            className="h-10 w-10 rounded-full flex-shrink-0 agent-gradient"
+            className="h-10 w-10 rounded-full flex-shrink-0 use-template-button"
           >
             <SendIcon className="h-5 w-5" />
           </Button>
@@ -450,4 +510,4 @@ const ChatSupport: React.FC = () => {
   );
 };
 
-export default ChatSupport; 
+export default ChatSupport;

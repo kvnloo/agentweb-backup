@@ -13,14 +13,14 @@ interface PromptFormProps {
   buttonText?: string;
 }
 
-export const PromptForm = ({ 
-  prompt, 
-  setPrompt, 
+export const PromptForm = ({
+  prompt,
+  setPrompt,
   onSubmit,
   isTemplateOpen,
   setIsTemplateOpen,
   placeholder,
-  buttonText
+  buttonText,
 }: PromptFormProps) => {
   return (
     <form onSubmit={onSubmit} className="p-4">
@@ -29,21 +29,25 @@ export const PromptForm = ({
           placeholder={placeholder || "Enter your task details or question..."}
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
-          className="resize-none p-4 min-h-[180px] bg-white border-[#D6BCFA] rounded-lg text-gray-900"
+          className="resize-none p-4 min-h-[180px] rounded-lg"
         />
       </div>
       <div className="flex justify-between mt-4">
-        <Button 
+        <Button
           variant="outline"
-          type="button"
-          className="text-gray-600 border-[#9b87f5] hover:bg-[#F3EFFD]"
+          className="text-gray-200 border-[#9b87f5] hover:bg-[#F3EFFD] h0"
           onClick={() => setIsTemplateOpen(!isTemplateOpen)}
         >
-          Templates {isTemplateOpen ? <ChevronUp className="ml-1 h-4 w-4" /> : <ChevronDown className="ml-1 h-4 w-4" />}
+          Templates{" "}
+          {isTemplateOpen ? (
+            <ChevronUp className="ml-1 h-4 w-4" />
+          ) : (
+            <ChevronDown className="ml-1 h-4 w-4" />
+          )}
         </Button>
-        <Button 
-          type="submit" 
-          disabled={!prompt.trim()} 
+        <Button
+          type="submit"
+          disabled={!prompt.trim()}
           className="bg-[#9b87f5] hover:bg-[#7E69AB] text-white"
         >
           <Send className="h-4 w-4 mr-2" />

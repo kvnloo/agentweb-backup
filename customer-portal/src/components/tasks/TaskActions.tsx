@@ -1,4 +1,3 @@
-
 import React from "react";
 import { DialogFooter } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
@@ -18,13 +17,13 @@ export const TaskActions: React.FC<TaskActionsProps> = ({
   status,
   onRunTask,
   onArchiveTask,
-  onClose
+  onClose,
 }) => {
   return (
     <DialogFooter className="flex justify-between items-center mt-4">
       <div>
-        <Button 
-          variant="destructive" 
+        <Button
+          variant="destructive"
           onClick={() => {
             onArchiveTask(taskId);
             onClose();
@@ -35,10 +34,7 @@ export const TaskActions: React.FC<TaskActionsProps> = ({
         </Button>
       </div>
       <div className="flex gap-2">
-        <Button
-          variant="outline"
-          onClick={onClose}
-        >
+        <Button className="secondary-button" onClick={onClose}>
           Close
         </Button>
         <Button

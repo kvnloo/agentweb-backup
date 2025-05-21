@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useState, useEffect } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   Container,
   Typography,
@@ -29,32 +29,32 @@ import {
   InputLabel,
   Select,
   MenuItem,
-  FormControl
-} from '@mui/material';
-import { 
-  Edit as EditIcon, 
-  Delete as DeleteIcon, 
+  FormControl,
+} from "@mui/material";
+import {
+  Edit as EditIcon,
+  Delete as DeleteIcon,
   Add as AddIcon,
   Public as PublicIcon,
   PublicOff as PublicOffIcon,
   AdminPanelSettings as AdminIcon,
   ArrowUpward as ArrowUpwardIcon,
-  ArrowDownward as ArrowDownwardIcon
-} from '@mui/icons-material';
-import axios from 'axios';
-import { useAuth } from '../contexts/AuthContext';
-import { buildApiUrl } from '../config';
-import { AVAILABLE_LLMS } from '../config';
+  ArrowDownward as ArrowDownwardIcon,
+} from "@mui/icons-material";
+import axios from "axios";
+import { useAuth } from "../contexts/AuthContext";
+import { buildApiUrl } from "../config";
+import { AVAILABLE_LLMS } from "../config";
 
 // Define supported categories
 const SUPPORTED_CATEGORIES = [
-  'Market Research',
-  'Creative Research',
-  'Social Listening',
-  'Productivity',
-  'Life',
-  'Data Analysis',
-  'Custom' // Allows free text input
+  "Market Research",
+  "Creative Research",
+  "Social Listening",
+  "Productivity",
+  "Life",
+  "Data Analysis",
+  "Custom", // Allows free text input
 ];
 
 interface Template {
@@ -82,28 +82,30 @@ interface Template {
 const extractParameters = (prompt: string): string[] => {
   const paramRegex = /\[([^\]]+)\]/g;
   const matches = prompt.match(paramRegex) || [];
-  
+
   // Extract parameter names without brackets and remove duplicates
-  return [...new Set(matches.map(match => match.slice(1, -1)))];
+  return [...new Set(matches.map((match) => match.slice(1, -1)))];
 };
 
 export default function Templates() {
   const [templates, setTemplates] = useState<Template[]>([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
+  const [error, setError] = useState("");
   const [openDialog, setOpenDialog] = useState(false);
-  const [deleteId, setDeleteId] = useState('');
+  const [deleteId, setDeleteId] = useState("");
   const [openEditDialog, setOpenEditDialog] = useState(false);
   const [currentTemplate, setCurrentTemplate] = useState<Template | null>(null);
   const [publishLoading, setPublishLoading] = useState<string | null>(null);
-  const [selectedNameParameter, setSelectedNameParameter] = useState<string | null>(null);
-  const [category, setCategory] = useState(''); // Added category state for form
-  const [customCategory, setCustomCategory] = useState(''); // Added for custom category input
-  
+  const [selectedNameParameter, setSelectedNameParameter] = useState<
+    string | null
+  >(null);
+  const [category, setCategory] = useState(""); // Added category state for form
+  const [customCategory, setCustomCategory] = useState(""); // Added for custom category input
+
   // Form state
-  const [name, setName] = useState('');
-  const [description, setDescription] = useState('');
-  const [prompt, setPrompt] = useState('');
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [prompt, setPrompt] = useState("");
   const [isInteractive, setIsInteractive] = useState(false);
   const [isDeepResearch, setIsDeepResearch] = useState(false);
   const [isComplexTask, setIsComplexTask] = useState(false);
@@ -111,14 +113,14 @@ export default function Templates() {
   const [outputAsHtml, setOutputAsHtml] = useState(false); // New state for HTML output
   const [selectedLLMs, setSelectedLLMs] = useState<string[]>([]); // New state for selected LLMs
   const [useSharedBrowser, setUseSharedBrowser] = useState(false); // ADDED: State for the toggle
-  
+
   const { token, user } = useAuth();
   const navigate = useNavigate();
 
   // Check if user is admin and redirect if not
   useEffect(() => {
     if (user && !user.isAdmin) {
-      navigate('/tasks');
+      navigate("/tasks");
     }
   }, [user, navigate]);
 
@@ -131,13 +133,13 @@ export default function Templates() {
   const fetchTemplates = async () => {
     setLoading(true);
     try {
-      const response = await axios.get(buildApiUrl('/api/templates'), {
+      const response = await axios.get(buildApiUrl("/api/templates"), {
         headers: { Authorization: `Bearer ${token}` },
       });
       setTemplates(response.data);
-      setError('');
+      setError("");
     } catch (err) {
-      setError('Failed to fetch templates');
+      setError("Failed to fetch templates");
       console.error(err);
     } finally {
       setLoading(false);
@@ -151,7 +153,7 @@ export default function Templates() {
 
   const handleCloseDialog = () => {
     setOpenDialog(false);
-    setDeleteId('');
+    setDeleteId("");
   };
 
   const handleDelete = async () => {
@@ -159,10 +161,12 @@ export default function Templates() {
       await axios.delete(buildApiUrl(`/api/templates/${deleteId}`), {
         headers: { Authorization: `Bearer ${token}` },
       });
-      setTemplates(templates.filter(template => template.templateId !== deleteId));
+      setTemplates(
+        templates.filter((template) => template.templateId !== deleteId)
+      );
       handleCloseDialog();
     } catch (err) {
-      setError('Failed to delete template');
+      setError("Failed to delete template");
       console.error(err);
       handleCloseDialog();
     }
@@ -172,34 +176,37 @@ export default function Templates() {
     if (template) {
       setCurrentTemplate(template);
       setName(template.name);
-      setDescription(template.description || '');
+      setDescription(template.description || "");
       setPrompt(template.prompt);
       setIsInteractive(template.isInteractive);
       setIsDeepResearch(template.isDeepResearch);
       setIsComplexTask(template.isComplexTask);
       setSelectedNameParameter(template.nameParameter);
-      setCategory(template.category || ''); // Set category from template
+      setCategory(template.category || ""); // Set category from template
       setOutputAsJson(template.outputAsJson || false); // Set outputAsJson
       setOutputAsHtml(template.outputAsHtml || false); // Set outputAsHtml
       setSelectedLLMs(template.selectedLLMs || []); // Set selectedLLMs
       setUseSharedBrowser(template.useSharedBrowser || false); // ADDED: Set useSharedBrowser state
-      if (template.category && !SUPPORTED_CATEGORIES.includes(template.category)) {
+      if (
+        template.category &&
+        !SUPPORTED_CATEGORIES.includes(template.category)
+      ) {
         setCustomCategory(template.category); // If existing category is custom
-        setCategory('Custom');
+        setCategory("Custom");
       } else {
-        setCustomCategory('');
+        setCustomCategory("");
       }
     } else {
       setCurrentTemplate(null);
-      setName('');
-      setDescription('');
-      setPrompt('');
+      setName("");
+      setDescription("");
+      setPrompt("");
       setIsInteractive(false);
       setIsDeepResearch(false);
       setIsComplexTask(false);
       setSelectedNameParameter(null);
-      setCategory(''); // Reset category for new template
-      setCustomCategory('');
+      setCategory(""); // Reset category for new template
+      setCustomCategory("");
       setOutputAsJson(false); // Reset outputAsJson
       setOutputAsHtml(false); // Reset outputAsHtml
       setSelectedLLMs([]); // Reset selectedLLMs
@@ -212,19 +219,19 @@ export default function Templates() {
     setOpenEditDialog(false);
     setCurrentTemplate(null);
     setSelectedNameParameter(null);
-    setCategory('');
-    setCustomCategory('');
+    setCategory("");
+    setCustomCategory("");
     setSelectedLLMs([]); // Clear selected LLMs on close
   };
 
   const handleSubmit = async () => {
     try {
       if (!name || !prompt) {
-        setError('Name and prompt are required');
+        setError("Name and prompt are required");
         return;
       }
-      
-      const finalCategory = category === 'Custom' ? customCategory : category;
+
+      const finalCategory = category === "Custom" ? customCategory : category;
 
       const templateData: any = {
         name,
@@ -236,13 +243,17 @@ export default function Templates() {
         nameParameter: selectedNameParameter,
         category: finalCategory || undefined, // Send finalCategory or undefined
         outputAsJson: outputAsJson, // Add outputAsJson to template data
-        outputAsHtml: outputAsHtml,  // Add outputAsHtml to template data
+        outputAsHtml: outputAsHtml, // Add outputAsHtml to template data
         selectedLLMs: selectedLLMs, // Add selectedLLMs to template data
-        useSharedBrowser: useSharedBrowser // ADDED: Add useSharedBrowser to template data
+        useSharedBrowser: useSharedBrowser, // ADDED: Add useSharedBrowser to template data
       };
 
       // Check if we're updating an existing template (has a valid templateId)
-      if (currentTemplate && currentTemplate.templateId && currentTemplate.templateId.length > 0) {
+      if (
+        currentTemplate &&
+        currentTemplate.templateId &&
+        currentTemplate.templateId.length > 0
+      ) {
         // Update existing template
         const updateResponse = await axios.put<Template>(
           buildApiUrl(`/api/templates/${currentTemplate.templateId}`),
@@ -251,47 +262,62 @@ export default function Templates() {
             headers: { Authorization: `Bearer ${token}` },
           }
         );
-        
+
         // Update the templates list
         setTemplates(
-          templates.map(template => 
-            template.templateId === currentTemplate.templateId ? updateResponse.data : template
+          templates.map((template) =>
+            template.templateId === currentTemplate.templateId
+              ? updateResponse.data
+              : template
           )
         );
       } else {
         // Create new template
         const createResponse = await axios.post<Template>(
-          buildApiUrl('/api/templates'),
+          buildApiUrl("/api/templates"),
           templateData,
           {
             headers: { Authorization: `Bearer ${token}` },
           }
         );
-        
+
         // Add the new template to the list
         setTemplates([...templates, createResponse.data]);
       }
-      
+
       handleCloseEditDialog();
     } catch (err) {
-      setError(currentTemplate ? 'Failed to update template' : 'Failed to create template');
+      setError(
+        currentTemplate
+          ? "Failed to update template"
+          : "Failed to create template"
+      );
       console.error(err);
     }
   };
 
-  const handleMoveLLM = (index: number, direction: 'up' | 'down') => {
-    if (direction === 'up' && index > 0) {
+  const handleMoveLLM = (index: number, direction: "up" | "down") => {
+    if (direction === "up" && index > 0) {
       const newLLMs = [...selectedLLMs];
-      [newLLMs[index - 1], newLLMs[index]] = [newLLMs[index], newLLMs[index - 1]];
+      [newLLMs[index - 1], newLLMs[index]] = [
+        newLLMs[index],
+        newLLMs[index - 1],
+      ];
       setSelectedLLMs(newLLMs);
-    } else if (direction === 'down' && index < selectedLLMs.length - 1) {
+    } else if (direction === "down" && index < selectedLLMs.length - 1) {
       const newLLMs = [...selectedLLMs];
-      [newLLMs[index + 1], newLLMs[index]] = [newLLMs[index], newLLMs[index + 1]];
+      [newLLMs[index + 1], newLLMs[index]] = [
+        newLLMs[index],
+        newLLMs[index + 1],
+      ];
       setSelectedLLMs(newLLMs);
     }
   };
 
-  const handlePublishToggle = async (templateId: string, currentStatus: boolean) => {
+  const handlePublishToggle = async (
+    templateId: string,
+    currentStatus: boolean
+  ) => {
     setPublishLoading(templateId);
     try {
       const response = await axios.put(
@@ -301,15 +327,15 @@ export default function Templates() {
           headers: { Authorization: `Bearer ${token}` },
         }
       );
-      
+
       // Update the templates list
       setTemplates(
-        templates.map(template => 
+        templates.map((template) =>
           template.templateId === templateId ? response.data : template
         )
       );
     } catch (err) {
-      setError('Failed to update template publish status');
+      setError("Failed to update template publish status");
       console.error(err);
     } finally {
       setPublishLoading(null);
@@ -329,7 +355,8 @@ export default function Templates() {
     if (templates.length === 0) {
       return (
         <Alert severity="info" sx={{ mt: 2 }}>
-          You don't have any templates yet. Create your first template to get started.
+          You don't have any templates yet. Create your first template to get
+          started.
         </Alert>
       );
     }
@@ -356,38 +383,40 @@ export default function Templates() {
                   {template.name}
                   {template.published && (
                     <Tooltip title="This template is published and available to all users">
-                      <Chip 
+                      <Chip
                         icon={<PublicIcon fontSize="small" />}
-                        label="Published" 
-                        color="success" 
+                        label="Published"
+                        color="success"
                         size="small"
                         sx={{ ml: 1 }}
                       />
                     </Tooltip>
                   )}
                   {template.nameParameter && (
-                    <Tooltip title={`Uses parameter [${template.nameParameter}] in task name`}>
-                      <Chip 
-                        label="Named" 
-                        size="small"
-                        sx={{ ml: 1 }}
-                      />
+                    <Tooltip
+                      title={`Uses parameter [${template.nameParameter}] in task name`}
+                    >
+                      <Chip label="Named" size="small" sx={{ ml: 1 }} />
                     </Tooltip>
                   )}
                 </TableCell>
-                <TableCell>{template.description || '-'}</TableCell>
+                <TableCell>{template.description || "-"}</TableCell>
                 <TableCell>
-                  {template.category ? <Chip label={template.category} size="small" /> : '-'}
+                  {template.category ? (
+                    <Chip label={template.category} size="small" />
+                  ) : (
+                    "-"
+                  )}
                 </TableCell>
                 <TableCell>
                   {template.parameters && template.parameters.length > 0 ? (
-                    <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
-                      {template.parameters.map(param => (
+                    <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5 }}>
+                      {template.parameters.map((param) => (
                         <Chip key={param} label={param} size="small" />
                       ))}
                     </Box>
                   ) : (
-                    'None'
+                    "None"
                   )}
                 </TableCell>
                 <TableCell>
@@ -395,15 +424,24 @@ export default function Templates() {
                     variant={template.published ? "outlined" : "contained"}
                     color={template.published ? "success" : "primary"}
                     size="small"
-                    startIcon={template.published ? <PublicOffIcon /> : <PublicIcon />}
-                    onClick={() => handlePublishToggle(template.templateId, template.published)}
+                    startIcon={
+                      template.published ? <PublicOffIcon /> : <PublicIcon />
+                    }
+                    onClick={() =>
+                      handlePublishToggle(
+                        template.templateId,
+                        template.published
+                      )
+                    }
                     disabled={publishLoading === template.templateId}
-                    sx={{ minWidth: '130px' }}
+                    sx={{ minWidth: "130px" }}
                   >
                     {publishLoading === template.templateId ? (
                       <CircularProgress size={20} />
+                    ) : template.published ? (
+                      "Unpublish"
                     ) : (
-                      template.published ? "Unpublish" : "Publish"
+                      "Publish"
                     )}
                   </Button>
                 </TableCell>
@@ -412,12 +450,16 @@ export default function Templates() {
                 <TableCell>
                   <Stack direction="row" spacing={1}>
                     <Tooltip title="Edit Template">
-                      <IconButton onClick={() => handleOpenEditDialog(template)}>
+                      <IconButton
+                        onClick={() => handleOpenEditDialog(template)}
+                      >
                         <EditIcon />
                       </IconButton>
                     </Tooltip>
                     <Tooltip title="Delete Template">
-                      <IconButton onClick={() => handleOpenDialog(template.templateId)}>
+                      <IconButton
+                        onClick={() => handleOpenDialog(template.templateId)}
+                      >
                         <DeleteIcon />
                       </IconButton>
                     </Tooltip>
@@ -434,8 +476,15 @@ export default function Templates() {
   return (
     <Container maxWidth="lg">
       <Paper sx={{ p: 4, mt: 4 }}>
-        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 3 }}>
-          <Box sx={{ display: 'flex', alignItems: 'center' }}>
+        <Box
+          sx={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            mb: 3,
+          }}
+        >
+          <Box sx={{ display: "flex", alignItems: "center" }}>
             <AdminIcon color="primary" sx={{ mr: 1 }} />
             <Typography variant="h4" component="h1">
               Template Management
@@ -452,8 +501,9 @@ export default function Templates() {
         </Box>
 
         <Alert severity="info" sx={{ mb: 3 }}>
-          As an admin, you can create and manage templates that will be available to all users when creating tasks.
-          Published templates will appear in the task creation page for all users.
+          As an admin, you can create and manage templates that will be
+          available to all users when creating tasks. Published templates will
+          appear in the task creation page for all users.
         </Alert>
 
         {error && (
@@ -463,7 +513,7 @@ export default function Templates() {
         )}
 
         {loading ? (
-          <Box sx={{ display: 'flex', justifyContent: 'center', p: 3 }}>
+          <Box sx={{ display: "flex", justifyContent: "center", p: 3 }}>
             <CircularProgress />
           </Box>
         ) : (
@@ -476,7 +526,8 @@ export default function Templates() {
         <DialogTitle>Delete Template</DialogTitle>
         <DialogContent>
           <DialogContentText>
-            Are you sure you want to delete this template? This action cannot be undone.
+            Are you sure you want to delete this template? This action cannot be
+            undone.
           </DialogContentText>
         </DialogContent>
         <DialogActions>
@@ -488,9 +539,14 @@ export default function Templates() {
       </Dialog>
 
       {/* Create/Edit Template Dialog */}
-      <Dialog open={openEditDialog} onClose={handleCloseEditDialog} maxWidth="md" fullWidth>
+      <Dialog
+        open={openEditDialog}
+        onClose={handleCloseEditDialog}
+        maxWidth="md"
+        fullWidth
+      >
         <DialogTitle>
-          {currentTemplate ? 'Edit Template' : 'Create Template'}
+          {currentTemplate ? "Edit Template" : "Create Template"}
         </DialogTitle>
         <DialogContent>
           <TextField
@@ -511,14 +567,18 @@ export default function Templates() {
               label="Category"
               onChange={(e) => setCategory(e.target.value as string)}
             >
-              <MenuItem value=""><em>(None)</em></MenuItem>
-              {SUPPORTED_CATEGORIES.map(cat => (
-                <MenuItem key={cat} value={cat}>{cat}</MenuItem>
+              <MenuItem value="">
+                <em>(None)</em>
+              </MenuItem>
+              {SUPPORTED_CATEGORIES.map((cat) => (
+                <MenuItem key={cat} value={cat}>
+                  {cat}
+                </MenuItem>
               ))}
             </Select>
           </FormControl>
 
-          {category === 'Custom' && (
+          {category === "Custom" && (
             <TextField
               margin="dense"
               label="Custom Category Name"
@@ -553,31 +613,38 @@ export default function Templates() {
             onChange={(e) => setPrompt(e.target.value)}
             helperText="The task instructions in natural language. You can include parameters in the format [parameter_name] that users will be prompted to fill in when creating a task from this template."
           />
-          
+
           {/* LLM Selection */}
           <FormControl fullWidth margin="normal">
-            <InputLabel id="llm-select-label">Allowed LLMs (Optional)</InputLabel>
+            <InputLabel id="llm-select-label">
+              Allowed LLMs (Optional)
+            </InputLabel>
             <Select
               labelId="llm-select-label"
               id="llm-select"
               multiple
               value={selectedLLMs}
-              onChange={(event) => setSelectedLLMs(event.target.value as string[])}
+              onChange={(event) =>
+                setSelectedLLMs(event.target.value as string[])
+              }
               label="Allowed LLMs (Optional)"
               renderValue={(selected) => (
-                <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
+                <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5 }}>
                   {(selected as string[]).map((value) => (
-                    <Chip key={value} label={value.split('->').pop() || value} /> // Display only the model name part
+                    <Chip
+                      key={value}
+                      label={value.split("->").pop() || value}
+                    /> // Display only the model name part
                   ))}
                 </Box>
               )}
             >
               {AVAILABLE_LLMS.map((llm: string) => {
-                const [provider, vendor, modelName] = llm.split('->');
+                const [provider, vendor, modelName] = llm.split("->");
                 const displayName = modelName || llm; // Fallback to full name if parsing fails
                 return (
-                  <MenuItem 
-                    key={llm} 
+                  <MenuItem
+                    key={llm}
                     value={llm}
                     selected={selectedLLMs.includes(llm)}
                   >
@@ -586,28 +653,63 @@ export default function Templates() {
                 );
               })}
             </Select>
-            <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5 }}>
-              Select specific LLMs to be available for tasks created from this template. If none are selected, all allowed LLMs for the task type will be available.
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              sx={{ mt: 0.5 }}
+            >
+              Select specific LLMs to be available for tasks created from this
+              template. If none are selected, all allowed LLMs for the task type
+              will be available.
             </Typography>
           </FormControl>
-          
-          {/* UI for reordering selected LLMs */} 
+
+          {/* UI for reordering selected LLMs */}
           {selectedLLMs.length > 0 && (
-            <Box sx={{ mt: 2, p: 2, border: '1px solid', borderColor: 'divider', borderRadius: 1 }}>
+            <Box
+              sx={{
+                mt: 2,
+                p: 2,
+                border: "1px solid",
+                borderColor: "divider",
+                borderRadius: 1,
+              }}
+            >
               <Typography variant="subtitle2" gutterBottom>
                 Selected LLMs Order (Drag to reorder coming soon)
               </Typography>
               {selectedLLMs.map((llm, index) => {
-                const [,, modelName] = llm.split('->');
+                const [, , modelName] = llm.split("->");
                 const displayName = modelName || llm;
                 return (
-                  <Box key={llm} sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 1, p: 1, backgroundColor: 'action.hover', borderRadius: 1}}>
-                    <Typography variant="body2">{`${index + 1}. ${displayName}`}</Typography>
+                  <Box
+                    key={llm}
+                    sx={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      mb: 1,
+                      p: 1,
+                      backgroundColor: "action.hover",
+                      borderRadius: 1,
+                    }}
+                  >
+                    <Typography variant="body2">{`${
+                      index + 1
+                    }. ${displayName}`}</Typography>
                     <Box>
-                      <IconButton size="small" onClick={() => handleMoveLLM(index, 'up')} disabled={index === 0}>
+                      <IconButton
+                        size="small"
+                        onClick={() => handleMoveLLM(index, "up")}
+                        disabled={index === 0}
+                      >
                         <ArrowUpwardIcon fontSize="inherit" />
                       </IconButton>
-                      <IconButton size="small" onClick={() => handleMoveLLM(index, 'down')} disabled={index === selectedLLMs.length - 1}>
+                      <IconButton
+                        size="small"
+                        onClick={() => handleMoveLLM(index, "down")}
+                        disabled={index === selectedLLMs.length - 1}
+                      >
                         <ArrowDownwardIcon fontSize="inherit" />
                       </IconButton>
                     </Box>
@@ -616,28 +718,34 @@ export default function Templates() {
               })}
             </Box>
           )}
-          
+
           {/* Display detected parameters */}
           {prompt && (
             <Box sx={{ mt: 2 }}>
               <Typography variant="subtitle2" gutterBottom>
                 Detected Parameters:
               </Typography>
-              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
+              <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5 }}>
                 {(() => {
                   const params = extractParameters(prompt);
                   return params.length > 0 ? (
                     params.map((param: string) => (
-                      <Chip key={param} label={param} size="small" color="primary" />
+                      <Chip
+                        key={param}
+                        label={param}
+                        size="small"
+                        color="primary"
+                      />
                     ))
                   ) : (
                     <Typography variant="body2" color="text.secondary">
-                      No parameters detected. Add parameters using the format [parameter_name] in your prompt.
+                      No parameters detected. Add parameters using the format
+                      [parameter_name] in your prompt.
                     </Typography>
                   );
                 })()}
               </Box>
-              
+
               {/* Parameter for task name */}
               {extractParameters(prompt).length > 0 && (
                 <Box sx={{ mt: 2 }}>
@@ -645,34 +753,45 @@ export default function Templates() {
                     Parameter for Task Name:
                   </Typography>
                   <Typography variant="body2" color="text.secondary" paragraph>
-                    Select a parameter to include in the task name. This helps differentiate tasks created from this template.
+                    Select a parameter to include in the task name. This helps
+                    differentiate tasks created from this template.
                   </Typography>
-                  <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
-                    <Chip 
-                      label="None" 
-                      color={selectedNameParameter === null ? "primary" : "default"}
+                  <Box sx={{ display: "flex", flexWrap: "wrap", gap: 1 }}>
+                    <Chip
+                      label="None"
+                      color={
+                        selectedNameParameter === null ? "primary" : "default"
+                      }
                       onClick={() => setSelectedNameParameter(null)}
                     />
-                    {extractParameters(prompt).map(param => (
-                      <Chip 
+                    {extractParameters(prompt).map((param) => (
+                      <Chip
                         key={param}
                         label={param}
-                        color={selectedNameParameter === param ? "primary" : "default"}
+                        color={
+                          selectedNameParameter === param
+                            ? "primary"
+                            : "default"
+                        }
                         onClick={() => setSelectedNameParameter(param)}
                       />
                     ))}
                   </Box>
-                  <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-                    {selectedNameParameter 
-                      ? `Tasks will be named: "${name} - [${selectedNameParameter}]"` 
+                  <Typography
+                    variant="body2"
+                    color="text.secondary"
+                    sx={{ mt: 1 }}
+                  >
+                    {selectedNameParameter
+                      ? `Tasks will be named: "${name} - [${selectedNameParameter}]"`
                       : "Tasks will use the template name without modification."}
                   </Typography>
                 </Box>
               )}
             </Box>
           )}
-          
-          <Box sx={{ mt: 2, display: 'flex', flexDirection: 'column', gap: 1 }}>
+
+          <Box sx={{ mt: 2, display: "flex", flexDirection: "column", gap: 1 }}>
             <Tooltip title="When enabled, the AI agent can ask for additional information during task execution">
               <FormControlLabel
                 control={
@@ -720,30 +839,50 @@ export default function Templates() {
               />
             </Tooltip>
             <FormControlLabel
-              control={<Switch checked={outputAsJson} onChange={(e) => { setOutputAsJson(e.target.checked); if (e.target.checked) setOutputAsHtml(false); }} />}
+              control={
+                <Switch
+                  checked={outputAsJson}
+                  onChange={(e) => {
+                    setOutputAsJson(e.target.checked);
+                    if (e.target.checked) setOutputAsHtml(false);
+                  }}
+                />
+              }
               label="Output as JSON"
               disabled={isDeepResearch}
             />
             <FormControlLabel
-              control={<Switch checked={outputAsHtml} onChange={(e) => { setOutputAsHtml(e.target.checked); if (e.target.checked) setOutputAsJson(false); }} />}
+              control={
+                <Switch
+                  checked={outputAsHtml}
+                  onChange={(e) => {
+                    setOutputAsHtml(e.target.checked);
+                    if (e.target.checked) setOutputAsJson(false);
+                  }}
+                />
+              }
               label="Output as HTML5"
               disabled={isDeepResearch}
             />
             <FormControlLabel
-              control={<Switch checked={useSharedBrowser} onChange={(e) => setUseSharedBrowser(e.target.checked)} />}
+              control={
+                <Switch
+                  checked={useSharedBrowser}
+                  onChange={(e) => setUseSharedBrowser(e.target.checked)}
+                />
+              }
               label="Use Shared Browser"
               disabled={isDeepResearch}
             />
           </Box>
-          
         </DialogContent>
         <DialogActions>
           <Button onClick={handleCloseEditDialog}>Cancel</Button>
           <Button onClick={handleSubmit} color="primary">
-            {currentTemplate ? 'Update' : 'Create'}
+            {currentTemplate ? "Update" : "Create"}
           </Button>
         </DialogActions>
       </Dialog>
     </Container>
   );
-} 
+}
