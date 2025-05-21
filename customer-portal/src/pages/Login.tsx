@@ -68,7 +68,10 @@ const Login = () => {
     >
       <Card
         className="w-full max-w-md rounded-[24px] shadow-lg"
-        style={{ backgroundColor: "#1B2549" }}
+        style={{
+          backgroundColor: "#1B2549",
+          boxShadow: "0 0 20px rgba(100, 63, 126, 0.2)",
+        }}
       >
         <CardHeader className="space-y-1">
           <div className="flex justify-center mb-4">
@@ -76,11 +79,19 @@ const Login = () => {
           </div>
           <CardTitle
             className="text-2xl font-bold text-center text-white"
-            style={{ fontFamily: "Inter, sans-serif" }}
+            style={{
+              fontFamily: "Inter, sans-serif",
+              fontSize: "28px",
+              fontWeight: 800,
+              letterSpacing: "-0.5px",
+            }}
           >
             Customer Portal
           </CardTitle>
-          <CardDescription className="text-center text-gray-300">
+          <CardDescription
+            className="text-center"
+            style={{ color: "rgba(255,255,255,0.8)" }}
+          >
             Enter your credentials to access your customer dashboard
           </CardDescription>
         </CardHeader>
@@ -109,6 +120,7 @@ const Login = () => {
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   required
+                  className="rounded-[8px] border border-[#7A6999] focus:border-[#ECAC5F] focus:shadow-[0_0_4px_#ECAC5F] transition-all duration-300 ease-in-out"
                 />
               </div>
               <div className="space-y-2">
@@ -121,6 +133,7 @@ const Login = () => {
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   required
+                  className="rounded-[8px] border border-[#7A6999] focus:border-[#ECAC5F] focus:shadow-[0_0_4px_#ECAC5F] transition-all duration-300 ease-in-out"
                 />
               </div>
 
@@ -138,9 +151,10 @@ const Login = () => {
 
               <Button
                 type="submit"
-                className="w-full text-white font-bold"
+                className="w-full text-white font-bold py-[12px] hover:brightness-110 transition-all duration-300 ease-in-out"
                 style={{
-                  background: "linear-gradient(90deg, #BD8891, #6F3ED8)",
+                  background:
+                    "linear-gradient(90deg, #643B7E 0%, #6F3DFD 100%)",
                 }}
                 disabled={isLoading}
               >
