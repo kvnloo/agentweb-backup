@@ -324,7 +324,7 @@ const Dashboard = () => {
         )}
       </div>
 
-      <div className="flex flex-col flex-1 rounded-lg bg-white border border-gray-200 shadow-sm overflow-hidden">
+      <div className="flex flex-col flex-1 rounded-lg border overflow-hidden">
         {/* Conditionally render the MessageList container only if there are messages */}
         {messages.length > 0 && (
           <div className="flex-1 overflow-hidden">
@@ -332,7 +332,7 @@ const Dashboard = () => {
           </div>
         )}
 
-        <div className="border-t border-[#D6BCFA] bg-[#F3EFFD]">
+        <div className="border-t">
           <PromptForm
             prompt={promptTextState}
             setPrompt={setPromptTextState}

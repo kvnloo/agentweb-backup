@@ -29,14 +29,14 @@ export const PromptForm = ({
           placeholder={placeholder || "Enter your task details or question..."}
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
-          className="resize-none p-4 min-h-[180px] bg-white border-[#D6BCFA] rounded-lg text-gray-900"
+          className="resize-none p-4 min-h-[180px] rounded-lg"
         />
       </div>
       <div className="flex justify-between mt-4">
         <Button
           variant="outline"
           type="button"
-          className="text-gray-200 border-[#9b87f5] hover:bg-[#F3EFFD] hover:text-gray-900"
+          className="text-gray-200 hover:bg-[#F3EFFD] hover:text-gray-900"
           onClick={() => setIsTemplateOpen(!isTemplateOpen)}
         >
           Templates{" "}
