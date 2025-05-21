@@ -174,9 +174,14 @@ const TaskDetailsPage: React.FC = () => {
   const [task, setTask] = useState<TaskDetail | null>(null);
   const [executions, setExecutions] = useState<Execution[]>([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [pageError, setPageError] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [isUpdatingInteractive, setIsUpdatingInteractive] = useState(false);
+
+  const [selectedInteraction, setSelectedInteraction] =
+    useState<Interaction | null>(null);
+  const [interactionError, setInteractionError] = useState("");
+  const [isInteracting, setIsInteracting] = useState(false);
 
   const executionsRef = useRef<Execution[]>(executions);
   const taskRef = useRef<TaskDetail | null>(task);
@@ -191,14 +196,14 @@ const TaskDetailsPage: React.FC = () => {
 
   const fetchTaskAndExecutions = async () => {
     if (!token || !taskId) {
-      setError("Task ID or authentication token missing.");
+      setPageError("Task ID or authentication token missing.");
       setLoading(false);
       return;
     }
     if (!taskRef.current) {
       setLoading(true);
     }
-    setError(null);
+    setPageError(null);
     try {
       const taskResponse = await axios.get(
         buildApiUrl(`/api/tasks/${taskId}`),
@@ -224,9 +229,11 @@ const TaskDetailsPage: React.FC = () => {
     } catch (err: unknown) {
       console.error("Failed to fetch task data:", err);
       if (axios.isAxiosError(err)) {
-        setError(err.response?.data?.message || "Failed to load task data.");
+        setPageError(
+          err.response?.data?.message || "Failed to load task data."
+        );
       } else {
-        setError("Failed to load task data.");
+        setPageError("Failed to load task data.");
       }
       setTask(null);
       setExecutions([]);
@@ -247,16 +254,14 @@ const TaskDetailsPage: React.FC = () => {
         latestExecution &&
         ["running", "pending", "queued"].includes(latestExecution.status);
 
-      if (shouldPoll) {
-        console.log(
-          "Polling: Latest execution is active (via ref), fetching updates..."
-        );
+      if (shouldPoll && !isInteracting) {
+        console.log("Polling: fetching task and executions");
         fetchTaskAndExecutions();
       }
     }, 5000);
 
     return () => clearInterval(intervalId);
-  }, [taskId, token]);
+  }, [taskId, token, isInteracting]);
 
   const handleRunTask = async () => {
     if (!token || !taskId) {
@@ -331,34 +336,114 @@ const TaskDetailsPage: React.FC = () => {
     }
   };
 
-  const UserInteractionDialog = ({ execution, onRespond }) => {
-    const [response, setResponse] = useState("");
-    const [selectedInteraction, setSelectedInteraction] = useState(null);
-    const [error, setError] = useState("");
-    if (!execution.userInteractions?.length || execution.status !== "running")
+  const handleUserResponse = async (
+    executionId: string,
+    interactionId: string,
+    userResponseText: string
+  ) => {
+    try {
+      await axios.put(
+        buildApiUrl(
+          `/api/tasks/${task?.taskId}/executions/${executionId}/interactions/${interactionId}`
+        ),
+        { response: userResponseText },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      console.log("User response sent successfully to API:", {
+        executionId,
+        interactionId,
+        response: userResponseText,
+      });
+      fetchTaskAndExecutions();
+      setSelectedInteraction(null);
+      setInteractionError("");
+      setIsInteracting(false);
+    } catch (err) {
+      console.error("Failed to send user response:", err);
+      setInteractionError("Failed to send response. Please try again.");
+      toast({
+        title: "Error",
+        description: "Failed to send response.",
+        variant: "destructive",
+      });
+    }
+  };
+
+  interface UserInteractionDialogProps {
+    execution: Execution;
+    onRespond: (
+      executionId: string,
+      interactionId: string,
+      responseText: string
+    ) => Promise<void>;
+    activeInteraction: Interaction | null;
+    setActiveInteraction: (interaction: Interaction | null) => void;
+    currentError: string;
+    setCurrentError: (error: string) => void;
+    setParentIsInteracting: (isInteracting: boolean) => void;
+  }
+
+  const UserInteractionDialog: React.FC<UserInteractionDialogProps> = ({
+    execution,
+    onRespond,
+    activeInteraction,
+    setActiveInteraction,
+    currentError,
+    setCurrentError,
+    setParentIsInteracting,
+  }) => {
+    const [dialogInputValue, setDialogInputValue] = useState("");
+
+    useEffect(() => {
+      if (activeInteraction) {
+        setDialogInputValue("");
+        setCurrentError("");
+      } else {
+        setDialogInputValue("");
+      }
+    }, [activeInteraction, setCurrentError]);
+
+    if (
+      !activeInteraction ||
+      !execution.userInteractions?.length ||
+      execution.status !== "running"
+    ) {
       return null;
+    }
+
     const pendingCount = execution.userInteractions.filter(
       (i) => i.status === "pending"
     ).length;
-    const handleRespond = async () => {
-      if (!selectedInteraction || !response.trim()) return;
+
+    const handleDialogSubmit = async () => {
+      if (!activeInteraction || !dialogInputValue.trim()) return;
+      setCurrentError("");
       try {
         await onRespond(
           execution.executionId,
-          selectedInteraction.id,
-          response.trim()
+          activeInteraction.id,
+          dialogInputValue.trim()
         );
-        setResponse("");
-        setSelectedInteraction(null);
-        setError("");
       } catch (err) {
-        setError("Failed to send response");
+        // Parent handles error display through setInteractionError
       }
     };
+
+    const handleCancel = () => {
+      setActiveInteraction(null);
+      setCurrentError("");
+      setParentIsInteracting(false);
+    };
+
+    const currentInteractionDetails = execution.userInteractions.find(
+      (i) => i.id === activeInteraction.id
+    );
+    if (!currentInteractionDetails) return null;
+
     return (
       <div className="rounded border p-4 my-4 bg-muted">
         <div className="flex items-center justify-between mb-2">
-          <span className="font-semibold">Agent Questions</span>
+          <span className="font-semibold">Agent Question</span>
           <span>
             <span
               className={`inline-block px-2 py-1 rounded text-xs ${
@@ -367,97 +452,52 @@ const TaskDetailsPage: React.FC = () => {
                   : "bg-green-200 text-green-800"
               }`}
             >
-              {pendingCount > 0 ? `${pendingCount} Pending` : "All Answered"}
+              {pendingCount > 0
+                ? `${pendingCount} Total Pending`
+                : "All Answered"}
             </span>
           </span>
         </div>
-        <ul className="space-y-4">
-          {execution.userInteractions.map((interaction, idx) => (
-            <li key={interaction.id} className="border-b pb-2 last:border-b-0">
-              <div className="font-medium mb-1">{interaction.question}</div>
-              {interaction.screenshot_url && (
-                <img
-                  src={interaction.screenshot_url}
-                  alt="Screenshot"
-                  className="max-w-xs mb-2 border rounded"
-                />
-              )}
-              {interaction.response ? (
-                <div className="bg-green-50 text-green-800 rounded px-2 py-1 text-sm">
-                  {interaction.response}
-                </div>
-              ) : interaction.status === "pending" ? (
-                selectedInteraction?.id === interaction.id ? (
-                  <div>
-                    <textarea
-                      className="w-full border rounded p-2 mb-2"
-                      rows={2}
-                      value={response}
-                      onChange={(e) => setResponse(e.target.value)}
-                    />
-                    {error && (
-                      <div className="text-red-600 text-xs mb-1">{error}</div>
-                    )}
-                    <div className="flex gap-2">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => {
-                          setSelectedInteraction(null);
-                          setResponse("");
-                          setError("");
-                        }}
-                      >
-                        Cancel
-                      </Button>
-                      <Button
-                        variant="default"
-                        size="sm"
-                        onClick={handleRespond}
-                        disabled={!response.trim()}
-                      >
-                        Send Response
-                      </Button>
-                    </div>
-                  </div>
-                ) : (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setSelectedInteraction(interaction)}
-                  >
-                    Respond
-                  </Button>
-                )
-              ) : null}
-            </li>
-          ))}
-        </ul>
+        <div className="border-b pb-2 last:border-b-0">
+          <div className="font-medium mb-1">
+            {currentInteractionDetails.question}
+          </div>
+          {currentInteractionDetails.screenshot_url && (
+            <img
+              src={currentInteractionDetails.screenshot_url}
+              alt="Screenshot"
+              className="max-w-xs mb-2 border rounded"
+            />
+          )}
+          <div>
+            <textarea
+              className="w-full border rounded p-2 mb-2 bg-slate-800 text-slate-100 border-slate-600 placeholder-slate-400 focus:ring-indigo-500 focus:border-indigo-500"
+              rows={3}
+              value={dialogInputValue}
+              onChange={(e) => setDialogInputValue(e.target.value)}
+              placeholder="Type your response here..."
+              autoFocus
+            />
+            {currentError && (
+              <div className="text-red-600 text-xs mb-1">{currentError}</div>
+            )}
+            <div className="flex gap-2">
+              <Button variant="outline" size="sm" onClick={handleCancel}>
+                Cancel
+              </Button>
+              <Button
+                variant="default"
+                size="sm"
+                onClick={handleDialogSubmit}
+                disabled={!dialogInputValue.trim()}
+              >
+                Send Response
+              </Button>
+            </div>
+          </div>
+        </div>
       </div>
     );
-  };
-
-  const handleUserResponse = async (
-    executionId,
-    interactionId,
-    userResponse
-  ) => {
-    try {
-      await axios.put(
-        buildApiUrl(
-          `/api/tasks/${task?.taskId}/executions/${executionId}/interactions/${interactionId}`
-        ),
-        { response: userResponse },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      fetchTaskAndExecutions();
-    } catch (err) {
-      toast({
-        title: "Error",
-        description: "Failed to send response.",
-        variant: "destructive",
-      });
-    }
   };
 
   if (loading && !task) {
@@ -468,22 +508,20 @@ const TaskDetailsPage: React.FC = () => {
     );
   }
 
-  if (error || !task) {
+  if (pageError || !task) {
     return (
       <Alert variant="destructive">
         <AlertCircle className="h-4 w-4" />
         <AlertTitle>Error Loading Task</AlertTitle>
-        <AlertDescription>{error || "Task not found."}</AlertDescription>
+        <AlertDescription>{pageError || "Task not found."}</AlertDescription>
       </Alert>
     );
   }
 
-  // Define latestExecution for use in CardContent
   const latestExecution = executions.length > 0 ? executions[0] : null;
 
   return (
     <div className="container mx-auto py-8 space-y-6 relative">
-      {/* Hidden divs for the full result of each execution */}
       {executions.map(
         (exec, index) =>
           exec.result && (
@@ -566,9 +604,7 @@ const TaskDetailsPage: React.FC = () => {
               );
             })()}
           </div>
-          {/* Scheduling Section */}
           <TaskScheduler taskId={task.taskId} />
-          {/* Interactive Mode Toggle */}
           <div className="flex items-center gap-2 mb-2">
             <Switch
               id="interactive-mode"
@@ -583,22 +619,46 @@ const TaskDetailsPage: React.FC = () => {
               </span>
             )}
           </div>
-          {/* User Interaction Dialog for latest running execution */}
-          {(() => {
-            if (
-              latestExecution &&
-              latestExecution.status === "running" &&
-              latestExecution.userInteractions?.length > 0
-            ) {
-              return (
-                <UserInteractionDialog
-                  execution={latestExecution}
-                  onRespond={handleUserResponse}
-                />
-              );
-            }
-            return null;
-          })()}
+          {latestExecution &&
+            latestExecution.status === "running" &&
+            latestExecution.userInteractions?.some(
+              (i) => i.status === "pending"
+            ) &&
+            !selectedInteraction && (
+              <div className="my-4">
+                <Button
+                  onClick={() => {
+                    const firstPending = latestExecution.userInteractions?.find(
+                      (i) => i.status === "pending"
+                    );
+                    if (firstPending) {
+                      setSelectedInteraction(firstPending);
+                      setIsInteracting(true);
+                      setInteractionError("");
+                    }
+                  }}
+                >
+                  Respond to Agent Questions (
+                  {
+                    latestExecution.userInteractions?.filter(
+                      (i) => i.status === "pending"
+                    ).length
+                  }
+                  )
+                </Button>
+              </div>
+            )}
+          {latestExecution && selectedInteraction && (
+            <UserInteractionDialog
+              execution={latestExecution}
+              onRespond={handleUserResponse}
+              activeInteraction={selectedInteraction}
+              setActiveInteraction={setSelectedInteraction}
+              currentError={interactionError}
+              setCurrentError={setInteractionError}
+              setParentIsInteracting={setIsInteracting}
+            />
+          )}
         </CardContent>
       </Card>
 
