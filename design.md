@@ -462,6 +462,51 @@ Two primary cloud-based solutions were considered: AWS Bedrock Knowledge Bases a
 -   **Cons:**
     -   Requires setup within the Google Cloud project.
 
+### Option 3: Pinecone + OpenAI
+
+-   **Storage:** Knowledge stored in Pinecone's vector database.
+-   **Indexing & Vector Store:** Pinecone provides a managed vector database with automatic scaling and high-performance similarity search.
+-   **Querying & Generation:** Integration with OpenAI's API for embedding generation and text generation.
+-   **Pros:**
+    -   Highly scalable vector database with low latency.
+    -   Flexible integration with any embedding model.
+    -   Strong performance for similarity search.
+    -   Can be used with any cloud provider.
+-   **Cons:**
+    -   Requires managing multiple services.
+    -   Additional cost for separate vector database.
+    -   More complex setup and maintenance.
+
+### Option 4: Weaviate
+
+-   **Storage:** Knowledge stored in Weaviate's vector database.
+-   **Indexing & Vector Store:** Weaviate provides a vector search engine with built-in support for multiple embedding models.
+-   **Querying & Generation:** GraphQL API for querying and can integrate with various LLMs for generation.
+-   **Pros:**
+    -   Open-source option with self-hosting capability.
+    -   Built-in support for multiple embedding models.
+    -   GraphQL interface for flexible querying.
+    -   Can be deployed on any cloud provider.
+-   **Cons:**
+    -   Requires more operational overhead for self-hosting.
+    -   Less managed than cloud provider solutions.
+    -   Additional infrastructure to maintain.
+
+### Option 5: Qdrant
+
+-   **Storage:** Knowledge stored in Qdrant's vector database.
+-   **Indexing & Vector Store:** Qdrant provides a vector similarity search engine with support for various distance metrics.
+-   **Querying & Generation:** REST API for querying and can integrate with any LLM for generation.
+-   **Pros:**
+    -   High-performance vector search.
+    -   Support for various distance metrics.
+    -   Can be self-hosted or used as a managed service.
+    -   Good scalability and performance.
+-   **Cons:**
+    -   Requires separate LLM integration.
+    -   More complex setup than fully managed solutions.
+    -   Additional operational overhead.
+
 ### Decision: Google Cloud Vertex AI Search
 
 AgentWeb will adopt **Google Cloud Vertex AI Search** for its agent knowledge base and RAG capabilities.
