@@ -13,7 +13,11 @@ const releases: Release[] = [
       "Added Kill button to Execution Details page",
       "- Users can now terminate a running task execution if not satisfied with its progress",
       "- Provides better control over task execution and resource management",
-      "- Helps prevent unnecessary resource usage from unwanted executions"
+      "- Helps prevent unnecessary resource usage from unwanted executions",
+      "Improved task ownership change notifications",
+      "- Fixed a bug",
+      "- Single email sent to new owner with old owner and admin CC'd",
+      "- Updated email links to point to customer portal instead of partner portal"
     ]
   },
   {

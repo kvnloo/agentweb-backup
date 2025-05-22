@@ -12,11 +12,12 @@ const transporter = nodemailer.createTransport({
 });
 
 export const emailService = {
-  async sendEmail(to: string, subject: string, text: string, html: string) {
+  async sendEmail(to: string, subject: string, text: string, html: string, cc?: string) {
     const mailOptions = {
       from: process.env.FROM_EMAIL,
       replyTo: 'support@agentweb.pro',
       to,
+      cc,
       subject,
       text,
       html
@@ -24,7 +25,7 @@ export const emailService = {
 
     try {
       await transporter.sendMail(mailOptions);
-      console.log('Email sent successfully to:', to);
+      console.log('Email sent successfully to:', to, cc ? `CC: ${cc}` : '');
     } catch (error) {
       console.error('Error sending email:', error);
       throw error;
@@ -81,7 +82,8 @@ export const emailService = {
     oldOwnerEmail: string,
     newOwnerEmail: string,
     changedByEmail: string,
-    siteDomain: string
+    siteDomain: string,
+    cc?: string
   ) {
     const subject = 'Task Ownership Change Notification';
     const taskUrl = `${siteDomain}/tasks/${taskId}`;
@@ -92,6 +94,7 @@ export const emailService = {
       `New Owner: ${newOwnerEmail}\n` +
       `Changed By: ${changedByEmail}\n\n` +
       `View task details: ${taskUrl}\n\n` +
+      `Note: Only the new owner will have access to the task details page. The previous owner will see an "Access Denied" error when trying to access the task.\n\n` +
       `Best regards,\nAgentWeb Team`;
 
     const html = `
@@ -112,9 +115,12 @@ export const emailService = {
         </tr>
       </table>
       <p>You can view the task details <a href="${taskUrl}">here</a>.</p>
+      <div style="background-color: #f8f9fa; padding: 15px; border-radius: 4px; margin: 15px 0;">
+        <p style="margin: 0; color: #666;"><strong>Important Note:</strong> Only the new owner will have access to the task details page. The previous owner will see an "Access Denied" error when trying to access the task.</p>
+      </div>
       <p>Best regards,<br>AgentWeb Team</p>
     `;
 
-    await this.sendEmail(recipientEmail, subject, text, html);
+    await this.sendEmail(recipientEmail, subject, text, html, cc);
   }
 }; 
