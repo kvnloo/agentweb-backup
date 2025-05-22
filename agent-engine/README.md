@@ -15,9 +15,73 @@ conda env create -f environment.yml
 conda activate agent-engine
 ```
 
-### Alternative Setup (pip)
+2. Install dependencies:
+Make sure your `requirements.txt` includes the Google Cloud libraries:
+```txt
+google-cloud-aiplatform
+google-cloud-discoveryengine
+google-cloud-storage
+```
+Then run:
+```bash
+pip install -r requirements.txt
+```
 
-You can install dependencies directly with pip:
+### Google Cloud Knowledge Base Setup (Vertex AI Search)
+
+To use the integrated knowledge base powered by Google Cloud Vertex AI Search, you need to perform the following setup in your Google Cloud Project and configure environment variables for the Agent Engine.
+
+**1. Google Cloud Project Setup:**
+
+   a.  **Create/Select a Google Cloud Project.**
+   b.  **Enable APIs:**
+       -   Vertex AI API
+       -   Discovery Engine API
+   c.  **Create a Google Cloud Storage (GCS) Bucket:** This bucket will store the raw knowledge files (e.g., `your-agentweb-kb-bucket`).
+   d.  **Create a Vertex AI Search App & Datastore:**
+       -   In the Google Cloud Console, navigate to Vertex AI Search.
+       -   Create a new "Search App" (select "Generic" or other appropriate type).
+       -   Within this app, create a new "Datastore".
+           -   **Type:** Select "Unstructured data".
+           -   **Datastore name:** Give it a descriptive name (e.g., `agentweb-knowledge-store`).
+           -   **Data source:** Configure it to use your GCS bucket (created in step 1c) as the data source. You can specify a folder within the bucket if desired (this would correspond to `GOOGLE_KB_GCS_PREFIX`).
+           -   Vertex AI Search will then start indexing your data from GCS.
+       -   Note down your **Project ID**, the **Datastore ID**, and the **Location** (e.g., `global`, `us`, `eu`).
+   e.  **Create a Service Account:**
+       -   In IAM & Admin > Service Accounts, create a new service account.
+       -   Grant this service account the following roles (or more granular permissions as needed):
+           -   `Vertex AI User` (for general Vertex AI access)
+           -   `Discovery Engine Viewer` (to query datastores)
+           -   `Storage Object Admin` (or `Storage Object Creator` & `Storage Object Viewer`) on the GCS bucket used for the knowledge base.
+       -   Download the **JSON key** for this service account.
+
+**2. Environment Variables for Agent Engine:**
+
+   Create or update a `.env` file in the `agent-engine` directory with the following:
+
+   ```env
+   # Google Cloud Settings for Knowledge Base
+   GOOGLE_APPLICATION_CREDENTIALS="/path/to/your/service-account-key.json"
+   GOOGLE_CLOUD_PROJECT_ID="your-gcp-project-id"
+   GOOGLE_VERTEX_AI_DATASTORE_ID="your-datastore-id"
+   GOOGLE_VERTEX_AI_SEARCH_LOCATION="your-datastore-location" # e.g., global, us, eu
+   GOOGLE_KB_GCS_BUCKET="your-agentweb-kb-bucket"
+   GOOGLE_KB_GCS_PREFIX="agent_knowledge/" # Optional: folder within the bucket. Ensure it ends with a '/' if used.
+
+   # Existing variables (ensure these are also present if needed)
+   # GEMINI_API_KEY=your_gemini_api_key_if_used_directly
+   # AZURE_OPENAI_ENDPOINT=...
+   # AZURE_OPENAI_API_KEY=...
+   # ... other S3 related env vars if used for screenshots etc.
+   S3_BUCKET_NAME="your-s3-bucket-for-other-files" # If S3 is still used for screenshots/GIFs
+   ```
+
+   - Replace placeholders with your actual values.
+   - Ensure the `GOOGLE_KB_GCS_PREFIX` matches the folder you configured in the Vertex AI Search Datastore if you used one.
+
+### Alternative Setup (pip without Conda)
+
+If not using Conda, you can install dependencies directly with pip after ensuring Python 3.8+ is installed:
 ```bash
 pip install -r requirements.txt
 ```
