@@ -919,6 +919,27 @@ export const taskDb = {
 
     const result = await dynamodb.update(params).promise();
     return result.Attributes;
+  },
+
+  async killTaskExecution(executionId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
+        Key: {
+          executionId
+        },
+        UpdateExpression: 'SET killRequested = :killRequested',
+        ExpressionAttributeValues: {
+          ':killRequested': new Date().toISOString()
+        },
+        ReturnValues: 'UPDATED_NEW'
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, 'killTaskExecution');
+    }
   }
 };
 

@@ -35,6 +35,42 @@ router.post('/:id/execute', executeTask);
 router.put('/:id/executions/:executionId', updateTaskExecution);
 router.put('/:id/executions/:executionId/interactions/:interactionId', respondToInteraction);
 
+// Kill execution
+router.put('/:taskId/executions/:executionId/kill', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { taskId, executionId } = req.params;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+      return res.status(403).json({ message: 'Not authorized to modify this execution' });
+    }
+
+    const execution = await taskDb.getTaskExecutionById(executionId);
+    if (!execution) {
+      return res.status(404).json({ message: 'Execution not found' });
+    }
+
+    if (execution.status.toLowerCase() !== 'running') {
+      return res.status(400).json({ message: 'Execution is not in a running state and cannot be killed.' });
+    }
+
+    const updatedExecution = await taskDb.killTaskExecution(executionId);
+    res.json(updatedExecution);
+  } catch (error) {
+    console.error('Error killing execution:', error);
+    res.status(500).json({ message: 'Error killing execution' });
+  }
+});
+
 // Get task subscribers
 router.get('/:taskId/subscribers', async (req, res) => {
   try {
