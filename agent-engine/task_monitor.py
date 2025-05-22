@@ -99,6 +99,7 @@ last_execution_time = None
 running_task_count = 0
 running_user_ids = set()
 running_task_ids = {}  # Dictionary to track running task IDs and their types
+running_processes = {}  # Dictionary to track execution_id -> process handle
 
 def get_pending_executions():
     global last_execution_time
@@ -264,6 +265,11 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
         # Get the execution to get the taskId and startTime
         execution = executions_table.get_item(Key={'executionId': execution_id}).get('Item')
         if execution:
+            # If current status is 'killed', don't update status as it's a final state
+            if execution.get('status') == 'killed':
+                logger.info(f"Execution {execution_id} is already killed. Not updating status to {status}")
+                return
+            
             # Update the execution
             executions_table.update_item(
                 Key={'executionId': execution_id},
@@ -414,6 +420,7 @@ def update_workflow_execution(workflow_execution_id: str, task_id: str, task_sta
         return False
 
 async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str, run_user_id: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False) -> Dict[str, Any]:
+    global running_processes
     log_sync_manager = None
     process = None
     
@@ -479,6 +486,11 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
             stderr=asyncio.subprocess.PIPE,
             env={**os.environ, 'PYTHONUNBUFFERED': '1'}  # Ensure unbuffered output
         )
+        
+        # Store process immediately in global running_processes
+        if execution_id:
+            running_processes[execution_id] = process
+            logger.info(f"Stored process handle for execution {execution_id}")
         
         # Set timeout based on complexity
         timeout_seconds = int(os.getenv('COMPLEX_TASK_EXECUTION_TIMEOUT_SECONDS', '1800')) if is_complex_task else int(os.getenv('TASK_EXECUTION_TIMEOUT_SECONDS', '900'))
@@ -557,6 +569,14 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
                 "error": f"Task execution timed out after {timeout_seconds} seconds",
                 "llmName": llm_name
             }
+        except asyncio.CancelledError:
+            # Process was cancelled (likely killed by monitor)
+            logger.info(f"Task execution was cancelled for {execution_id}")
+            return {
+                "success": False,
+                "error": "Task execution was cancelled",
+                "llmName": llm_name
+            }
             
     except Exception as e:
         logger.error(f"Error in run_web_agent_cli: {e}")
@@ -605,7 +625,7 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
                 pass
 
 async def execute_task(execution):
-    global running_task_count, running_user_ids, running_task_ids
+    global running_task_count, running_user_ids, running_task_ids, running_processes
     
     execution_id = execution['executionId']
     task_id = execution['taskId']
@@ -938,6 +958,20 @@ async def execute_task(execution):
                 else:
                     last_error = result.get('error', 'Unknown error')
                     logger.warning(f"LLM {llm_name} failed with error: {last_error}")
+                    
+                    # Check if execution was killed while we were processing
+                    try:
+                        execution_status = executions_table.get_item(
+                            Key={'executionId': execution_id},
+                            ProjectionExpression='#s',
+                            ExpressionAttributeNames={'#s': 'status'}
+                        ).get('Item', {}).get('status')
+                        
+                        if execution_status == 'killed':
+                            logger.info(f"Execution {execution_id} was killed, stopping LLM attempts")
+                            break
+                    except Exception as e:
+                        logger.error(f"Error checking execution status: {e}")
             except Exception as e:
                 last_error = str(e)
                 logger.error(f"Error with LLM {llm_name}: {e}")
@@ -1034,6 +1068,23 @@ async def execute_task(execution):
             if user_id in running_user_ids:
                 running_user_ids.remove(user_id)
             running_task_ids.pop(execution_id, None)
+            
+            # Clean up process handle
+            if execution_id in running_processes:
+                # Check if process was already terminated by the monitor thread
+                proc = running_processes[execution_id]
+                if proc and hasattr(proc, 'returncode') and proc.returncode is None:
+                    try:
+                        # Process is still running, try to terminate it
+                        logger.info(f"Process for {execution_id} is still running during cleanup, terminating it")
+                        proc.terminate()
+                    except Exception as e:
+                        logger.error(f"Error terminating process during cleanup: {e}")
+                        
+                # Remove from dictionary
+                del running_processes[execution_id]
+                logger.info(f"Removed process from tracking dictionary for {execution_id}")
+                
             try:
                 logger.info(f"Task {execution_id} cleanup completed")
             except:
@@ -1148,7 +1199,7 @@ async def process_workflow_executions():
         logger.error(f"Error in process_workflow_executions: {e}")
 
 async def monitor_executions():
-    global last_execution_time
+    global last_execution_time, running_task_count, running_user_ids, running_task_ids, running_processes
 
     INTERVAL = 5
     MAX_CONCURRENT = int(os.getenv('MAX_CONCURRENT_TASKS', '3'))
@@ -1161,6 +1212,49 @@ async def monitor_executions():
             
             # Then process workflow executions
             await process_workflow_executions()
+            
+            # Check for kill requests
+            for execution_id, process_handle in list(running_processes.items()):
+                try:
+                    # Get execution from DynamoDB
+                    execution = executions_table.get_item(Key={'executionId': execution_id}).get('Item')
+                    
+                    # Check if kill was requested
+                    if execution and execution.get('killRequested'):
+                        logger.info(f"Kill requested for execution {execution_id}. Terminating process.")
+                        
+                        # Terminate process if it's still running
+                        if process_handle and hasattr(process_handle, 'returncode') and process_handle.returncode is None:
+                            try:
+                                # Try graceful termination first
+                                process_handle.terminate()
+                                
+                                # Wait briefly for termination
+                                try:
+                                    # For asyncio subprocess
+                                    if hasattr(process_handle, 'wait') and asyncio.iscoroutinefunction(process_handle.wait):
+                                        await asyncio.wait_for(process_handle.wait(), timeout=5.0)
+                                    # For regular subprocess
+                                    elif hasattr(process_handle, 'wait'):
+                                        process_handle.wait(timeout=5)
+                                except (asyncio.TimeoutError, subprocess.TimeoutExpired):
+                                    # Force kill if not terminated gracefully
+                                    logger.warning(f"Process for {execution_id} did not terminate gracefully, forcing kill")
+                                    process_handle.kill()
+                                
+                                # Update execution status directly here
+                                # This ensures the status is updated even if the process is killed
+                                update_execution_status(
+                                    execution_id, 
+                                    'killed', 
+                                    error='Task was terminated by user request'
+                                )
+                                
+                                logger.info(f"Execution {execution_id} successfully terminated")
+                            except Exception as e:
+                                logger.error(f"Error terminating process for execution {execution_id}: {e}")
+                except Exception as e:
+                    logger.error(f"Error checking kill request for execution {execution_id}: {e}")
             
             # Then process pending task executions
             pending_executions = get_pending_executions()

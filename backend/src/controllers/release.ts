@@ -8,6 +8,15 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-05-22",
+    changes: [
+      "Added Kill button to Execution Details page",
+      "- Users can now terminate a running task execution if not satisfied with its progress",
+      "- Provides better control over task execution and resource management",
+      "- Helps prevent unnecessary resource usage from unwanted executions"
+    ]
+  },
+  {
     date: "2025-05-19",
     changes: [
       "Added new models for task runs",

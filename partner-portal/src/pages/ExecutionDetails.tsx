@@ -30,6 +30,7 @@ import ArchiveIcon from '@mui/icons-material/Archive';
 import UnarchiveIcon from '@mui/icons-material/Unarchive';
 import AutorenewIcon from '@mui/icons-material/Autorenew';
 import EmailIcon from '@mui/icons-material/Email';
+import PowerOffIcon from '@mui/icons-material/PowerOff';
 import { useAuth } from '../contexts/AuthContext';
 import axios from 'axios';
 import { buildApiUrl } from '../config';
@@ -129,6 +130,11 @@ export default function ExecutionDetails() {
   const [iframeKey] = useState(Date.now()); // Used only for initial rendering
   const iframeRef = React.useRef<HTMLIFrameElement>(null);
 
+  // Kill dialog state
+  const [killDialogOpen, setKillDialogOpen] = useState(false);
+  const [killLoading, setKillLoading] = useState(false);
+  const [killError, setKillError] = useState('');
+
   // Email dialog state
   const [emailDialogOpen, setEmailDialogOpen] = useState(false);
   const [emailAddress, setEmailAddress] = useState('');
@@ -191,6 +197,34 @@ export default function ExecutionDetails() {
       }
     };
   }, [execution?.status, fetchExecution]);
+
+  const handleKillClick = () => {
+    setKillError('');
+    setKillDialogOpen(true);
+  };
+
+  const handleConfirmKill = async () => {
+    if (!taskId || !executionId || !token) return;
+
+    setKillLoading(true);
+    setKillError('');
+
+    try {
+      await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}/executions/${executionId}/kill`),
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      // Refresh execution data
+      fetchExecution();
+      setKillDialogOpen(false);
+    } catch (error: any) {
+      console.error('Error killing execution:', error);
+      setKillError(error.response?.data?.message || 'Failed to kill execution');
+    } finally {
+      setKillLoading(false);
+    }
+  };
 
   const handleFeedbackChange = async (feedback: 'accepted' | 'rejected' | null) => {
     if (!taskId || !executionId) return;
@@ -392,6 +426,16 @@ export default function ExecutionDetails() {
                     <ShareIcon />
                   </IconButton>
                 </Tooltip>
+                {user?.userId === execution.userId && execution.status.toLowerCase() === 'running' && (
+                  <Tooltip title="Kill execution">
+                    <IconButton
+                      onClick={handleKillClick}
+                      disabled={killLoading} // Disable button while kill is in progress
+                    >
+                      <PowerOffIcon />
+                    </IconButton>
+                  </Tooltip>
+                )}
                 <Tooltip title="Email execution details">
                   <IconButton onClick={() => setEmailDialogOpen(true)}>
                     <EmailIcon />
@@ -738,17 +782,13 @@ export default function ExecutionDetails() {
         <DialogContent>
           <Typography>
             {archiveAction === 'archive'
-              ? 'Are you sure you want to archive this execution? Archived executions will not appear in the task details page.'
-              : 'Are you sure you want to unarchive this execution? The execution will be visible again in the task details page.'}
+              ? 'Are you sure you want to archive this execution?'
+              : 'Are you sure you want to unarchive this execution?'}
           </Typography>
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setArchiveDialogOpen(false)}>Cancel</Button>
-          <Button
-            variant="contained"
-            color="primary"
-            onClick={handleArchiveToggle}
-          >
+          <Button onClick={handleArchiveToggle} autoFocus>
             {archiveAction === 'archive' ? 'Archive' : 'Unarchive'}
           </Button>
         </DialogActions>
@@ -833,6 +873,41 @@ export default function ExecutionDetails() {
             disabled={sendingEmail || emailSuccess || !emailAddress.trim()}
           >
             {sendingEmail ? <CircularProgress size={24} /> : "Send"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Kill Dialog */}
+      <Dialog
+        open={killDialogOpen}
+        onClose={() => setKillDialogOpen(false)}
+        aria-labelledby="alert-dialog-title"
+        aria-describedby="alert-dialog-description"
+      >
+        <DialogTitle id="alert-dialog-title">{"Kill Execution?"}</DialogTitle>
+        <DialogContent>
+          {killError && (
+            <Alert severity="error" sx={{ mb: 2 }}>
+              {killError}
+            </Alert>
+          )}
+          <Typography>
+            Are you sure you want to send a kill command to this execution? This may not be reversible.
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setKillDialogOpen(false)} color="primary">
+            Cancel
+          </Button>
+          <Button 
+            onClick={handleConfirmKill} 
+            color="error" 
+            variant="contained" 
+            disabled={killLoading}
+            startIcon={killLoading ? <CircularProgress size={20} color="inherit" /> : <PowerOffIcon />}
+            autoFocus
+          >
+            {killLoading ? 'Killing...' : 'Kill Execution'}
           </Button>
         </DialogActions>
       </Dialog>
