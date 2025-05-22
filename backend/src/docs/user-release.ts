@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-05-22',
+    changes: [
+      'Updated sign up page to look like login page and improved dropdown',
+      '- Unified the design between login and sign up pages for better user experience',
+      '- Enhanced dropdown functionality and appearance'
+    ],
+  },
+  {
     date: '2025-05-21',
     changes: [
       'Support co-pilot mode and schedule for tasks.',
