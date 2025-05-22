@@ -51,11 +51,11 @@ const UserProfileDropdown = () => {
           </Avatar>
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-56">
-        <DropdownMenuLabel className="font-normal">
+      <DropdownMenuContent align="end" className="w-56 p-2">
+        <DropdownMenuLabel className="font-normal px-3 py-2">
           <div className="flex flex-col space-y-1">
-            <p className="text-sm font-medium leading-none">{user.email}</p>
-            <p className="text-xs leading-none text-muted-foreground">
+            <p className="text-base font-medium leading-none">{user.email}</p>
+            <p className="text-sm leading-none text-muted-foreground">
               {user.roles[0] === "customer"
                 ? "Customer Account"
                 : "Partner Account"}
@@ -65,17 +65,17 @@ const UserProfileDropdown = () => {
         <DropdownMenuSeparator />
         <DropdownMenuItem
           onClick={handleSettings}
-          className="cursor-pointer select-item-hover-gradient"
+          className="cursor-pointer px-3 py-2"
         >
-          <Settings className="mr-2 h-4 w-4" />
+          <Settings className="mr-3 h-5 w-5" />
           <span>Settings</span>
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem
           onClick={handleLogout}
-          className="cursor-pointer select-item-hover-gradient"
+          className="cursor-pointer px-3 py-2"
         >
-          <LogOut className="mr-2 h-4 w-4" />
+          <LogOut className="mr-3 h-5 w-5" />
           <span>Log out</span>
         </DropdownMenuItem>
       </DropdownMenuContent>

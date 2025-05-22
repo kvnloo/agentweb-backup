@@ -152,18 +152,9 @@ export const TaskScheduler: React.FC<TaskSchedulerProps> = ({ taskId }) => {
               <SelectValue placeholder="Frequency" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="daily" className="select-item-hover-gradient">
-                Daily
-              </SelectItem>
-              <SelectItem value="weekly" className="select-item-hover-gradient">
-                Weekly
-              </SelectItem>
-              <SelectItem
-                value="monthly"
-                className="select-item-hover-gradient"
-              >
-                Monthly
-              </SelectItem>
+              <SelectItem value="daily">Daily</SelectItem>
+              <SelectItem value="weekly">Weekly</SelectItem>
+              <SelectItem value="monthly">Monthly</SelectItem>
             </SelectContent>
           </Select>
         </div>
