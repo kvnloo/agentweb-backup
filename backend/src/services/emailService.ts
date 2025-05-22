@@ -94,6 +94,7 @@ export const emailService = {
       `New Owner: ${newOwnerEmail}\n` +
       `Changed By: ${changedByEmail}\n\n` +
       `View task details: ${taskUrl}\n\n` +
+      `Note: Only the new owner will have access to the task details page. The previous owner will see an "Access Denied" error when trying to access the task.\n\n` +
       `Best regards,\nAgentWeb Team`;
 
     const html = `
@@ -114,6 +115,9 @@ export const emailService = {
         </tr>
       </table>
       <p>You can view the task details <a href="${taskUrl}">here</a>.</p>
+      <div style="background-color: #f8f9fa; padding: 15px; border-radius: 4px; margin: 15px 0;">
+        <p style="margin: 0; color: #666;"><strong>Important Note:</strong> Only the new owner will have access to the task details page. The previous owner will see an "Access Denied" error when trying to access the task.</p>
+      </div>
       <p>Best regards,<br>AgentWeb Team</p>
     `;
 
