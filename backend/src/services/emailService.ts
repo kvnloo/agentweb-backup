@@ -12,11 +12,12 @@ const transporter = nodemailer.createTransport({
 });
 
 export const emailService = {
-  async sendEmail(to: string, subject: string, text: string, html: string) {
+  async sendEmail(to: string, subject: string, text: string, html: string, cc?: string) {
     const mailOptions = {
       from: process.env.FROM_EMAIL,
       replyTo: 'support@agentweb.pro',
       to,
+      cc,
       subject,
       text,
       html
@@ -24,7 +25,7 @@ export const emailService = {
 
     try {
       await transporter.sendMail(mailOptions);
-      console.log('Email sent successfully to:', to);
+      console.log('Email sent successfully to:', to, cc ? `CC: ${cc}` : '');
     } catch (error) {
       console.error('Error sending email:', error);
       throw error;
@@ -81,7 +82,8 @@ export const emailService = {
     oldOwnerEmail: string,
     newOwnerEmail: string,
     changedByEmail: string,
-    siteDomain: string
+    siteDomain: string,
+    cc?: string
   ) {
     const subject = 'Task Ownership Change Notification';
     const taskUrl = `${siteDomain}/tasks/${taskId}`;
@@ -115,6 +117,6 @@ export const emailService = {
       <p>Best regards,<br>AgentWeb Team</p>
     `;
 
-    await this.sendEmail(recipientEmail, subject, text, html);
+    await this.sendEmail(recipientEmail, subject, text, html, cc);
   }
 }; 

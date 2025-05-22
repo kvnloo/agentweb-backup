@@ -206,40 +206,30 @@ router.put('/:id/owner', isAdmin, async (req: Request, res: Response) => {
     await taskDb.updateTaskOwner(taskId, newOwner.userId);
 
     // Send email notifications
-    const siteDomain = process.env.FRONTEND_URL || 'https://agentweb.pro';
+    const siteDomain = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
     
-    // Send to admin with both users CCed
-    await emailService.sendTaskOwnershipChangeEmail(
-      process.env.ADMIN_EMAIL || '',
-      task.name,
-      taskId,
-      currentOwner.email,
-      newOwnerEmail,
-      adminUser.email,
-      siteDomain
-    );
+    // Prepare CC list - include old owner and admin if they're different from each other
+    const ccList = [currentOwner.email];
+    if (adminUser.email !== currentOwner.email) {
+      ccList.push(adminUser.email);
+    }
+    const cc = ccList.join(', ');
 
-    // Send to old owner
-    await emailService.sendTaskOwnershipChangeEmail(
-      currentOwner.email,
-      task.name,
-      taskId,
-      currentOwner.email,
-      newOwnerEmail,
-      adminUser.email,
-      siteDomain
-    );
-
-    // Send to new owner
-    await emailService.sendTaskOwnershipChangeEmail(
-      newOwnerEmail,
-      task.name,
-      taskId,
-      currentOwner.email,
-      newOwnerEmail,
-      adminUser.email,
-      siteDomain
-    );
+    // Send single email to new owner with CCs
+    try {
+      await emailService.sendTaskOwnershipChangeEmail(
+        newOwnerEmail,
+        task.name,
+        taskId,
+        currentOwner.email,
+        newOwnerEmail,
+        adminUser.email,
+        siteDomain,
+        cc
+      );
+    } catch (error) {
+      console.error('Failed to send ownership change email:', error);
+    }
 
     res.json({ message: 'Task ownership updated successfully' });
   } catch (error) {
