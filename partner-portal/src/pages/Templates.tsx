@@ -76,6 +76,7 @@ interface Template {
   outputAsHtml?: boolean; // Added for HTML output
   selectedLLMs?: string[]; // Added for LLM selection
   useSharedBrowser?: boolean; // ADDED: Flag for using shared browser
+  turnOffHeadless?: boolean;
 }
 
 // Helper function to extract parameters from prompt
@@ -113,6 +114,7 @@ export default function Templates() {
   const [outputAsHtml, setOutputAsHtml] = useState(false); // New state for HTML output
   const [selectedLLMs, setSelectedLLMs] = useState<string[]>([]); // New state for selected LLMs
   const [useSharedBrowser, setUseSharedBrowser] = useState(false); // ADDED: State for the toggle
+  const [turnOffHeadless, setTurnOffHeadless] = useState(false);
 
   const { token, user } = useAuth();
   const navigate = useNavigate();
@@ -182,16 +184,14 @@ export default function Templates() {
       setIsDeepResearch(template.isDeepResearch);
       setIsComplexTask(template.isComplexTask);
       setSelectedNameParameter(template.nameParameter);
-      setCategory(template.category || ""); // Set category from template
-      setOutputAsJson(template.outputAsJson || false); // Set outputAsJson
-      setOutputAsHtml(template.outputAsHtml || false); // Set outputAsHtml
-      setSelectedLLMs(template.selectedLLMs || []); // Set selectedLLMs
-      setUseSharedBrowser(template.useSharedBrowser || false); // ADDED: Set useSharedBrowser state
-      if (
-        template.category &&
-        !SUPPORTED_CATEGORIES.includes(template.category)
-      ) {
-        setCustomCategory(template.category); // If existing category is custom
+      setCategory(template.category || "");
+      setOutputAsJson(template.outputAsJson || false);
+      setOutputAsHtml(template.outputAsHtml || false);
+      setSelectedLLMs(template.selectedLLMs || []);
+      setUseSharedBrowser(template.useSharedBrowser || false);
+      setTurnOffHeadless(template.turnOffHeadless || false);
+      if (template.category && !SUPPORTED_CATEGORIES.includes(template.category)) {
+        setCustomCategory(template.category);
         setCategory("Custom");
       } else {
         setCustomCategory("");
@@ -205,12 +205,13 @@ export default function Templates() {
       setIsDeepResearch(false);
       setIsComplexTask(false);
       setSelectedNameParameter(null);
-      setCategory(""); // Reset category for new template
+      setCategory("");
       setCustomCategory("");
-      setOutputAsJson(false); // Reset outputAsJson
-      setOutputAsHtml(false); // Reset outputAsHtml
-      setSelectedLLMs([]); // Reset selectedLLMs
-      setUseSharedBrowser(false); // ADDED: Reset useSharedBrowser state
+      setOutputAsJson(false);
+      setOutputAsHtml(false);
+      setSelectedLLMs([]);
+      setUseSharedBrowser(false);
+      setTurnOffHeadless(false);
     }
     setOpenEditDialog(true);
   };
@@ -241,11 +242,12 @@ export default function Templates() {
         isDeepResearch,
         isComplexTask,
         nameParameter: selectedNameParameter,
-        category: finalCategory || undefined, // Send finalCategory or undefined
-        outputAsJson: outputAsJson, // Add outputAsJson to template data
-        outputAsHtml: outputAsHtml, // Add outputAsHtml to template data
-        selectedLLMs: selectedLLMs, // Add selectedLLMs to template data
-        useSharedBrowser: useSharedBrowser, // ADDED: Add useSharedBrowser to template data
+        category: finalCategory || undefined,
+        outputAsJson: outputAsJson,
+        outputAsHtml: outputAsHtml,
+        selectedLLMs: selectedLLMs,
+        useSharedBrowser: useSharedBrowser,
+        turnOffHeadless: turnOffHeadless,
       };
 
       // Check if we're updating an existing template (has a valid templateId)
@@ -872,6 +874,16 @@ export default function Templates() {
                 />
               }
               label="Use Shared Browser"
+              disabled={isDeepResearch}
+            />
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={turnOffHeadless}
+                  onChange={(e) => setTurnOffHeadless(e.target.checked)}
+                />
+              }
+              label="Turn Off Headless"
               disabled={isDeepResearch}
             />
           </Box>
