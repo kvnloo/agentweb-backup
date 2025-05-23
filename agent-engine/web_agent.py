@@ -249,6 +249,7 @@ class WebAgent:
         """Execute a task based on the natural language prompt"""
         log_file = None
         try:
+            logger.info("Starting execute_task...")
             # Set class variables
             self.current_execution_id = execution_id
             self.current_task_id = task_id
@@ -258,7 +259,9 @@ class WebAgent:
             self.output_as_html = output_as_html
             self.use_shared_browser = use_shared_browser
             self.turn_off_headless = turn_off_headless
+            
             # Set up logging
+            logger.info("Setting up execution logging...")
             log_file = self.setup_execution_logging(execution_id)
             
             logger.info(f"Executing task with prompt: {prompt[:100]}...")
@@ -269,6 +272,7 @@ class WebAgent:
             logger.info(f"Output as JSON: {output_as_json}")
             
             # Register actions after setting is_interactive
+            logger.info("Registering actions...")
             self._register_actions()
             
             # Add interactive mode context to the prompt if enabled
@@ -285,6 +289,7 @@ class WebAgent:
             self.task = prompt
 
             # Initialize browser and controller
+            logger.info("Setting up browser and controller...")
             await self.setup(validate_output)
 
             # Set max_steps based on task complexity
@@ -294,16 +299,23 @@ class WebAgent:
                 max_steps = 25
             
             logger.info(f"Running agent with max_steps={max_steps} (Complex Task: {is_complex_task})")
-            result = await self.agent.run(max_steps=max_steps)
+            try:
+                result = await self.agent.run(max_steps=max_steps)
+                logger.info("Agent run completed successfully")
+            except Exception as e:
+                logger.error(f"Error during agent run: {e}")
+                raise
             
             task_is_done = False  # Initialize task_is_done
             agent_message = None
             if result.is_done():
                 task_is_done = True
                 agent_message = result.history[-1].result[-1].extracted_content
+                logger.info("Task completed successfully")
 
             if agent_message is None:
                 agent_message = 'Oops! Something went wrong while running AgentWeb.'
+                logger.warning("No agent message found in result")
             
             # If json output is required, validate the response is proper JSON
             if output_as_json and task_is_done:
@@ -334,6 +346,7 @@ class WebAgent:
             # If task completed successfully, check for downloaded files
             result_files = []
             downloads_path = self._get_downloads_path()
+            logger.info(f"Downloads path: {downloads_path}")
             
             # Extract JSON content if enabled
             if extract_page_content:
@@ -372,8 +385,14 @@ class WebAgent:
                     logger.info("No JSON objects found in the extracted content")
 
             if self.current_execution_id:
-                result_files = upload_task_result_files(downloads_path, self.current_execution_id)
+                logger.info("Uploading task result files...")
+                try:
+                    result_files = upload_task_result_files(downloads_path, self.current_execution_id)
+                    logger.info(f"Successfully uploaded {len(result_files) if result_files else 0} result files")
+                except Exception as e:
+                    logger.error(f"Error uploading result files: {e}")
             
+            logger.info("Preparing final response...")
             return {
                 "success": task_is_done,
                 "summary" if task_is_done else "error": agent_message,
@@ -382,6 +401,9 @@ class WebAgent:
             }
         except Exception as e:
             logger.error(f"Error in execute_task: {e}")
+            logger.error(f"Error type: {type(e)}")
+            import traceback
+            logger.error(f"Error traceback: {traceback.format_exc()}")
             # Clean up
             await self.cleanup()
             return {
