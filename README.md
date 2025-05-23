@@ -654,6 +654,7 @@ sudo apt-get install -y \
 sudo apt-get install -y \
     fonts-liberation \
     fonts-dejavu \
+    xvfb \
     libasound2 \
     libatk-bridge2.0-0 \
     libatk1.0-0 \
@@ -731,6 +732,10 @@ playwright install
 cd ~/agentweb/agent-engine
 conda activate agent-engine
 
+# Start Xvfb in the background (if running on a headless server)
+Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
+export DISPLAY=:99
+
 # Start the agent engine
 python task_monitor.py
 ```
@@ -750,3 +755,15 @@ git pull
 conda env update -f environment.yml --prune
 pip install -r requirements.txt
 ```
+
+#### Troubleshooting
+
+If you encounter browser initialization errors:
+1. Make sure Xvfb is running: `ps aux | grep Xvfb`
+2. Check if DISPLAY is set: `echo $DISPLAY`
+3. Restart Xvfb if needed:
+   ```bash
+   pkill Xvfb
+   Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
+   export DISPLAY=:99
+   ```
