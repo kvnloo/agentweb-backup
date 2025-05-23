@@ -166,7 +166,7 @@ export const updateTemplate = async (req: AuthRequest, res: Response) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    const { name, description, prompt, isInteractive, isDeepResearch, isComplexTask, published, nameParameter, category, outputAsJson, outputAsHtml, selectedLLMs, useSharedBrowser } = req.body;
+    const { name, description, prompt, isInteractive, isDeepResearch, isComplexTask, published, nameParameter, category, outputAsJson, outputAsHtml, selectedLLMs, useSharedBrowser, turnOffHeadless } = req.body;
 
     const updates: any = {};
     if (name !== undefined) updates.name = name;
@@ -216,7 +216,8 @@ export const updateTemplate = async (req: AuthRequest, res: Response) => {
     if (outputAsHtml !== undefined) updates.outputAsHtml = outputAsHtml ? true : (updates.outputAsJson === undefined ? template.outputAsJson : updates.outputAsJson) ? false : false;
     
     if (selectedLLMs !== undefined) updates.selectedLLMs = selectedLLMs;
-    if (useSharedBrowser !== undefined) updates.useSharedBrowser = Boolean(useSharedBrowser); // ADDED useSharedBrowser
+    if (useSharedBrowser !== undefined) updates.useSharedBrowser = Boolean(useSharedBrowser);
+    if (turnOffHeadless !== undefined) updates.turnOffHeadless = Boolean(turnOffHeadless);
     
     // Only allow admins to update the published status
     if (published !== undefined && user.isAdmin) {
