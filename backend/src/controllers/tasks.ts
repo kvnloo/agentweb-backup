@@ -40,7 +40,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       outputAsJson,
       outputAsHtml,
       selectedLLMs,
-      useSharedBrowser
+      useSharedBrowser,
+      turnOffHeadless
     } = req.body;
     
     // If templateId is provided, fetch the template and use its values
@@ -84,6 +85,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           outputAsJson: outputAsJson !== undefined ? Boolean(outputAsJson) : template.outputAsJson,
           outputAsHtml: outputAsHtml !== undefined ? Boolean(outputAsHtml) : template.outputAsHtml,
           useSharedBrowser: useSharedBrowser !== undefined ? Boolean(useSharedBrowser) : template.useSharedBrowser,
+          turnOffHeadless: turnOffHeadless !== undefined ? Boolean(turnOffHeadless) : template.turnOffHeadless,
           createdAt: new Date().toISOString(),
           llmName: req.body.llmName || null,
           category: category || template.category,
@@ -119,6 +121,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       outputAsJson: Boolean(outputAsJson),
       outputAsHtml: Boolean(outputAsHtml),
       useSharedBrowser: Boolean(useSharedBrowser),
+      turnOffHeadless: Boolean(turnOffHeadless),
       createdAt: new Date().toISOString(),
       llmName: req.body.llmName || null,
       category: category,
@@ -242,6 +245,10 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
 
     if (req.body.useSharedBrowser !== undefined) {
       updates.useSharedBrowser = Boolean(req.body.useSharedBrowser);
+    }
+
+    if (req.body.turnOffHeadless !== undefined) {
+      updates.turnOffHeadless = Boolean(req.body.turnOffHeadless);
     }
 
     // Handle outputAsJson and outputAsHtml mutual exclusivity
