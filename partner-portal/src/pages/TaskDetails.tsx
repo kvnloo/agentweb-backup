@@ -75,6 +75,7 @@ interface Task {
   attachments?: TaskAttachment[];
   selectedLLMs?: string[];
   useSharedBrowser?: boolean; // Flag for using shared browser
+  turnOffHeadless?: boolean; // Flag for turning off headless mode
 }
 
 interface TaskAttachment {
@@ -1117,6 +1118,22 @@ export default function TaskDetails() {
     }
   };
 
+  const handleTurnOffHeadlessToggle = async () => {
+    if (!task || !token) return;
+    const newTurnOffHeadlessValue = !(task?.turnOffHeadless || false); // Calculate new value based on task state
+    try {
+      await axios.put(buildApiUrl(`/api/tasks/${task.taskId}`), 
+        { turnOffHeadless: newTurnOffHeadlessValue },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      await fetchTask(); // Re-fetch task data to update UI from source of truth
+      setError(''); // Clear previous errors
+    } catch (err) {
+      console.error('Failed to update turn off headless mode:', err);
+      setError('Failed to update headless mode setting. Please try again.');
+    }
+  };
+
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
@@ -1439,6 +1456,12 @@ export default function TaskDetails() {
                     <FormControlLabel
                       control={<Switch checked={task?.useSharedBrowser || false} onChange={handleUseSharedBrowserToggle} />}
                       label="Use Shared Browser"
+                    />
+                  </Tooltip>
+                  <Tooltip title="When enabled, the browser will not be headless during task execution. This is needed for accessing some websites that require a visible browser such as x.com, circle.so, etc.">
+                    <FormControlLabel
+                      control={<Switch checked={task?.turnOffHeadless || false} onChange={handleTurnOffHeadlessToggle} />}
+                      label="Turn Off Headless Mode"
                     />
                   </Tooltip>
                 </Box>

@@ -17,4 +17,5 @@ export interface Task {
   outputAsHtml?: boolean;
   llmName?: string;  // The preferred LLM to try first for this task
   useSharedBrowser?: boolean; // Whether the task should use a shared browser session
+  turnOffHeadless?: boolean; // Whether to run the browser in visible mode
 } 
