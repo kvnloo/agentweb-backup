@@ -653,6 +653,7 @@ sudo apt-get install -y \
 # Install additional browser dependencies
 sudo apt-get install -y \
     fonts-liberation \
+    fonts-dejavu \
     libasound2 \
     libatk-bridge2.0-0 \
     libatk1.0-0 \
