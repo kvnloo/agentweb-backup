@@ -49,6 +49,8 @@ interface Template {
   outputAsJson?: boolean;
   outputAsHtml?: boolean;
   useSharedBrowser?: boolean;
+  turnOffHeadless?: boolean;
+  selectedLLMs?: string[];
 }
 
 export default function CreateTask() {
@@ -60,6 +62,7 @@ export default function CreateTask() {
   const [outputAsJson, setOutputAsJson] = useState(false);
   const [outputAsHtml, setOutputAsHtml] = useState(false);
   const [useSharedBrowser, setUseSharedBrowser] = useState(false);
+  const [turnOffHeadless, setTurnOffHeadless] = useState(false);
   const [error, setError] = useState('');
   const [selectedTemplate, setSelectedTemplate] = useState('');
   const [templates, setTemplates] = useState<Template[]>([]);
@@ -137,6 +140,7 @@ export default function CreateTask() {
       setOutputAsJson(template.outputAsJson || false);
       setOutputAsHtml(template.outputAsHtml || false);
       setUseSharedBrowser(template.useSharedBrowser || false);
+      setTurnOffHeadless(template.turnOffHeadless || false);
       
       // Set current template parameters
       setCurrentTemplateParams(template.parameters || []);
@@ -217,6 +221,7 @@ export default function CreateTask() {
         outputAsJson: outputAsJson,
         outputAsHtml: outputAsHtml,
         useSharedBrowser: useSharedBrowser,
+        turnOffHeadless: turnOffHeadless,
         emailNotification,
         // Only include templateId if a template is selected AND we are on the template tab
         templateId: tabValue === 0 && selectedTemplate ? selectedTemplate : undefined,
@@ -545,18 +550,18 @@ export default function CreateTask() {
                       {getSelectedTemplate()?.isDeepResearch && (
                         <Chip label="Email Notifications" size="small" />
                       )}
-                      {/* START: Read-only display for Template tab */}
                       {getSelectedTemplate()?.outputAsJson && (
                         <Chip label="Output as JSON" size="small" color="info" variant="outlined" />
                       )}
                       {getSelectedTemplate()?.outputAsHtml && (
                         <Chip label="Output as HTML5" size="small" color="info" variant="outlined" />
                       )}
-                      {/* Display Use Shared Browser from template */}
                       {getSelectedTemplate()?.useSharedBrowser && (
                         <Chip label="Use Shared Browser" size="small" color="info" variant="outlined" />
                       )}
-                      {/* END: Read-only display for Template tab */}
+                      {getSelectedTemplate()?.turnOffHeadless && (
+                        <Chip label="Turn Off Headless" size="small" color="info" variant="outlined" />
+                      )}
                     </Box>
                   </Box>
                 </CardContent>

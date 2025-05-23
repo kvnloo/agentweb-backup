@@ -177,6 +177,7 @@ class WebAgent:
         self.log_filter_thread = None
         self.is_agentic_dev_mode = False  # Initialize is_agentic_dev_mode property
         self.output_as_html = False # Initialize output_as_html property
+        self.turn_off_headless = False  # Initialize turn_off_headless property
 
     def setup_execution_logging(self, execution_id: str):
         """Setup logging for the current execution"""
@@ -244,7 +245,7 @@ class WebAgent:
         # Clear the reference to the log filter thread to help with garbage collection
         self.log_filter_thread = None
 
-    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False) -> Dict[str, Any]:
+    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
         log_file = None
         try:
@@ -256,6 +257,7 @@ class WebAgent:
             self.is_agentic_dev_mode = is_agentic_dev_mode
             self.output_as_html = output_as_html
             self.use_shared_browser = use_shared_browser
+            self.turn_off_headless = turn_off_headless
             # Set up logging
             log_file = self.setup_execution_logging(execution_id)
             
@@ -1382,6 +1384,11 @@ Once the PR is approved and merged, this code will be available through the 'Run
         # Get headless mode from environment variable, default to False if not set
         headless = os.getenv('BROWSER_HEADLESS', 'true').lower() == 'true'
         
+        # If turn_off_headless is set, force headless to false
+        if self.turn_off_headless:
+            logger.info("Turn Off Headless is enabled. Setting headless=false.")
+            headless = False
+            
         # If run_user_id is set, force headless to false to allow admin interaction
         if self.run_user_id:
             logger.info(f"Task run by user {self.run_user_id} who is not the owner. Setting headless=false to allow admin interaction.")
@@ -1500,6 +1507,7 @@ async def main():
     parser.add_argument('--agentic-dev-mode', action='store_true', help='Enable agentic dev mode features')
     parser.add_argument('--output-as-html', action='store_true', help='Output result as HTML5')
     parser.add_argument('--use-shared-browser', action='store_true', help='Use shared browser')
+    parser.add_argument('--turn-off-headless', action='store_true', help='Turn off headless mode')
 
     args = parser.parse_args()
 
@@ -1530,7 +1538,8 @@ async def main():
             output_as_json=args.output_as_json,
             is_agentic_dev_mode=args.agentic_dev_mode,
             output_as_html=args.output_as_html,
-            use_shared_browser=args.use_shared_browser
+            use_shared_browser=args.use_shared_browser,
+            turn_off_headless=args.turn_off_headless
         )
         print(json.dumps(result))
         sys.exit(0 if result["success"] else 1)

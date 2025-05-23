@@ -31,6 +31,7 @@ interface FetchedTemplate {
   outputAsHtml?: boolean; // Added
   selectedLLMs?: string[]; // Added for template LLM selection
   useSharedBrowser?: boolean; // Added useSharedBrowser
+  turnOffHeadless?: boolean;
 }
 
 // Define a new interface that correctly combines FrontendTemplateDef with additional fields
@@ -39,10 +40,11 @@ interface DisplayTemplate extends FrontendTemplateDef {
   isInteractive?: boolean;
   isDeepResearch?: boolean;
   isComplexTask?: boolean;
-  outputAsJson?: boolean; // Added
-  outputAsHtml?: boolean; // Added
-  selectedLLMs?: string[]; // Added for template LLM selection
-  useSharedBrowser?: boolean; // Added useSharedBrowser
+  outputAsJson?: boolean;
+  outputAsHtml?: boolean;
+  selectedLLMs?: string[];
+  useSharedBrowser?: boolean;
+  turnOffHeadless?: boolean;
   // Ensure promptTemplate is part of DisplayTemplate if used directly from it later
   // FrontendTemplateDef already has promptTemplate?: string;
 }
@@ -120,6 +122,7 @@ const Dashboard = () => {
           outputAsHtml: ft.outputAsHtml,
           selectedLLMs: ft.selectedLLMs, // Map selectedLLMs
           useSharedBrowser: ft.useSharedBrowser, // Added useSharedBrowser
+          turnOffHeadless: ft.turnOffHeadless, // Added turnOffHeadless
         };
         newGroupedTemplates[ft.category].push(displayTemplate);
       }
@@ -277,7 +280,8 @@ const Dashboard = () => {
       outputAsJson: templateData.outputAsJson || false,
       outputAsHtml: templateData.outputAsHtml || false,
       selectedLLMs: templateData.selectedLLMs,
-      useSharedBrowser: templateData.useSharedBrowser || false, // Added useSharedBrowser
+      useSharedBrowser: templateData.useSharedBrowser || false,
+      turnOffHeadless: templateData.turnOffHeadless || false,
     };
 
     console.log("Attempting to create task with payload:", taskPayload);
