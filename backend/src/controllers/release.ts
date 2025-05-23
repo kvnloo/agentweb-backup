@@ -8,6 +8,15 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-05-23",
+    changes: [
+      "Support Turn Off Headless toggle",
+      "- Added new toggle in Task Details page of Partner Portal and Templates",
+      "- When creating a new task based on a template, this setting will be enabled based on template",
+      "- Useful for tasks which visit sites that require headless to be off such as x.com, circle.so"
+    ]
+  },
+  {
     date: "2025-05-22",
     changes: [
       "Added Kill button to Execution Details page",
