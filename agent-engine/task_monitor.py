@@ -989,14 +989,23 @@ async def execute_task(execution):
         if not success:
             error_message = f"All LLMs failed. Last error: {last_error}"
             try:
-                # Send oncall alert before updating status
-                from email_utils import send_oncall_alert
-                send_oncall_alert(
-                    task_name=task['name'] if task else 'Unknown Task',
-                    task_id=task_id,
-                    error=error_message,
-                    llm_names_tried=llm_names_tried
-                )
+                # Check if execution was killed before sending oncall alert
+                execution_status = executions_table.get_item(
+                    Key={'executionId': execution_id},
+                    ProjectionExpression='#s',
+                    ExpressionAttributeNames={'#s': 'status'}
+                ).get('Item', {}).get('status')
+                
+                # Only send oncall alert if task was not killed
+                if execution_status != 'killed':
+                    # Send oncall alert before updating status
+                    from email_utils import send_oncall_alert
+                    send_oncall_alert(
+                        task_name=task['name'] if task else 'Unknown Task',
+                        task_id=task_id,
+                        error=error_message,
+                        llm_names_tried=llm_names_tried
+                    )
                 
                 update_execution_status(
                     execution_id, 
