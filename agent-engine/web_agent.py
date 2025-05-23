@@ -260,10 +260,6 @@ class WebAgent:
             self.use_shared_browser = use_shared_browser
             self.turn_off_headless = turn_off_headless
             
-            # Set font path for GIF generation
-            os.environ['FONT_PATH'] = '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf'
-            logger.info(f"Set FONT_PATH to {os.environ['FONT_PATH']}")
-            
             # Set up logging
             logger.info("Setting up execution logging...")
             log_file = self.setup_execution_logging(execution_id)
@@ -306,15 +302,6 @@ class WebAgent:
             try:
                 result = await self.agent.run(max_steps=max_steps)
                 logger.info("Agent run completed successfully")
-            except OSError as e:
-                if "cannot open resource" in str(e) and "ImageFont" in str(e):
-                    # This is a font loading error during GIF generation
-                    logger.warning("Font loading error during GIF generation, continuing without GIF")
-                    # Get the result from the agent's state
-                    result = self.agent.state
-                else:
-                    # This is a different OSError, re-raise it
-                    raise
             except Exception as e:
                 logger.error(f"Error during agent run: {e}")
                 raise
