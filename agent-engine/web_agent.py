@@ -1449,39 +1449,79 @@ Once the PR is approved and merged, this code will be available through the 'Run
 
     async def cleanup(self):
         """Clean up browser resources and sync cookies"""
+        logger.info("Starting cleanup process...")
         try:
             if self.browser:
+                logger.info("Browser exists, starting browser cleanup...")
                 # Save cookies before closing
                 cookies_path = self._get_cookies_path()
+                logger.info(f"Cookies path: {cookies_path}")
+                
                 if cookies_path:
                     if self.cookie_sync:
+                        logger.info("Cookie sync exists, attempting to upload cookies...")
                         # Upload cookies
                         effective_user_id_for_upload = "SHARED_USER_ID" if self.use_shared_browser else self.user_id
+                        logger.info(f"Effective user ID for upload: {effective_user_id_for_upload}")
+                        
                         if not effective_user_id_for_upload:
                             logger.warning("Cannot upload cookies: user_id is None and not in shared browser mode.")
                         else:
-                            self.cookie_sync.upload_cookies(effective_user_id_for_upload, cookies_path)
-                        logger.info("Cookies uploaded to S3")
-                    Path(cookies_path).unlink(missing_ok=True)
-                    logger.info(f"Deleted cookie file at local: {cookies_path}")
+                            try:
+                                self.cookie_sync.upload_cookies(effective_user_id_for_upload, cookies_path)
+                                logger.info("Cookies uploaded to S3")
+                            except Exception as e:
+                                logger.error(f"Error uploading cookies to S3: {e}")
+                                
+                        try:
+                            Path(cookies_path).unlink(missing_ok=True)
+                            logger.info(f"Deleted cookie file at local: {cookies_path}")
+                        except Exception as e:
+                            logger.error(f"Error deleting cookie file: {e}")
                 
-                await self.browser.close()
+                try:
+                    logger.info("Attempting to close browser...")
+                    await self.browser.close()
+                    logger.info("Browser closed successfully")
+                except Exception as e:
+                    logger.error(f"Error closing browser: {e}")
+                finally:
+                    self.browser = None
+                    logger.info("Browser reference set to None")
             
             # Clean up logging handlers (which also stops the log filter thread)
-            self.cleanup_logging()
+            logger.info("Starting logging cleanup...")
+            try:
+                self.cleanup_logging()
+                logger.info("Logging cleanup completed")
+            except Exception as e:
+                logger.error(f"Error during logging cleanup: {e}")
 
-            # No need to filter and save browser-use log anymore, as it's now done in real-time
-            # But we should clean up the original unfiltered log file
-            browser_use_log = f'logs/execution_{self.current_execution_id}_browser_use.log'
-            if Path(browser_use_log).exists():
-                try:
-                    # Remove the original unfiltered log file
-                    Path(browser_use_log).unlink()
-                    logger.info(f"Removed original unfiltered log file: {browser_use_log}")
-                except Exception as e:
-                    logger.error(f"Error removing original log file: {e}")
+            # Clean up the original unfiltered log file
+            if self.current_execution_id:
+                browser_use_log = f'logs/execution_{self.current_execution_id}_browser_use.log'
+                logger.info(f"Checking for unfiltered log file: {browser_use_log}")
+                
+                if Path(browser_use_log).exists():
+                    try:
+                        logger.info("Removing original unfiltered log file...")
+                        Path(browser_use_log).unlink()
+                        logger.info(f"Removed original unfiltered log file: {browser_use_log}")
+                    except Exception as e:
+                        logger.error(f"Error removing original log file: {e}")
+                else:
+                    logger.info("Unfiltered log file does not exist")
+            else:
+                logger.warning("No execution ID available for log cleanup")
+
+            logger.info("Cleanup process completed successfully")
+            
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
+            logger.error(f"Cleanup error details: {str(e)}")
+            logger.error(f"Cleanup error type: {type(e)}")
+            import traceback
+            logger.error(f"Cleanup error traceback: {traceback.format_exc()}")
             raise
 
     def get_action_history(self):
