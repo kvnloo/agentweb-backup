@@ -1129,7 +1129,7 @@ export default function TaskDetails() {
       await fetchTask(); // Re-fetch task data to update UI from source of truth
       setError(''); // Clear previous errors
     } catch (err) {
-      console.error('Failed to update turn off headless mode:', err);
+      console.error('Failed to update turn off headless:', err);
       setError('Failed to update headless mode setting. Please try again.');
     }
   };
@@ -1461,7 +1461,7 @@ export default function TaskDetails() {
                   <Tooltip title="When enabled, the browser will not be headless during task execution. This is needed for accessing some websites that require a visible browser such as x.com, circle.so, etc.">
                     <FormControlLabel
                       control={<Switch checked={task?.turnOffHeadless || false} onChange={handleTurnOffHeadlessToggle} />}
-                      label="Turn Off Headless Mode"
+                      label="Turn Off Headless"
                     />
                   </Tooltip>
                 </Box>
