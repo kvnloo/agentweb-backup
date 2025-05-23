@@ -512,10 +512,16 @@ This section describes how to deploy the agent-engine on a single Google Cloud V
      - For cost optimization, start with `e2-standard-2`
 
    **Boot Disk:**
-   - Operating System: `Ubuntu`
-   - Version: `Ubuntu 24.04 LTS`
+   - Operating System: `Ubuntu` or `Debian`
+   - Version: `Ubuntu 24.04 LTS` or `Debian/GNU Linux 12`
    - Size: `100 GB`
    - Type: `Standard persistent disk`
+
+   **Note:** After increasing the disk size in Google Cloud Console, simply reboot the instance:
+   ```bash
+   sudo reboot
+   ```
+   The disk resize will be handled automatically after reboot.
 
    **Identity and Security:**
    - Service account: `Compute Engine default service account`
@@ -528,8 +534,6 @@ This section describes how to deploy the agent-engine on a single Google Cloud V
 4. Launch and Connect
    - Click "CREATE" and wait for deployment
    - Click "SSH" in the VM instances list to connect
-
-```
 
 #### 2. System Dependencies
 
@@ -577,6 +581,7 @@ sudo apt-get install -y \
     xdg-utils
 
 # Install Playwright-specific dependencies
+# For Ubuntu:
 sudo apt-get install -y \
     libnss3 \
     libnspr4 \
@@ -592,6 +597,99 @@ sudo apt-get install -y \
     libcairo2 \
     libasound2t64 \
     libatspi2.0-0t64
+
+# For Debian:
+# First, enable additional repositories
+sudo sed -i 's/^deb \(.*\) bookworm main$/deb \1 bookworm main contrib non-free/' /etc/apt/sources.list
+sudo apt-get update
+
+# Install dependencies
+sudo apt-get install -y \
+    libnss3 \
+    libnspr4 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libasound2 \
+    libatspi2.0-0 \
+    libgstreamer1.0-0 \
+    libgtk-4-1 \
+    libgraphene-1.0-0 \
+    libatomic1 \
+    libxslt1.1 \
+    libvpx7 \
+    libopus0 \
+    libgstreamer-plugins-base1.0-0 \
+    libflite1 \
+    libwebpdemux2 \
+    libavif15 \
+    libharfbuzz-icu0 \
+    libwebpmux3 \
+    libenchant-2-2 \
+    libsecret-1-0 \
+    libhyphen0 \
+    libmanette-0.2-0 \
+    libx264-164 \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly \
+    gstreamer1.0-libav \
+    gstreamer1.0-tools \
+    gstreamer1.0-x \
+    gstreamer1.0-alsa \
+    gstreamer1.0-gl \
+    gstreamer1.0-gtk3 \
+    gstreamer1.0-qt5 \
+    gstreamer1.0-pulseaudio
+
+# Install additional browser dependencies
+sudo apt-get install -y \
+    fonts-liberation \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libatk1.0-0 \
+    libatspi2.0-0 \
+    libcups2 \
+    libdbus-1-3 \
+    libdrm2 \
+    libgbm1 \
+    libgtk-3-0 \
+    libnspr4 \
+    libnss3 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libxshmfence1 \
+    xdg-utils
+
+# Install build dependencies for WOFF2
+sudo apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    pkg-config \
+    libbrotli-dev
+
+# Build and install WOFF2 from source
+cd /tmp
+git clone https://github.com/google/woff2.git
+cd woff2
+git submodule update --init --recursive
+mkdir build
+cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make
+sudo make install
+sudo ldconfig
 
 #### 3. Python Environment Setup
 
@@ -609,11 +707,15 @@ source ~/.bashrc
 #### 4. Agent Engine Setup
 
 ```bash
+# Install Git (if not already installed)
+sudo apt-get update
+sudo apt-get install -y git
+
 # Clone repository
-git clone https://github.com/yourusername/agentweb.git
-cd agentweb/agent-engine
+git clone https://github.com/AgentWebPro/agentweb.git
 
 # Create and activate Conda environment
+cd agentweb/agent-engine
 conda env create -f environment.yml
 conda activate agent-engine
 
