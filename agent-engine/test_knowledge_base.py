@@ -39,8 +39,8 @@ def test_search_knowledge():
         print(f"\nResult {i}:")
         print(f"Content: {result['content']}")
         print(f"Metadata: {result['metadata']}")
-        if 'score' in result:
-            print(f"Score: {result['score']}")
+        # Debug: Print the full structure of the result
+        print(f"Full result structure: {result}")
 
 if __name__ == "__main__":
     import sys
