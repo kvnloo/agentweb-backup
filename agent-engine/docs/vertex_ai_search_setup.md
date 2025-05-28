@@ -223,6 +223,19 @@ gcloud storage buckets update gs://agentweb-knowledge-base-dev --versioning
 
 Since you already have a VM instance with a default service account (107995268574-compute@developer.gserviceaccount.com), follow these steps to set up the necessary permissions:
 
+#### Option 1: Using Google Cloud Console UI
+
+1. Go to the Google Cloud Console: https://console.cloud.google.com
+2. Navigate to Compute Engine > VM instances
+3. Find your VM instance and click on it
+4. Click "Edit" (pencil icon)
+5. Scroll down to "Access scopes"
+6. Choolse "Allow full access to all Cloud APIs"
+8. Click "Save"
+9. The VM will be restarted automatically
+
+#### After configuring scopes
+
 1. Grant necessary permissions to the default service account:
 ```bash
 gcloud projects add-iam-policy-binding 107995268574 \
@@ -232,6 +245,10 @@ gcloud projects add-iam-policy-binding 107995268574 \
 gcloud projects add-iam-policy-binding 107995268574 \
     --member="serviceAccount:107995268574-compute@developer.gserviceaccount.com" \
     --role="roles/storage.admin"
+
+gcloud projects add-iam-policy-binding 107995268574 \
+    --member="serviceAccount:107995268574-compute@developer.gserviceaccount.com" \
+    --role="roles/discoveryengine.user"
 ```
 
 2. SSH into your VM:
