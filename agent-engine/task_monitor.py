@@ -419,7 +419,7 @@ def update_workflow_execution(workflow_execution_id: str, task_id: str, task_sta
         logger.error(f"Error updating workflow execution: {e}")
         return False
 
-async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str, run_user_id: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False) -> Dict[str, Any]:
+async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str, run_user_id: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False, use_knowledge_base: bool = False) -> Dict[str, Any]:
     global running_processes
     log_sync_manager = None
     process = None
@@ -479,6 +479,8 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
             cmd.append('--use-shared-browser')
         if turn_off_headless:
             cmd.append('--turn-off-headless')
+        if use_knowledge_base:
+            cmd.append('--use-knowledge-base')
         
         # Run command with output redirection
         logger.info(f"Running command: {' '.join(cmd)}")
@@ -882,6 +884,7 @@ async def execute_task(execution):
                         is_agentic_dev_mode = bool(task.get('isAgenticDevMode', False)) if task else False
                         use_shared_browser = bool(task.get('useSharedBrowser', False)) if task else False
                         turn_off_headless = bool(task.get('turnOffHeadless', False)) if task else False
+                        use_knowledge_base = bool(task.get('useKnowledgeBase', False)) if task else False
                         
                         # Set filtered activity log path for later reference
                         filtered_activity_log = f'logs/execution_{execution_id}_browser_use.filtered.log'
@@ -903,7 +906,8 @@ async def execute_task(execution):
                             is_agentic_dev_mode,
                             output_as_html,
                             use_shared_browser,
-                            turn_off_headless
+                            turn_off_headless,
+                            use_knowledge_base
                         )
                     except Exception as e:
                         logger.error(f"Error running web agent: {str(e)}")
