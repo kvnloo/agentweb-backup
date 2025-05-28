@@ -30,7 +30,7 @@ gcloud services enable storage.googleapis.com
 # Create a new bucket with a unique name
 # Note: Bucket names must be globally unique across all of Google Cloud
 gcloud storage buckets create gs://agentweb-knowledge-base-dev \
-    --project=agent-engine-460619 \
+    --project=107995268574 \
     --location=us-west1 \
     --uniform-bucket-level-access
 ```
@@ -79,13 +79,13 @@ gcloud iam service-accounts create agentweb-knowledge-base \
 2. Grant necessary permissions:
 ```bash
 # Grant Storage Object Admin role
-gcloud projects add-iam-policy-binding agent-engine-460619 \
-    --member="serviceAccount:agentweb-knowledge-base@agent-engine-460619.iam.gserviceaccount.com" \
+gcloud projects add-iam-policy-binding 107995268574 \
+    --member="serviceAccount:agentweb-knowledge-base@107995268574.iam.gserviceaccount.com" \
     --role="roles/storage.objectAdmin"
 
 # Grant Discovery Engine User role
-gcloud projects add-iam-policy-binding agent-engine-460619 \
-    --member="serviceAccount:agentweb-knowledge-base@agent-engine-460619.iam.gserviceaccount.com" \
+gcloud projects add-iam-policy-binding 107995268574 \
+    --member="serviceAccount:agentweb-knowledge-base@107995268574.iam.gserviceaccount.com" \
     --role="roles/discoveryengine.user"
 ```
 
@@ -132,10 +132,10 @@ The cron job will automatically refresh the credentials every 50 minutes to ensu
 1. Create a .env file in your agent-engine directory:
 ```bash
 # Create .env file
-cat > .env << EOL
-GOOGLE_CLOUD_PROJECT=agent-engine-460619
-VERTEX_AI_LOCATION=us
-VERTEX_AI_DATASTORE_ID=agentweb-kb_1748183084544
+cat > .env << EOLGOOGLE_CLOUD_PROJECT=107995268574
+VERTEX_AI_LOCATION=global
+VERTEX_AI_SEARCH_APP_ID=agentweb-kb3_1748352686579
+VERTEX_AI_DATASTORE_ID=agentweb-knowledge-base-connector-dev3_1748350752931_gcs_store
 GCS_BUCKET_NAME=agentweb-knowledge-base-dev
 EOL
 ```
@@ -217,4 +217,46 @@ gcloud storage buckets update gs://agentweb-knowledge-base-dev --versioning
 2. Monitor storage usage
 3. Clean up old knowledge entries
 4. Use appropriate storage classes
-5. Set up lifecycle policies for the bucket 
+5. Set up lifecycle policies for the bucket
+
+### 2. VM Deployment
+
+Since you already have a VM instance with a default service account (107995268574-compute@developer.gserviceaccount.com), follow these steps to set up the necessary permissions:
+
+1. Grant necessary permissions to the default service account:
+```bash
+gcloud projects add-iam-policy-binding 107995268574 \
+    --member="serviceAccount:107995268574-compute@developer.gserviceaccount.com" \
+    --role="roles/aiplatform.user"
+
+gcloud projects add-iam-policy-binding 107995268574 \
+    --member="serviceAccount:107995268574-compute@developer.gserviceaccount.com" \
+    --role="roles/storage.admin"
+```
+
+2. SSH into your VM:
+```bash
+gcloud compute ssh YOUR_VM_NAME --zone=YOUR_ZONE
+```
+
+3. On the VM, verify the service account is working:
+```bash
+# Verify the authentication
+gcloud auth list
+```
+
+Note: Replace the following placeholders with your actual values:
+- `YOUR_VM_NAME`: Your existing VM instance name
+- `YOUR_ZONE`: The zone where your VM is located (e.g., us-central1-a)
+
+### 3. Security Considerations
+
+1. Follow the principle of least privilege:
+   - Only grant the minimum necessary permissions to the service account
+   - Regularly audit service account permissions
+   - Consider removing unnecessary permissions
+
+2. Monitor service account usage:
+   - Enable Cloud Audit Logs
+   - Set up alerts for unusual activity
+   - Regularly review service account access patterns 
