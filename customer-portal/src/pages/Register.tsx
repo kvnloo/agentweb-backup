@@ -83,7 +83,7 @@ const Register = () => {
 
       // For invitation pending errors
       if (errorCode === "not_invited") {
-        const discordInviteLink = "https://discord.gg/yUCuSxHH";
+        const discordInviteLink = "https://discord.gg/kP2u6Wf9KQ";
 
         return (
           <>
