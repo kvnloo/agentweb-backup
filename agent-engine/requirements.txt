@@ -11,3 +11,5 @@ xmltodict
 facebook-business
 cryptography
 watchdog
+google-cloud-storage
+google-cloud-discoveryengine
