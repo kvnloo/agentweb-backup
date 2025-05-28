@@ -76,6 +76,7 @@ interface Task {
   selectedLLMs?: string[];
   useSharedBrowser?: boolean; // Flag for using shared browser
   turnOffHeadless?: boolean; // Flag for turning off headless mode
+  useKnowledgeBase?: boolean; // Flag for using knowledge base
 }
 
 interface TaskAttachment {
@@ -1134,6 +1135,22 @@ export default function TaskDetails() {
     }
   };
 
+  const handleUseKnowledgeBaseToggle = async () => {
+    if (!task || !token) return;
+    const newUseKnowledgeBaseValue = !(task?.useKnowledgeBase || false);
+    try {
+      await axios.put(buildApiUrl(`/api/tasks/${task.taskId}`), 
+        { useKnowledgeBase: newUseKnowledgeBaseValue },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      await fetchTask(); // Re-fetch task data to update UI from source of truth
+      setError(''); // Clear previous errors
+    } catch (err) {
+      console.error('Failed to update use knowledge base:', err);
+      setError('Failed to update knowledge base setting. Please try again.');
+    }
+  };
+
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
@@ -1462,6 +1479,12 @@ export default function TaskDetails() {
                     <FormControlLabel
                       control={<Switch checked={task?.turnOffHeadless || false} onChange={handleTurnOffHeadlessToggle} />}
                       label="Turn Off Headless"
+                    />
+                  </Tooltip>
+                  <Tooltip title="When enabled, the agent can search the knowledge base for relevant information during task execution">
+                    <FormControlLabel
+                      control={<Switch checked={task?.useKnowledgeBase || false} onChange={handleUseKnowledgeBaseToggle} />}
+                      label="Use Knowledge Base"
                     />
                   </Tooltip>
                 </Box>
