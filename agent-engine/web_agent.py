@@ -29,6 +29,7 @@ import base64  # Add at the top with other imports
 import boto3  # Add at the top with other imports
 from urllib.parse import quote
 from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content, generate_content_hash, get_agent_code_base_path, call_github_api, run_python_code_in_sandbox, fetch_api_credentials, decrypt_password, get_all_configs, parse_json
+from knowledge_base_utils import get_knowledge_base_manager
 # Load environment variables
 load_dotenv()
 
@@ -178,6 +179,7 @@ class WebAgent:
         self.is_agentic_dev_mode = False  # Initialize is_agentic_dev_mode property
         self.output_as_html = False # Initialize output_as_html property
         self.turn_off_headless = False  # Initialize turn_off_headless property
+        self.kb_manager = get_knowledge_base_manager()
 
     def setup_execution_logging(self, execution_id: str):
         """Setup logging for the current execution"""
@@ -1338,6 +1340,25 @@ Once the PR is approved and merged, this code will be available through the 'Run
                 except Exception as e:
                     logger.error(f"Error running JavaScript: {str(e)}")
                     return ActionResult(error=f"Failed to run JavaScript: {str(e)}")
+
+        @self.controller.registry.action('Search knowledge base')
+        def search_knowledge_base(query: str) -> ActionResult:
+            """Search the knowledge base for relevant information.
+            
+            Args:
+                query: The search query
+                
+            Returns:
+                ActionResult with search results
+            """
+            try:
+                results = self.kb_manager.search_knowledge(query)
+                return ActionResult(
+                    extracted_content=f"Found {len(results)} results for query '{query}':\n\n" + 
+                    "\n\n".join(f"Result {i+1}:\n{result['content']}" for i, result in enumerate(results))
+                )
+            except Exception as e:
+                return ActionResult(error=f"Failed to search knowledge base: {str(e)}")
 
     def _get_cookies_path(self):
         """Get the path to the user's cookies file"""
