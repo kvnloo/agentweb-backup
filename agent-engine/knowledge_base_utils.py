@@ -30,12 +30,11 @@ class KnowledgeBaseManager:
             client_options = None
         self.discovery_client = discoveryengine.SearchServiceClient(client_options=client_options)
         
-    def save_knowledge(self, content: str, metadata: Dict, bucket_name: str) -> str:
+    def save_knowledge(self, content: str, bucket_name: str) -> str:
         """Save new knowledge to GCS bucket for indexing.
         
         Args:
             content: The knowledge content to save
-            metadata: Additional metadata about the knowledge
             bucket_name: Name of the GCS bucket
             
         Returns:
@@ -44,21 +43,14 @@ class KnowledgeBaseManager:
         bucket = self.storage_client.bucket(bucket_name)
         
         # Create a unique filename with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"knowledge_{timestamp}.json"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")  # Added microseconds for uniqueness
+        filename = f"knowledge_{timestamp}.txt"
         
-        # Combine content and metadata
-        knowledge_data = {
-            "content": content,
-            "metadata": metadata,
-            "timestamp": timestamp
-        }
-        
-        # Upload to GCS
+        # Upload raw content to GCS
         blob = bucket.blob(filename)
         blob.upload_from_string(
-            json.dumps(knowledge_data),
-            content_type='application/json'
+            content,
+            content_type='text/plain'
         )
         
         return f"gs://{bucket_name}/{filename}"
@@ -81,23 +73,14 @@ class KnowledgeBaseManager:
 
         # Build content_search_spec using the SDK types
         content_search_spec = discoveryengine.SearchRequest.ContentSearchSpec(
-            snippet_spec=discoveryengine.SearchRequest.ContentSearchSpec.SnippetSpec(
-                return_snippet=True
-            ),
-            summary_spec=discoveryengine.SearchRequest.ContentSearchSpec.SummarySpec(
-                summary_result_count=5,
-                include_citations=True,
-                ignore_adversarial_query=True,
-                ignore_non_summary_seeking_query=True,
-                # You can customize the prompt and model version if needed
-                # model_prompt_spec=..., model_spec=...
-            ),
+            extractive_content_spec=discoveryengine.SearchRequest.ContentSearchSpec.ExtractiveContentSpec(
+                max_extractive_segment_count=max_results
+            )
         )
 
         request = discoveryengine.SearchRequest(
             serving_config=serving_config,
             query=query,
-            page_size=max_results,
             content_search_spec=content_search_spec,
             query_expansion_spec=discoveryengine.SearchRequest.QueryExpansionSpec(
                 condition=discoveryengine.SearchRequest.QueryExpansionSpec.Condition.AUTO
@@ -105,37 +88,28 @@ class KnowledgeBaseManager:
             spell_correction_spec=discoveryengine.SearchRequest.SpellCorrectionSpec(
                 mode=discoveryengine.SearchRequest.SpellCorrectionSpec.Mode.AUTO
             ),
-            # language_code="en-US",  # Uncomment if you want to specify language
         )
 
         response = self.discovery_client.search(request)
 
         results = []
         for result in response.results:
-            # Print the full document for debugging
-            print("DEBUG: Full document:", result.document)
             struct_data = result.document.derived_struct_data
-            # Extract snippets
-            snippets = struct_data.get("snippets", [])
-            if snippets:
-                # Assume the first snippet contains the content and metadata
-                snippet = snippets[0]
-                snippet_text = snippet.get("snippet", "")
-                # Decode HTML and parse as JSON
-                decoded_text = html.unescape(snippet_text)
-                try:
-                    snippet_data = json.loads(decoded_text)
-                    results.append({
-                        "content": snippet_data.get("content", ""),
-                        "metadata": snippet_data.get("metadata", {}),
-                        "raw": dict(struct_data)
-                    })
-                except json.JSONDecodeError:
-                    print("Failed to parse snippet as JSON:", decoded_text)
+            
+            # Extract extractive segments
+            extractive_segments = struct_data.get("extractive_segments", [])
+            if extractive_segments:
+                for segment in extractive_segments:
+                    # Get the content field from the segment
+                    content = segment.get("content", "")
+                    if content:
+                        results.append({
+                            "content": content,
+                            "raw": dict(struct_data)
+                        })
             else:
                 results.append({
                     "content": "",
-                    "metadata": {},
                     "raw": dict(struct_data)
                 })
         return results
