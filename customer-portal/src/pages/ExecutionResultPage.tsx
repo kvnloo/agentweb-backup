@@ -16,6 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Loader2, ArrowLeft } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 // Define interfaces based on the example provided
 interface ResultFile {
@@ -81,6 +82,11 @@ const ExecutionResultPage = () => {
   const [execution, setExecution] = useState<Execution | null>(null);
   const [taskName, setTaskName] = useState<string | null>(null); // Added state for task name
   const [htmlContent, setHtmlContent] = useState<string | null>(null);
+  const [tabbedFiles, setTabbedFiles] = useState<ResultFile[]>([]);
+  const [primaryHtmlFileInfo, setPrimaryHtmlFileInfo] = useState<{
+    url: string;
+    filename: string;
+  } | null>(null); // Added
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -127,16 +133,24 @@ const ExecutionResultPage = () => {
           // Not setting a blocking error, header will have a fallback
         }
 
-        const htmlFile = currentExecution.result_files?.find(
+        const allResultFiles = currentExecution.result_files || []; // Added
+        const primaryHtmlFile = allResultFiles.find(
+          // Changed: use allResultFiles
           (file) => file.view_type === "html" && file.filename.endsWith(".html")
         );
 
-        if (htmlFile && htmlFile.url) {
+        // Set files for tabs (all non-primary HTML files, and other types)
+        setTabbedFiles(
+          allResultFiles.filter((file) => file !== primaryHtmlFile)
+        ); // Added
+
+        if (primaryHtmlFile && primaryHtmlFile.url) {
+          // Changed: use primaryHtmlFile
           try {
             const fileContentResponse = await axios.get<string>(
               buildApiUrl(
                 `/api/files/view-external?url=${encodeURIComponent(
-                  htmlFile.url
+                  primaryHtmlFile.url
                 )}`
               ),
               { responseType: "text" }
@@ -195,6 +209,12 @@ const ExecutionResultPage = () => {
             }
 
             setHtmlContent(sanitizedHtml);
+            if (primaryHtmlFile) {
+              setPrimaryHtmlFileInfo({
+                url: primaryHtmlFile.url,
+                filename: primaryHtmlFile.filename,
+              });
+            }
           } catch (fileError) {
             console.error("Error fetching HTML file content:", fileError);
             setError(
@@ -277,12 +297,28 @@ const ExecutionResultPage = () => {
         <CardContent>
           {renderErrorAlert()}
           {htmlContent ? (
-            <iframe
-              srcDoc={htmlContent}
-              title="Execution Result HTML"
-              style={{ width: "100%", height: "600px", border: "none" }}
-              sandbox="allow-same-origin allow-scripts allow-popups"
-            />
+            <>
+              {primaryHtmlFileInfo && (
+                <div className="mb-2 flex justify-end">
+                  <Button variant="outline" size="sm" asChild>
+                    <a
+                      href={primaryHtmlFileInfo.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      download={primaryHtmlFileInfo.filename}
+                    >
+                      Download HTML
+                    </a>
+                  </Button>
+                </div>
+              )}
+              <iframe
+                srcDoc={htmlContent}
+                title="Execution Result HTML"
+                style={{ width: "100%", height: "600px", border: "none" }}
+                sandbox="allow-same-origin allow-scripts allow-popups"
+              />
+            </>
           ) : execution?.result ? (
             <div className="prose dark:prose-invert max-w-none p-4 rounded-md bg-muted dark:bg-slate-900/50">
               <ReactMarkdown remarkPlugins={[remarkGfm]}>
@@ -293,6 +329,90 @@ const ExecutionResultPage = () => {
             <p className="text-sm text-muted-foreground">
               No result content available for this execution.
             </p>
+          )}
+
+          {/* Display other result files in Tabs */}
+          {tabbedFiles.length > 0 && ( // Changed: Use tabbedFiles
+            <div className="mt-6 pt-4 border-t">
+              <h4 className="text-md font-semibold mb-3">Additional Files:</h4>
+              <Tabs defaultValue={tabbedFiles[0].filename} className="w-full">
+                <TabsList className="grid w-full grid-cols-none sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-1 h-auto mb-2">
+                  {tabbedFiles.map((file, index) => (
+                    <TabsTrigger
+                      key={index}
+                      value={file.filename}
+                      className="text-xs px-2 py-1.5 h-auto truncate"
+                    >
+                      {file.filename}
+                    </TabsTrigger>
+                  ))}
+                </TabsList>
+                {tabbedFiles.map((file, index) => {
+                  const isHtml =
+                    file.filename.endsWith(".html") ||
+                    file.view_type === "html";
+                  const isImage = [
+                    ".png",
+                    ".jpg",
+                    ".jpeg",
+                    ".gif",
+                    ".svg",
+                  ].some((ext) => file.filename.toLowerCase().endsWith(ext));
+                  return (
+                    <TabsContent key={index} value={file.filename}>
+                      <Card className="mt-2">
+                        <CardHeader className="py-3 px-4 border-b">
+                          <div className="flex justify-between items-center">
+                            <CardTitle className="text-sm font-medium truncate">
+                              {file.filename}
+                            </CardTitle>
+                            <Button variant="outline" size="sm" asChild>
+                              <a
+                                href={file.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                              >
+                                Download
+                              </a>
+                            </Button>
+                          </div>
+                        </CardHeader>
+                        <CardContent className="p-4 text-sm">
+                          {isHtml ? (
+                            <iframe
+                              src={file.url} // Directly use the URL, assuming it's servable
+                              title={`Preview: ${file.filename}`}
+                              style={{
+                                width: "100%",
+                                height: "400px",
+                                border: "1px solid #e2e8f0",
+                              }}
+                              sandbox="allow-same-origin allow-scripts" // Sandboxed for security
+                            />
+                          ) : isImage ? (
+                            <img
+                              src={file.url}
+                              alt={`Preview: ${file.filename}`}
+                              style={{
+                                maxWidth: "100%",
+                                maxHeight: "400px",
+                                border: "1px solid #e2e8f0",
+                                objectFit: "contain",
+                              }}
+                            />
+                          ) : (
+                            <p>
+                              Preview not available for this file type. Please
+                              download the file.
+                            </p>
+                          )}
+                        </CardContent>
+                      </Card>
+                    </TabsContent>
+                  );
+                })}
+              </Tabs>
+            </div>
           )}
         </CardContent>
       </Card>
