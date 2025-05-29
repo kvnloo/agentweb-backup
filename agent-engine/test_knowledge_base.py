@@ -33,7 +33,7 @@ def test_search_knowledge():
     kb_manager = get_knowledge_base_manager()
     
     # Test searching knowledge
-    query = "test"  # Simple query to match any content containing "dog"
+    query = "lazy dog"  # Simple query to match any content containing "dog"
     results = kb_manager.search_knowledge(query, max_results=5)
     
     # Print results
