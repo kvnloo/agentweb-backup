@@ -276,4 +276,153 @@ Note: Replace the following placeholders with your actual values:
 2. Monitor service account usage:
    - Enable Cloud Audit Logs
    - Set up alerts for unusual activity
-   - Regularly review service account access patterns 
+   - Regularly review service account access patterns
+
+### 4. Connecting AWS Elastic Beanstalk to GCS
+
+To allow your AWS Elastic Beanstalk backend to interact with Google Cloud Storage, follow these steps:
+
+1. Create a new service account for AWS:
+```bash
+# Create a new service account
+gcloud iam service-accounts create aws-backend-sa \
+    --display-name="AWS Backend Service Account"
+
+# Grant necessary permissions
+gcloud projects add-iam-policy-binding 107995268574 \
+    --member="serviceAccount:aws-backend-sa@107995268574.iam.gserviceaccount.com" \
+    --role="roles/storage.admin"
+
+gcloud projects add-iam-policy-binding 107995268574 \
+    --member="serviceAccount:aws-backend-sa@107995268574.iam.gserviceaccount.com" \
+    --role="roles/discoveryengine.user"
+```
+
+2. Create and download service account key:
+```bash
+# Create a new key for the service account
+gcloud iam service-accounts keys create aws-backend-key.json \
+    --iam-account=aws-backend-sa@107995268574.iam.gserviceaccount.com
+```
+
+3. Store the service account key in AWS Secrets Manager:
+   - Go to AWS Secrets Manager Console
+   - Click "Store a new secret"
+   - Choose "Other type of secret"
+   - Copy the entire contents of `aws-backend-key.json` into the secret value
+   - Name the secret (e.g., "gcs-service-account-key")
+   - Note down the secret ARN
+
+4. Set up AWS Elastic Beanstalk environment variables:
+   - Go to AWS Elastic Beanstalk Console
+   - Select your environment
+   - Go to Configuration > Software
+   - Add the following environment variables:
+     ```
+     GCS_BUCKET_NAME=your-bucket-name
+     GCS_SECRET_ARN=your-secret-arn
+     ```
+
+5. Create an IAM role for Elastic Beanstalk to access Secrets Manager:
+   - Go to IAM Console
+   - Create a new role for Elastic Beanstalk
+   - Add the following policy:
+     ```json
+     {
+         "Version": "2012-10-17",
+         "Statement": [
+             {
+                 "Effect": "Allow",
+                 "Action": [
+                     "secretsmanager:GetSecretValue"
+                 ],
+                 "Resource": "your-secret-arn"
+             }
+         ]
+     }
+     ```
+   - Attach this role to your Elastic Beanstalk environment
+
+6. Update your backend code to use the credentials:
+```javascript
+const { Storage } = require('@google-cloud/storage');
+const { DocumentServiceClient } = require('@google-cloud/discoveryengine');
+const AWS = require('aws-sdk');
+const { GoogleAuth } = require('google-auth-library');
+
+async function getGcsCredentials() {
+    // Get secret from AWS Secrets Manager
+    const secretsManager = new AWS.SecretsManager();
+    const secret = await secretsManager.getSecretValue({
+        SecretId: process.env.GCS_SECRET_ARN
+    }).promise();
+    
+    const secretDict = JSON.parse(secret.SecretString);
+    
+    // Create credentials object
+    const auth = new GoogleAuth({
+        credentials: secretDict
+    });
+    
+    return auth;
+}
+
+// Initialize clients with credentials
+async function initializeClients() {
+    const credentials = await getGcsCredentials();
+    
+    const storageClient = new Storage({
+        authClient: credentials
+    });
+    
+    const discoveryClient = new DocumentServiceClient({
+        authClient: credentials
+    });
+    
+    return { storageClient, discoveryClient };
+}
+
+// Example usage
+async function example() {
+    const { storageClient, discoveryClient } = await initializeClients();
+    
+    // Use the clients...
+    const [buckets] = await storageClient.getBuckets();
+    console.log('Buckets:', buckets);
+}
+```
+
+7. Security best practices:
+   - Never store service account keys in code or configuration files
+   - Use AWS Secrets Manager for all sensitive credentials
+   - Regularly rotate the service account key
+   - Monitor access logs for unusual activity
+   - Implement proper error handling for GCS operations
+   - Use IAM roles with least privilege principle
+   - Enable AWS CloudTrail for audit logging
+
+8. Testing the connection:
+```javascript
+async function testGcsConnection() {
+    try {
+        const { storageClient } = await initializeClients();
+        
+        // List buckets to test connection
+        const [buckets] = await storageClient.getBuckets();
+        console.log('Successfully connected to GCS');
+        return true;
+    } catch (error) {
+        console.error('Failed to connect to GCS:', error);
+        return false;
+    }
+}
+```
+
+Note: Replace the following placeholders with your actual values:
+- `your-secret-arn`: The ARN of your secret in AWS Secrets Manager
+- `your-bucket-name`: Your actual GCS bucket name
+
+Required npm packages:
+```bash
+npm install @google-cloud/storage @google-cloud/discoveryengine aws-sdk google-auth-library
+``` 
