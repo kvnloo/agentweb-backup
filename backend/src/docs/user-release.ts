@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-05-29',
+    changes: [
+      'Support file downloads in Execution Details page',
+      '- Users can now download files generated during task execution',
+      '- Files are securely stored and accessible through the Execution Details page',
+      'Bug fixes',
+      '- Fixed an issue with Discord integration'
+    ],
+  },
+  {
     date: '2025-05-22',
     changes: [
       'Updated sign up page to look like login page and improved dropdown',
