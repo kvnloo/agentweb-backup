@@ -57,6 +57,11 @@ interface Execution {
   prompt: string;
   result: string;
   userInteractions?: Interaction[];
+  result_files?: {
+    url: string;
+    filename: string;
+    is_html?: boolean;
+  }[];
 }
 
 // Add Interaction type for userInteractions
@@ -69,6 +74,14 @@ interface Interaction {
   screenshot_url?: string;
 }
 
+// Define TaskAttachment interface
+interface TaskAttachment {
+  url: string;
+  key: string;
+  filename: string;
+  uploadedAt: string;
+}
+
 // Update TaskDetail interface
 interface TaskDetail extends Task {
   parameterValues?: Record<string, string>;
@@ -77,6 +90,7 @@ interface TaskDetail extends Task {
   resultLink?: string;
   isInteractive?: boolean;
   isDeepResearch?: boolean;
+  attachments?: TaskAttachment[];
 }
 
 // Base Task interface
@@ -569,6 +583,26 @@ const TaskDetailsPage: React.FC = () => {
           )}
         </CardHeader>
         <CardContent className="space-y-4">
+          {task.attachments && task.attachments.length > 0 && (
+            <div className="pb-4 border-b">
+              <h3 className="font-semibold mb-2 text-sm">Attachments:</h3>
+              <ul className="list-disc pl-5 space-y-1">
+                {task.attachments.map((att) => (
+                  <li key={att.key} className="text-sm">
+                    <a
+                      href={att.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-blue-600 hover:underline"
+                    >
+                      {att.filename} (added on{" "}
+                      {new Date(att.uploadedAt).toLocaleDateString()})
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           {task.description && (
             <div className="pb-4 border-b">
               <h3 className="font-semibold mb-1 text-sm">Description:</h3>
@@ -712,6 +746,27 @@ const TaskDetailsPage: React.FC = () => {
                       Result: {exec.result.substring(0, 100)}
                       {exec.result.length > 100 ? "..." : ""}
                     </p>
+                  )}
+                  {exec.result_files && exec.result_files.length > 0 && (
+                    <div className="pt-2 mt-2 border-t border-dashed">
+                      <p className="text-xs font-semibold mb-1">
+                        Result Files:
+                      </p>
+                      <ul className="list-disc pl-4 space-y-0.5">
+                        {exec.result_files.map((file, idx) => (
+                          <li key={idx} className="text-xs">
+                            <a
+                              href={file.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-blue-500 hover:underline"
+                            >
+                              {file.filename}
+                            </a>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
                   )}
                 </CardContent>
               </Card>
