@@ -8,6 +8,8 @@ import { isAdmin } from '../middleware/admin';
 import { userDb } from '../services/db';
 import { emailService } from '../services/emailService';
 import { Storage } from '@google-cloud/storage';
+import OpenAI from 'openai';
+import axios from 'axios';
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -21,12 +23,29 @@ const storage = new Storage({
   }
 });
 
+// Initialize Azure OpenAI client
+const openai = new OpenAI({
+  apiKey: process.env.AZURE_OPENAI_API_KEY,
+  baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT}`,
+  defaultQuery: {
+    "api-version": process.env.AZURE_OPENAI_API_VERSION || "2024-08-01-preview",
+  },
+  defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
+});
+
 // Ensure bucket exists
 const BUCKET_NAME = process.env.GCS_BUCKET || 'agentweb-knowledge-base-dev';
 
 type FileRequest = AuthenticatedRequest & {
   file?: Express.Multer.File;
 };
+
+interface ResultFile {
+  url: string;
+  filename: string;
+  token: string;
+  is_html?: boolean;
+}
 
 // Public routes (no authentication required)
 router.get('/execution/:executionId/token/:token', getExecutionWithToken);
@@ -429,6 +448,107 @@ router.put('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
     }
   } catch (error) {
     console.error('Error in knowledge base PUT:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Update knowledge base from execution
+router.post('/:taskId/executions/:executionId/update-knowledge-base', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { taskId, executionId } = req.params;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+      return res.status(403).json({ message: 'Not authorized to modify this task' });
+    }
+
+    const execution = await taskDb.getTaskExecutionById(executionId);
+    if (!execution) {
+      return res.status(404).json({ message: 'Execution not found' });
+    }
+
+    // Get the current knowledge base content
+    const bucket = storage.bucket(BUCKET_NAME);
+    const filePath = `tasks/${taskId}/knowledge-base.md`;
+    const file = bucket.file(filePath);
+    const [exists] = await file.exists();
+    
+    let currentContent = '';
+    if (exists) {
+      const [content] = await file.download();
+      currentContent = content.toString();
+    }
+
+    // Download and process result files
+    let resultFilesContent = '';
+    if (execution.result_files && execution.result_files.length > 0) {
+      const textFiles = execution.result_files.filter((file: ResultFile) => 
+        file.filename.endsWith('.html') || 
+        file.filename.endsWith('.txt') || 
+        file.filename.endsWith('.md')
+      );
+
+      for (const file of textFiles) {
+        try {
+          const response = await axios.get(file.url);
+          resultFilesContent += `\n\nContent from ${file.filename}:\n${response.data}`;
+        } catch (error) {
+          console.error(`Error downloading file ${file.filename}:`, error);
+        }
+      }
+    }
+
+    // Use OpenAI to analyze the execution and suggest knowledge base updates
+    const prompt = `Analyze the following task execution and suggest updates to the knowledge base. 
+    Current knowledge base content:
+    ${currentContent}
+    
+    Task execution details:
+    Task: ${task.name}
+    Prompt: ${task.prompt}
+    Result: ${execution.result}
+    Error: ${execution.error || 'None'}
+    ${resultFilesContent ? `\nResult Files Content:${resultFilesContent}` : ''}
+    
+    Based on the above information, provide ONLY the updated markdown content for the knowledge base. Do not include any explanations, notes, or additional text. Output only the markdown content that should replace the current knowledge base content.`;
+
+    // Call OpenAI to get the updated content
+    const completion = await openai.chat.completions.create({
+      messages: [{ role: "user", content: prompt }],
+      model: process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4",
+      temperature: 0.4,
+      max_tokens: 32768,
+    });
+
+    const updatedContent = completion.choices[0].message.content || '';
+
+    // Save the updated content
+    await file.save(updatedContent, {
+      contentType: 'text/markdown',
+      metadata: {
+        taskId,
+        userId,
+        updatedAt: new Date().toISOString(),
+        sourceExecutionId: executionId
+      }
+    });
+
+    res.json({ 
+      content: updatedContent,
+      url: task.knowledgeBase,
+      message: 'Knowledge base updated successfully'
+    });
+  } catch (error) {
+    console.error('Error updating knowledge base from execution:', error);
     res.status(500).json({ message: 'Internal server error' });
   }
 });

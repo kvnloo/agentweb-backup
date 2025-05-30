@@ -52,6 +52,7 @@ import { useAuth } from '../contexts/AuthContext';
 import ScheduleForm from '../components/ScheduleForm';
 import ScheduleList from '../components/ScheduleList';
 import { buildApiUrl, getLLMsForTask } from '../config';
+import { toast } from 'react-hot-toast';
 
 interface Task {
   taskId: string;
@@ -377,6 +378,7 @@ export default function TaskDetails() {
   const [editedKnowledgeBase, setEditedKnowledgeBase] = useState('');
   const [knowledgeBaseContent, setKnowledgeBaseContent] = useState('');
   const [knowledgeBaseError, setKnowledgeBaseError] = useState('');
+  const [isUpdatingKnowledgeBase, setIsUpdatingKnowledgeBase] = useState<string | null>(null);
 
   const isAdminRoute = location.pathname.startsWith('/admin/');
   const showActions = !isAdminRoute || (task && user && task.userId === user.userId);
@@ -1257,6 +1259,32 @@ export default function TaskDetails() {
     loadData();
   }, [taskId, token]);
 
+  // Add function to handle knowledge base update
+  const handleUpdateKnowledgeBase = async (executionId: string) => {
+    if (!task) return;
+    
+    try {
+      setIsUpdatingKnowledgeBase(executionId);
+      const response = await axios.post(
+        buildApiUrl(`/api/tasks/${taskId}/executions/${executionId}/update-knowledge-base`),
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      
+      // Update the knowledge base content
+      setKnowledgeBaseContent(response.data.content);
+      setEditedKnowledgeBase(response.data.content);
+      setIsUpdatingKnowledgeBase(null);
+      
+      // Show success message
+      toast.success('Knowledge base updated successfully');
+    } catch (error: any) {
+      console.error('Error updating knowledge base:', error);
+      toast.error(error.response?.data?.message || 'Failed to update knowledge base');
+      setIsUpdatingKnowledgeBase(null);
+    }
+  };
+
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
@@ -1895,6 +1923,7 @@ export default function TaskDetails() {
                     <TableCell width="25%">Result</TableCell>
                     <TableCell width="250px">Details</TableCell>
                     <TableCell width="80px" align="center">Feedback</TableCell>
+                    <TableCell width="100px" align="center">Actions</TableCell>
                   </TableRow>
                 </TableHead>
                 <TableBody>
@@ -2016,6 +2045,31 @@ export default function TaskDetails() {
                             </IconButton>
                           </Tooltip>
                         </Box>
+                      </TableCell>
+                      <TableCell align="center">
+                        <div className="flex items-center space-x-2">
+                          <button
+                            onClick={() => handleUpdateKnowledgeBase(execution.executionId)}
+                            disabled={isUpdatingKnowledgeBase === execution.executionId}
+                            className={`px-3 py-1 text-sm rounded ${
+                              isUpdatingKnowledgeBase === execution.executionId
+                                ? 'bg-gray-300 cursor-not-allowed'
+                                : 'bg-blue-500 hover:bg-blue-600 text-white'
+                            }`}
+                          >
+                            {isUpdatingKnowledgeBase === execution.executionId ? (
+                              <span className="flex items-center">
+                                <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                </svg>
+                                Updating...
+                              </span>
+                            ) : (
+                              'Update Knowledge Base'
+                            )}
+                          </button>
+                        </div>
                       </TableCell>
                     </TableRow>
                   ))}
