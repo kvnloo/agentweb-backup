@@ -384,7 +384,6 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
     if (exists) {
       const [content] = await file.download();
       const contentStr = content.toString();
-      console.log('Knowledge base content:', contentStr);
       res.json({ content: contentStr, url: task.knowledgeBase });
     } else {
       // If file doesn't exist but task has a knowledge base link, return 404

@@ -285,6 +285,10 @@ class WebAgent:
             elif self.output_as_html:
                 prompt = f"{prompt}\n\nRequirement: The final output for this task MUST be in well-formatted HTML5. You MUST use the 'Write file' action to save this HTML content into a file with an .html extension."
 
+            # Add knowledge base instruction if enabled
+            if self.use_knowledge_base:
+                prompt = f"{prompt}\n\nImportant: Before browsing the web, you MUST first search the knowledge base using the 'Search knowledge base' action to find relevant information. Only proceed with web browsing if the knowledge base search doesn't provide sufficient information."
+
             # Create task
             self.task = prompt
 
