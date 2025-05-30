@@ -1197,7 +1197,7 @@ export default function TaskDetails() {
       console.log('Saving knowledge base content:', editedKnowledgeBase);
       const response = await axios.put(
         buildApiUrl(`/api/tasks/${taskId}/knowledge-base`),
-        { content: editedKnowledgeBase },
+        { content: editedKnowledgeBase || '' },  // Allow empty string
         { headers: { Authorization: `Bearer ${token}` } }
       );
       console.log('Save response:', response.data);

@@ -504,6 +504,7 @@ export const taskDb = {
     selectedLLMs?: string[];
     useSharedBrowser?: boolean;
     turnOffHeadless?: boolean;
+    knowledgeBase?: string;
   }>) {
     try {
       const setClauses: string[] = [];

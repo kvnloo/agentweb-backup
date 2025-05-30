@@ -387,9 +387,8 @@ router.put('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    if (!content) {
-      return res.status(400).json({ message: 'Content is required' });
-    }
+    // Allow empty content
+    const contentToSave = content || '';
 
     const task = await taskDb.getTaskById(taskId);
     if (!task) {
@@ -405,7 +404,7 @@ router.put('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
     const file = bucket.file(filePath);
 
     // Save content to file
-    await file.save(content, {
+    await file.save(contentToSave, {
       contentType: 'text/markdown',
       metadata: {
         taskId,
@@ -424,9 +423,9 @@ router.put('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
       // Update task with the new knowledge base link
       await taskDb.updateTask(taskId, { knowledgeBase: url });
       
-      res.json({ content, url });
+      res.json({ content: contentToSave, url });
     } else {
-      res.json({ content, url: task.knowledgeBase });
+      res.json({ content: contentToSave, url: task.knowledgeBase });
     }
   } catch (error) {
     console.error('Error in knowledge base PUT:', error);
