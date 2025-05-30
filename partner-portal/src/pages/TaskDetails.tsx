@@ -1197,13 +1197,11 @@ export default function TaskDetails() {
     if (!task) return;
     
     try {
-      console.log('Saving knowledge base content:', editedKnowledgeBase);
       const response = await axios.put(
         buildApiUrl(`/api/tasks/${taskId}/knowledge-base`),
         { content: editedKnowledgeBase || '' },  // Allow empty string
         { headers: { Authorization: `Bearer ${token}` } }
       );
-      console.log('Save response:', response.data);
       
       // Update task with the new knowledge base URL and content
       const updatedTask = { ...task, knowledgeBase: response.data.url };
@@ -1228,12 +1226,10 @@ export default function TaskDetails() {
         if (taskData) {
           // Always try to load knowledge base content
           try {
-            console.log('Loading knowledge base for task:', taskId);
             const response = await axios.get(
               buildApiUrl(`/api/tasks/${taskId}/knowledge-base`),
               { headers: { Authorization: `Bearer ${token}` } }
             );
-            console.log('Knowledge base response:', response.data);
             // Set both the edited content and the displayed content
             setEditedKnowledgeBase(response.data.content || '');
             setKnowledgeBaseContent(response.data.content || '');
