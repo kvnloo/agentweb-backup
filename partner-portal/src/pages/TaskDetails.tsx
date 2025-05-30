@@ -77,6 +77,7 @@ interface Task {
   useSharedBrowser?: boolean; // Flag for using shared browser
   turnOffHeadless?: boolean; // Flag for turning off headless mode
   useKnowledgeBase?: boolean; // Flag for using knowledge base
+  knowledgeBase?: string; // The content of the task's knowledge base
 }
 
 interface TaskAttachment {
@@ -372,6 +373,10 @@ export default function TaskDetails() {
   const [newOwnerEmail, setNewOwnerEmail] = useState('');
   const [ownerChangeError, setOwnerChangeError] = useState('');
   const [ownerChangeSuccess, setOwnerChangeSuccess] = useState('');
+  const [isEditingKnowledgeBase, setIsEditingKnowledgeBase] = useState(false);
+  const [editedKnowledgeBase, setEditedKnowledgeBase] = useState('');
+  const [knowledgeBaseContent, setKnowledgeBaseContent] = useState('');
+  const [knowledgeBaseError, setKnowledgeBaseError] = useState('');
 
   const isAdminRoute = location.pathname.startsWith('/admin/');
   const showActions = !isAdminRoute || (task && user && task.userId === user.userId);
@@ -1151,6 +1156,95 @@ export default function TaskDetails() {
     }
   };
 
+  const handleKnowledgeBaseEdit = async () => {
+    if (task) {
+      try {
+        // Fetch the content from the GCS URL
+        const response = await axios.get(
+          buildApiUrl(`/api/tasks/${taskId}/knowledge-base`),
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        setEditedKnowledgeBase(response.data.content || '');
+        setIsEditingKnowledgeBase(true);
+      } catch (error: any) {
+        console.error('Error fetching knowledge base:', error);
+        setKnowledgeBaseError(error.response?.data?.message || 'Failed to fetch knowledge base');
+      }
+    }
+  };
+
+  const handleKnowledgeBaseCancel = () => {
+    setIsEditingKnowledgeBase(false);
+    setEditedKnowledgeBase('');
+  };
+
+  const handleKnowledgeBaseSave = async () => {
+    if (!task) return;
+    
+    try {
+      console.log('Saving knowledge base content:', editedKnowledgeBase);
+      const response = await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}/knowledge-base`),
+        { content: editedKnowledgeBase },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      console.log('Save response:', response.data);
+      
+      // Update task with the new knowledge base URL and content
+      const updatedTask = { ...task, knowledgeBase: response.data.url };
+      setTask(updatedTask);
+      // Update both the edited content and the displayed content
+      setEditedKnowledgeBase(response.data.content || '');
+      setKnowledgeBaseContent(response.data.content || '');
+      setIsEditingKnowledgeBase(false);
+      setKnowledgeBaseError('');
+    } catch (error: any) {
+      console.error('Error updating knowledge base:', error);
+      setKnowledgeBaseError(error.response?.data?.message || 'Failed to update knowledge base');
+    }
+  };
+
+  // Load task and knowledge base on mount
+  useEffect(() => {
+    const loadData = async () => {
+      setLoading(true);
+      try {
+        const taskData = await fetchTask();
+        if (taskData) {
+          // Always try to load knowledge base content
+          try {
+            console.log('Loading knowledge base for task:', taskId);
+            const response = await axios.get(
+              buildApiUrl(`/api/tasks/${taskId}/knowledge-base`),
+              { headers: { Authorization: `Bearer ${token}` } }
+            );
+            console.log('Knowledge base response:', response.data);
+            // Set both the edited content and the displayed content
+            setEditedKnowledgeBase(response.data.content || '');
+            setKnowledgeBaseContent(response.data.content || '');
+            // Update task with the knowledge base URL if it's new
+            if (response.data.url && !taskData.knowledgeBase) {
+              const updatedTask = { ...taskData, knowledgeBase: response.data.url };
+              setTask(updatedTask);
+            }
+          } catch (error: any) {
+            console.error('Error loading knowledge base:', error);
+            // Only show error if it's not a 404 (file doesn't exist yet)
+            if (error.response?.status !== 404) {
+              setKnowledgeBaseError(error.response?.data?.message || 'Failed to load knowledge base');
+            }
+          }
+        }
+      } catch (error: any) {
+        console.error('Error loading task:', error);
+        setError(error.response?.data?.message || 'Failed to load task');
+      } finally {
+        setLoading(false);
+      }
+    };
+    loadData();
+  }, [taskId, token]);
+
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
@@ -1695,6 +1789,118 @@ export default function TaskDetails() {
               </Typography>
             </Grid>
           )}
+
+          {/* Knowledge Base Section */}
+          <Grid item xs={12}>
+            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+              <Typography variant="h6" gutterBottom>
+                Knowledge Base
+              </Typography>
+              {showActions && !isEditingKnowledgeBase && (
+                <Tooltip title="Edit knowledge base">
+                  <IconButton onClick={handleKnowledgeBaseEdit} size="small">
+                    <EditIcon />
+                  </IconButton>
+                </Tooltip>
+              )}
+            </Box>
+            {knowledgeBaseError && (
+              <Alert severity="error" sx={{ mb: 2 }}>
+                {knowledgeBaseError}
+              </Alert>
+            )}
+            {isEditingKnowledgeBase ? (
+              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                <TextField
+                  multiline
+                  rows={10}
+                  fullWidth
+                  value={editedKnowledgeBase}
+                  onChange={(e) => setEditedKnowledgeBase(e.target.value)}
+                  variant="outlined"
+                  placeholder="Enter knowledge base content..."
+                />
+                <Box sx={{ display: 'flex', gap: 1, justifyContent: 'flex-end' }}>
+                  <Button
+                    startIcon={<CancelIcon />}
+                    onClick={handleKnowledgeBaseCancel}
+                    variant="outlined"
+                    color="inherit"
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    startIcon={<SaveIcon />}
+                    onClick={handleKnowledgeBaseSave}
+                    variant="contained"
+                    color="primary"
+                  >
+                    Save
+                  </Button>
+                </Box>
+              </Box>
+            ) : (
+              <Box sx={{ 
+                backgroundColor: '#f5f5f5',
+                padding: 2,
+                borderRadius: 1,
+                minHeight: '200px',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 2
+              }}>
+                {editedKnowledgeBase ? (
+                  <>
+                    <Typography variant="body1" component="pre" sx={{ 
+                      whiteSpace: 'pre-wrap',
+                      fontFamily: 'monospace',
+                      flex: 1
+                    }}>
+                      {editedKnowledgeBase}
+                    </Typography>
+                    <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      {task?.knowledgeBase && (
+                        <Link href={task.knowledgeBase} target="_blank" rel="noopener noreferrer">
+                          View in GCS
+                        </Link>
+                      )}
+                      {showActions && (
+                        <Button
+                          variant="contained"
+                          color="primary"
+                          onClick={handleKnowledgeBaseEdit}
+                          startIcon={<EditIcon />}
+                        >
+                          Edit Content
+                        </Button>
+                      )}
+                    </Box>
+                  </>
+                ) : (
+                  <>
+                    <Typography variant="body1" component="pre" sx={{ 
+                      whiteSpace: 'pre-wrap',
+                      fontFamily: 'monospace',
+                      flex: 1
+                    }}>
+                      No knowledge base content yet. Click the edit button to add content.
+                    </Typography>
+                    {showActions && (
+                      <Button
+                        variant="contained"
+                        color="primary"
+                        onClick={handleKnowledgeBaseEdit}
+                        startIcon={<EditIcon />}
+                        sx={{ alignSelf: 'flex-end' }}
+                      >
+                        Add Content
+                      </Button>
+                    )}
+                  </>
+                )}
+              </Box>
+            )}
+          </Grid>
 
           <Grid item xs={12}>
             <Typography variant="h6" gutterBottom sx={{ mt: 2 }}>

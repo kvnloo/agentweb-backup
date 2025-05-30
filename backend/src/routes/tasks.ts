@@ -7,9 +7,22 @@ import { RequestHandler as ExpressRequestHandler } from 'express-serve-static-co
 import { isAdmin } from '../middleware/admin';
 import { userDb } from '../services/db';
 import { emailService } from '../services/emailService';
+import { Storage } from '@google-cloud/storage';
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
+
+// Initialize GCS with service account credentials
+const storage = new Storage({
+  projectId: process.env.GCS_PROJECT_ID,
+  credentials: {
+    client_email: process.env.GCS_CLIENT_EMAIL,
+    private_key: process.env.GCS_PRIVATE_KEY?.replace(/\\n/g, '\n')
+  }
+});
+
+// Ensure bucket exists
+const BUCKET_NAME = process.env.GCS_BUCKET || 'agentweb-knowledge-base-dev';
 
 type FileRequest = AuthenticatedRequest & {
   file?: Express.Multer.File;
@@ -295,6 +308,129 @@ router.put('/:taskId/executions/:executionId/unarchive', authenticateToken, asyn
   } catch (error) {
     console.error('Error unarchiving execution:', error);
     res.status(500).json({ message: 'Error unarchiving execution' });
+  }
+});
+
+// Knowledge Base routes
+router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { taskId } = req.params;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+      return res.status(403).json({ message: 'Not authorized to access this task' });
+    }
+
+    const bucket = storage.bucket(BUCKET_NAME);
+    const filePath = `tasks/${taskId}/knowledge-base.md`;
+    const file = bucket.file(filePath);
+
+    // Check if file exists
+    const [exists] = await file.exists();
+    
+    // If file doesn't exist and no knowledge base link exists, create a new one
+    if (!exists && !task.knowledgeBase) {
+      // Create empty file
+      await file.save('', {
+        contentType: 'text/markdown',
+        metadata: {
+          taskId,
+          userId,
+          createdAt: new Date().toISOString()
+        }
+      });
+
+      // Get the public URL
+      const [url] = await file.getSignedUrl({
+        action: 'read',
+        expires: '03-01-2500' // Far future expiration
+      });
+
+      // Update task with the new knowledge base link
+      await taskDb.updateTask(taskId, { knowledgeBase: url });
+
+      return res.json({ content: '', url });
+    }
+
+    // If file exists, get the content
+    if (exists) {
+      const [content] = await file.download();
+      const contentStr = content.toString();
+      console.log('Knowledge base content:', contentStr);
+      res.json({ content: contentStr, url: task.knowledgeBase });
+    } else {
+      // If file doesn't exist but task has a knowledge base link, return 404
+      res.status(404).json({ message: 'Knowledge base file not found' });
+    }
+  } catch (error) {
+    console.error('Error in knowledge base GET:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+router.put('/:taskId/knowledge-base', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { taskId } = req.params;
+    const { content } = req.body;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!content) {
+      return res.status(400).json({ message: 'Content is required' });
+    }
+
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+      return res.status(403).json({ message: 'Not authorized to modify this task' });
+    }
+
+    const bucket = storage.bucket(BUCKET_NAME);
+    const filePath = `tasks/${taskId}/knowledge-base.md`;
+    const file = bucket.file(filePath);
+
+    // Save content to file
+    await file.save(content, {
+      contentType: 'text/markdown',
+      metadata: {
+        taskId,
+        userId,
+        updatedAt: new Date().toISOString()
+      }
+    });
+
+    // Get the public URL if it's a new file
+    if (!task.knowledgeBase) {
+      const [url] = await file.getSignedUrl({
+        action: 'read',
+        expires: '03-01-2500' // Far future expiration
+      });
+      
+      // Update task with the new knowledge base link
+      await taskDb.updateTask(taskId, { knowledgeBase: url });
+      
+      res.json({ content, url });
+    } else {
+      res.json({ content, url: task.knowledgeBase });
+    }
+  } catch (error) {
+    console.error('Error in knowledge base PUT:', error);
+    res.status(500).json({ message: 'Internal server error' });
   }
 });
 
