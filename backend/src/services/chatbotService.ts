@@ -322,10 +322,10 @@ export class ChatbotDB {
       messages: [
         {
           role: "system",
-          content: selectedSystemMessage, // Use selected system message
+          content: selectedSystemMessage,
           metadata: {
             timestamp,
-            knowledgeBaseChunks: knowledgeBase.length, // This will be total, pre-filtering
+            knowledgeBaseChunks: knowledgeBase.length,
             portalType,
             pageIdentifier,
           },
@@ -338,9 +338,22 @@ export class ChatbotDB {
     };
 
     if (pageContent) {
-      chatSession.pageContent = pageContent;
-      chatSession.contextChunks = splitIntoChunks(pageContent);
-      // Optional: Add a more specific system message if pageContent and pageIdentifier are present
+      // Limit page content to first 100KB to stay under DynamoDB's 400KB limit
+      const MAX_PAGE_CONTENT = 100000;
+      chatSession.pageContent = pageContent.length > MAX_PAGE_CONTENT 
+        ? pageContent.substring(0, MAX_PAGE_CONTENT) 
+        : pageContent;
+
+      // Create chunks but limit their total size
+      const chunks = splitIntoChunks(chatSession.pageContent);
+      let totalChunkSize = 0;
+      const MAX_CHUNKS_SIZE = 100000; // 100KB for chunks
+      chatSession.contextChunks = chunks.filter(chunk => {
+        totalChunkSize += chunk.content.length;
+        return totalChunkSize <= MAX_CHUNKS_SIZE;
+      });
+
+      // Add a more specific system message if pageContent and pageIdentifier are present
       chatSession.messages.push({
         role: "system",
         content: `Context initialized for page: ${
@@ -348,7 +361,7 @@ export class ChatbotDB {
         }. Use relevant information from the page content.`,
         metadata: {
           timestamp,
-          pageContentLength: pageContent.length,
+          pageContentLength: chatSession.pageContent.length,
           knowledgeBaseChunks: knowledgeBase.length,
           portalType,
           pageIdentifier,
