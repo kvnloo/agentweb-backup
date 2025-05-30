@@ -15,11 +15,17 @@ const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
 // Initialize GCS with service account credentials
+// For Elastic Beanstalk deployment:
+// 1. Replace all newlines in the private key with [NEWLINE]
+// 2. Example format:
+//    -----BEGIN PRIVATE KEY-----[NEWLINE]MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC9QFi67K6Z...[NEWLINE]...[NEWLINE]-----END PRIVATE KEY-----[NEWLINE]
+const privateKey = process.env.GCS_PRIVATE_KEY?.replace(/\[NEWLINE\]/g, '\n');
+
 const storage = new Storage({
   projectId: process.env.GCS_PROJECT_ID,
   credentials: {
     client_email: process.env.GCS_CLIENT_EMAIL,
-    private_key: process.env.GCS_PRIVATE_KEY?.replace(/\\n/g, '\n')
+    private_key: privateKey
   }
 });
 

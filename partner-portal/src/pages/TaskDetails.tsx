@@ -377,7 +377,6 @@ export default function TaskDetails() {
   const [ownerChangeSuccess, setOwnerChangeSuccess] = useState('');
   const [isEditingKnowledgeBase, setIsEditingKnowledgeBase] = useState(false);
   const [editedKnowledgeBase, setEditedKnowledgeBase] = useState('');
-  const [knowledgeBaseContent, setKnowledgeBaseContent] = useState('');
   const [knowledgeBaseError, setKnowledgeBaseError] = useState('');
   const [isUpdatingKnowledgeBase, setIsUpdatingKnowledgeBase] = useState<string | null>(null);
 
@@ -1206,9 +1205,8 @@ export default function TaskDetails() {
       // Update task with the new knowledge base URL and content
       const updatedTask = { ...task, knowledgeBase: response.data.url };
       setTask(updatedTask);
-      // Update both the edited content and the displayed content
+      // Update the edited content
       setEditedKnowledgeBase(response.data.content || '');
-      setKnowledgeBaseContent(response.data.content || '');
       setIsEditingKnowledgeBase(false);
       setKnowledgeBaseError('');
     } catch (error: any) {
@@ -1230,9 +1228,8 @@ export default function TaskDetails() {
               buildApiUrl(`/api/tasks/${taskId}/knowledge-base`),
               { headers: { Authorization: `Bearer ${token}` } }
             );
-            // Set both the edited content and the displayed content
+            // Set the edited content
             setEditedKnowledgeBase(response.data.content || '');
-            setKnowledgeBaseContent(response.data.content || '');
             // Update task with the knowledge base URL if it's new
             if (response.data.url && !taskData.knowledgeBase) {
               const updatedTask = { ...taskData, knowledgeBase: response.data.url };
@@ -1269,7 +1266,6 @@ export default function TaskDetails() {
       );
       
       // Update the knowledge base content
-      setKnowledgeBaseContent(response.data.content);
       setEditedKnowledgeBase(response.data.content);
       
       // Refresh executions list to get updated knowledge_base_updated_at
