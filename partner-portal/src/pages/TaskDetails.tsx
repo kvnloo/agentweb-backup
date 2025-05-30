@@ -1856,16 +1856,14 @@ export default function TaskDetails() {
                 backgroundColor: '#f5f5f5',
                 padding: 2,
                 borderRadius: 1,
-                minHeight: '200px',
-                display: 'flex',
-                flexDirection: 'column',
-                gap: 2
+                height: '300px',
+                overflow: 'auto'
               }}>
                 {editedKnowledgeBase ? (
                   <Typography variant="body1" component="pre" sx={{ 
                     whiteSpace: 'pre-wrap',
                     fontFamily: 'monospace',
-                    flex: 1
+                    margin: 0
                   }}>
                     {editedKnowledgeBase}
                   </Typography>
@@ -1873,7 +1871,7 @@ export default function TaskDetails() {
                   <Typography variant="body1" component="pre" sx={{ 
                     whiteSpace: 'pre-wrap',
                     fontFamily: 'monospace',
-                    flex: 1
+                    margin: 0
                   }}>
                     No knowledge base content yet. Click the edit button to add content.
                   </Typography>
