@@ -350,7 +350,7 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
     }
 
     const bucket = storage.bucket(BUCKET_NAME);
-    const filePath = `tasks/${taskId}/knowledge-base.md`;
+    const filePath = `tasks/${taskId}/knowledge-base.txt`;
     const file = bucket.file(filePath);
 
     // Check if file exists
@@ -360,7 +360,7 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
     if (!exists && !task.knowledgeBase) {
       // Create empty file
       await file.save('', {
-        contentType: 'text/markdown',
+        contentType: 'text/plain',
         metadata: {
           taskId,
           userId,
@@ -419,12 +419,12 @@ router.put('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
     }
 
     const bucket = storage.bucket(BUCKET_NAME);
-    const filePath = `tasks/${taskId}/knowledge-base.md`;
+    const filePath = `tasks/${taskId}/knowledge-base.txt`;
     const file = bucket.file(filePath);
 
     // Save content to file
     await file.save(contentToSave, {
-      contentType: 'text/markdown',
+      contentType: 'text/plain',
       metadata: {
         taskId,
         userId,
@@ -478,7 +478,7 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
 
     // Get the current knowledge base content
     const bucket = storage.bucket(BUCKET_NAME);
-    const filePath = `tasks/${taskId}/knowledge-base.md`;
+    const filePath = `tasks/${taskId}/knowledge-base.txt`;
     const file = bucket.file(filePath);
     const [exists] = await file.exists();
     
@@ -533,7 +533,7 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
 
     // Save the updated content
     await file.save(updatedContent, {
-      contentType: 'text/markdown',
+      contentType: 'text/plain',
       metadata: {
         taskId,
         userId,
