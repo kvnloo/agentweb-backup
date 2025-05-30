@@ -883,10 +883,16 @@ export async function searchKnowledgeBase(query: string, maxResults: number = 5)
 export async function searchPlatformKnowledgeBase(query: string, maxResults: number = 5): Promise<ContextChunk[]> {
   try {
     // Initialize the Search Service client
+    const privateKey = process.env.GCS_PRIVATE_KEY?.replace(/\[NEWLINE\]/g, '\n');
+
     const client = new SearchServiceClient({
       apiEndpoint: process.env.VERTEX_AI_LOCATION === 'global' 
         ? 'discoveryengine.googleapis.com'
-        : `${process.env.VERTEX_AI_LOCATION}-discoveryengine.googleapis.com`
+        : `${process.env.VERTEX_AI_LOCATION}-discoveryengine.googleapis.com`,
+      credentials: {
+        client_email: process.env.GCS_CLIENT_EMAIL,
+        private_key: privateKey
+      }
     });
 
     // Build the serving config path
@@ -916,26 +922,25 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
     const results: ContextChunk[] = [];
     
     for (const result of searchResults) {
-      const structData = result.document?.derivedStructData as {
-        extractiveSegments?: Array<{
-          content?: string;
-          pageNumber?: number;
-        }>;
-      };
-      
-      if (!structData?.extractiveSegments?.length) continue;
-      
-      // Add each segment as a separate chunk
-      for (const segment of structData.extractiveSegments) {
-        if (segment.content) {
-          results.push({
-            id: `kb-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-            content: segment.content,
-            metadata: {
-              source: 'platform-knowledge-base'
-            }
-          });
+      const structData = result.document?.derivedStructData;
+      if (!structData?.fields?.extractive_segments?.listValue?.values) {
+        continue;
+      }
+
+      // Process each segment in the list
+      for (const segment of structData.fields.extractive_segments.listValue.values) {
+        if (!segment.structValue?.fields?.content?.stringValue) {
+          continue;
         }
+
+        const content = segment.structValue.fields.content.stringValue;
+        results.push({
+          id: `kb-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+          content: content,
+          metadata: {
+            source: 'platform-knowledge-base'
+          }
+        });
       }
     }
 
@@ -1031,20 +1036,23 @@ export async function generateChatResponse(
           .join("\n\n");
       }
 
-      // If no relevant chunks found in local KB, try platform-wide KB
-      if (relevantChunks.length === 0) {
-        const platformChunks = await searchPlatformKnowledgeBase(userMessage);
-        if (platformChunks.length > 0) {
-          const platformContext = platformChunks
-            .map((chunk) => `${chunk.content} (Source: ${chunk.metadata.source})`)
-            .join("\n\n");
-          
-          contextInfo = platformContext;
-          relevantChunksInfo = {
-            count: platformChunks.length,
-            sources: platformChunks.map((c) => c.metadata.source),
-          };
-        }
+      // Always try platform-wide KB and append results
+      const platformChunks = await searchPlatformKnowledgeBase(userMessage);
+      if (platformChunks.length > 0) {
+        const platformContext = platformChunks
+          .map((chunk) => `${chunk.content} (Source: ${chunk.metadata.source})`)
+          .join("\n\n");
+        
+        // Append platform context to existing context
+        contextInfo = contextInfo 
+          ? `${contextInfo}\n\n${platformContext}`
+          : platformContext;
+
+        // Update relevantChunksInfo to include both sources
+        relevantChunksInfo = {
+          count: relevantChunks.length + platformChunks.length,
+          sources: [...new Set([...relevantChunks, ...platformChunks].map((c) => c.metadata.source))],
+        };
       }
 
       // Find the index of the last user message
