@@ -1174,8 +1174,20 @@ export default function TaskDetails() {
   };
 
   const handleKnowledgeBaseCancel = () => {
+    // Fetch the content again to restore it
+    if (task?.knowledgeBase) {
+      axios.get(
+        buildApiUrl(`/api/tasks/${taskId}/knowledge-base`),
+        { headers: { Authorization: `Bearer ${token}` } }
+      )
+      .then(response => {
+        setEditedKnowledgeBase(response.data.content || '');
+      })
+      .catch(error => {
+        console.error('Error restoring knowledge base content:', error);
+      });
+    }
     setIsEditingKnowledgeBase(false);
-    setEditedKnowledgeBase('');
   };
 
   const handleKnowledgeBaseSave = async () => {
