@@ -130,6 +130,14 @@ export default function Layout() {
               >
                 Guide
               </Button>
+              <Button 
+                color="primary" 
+                component={RouterLink} 
+                to="/release"
+                variant={isActivePath('/release') ? 'contained' : 'text'}
+              >
+                Release
+              </Button>
               {user && (
                 <>
                   <Button 
