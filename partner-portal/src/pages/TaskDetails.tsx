@@ -1862,53 +1862,21 @@ export default function TaskDetails() {
                 gap: 2
               }}>
                 {editedKnowledgeBase ? (
-                  <>
-                    <Typography variant="body1" component="pre" sx={{ 
-                      whiteSpace: 'pre-wrap',
-                      fontFamily: 'monospace',
-                      flex: 1
-                    }}>
-                      {editedKnowledgeBase}
-                    </Typography>
-                    <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                      {task?.knowledgeBase && (
-                        <Link href={task.knowledgeBase} target="_blank" rel="noopener noreferrer">
-                          View in GCS
-                        </Link>
-                      )}
-                      {showActions && (
-                        <Button
-                          variant="contained"
-                          color="primary"
-                          onClick={handleKnowledgeBaseEdit}
-                          startIcon={<EditIcon />}
-                        >
-                          Edit Content
-                        </Button>
-                      )}
-                    </Box>
-                  </>
+                  <Typography variant="body1" component="pre" sx={{ 
+                    whiteSpace: 'pre-wrap',
+                    fontFamily: 'monospace',
+                    flex: 1
+                  }}>
+                    {editedKnowledgeBase}
+                  </Typography>
                 ) : (
-                  <>
-                    <Typography variant="body1" component="pre" sx={{ 
-                      whiteSpace: 'pre-wrap',
-                      fontFamily: 'monospace',
-                      flex: 1
-                    }}>
-                      No knowledge base content yet. Click the edit button to add content.
-                    </Typography>
-                    {showActions && (
-                      <Button
-                        variant="contained"
-                        color="primary"
-                        onClick={handleKnowledgeBaseEdit}
-                        startIcon={<EditIcon />}
-                        sx={{ alignSelf: 'flex-end' }}
-                      >
-                        Add Content
-                      </Button>
-                    )}
-                  </>
+                  <Typography variant="body1" component="pre" sx={{ 
+                    whiteSpace: 'pre-wrap',
+                    fontFamily: 'monospace',
+                    flex: 1
+                  }}>
+                    No knowledge base content yet. Click the edit button to add content.
+                  </Typography>
                 )}
               </Box>
             )}
