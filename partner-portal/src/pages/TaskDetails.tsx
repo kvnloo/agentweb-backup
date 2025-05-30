@@ -117,6 +117,7 @@ interface TaskExecution {
     is_html?: boolean;
   }[];
   archived: boolean;
+  knowledge_base_updated_at?: string;
 }
 
 interface Subscriber {
@@ -1274,6 +1275,13 @@ export default function TaskDetails() {
       // Update the knowledge base content
       setKnowledgeBaseContent(response.data.content);
       setEditedKnowledgeBase(response.data.content);
+      
+      // Refresh executions list to get updated knowledge_base_updated_at
+      const executionsResponse = await axios.get(buildApiUrl(`/api/tasks/${taskId}/executions`), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setExecutions(executionsResponse.data);
+      
       setIsUpdatingKnowledgeBase(null);
       
       // Show success message
@@ -2047,29 +2055,26 @@ export default function TaskDetails() {
                         </Box>
                       </TableCell>
                       <TableCell align="center">
-                        <div className="flex items-center space-x-2">
-                          <button
+                        <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 0.5 }}>
+                          <Button
+                            variant="outlined"
+                            size="small"
                             onClick={() => handleUpdateKnowledgeBase(execution.executionId)}
                             disabled={isUpdatingKnowledgeBase === execution.executionId}
-                            className={`px-3 py-1 text-sm rounded ${
-                              isUpdatingKnowledgeBase === execution.executionId
-                                ? 'bg-gray-300 cursor-not-allowed'
-                                : 'bg-blue-500 hover:bg-blue-600 text-white'
-                            }`}
+                            sx={{ minWidth: '160px' }}
                           >
                             {isUpdatingKnowledgeBase === execution.executionId ? (
-                              <span className="flex items-center">
-                                <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                                </svg>
-                                Updating...
-                              </span>
+                              <CircularProgress size={20} />
                             ) : (
                               'Update Knowledge Base'
                             )}
-                          </button>
-                        </div>
+                          </Button>
+                          {execution.knowledge_base_updated_at && (
+                            <Typography variant="caption" color="text.secondary">
+                              Last updated: {new Date(execution.knowledge_base_updated_at).toLocaleString()}
+                            </Typography>
+                          )}
+                        </Box>
                       </TableCell>
                     </TableRow>
                   ))}

@@ -542,6 +542,11 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
       }
     });
 
+    // Update the execution record with knowledge base update info
+    await taskDb.updateTaskExecution(executionId, {
+      knowledge_base_updated_at: new Date().toISOString()
+    });
+
     res.json({ 
       content: updatedContent,
       url: task.knowledgeBase,

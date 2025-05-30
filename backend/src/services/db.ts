@@ -629,6 +629,7 @@ export const taskDb = {
     feedback: 'accepted' | 'rejected' | null;
     userInteractions: UserInteraction[];
     shareToken: string;
+    knowledge_base_updated_at: string;
   }>) {
     try {
       const updateExpressions: string[] = [];
