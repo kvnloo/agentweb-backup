@@ -27,22 +27,38 @@ def test_save_knowledge_freetext():
         print(f"Saved to: {result}")
         time.sleep(1)  # Sleep for 1 second between saves
 
-def test_search_knowledge():
-    """Test searching knowledge base"""
+def test_search_knowledge(query=None, max_results=5, max_content_length=200):
+    """Test searching knowledge base
+    
+    Args:
+        query (str, optional): Search query. If None, will prompt for input.
+        max_results (int, optional): Maximum number of results to return. Defaults to 5.
+        max_content_length (int, optional): Maximum length of content to print. Defaults to 200.
+    """
     # Get the knowledge base manager
     kb_manager = get_knowledge_base_manager()
     
+    # If no query provided, prompt for input
+    if query is None:
+        query = input("\nEnter search query: ")
+    
     # Test searching knowledge
-    query = "lazy dog"  # Simple query to match any content containing "dog"
-    results = kb_manager.search_knowledge(query, max_results=5)
+    results = kb_manager.search_knowledge(query, max_results=max_results)
     
     # Print results
     print(f"\nSearch Results for '{query}':")
+    if not results:
+        print("No results found.")
+        return
+        
     for i, result in enumerate(results, 1):
         print(f"\nResult {i}:")
-        print(f"Content: {result['content']}")
-        # Debug: Print the full structure of the result
-        print(f"Full result structure: {result}")
+        content = result.get('content', '')
+        if len(content) > max_content_length:
+            content = content[:max_content_length] + "..."
+        print(f"Content: {content}")
+        print(f"Score: {result.get('score', 'N/A')}")
+        print(f"Source: {result.get('source', 'N/A')}")
 
 if __name__ == "__main__":
     import sys
@@ -52,10 +68,13 @@ if __name__ == "__main__":
         if test_type == "save_freetext":
             test_save_knowledge_freetext()
         elif test_type == "search":
-            test_search_knowledge()
+            # Get query from command line if provided
+            query = sys.argv[2] if len(sys.argv) > 2 else None
+            test_search_knowledge(query)
         else:
             print("Invalid test type. Use 'save_freetext' or 'search'")
     else:
         print("Please specify test type: 'save_freetext' or 'search'")
         print("Example: python test_knowledge_base.py save_freetext")
-        print("Example: python test_knowledge_base.py search") 
+        print("Example: python test_knowledge_base.py search")
+        print("Example: python test_knowledge_base.py search 'your search query'") 
