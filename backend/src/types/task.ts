@@ -18,4 +18,28 @@ export interface Task {
   llmName?: string;  // The preferred LLM to try first for this task
   useSharedBrowser?: boolean; // Whether the task should use a shared browser session
   turnOffHeadless?: boolean; // Whether to run the browser in visible mode
+  useKnowledgeBase?: boolean; // Whether the task can use the knowledge base
+  knowledgeBase?: string; // The GCS URL of the task's knowledge base file
+}
+
+export interface TaskUpdate {
+  name?: string;
+  prompt?: string;
+  status?: string;
+  error?: string;
+  summary?: string;
+  emailNotification?: boolean;
+  isInteractive?: boolean;
+  isDeepResearch?: boolean;
+  isComplexTask?: boolean;
+  extractPageContent?: boolean;
+  validateOutput?: boolean;
+  outputAsJson?: boolean;
+  outputAsHtml?: boolean;
+  isAgenticDevMode?: boolean;
+  llmName?: string;
+  useSharedBrowser?: boolean;
+  turnOffHeadless?: boolean;
+  useKnowledgeBase?: boolean;
+  knowledgeBase?: string; // Add knowledgeBase field
 } 

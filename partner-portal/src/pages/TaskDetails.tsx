@@ -52,6 +52,7 @@ import { useAuth } from '../contexts/AuthContext';
 import ScheduleForm from '../components/ScheduleForm';
 import ScheduleList from '../components/ScheduleList';
 import { buildApiUrl, getLLMsForTask } from '../config';
+import { toast } from 'react-hot-toast';
 
 interface Task {
   taskId: string;
@@ -76,6 +77,8 @@ interface Task {
   selectedLLMs?: string[];
   useSharedBrowser?: boolean; // Flag for using shared browser
   turnOffHeadless?: boolean; // Flag for turning off headless mode
+  useKnowledgeBase?: boolean; // Flag for using knowledge base
+  knowledgeBase?: string; // The content of the task's knowledge base
 }
 
 interface TaskAttachment {
@@ -114,6 +117,7 @@ interface TaskExecution {
     is_html?: boolean;
   }[];
   archived: boolean;
+  knowledge_base_updated_at?: string;
 }
 
 interface Subscriber {
@@ -371,6 +375,10 @@ export default function TaskDetails() {
   const [newOwnerEmail, setNewOwnerEmail] = useState('');
   const [ownerChangeError, setOwnerChangeError] = useState('');
   const [ownerChangeSuccess, setOwnerChangeSuccess] = useState('');
+  const [isEditingKnowledgeBase, setIsEditingKnowledgeBase] = useState(false);
+  const [editedKnowledgeBase, setEditedKnowledgeBase] = useState('');
+  const [knowledgeBaseError, setKnowledgeBaseError] = useState('');
+  const [isUpdatingKnowledgeBase, setIsUpdatingKnowledgeBase] = useState<string | null>(null);
 
   const isAdminRoute = location.pathname.startsWith('/admin/');
   const showActions = !isAdminRoute || (task && user && task.userId === user.userId);
@@ -1134,6 +1142,149 @@ export default function TaskDetails() {
     }
   };
 
+  const handleUseKnowledgeBaseToggle = async () => {
+    if (!task || !token) return;
+    const newUseKnowledgeBaseValue = !(task?.useKnowledgeBase || false);
+    try {
+      await axios.put(buildApiUrl(`/api/tasks/${task.taskId}`), 
+        { useKnowledgeBase: newUseKnowledgeBaseValue },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      await fetchTask(); // Re-fetch task data to update UI from source of truth
+      setError(''); // Clear previous errors
+    } catch (err) {
+      console.error('Failed to update use knowledge base:', err);
+      setError('Failed to update knowledge base setting. Please try again.');
+    }
+  };
+
+  const handleKnowledgeBaseEdit = async () => {
+    if (task) {
+      try {
+        // Fetch the content from the GCS URL
+        const response = await axios.get(
+          buildApiUrl(`/api/tasks/${taskId}/knowledge-base`),
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        setEditedKnowledgeBase(response.data.content || '');
+        setIsEditingKnowledgeBase(true);
+      } catch (error: any) {
+        console.error('Error fetching knowledge base:', error);
+        setKnowledgeBaseError(error.response?.data?.message || 'Failed to fetch knowledge base');
+      }
+    }
+  };
+
+  const handleKnowledgeBaseCancel = () => {
+    // Fetch the content again to restore it
+    if (task?.knowledgeBase) {
+      axios.get(
+        buildApiUrl(`/api/tasks/${taskId}/knowledge-base`),
+        { headers: { Authorization: `Bearer ${token}` } }
+      )
+      .then(response => {
+        setEditedKnowledgeBase(response.data.content || '');
+      })
+      .catch(error => {
+        console.error('Error restoring knowledge base content:', error);
+      });
+    }
+    setIsEditingKnowledgeBase(false);
+  };
+
+  const handleKnowledgeBaseSave = async () => {
+    if (!task) return;
+    
+    try {
+      const response = await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}/knowledge-base`),
+        { content: editedKnowledgeBase || '' },  // Allow empty string
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      
+      // Update task with the new knowledge base URL and content
+      const updatedTask = { ...task, knowledgeBase: response.data.url };
+      setTask(updatedTask);
+      // Update the edited content
+      setEditedKnowledgeBase(response.data.content || '');
+      setIsEditingKnowledgeBase(false);
+      setKnowledgeBaseError('');
+    } catch (error: any) {
+      console.error('Error updating knowledge base:', error);
+      setKnowledgeBaseError(error.response?.data?.message || 'Failed to update knowledge base');
+    }
+  };
+
+  // Load task and knowledge base on mount
+  useEffect(() => {
+    const loadData = async () => {
+      setLoading(true);
+      try {
+        const taskData = await fetchTask();
+        if (taskData) {
+          // Always try to load knowledge base content
+          try {
+            const response = await axios.get(
+              buildApiUrl(`/api/tasks/${taskId}/knowledge-base`),
+              { headers: { Authorization: `Bearer ${token}` } }
+            );
+            // Set the edited content
+            setEditedKnowledgeBase(response.data.content || '');
+            // Update task with the knowledge base URL if it's new
+            if (response.data.url && !taskData.knowledgeBase) {
+              const updatedTask = { ...taskData, knowledgeBase: response.data.url };
+              setTask(updatedTask);
+            }
+          } catch (error: any) {
+            console.error('Error loading knowledge base:', error);
+            // Only show error if it's not a 404 (file doesn't exist yet)
+            if (error.response?.status !== 404) {
+              setKnowledgeBaseError(error.response?.data?.message || 'Failed to load knowledge base');
+            }
+          }
+        }
+      } catch (error: any) {
+        console.error('Error loading task:', error);
+        setError(error.response?.data?.message || 'Failed to load task');
+      } finally {
+        setLoading(false);
+      }
+    };
+    loadData();
+  }, [taskId, token]);
+
+  // Add function to handle knowledge base update
+  const handleUpdateKnowledgeBase = async (executionId: string) => {
+    if (!task) return;
+    
+    try {
+      setIsUpdatingKnowledgeBase(executionId);
+      const response = await axios.post(
+        buildApiUrl(`/api/tasks/${taskId}/executions/${executionId}/update-knowledge-base`),
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      
+      // Update the knowledge base content
+      setEditedKnowledgeBase(response.data.content);
+      
+      // Refresh executions list to get updated knowledge_base_updated_at
+      const executionsResponse = await axios.get(buildApiUrl(`/api/tasks/${taskId}/executions`), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setExecutions(executionsResponse.data);
+      
+      setIsUpdatingKnowledgeBase(null);
+      
+      // Show success message
+      toast.success('Knowledge base updated successfully');
+    } catch (error: any) {
+      console.error('Error updating knowledge base:', error);
+      toast.error(error.response?.data?.message || 'Failed to update knowledge base');
+      setIsUpdatingKnowledgeBase(null);
+    }
+  };
+
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
@@ -1464,6 +1615,12 @@ export default function TaskDetails() {
                       label="Turn Off Headless"
                     />
                   </Tooltip>
+                  <Tooltip title="When enabled, the agent can search the knowledge base for relevant information during task execution">
+                    <FormControlLabel
+                      control={<Switch checked={task?.useKnowledgeBase || false} onChange={handleUseKnowledgeBaseToggle} />}
+                      label="Use Knowledge Base"
+                    />
+                  </Tooltip>
                 </Box>
                 <Tooltip title={
                   <div>
@@ -1673,6 +1830,84 @@ export default function TaskDetails() {
             </Grid>
           )}
 
+          {/* Knowledge Base Section */}
+          <Grid item xs={12}>
+            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+              <Typography variant="h6" gutterBottom>
+                Knowledge Base
+              </Typography>
+              {showActions && !isEditingKnowledgeBase && (
+                <Tooltip title="Edit knowledge base">
+                  <IconButton onClick={handleKnowledgeBaseEdit} size="small">
+                    <EditIcon />
+                  </IconButton>
+                </Tooltip>
+              )}
+            </Box>
+            {knowledgeBaseError && (
+              <Alert severity="error" sx={{ mb: 2 }}>
+                {knowledgeBaseError}
+              </Alert>
+            )}
+            {isEditingKnowledgeBase ? (
+              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                <TextField
+                  multiline
+                  rows={10}
+                  fullWidth
+                  value={editedKnowledgeBase}
+                  onChange={(e) => setEditedKnowledgeBase(e.target.value)}
+                  variant="outlined"
+                  placeholder="Enter knowledge base content..."
+                />
+                <Box sx={{ display: 'flex', gap: 1, justifyContent: 'flex-end' }}>
+                  <Button
+                    startIcon={<CancelIcon />}
+                    onClick={handleKnowledgeBaseCancel}
+                    variant="outlined"
+                    color="inherit"
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    startIcon={<SaveIcon />}
+                    onClick={handleKnowledgeBaseSave}
+                    variant="contained"
+                    color="primary"
+                  >
+                    Save
+                  </Button>
+                </Box>
+              </Box>
+            ) : (
+              <Box sx={{ 
+                backgroundColor: '#f5f5f5',
+                padding: 2,
+                borderRadius: 1,
+                height: '300px',
+                overflow: 'auto'
+              }}>
+                {editedKnowledgeBase ? (
+                  <Typography variant="body1" component="pre" sx={{ 
+                    whiteSpace: 'pre-wrap',
+                    fontFamily: 'monospace',
+                    margin: 0
+                  }}>
+                    {editedKnowledgeBase}
+                  </Typography>
+                ) : (
+                  <Typography variant="body1" component="pre" sx={{ 
+                    whiteSpace: 'pre-wrap',
+                    fontFamily: 'monospace',
+                    margin: 0
+                  }}>
+                    No knowledge base content yet. Click the edit button to add content.
+                  </Typography>
+                )}
+              </Box>
+            )}
+          </Grid>
+
           <Grid item xs={12}>
             <Typography variant="h6" gutterBottom sx={{ mt: 2 }}>
               Execution History
@@ -1688,6 +1923,7 @@ export default function TaskDetails() {
                     <TableCell width="25%">Result</TableCell>
                     <TableCell width="250px">Details</TableCell>
                     <TableCell width="80px" align="center">Feedback</TableCell>
+                    <TableCell width="100px" align="center">Actions</TableCell>
                   </TableRow>
                 </TableHead>
                 <TableBody>
@@ -1808,6 +2044,28 @@ export default function TaskDetails() {
                               <ThumbDownIcon fontSize="small" />
                             </IconButton>
                           </Tooltip>
+                        </Box>
+                      </TableCell>
+                      <TableCell align="center">
+                        <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 0.5 }}>
+                          <Button
+                            variant="outlined"
+                            size="small"
+                            onClick={() => handleUpdateKnowledgeBase(execution.executionId)}
+                            disabled={isUpdatingKnowledgeBase === execution.executionId}
+                            sx={{ minWidth: '160px' }}
+                          >
+                            {isUpdatingKnowledgeBase === execution.executionId ? (
+                              <CircularProgress size={20} />
+                            ) : (
+                              'Update Knowledge Base'
+                            )}
+                          </Button>
+                          {execution.knowledge_base_updated_at && (
+                            <Typography variant="caption" color="text.secondary">
+                              Last updated: {new Date(execution.knowledge_base_updated_at).toLocaleString()}
+                            </Typography>
+                          )}
                         </Box>
                       </TableCell>
                     </TableRow>

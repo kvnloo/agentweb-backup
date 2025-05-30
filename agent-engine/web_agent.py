@@ -29,6 +29,7 @@ import base64  # Add at the top with other imports
 import boto3  # Add at the top with other imports
 from urllib.parse import quote
 from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content, generate_content_hash, get_agent_code_base_path, call_github_api, run_python_code_in_sandbox, fetch_api_credentials, decrypt_password, get_all_configs, parse_json
+from knowledge_base_utils import get_knowledge_base_manager
 # Load environment variables
 load_dotenv()
 
@@ -178,6 +179,8 @@ class WebAgent:
         self.is_agentic_dev_mode = False  # Initialize is_agentic_dev_mode property
         self.output_as_html = False # Initialize output_as_html property
         self.turn_off_headless = False  # Initialize turn_off_headless property
+        self.use_knowledge_base = False  # Initialize use_knowledge_base property
+        self.kb_manager = get_knowledge_base_manager()
 
     def setup_execution_logging(self, execution_id: str):
         """Setup logging for the current execution"""
@@ -245,7 +248,7 @@ class WebAgent:
         # Clear the reference to the log filter thread to help with garbage collection
         self.log_filter_thread = None
 
-    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False) -> Dict[str, Any]:
+    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False, use_knowledge_base: bool = False) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
         log_file = None
         try:
@@ -258,6 +261,7 @@ class WebAgent:
             self.output_as_html = output_as_html
             self.use_shared_browser = use_shared_browser
             self.turn_off_headless = turn_off_headless
+            self.use_knowledge_base = use_knowledge_base
             # Set up logging
             log_file = self.setup_execution_logging(execution_id)
             
@@ -280,6 +284,10 @@ class WebAgent:
                 prompt = f"{prompt}\n\nRequirement: Output result as JSON instead of free text."
             elif self.output_as_html:
                 prompt = f"{prompt}\n\nRequirement: The final output for this task MUST be in well-formatted HTML5. You MUST use the 'Write file' action to save this HTML content into a file with an .html extension."
+
+            # Add knowledge base instruction if enabled
+            if self.use_knowledge_base:
+                prompt = f"{prompt}\n\nImportant: Before browsing the web, you MUST first search the knowledge base using the 'Search knowledge base' action to find relevant information. Only proceed with web browsing if the knowledge base search doesn't provide sufficient information."
 
             # Create task
             self.task = prompt
@@ -1339,6 +1347,19 @@ Once the PR is approved and merged, this code will be available through the 'Run
                     logger.error(f"Error running JavaScript: {str(e)}")
                     return ActionResult(error=f"Failed to run JavaScript: {str(e)}")
 
+        if self.use_knowledge_base:
+            @self.controller.registry.action('Search knowledge base')
+            def search_knowledge_base(query: str) -> ActionResult:
+                """Search the knowledge base for relevant information"""              
+                try:
+                    results = self.kb_manager.search_knowledge(query)
+                    return ActionResult(
+                        extracted_content=f"Found {len(results)} results for query '{query}':\n\n" + 
+                        "\n\n".join(f"Result {i+1}:\n{result['content']}" for i, result in enumerate(results))
+                    )
+                except Exception as e:
+                    return ActionResult(error=f"Failed to search knowledge base: {str(e)}")
+
     def _get_cookies_path(self):
         """Get the path to the user's cookies file"""
         if not self.user_id:
@@ -1508,6 +1529,7 @@ async def main():
     parser.add_argument('--output-as-html', action='store_true', help='Output result as HTML5')
     parser.add_argument('--use-shared-browser', action='store_true', help='Use shared browser')
     parser.add_argument('--turn-off-headless', action='store_true', help='Turn off headless mode')
+    parser.add_argument('--use-knowledge-base', action='store_true', help='Enable knowledge base usage')
 
     args = parser.parse_args()
 
@@ -1539,7 +1561,8 @@ async def main():
             is_agentic_dev_mode=args.agentic_dev_mode,
             output_as_html=args.output_as_html,
             use_shared_browser=args.use_shared_browser,
-            turn_off_headless=args.turn_off_headless
+            turn_off_headless=args.turn_off_headless,
+            use_knowledge_base=args.use_knowledge_base
         )
         print(json.dumps(result))
         sys.exit(0 if result["success"] else 1)

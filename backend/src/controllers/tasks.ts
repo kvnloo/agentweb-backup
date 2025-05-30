@@ -41,7 +41,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       outputAsHtml,
       selectedLLMs,
       useSharedBrowser,
-      turnOffHeadless
+      turnOffHeadless,
+      useKnowledgeBase
     } = req.body;
     
     // If templateId is provided, fetch the template and use its values
@@ -86,6 +87,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           outputAsHtml: outputAsHtml !== undefined ? Boolean(outputAsHtml) : template.outputAsHtml,
           useSharedBrowser: useSharedBrowser !== undefined ? Boolean(useSharedBrowser) : template.useSharedBrowser,
           turnOffHeadless: turnOffHeadless !== undefined ? Boolean(turnOffHeadless) : template.turnOffHeadless,
+          useKnowledgeBase: useKnowledgeBase !== undefined ? Boolean(useKnowledgeBase) : template.useKnowledgeBase,
           createdAt: new Date().toISOString(),
           llmName: req.body.llmName || null,
           category: category || template.category,
@@ -122,6 +124,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       outputAsHtml: Boolean(outputAsHtml),
       useSharedBrowser: Boolean(useSharedBrowser),
       turnOffHeadless: Boolean(turnOffHeadless),
+      useKnowledgeBase: Boolean(useKnowledgeBase),
       createdAt: new Date().toISOString(),
       llmName: req.body.llmName || null,
       category: category,
@@ -249,6 +252,10 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
 
     if (req.body.turnOffHeadless !== undefined) {
       updates.turnOffHeadless = Boolean(req.body.turnOffHeadless);
+    }
+
+    if (req.body.useKnowledgeBase !== undefined) {
+      updates.useKnowledgeBase = Boolean(req.body.useKnowledgeBase);
     }
 
     // Handle outputAsJson and outputAsHtml mutual exclusivity

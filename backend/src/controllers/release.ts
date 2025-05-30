@@ -8,6 +8,17 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-05-30",
+    changes: [
+      "Added support for Knowledge Base",
+      "- Based on Google Vertex AI Search for powerful search capability",
+      "- Automatically update knowledge base from good execution records",
+      "- Manual knowledge base updates available on Task Details page",
+      "- Enable 'Use Knowledge Base' option when running tasks",
+      "- Agents can search platform-wide knowledge base during web navigation"
+    ]
+  },
+  {
     date: "2025-05-23",
     changes: [
       "Support Turn Off Headless toggle",
