@@ -91,9 +91,31 @@ gcloud projects add-iam-policy-binding 107995268574 \
 
 ### 6. Authentication Setup
 
-#### Local Development
+#### Option 1: Service Account Key File (Recommended)
 
-For local development, you'll need to authenticate with your user account:
+1. Create and download a service account key:
+```bash
+# Create a key file for the service account
+gcloud iam service-accounts keys create vertex-ai-search-key.json \
+    --iam-account=agentweb-knowledge-base@107995268574.iam.gserviceaccount.com
+```
+
+2. Set the environment variable:
+```bash
+# Add to your shell profile (~/.bashrc, ~/.zshrc, etc.) for local development
+# Or to /etc/environment for VM deployment
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/vertex-ai-search-key.json"
+```
+
+3. For VM deployment, copy the key file to a secure location:
+```bash
+# Copy the key file to the VM
+gcloud compute scp vertex-ai-search-key.json YOUR_VM_NAME:/path/to/secure/location/ --zone=YOUR_ZONE
+```
+
+#### Option 2: Application Default Credentials
+
+For local development, you can use application default credentials:
 
 ```bash
 # Login with your user account
@@ -110,33 +132,70 @@ This will:
 
 Note: You'll need to manually refresh the credentials when they expire (every hour) by running `gcloud auth application-default login` again.
 
-#### VM Deployment
+#### Option 3: Workload Identity Federation (For AWS Elastic Beanstalk)
 
-For the VM instance, set up persistent authentication:
+If you're using AWS Elastic Beanstalk, you can use Workload Identity Federation:
 
+1. Enable the IAM API in your Google Cloud project:
 ```bash
-# Login with your user account
-gcloud auth login
-
-# Set up application default credentials
-gcloud auth application-default login
-
-# Set up automatic credential refresh (add to crontab)
-(crontab -l 2>/dev/null; echo "*/50 * * * * gcloud auth application-default login --quiet") | crontab -
+gcloud services enable iamcredentials.googleapis.com
 ```
 
-The cron job will automatically refresh the credentials every 50 minutes to ensure they don't expire.
+2. Create a Workload Identity Pool:
+```bash
+# Create a Workload Identity Pool
+gcloud iam workload-identity-pools create "aws-pool" \
+    --location="global" \
+    --display-name="AWS Pool"
+
+# Get the Workload Identity Pool ID
+WORKLOAD_IDENTITY_POOL_ID=$(gcloud iam workload-identity-pools describe "aws-pool" \
+    --location="global" \
+    --format="value(name)")
+
+# Create a Workload Identity Provider for AWS
+gcloud iam workload-identity-pools providers create-aws "aws-provider" \
+    --location="global" \
+    --workload-identity-pool="aws-pool" \
+    --account-id="992382574572"
+
+# Get the provider resource name
+PROVIDER_NAME=$(gcloud iam workload-identity-pools providers describe "aws-provider" \
+    --location="global" \
+    --workload-identity-pool="aws-pool" \
+    --format="value(name)")
+
+# Create a service account for AWS workloads
+gcloud iam service-accounts create aws-workload-sa \
+    --display-name="AWS Workload Service Account"
+
+# Grant necessary permissions to the service account
+gcloud projects add-iam-policy-binding 107995268574 \
+    --member="serviceAccount:aws-workload-sa@agent-engine-460619.iam.gserviceaccount.com" \
+    --role="roles/storage.admin"
+
+gcloud projects add-iam-policy-binding 107995268574 \
+    --member="serviceAccount:aws-workload-sa@agent-engine-460619.iam.gserviceaccount.com" \
+    --role="roles/discoveryengine.user"
+
+# Allow the AWS provider to impersonate the service account
+gcloud iam service-accounts add-iam-policy-binding aws-workload-sa@agent-engine-460619.iam.gserviceaccount.com \
+    --role="roles/iam.workloadIdentityUser" \
+    --member="principalSet://iam.googleapis.com/${WORKLOAD_IDENTITY_POOL_ID}/attribute.aws_role/arn:aws:iam::992382574572:role/service-role/aws-elasticbeanstalk-service-role"
+```
 
 ### 7. Verify Setup
 
 1. Create a .env file in your agent-engine directory:
 ```bash
 # Create .env file
-cat > .env << EOLGOOGLE_CLOUD_PROJECT=107995268574
+cat > .env << EOL
+GOOGLE_CLOUD_PROJECT=107995268574
 VERTEX_AI_LOCATION=global
 VERTEX_AI_SEARCH_APP_ID=agentweb-kb3_1748352686579
 VERTEX_AI_DATASTORE_ID=agentweb-knowledge-base-connector-dev3_1748350752931_gcs_store
 GCS_BUCKET_NAME=agentweb-knowledge-base-dev
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/vertex-ai-search-key.json
 EOL
 ```
 
@@ -280,149 +339,56 @@ Note: Replace the following placeholders with your actual values:
 
 ### 4. Connecting AWS Elastic Beanstalk to GCS
 
-To allow your AWS Elastic Beanstalk backend to interact with Google Cloud Storage, follow these steps:
+You have two options to connect your AWS Elastic Beanstalk backend to Google Cloud Storage:
 
-1. Create a new service account for AWS:
+#### Option A: Using Workload Identity Federation (Recommended)
+
+Workload Identity Federation allows your AWS workloads to access Google Cloud resources without using service account keys. This is more secure as it eliminates the need to manage and rotate service account keys.
+
+1. Enable the IAM API in your Google Cloud project:
 ```bash
-# Create a new service account
-gcloud iam service-accounts create aws-backend-sa \
-    --display-name="AWS Backend Service Account"
+gcloud services enable iamcredentials.googleapis.com
+```
 
-# Grant necessary permissions
+2. Create a Workload Identity Pool:
+```bash
+# Create a Workload Identity Pool
+gcloud iam workload-identity-pools create "aws-pool" \
+    --location="global" \
+    --display-name="AWS Pool"
+
+# Get the Workload Identity Pool ID
+WORKLOAD_IDENTITY_POOL_ID=$(gcloud iam workload-identity-pools describe "aws-pool" \
+    --location="global" \
+    --format="value(name)")
+
+# Create a Workload Identity Provider for AWS
+gcloud iam workload-identity-pools providers create-aws "aws-provider" \
+    --location="global" \
+    --workload-identity-pool="aws-pool" \
+    --account-id="992382574572"
+
+# Get the provider resource name
+PROVIDER_NAME=$(gcloud iam workload-identity-pools providers describe "aws-provider" \
+    --location="global" \
+    --workload-identity-pool="aws-pool" \
+    --format="value(name)")
+
+# Create a service account for AWS workloads
+gcloud iam service-accounts create aws-workload-sa \
+    --display-name="AWS Workload Service Account"
+
+# Grant necessary permissions to the service account
 gcloud projects add-iam-policy-binding 107995268574 \
-    --member="serviceAccount:aws-backend-sa@107995268574.iam.gserviceaccount.com" \
+    --member="serviceAccount:aws-workload-sa@agent-engine-460619.iam.gserviceaccount.com" \
     --role="roles/storage.admin"
 
 gcloud projects add-iam-policy-binding 107995268574 \
-    --member="serviceAccount:aws-backend-sa@107995268574.iam.gserviceaccount.com" \
+    --member="serviceAccount:aws-workload-sa@agent-engine-460619.iam.gserviceaccount.com" \
     --role="roles/discoveryengine.user"
+
+# Allow the AWS provider to impersonate the service account
+gcloud iam service-accounts add-iam-policy-binding aws-workload-sa@agent-engine-460619.iam.gserviceaccount.com \
+    --role="roles/iam.workloadIdentityUser" \
+    --member="principalSet://iam.googleapis.com/${WORKLOAD_IDENTITY_POOL_ID}/attribute.aws_role/arn:aws:iam::992382574572:role/service-role/aws-elasticbeanstalk-service-role"
 ```
-
-2. Create and download service account key:
-```bash
-# Create a new key for the service account
-gcloud iam service-accounts keys create aws-backend-key.json \
-    --iam-account=aws-backend-sa@107995268574.iam.gserviceaccount.com
-```
-
-3. Store the service account key in AWS Secrets Manager:
-   - Go to AWS Secrets Manager Console
-   - Click "Store a new secret"
-   - Choose "Other type of secret"
-   - Copy the entire contents of `aws-backend-key.json` into the secret value
-   - Name the secret (e.g., "gcs-service-account-key")
-   - Note down the secret ARN
-
-4. Set up AWS Elastic Beanstalk environment variables:
-   - Go to AWS Elastic Beanstalk Console
-   - Select your environment
-   - Go to Configuration > Software
-   - Add the following environment variables:
-     ```
-     GCS_BUCKET_NAME=your-bucket-name
-     GCS_SECRET_ARN=your-secret-arn
-     ```
-
-5. Create an IAM role for Elastic Beanstalk to access Secrets Manager:
-   - Go to IAM Console
-   - Create a new role for Elastic Beanstalk
-   - Add the following policy:
-     ```json
-     {
-         "Version": "2012-10-17",
-         "Statement": [
-             {
-                 "Effect": "Allow",
-                 "Action": [
-                     "secretsmanager:GetSecretValue"
-                 ],
-                 "Resource": "your-secret-arn"
-             }
-         ]
-     }
-     ```
-   - Attach this role to your Elastic Beanstalk environment
-
-6. Update your backend code to use the credentials:
-```javascript
-const { Storage } = require('@google-cloud/storage');
-const { DocumentServiceClient } = require('@google-cloud/discoveryengine');
-const AWS = require('aws-sdk');
-const { GoogleAuth } = require('google-auth-library');
-
-async function getGcsCredentials() {
-    // Get secret from AWS Secrets Manager
-    const secretsManager = new AWS.SecretsManager();
-    const secret = await secretsManager.getSecretValue({
-        SecretId: process.env.GCS_SECRET_ARN
-    }).promise();
-    
-    const secretDict = JSON.parse(secret.SecretString);
-    
-    // Create credentials object
-    const auth = new GoogleAuth({
-        credentials: secretDict
-    });
-    
-    return auth;
-}
-
-// Initialize clients with credentials
-async function initializeClients() {
-    const credentials = await getGcsCredentials();
-    
-    const storageClient = new Storage({
-        authClient: credentials
-    });
-    
-    const discoveryClient = new DocumentServiceClient({
-        authClient: credentials
-    });
-    
-    return { storageClient, discoveryClient };
-}
-
-// Example usage
-async function example() {
-    const { storageClient, discoveryClient } = await initializeClients();
-    
-    // Use the clients...
-    const [buckets] = await storageClient.getBuckets();
-    console.log('Buckets:', buckets);
-}
-```
-
-7. Security best practices:
-   - Never store service account keys in code or configuration files
-   - Use AWS Secrets Manager for all sensitive credentials
-   - Regularly rotate the service account key
-   - Monitor access logs for unusual activity
-   - Implement proper error handling for GCS operations
-   - Use IAM roles with least privilege principle
-   - Enable AWS CloudTrail for audit logging
-
-8. Testing the connection:
-```javascript
-async function testGcsConnection() {
-    try {
-        const { storageClient } = await initializeClients();
-        
-        // List buckets to test connection
-        const [buckets] = await storageClient.getBuckets();
-        console.log('Successfully connected to GCS');
-        return true;
-    } catch (error) {
-        console.error('Failed to connect to GCS:', error);
-        return false;
-    }
-}
-```
-
-Note: Replace the following placeholders with your actual values:
-- `your-secret-arn`: The ARN of your secret in AWS Secrets Manager
-- `your-bucket-name`: Your actual GCS bucket name
-
-Required npm packages:
-```bash
-npm install @google-cloud/storage @google-cloud/discoveryengine aws-sdk google-auth-library
-``` 
