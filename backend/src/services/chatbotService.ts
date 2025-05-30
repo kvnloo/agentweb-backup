@@ -9,6 +9,9 @@ import { getApiDocs } from "../controllers/api";
 import { getUserGuide } from "../controllers/user-guide";
 import { getUserReleaseNotes } from "../controllers/docsController";
 import { Request, Response } from "express";
+import { EngineServiceClient } from '@google-cloud/discoveryengine';
+import { Storage } from '@google-cloud/storage';
+import { SearchServiceClient, protos } from '@google-cloud/discoveryengine';
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -89,7 +92,7 @@ export interface ChatSession {
 }
 
 // Interface for context chunks
-interface ContextChunk {
+export interface ContextChunk {
   id: string;
   content: string;
   metadata: {
@@ -319,10 +322,10 @@ export class ChatbotDB {
       messages: [
         {
           role: "system",
-          content: selectedSystemMessage, // Use selected system message
+          content: selectedSystemMessage,
           metadata: {
             timestamp,
-            knowledgeBaseChunks: knowledgeBase.length, // This will be total, pre-filtering
+            knowledgeBaseChunks: knowledgeBase.length,
             portalType,
             pageIdentifier,
           },
@@ -335,9 +338,22 @@ export class ChatbotDB {
     };
 
     if (pageContent) {
-      chatSession.pageContent = pageContent;
-      chatSession.contextChunks = splitIntoChunks(pageContent);
-      // Optional: Add a more specific system message if pageContent and pageIdentifier are present
+      // Limit page content to first 100KB to stay under DynamoDB's 400KB limit
+      const MAX_PAGE_CONTENT = 100000;
+      chatSession.pageContent = pageContent.length > MAX_PAGE_CONTENT 
+        ? pageContent.substring(0, MAX_PAGE_CONTENT) 
+        : pageContent;
+
+      // Create chunks but limit their total size
+      const chunks = splitIntoChunks(chatSession.pageContent);
+      let totalChunkSize = 0;
+      const MAX_CHUNKS_SIZE = 100000; // 100KB for chunks
+      chatSession.contextChunks = chunks.filter(chunk => {
+        totalChunkSize += chunk.content.length;
+        return totalChunkSize <= MAX_CHUNKS_SIZE;
+      });
+
+      // Add a more specific system message if pageContent and pageIdentifier are present
       chatSession.messages.push({
         role: "system",
         content: `Context initialized for page: ${
@@ -345,7 +361,7 @@ export class ChatbotDB {
         }. Use relevant information from the page content.`,
         metadata: {
           timestamp,
-          pageContentLength: pageContent.length,
+          pageContentLength: chatSession.pageContent.length,
           knowledgeBaseChunks: knowledgeBase.length,
           portalType,
           pageIdentifier,
@@ -864,7 +880,91 @@ function logTokenUsage(
   };
 }
 
-// Update generateChatResponse to use cached knowledge base
+// Function to search knowledge base
+export async function searchKnowledgeBase(query: string, maxResults: number = 5): Promise<ContextChunk[]> {
+  try {
+    // Use the existing findRelevantChunks function to search through the knowledge base
+    const relevantChunks = await findRelevantChunks(query, knowledgeBase, maxResults);
+    return relevantChunks;
+  } catch (error) {
+    console.error("[searchKnowledgeBase] Error:", error);
+    throw error;
+  }
+}
+
+// Function to search platform-wide knowledge base using Vertex AI Search
+export async function searchPlatformKnowledgeBase(query: string, maxResults: number = 5): Promise<ContextChunk[]> {
+  try {
+    // Initialize the Search Service client
+    const privateKey = process.env.GCS_PRIVATE_KEY?.replace(/\[NEWLINE\]/g, '\n');
+
+    const client = new SearchServiceClient({
+      apiEndpoint: process.env.VERTEX_AI_LOCATION === 'global' 
+        ? 'discoveryengine.googleapis.com'
+        : `${process.env.VERTEX_AI_LOCATION}-discoveryengine.googleapis.com`,
+      credentials: {
+        client_email: process.env.GCS_CLIENT_EMAIL,
+        private_key: privateKey
+      }
+    });
+
+    // Build the serving config path
+    const servingConfig = `projects/${process.env.GOOGLE_CLOUD_PROJECT}/locations/${process.env.VERTEX_AI_LOCATION}/collections/default_collection/engines/${process.env.VERTEX_AI_SEARCH_APP_ID}/servingConfigs/default_config`;
+
+    // Create the search request with proper types
+    const request: protos.google.cloud.discoveryengine.v1.ISearchRequest = {
+      servingConfig,
+      query,
+      contentSearchSpec: {
+        extractiveContentSpec: {
+          maxExtractiveSegmentCount: maxResults
+        }
+      },
+      queryExpansionSpec: {
+        condition: protos.google.cloud.discoveryengine.v1.SearchRequest.QueryExpansionSpec.Condition.AUTO
+      },
+      spellCorrectionSpec: {
+        mode: protos.google.cloud.discoveryengine.v1.SearchRequest.SpellCorrectionSpec.Mode.AUTO
+      }
+    };
+
+    // Execute the search
+    const [searchResults] = await client.search(request);
+
+    // Process and transform the results
+    const results: ContextChunk[] = [];
+    
+    for (const result of searchResults) {
+      const structData = result.document?.derivedStructData;
+      if (!structData?.fields?.extractive_segments?.listValue?.values) {
+        continue;
+      }
+
+      // Process each segment in the list
+      for (const segment of structData.fields.extractive_segments.listValue.values) {
+        if (!segment.structValue?.fields?.content?.stringValue) {
+          continue;
+        }
+
+        const content = segment.structValue.fields.content.stringValue;
+        results.push({
+          id: `kb-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+          content: content,
+          metadata: {
+            source: 'platform-knowledge-base'
+          }
+        });
+      }
+    }
+
+    return results;
+  } catch (error) {
+    console.error("[searchPlatformKnowledgeBase] Error:", error);
+    throw error;
+  }
+}
+
+// Update generateChatResponse to use platform knowledge base when needed
 export async function generateChatResponse(
   sessionId: string,
   userMessage: string,
@@ -932,14 +1032,12 @@ export async function generateChatResponse(
       combinedChunks = [...pageChunksResult, ...activeKnowledgeBase];
     }
 
-    // RAG: Retrieve relevant chunks from combinedChunks
+    // RAG: Search knowledge base and retrieve relevant chunks
     let retrievalErrorOccurred = false;
     let relevantChunksInfo: { count: number; sources: string[] } | undefined;
     try {
-      const relevantChunks = await findRelevantChunks(
-        userMessage,
-        combinedChunks
-      );
+      // First try the local knowledge base
+      const relevantChunks = await searchKnowledgeBase(userMessage);
       relevantChunksInfo = {
         count: relevantChunks.length,
         sources: relevantChunks.map((c) => c.metadata.source),
@@ -949,27 +1047,46 @@ export async function generateChatResponse(
         contextInfo = relevantChunks
           .map((chunk) => `${chunk.content} (Source: ${chunk.metadata.source})`)
           .join("\n\n");
+      }
 
-        // Find the index of the last user message
-        const lastUserMsgIndex = messages
-          .map((m) => m.role)
-          .lastIndexOf("user");
+      // Always try platform-wide KB and append results
+      const platformChunks = await searchPlatformKnowledgeBase(userMessage);
+      if (platformChunks.length > 0) {
+        const platformContext = platformChunks
+          .map((chunk) => `${chunk.content} (Source: ${chunk.metadata.source})`)
+          .join("\n\n");
+        
+        // Append platform context to existing context
+        contextInfo = contextInfo 
+          ? `${contextInfo}\n\n${platformContext}`
+          : platformContext;
 
-        // Insert the context right before the user's message
-        if (lastUserMsgIndex > 0) {
-          messages.splice(lastUserMsgIndex, 0, {
-            role: "system",
-            content: `Here is relevant information from the current page and our documentation:\n\n${contextInfo}`,
-            metadata: {
-              timestamp,
-              relevantChunks: relevantChunksInfo,
-            },
-          });
-        }
+        // Update relevantChunksInfo to include both sources
+        relevantChunksInfo = {
+          count: relevantChunks.length + platformChunks.length,
+          sources: [...new Set([...relevantChunks, ...platformChunks].map((c) => c.metadata.source))],
+        };
+      }
+
+      // Find the index of the last user message
+      const lastUserMsgIndex = messages
+        .map((m) => m.role)
+        .lastIndexOf("user");
+
+      // Insert the context right before the user's message if we have any
+      if (contextInfo && lastUserMsgIndex > 0) {
+        messages.splice(lastUserMsgIndex, 0, {
+          role: "system",
+          content: `Here is relevant information from our knowledge base:\n\n${contextInfo}`,
+          metadata: {
+            timestamp,
+            relevantChunks: relevantChunksInfo,
+          },
+        });
       }
     } catch (error) {
       console.error(
-        "[generateChatResponse] Error in context retrieval:",
+        "[generateChatResponse] Error in knowledge base search:",
         error
       );
       retrievalErrorOccurred = true;
