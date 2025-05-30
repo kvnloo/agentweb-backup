@@ -9,6 +9,9 @@ import { getApiDocs } from "../controllers/api";
 import { getUserGuide } from "../controllers/user-guide";
 import { getUserReleaseNotes } from "../controllers/docsController";
 import { Request, Response } from "express";
+import { EngineServiceClient } from '@google-cloud/discoveryengine';
+import { Storage } from '@google-cloud/storage';
+import { SearchServiceClient, protos } from '@google-cloud/discoveryengine';
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -89,7 +92,7 @@ export interface ChatSession {
 }
 
 // Interface for context chunks
-interface ContextChunk {
+export interface ContextChunk {
   id: string;
   content: string;
   metadata: {
@@ -864,7 +867,86 @@ function logTokenUsage(
   };
 }
 
-// Update generateChatResponse to use cached knowledge base
+// Function to search knowledge base
+export async function searchKnowledgeBase(query: string, maxResults: number = 5): Promise<ContextChunk[]> {
+  try {
+    // Use the existing findRelevantChunks function to search through the knowledge base
+    const relevantChunks = await findRelevantChunks(query, knowledgeBase, maxResults);
+    return relevantChunks;
+  } catch (error) {
+    console.error("[searchKnowledgeBase] Error:", error);
+    throw error;
+  }
+}
+
+// Function to search platform-wide knowledge base using Vertex AI Search
+export async function searchPlatformKnowledgeBase(query: string, maxResults: number = 5): Promise<ContextChunk[]> {
+  try {
+    // Initialize the Search Service client
+    const client = new SearchServiceClient({
+      apiEndpoint: process.env.VERTEX_AI_LOCATION === 'global' 
+        ? 'discoveryengine.googleapis.com'
+        : `${process.env.VERTEX_AI_LOCATION}-discoveryengine.googleapis.com`
+    });
+
+    // Build the serving config path
+    const servingConfig = `projects/${process.env.GOOGLE_CLOUD_PROJECT}/locations/${process.env.VERTEX_AI_LOCATION}/collections/default_collection/engines/${process.env.VERTEX_AI_SEARCH_APP_ID}/servingConfigs/default_config`;
+
+    // Create the search request with proper types
+    const request: protos.google.cloud.discoveryengine.v1.ISearchRequest = {
+      servingConfig,
+      query,
+      contentSearchSpec: {
+        extractiveContentSpec: {
+          maxExtractiveSegmentCount: maxResults
+        }
+      },
+      queryExpansionSpec: {
+        condition: protos.google.cloud.discoveryengine.v1.SearchRequest.QueryExpansionSpec.Condition.AUTO
+      },
+      spellCorrectionSpec: {
+        mode: protos.google.cloud.discoveryengine.v1.SearchRequest.SpellCorrectionSpec.Mode.AUTO
+      }
+    };
+
+    // Execute the search
+    const [searchResults] = await client.search(request);
+
+    // Process and transform the results
+    const results: ContextChunk[] = [];
+    
+    for (const result of searchResults) {
+      const structData = result.document?.derivedStructData as {
+        extractiveSegments?: Array<{
+          content?: string;
+          pageNumber?: number;
+        }>;
+      };
+      
+      if (!structData?.extractiveSegments?.length) continue;
+      
+      // Add each segment as a separate chunk
+      for (const segment of structData.extractiveSegments) {
+        if (segment.content) {
+          results.push({
+            id: `kb-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+            content: segment.content,
+            metadata: {
+              source: 'platform-knowledge-base'
+            }
+          });
+        }
+      }
+    }
+
+    return results;
+  } catch (error) {
+    console.error("[searchPlatformKnowledgeBase] Error:", error);
+    throw error;
+  }
+}
+
+// Update generateChatResponse to use platform knowledge base when needed
 export async function generateChatResponse(
   sessionId: string,
   userMessage: string,
@@ -932,14 +1014,12 @@ export async function generateChatResponse(
       combinedChunks = [...pageChunksResult, ...activeKnowledgeBase];
     }
 
-    // RAG: Retrieve relevant chunks from combinedChunks
+    // RAG: Search knowledge base and retrieve relevant chunks
     let retrievalErrorOccurred = false;
     let relevantChunksInfo: { count: number; sources: string[] } | undefined;
     try {
-      const relevantChunks = await findRelevantChunks(
-        userMessage,
-        combinedChunks
-      );
+      // First try the local knowledge base
+      const relevantChunks = await searchKnowledgeBase(userMessage);
       relevantChunksInfo = {
         count: relevantChunks.length,
         sources: relevantChunks.map((c) => c.metadata.source),
@@ -949,27 +1029,43 @@ export async function generateChatResponse(
         contextInfo = relevantChunks
           .map((chunk) => `${chunk.content} (Source: ${chunk.metadata.source})`)
           .join("\n\n");
+      }
 
-        // Find the index of the last user message
-        const lastUserMsgIndex = messages
-          .map((m) => m.role)
-          .lastIndexOf("user");
-
-        // Insert the context right before the user's message
-        if (lastUserMsgIndex > 0) {
-          messages.splice(lastUserMsgIndex, 0, {
-            role: "system",
-            content: `Here is relevant information from the current page and our documentation:\n\n${contextInfo}`,
-            metadata: {
-              timestamp,
-              relevantChunks: relevantChunksInfo,
-            },
-          });
+      // If no relevant chunks found in local KB, try platform-wide KB
+      if (relevantChunks.length === 0) {
+        const platformChunks = await searchPlatformKnowledgeBase(userMessage);
+        if (platformChunks.length > 0) {
+          const platformContext = platformChunks
+            .map((chunk) => `${chunk.content} (Source: ${chunk.metadata.source})`)
+            .join("\n\n");
+          
+          contextInfo = platformContext;
+          relevantChunksInfo = {
+            count: platformChunks.length,
+            sources: platformChunks.map((c) => c.metadata.source),
+          };
         }
+      }
+
+      // Find the index of the last user message
+      const lastUserMsgIndex = messages
+        .map((m) => m.role)
+        .lastIndexOf("user");
+
+      // Insert the context right before the user's message if we have any
+      if (contextInfo && lastUserMsgIndex > 0) {
+        messages.splice(lastUserMsgIndex, 0, {
+          role: "system",
+          content: `Here is relevant information from our knowledge base:\n\n${contextInfo}`,
+          metadata: {
+            timestamp,
+            relevantChunks: relevantChunksInfo,
+          },
+        });
       }
     } catch (error) {
       console.error(
-        "[generateChatResponse] Error in context retrieval:",
+        "[generateChatResponse] Error in knowledge base search:",
         error
       );
       retrievalErrorOccurred = true;
