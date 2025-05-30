@@ -15,7 +15,8 @@ const releases: Release[] = [
       "- Automatically update knowledge base from good execution records",
       "- Manual knowledge base updates available on Task Details page",
       "- Enable 'Use Knowledge Base' option when running tasks",
-      "- Agents can search platform-wide knowledge base during web navigation"
+      "- Agents can search platform-wide knowledge base during web navigation",
+      "- Chatbots now have access to platform-wide knowledge base for more comprehensive support"
     ]
   },
   {
