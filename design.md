@@ -147,12 +147,14 @@ AgentWeb is a web platform that enables users to create and manage AI-powered we
    - Connects to various agent platforms:
        - **Google Cloud Agent Engine:** Runs managed agents provided by Google.
        - **BrowserUse Agent Engine:** Executes agents specifically designed for browser automation and website navigation using the `browser-use` library.
+       - **AG2 Agent Engine:** Executes agents using the AG2 framework for complex task handling.
        - **(Future) AWS Bedrock:** Integration point for running agents managed by AWS Bedrock.
        - **(Future) OpenAI Agents:** Integration point for leveraging OpenAI's agent capabilities.
 
 4. **Agent Execution Platforms**
    - **Google Cloud Agent Engine:** Managed environment for executing Google's agents.
    - **BrowserUse Agent Engine:** Dedicated environment for running `browser-use` based agents for web interaction tasks. Requires separate deployment and management (e.g., on GCE VM as per README). Handles browser isolation, task execution, credential injection (scoped to task), and result/artifact generation (e.g., screenshots, GIFs).
+   - **AG2 Agent Engine:** Containerized service for executing AG2-based agents, providing flexible agent coordination and complex task handling capabilities.
    - Future platforms (Bedrock, OpenAI) will integrate via ADK.
 
 5. **Security Layer**
@@ -166,6 +168,7 @@ AgentWeb is a web platform that enables users to create and manage AI-powered we
    - **AgentWeb Frontend/Backend:** AWS Elastic Beanstalk (Node.js platform).
    - **BrowserUse Agent Engine:** Deployed separately, e.g., Google Cloud VM (as detailed in README) or containerized service. Requires resources capable of running browser instances.
    - **Google Cloud Agent Engine:** Managed service within Google Cloud Platform.
+   - **AG2 Agent Engine:** Containerized service on GCP for AG2-based agent execution.
    - Potential future use of AWS Lambda/ECS for specific agent types via Bedrock.
 
 2. **Database**
@@ -200,6 +203,7 @@ AgentWeb is a web platform that enables users to create and manage AI-powered we
 - **Multi-Agent Orchestration:** Distribute tasks across specialized agents working together
 - **Cross-Provider Compatibility:** Mix and match agents from different providers
 - **Result Aggregation:** Centralized collection and processing of results from multiple agents
+- **A2A Compatibility:** Native support for agent-to-agent communication open protocols (proposed by Google, adopted by companies include Salesforce, Microsoft), enabling seamless collaboration between different agent types and platforms
 
 ### Google Cloud Agent Engine Advantages
 - **Managed Infrastructure:** Google-managed runtime with high availability and fault tolerance
@@ -365,6 +369,10 @@ AgentWeb is a web platform that enables users to create and manage AI-powered we
   - Playwright for browser control
   - Browser isolation and security features
   - Screenshot and GIF generation capabilities
+  
+- **AG2 Agent Engine**
+  - Containerized service for executing AG2-based agents
+  - Flexible agent coordination and complex task handling capabilities
   
 - **Future Platforms** (planned)
   - AWS Bedrock integration
