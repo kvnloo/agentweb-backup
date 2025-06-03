@@ -368,7 +368,7 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
     except ClientError as e:
         logger.error(f"Error updating execution status: {e}")
 
-def update_workflow_execution(workflow_execution_id: str, task_id: str, task_status: str, error: str = None, result: str = None):
+def update_workflow_execution(workflow_execution_id: str, task_id: str, task_status: str, error: str = None, result: str = None, task_execution_id: str = None):
     """
     Common function to update workflow execution record.
     Args:
@@ -377,6 +377,7 @@ def update_workflow_execution(workflow_execution_id: str, task_id: str, task_sta
         task_status: New status for the task ('running', 'completed', 'failed')
         error: Optional error message if task failed
         result: Optional result summary for completed tasks
+        task_execution_id: Optional ID of the task execution
     """
     try:
         workflow_table = dynamodb.Table(f'{TABLE_PREFIX}AW-WorkflowExecutions')
@@ -392,7 +393,8 @@ def update_workflow_execution(workflow_execution_id: str, task_id: str, task_sta
                     'status': task_status, 
                     'completedAt': datetime.now(timezone.utc).isoformat() if task_status in ['completed', 'failed'] else t.get('completedAt'),
                     **(({'error': error} if error else {}) if task_status == 'failed' else {}),
-                    **(({'result': result} if result else {}) if task_status == 'completed' else {})
+                    **(({'result': result} if result else {}) if task_status == 'completed' else {}),
+                    **(({'executionId': task_execution_id} if task_execution_id else {}))
                 }
                 if t['taskId'] == task_id else t 
                 for t in workflow_execution['tasks']
@@ -1181,8 +1183,8 @@ Current task:
             logger.error(f"Failed to create execution for task {task['taskId']}")
             return False
 
-        # Update workflow task status to running
-        update_workflow_execution(execution_id, task['taskId'], 'running')
+        # Update workflow task status to running and store task execution ID
+        update_workflow_execution(execution_id, task['taskId'], 'running', task_execution_id=task_execution_id)
         logger.info(f"Created execution {task_execution_id} for task {task['taskId']} in workflow {execution_id}")
 
         return True
