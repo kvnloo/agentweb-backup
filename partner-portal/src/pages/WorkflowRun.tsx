@@ -15,7 +15,8 @@ import {
   Chip,
   CircularProgress,
   Alert,
-  Tooltip
+  Tooltip,
+  Link
 } from '@mui/material';
 import {
   Refresh as RefreshIcon,
@@ -354,9 +355,29 @@ export default function WorkflowRun() {
                 </TableCell>
                 <TableCell>
                   {execution.status === 'failed' ? (
-                    <CollapsibleText text={execution.error || 'No error details available'} />
+                    <Box>
+                      <CollapsibleText text={execution.error || 'No error details available'} />
+                      <Link
+                        component="button"
+                        variant="body2"
+                        onClick={() => navigate(`/workflows/${id}/executions/${execution.executionId}`)}
+                        sx={{ display: 'block', mt: 1 }}
+                      >
+                        View Full Details
+                      </Link>
+                    </Box>
                   ) : execution.status === 'completed' ? (
-                    <CollapsibleText text={execution.result || 'No result available'} />
+                    <Box>
+                      <CollapsibleText text={execution.result || 'No result available'} />
+                      <Link
+                        component="button"
+                        variant="body2"
+                        onClick={() => navigate(`/workflows/${id}/executions/${execution.executionId}`)}
+                        sx={{ display: 'block', mt: 1 }}
+                      >
+                        View Full Details
+                      </Link>
+                    </Box>
                   ) : null}
                 </TableCell>
               </TableRow>

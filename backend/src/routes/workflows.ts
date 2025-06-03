@@ -54,6 +54,7 @@ router.post('/generate', generateWorkflow as unknown as RequestHandlerAuth);
 
 // Workflow execution routes
 router.get('/:id/executions', getWorkflowExecutions as unknown as RequestHandlerAuth);
+router.get('/:id/executions/:executionId', getWorkflowExecutions as unknown as RequestHandlerAuth);
 router.post('/:id/run', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
