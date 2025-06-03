@@ -378,7 +378,21 @@ export default function WorkflowRun() {
                         View Full Details
                       </Link>
                     </Box>
-                  ) : null}
+                  ) : (
+                    <Box>
+                      <Typography variant="body2" color="text.secondary">
+                        {execution.status === 'running' ? 'Execution in progress...' : 'Waiting to start...'}
+                      </Typography>
+                      <Link
+                        component="button"
+                        variant="body2"
+                        onClick={() => navigate(`/workflows/${id}/executions/${execution.executionId}`)}
+                        sx={{ display: 'block', mt: 1 }}
+                      >
+                        View Full Details
+                      </Link>
+                    </Box>
+                  )}
                 </TableCell>
               </TableRow>
             ))}
