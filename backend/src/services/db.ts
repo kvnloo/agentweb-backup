@@ -717,9 +717,19 @@ export const taskDb = {
       const taskResult = await dynamodb.scan(taskParams).promise();
       const tasks = taskResult.Items || [];
 
-      // Get all executions (no date filter)
+      // Get total count of executions using a separate count operation
+      const executionCountParams = {
+        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
+        Select: 'COUNT'
+      };
+
+      const executionCountResult = await dynamodb.scan(executionCountParams).promise();
+      const totalExecutions = executionCountResult.Count || 0;
+
+      // Get executions for status counts (limited to 1000 for performance)
       const executionParams = {
-        TableName: `${TABLE_PREFIX}AW-TaskExecutions`
+        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
+        Limit: 1000
       };
 
       const executionResult = await dynamodb.scan(executionParams).promise();
@@ -768,7 +778,7 @@ export const taskDb = {
       return {
         totalTasks: tasks.length,
         newTasks: tasks.filter(t => t.createdAt >= startDate && t.createdAt <= endDate).length,
-        totalExecutions: executions.length,
+        totalExecutions: totalExecutions,
         successfulExecutions: executions.filter(e => e.status === 'completed').length,
         failedExecutions: executions.filter(e => e.status === 'failed').length,
         newExecutions: executions.filter(e => e.startTime >= startDate && e.startTime <= endDate).length,
