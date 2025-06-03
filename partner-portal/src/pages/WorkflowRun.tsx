@@ -381,7 +381,7 @@ export default function WorkflowRun() {
                   ) : (
                     <Box>
                       <Typography variant="body2" color="text.secondary">
-                        {execution.status === 'running' ? 'Execution in progress...' : 'Waiting to start...'}
+                        {execution.status === 'running' ? 'Execution in progress...' : ''}
                       </Typography>
                       <Link
                         component="button"

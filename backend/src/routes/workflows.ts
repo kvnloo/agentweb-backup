@@ -10,9 +10,13 @@ import {
   runWorkflow,
   generateWorkflow
 } from '../controllers/workflows';
-import { workflowDb, WorkflowExecution, WorkflowTask } from '../services/workflow';
+import { WorkflowExecution, WorkflowTask } from '../services/workflow';
+import { WorkflowService } from '../services/workflowDb';
 import { v4 as uuidv4 } from 'uuid';
 import yaml from 'js-yaml';
+
+// Initialize workflow service
+const workflowDb = new WorkflowService();
 
 interface WorkflowNode {
   id: string;
@@ -133,6 +137,35 @@ router.post('/:id/run', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Error running workflow:', error);
     res.status(500).json({ error: 'Failed to run workflow', details: error instanceof Error ? error.message : 'Unknown error' });
+  }
+});
+
+// Kill workflow execution
+router.put('/:workflowId/executions/:executionId/kill', authenticateToken, async (req, res) => {
+  try {
+    const { workflowId, executionId } = req.params;
+    const userId = req.user?.userId;
+
+    // Get the workflow execution
+    const execution = await workflowDb.getWorkflowExecution(executionId);
+    if (!execution) {
+      return res.status(404).json({ message: 'Workflow execution not found' });
+    }
+
+    // Check if user has permission
+    if (execution.userId !== userId) {
+      return res.status(403).json({ message: 'Not authorized to kill this workflow execution' });
+    }
+
+    // Update the workflow execution to set killRequested
+    await workflowDb.updateWorkflowExecution(executionId, {
+      killRequested: new Date().toISOString()
+    });
+
+    res.json({ message: 'Workflow execution kill request sent' });
+  } catch (error) {
+    console.error('Error killing workflow execution:', error);
+    res.status(500).json({ message: 'Failed to kill workflow execution' });
   }
 });
 

@@ -27,6 +27,7 @@ export interface WorkflowExecution {
   endTime?: string;
   duration?: string;
   error?: string;
+  killRequested?: string;
   tasks: {
     nodeId: string;
     taskId: string;
@@ -171,5 +172,14 @@ export class WorkflowService {
     }).promise();
 
     return result.Items as WorkflowExecution[];
+  }
+
+  async getWorkflowExecution(executionId: string): Promise<WorkflowExecution | null> {
+    const result = await this.dynamodb.get({
+      TableName: `${TABLE_PREFIX}AW-WorkflowExecutions`,
+      Key: { executionId }
+    }).promise();
+
+    return result.Item as WorkflowExecution || null;
   }
 } 

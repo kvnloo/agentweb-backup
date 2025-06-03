@@ -19,7 +19,11 @@ import {
   Grid,
   Divider,
   Tooltip,
-  Collapse
+  Collapse,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions
 } from '@mui/material';
 import {
   ArrowBack as ArrowBackIcon,
@@ -30,11 +34,13 @@ import {
   KeyboardArrowDown as KeyboardArrowDownIcon,
   KeyboardArrowUp as KeyboardArrowUpIcon,
   ContentCopy as ContentCopyIcon,
-  Autorenew as AutorenewIcon
+  Autorenew as AutorenewIcon,
+  PowerOff as PowerOffIcon
 } from '@mui/icons-material';
 import { useAuth } from '../contexts/AuthContext';
 import { formatDistanceToNow, intervalToDuration } from 'date-fns';
 import { API_URL } from '../config';
+import axios from 'axios';
 
 interface WorkflowTask {
   taskId: string;
@@ -140,6 +146,9 @@ export default function WorkflowExecutionDetails() {
   const [error, setError] = useState<string | null>(null);
   const [isAutoRefreshing, setIsAutoRefreshing] = useState(false);
   const [expandedTask, setExpandedTask] = useState<string | null>(null);
+  const [killDialogOpen, setKillDialogOpen] = useState(false);
+  const [killLoading, setKillLoading] = useState(false);
+  const [killError, setKillError] = useState('');
 
   const fetchData = useCallback(async () => {
     console.log('fetchData called with:', { workflowId, executionId });
@@ -209,6 +218,7 @@ export default function WorkflowExecutionDetails() {
               console.log('Task execution data received:', taskExecutionData);
               return {
                 ...task,
+                status: taskExecutionData.status,
                 prompt: taskExecutionData.prompt,
                 details_gif: taskExecutionData.details_gif,
                 browser_use_log: taskExecutionData.browser_use_log,
@@ -314,6 +324,36 @@ export default function WorkflowExecutionDetails() {
     setExpandedTask(expandedTask === taskId ? null : taskId);
   };
 
+  const handleKillClick = () => {
+    setKillError('');
+    setKillDialogOpen(true);
+  };
+
+  const handleConfirmKill = async () => {
+    if (!workflowId || !executionId || !token) return;
+
+    setKillLoading(true);
+    setKillError('');
+
+    try {
+      // Call the workflow kill endpoint
+      const response = await axios.put(
+        `${API_URL}/api/workflows/${workflowId}/executions/${executionId}/kill`,
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      // Refresh execution data
+      fetchData();
+      setKillDialogOpen(false);
+    } catch (error: any) {
+      console.error('Error killing workflow execution:', error);
+      setKillError(error.response?.data?.message || 'Failed to kill workflow execution');
+    } finally {
+      setKillLoading(false);
+    }
+  };
+
   if (loading) {
     return (
       <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh' }}>
@@ -337,6 +377,17 @@ export default function WorkflowExecutionDetails() {
           {isAutoRefreshing && (
             <Tooltip title="Real-time updates active">
               <AutorenewIcon color="info" sx={{ animation: 'spin 2s linear infinite' }} />
+            </Tooltip>
+          )}
+          {execution?.status.toLowerCase() === 'running' && (
+            <Tooltip title="Kill all running tasks">
+              <IconButton
+                onClick={handleKillClick}
+                disabled={killLoading}
+                color="error"
+              >
+                <PowerOffIcon />
+              </IconButton>
             </Tooltip>
           )}
         </Box>
@@ -523,6 +574,41 @@ export default function WorkflowExecutionDetails() {
           </Typography>
         )}
       </Paper>
+
+      {/* Kill Dialog */}
+      <Dialog
+        open={killDialogOpen}
+        onClose={() => setKillDialogOpen(false)}
+        aria-labelledby="alert-dialog-title"
+        aria-describedby="alert-dialog-description"
+      >
+        <DialogTitle id="alert-dialog-title">{"Kill Running Tasks?"}</DialogTitle>
+        <DialogContent>
+          {killError && (
+            <Alert severity="error" sx={{ mb: 2 }}>
+              {killError}
+            </Alert>
+          )}
+          <Typography>
+            Are you sure you want to kill all running tasks in this workflow execution? This action cannot be undone.
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setKillDialogOpen(false)} color="primary">
+            Cancel
+          </Button>
+          <Button 
+            onClick={handleConfirmKill} 
+            color="error" 
+            variant="contained" 
+            disabled={killLoading}
+            startIcon={killLoading ? <CircularProgress size={20} color="inherit" /> : <PowerOffIcon />}
+            autoFocus
+          >
+            {killLoading ? 'Killing Tasks...' : 'Kill All Tasks'}
+          </Button>
+        </DialogActions>
+      </Dialog>
 
       <style>
         {`
