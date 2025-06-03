@@ -196,7 +196,7 @@ export default function WorkflowExecutionDetails() {
 
           try {
             console.log('Fetching task execution details for:', task.executionId);
-            const taskExecutionResponse = await fetch(`${baseUrl}/api/task-executions/${task.executionId}`, {
+            const taskExecutionResponse = await fetch(`${baseUrl}/api/tasks/${task.taskId}/executions/${task.executionId}`, {
               headers: {
                 Authorization: `Bearer ${token}`,
               },
@@ -424,7 +424,28 @@ export default function WorkflowExecutionDetails() {
                   </Grid>
                 )}
 
-                {/* Execution GIF Section */}
+                {/* Execution Log Section */}
+                {task.browser_use_log && (
+                  <Grid item xs={12}>
+                    <Typography variant="subtitle2" color="text.secondary" gutterBottom>
+                      Execution Log
+                    </Typography>
+                    <Paper sx={{ p: 2, bgcolor: 'background.default' }}>
+                      <iframe
+                        src={`${API_URL}/api/tasks/${task.taskId}/executions/${task.executionId}/log?token=${task.browser_use_log.split('_').pop()?.replace('.log', '')}`}
+                        style={{
+                          width: '100%',
+                          height: '400px',
+                          border: 'none',
+                          backgroundColor: 'white'
+                        }}
+                        title="Execution Log"
+                      />
+                    </Paper>
+                  </Grid>
+                )}
+
+                {/* Execution Recording Section */}
                 {task.details_gif && (
                   <Grid item xs={12}>
                     <Typography variant="subtitle2" color="text.secondary" gutterBottom>
@@ -439,42 +460,6 @@ export default function WorkflowExecutionDetails() {
                         />
                       </Box>
                     </Paper>
-                  </Grid>
-                )}
-
-                {/* Browser Log Section */}
-                {task.browser_use_log && (
-                  <Grid item xs={12}>
-                    <Typography variant="subtitle2" color="text.secondary" gutterBottom>
-                      Browser Log
-                    </Typography>
-                    <Paper sx={{ p: 2, bgcolor: 'background.default' }}>
-                      <iframe
-                        src={`${API_URL}/api/tasks/${task.taskId}/executions/${task.executionId}/log`}
-                        style={{
-                          width: '100%',
-                          height: '400px',
-                          border: 'none',
-                          backgroundColor: 'white'
-                        }}
-                        title="Browser Log"
-                      />
-                    </Paper>
-                  </Grid>
-                )}
-
-                {/* Task Execution Details Link */}
-                {task.executionId && (
-                  <Grid item xs={12}>
-                    <Box sx={{ display: 'flex', justifyContent: 'flex-end' }}>
-                      <Link
-                        component="button"
-                        variant="body2"
-                        onClick={() => navigate(`/tasks/${task.taskId}/executions/${task.executionId}`)}
-                      >
-                        View Full Task Details
-                      </Link>
-                    </Box>
                   </Grid>
                 )}
               </Grid>
