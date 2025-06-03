@@ -163,12 +163,14 @@ const Dashboard = () => {
       prompt: promptContent,
       isInteractive: false,
       isDeepResearch: false,
-      isComplexTask: false,
+      isComplexTask: true,
       emailNotification: false,
       extractPageContent: false,
       category: "General",
       description: "Task created from dashboard prompt.",
       parameterValues: {},
+      outputAsHtml: true,
+      useSharedBrowser: true,
     };
 
     console.log(
