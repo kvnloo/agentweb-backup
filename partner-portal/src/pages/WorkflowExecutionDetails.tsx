@@ -48,6 +48,8 @@ interface WorkflowTask {
   prompt?: string;
   details_gif?: string;
   browser_use_log?: string;
+  startTime?: string;
+  llmName?: string;
 }
 
 interface WorkflowExecution {
@@ -212,7 +214,9 @@ export default function WorkflowExecutionDetails() {
                 browser_use_log: taskExecutionData.browser_use_log,
                 result: taskExecutionData.result,
                 error: taskExecutionData.error,
-                completedAt: taskExecutionData.completedAt
+                completedAt: taskExecutionData.completedAt,
+                startTime: taskExecutionData.startTime,
+                llmName: taskExecutionData.llmName
               };
             } else {
               console.error('Failed to fetch task execution:', await taskExecutionResponse.text());
@@ -389,13 +393,59 @@ export default function WorkflowExecutionDetails() {
             <Paper sx={{ p: 2, mb: 2 }}>
               <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
                 <Typography variant="h6">
-                  Task {task.order + 1}
+                  Task {index + 1}
                 </Typography>
-                <Chip
-                  icon={getStatusIcon(task.status)}
-                  label={task.status}
-                  color={getStatusColor(task.status)}
-                />
+                <Box sx={{ display: 'flex', gap: 1 }}>
+                  <Chip
+                    icon={getStatusIcon(task.status)}
+                    label={task.status}
+                    color={getStatusColor(task.status)}
+                  />
+                  {task.llmName && (
+                    <Chip
+                      label={`LLM: ${task.llmName}`}
+                      variant="outlined"
+                    />
+                  )}
+                </Box>
+              </Box>
+
+              {/* Task Timing Details */}
+              <Box sx={{ 
+                display: 'flex', 
+                gap: 3, 
+                mb: 2, 
+                flexWrap: 'wrap',
+                '& > div': {
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 1
+                }
+              }}>
+                <Box>
+                  <Typography variant="body2" color="text.secondary" component="span">
+                    <strong>Started:</strong>
+                  </Typography>
+                  <Typography variant="body2" component="span">
+                    {task.startTime ? new Date(task.startTime).toLocaleString() : '-'}
+                  </Typography>
+                </Box>
+                <Box>
+                  <Typography variant="body2" color="text.secondary" component="span">
+                    <strong>Completed:</strong>
+                  </Typography>
+                  <Typography variant="body2" component="span">
+                    {task.completedAt ? new Date(task.completedAt).toLocaleString() : '-'}
+                  </Typography>
+                </Box>
+                <Box>
+                  <Typography variant="body2" color="text.secondary" component="span">
+                    <strong>Duration:</strong>
+                  </Typography>
+                  <Typography variant="body2" component="span">
+                    {task.startTime && task.completedAt ? getDuration(task.startTime, task.completedAt) : '-'}
+                  </Typography>
+                </Box>
               </Box>
 
               {/* Task Details */}
