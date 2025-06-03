@@ -24,7 +24,7 @@ import {
   MoreVert as MoreVertIcon,
   PlayArrow as PlayIcon,
   Edit as EditIcon,
-  Delete as DeleteIcon
+  Archive as ArchiveIcon
 } from '@mui/icons-material';
 import { useNavigate } from 'react-router-dom';
 import { API_URL } from '../config';
@@ -46,7 +46,7 @@ export default function Workflows() {
   const [error, setError] = useState<string | null>(null);
   const [anchorEl, setAnchorEl] = useState<null | HTMLElement>(null);
   const [selectedWorkflow, setSelectedWorkflow] = useState<Workflow | null>(null);
-  const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
+  const [isArchiveDialogOpen, setIsArchiveDialogOpen] = useState(false);
   const [showSnackbar, setShowSnackbar] = useState(false);
   const [snackbarMessage, setSnackbarMessage] = useState('');
   const [snackbarSeverity, setSnackbarSeverity] = useState<'success' | 'error'>('success');
@@ -71,15 +71,17 @@ export default function Workflows() {
 
         const data = await response.json();
         console.log('Workflow data from API:', data);
-        setWorkflows(data.map((workflow: any) => ({
-          id: workflow.workflowId,
-          name: workflow.name,
-          description: workflow.description,
-          status: workflow.status === 'archived' ? 'archived' : 'active',
-          taskCount: workflow.taskCount || 0,
-          lastRun: workflow.lastRun,
-          createdAt: workflow.createdAt
-        })));
+        setWorkflows(data
+          .filter((workflow: any) => workflow.status !== 'archived')
+          .map((workflow: any) => ({
+            id: workflow.workflowId,
+            name: workflow.name,
+            description: workflow.description,
+            status: 'active',
+            taskCount: workflow.taskCount || 0,
+            lastRun: workflow.lastRun,
+            createdAt: workflow.createdAt
+          })));
       } catch (error) {
         console.error('Error fetching workflows:', error);
         setError(error instanceof Error ? error.message : 'Failed to fetch workflows');
@@ -115,37 +117,40 @@ export default function Workflows() {
     handleMenuClose();
   };
 
-  const handleDeleteWorkflow = async () => {
+  const handleArchiveWorkflow = async () => {
     try {
       if (!selectedWorkflow) return;
 
       const baseUrl = API_URL;
       const response = await fetch(`${baseUrl}/api/workflows/${selectedWorkflow.id}`, {
-        method: 'DELETE',
+        method: 'PUT',
         headers: {
           'Authorization': `Bearer ${localStorage.getItem('token')}`,
           'Content-Type': 'application/json'
         },
+        body: JSON.stringify({ status: 'archived' }),
         credentials: 'include'
       });
 
       if (!response.ok) {
-        throw new Error('Failed to delete workflow');
+        throw new Error('Failed to archive workflow');
       }
 
-      // Remove the workflow from the local state
-      setWorkflows(workflows.filter(w => w.id !== selectedWorkflow.id));
+      // Update the workflow in the local state
+      setWorkflows(workflows.map(w => 
+        w.id === selectedWorkflow.id ? { ...w, status: 'archived' } : w
+      ));
       
       // Show success message
       setError(null);
-      setSnackbarMessage('Workflow deleted successfully');
+      setSnackbarMessage('Workflow archived successfully');
       setSnackbarSeverity('success');
       setShowSnackbar(true);
     } catch (error) {
-      console.error('Error deleting workflow:', error);
-      setError(error instanceof Error ? error.message : 'Failed to delete workflow');
+      console.error('Error archiving workflow:', error);
+      setError(error instanceof Error ? error.message : 'Failed to archive workflow');
     } finally {
-      setIsDeleteDialogOpen(false);
+      setIsArchiveDialogOpen(false);
       handleMenuClose();
     }
   };
@@ -252,9 +257,11 @@ export default function Workflows() {
         <MenuItem onClick={() => selectedWorkflow && handleEditWorkflow(selectedWorkflow.id)}>
           <EditIcon sx={{ mr: 1 }} /> Edit
         </MenuItem>
-        <MenuItem onClick={() => setIsDeleteDialogOpen(true)} sx={{ color: 'error.main' }}>
-          <DeleteIcon sx={{ mr: 1 }} /> Delete
-        </MenuItem>
+        {selectedWorkflow?.status !== 'archived' && (
+          <MenuItem onClick={() => setIsArchiveDialogOpen(true)} sx={{ color: 'warning.main' }}>
+            <ArchiveIcon sx={{ mr: 1 }} /> Archive
+          </MenuItem>
+        )}
       </Menu>
 
       <Snackbar
@@ -271,17 +278,17 @@ export default function Workflows() {
         </Alert>
       </Snackbar>
 
-      <Dialog open={isDeleteDialogOpen} onClose={() => setIsDeleteDialogOpen(false)}>
-        <DialogTitle>Delete Workflow</DialogTitle>
+      <Dialog open={isArchiveDialogOpen} onClose={() => setIsArchiveDialogOpen(false)}>
+        <DialogTitle>Archive Workflow</DialogTitle>
         <DialogContent>
           <Typography>
-            Are you sure you want to delete "{selectedWorkflow?.name}"? This action cannot be undone.
+            Are you sure you want to archive "{selectedWorkflow?.name}"? This action cannot be undone. If you need to unarchive this workflow in the future, please contact AgentWeb support.
           </Typography>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setIsDeleteDialogOpen(false)}>Cancel</Button>
-          <Button onClick={handleDeleteWorkflow} color="error" variant="contained">
-            Delete
+          <Button onClick={() => setIsArchiveDialogOpen(false)}>Cancel</Button>
+          <Button onClick={handleArchiveWorkflow} color="warning" variant="contained">
+            Archive
           </Button>
         </DialogActions>
       </Dialog>
