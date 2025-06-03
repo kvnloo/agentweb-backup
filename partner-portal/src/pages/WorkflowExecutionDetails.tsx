@@ -305,8 +305,8 @@ export default function WorkflowExecutionDetails() {
     }
   };
 
-  const getDuration = (startTime: string, completedAt?: string) => {
-    if (!completedAt) return 'In progress';
+  const getDuration = (startTime: string, completedAt?: string, status?: string) => {
+    if (!completedAt || status === 'killed') return 'In progress';
     
     const start = new Date(startTime);
     const end = new Date(completedAt);
@@ -428,7 +428,7 @@ export default function WorkflowExecutionDetails() {
               </Typography>
             )}
             <Typography variant="body1" sx={{ mb: 1 }}>
-              <strong>Duration:</strong> {execution ? getDuration(execution.startTime, execution.completedAt) : '-'}
+              <strong>Duration:</strong> {execution ? getDuration(execution.startTime, execution.completedAt, execution.status) : '-'}
             </Typography>
           </Grid>
         </Grid>
@@ -494,7 +494,7 @@ export default function WorkflowExecutionDetails() {
                     <strong>Duration:</strong>
                   </Typography>
                   <Typography variant="body2" component="span">
-                    {task.startTime && task.completedAt ? getDuration(task.startTime, task.completedAt) : '-'}
+                    {task.startTime && task.completedAt ? getDuration(task.startTime, task.completedAt, task.status) : '-'}
                   </Typography>
                 </Box>
               </Box>

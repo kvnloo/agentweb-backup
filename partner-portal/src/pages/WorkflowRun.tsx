@@ -242,8 +242,8 @@ export default function WorkflowRun() {
     }
   };
 
-  const getDuration = (startTime: string, completedAt?: string) => {
-    if (!completedAt) return 'In progress';
+  const getDuration = (startTime: string, completedAt?: string, status?: string) => {
+    if (!completedAt || status === 'killed') return 'In progress';
     
     const start = new Date(startTime);
     const end = new Date(completedAt);
@@ -328,7 +328,7 @@ export default function WorkflowRun() {
                   {formatDistanceToNow(new Date(execution.startTime), { addSuffix: true })}
                 </TableCell>
                 <TableCell>
-                  {getDuration(execution.startTime, execution.completedAt)}
+                  {getDuration(execution.startTime, execution.completedAt, execution.status)}
                 </TableCell>
                 <TableCell>
                   <Box sx={{ display: 'flex', gap: 1 }}>
