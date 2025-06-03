@@ -129,7 +129,7 @@ export class WorkflowService {
 
   // Workflow Executions operations
   async createWorkflowExecution(execution: Omit<WorkflowExecution, 'executionId'>): Promise<WorkflowExecution> {
-    const executionId = uuidv4();
+    const executionId = Date.now().toString();
     const newExecution: WorkflowExecution = {
       ...execution,
       executionId
