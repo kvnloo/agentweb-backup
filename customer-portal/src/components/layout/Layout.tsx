@@ -8,6 +8,7 @@ import {
   ChevronRight,
   Bell,
   Activity,
+  MessageSquare,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -21,8 +22,13 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
   const location = useLocation();
   const navigate = useNavigate();
   const { user } = useAuth();
-  const [isCollapsed, setIsCollapsed] = useState(false);
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+  const [isChatPanelCollapsed, setIsChatPanelCollapsed] = useState(false);
   const [activeItem, setActiveItem] = useState<string | null>(null);
+
+  const toggleChatPanel = () => {
+    setIsChatPanelCollapsed(!isChatPanelCollapsed);
+  };
 
   const categories = [
     {
@@ -82,17 +88,17 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
       <aside
         className={cn(
           "flex flex-col h-screen bg-white dark:bg-[#1B2549] transition-all duration-300 shrink-0",
-          isCollapsed ? "w-[60px]" : "w-[240px]"
+          isSidebarCollapsed ? "w-[60px]" : "w-[240px]"
         )}
       >
         {/* Logo section */}
         <div className="flex h-14 items-center px-4">
-          {!isCollapsed && (
+          {!isSidebarCollapsed && (
             <Link to="/" className="flex items-center gap-2">
               <img src={AgentWebLogo} alt="AgentWeb Logo" className="h-8" />
             </Link>
           )}
-          {isCollapsed && (
+          {isSidebarCollapsed && (
             <div className="w-full flex justify-center">
               <img src={AgentWebLogo} alt="AgentWeb Logo" className="h-8" />
             </div>
@@ -103,7 +109,7 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
         <div className="flex-1 overflow-auto py-2">
           {categories.map((category, categoryIndex) => (
             <div key={categoryIndex} className="mb-4">
-              {!isCollapsed && (
+              {!isSidebarCollapsed && (
                 <div className="px-4 py-1">
                   <p className="text-xs font-semibold text-[#7E69AB] dark:text-[rgba(255,255,255,0.7)] tracking-wider">
                     {category.title}
@@ -126,11 +132,11 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
                     <item.icon
                       className={cn(
                         "h-5 w-5",
-                        isCollapsed ? "mx-auto" : "mr-3"
+                        isSidebarCollapsed ? "mx-auto" : "mr-3"
                       )}
                     />
-                    {!isCollapsed && <span>{item.label}</span>}
-                    {activeItem === item.id && !isCollapsed && (
+                    {!isSidebarCollapsed && <span>{item.label}</span>}
+                    {activeItem === item.id && !isSidebarCollapsed && (
                       <div className="absolute left-0 h-6 w-1 agent-gradient rounded-r-full" />
                     )}
                   </Link>
@@ -141,7 +147,7 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
         </div>
 
         {/* Public Beta Notice */}
-        {!isCollapsed && (
+        {!isSidebarCollapsed && (
           <div className="px-4 py-2 text-xs text-gray-500 dark:text-[rgba(255,255,255,0.7)] border-t border-[#D6BCFA] dark:border-[rgba(255,255,255,0.1)]">
             <p className="mb-1">
               Customer Portal is in{" "}
@@ -168,9 +174,9 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
             variant="ghost"
             size="sm"
             className="w-full flex justify-center text-[#7E69AB] hover:bg-[#F3EFFD] hover:text-[#7E69AB] dark:text-[rgba(255,255,255,0.85)] dark:hover:bg-[rgba(255,255,255,0.1)] dark:hover:text-white"
-            onClick={() => setIsCollapsed(!isCollapsed)}
+            onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
           >
-            {isCollapsed ? (
+            {isSidebarCollapsed ? (
               <ChevronRight size={18} />
             ) : (
               <ChevronLeft size={18} />
@@ -180,7 +186,7 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
       </aside>
 
       {/* Main Content Area */}
-      <main className="flex-1 flex flex-col h-screen overflow-auto bg-gray-50 dark:bg-[#10141F]">
+      <main className="flex-1 flex flex-col overflow-hidden bg-gray-50 dark:bg-[#10141F]">
         {/* Header */}
         <header className="bg-white dark:bg-[#1B2549] h-14 px-4 flex items-center justify-between shrink-0">
           {/* Gradient bar */}
@@ -205,14 +211,20 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
         </header>
 
         {/* Page Children - make it scrollable independently */}
-        <div className="flex-1 container mx-auto p-6 overflow-y-auto">
-          {children}
-        </div>
+        <div className="flex-1 p-6 overflow-y-auto">{children}</div>
       </main>
 
-      {/* Right Chat Panel */}
-      <aside className="w-96 h-screen shrink-0 border-l border-[#D6BCFA] bg-white dark:bg-white flex flex-col">
-        <ChatSupport />
+      {/* Right Chat Panel Container */}
+      <aside
+        className={cn(
+          "h-screen shrink-0 border-l border-[#D6BCFA] dark:border-gray-700 bg-white dark:bg-white flex flex-col transition-all duration-300",
+          isChatPanelCollapsed ? "w-0 border-l-0" : "w-96"
+        )}
+      >
+        <ChatSupport
+          isChatPanelCollapsed={isChatPanelCollapsed}
+          onToggleChatPanel={toggleChatPanel}
+        />
       </aside>
     </div>
   );

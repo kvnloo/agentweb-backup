@@ -14,6 +14,8 @@ import {
   User,
   PlusCircle,
   Navigation,
+  ChevronDown,
+  ChevronUp,
 } from "lucide-react";
 import { Alert, AlertDescription } from "../ui/alert";
 import { io, Socket } from "socket.io-client";
@@ -42,7 +44,15 @@ interface ChatSession {
   portalType?: "customer" | "partner";
 }
 
-const ChatSupport: React.FC = () => {
+interface ChatSupportProps {
+  isChatPanelCollapsed: boolean;
+  onToggleChatPanel: () => void;
+}
+
+const ChatSupport: React.FC<ChatSupportProps> = ({
+  isChatPanelCollapsed,
+  onToggleChatPanel,
+}) => {
   const { token } = useAuth();
   const location = useLocation();
   const [message, setMessage] = useState("");
@@ -174,10 +184,10 @@ const ChatSupport: React.FC = () => {
 
   // Create or get existing chat session when token or pathname changes
   useEffect(() => {
-    if (token) {
-      fetchOrCreateSession(); // Always fetch/create when token is present and path might have changed
+    if (token && !isChatPanelCollapsed) {
+      fetchOrCreateSession();
     }
-  }, [token, location.pathname]);
+  }, [token, location.pathname, isChatPanelCollapsed]);
 
   // Manage page title when chat is opened/closed
   useEffect(() => {
@@ -193,10 +203,10 @@ const ChatSupport: React.FC = () => {
 
   // Scroll to bottom of messages
   useEffect(() => {
-    if (messagesEndRef.current) {
+    if (messagesEndRef.current && !isChatPanelCollapsed) {
       messagesEndRef.current.scrollIntoView({ behavior: "smooth" });
     }
-  }, [session?.messages]);
+  }, [session?.messages, isChatPanelCollapsed]);
 
   const fetchOrCreateSession = async () => {
     try {
@@ -354,23 +364,48 @@ const ChatSupport: React.FC = () => {
     }
   };
 
+  if (isChatPanelCollapsed) {
+    return (
+      <div className="fixed bottom-5 right-5 z-[100]">
+        <Button
+          onClick={onToggleChatPanel}
+          className="rounded-full h-14 w-14 shadow-lg use-template-button flex items-center justify-center"
+          size="icon"
+          aria-label="Expand chat"
+        >
+          <MessageSquare className="h-7 w-7" />
+        </Button>
+      </div>
+    );
+  }
+
   return (
-    <div className="flex flex-col h-full w-full bg-white border-gray-200 dark:border-gray-700">
+    <div className="flex flex-col h-full w-full bg-white border-gray-200 dark:border-gray-700 overflow-hidden">
       <div className="bg-[#7E69AB] text-white py-3 px-4 flex justify-between items-center shrink-0">
         <div className="flex items-center">
           <Bot className="mr-2 h-5 w-5" />
           <h3 className="text-sm font-medium">Emma</h3>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1">
           <Button
             variant="ghost"
             size="sm"
             onClick={() => createNewChatSession(location.pathname)}
             disabled={isLoading}
             className="text-white hover:bg-[#9578C7] hover:text-white h-8 px-2 text-xs flex items-center gap-1"
+            aria-label="Start new chat"
           >
             <PlusCircle className="h-4 w-4" />
             <span>New Chat</span>
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={onToggleChatPanel}
+            className="text-white hover:bg-[#9578C7] hover:text-white h-8 w-8"
+            aria-label="Collapse chat"
+          >
+            <ChevronDown className="h-5 w-5" />
           </Button>
         </div>
       </div>
