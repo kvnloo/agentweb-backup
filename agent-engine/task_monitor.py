@@ -1245,13 +1245,13 @@ async def execute_workflow_task(execution_id: str, task: dict):
                 if dep_task.get('executionId'):
                     dep_execution = executions_table.get_item(Key={'executionId': dep_task['executionId']}).get('Item')
                     if dep_execution and dep_execution.get('result_files'):
-                        for file_info in dep_execution['result_files']:
+                        for i, file_info in enumerate(dep_execution['result_files'], 1):
                             try:
                                 # Download file content using requests in a thread
                                 response = await asyncio.to_thread(requests.get, file_info.get('url'))
                                 if response.status_code == 200:
                                     content = response.text
-                                    result_parts.append(f"\nFile {file_info.get('filename')}:\n{content}")
+                                    result_parts.append(f"\nResult file {i} content:\n{content}")
                                     logger.info(f"Downloaded content from {file_info.get('url')}, {len(content)} bytes")
                                 else:
                                     logger.error(f"Failed to download file from {file_info.get('url')}: {response.status_code}")
