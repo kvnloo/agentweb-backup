@@ -135,6 +135,46 @@ const CollapsibleText = ({ text, maxLength = 150 }: { text: string, maxLength?: 
   );
 };
 
+// Add formatJsonIfValid helper function
+const formatJsonIfValid = (text: string): JSX.Element => {
+  // Check if text is valid JSON
+  try {
+    const parsed = JSON.parse(text);
+    const formattedJson = JSON.stringify(parsed, null, 2);
+    
+    return (
+      <pre
+        style={{
+          backgroundColor: '#f5f5f5',
+          padding: '12px',
+          borderRadius: '4px',
+          overflow: 'auto',
+          maxHeight: '500px',
+          fontSize: '0.9rem',
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-word'
+        }}
+      >
+        {formattedJson}
+      </pre>
+    );
+  } catch (e) {
+    // If not valid JSON, return regular text
+    return (
+      <Typography 
+        variant="body1" 
+        sx={{ 
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-word',
+          overflowWrap: 'break-word'
+        }}
+      >
+        {text}
+      </Typography>
+    );
+  }
+};
+
 export default function WorkflowExecutionDetails() {
   const { id: workflowId, executionId } = useParams();
   const navigate = useNavigate();
@@ -515,8 +555,17 @@ export default function WorkflowExecutionDetails() {
                     <Typography variant="subtitle2" color="text.secondary" gutterBottom>
                       Prompt
                     </Typography>
-                    <Paper sx={{ p: 2, bgcolor: 'background.default' }}>
-                      <CollapsibleText text={task.prompt} />
+                    <Paper variant="outlined" sx={{ p: 2, bgcolor: 'grey.50' }}>
+                      <Typography 
+                        variant="body1" 
+                        sx={{ 
+                          whiteSpace: 'pre-wrap',
+                          wordBreak: 'break-word',
+                          overflowWrap: 'break-word'
+                        }}
+                      >
+                        {task.prompt}
+                      </Typography>
                     </Paper>
                   </Grid>
                 )}
@@ -527,8 +576,68 @@ export default function WorkflowExecutionDetails() {
                     <Typography variant="subtitle2" color="text.secondary" gutterBottom>
                       {task.status === 'failed' ? 'Error' : 'Result'}
                     </Typography>
+                    <Paper variant="outlined" sx={{ p: 2, bgcolor: task.error ? 'error.50' : 'success.50' }}>
+                      {task.error ? (
+                        <Typography 
+                          variant="body1" 
+                          color="error"
+                          sx={{ 
+                            whiteSpace: 'pre-wrap',
+                            wordBreak: 'break-word',
+                            overflowWrap: 'break-word'
+                          }}
+                        >
+                          {task.error}
+                        </Typography>
+                      ) : task.result ? (
+                        (task.result.trim().startsWith('{') || task.result.trim().startsWith('[')) ? (
+                          formatJsonIfValid(task.result)
+                        ) : (
+                          <Typography 
+                            variant="body1" 
+                            sx={{ 
+                              whiteSpace: 'pre-wrap',
+                              wordBreak: 'break-word',
+                              overflowWrap: 'break-word'
+                            }}
+                          >
+                            {task.result}
+                          </Typography>
+                        )
+                      ) : (
+                        <Typography color="textSecondary">No result available</Typography>
+                      )}
+                    </Paper>
+                  </Grid>
+                )}
+
+                {/* Result Files Section */}
+                {task.result_files && task.result_files.length > 0 && (
+                  <Grid item xs={12}>
+                    <Typography variant="subtitle2" color="text.secondary" gutterBottom>
+                      Result Files
+                    </Typography>
                     <Paper sx={{ p: 2, bgcolor: 'background.default' }}>
-                      <CollapsibleText text={task.status === 'failed' ? (task.error || 'No error details available') : (task.result || 'No result available')} />
+                      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+                        {task.result_files.map((file, index) => (
+                          <Link
+                            key={index}
+                            href={file.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            sx={{ display: 'flex', alignItems: 'center' }}
+                          >
+                            {file.is_html ? (
+                              <>
+                                <ScreenshotIcon sx={{ mr: 1, fontSize: '1.2rem' }} />
+                                {file.filename} <Typography variant="caption" sx={{ ml: 1, color: 'text.secondary' }}>(View in browser)</Typography>
+                              </>
+                            ) : (
+                              file.filename
+                            )}
+                          </Link>
+                        ))}
+                      </Box>
                     </Paper>
                   </Grid>
                 )}
@@ -567,37 +676,6 @@ export default function WorkflowExecutionDetails() {
                           alt="Task Execution Recording"
                           style={{ maxWidth: '100%', maxHeight: '400px' }}
                         />
-                      </Box>
-                    </Paper>
-                  </Grid>
-                )}
-
-                {/* Result Files Section */}
-                {task.result_files && task.result_files.length > 0 && (
-                  <Grid item xs={12}>
-                    <Typography variant="subtitle2" color="text.secondary" gutterBottom>
-                      Result Files
-                    </Typography>
-                    <Paper sx={{ p: 2, bgcolor: 'background.default' }}>
-                      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-                        {task.result_files.map((file, index) => (
-                          <Link
-                            key={index}
-                            href={file.url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            sx={{ display: 'flex', alignItems: 'center' }}
-                          >
-                            {file.is_html ? (
-                              <>
-                                <ScreenshotIcon sx={{ mr: 1, fontSize: '1.2rem' }} />
-                                {file.filename} <Typography variant="caption" sx={{ ml: 1, color: 'text.secondary' }}>(View in browser)</Typography>
-                              </>
-                            ) : (
-                              file.filename
-                            )}
-                          </Link>
-                        ))}
                       </Box>
                     </Paper>
                   </Grid>
