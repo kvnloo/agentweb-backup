@@ -183,12 +183,21 @@ export async function runWorkflow(req: AuthenticatedRequest, res: Response) {
 export async function generateWorkflow(req: AuthenticatedRequest, res: Response) {
   try {
     const { message, currentYaml } = req.body;
+    const userId = req.user?.userId;
 
     if (!message) {
       return res.status(400).json({ error: 'Message is required' });
     }
 
-    const { yaml, nodes, edges, message: responseMessage } = await generateWorkflowFromDescription(message, currentYaml);
+    if (!userId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    const { yaml, nodes, edges, message: responseMessage } = await generateWorkflowFromDescription(
+      message,
+      userId,
+      currentYaml
+    );
 
     res.json({
       yaml,

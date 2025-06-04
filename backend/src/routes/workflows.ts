@@ -10,10 +10,12 @@ import {
   runWorkflow,
   generateWorkflow
 } from '../controllers/workflows';
-import { WorkflowExecution, WorkflowTask } from '../services/workflow';
-import { WorkflowService } from '../services/workflowDb';
+import { WorkflowTask } from '../services/workflow';
+import { WorkflowService, WorkflowExecution } from '../services/workflowDb';
 import { v4 as uuidv4 } from 'uuid';
 import yaml from 'js-yaml';
+import { taskDb } from '../services/db';
+import { Task } from '../types/task';
 
 // Initialize workflow service
 const workflowDb = new WorkflowService();
@@ -90,8 +92,7 @@ router.post('/:id/run', async (req: Request, res: Response) => {
 
     // Create workflow execution
     const executionId = Date.now().toString();
-    const execution: WorkflowExecution = {
-      executionId,
+    const execution: Omit<WorkflowExecution, 'executionId'> = {
       workflowId: id,
       userId,
       status: 'pending',
@@ -120,13 +121,18 @@ router.post('/:id/run', async (req: Request, res: Response) => {
 
         const task: WorkflowTask = {
           taskId,
-          status: 'pending',
+          status: 'pending' as const,
           order: node.data.order || 0,
           dependsOn: dependsOn.length > 0 ? dependsOn : undefined,
           prompt: node.data.prompt
         };
 
-        return task;
+        return {
+          nodeId: node.id,
+          taskId,
+          status: 'pending' as const,
+          startTime: new Date().toISOString()
+        };
       })
     };
 
