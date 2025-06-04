@@ -2,6 +2,7 @@ import AWS from 'aws-sdk';
 import dotenv from 'dotenv';
 import path from 'path';
 import { S3 } from 'aws-sdk';
+import { Task } from '../types/task';
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
@@ -408,7 +409,7 @@ export const taskDb = {
         ExpressionAttributeValues: {
           ':userId': userId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, #adm, category, description, templateId',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, knowledgeBaseSize',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
@@ -448,6 +449,17 @@ export const taskDb = {
       return tasksWithDetails;
     } catch (error) {
       handleDynamoDbError(error, 'getTasksByUserId');
+    }
+  },
+
+  async getAvailableTasks(userId: string) {
+    try {
+      const tasks = await this.getTasksByUserId(userId);
+      if (!tasks) return [];
+      return tasks.filter((task: any) => task.status === 'active');
+    } catch (error) {
+      handleDynamoDbError(error, 'getAvailableTasks');
+      return [];
     }
   },
 
@@ -505,6 +517,7 @@ export const taskDb = {
     useSharedBrowser?: boolean;
     turnOffHeadless?: boolean;
     knowledgeBase?: string;
+    knowledgeBaseSize?: number;
   }>) {
     try {
       const setClauses: string[] = [];
@@ -717,9 +730,19 @@ export const taskDb = {
       const taskResult = await dynamodb.scan(taskParams).promise();
       const tasks = taskResult.Items || [];
 
-      // Get all executions (no date filter)
+      // Get total count of executions using a separate count operation
+      const executionCountParams = {
+        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
+        Select: 'COUNT'
+      };
+
+      const executionCountResult = await dynamodb.scan(executionCountParams).promise();
+      const totalExecutions = executionCountResult.Count || 0;
+
+      // Get executions for status counts (limited to 1000 for performance)
       const executionParams = {
-        TableName: `${TABLE_PREFIX}AW-TaskExecutions`
+        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
+        Limit: 1000
       };
 
       const executionResult = await dynamodb.scan(executionParams).promise();
@@ -768,7 +791,7 @@ export const taskDb = {
       return {
         totalTasks: tasks.length,
         newTasks: tasks.filter(t => t.createdAt >= startDate && t.createdAt <= endDate).length,
-        totalExecutions: executions.length,
+        totalExecutions: totalExecutions,
         successfulExecutions: executions.filter(e => e.status === 'completed').length,
         failedExecutions: executions.filter(e => e.status === 'failed').length,
         newExecutions: executions.filter(e => e.startTime >= startDate && e.startTime <= endDate).length,

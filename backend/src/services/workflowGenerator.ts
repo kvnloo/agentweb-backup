@@ -1,5 +1,7 @@
 import yaml from 'js-yaml';
 import OpenAI from 'openai';
+import { taskDb } from './db';
+import { Task } from '../types/task';
 
 interface Position {
   x: number;
@@ -36,6 +38,14 @@ interface GeneratedWorkflow {
   nodes: Node[];
   edges: Edge[];
   message: string;
+}
+
+interface TaskReference {
+  taskId: string;
+  name: string;
+  prompt: string;
+  description?: string;
+  category?: string;
 }
 
 const openai = new OpenAI({
@@ -119,8 +129,13 @@ function generateVisualization(workflowData: any): { nodes: Node[], edges: Edge[
 
 async function generateWorkflowYaml(
   description: string,
-  currentYaml?: string
+  userId: string,
+  currentYaml?: string,
+  retry: number = 3
 ): Promise<string> {
+  // Get available tasks for the user
+  const availableTasks = await taskDb.getAvailableTasks(userId);
+  
   const functionDefinition = {
     name: 'generate_workflow',
     description: 'Generate a workflow definition in YAML format',
@@ -139,8 +154,9 @@ async function generateWorkflowYaml(
               data: {
                 type: 'object',
                 properties: {
-                  label: { type: 'string' },
+                  label: { type: 'string', description: 'Label for the node. If taskId is provided, this must match the task name exactly.' },
                   prompt: { type: 'string', optional: true },
+                  taskId: { type: 'string', description: 'ID of an existing task to reference', optional: true },
                   loopCount: { type: 'number', optional: true },
                   condition: { type: 'string', optional: true }
                 },
@@ -169,7 +185,26 @@ async function generateWorkflowYaml(
 
   const systemMessage = `You are a workflow generation assistant. Generate a workflow based on the user's description.
 The workflow should be logically structured with proper connections between nodes.
-If modifying an existing workflow, maintain its overall structure while applying the requested changes.`;
+If modifying an existing workflow, maintain its overall structure while applying the requested changes.
+
+Available tasks that can be referenced in the workflow:
+${availableTasks.map(task => `
+Task ID: ${task.taskId}
+Name: ${task.name}
+Description: ${task.description || 'No description'}
+Category: ${task.category || 'Uncategorized'}
+Prompt: ${task.prompt}
+`).join('\n')}
+
+When creating task nodes, you can either:
+1. Reference an existing task by including its taskId in the node data
+   - When using taskId, the node's label MUST exactly match the task's name
+   - This ensures consistency between the workflow visualization and the actual task
+2. Create a new task by providing a prompt
+   - In this case, you can use any appropriate label
+
+If referencing an existing task, use its taskId and the task's prompt will be automatically used.
+If creating a new task, provide a prompt that describes what the task should do.`;
 
   const completion = await openai.chat.completions.create({
     model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
@@ -187,16 +222,42 @@ If modifying an existing workflow, maintain its overall structure while applying
   }
 
   const workflowDefinition = JSON.parse(functionCall.arguments);
+
+  // Validate that task labels match task names when taskId is used
+  const validationErrors: string[] = [];
+  workflowDefinition.nodes.forEach((node: any) => {
+    if (node.data.taskId) {
+      const task = availableTasks.find(t => t.taskId === node.data.taskId);
+      if (!task) {
+        validationErrors.push(`Task with ID ${node.data.taskId} not found`);
+      } else if (node.data.label !== task.name) {
+        validationErrors.push(`Node label "${node.data.label}" does not match task name "${task.name}" for task ID ${node.data.taskId}`);
+      }
+    }
+  });
+
+  if (validationErrors.length > 0) {
+    // If there are validation errors and we still have retries left, regenerate the workflow
+    if (retry > 0) {
+      const errorMessage = `Please regenerate the workflow. The following issues were found:\n${validationErrors.join('\n')}`;
+      return generateWorkflowYaml(`${description}\n\n${errorMessage}`, userId, currentYaml, retry - 1);
+    } else {
+      // If we're out of retries, throw an error with all validation issues
+      throw new Error(`Failed to generate valid workflow after ${3 - retry} attempts. Validation errors:\n${validationErrors.join('\n')}`);
+    }
+  }
+
   return yaml.dump(workflowDefinition);
 }
 
 export async function generateWorkflowFromDescription(
   message: string,
+  userId: string,
   currentYaml?: string
 ): Promise<GeneratedWorkflow> {
   try {
     // Generate the YAML using function calling
-    const yamlContent = await generateWorkflowYaml(message, currentYaml);
+    const yamlContent = await generateWorkflowYaml(message, userId, currentYaml);
     const workflowData = yaml.load(yamlContent) as any;
 
     // Generate visualization from the YAML data

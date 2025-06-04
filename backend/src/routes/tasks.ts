@@ -381,7 +381,7 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
       });
 
       // Update task with the new knowledge base link
-      await taskDb.updateTask(taskId, { knowledgeBase: url });
+      await taskDb.updateTask(taskId, { knowledgeBase: url, knowledgeBaseSize: 0 });
 
       return res.json({ content: '', url });
     }
@@ -445,7 +445,7 @@ router.put('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
       });
       
       // Update task with the new knowledge base link
-      await taskDb.updateTask(taskId, { knowledgeBase: url });
+      await taskDb.updateTask(taskId, { knowledgeBase: url, knowledgeBaseSize: Buffer.byteLength(contentToSave, 'utf8') });
       
       res.json({ content: contentToSave, url });
     } else {
@@ -536,6 +536,9 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
 
     const updatedContent = completion.choices[0].message.content || '';
 
+    // Calculate knowledge base size in bytes
+    const knowledgeBaseSize = Buffer.byteLength(updatedContent, 'utf8');
+
     // Save the updated content
     await file.save(updatedContent, {
       contentType: 'text/plain',
@@ -547,6 +550,11 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
       }
     });
 
+    // Update the task with knowledge base size
+    await taskDb.updateTask(taskId, {
+      knowledgeBaseSize
+    });
+
     // Update the execution record with knowledge base update info
     await taskDb.updateTaskExecution(executionId, {
       knowledge_base_updated_at: new Date().toISOString()
@@ -555,7 +563,8 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
     res.json({ 
       content: updatedContent,
       url: task.knowledgeBase,
-      message: 'Knowledge base updated successfully'
+      message: 'Knowledge base updated successfully',
+      size: knowledgeBaseSize
     });
   } catch (error) {
     console.error('Error updating knowledge base from execution:', error);

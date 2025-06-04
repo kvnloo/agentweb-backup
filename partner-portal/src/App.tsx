@@ -25,6 +25,7 @@ import Workflows from './pages/Workflows';
 import WorkflowBuilder from './pages/WorkflowBuilder';
 import WorkflowDetails from './pages/WorkflowDetails';
 import WorkflowRun from './pages/WorkflowRun';
+import WorkflowExecutionDetails from './pages/WorkflowExecutionDetails';
 import Release from './pages/Release';
 import Guide from './pages/Guide';
 import Templates from './pages/Templates';
@@ -169,6 +170,14 @@ export default function App() {
                       element={
                         <PartnerRoute>
                           <WorkflowRun />
+                        </PartnerRoute>
+                      }
+                    />
+                    <Route
+                      path="workflows/:id/executions/:executionId"
+                      element={
+                        <PartnerRoute>
+                          <WorkflowExecutionDetails />
                         </PartnerRoute>
                       }
                     />

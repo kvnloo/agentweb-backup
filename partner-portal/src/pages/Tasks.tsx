@@ -32,6 +32,7 @@ interface Task {
   };
   scheduleCount: number;
   subscriberCount: number;
+  knowledgeBaseSize?: number;
 }
 
 export default function Tasks() {
@@ -193,7 +194,7 @@ export default function Tasks() {
                       />
                     )}
                   </Box>
-                  <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
+                  <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', flexWrap: 'wrap' }}>
                     <Chip
                       label={`${task.scheduleCount} Schedule${task.scheduleCount !== 1 ? 's' : ''}`}
                       size="small"
@@ -204,6 +205,13 @@ export default function Tasks() {
                       size="small"
                       variant="outlined"
                     />
+                    {task.knowledgeBaseSize && task.knowledgeBaseSize > 0 && (
+                      <Chip
+                        label={`Knowledge: ${(task.knowledgeBaseSize / 1024).toFixed(1)} KB`}
+                        size="small"
+                        variant="outlined"
+                      />
+                    )}
                     <Typography 
                       variant="caption" 
                       color="text.secondary"

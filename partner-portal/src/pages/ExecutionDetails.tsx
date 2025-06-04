@@ -406,7 +406,7 @@ export default function ExecutionDetails() {
                 )}
               </Box>
               <Box sx={{ display: 'flex', gap: 1 }}>
-                {user?.userId === execution.userId && (
+                {(user?.userId === execution.userId || user?.isAdmin) && (
                   <Tooltip title={execution.archived ? "Unarchive execution" : "Archive execution"}>
                     <IconButton
                       onClick={() => {
@@ -426,7 +426,7 @@ export default function ExecutionDetails() {
                     <ShareIcon />
                   </IconButton>
                 </Tooltip>
-                {user?.userId === execution.userId && execution.status.toLowerCase() === 'running' && (
+                {(user?.userId === execution.userId || user?.isAdmin) && execution.status.toLowerCase() === 'running' && (
                   <Tooltip title="Kill execution">
                     <IconButton
                       onClick={handleKillClick}

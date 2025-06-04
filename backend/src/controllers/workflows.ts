@@ -114,10 +114,10 @@ export async function deleteWorkflow(req: AuthenticatedRequest, res: Response) {
 
 export async function getWorkflowExecutions(req: AuthenticatedRequest, res: Response) {
   try {
-    const { id } = req.params;
+    const { id: workflowId, executionId } = req.params;
 
     // Check workflow exists and user has access
-    const workflow = await workflowService.getWorkflow(id);
+    const workflow = await workflowService.getWorkflow(workflowId);
     if (!workflow) {
       return res.status(404).json({ error: 'Workflow not found' });
     }
@@ -125,8 +125,19 @@ export async function getWorkflowExecutions(req: AuthenticatedRequest, res: Resp
       return res.status(403).json({ error: 'Not authorized to view this workflow' });
     }
 
-    const executions = await workflowService.getWorkflowExecutions(id);
-    res.json(executions);
+    if (executionId) {
+      // Get specific execution
+      const executions = await workflowService.getWorkflowExecutions(workflowId);
+      const execution = executions.find(e => e.executionId === executionId);
+      if (!execution) {
+        return res.status(404).json({ error: 'Workflow execution not found' });
+      }
+      return res.json(execution);
+    } else {
+      // List all executions
+      const executions = await workflowService.getWorkflowExecutions(workflowId);
+      return res.json(executions);
+    }
   } catch (error) {
     console.error('Error getting workflow executions:', error);
     res.status(500).json({ error: 'Failed to get workflow executions' });
@@ -172,12 +183,21 @@ export async function runWorkflow(req: AuthenticatedRequest, res: Response) {
 export async function generateWorkflow(req: AuthenticatedRequest, res: Response) {
   try {
     const { message, currentYaml } = req.body;
+    const userId = req.user?.userId;
 
     if (!message) {
       return res.status(400).json({ error: 'Message is required' });
     }
 
-    const { yaml, nodes, edges, message: responseMessage } = await generateWorkflowFromDescription(message, currentYaml);
+    if (!userId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    const { yaml, nodes, edges, message: responseMessage } = await generateWorkflowFromDescription(
+      message,
+      userId,
+      currentYaml
+    );
 
     res.json({
       yaml,

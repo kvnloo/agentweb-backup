@@ -20,6 +20,8 @@ export interface Task {
   turnOffHeadless?: boolean; // Whether to run the browser in visible mode
   useKnowledgeBase?: boolean; // Whether the task can use the knowledge base
   knowledgeBase?: string; // The GCS URL of the task's knowledge base file
+  description?: string; // Description of the task
+  category?: string; // Category of the task
 }
 
 export interface TaskUpdate {
