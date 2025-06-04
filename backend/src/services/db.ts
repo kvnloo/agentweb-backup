@@ -409,7 +409,7 @@ export const taskDb = {
         ExpressionAttributeValues: {
           ':userId': userId
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, #adm, category, description, templateId',
+        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, knowledgeBaseSize',
         ExpressionAttributeNames: {
           '#n': 'name',
           '#s': 'status',
@@ -517,6 +517,7 @@ export const taskDb = {
     useSharedBrowser?: boolean;
     turnOffHeadless?: boolean;
     knowledgeBase?: string;
+    knowledgeBaseSize?: number;
   }>) {
     try {
       const setClauses: string[] = [];
