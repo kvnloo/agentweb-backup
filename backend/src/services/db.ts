@@ -2,6 +2,7 @@ import AWS from 'aws-sdk';
 import dotenv from 'dotenv';
 import path from 'path';
 import { S3 } from 'aws-sdk';
+import { Task } from '../types/task';
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
@@ -448,6 +449,17 @@ export const taskDb = {
       return tasksWithDetails;
     } catch (error) {
       handleDynamoDbError(error, 'getTasksByUserId');
+    }
+  },
+
+  async getAvailableTasks(userId: string) {
+    try {
+      const tasks = await this.getTasksByUserId(userId);
+      if (!tasks) return [];
+      return tasks.filter((task: any) => task.status === 'active');
+    } catch (error) {
+      handleDynamoDbError(error, 'getAvailableTasks');
+      return [];
     }
   },
 

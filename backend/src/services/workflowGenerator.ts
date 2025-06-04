@@ -127,19 +127,6 @@ function generateVisualization(workflowData: any): { nodes: Node[], edges: Edge[
   return { nodes, edges };
 }
 
-async function getAvailableTasks(userId: string): Promise<TaskReference[]> {
-  const tasks = await taskDb.getTasksByUserId(userId);
-  if (!tasks) return [];
-  
-  return tasks.map((task: any) => ({
-    taskId: task.taskId,
-    name: task.name,
-    prompt: task.prompt,
-    description: task.description,
-    category: task.category
-  }));
-}
-
 async function generateWorkflowYaml(
   description: string,
   userId: string,
@@ -147,7 +134,7 @@ async function generateWorkflowYaml(
   retry: number = 3
 ): Promise<string> {
   // Get available tasks for the user
-  const availableTasks = await getAvailableTasks(userId);
+  const availableTasks = await taskDb.getAvailableTasks(userId);
   
   const functionDefinition = {
     name: 'generate_workflow',
