@@ -27,6 +27,7 @@ import traceback
 import threading
 import resource
 from email_utils import get_task_subscribers
+import requests
 
 # Increase file descriptor limit
 soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -1234,8 +1235,31 @@ async def execute_workflow_task(execution_id: str, task: dict):
                 if not dep_task or dep_task['status'] != 'completed':
                     logger.info(f"Task {task['taskId']} waiting for dependency {dep_task_id}")
                     return False
+                
+                # Get dependent task's result and files
+                result_parts = []
                 if dep_task.get('result'):
-                    dependent_results.append(f"Result from task {dep_task_id}: {dep_task['result']}")
+                    result_parts.append(dep_task['result'])
+                
+                # Get dependent task's result files
+                if dep_task.get('executionId'):
+                    dep_execution = executions_table.get_item(Key={'executionId': dep_task['executionId']}).get('Item')
+                    if dep_execution and dep_execution.get('result_files'):
+                        for file_info in dep_execution['result_files']:
+                            try:
+                                # Download file content using requests in a thread
+                                response = await asyncio.to_thread(requests.get, file_info.get('url'))
+                                if response.status_code == 200:
+                                    content = response.text
+                                    result_parts.append(f"\nFile {file_info.get('filename')}:\n{content}")
+                                    logger.info(f"Downloaded content from {file_info.get('url')}, {len(content)} bytes")
+                                else:
+                                    logger.error(f"Failed to download file from {file_info.get('url')}: {response.status_code}")
+                            except Exception as e:
+                                logger.error(f"Error downloading file from {file_info.get('url')}: {e}")
+                
+                if result_parts:
+                    dependent_results.append(f"Task {dep_task_id}:\n{chr(10).join(result_parts)}")
 
         # Get the task prompt
         task_id = task['taskId']
@@ -1255,7 +1279,7 @@ async def execute_workflow_task(execution_id: str, task: dict):
             task_prompt = f"""Current task:
 {task_prompt}
 
-Previous task results:
+Dependent task results:
 {chr(10).join(dependent_results)}"""
 
         # Create task execution with prompt and workflow execution ID
@@ -1270,7 +1294,12 @@ Previous task results:
             return False
 
         # Update workflow task status to running and store task execution ID
-        update_workflow_task_execution(execution_id, task['taskId'], 'running', task_execution_id=task_execution_id)
+        update_workflow_task_execution(
+            execution_id, 
+            task['taskId'], 
+            'running', 
+            task_execution_id=task_execution_id
+        )
         logger.info(f"Created execution {task_execution_id} for task {task['taskId']} in workflow {execution_id}")
 
         return True

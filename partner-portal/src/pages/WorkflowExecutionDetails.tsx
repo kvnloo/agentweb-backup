@@ -35,7 +35,8 @@ import {
   KeyboardArrowUp as KeyboardArrowUpIcon,
   ContentCopy as ContentCopyIcon,
   Autorenew as AutorenewIcon,
-  PowerOff as PowerOffIcon
+  PowerOff as PowerOffIcon,
+  Screenshot as ScreenshotIcon
 } from '@mui/icons-material';
 import { useAuth } from '../contexts/AuthContext';
 import { formatDistanceToNow, intervalToDuration } from 'date-fns';
@@ -56,6 +57,12 @@ interface WorkflowTask {
   browser_use_log?: string;
   startTime?: string;
   llmName?: string;
+  result_files?: {
+    url: string;
+    filename: string;
+    token: string;
+    is_html?: boolean;
+  }[];
 }
 
 interface WorkflowExecution {
@@ -226,7 +233,8 @@ export default function WorkflowExecutionDetails() {
                 error: taskExecutionData.error,
                 completedAt: taskExecutionData.completedAt,
                 startTime: taskExecutionData.startTime,
-                llmName: taskExecutionData.llmName
+                llmName: taskExecutionData.llmName,
+                result_files: taskExecutionData.result_files
               };
             } else {
               console.error('Failed to fetch task execution:', await taskExecutionResponse.text());
@@ -559,6 +567,37 @@ export default function WorkflowExecutionDetails() {
                           alt="Task Execution Recording"
                           style={{ maxWidth: '100%', maxHeight: '400px' }}
                         />
+                      </Box>
+                    </Paper>
+                  </Grid>
+                )}
+
+                {/* Result Files Section */}
+                {task.result_files && task.result_files.length > 0 && (
+                  <Grid item xs={12}>
+                    <Typography variant="subtitle2" color="text.secondary" gutterBottom>
+                      Result Files
+                    </Typography>
+                    <Paper sx={{ p: 2, bgcolor: 'background.default' }}>
+                      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+                        {task.result_files.map((file, index) => (
+                          <Link
+                            key={index}
+                            href={file.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            sx={{ display: 'flex', alignItems: 'center' }}
+                          >
+                            {file.is_html ? (
+                              <>
+                                <ScreenshotIcon sx={{ mr: 1, fontSize: '1.2rem' }} />
+                                {file.filename} <Typography variant="caption" sx={{ ml: 1, color: 'text.secondary' }}>(View in browser)</Typography>
+                              </>
+                            ) : (
+                              file.filename
+                            )}
+                          </Link>
+                        ))}
                       </Box>
                     </Paper>
                   </Grid>
