@@ -714,16 +714,9 @@ async def execute_task(execution):
         running_task_count += 1
         running_user_ids.add(user_id)
         
-        # For workflow tasks, use the prompt directly from the execution record
-        if 'workflowExecutionId' in execution:
-            prompt = execution.get('prompt')
-            if not prompt:
-                raise Exception(f"No prompt found for workflow task {task_id}")
-            
-            # Update execution status to running
-            update_execution_status(execution_id, 'running')
-        else:
-            # Get task details from tasks table for non-workflow tasks
+        # Get task details from tasks table if taskId doesn't start with 'task-'
+        task_id = execution['taskId']
+        if not task_id.startswith('task-'):
             task_response = tasks_table.get_item(Key={'taskId': task_id})
             task = task_response.get('Item')
             
@@ -781,7 +774,7 @@ async def execute_task(execution):
                 }
 
             # Prepare the prompt with previous feedback and user_id context
-            base_prompt = task['prompt']
+            base_prompt = execution.get('prompt') or task['prompt']
             
             if previous_feedback:
                 prompt = f"Task: {base_prompt}\n\nNote: Previous attempt {previous_feedback['time_ago']} was {previous_feedback['feedback']}. Previous result: {previous_feedback['result']}"
@@ -792,12 +785,17 @@ async def execute_task(execution):
             if task.get('attachments'):
                 attachment_list = "\n".join([f"- {attachment['filename']}" for attachment in task['attachments']])
                 prompt += f"\n\nThe following files are attached to this task:\n{attachment_list}"
-
-            # if task.get('outputAsJson'):
-            #     prompt = f"{prompt} Output result as JSON instead of free text."
             
             # Update execution status to running and include the prompt
             update_execution_status(execution_id, 'running', prompt=prompt)
+        else:
+            # For new tasks (task- prefix), use the prompt from the execution record
+            prompt = execution.get('prompt')
+            if not prompt:
+                raise Exception(f"No prompt found for task {task_id}")
+            
+            # Update execution status to running
+            update_execution_status(execution_id, 'running')
 
         # Get LLM names from task or environment
         llm_names = []
@@ -1239,19 +1237,26 @@ async def execute_workflow_task(execution_id: str, task: dict):
                 if dep_task.get('result'):
                     dependent_results.append(f"Result from task {dep_task_id}: {dep_task['result']}")
 
-        # Get the task prompt from the workflow task
-        task_prompt = task.get('prompt')
-        if not task_prompt:
-            logger.error(f"Task {task['taskId']} is missing prompt")
-            return False
+        # Get the task prompt
+        task_id = task['taskId']
+        if not task_id.startswith('task-'):
+            # For referenced tasks, fetch the prompt from the task
+            task_response = tasks_table.get_item(Key={'taskId': task_id})
+            task_data = task_response.get('Item')
+            if not task_data:
+                raise Exception(f"Referenced task {task_id} not found")
+            task_prompt = task_data['prompt']
+        else:
+            # For new tasks, use the prompt from the workflow task
+            task_prompt = task.get('prompt')
 
         # Add dependent results to prompt if any exist
         if dependent_results:
-            task_prompt = f"""Previous task results:
-{chr(10).join(dependent_results)}
+            task_prompt = f"""Current task:
+{task_prompt}
 
-Current task:
-{task_prompt}"""
+Previous task results:
+{chr(10).join(dependent_results)}"""
 
         # Create task execution with prompt and workflow execution ID
         task_execution_id = create_execution(

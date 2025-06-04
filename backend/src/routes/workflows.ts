@@ -97,14 +97,23 @@ router.post('/:id/run', async (req: Request, res: Response) => {
       userId,
       status: 'pending',
       startTime: new Date().toISOString(),
-      tasks: workflowData.nodes.map((node: WorkflowNode) => {
-        if (!node.data?.prompt) {
-          console.error(`Node missing prompt:`, node);
-          throw new Error(`Invalid workflow node: missing prompt`);
+      tasks: await Promise.all(workflowData.nodes.map(async (node: WorkflowNode) => {
+        if (!node.data?.prompt && !node.data?.taskId) {
+          console.error(`Node missing both prompt and taskId:`, node);
+          throw new Error(`Invalid workflow node: missing both prompt and taskId`);
         }
 
-        // Create a task ID for this node if it doesn't exist
-        const taskId = node.data.taskId || `task-${uuidv4()}`;
+        // If taskId is provided, validate it exists
+        let taskId = node.data.taskId;
+        if (taskId) {
+          const existingTask = await taskDb.getTaskById(taskId);
+          if (!existingTask) {
+            throw new Error(`Referenced task ${taskId} not found`);
+          }
+        } else {
+          // Create a new task ID if none exists
+          taskId = `task-${uuidv4()}`;
+        }
         
         // Store the taskId in the node data for dependency resolution
         node.data.taskId = taskId;
@@ -127,13 +136,8 @@ router.post('/:id/run', async (req: Request, res: Response) => {
           prompt: node.data.prompt
         };
 
-        return {
-          nodeId: node.id,
-          taskId,
-          status: 'pending' as const,
-          startTime: new Date().toISOString()
-        };
-      })
+        return task;
+      }))
     };
 
     console.log('Creating workflow execution:', JSON.stringify(execution, null, 2));
