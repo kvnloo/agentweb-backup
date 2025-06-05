@@ -128,15 +128,15 @@ router.post('/:id/run', async (req: Request, res: Response) => {
               .filter((taskId: string | undefined): taskId is string => taskId !== undefined)
           : [];
 
-        const task: WorkflowTask = {
+        return {
+          nodeId: node.id,
           taskId,
           status: 'pending' as const,
+          startTime: new Date().toISOString(),
           order: node.data.order || 0,
           dependsOn: dependsOn.length > 0 ? dependsOn : undefined,
           prompt: node.data.prompt
         };
-
-        return task;
       }))
     };
 
