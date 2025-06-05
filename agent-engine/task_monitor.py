@@ -27,6 +27,7 @@ import traceback
 import threading
 import resource
 from email_utils import get_task_subscribers
+import requests
 
 # Increase file descriptor limit
 soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -368,15 +369,16 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
     except ClientError as e:
         logger.error(f"Error updating execution status: {e}")
 
-def update_workflow_execution(workflow_execution_id: str, task_id: str, task_status: str, error: str = None, result: str = None):
+def update_workflow_task_execution(workflow_execution_id: str, task_id: str, task_status: str, error: str = None, result: str = None, task_execution_id: str = None):
     """
-    Common function to update workflow execution record.
+    Update a task's status within a workflow execution.
     Args:
         workflow_execution_id: ID of the workflow execution
         task_id: ID of the task being updated
         task_status: New status for the task ('running', 'completed', 'failed')
         error: Optional error message if task failed
         result: Optional result summary for completed tasks
+        task_execution_id: Optional ID of the task execution
     """
     try:
         workflow_table = dynamodb.Table(f'{TABLE_PREFIX}AW-WorkflowExecutions')
@@ -392,7 +394,8 @@ def update_workflow_execution(workflow_execution_id: str, task_id: str, task_sta
                     'status': task_status, 
                     'completedAt': datetime.now(timezone.utc).isoformat() if task_status in ['completed', 'failed'] else t.get('completedAt'),
                     **(({'error': error} if error else {}) if task_status == 'failed' else {}),
-                    **(({'result': result} if result else {}) if task_status == 'completed' else {})
+                    **(({'result': result} if result else {}) if task_status == 'completed' else {}),
+                    **(({'executionId': task_execution_id} if task_execution_id else {}))
                 }
                 if t['taskId'] == task_id else t 
                 for t in workflow_execution['tasks']
@@ -400,9 +403,11 @@ def update_workflow_execution(workflow_execution_id: str, task_id: str, task_sta
             
             # Update workflow status if needed
             if task_status == 'failed':
-                workflow_execution['status'] = 'failed'
-                workflow_execution['error'] = f"Task {task_id} failed: {error}"
-                workflow_execution['completedAt'] = datetime.now(timezone.utc).isoformat()
+                # Only update to failed if current status is not killed
+                if workflow_execution.get('status') != 'killed':
+                    workflow_execution['status'] = 'failed'
+                    workflow_execution['error'] = f"Task {task_id} failed: {error}"
+                    workflow_execution['completedAt'] = datetime.now(timezone.utc).isoformat()
             elif task_status == 'completed':
                 # Check if all tasks are completed
                 all_completed = all(t['status'] == 'completed' for t in workflow_execution['tasks'])
@@ -412,9 +417,58 @@ def update_workflow_execution(workflow_execution_id: str, task_id: str, task_sta
                     workflow_execution['completedAt'] = datetime.now(timezone.utc).isoformat()
             
             workflow_table.put_item(Item=workflow_execution)
-            logger.info(f"Updated workflow execution {workflow_execution_id} - task {task_id} {task_status}")
+            logger.info(f"Updated workflow task execution {workflow_execution_id} - task {task_id} {task_status}")
             return True
         return False
+    except Exception as e:
+        logger.error(f"Error updating workflow task execution: {e}")
+        return False
+
+async def update_workflow_execution(workflow_id: str, execution_id: str, updates: dict):
+    """
+    Update a workflow execution record.
+    Args:
+        workflow_id: ID of the workflow
+        execution_id: ID of the workflow execution
+        updates: Dictionary of fields to update (status, error, completedAt, etc.)
+    """
+    try:
+        workflow_table = dynamodb.Table(f'{TABLE_PREFIX}AW-WorkflowExecutions')
+        
+        # Get current execution to check status
+        current_execution = workflow_table.get_item(
+            Key={'executionId': execution_id}
+        ).get('Item')
+        
+        # If current status is killed, don't update
+        if current_execution and current_execution.get('status') == 'killed':
+            logger.info(f"Workflow execution {execution_id} is already killed. Not updating.")
+            return True
+        
+        # Build update expression and attribute values
+        update_expression_parts = []
+        expression_values = {}
+        expression_names = {}
+        
+        for key, value in updates.items():
+            update_expression_parts.append(f"#{key} = :{key}")
+            expression_values[f":{key}"] = value
+            expression_names[f"#{key}"] = key
+        
+        update_expression = f"SET {', '.join(update_expression_parts)}"
+        
+        # Update the workflow execution
+        workflow_table.update_item(
+            Key={
+                'executionId': execution_id
+            },
+            UpdateExpression=update_expression,
+            ExpressionAttributeValues=expression_values,
+            ExpressionAttributeNames=expression_names
+        )
+        
+        logger.info(f"Updated workflow execution {execution_id} with updates: {updates}")
+        return True
     except Exception as e:
         logger.error(f"Error updating workflow execution: {e}")
         return False
@@ -581,6 +635,19 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
                 "error": "Task execution was cancelled",
                 "llmName": llm_name
             }
+        except BrokenPipeError as e:
+            # Handle EPIPE errors gracefully
+            logger.error(f"Broken pipe error during task execution: {e}")
+            if process:
+                try:
+                    process.kill()
+                except:
+                    pass
+            return {
+                "success": False,
+                "error": "Browser process was terminated unexpectedly. This may be due to a system resource limitation or browser crash.",
+                "llmName": llm_name
+            }
             
     except Exception as e:
         logger.error(f"Error in run_web_agent_cli: {e}")
@@ -648,16 +715,9 @@ async def execute_task(execution):
         running_task_count += 1
         running_user_ids.add(user_id)
         
-        # For workflow tasks, use the prompt directly from the execution record
-        if 'workflowExecutionId' in execution:
-            prompt = execution.get('prompt')
-            if not prompt:
-                raise Exception(f"No prompt found for workflow task {task_id}")
-            
-            # Update execution status to running
-            update_execution_status(execution_id, 'running')
-        else:
-            # Get task details from tasks table for non-workflow tasks
+        # Get task details from tasks table if taskId doesn't start with 'task-'
+        task_id = execution['taskId']
+        if not task_id.startswith('task-'):
             task_response = tasks_table.get_item(Key={'taskId': task_id})
             task = task_response.get('Item')
             
@@ -715,7 +775,7 @@ async def execute_task(execution):
                 }
 
             # Prepare the prompt with previous feedback and user_id context
-            base_prompt = task['prompt']
+            base_prompt = execution.get('prompt') or task['prompt']
             
             if previous_feedback:
                 prompt = f"Task: {base_prompt}\n\nNote: Previous attempt {previous_feedback['time_ago']} was {previous_feedback['feedback']}. Previous result: {previous_feedback['result']}"
@@ -726,12 +786,17 @@ async def execute_task(execution):
             if task.get('attachments'):
                 attachment_list = "\n".join([f"- {attachment['filename']}" for attachment in task['attachments']])
                 prompt += f"\n\nThe following files are attached to this task:\n{attachment_list}"
-
-            # if task.get('outputAsJson'):
-            #     prompt = f"{prompt} Output result as JSON instead of free text."
             
             # Update execution status to running and include the prompt
             update_execution_status(execution_id, 'running', prompt=prompt)
+        else:
+            # For new tasks (task- prefix), use the prompt from the execution record
+            prompt = execution.get('prompt')
+            if not prompt:
+                raise Exception(f"No prompt found for task {task_id}")
+            
+            # Update execution status to running
+            update_execution_status(execution_id, 'running')
 
         # Get LLM names from task or environment
         llm_names = []
@@ -746,6 +811,9 @@ async def execute_task(execution):
         if is_deep_research:
             default_llm_names = os.getenv('DEEP_RESEARCH_LLM_NAMES', 'azure->openai->o1-mini,azure->openai->gpt-4o').split(',')
             logger.info(f"Using deep research LLM list: {default_llm_names}")
+        elif execution.get('workflowExecutionId') and task_id.startswith('task-'):
+            default_llm_names = os.getenv('WORKFLOW_LLM_NAMES', 'azure->openai->gpt-4o').split(',')
+            logger.info(f"Using workflow LLM list: {default_llm_names}")
         else:
             default_llm_names = os.getenv('LIST_FULL_LLM_NAMES', 'azure->openai->gpt-4o,aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0,openai->openai->gpt-4o').split(',')
             logger.info(f"Using default LLM list: {default_llm_names}")
@@ -956,7 +1024,7 @@ async def execute_task(execution):
                     # Update workflow execution if this is a workflow task
                     if 'workflowExecutionId' in execution:
                         try:
-                            update_workflow_execution(execution['workflowExecutionId'], task_id, 'completed', result=result_summary)
+                            update_workflow_task_execution(execution['workflowExecutionId'], task_id, 'completed', result=result_summary)
                             logger.info(f"Updated workflow execution for task {task_id}")
                         except Exception as e:
                             logger.error(f"Error updating workflow execution: {e}", exc_info=True)
@@ -1023,7 +1091,7 @@ async def execute_task(execution):
             # Update workflow execution if this is a workflow task
             if 'workflowExecutionId' in execution:
                 try:
-                    update_workflow_execution(execution['workflowExecutionId'], task_id, 'failed', error=error_message)
+                    update_workflow_task_execution(execution['workflowExecutionId'], task_id, 'failed', error=error_message)
                     logger.info(f"Updated workflow execution status to failed for task {task_id}")
                 except Exception as e:
                     logger.error(f"Error updating workflow execution status to failed: {e}", exc_info=True)
@@ -1039,7 +1107,7 @@ async def execute_task(execution):
         # Update workflow execution if this is a workflow task
         if 'workflowExecutionId' in execution:
             try:
-                update_workflow_execution(execution['workflowExecutionId'], task_id, 'failed', error=str(e))
+                update_workflow_task_execution(execution['workflowExecutionId'], task_id, 'failed', error=str(e))
                 logger.info(f"Updated workflow execution status to failed for task {task_id} due to error")
             except Exception as workflow_error:
                 logger.error(f"Error updating workflow execution after task error: {workflow_error}", exc_info=True)
@@ -1116,9 +1184,10 @@ async def execute_task(execution):
             except:
                 pass
 
-def get_pending_workflow_executions():
+async def get_pending_workflow_executions():
     try:
-        query_params = {
+        # Query for pending executions
+        pending_params = {
             'IndexName': 'StatusStartTimeIndex',
             'KeyConditionExpression': '#status = :status',
             'ExpressionAttributeNames': {
@@ -1128,9 +1197,25 @@ def get_pending_workflow_executions():
                 ':status': 'pending'
             }
         }
+        pending_response = dynamodb.Table(f'{TABLE_PREFIX}AW-WorkflowExecutions').query(**pending_params)
+        pending_items = pending_response.get('Items', [])
 
-        response = dynamodb.Table(f'{TABLE_PREFIX}AW-WorkflowExecutions').query(**query_params)
-        return response.get('Items', [])
+        # Query for running executions
+        running_params = {
+            'IndexName': 'StatusStartTimeIndex',
+            'KeyConditionExpression': '#status = :status',
+            'ExpressionAttributeNames': {
+                '#status': 'status'
+            },
+            'ExpressionAttributeValues': {
+                ':status': 'running'
+            }
+        }
+        running_response = dynamodb.Table(f'{TABLE_PREFIX}AW-WorkflowExecutions').query(**running_params)
+        running_items = running_response.get('Items', [])
+
+        # Combine both results
+        return pending_items + running_items
     except ClientError as e:
         logger.error(f"Error querying pending workflow executions: {e}")
         return []
@@ -1153,22 +1238,52 @@ async def execute_workflow_task(execution_id: str, task: dict):
                 if not dep_task or dep_task['status'] != 'completed':
                     logger.info(f"Task {task['taskId']} waiting for dependency {dep_task_id}")
                     return False
+                
+                # Get dependent task's result and files
+                result_parts = []
                 if dep_task.get('result'):
-                    dependent_results.append(f"Result from task {dep_task_id}: {dep_task['result']}")
+                    result_parts.append(dep_task['result'])
+                
+                # Get dependent task's result files
+                if dep_task.get('executionId'):
+                    dep_execution = executions_table.get_item(Key={'executionId': dep_task['executionId']}).get('Item')
+                    if dep_execution and dep_execution.get('result_files'):
+                        for i, file_info in enumerate(dep_execution['result_files'], 1):
+                            try:
+                                # Download file content using requests in a thread
+                                response = await asyncio.to_thread(requests.get, file_info.get('url'))
+                                if response.status_code == 200:
+                                    content = response.text
+                                    result_parts.append(f"\nResult file {i} content:\n{content}")
+                                    logger.info(f"Downloaded content from {file_info.get('url')}, {len(content)} bytes")
+                                else:
+                                    logger.error(f"Failed to download file from {file_info.get('url')}: {response.status_code}")
+                            except Exception as e:
+                                logger.error(f"Error downloading file from {file_info.get('url')}: {e}")
+                
+                if result_parts:
+                    dependent_results.append(f"Task {dep_task_id}:\n{chr(10).join(result_parts)}")
 
-        # Get the task prompt from the workflow task
-        task_prompt = task.get('prompt')
-        if not task_prompt:
-            logger.error(f"Task {task['taskId']} is missing prompt")
-            return False
+        # Get the task prompt
+        task_id = task['taskId']
+        if not task_id.startswith('task-'):
+            # For referenced tasks, fetch the prompt from the task
+            task_response = tasks_table.get_item(Key={'taskId': task_id})
+            task_data = task_response.get('Item')
+            if not task_data:
+                raise Exception(f"Referenced task {task_id} not found")
+            task_prompt = task_data['prompt']
+        else:
+            # For new tasks, use the prompt from the workflow task
+            task_prompt = task.get('prompt')
 
         # Add dependent results to prompt if any exist
         if dependent_results:
-            task_prompt = f"""Previous task results:
-{chr(10).join(dependent_results)}
+            task_prompt = f"""Current task:
+{task_prompt}
 
-Current task:
-{task_prompt}"""
+Dependent task results:
+{chr(10).join(dependent_results)}"""
 
         # Create task execution with prompt and workflow execution ID
         task_execution_id = create_execution(
@@ -1181,8 +1296,13 @@ Current task:
             logger.error(f"Failed to create execution for task {task['taskId']}")
             return False
 
-        # Update workflow task status to running
-        update_workflow_execution(execution_id, task['taskId'], 'running')
+        # Update workflow task status to running and store task execution ID
+        update_workflow_task_execution(
+            execution_id, 
+            task['taskId'], 
+            'running', 
+            task_execution_id=task_execution_id
+        )
         logger.info(f"Created execution {task_execution_id} for task {task['taskId']} in workflow {execution_id}")
 
         return True
@@ -1190,15 +1310,64 @@ Current task:
         logger.error(f"Error executing workflow task: {e}")
         return False
 
-async def process_workflow_executions():
+async def request_kill_task_execution(execution_id: str):
+    """Request to kill a task execution by setting killRequested flag."""
     try:
-        pending_workflows = get_pending_workflow_executions()
+        # Update task execution to set killRequested
+        executions_table.update_item(
+            Key={'executionId': execution_id},
+            UpdateExpression='SET killRequested = :killRequested',
+            ExpressionAttributeValues={
+                ':killRequested': datetime.now(timezone.utc).isoformat()
+            }
+        )
+        logger.info(f"Kill requested for task execution {execution_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Error requesting kill for task execution {execution_id}: {str(e)}")
+        return False
+
+async def process_workflow_executions():
+    """Process pending workflow executions."""
+    try:
+        # Get pending workflow executions
+        workflow_executions = await get_pending_workflow_executions()
         
-        for workflow in pending_workflows:
+        for workflow_execution in workflow_executions:
             try:
+                if workflow_execution.get('status') != 'running':
+                    await update_workflow_execution(
+                        workflow_execution['workflowId'],
+                        workflow_execution['executionId'],
+                        {
+                            'status': 'running'
+                        }
+                    )
+                
+                # Check if workflow execution has been requested to be killed
+                if workflow_execution.get('killRequested'):
+                    logger.info(f"Kill requested for workflow execution {workflow_execution['executionId']}")
+                    
+                    # Request kill for all running tasks in the workflow
+                    for task in workflow_execution['tasks']:
+                        if task.get('status') in ['running', 'pending'] and task.get('executionId'):
+                            await request_kill_task_execution(task['executionId'])
+                    
+                    # Update workflow execution status to killed
+                    await update_workflow_execution(
+                        workflow_execution['workflowId'],
+                        workflow_execution['executionId'],
+                        {
+                            'status': 'killed',
+                            'error': 'Workflow execution was killed by user',
+                            'completedAt': datetime.utcnow().isoformat()
+                        }
+                    )
+                    continue
+
                 # Get tasks that are ready to execute (pending and dependencies met)
                 pending_tasks = [
-                    task for task in workflow['tasks'] 
+                    task for task in workflow_execution['tasks'] 
                     if task['status'] == 'pending'
                 ]
 
@@ -1207,13 +1376,23 @@ async def process_workflow_executions():
 
                 # Try to execute each pending task
                 for task in pending_tasks:
-                    await execute_workflow_task(workflow['executionId'], task)
-
+                    await execute_workflow_task(workflow_execution['executionId'], task)
+                    
             except Exception as e:
-                logger.error(f"Error processing workflow {workflow['executionId']}: {e}")
+                logger.error(f"Error processing workflow execution {workflow_execution.get('executionId')}: {str(e)}")
+                # Update workflow execution status to failed
+                await update_workflow_execution(
+                    workflow_execution['workflowId'],
+                    workflow_execution['executionId'],
+                    {
+                        'status': 'failed',
+                        'error': str(e),
+                        'completedAt': datetime.utcnow().isoformat()
+                    }
+                )
                 
     except Exception as e:
-        logger.error(f"Error in process_workflow_executions: {e}")
+        logger.error(f"Error in process_workflow_executions: {str(e)}")
 
 async def monitor_executions():
     global last_execution_time, running_task_count, running_user_ids, running_task_ids, running_processes

@@ -10,9 +10,15 @@ import {
   runWorkflow,
   generateWorkflow
 } from '../controllers/workflows';
-import { workflowDb, WorkflowExecution, WorkflowTask } from '../services/workflow';
+import { WorkflowTask } from '../services/workflow';
+import { WorkflowService, WorkflowExecution } from '../services/workflowDb';
 import { v4 as uuidv4 } from 'uuid';
 import yaml from 'js-yaml';
+import { taskDb } from '../services/db';
+import { Task } from '../types/task';
+
+// Initialize workflow service
+const workflowDb = new WorkflowService();
 
 interface WorkflowNode {
   id: string;
@@ -54,6 +60,7 @@ router.post('/generate', generateWorkflow as unknown as RequestHandlerAuth);
 
 // Workflow execution routes
 router.get('/:id/executions', getWorkflowExecutions as unknown as RequestHandlerAuth);
+router.get('/:id/executions/:executionId', getWorkflowExecutions as unknown as RequestHandlerAuth);
 router.post('/:id/run', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
@@ -85,20 +92,28 @@ router.post('/:id/run', async (req: Request, res: Response) => {
 
     // Create workflow execution
     const executionId = Date.now().toString();
-    const execution: WorkflowExecution = {
-      executionId,
+    const execution: Omit<WorkflowExecution, 'executionId'> = {
       workflowId: id,
       userId,
       status: 'pending',
       startTime: new Date().toISOString(),
-      tasks: workflowData.nodes.map((node: WorkflowNode) => {
-        if (!node.data?.prompt) {
-          console.error(`Node missing prompt:`, node);
-          throw new Error(`Invalid workflow node: missing prompt`);
+      tasks: await Promise.all(workflowData.nodes.map(async (node: WorkflowNode) => {
+        if (!node.data?.prompt && !node.data?.taskId) {
+          console.error(`Node missing both prompt and taskId:`, node);
+          throw new Error(`Invalid workflow node: missing both prompt and taskId`);
         }
 
-        // Create a task ID for this node if it doesn't exist
-        const taskId = node.data.taskId || `task-${uuidv4()}`;
+        // If taskId is provided, validate it exists
+        let taskId = node.data.taskId;
+        if (taskId) {
+          const existingTask = await taskDb.getTaskById(taskId);
+          if (!existingTask) {
+            throw new Error(`Referenced task ${taskId} not found`);
+          }
+        } else {
+          // Create a new task ID if none exists
+          taskId = `task-${uuidv4()}`;
+        }
         
         // Store the taskId in the node data for dependency resolution
         node.data.taskId = taskId;
@@ -113,16 +128,16 @@ router.post('/:id/run', async (req: Request, res: Response) => {
               .filter((taskId: string | undefined): taskId is string => taskId !== undefined)
           : [];
 
-        const task: WorkflowTask = {
+        return {
+          nodeId: node.id,
           taskId,
-          status: 'pending',
+          status: 'pending' as const,
+          startTime: new Date().toISOString(),
           order: node.data.order || 0,
           dependsOn: dependsOn.length > 0 ? dependsOn : undefined,
           prompt: node.data.prompt
         };
-
-        return task;
-      })
+      }))
     };
 
     console.log('Creating workflow execution:', JSON.stringify(execution, null, 2));
@@ -132,6 +147,35 @@ router.post('/:id/run', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Error running workflow:', error);
     res.status(500).json({ error: 'Failed to run workflow', details: error instanceof Error ? error.message : 'Unknown error' });
+  }
+});
+
+// Kill workflow execution
+router.put('/:workflowId/executions/:executionId/kill', authenticateToken, async (req, res) => {
+  try {
+    const { workflowId, executionId } = req.params;
+    const userId = req.user?.userId;
+
+    // Get the workflow execution
+    const execution = await workflowDb.getWorkflowExecution(executionId);
+    if (!execution) {
+      return res.status(404).json({ message: 'Workflow execution not found' });
+    }
+
+    // Check if user has permission
+    if (execution.userId !== userId) {
+      return res.status(403).json({ message: 'Not authorized to kill this workflow execution' });
+    }
+
+    // Update the workflow execution to set killRequested
+    await workflowDb.updateWorkflowExecution(executionId, {
+      killRequested: new Date().toISOString()
+    });
+
+    res.json({ message: 'Workflow execution kill request sent' });
+  } catch (error) {
+    console.error('Error killing workflow execution:', error);
+    res.status(500).json({ message: 'Failed to kill workflow execution' });
   }
 });
 

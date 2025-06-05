@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-06-03',
+    changes: [
+      'Made Emma chat window collapsable',
+      'Improved custom defined task defaults',
+      '- Set default task type to complex task',
+      '- Set default output format to HTML',
+      '- Enabled shared browser mode by default'
+    ],
+  },
+  {
     date: '2025-05-29',
     changes: [
       'Support file downloads in Execution Details page',

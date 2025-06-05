@@ -563,20 +563,23 @@ export const getTaskExecution = async (req: AuthRequest, res: Response) => {
     const taskId = req.params.id;
     const executionId = req.params.executionId;
     
-    // Get the task to check permissions
-    const task = await taskDb.getTaskById(taskId);
-    if (!task) {
-      return res.status(404).json({ message: 'Task not found' });
-    }
+    // Skip task existence check for temporary task IDs
+    if (!taskId.startsWith('task-')) {
+      // Get the task to check permissions
+      const task = await taskDb.getTaskById(taskId);
+      if (!task) {
+        return res.status(404).json({ message: 'Task not found' });
+      }
 
-    // Check if user is admin or task owner
-    const user = await userDb.getUserById(userId);
-    if (!user) {
-      return res.status(401).json({ message: 'User not found' });
-    }
+      // Check if user is admin or task owner
+      const user = await userDb.getUserById(userId);
+      if (!user) {
+        return res.status(401).json({ message: 'User not found' });
+      }
 
-    if (!user.isAdmin && task.userId !== userId) {
-      return res.status(403).json({ message: 'Access denied' });
+      if (!user.isAdmin && task.userId !== userId) {
+        return res.status(403).json({ message: 'Access denied' });
+      }
     }
 
     // Get the execution

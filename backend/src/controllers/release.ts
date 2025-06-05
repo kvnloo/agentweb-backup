@@ -8,6 +8,17 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-06-04",
+    changes: [
+      "Improved the workflow feature",
+      "- Added a Workflow Execution Details page for better visibility",
+      "- Enhanced Workflow to support referencing existing tasks of the user",
+      "Tasks page shows knowledge size for better knowledge base management",
+      "Enhanced admin functions for better customer support",
+      "- Added ability for admins to archive and kill task executions"
+    ]
+  },
+  {
     date: "2025-05-30",
     changes: [
       "Added support for Knowledge Base",

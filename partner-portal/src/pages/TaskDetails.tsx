@@ -79,6 +79,7 @@ interface Task {
   turnOffHeadless?: boolean; // Flag for turning off headless mode
   useKnowledgeBase?: boolean; // Flag for using knowledge base
   knowledgeBase?: string; // The content of the task's knowledge base
+  knowledgeBaseSize?: number; // Size of the knowledge base in bytes
 }
 
 interface TaskAttachment {

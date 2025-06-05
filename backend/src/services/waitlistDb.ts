@@ -98,7 +98,7 @@ export const waitlistDb = {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Waitlist`,
-        Limit: 50,
+        Limit: 1000,
         ...(lastEvaluatedKey && { ExclusiveStartKey: lastEvaluatedKey }),
       };
 

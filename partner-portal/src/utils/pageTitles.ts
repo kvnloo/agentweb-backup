@@ -55,6 +55,13 @@ export function getPageTitle(path: string): string {
     const workflowId = cleanPath.split('/').pop() || '';
     return `Workflow Details: ${workflowId}`;
   }
+
+  // Handle workflow execution details pattern
+  if (cleanPath.match(/^\/workflows\/[^/]+\/executions\/[^/]+$/)) {
+    const segments = cleanPath.split('/');
+    const executionId = segments[4] || '';
+    return `Execution ${executionId} - Workflow Execution Details`;
+  }
   
   if (cleanPath.match(/^\/marketing\/research\/[^/]+$/)) {
     const researchId = cleanPath.split('/').pop() || '';

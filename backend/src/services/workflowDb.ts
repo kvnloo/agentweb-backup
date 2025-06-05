@@ -1,6 +1,8 @@
 import { DynamoDB } from 'aws-sdk';
 import { v4 as uuidv4 } from 'uuid';
 import { TABLE_PREFIX } from '../config/constants';
+import { taskDb } from './db';
+import yaml from 'js-yaml';
 
 export interface Workflow {
   workflowId: string;
@@ -22,15 +24,16 @@ export interface WorkflowExecution {
   executionId: string;
   workflowId: string;
   userId: string;
-  status: 'success' | 'failed' | 'running' | 'pending';
+  status: 'pending' | 'success' | 'failed' | 'running';
   startTime: string;
   endTime?: string;
   duration?: string;
   error?: string;
+  killRequested?: string;
   tasks: {
     nodeId: string;
     taskId: string;
-    status: 'success' | 'failed' | 'running' | 'pending';
+    status: 'pending' | 'success' | 'failed' | 'running';
     startTime: string;
     endTime?: string;
     error?: string;
@@ -128,7 +131,7 @@ export class WorkflowService {
 
   // Workflow Executions operations
   async createWorkflowExecution(execution: Omit<WorkflowExecution, 'executionId'>): Promise<WorkflowExecution> {
-    const executionId = uuidv4();
+    const executionId = Date.now().toString();
     const newExecution: WorkflowExecution = {
       ...execution,
       executionId
@@ -171,5 +174,69 @@ export class WorkflowService {
     }).promise();
 
     return result.Items as WorkflowExecution[];
+  }
+
+  async getWorkflowExecution(executionId: string): Promise<WorkflowExecution | null> {
+    const result = await this.dynamodb.get({
+      TableName: `${TABLE_PREFIX}AW-WorkflowExecutions`,
+      Key: { executionId }
+    }).promise();
+
+    return result.Item as WorkflowExecution || null;
+  }
+
+  async createWorkflowWithTaskReferences(
+    workflow: Omit<Workflow, 'workflowId' | 'createdAt' | 'updatedAt'>,
+    taskReferences: { taskId: string; nodeId: string }[]
+  ): Promise<Workflow> {
+    const now = new Date().toISOString();
+    const workflowId = uuidv4();
+
+    // Get referenced tasks
+    const referencedTasks = await Promise.all(
+      taskReferences.map(async ({ taskId }) => {
+        const task = await taskDb.getTaskById(taskId);
+        if (!task) {
+          throw new Error(`Referenced task ${taskId} not found`);
+        }
+        return task;
+      })
+    );
+
+    // Create workflow nodes from referenced tasks
+    const nodes = taskReferences.map(({ taskId, nodeId }, index) => ({
+      id: nodeId,
+      data: {
+        taskId,
+        prompt: referencedTasks[index].prompt,
+        order: index
+      }
+    }));
+
+    // Create edges between nodes (simple sequential flow)
+    const edges = nodes.slice(1).map((node, index) => ({
+      id: `edge-${index}`,
+      source: nodes[index].id,
+      target: node.id
+    }));
+
+    // Create YAML representation
+    const yamlContent = yaml.dump({ nodes, edges });
+
+    const newWorkflow: Workflow = {
+      ...workflow,
+      workflowId,
+      createdAt: now,
+      updatedAt: now,
+      yaml: yamlContent,
+      chatHistory: workflow.chatHistory || []
+    };
+
+    await this.dynamodb.put({
+      TableName: `${TABLE_PREFIX}AW-Workflows`,
+      Item: newWorkflow
+    }).promise();
+
+    return newWorkflow;
   }
 } 

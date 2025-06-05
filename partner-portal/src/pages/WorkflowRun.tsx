@@ -15,7 +15,8 @@ import {
   Chip,
   CircularProgress,
   Alert,
-  Tooltip
+  Tooltip,
+  Link
 } from '@mui/material';
 import {
   Refresh as RefreshIcon,
@@ -241,8 +242,8 @@ export default function WorkflowRun() {
     }
   };
 
-  const getDuration = (startTime: string, completedAt?: string) => {
-    if (!completedAt) return 'In progress';
+  const getDuration = (startTime: string, completedAt?: string, status?: string) => {
+    if (!completedAt || status === 'killed') return 'In progress';
     
     const start = new Date(startTime);
     const end = new Date(completedAt);
@@ -327,7 +328,7 @@ export default function WorkflowRun() {
                   {formatDistanceToNow(new Date(execution.startTime), { addSuffix: true })}
                 </TableCell>
                 <TableCell>
-                  {getDuration(execution.startTime, execution.completedAt)}
+                  {getDuration(execution.startTime, execution.completedAt, execution.status)}
                 </TableCell>
                 <TableCell>
                   <Box sx={{ display: 'flex', gap: 1 }}>
@@ -354,10 +355,44 @@ export default function WorkflowRun() {
                 </TableCell>
                 <TableCell>
                   {execution.status === 'failed' ? (
-                    <CollapsibleText text={execution.error || 'No error details available'} />
+                    <Box>
+                      <CollapsibleText text={execution.error || 'No error details available'} />
+                      <Link
+                        component="button"
+                        variant="body2"
+                        onClick={() => navigate(`/workflows/${id}/executions/${execution.executionId}`)}
+                        sx={{ display: 'block', mt: 1 }}
+                      >
+                        View Full Details
+                      </Link>
+                    </Box>
                   ) : execution.status === 'completed' ? (
-                    <CollapsibleText text={execution.result || 'No result available'} />
-                  ) : null}
+                    <Box>
+                      <CollapsibleText text={execution.result || 'No result available'} />
+                      <Link
+                        component="button"
+                        variant="body2"
+                        onClick={() => navigate(`/workflows/${id}/executions/${execution.executionId}`)}
+                        sx={{ display: 'block', mt: 1 }}
+                      >
+                        View Full Details
+                      </Link>
+                    </Box>
+                  ) : (
+                    <Box>
+                      <Typography variant="body2" color="text.secondary">
+                        {execution.status === 'running' ? 'Execution in progress...' : ''}
+                      </Typography>
+                      <Link
+                        component="button"
+                        variant="body2"
+                        onClick={() => navigate(`/workflows/${id}/executions/${execution.executionId}`)}
+                        sx={{ display: 'block', mt: 1 }}
+                      >
+                        View Full Details
+                      </Link>
+                    </Box>
+                  )}
                 </TableCell>
               </TableRow>
             ))}
