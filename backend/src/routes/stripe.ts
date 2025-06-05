@@ -1,6 +1,9 @@
 import express, { Request, Response } from "express";
 import Stripe from "stripe";
 import dotenv from "dotenv";
+import { waitlistDb } from "../services/waitlistDb"; // Import waitlistDb
+import { authenticateToken, AuthenticatedRequest } from "../middleware/auth"; // Added AuthenticatedRequest and authenticateToken
+import { userDb } from "../services/db"; // Added userDb
 
 dotenv.config();
 
@@ -8,6 +11,8 @@ const router = express.Router();
 
 // Ensure STRIPE_SECRET_KEY is set in your .env file
 const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
+const CUSTOMER_FRONTEND_URL =
+  process.env.CUSTOMER_FRONTEND_URL || "http://localhost:5174"; // For return URL
 
 if (!stripeSecretKey) {
   console.error(
@@ -54,6 +59,8 @@ router.get("/session/:sessionId", async (req: Request, res: Response) => {
     });
 
     let email: string | null = null;
+    let fullName: string | undefined = undefined;
+    let phoneNumber: string | undefined = undefined;
 
     // 1. Check customer object directly attached to the session
     if (
@@ -63,10 +70,14 @@ router.get("/session/:sessionId", async (req: Request, res: Response) => {
       session.customer.email
     ) {
       email = session.customer.email;
+      fullName = session.customer.name || undefined; // Get name from customer object
+      phoneNumber = session.customer.phone || undefined; // Get phone from customer object
     }
     // 2. Check customer_details (often used for guest checkouts)
     else if (session.customer_details && session.customer_details.email) {
       email = session.customer_details.email;
+      fullName = session.customer_details.name || undefined; // Get name from customer_details
+      phoneNumber = session.customer_details.phone || undefined; // Get phone from customer_details
     }
     // 3. Check customer object on the PaymentIntent (if it exists)
     else if (
@@ -78,6 +89,8 @@ router.get("/session/:sessionId", async (req: Request, res: Response) => {
       session.payment_intent.customer.email
     ) {
       email = session.payment_intent.customer.email;
+      fullName = session.payment_intent.customer.name || undefined;
+      phoneNumber = session.payment_intent.customer.phone || undefined;
     }
     // 4. Check customer object on the SetupIntent (if it exists, e.g., for subscriptions)
     else if (
@@ -89,9 +102,85 @@ router.get("/session/:sessionId", async (req: Request, res: Response) => {
       session.setup_intent.customer.email
     ) {
       email = session.setup_intent.customer.email;
+      fullName = session.setup_intent.customer.name || undefined;
+      phoneNumber = session.setup_intent.customer.phone || undefined;
     }
 
     if (email) {
+      // Attempt to add to waitlist before sending response
+      try {
+        const waitlistEntry = {
+          email: email,
+          fullName: fullName,
+          phoneNumber: phoneNumber,
+          companyName: "Freelancer", // As requested
+          supportNote: "Joined directly from Stripe", // As requested
+          joinedAt: new Date().toISOString(),
+          // status will default to 'pending' in waitlistDb.add
+        };
+        await waitlistDb.add(waitlistEntry);
+        console.log(
+          `Successfully added ${email} to waitlist from Stripe session.`
+        );
+        // After adding, immediately update status to invited
+        try {
+          await waitlistDb.updateStatus(
+            email,
+            "invited",
+            new Date().toISOString()
+          );
+          console.log(
+            `Successfully updated ${email} status to 'invited' in waitlist.`
+          );
+        } catch (updateError: any) {
+          console.error(
+            `Failed to update status to 'invited' for ${email}:`,
+            updateError.message
+          );
+          // Continue even if status update fails, primary goal is email pre-fill
+        }
+      } catch (waitlistError: any) {
+        if (waitlistError.code === "ConditionalCheckFailedException") {
+          console.log(
+            `User ${email} from Stripe session is already on the waitlist.`
+          );
+          // If user already exists, still try to update their status to invited
+          try {
+            // Check current status first to avoid unnecessary updates if already invited or beyond
+            const existingEntry = await waitlistDb.getByEmail(email);
+            if (
+              existingEntry &&
+              existingEntry.status !== "invited" &&
+              existingEntry.status !== "onboarded"
+            ) {
+              // Example: don't downgrade if already 'onboarded'
+              await waitlistDb.updateStatus(
+                email,
+                "invited",
+                new Date().toISOString()
+              );
+              console.log(
+                `Successfully updated existing user ${email} status to 'invited' in waitlist.`
+              );
+            } else if (existingEntry) {
+              console.log(
+                `User ${email} status is already '${existingEntry.status}', no update needed or appropriate.`
+              );
+            }
+          } catch (updateError: any) {
+            console.error(
+              `Failed to update status to 'invited' for existing user ${email}:`,
+              updateError.message
+            );
+          }
+        } else {
+          console.error(
+            "Failed to add user to waitlist from Stripe session:",
+            waitlistError.message
+          );
+        }
+      }
+
       res.json({ email });
     } else {
       console.warn(
@@ -136,5 +225,63 @@ router.get("/session/:sessionId", async (req: Request, res: Response) => {
     }
   }
 });
+
+/**
+ * @route POST /api/stripe/create-customer-portal-session
+ * @desc Create a Stripe Customer Portal session for the authenticated user
+ * @access Private (requires authentication)
+ */
+router.post(
+  "/create-customer-portal-session",
+  authenticateToken,
+  async (req: Request, res: Response) => {
+    if (!stripe) {
+      console.error("Stripe SDK not initialized. Missing STRIPE_SECRET_KEY.");
+      return res
+        .status(500)
+        .json({ error: "Stripe integration is not configured correctly." });
+    }
+
+    const authenticatedReq = req as AuthenticatedRequest;
+    const userId = authenticatedReq.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: "User not authenticated." });
+    }
+
+    try {
+      // --- Placeholder for fetching Stripe Customer ID ---
+      // TODO: Replace this with actual logic to get stripeCustomerId from your userDb
+      // For example, if you add 'stripeCustomerId' to your User model:
+      const user = await userDb.getUserById(userId);
+      const stripeCustomerId = user?.stripeCustomerId; // Assuming user object has stripeCustomerId
+      // --- End Placeholder ---
+
+      if (!stripeCustomerId) {
+        console.error(`Stripe Customer ID not found for user ${userId}.`);
+        return res.status(404).json({
+          message:
+            "Stripe customer ID not found for this user. Unable to create portal session.",
+        });
+      }
+
+      const portalSession = await stripe.billingPortal.sessions.create({
+        customer: stripeCustomerId,
+        return_url: `${CUSTOMER_FRONTEND_URL}/dashboard`, // Or any other appropriate return URL
+      });
+
+      res.json({ url: portalSession.url });
+    } catch (error: any) {
+      console.error(
+        "Error creating Stripe Customer Portal session:",
+        error.message
+      );
+      res.status(500).json({
+        message: "Failed to create Stripe Customer Portal session.",
+        error: error.message,
+      });
+    }
+  }
+);
 
 export default router;
