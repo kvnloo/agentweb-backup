@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
   Box,
@@ -6,12 +6,6 @@ import {
   Typography,
   Button,
   IconButton,
-  Table,
-  TableBody,
-  TableCell,
-  TableContainer,
-  TableHead,
-  TableRow,
   Chip,
   CircularProgress,
   Alert,
@@ -19,7 +13,6 @@ import {
   Grid,
   Divider,
   Tooltip,
-  Collapse,
   Dialog,
   DialogTitle,
   DialogContent,
@@ -31,15 +24,12 @@ import {
   Error as ErrorIcon,
   Pending as PendingIcon,
   Timeline as TimelineIcon,
-  KeyboardArrowDown as KeyboardArrowDownIcon,
-  KeyboardArrowUp as KeyboardArrowUpIcon,
-  ContentCopy as ContentCopyIcon,
   Autorenew as AutorenewIcon,
   PowerOff as PowerOffIcon,
   Screenshot as ScreenshotIcon
 } from '@mui/icons-material';
 import { useAuth } from '../contexts/AuthContext';
-import { formatDistanceToNow, intervalToDuration } from 'date-fns';
+import { intervalToDuration } from 'date-fns';
 import { API_URL } from '../config';
 import axios from 'axios';
 
@@ -86,54 +76,6 @@ interface Workflow {
   createdAt: string;
   updatedAt: string;
 }
-
-// Add CollapsibleText component
-const CollapsibleText = ({ text, maxLength = 150 }: { text: string, maxLength?: number }) => {
-  const [isExpanded, setIsExpanded] = useState(false);
-  const [isCopied, setIsCopied] = useState(false);
-
-  const handleCopy = () => {
-    navigator.clipboard.writeText(text);
-    setIsCopied(true);
-    setTimeout(() => setIsCopied(false), 2000);
-  };
-
-  if (!text) return null;
-  if (text.length <= maxLength) {
-    return (
-      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-        <Typography>{text}</Typography>
-        <Tooltip title={isCopied ? "Copied!" : "Copy to clipboard"}>
-          <IconButton size="small" onClick={handleCopy}>
-            <ContentCopyIcon fontSize="small" />
-          </IconButton>
-        </Tooltip>
-      </Box>
-    );
-  }
-
-  return (
-    <Box>
-      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-        <Typography>
-          {isExpanded ? text : `${text.slice(0, maxLength)}...`}
-        </Typography>
-        <Box sx={{ display: 'flex', gap: 0.5 }}>
-          <Tooltip title={isExpanded ? "Show less" : "Show more"}>
-            <IconButton size="small" onClick={() => setIsExpanded(!isExpanded)}>
-              {isExpanded ? <KeyboardArrowUpIcon /> : <KeyboardArrowDownIcon />}
-            </IconButton>
-          </Tooltip>
-          <Tooltip title={isCopied ? "Copied!" : "Copy to clipboard"}>
-            <IconButton size="small" onClick={handleCopy}>
-              <ContentCopyIcon fontSize="small" />
-            </IconButton>
-          </Tooltip>
-        </Box>
-      </Box>
-    </Box>
-  );
-};
 
 // Add formatJsonIfValid helper function
 const formatJsonIfValid = (text: string): JSX.Element => {
@@ -192,10 +134,8 @@ export default function WorkflowExecutionDetails() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isAutoRefreshing, setIsAutoRefreshing] = useState(false);
-  const [expandedTask, setExpandedTask] = useState<string | null>(null);
   const [killDialogOpen, setKillDialogOpen] = useState(false);
   const [killLoading, setKillLoading] = useState(false);
-  const [killError, setKillError] = useState('');
 
   const fetchData = useCallback(async () => {
     console.log('fetchData called with:', { workflowId, executionId });
@@ -355,9 +295,9 @@ export default function WorkflowExecutionDetails() {
 
   const getDuration = (startTime: string, completedAt?: string, status?: string) => {
     if (!completedAt || status === 'killed') return 'In progress';
-    
+
+    const end = completedAt ? new Date(completedAt) : new Date();
     const start = new Date(startTime);
-    const end = new Date(completedAt);
     const duration = intervalToDuration({ start, end });
     
     const parts = [];
@@ -368,12 +308,8 @@ export default function WorkflowExecutionDetails() {
     return parts.join(' ') || '< 1s';
   };
 
-  const handleTaskExpand = (taskId: string) => {
-    setExpandedTask(expandedTask === taskId ? null : taskId);
-  };
-
   const handleKillClick = () => {
-    setKillError('');
+    setError(null);
     setKillDialogOpen(true);
   };
 
@@ -381,14 +317,17 @@ export default function WorkflowExecutionDetails() {
     if (!workflowId || !executionId || !token) return;
 
     setKillLoading(true);
-    setKillError('');
+    setError(null);
 
     try {
-      // Call the workflow kill endpoint
-      const response = await axios.put(
+      await axios.put(
         `${API_URL}/api/workflows/${workflowId}/executions/${executionId}/kill`,
         {},
-        { headers: { Authorization: `Bearer ${token}` } }
+        {
+          headers: {
+            Authorization: `Bearer ${token}`
+          }
+        }
       );
 
       // Refresh execution data
@@ -396,7 +335,7 @@ export default function WorkflowExecutionDetails() {
       setKillDialogOpen(false);
     } catch (error: any) {
       console.error('Error killing workflow execution:', error);
-      setKillError(error.response?.data?.message || 'Failed to kill workflow execution');
+      setError(error.response?.data?.message || 'Failed to kill workflow execution');
     } finally {
       setKillLoading(false);
     }
@@ -701,9 +640,9 @@ export default function WorkflowExecutionDetails() {
       >
         <DialogTitle id="alert-dialog-title">{"Kill Running Tasks?"}</DialogTitle>
         <DialogContent>
-          {killError && (
+          {error && (
             <Alert severity="error" sx={{ mb: 2 }}>
-              {killError}
+              {error}
             </Alert>
           )}
           <Typography>
@@ -714,8 +653,8 @@ export default function WorkflowExecutionDetails() {
           <Button onClick={() => setKillDialogOpen(false)} color="primary">
             Cancel
           </Button>
-          <Button 
-            onClick={handleConfirmKill} 
+          <Button
+            onClick={handleConfirmKill}
             color="error" 
             variant="contained" 
             disabled={killLoading}

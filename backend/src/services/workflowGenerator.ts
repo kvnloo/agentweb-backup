@@ -189,11 +189,11 @@ If modifying an existing workflow, maintain its overall structure while applying
 
 Available tasks that can be referenced in the workflow:
 ${availableTasks.map(task => `
-Task ID: ${task.taskId}
-Name: ${task.name}
-Description: ${task.description || 'No description'}
-Category: ${task.category || 'Uncategorized'}
-Prompt: ${task.prompt}
+Task ID: ${(task as any).taskId}
+Name: ${(task as any).name}
+Description: ${(task as any).description || 'No description'}
+Category: ${(task as any).category || 'Uncategorized'}
+Prompt: ${(task as any).prompt}
 `).join('\n')}
 
 When creating task nodes, you can either:
@@ -227,11 +227,11 @@ If creating a new task, provide a prompt that describes what the task should do.
   const validationErrors: string[] = [];
   workflowDefinition.nodes.forEach((node: any) => {
     if (node.data.taskId) {
-      const task = availableTasks.find(t => t.taskId === node.data.taskId);
+      const task = availableTasks.find(t => (t as any).taskId === node.data.taskId);
       if (!task) {
         validationErrors.push(`Task with ID ${node.data.taskId} not found`);
-      } else if (node.data.label !== task.name) {
-        validationErrors.push(`Node label "${node.data.label}" does not match task name "${task.name}" for task ID ${node.data.taskId}`);
+      } else if (node.data.label !== (task as any).name) {
+        validationErrors.push(`Node label "${node.data.label}" does not match task name "${(task as any).name}" for task ID ${node.data.taskId}`);
       }
     }
   });

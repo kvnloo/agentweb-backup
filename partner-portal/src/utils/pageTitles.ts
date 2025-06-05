@@ -59,9 +59,8 @@ export function getPageTitle(path: string): string {
   // Handle workflow execution details pattern
   if (cleanPath.match(/^\/workflows\/[^/]+\/executions\/[^/]+$/)) {
     const segments = cleanPath.split('/');
-    const workflowId = segments[2] || '';
     const executionId = segments[4] || '';
-    return `Workflow Execution Details: ${executionId}`;
+    return `Execution ${executionId} - Workflow Execution Details`;
   }
   
   if (cleanPath.match(/^\/marketing\/research\/[^/]+$/)) {
