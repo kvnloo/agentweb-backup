@@ -17,6 +17,8 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import GoogleSignInButton from "@/components/auth/GoogleSignInButton";
 import { Separator } from "@/components/ui/separator";
 import AgentWebLogo from "@/assets/AgentWeb-Logo-189x62.svg";
+import axios from "axios";
+import { buildApiUrl } from "@/config";
 
 const Register = () => {
   const [searchParams] = useSearchParams();
@@ -25,14 +27,37 @@ const Register = () => {
   const [confirmPassword, setConfirmPassword] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [formError, setFormError] = useState("");
+  const [isEmailFromStripe, setIsEmailFromStripe] = useState(false);
   const { error, register, errorCode, landingSiteUrl } = useAuth();
   const navigate = useNavigate();
 
-  // Pre-fill email from URL params
+  // Pre-fill email from URL params (session_id or email)
   useEffect(() => {
+    const sessionId = searchParams.get("session_id");
     const emailParam = searchParams.get("email");
-    if (emailParam) {
+
+    if (sessionId) {
+      setIsLoading(true); // Optionally indicate loading while fetching email
+      axios
+        .get(buildApiUrl(`/api/stripe/session/${sessionId}`))
+        .then((response) => {
+          if (response.data && response.data.email) {
+            setEmail(response.data.email);
+            setIsEmailFromStripe(true); // Mark that email came from Stripe
+          }
+        })
+        .catch((err) => {
+          console.error("Failed to fetch email from Stripe session:", err);
+          // Optionally set a specific formError here
+          // If fetching email fails, user can still type it manually
+        })
+        .finally(() => {
+          setIsLoading(false);
+        });
+    } else if (emailParam) {
       setEmail(emailParam);
+      // Decide if emailParam from URL should also make the field read-only or behave differently
+      // For now, if 'email' param is present, it's not considered "from Stripe" for disabling logic.
     }
   }, [searchParams]);
 
@@ -174,7 +199,7 @@ const Register = () => {
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   required
-                  disabled={!!searchParams.get("email")}
+                  disabled={!isEmailFromStripe && !!searchParams.get("email")}
                   className="rounded-[8px] border border-[#7A6999] focus:border-[#ECAC5F] focus:shadow-[0_0_4px_#ECAC5F] transition-all duration-300 ease-in-out"
                 />
               </div>
