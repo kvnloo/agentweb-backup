@@ -28,6 +28,7 @@ interface User {
   taskCount?: number;
   workflowCount?: number;
   isOAuthUser?: boolean;
+  stripe_customer_id?: string;
 }
 
 interface AdminContextType {

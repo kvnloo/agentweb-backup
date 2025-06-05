@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import { waitlistDb } from "../services/waitlistDb"; // Import waitlistDb
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth"; // Added AuthenticatedRequest and authenticateToken
 import { userDb } from "../services/db"; // Added userDb
+import { handleStripeWebhook } from "../controllers/stripeWebhookController"; // Added import for webhook handler
 
 dotenv.config();
 
@@ -28,6 +29,24 @@ const stripe = stripeSecretKey
       apiVersion: "2025-05-28.basil", // Using the version suggested by the linter
     })
   : null;
+
+// Stripe Webhook Handler
+// IMPORTANT: This route needs to be before any global express.json() middleware
+// or specifically use express.raw for body parsing.
+router.post(
+  "/webhook",
+  // Use express.raw to get the raw body as a Buffer, which Stripe needs for signature verification
+  // The express.raw middleware should be applied in app.ts before express.json() for this route path
+  // or used directly here if the router setup allows for it without conflicting with app.ts.
+  // For simplicity in this edit, we assume it's handled in app.ts or by using the body directly
+  // if the global middleware is express.json() but constructEvent can handle stringified JSON from req.body.
+  // Stripe's constructEvent can take a string or a buffer.
+  // If express.json() has already parsed it, req.body will be an object. stripe.webhooks.constructEvent expects the raw string or buffer.
+  // The controller (stripeWebhookController.ts) currently uses req.body. This means app.ts
+  // MUST use express.raw({type: 'application/json'}) for the '/api/stripe/webhook' path.
+  express.raw({ type: "application/json" }), // Ensure raw body is available
+  handleStripeWebhook
+);
 
 /**
  * @route GET /api/stripe/session/:sessionId
@@ -61,6 +80,16 @@ router.get("/session/:sessionId", async (req: Request, res: Response) => {
     let email: string | null = null;
     let fullName: string | undefined = undefined;
     let phoneNumber: string | undefined = undefined;
+    let stripeCustomerIdFromSession: string | undefined = undefined; // Variable to hold the customer ID
+
+    // Extract Stripe Customer ID first
+    if (session.customer) {
+      if (typeof session.customer === "string") {
+        stripeCustomerIdFromSession = session.customer;
+      } else if (session.customer.id && !session.customer.deleted) {
+        stripeCustomerIdFromSession = session.customer.id;
+      }
+    }
 
     // 1. Check customer object directly attached to the session
     if (
@@ -109,7 +138,8 @@ router.get("/session/:sessionId", async (req: Request, res: Response) => {
     if (email) {
       // Attempt to add to waitlist before sending response
       try {
-        const waitlistEntry = {
+        const waitlistEntryData: any = {
+          // Use any type temporarily for easier object construction
           email: email,
           fullName: fullName,
           phoneNumber: phoneNumber,
@@ -118,7 +148,12 @@ router.get("/session/:sessionId", async (req: Request, res: Response) => {
           joinedAt: new Date().toISOString(),
           // status will default to 'pending' in waitlistDb.add
         };
-        await waitlistDb.add(waitlistEntry);
+
+        if (stripeCustomerIdFromSession) {
+          waitlistEntryData.stripe_customer_id = stripeCustomerIdFromSession;
+        }
+
+        await waitlistDb.add(waitlistEntryData); // Pass the object that matches WaitlistEntry structure
         console.log(
           `Successfully added ${email} to waitlist from Stripe session.`
         );
@@ -250,24 +285,18 @@ router.post(
     }
 
     try {
-      // --- Placeholder for fetching Stripe Customer ID ---
-      // TODO: Replace this with actual logic to get stripeCustomerId from your userDb
-      // For example, if you add 'stripeCustomerId' to your User model:
       const user = await userDb.getUserById(userId);
-      const stripeCustomerId = user?.stripeCustomerId; // Assuming user object has stripeCustomerId
-      // --- End Placeholder ---
-
-      if (!stripeCustomerId) {
-        console.error(`Stripe Customer ID not found for user ${userId}.`);
+      if (!user || !user.stripe_customer_id) {
+        console.error(`User ${userId} does not have a Stripe customer ID.`);
         return res.status(404).json({
           message:
-            "Stripe customer ID not found for this user. Unable to create portal session.",
+            "Stripe customer ID not found for this user. Cannot open portal.",
         });
       }
 
       const portalSession = await stripe.billingPortal.sessions.create({
-        customer: stripeCustomerId,
-        return_url: `${CUSTOMER_FRONTEND_URL}/dashboard`, // Or any other appropriate return URL
+        customer: user.stripe_customer_id,
+        return_url: `${CUSTOMER_FRONTEND_URL}/settings`, // Or any other relevant page
       });
 
       res.json({ url: portalSession.url });
@@ -277,8 +306,8 @@ router.post(
         error.message
       );
       res.status(500).json({
-        message: "Failed to create Stripe Customer Portal session.",
-        error: error.message,
+        error: "Failed to create Stripe Customer Portal session.",
+        details: error.message,
       });
     }
   }

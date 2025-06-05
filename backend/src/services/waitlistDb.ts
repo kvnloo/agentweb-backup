@@ -32,6 +32,7 @@ interface WaitlistEntry {
   useCaseCategories?: string[];
   useCaseDescription?: string;
   supportNote?: string;
+  stripe_customer_id?: string;
 }
 
 // Helper function to handle DynamoDB errors
@@ -61,6 +62,7 @@ export const waitlistDb = {
         useCaseCategories: entry.useCaseCategories || [],
         useCaseDescription: entry.useCaseDescription || "",
         supportNote: entry.supportNote || "",
+        stripe_customer_id: entry.stripe_customer_id,
       },
       ConditionExpression: "attribute_not_exists(email)",
     };

@@ -52,6 +52,7 @@ interface User {
   isActive: boolean;
   createdAt: string;
   roles?: ("partner" | "customer")[];
+  stripe_customer_id?: string;
 }
 
 interface UserInteraction {
@@ -132,7 +133,8 @@ class UserDB {
     isAdmin: boolean = false,
     roles: ("partner" | "customer")[] = ["partner"],
     displayName?: string,
-    googleId?: string
+    googleId?: string,
+    stripe_customer_id?: string
   ) {
     const itemToCreate: any = {
       userId,
@@ -150,6 +152,9 @@ class UserDB {
     }
     if (googleId) {
       itemToCreate.googleId = googleId;
+    }
+    if (stripe_customer_id) {
+      itemToCreate.stripe_customer_id = stripe_customer_id;
     }
 
     const params = {
@@ -290,6 +295,7 @@ class UserDB {
       isAdmin: boolean;
       isActive: boolean;
       email: string;
+      stripe_customer_id: string;
     }>
   ) {
     try {

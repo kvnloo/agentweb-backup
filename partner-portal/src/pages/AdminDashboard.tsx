@@ -89,6 +89,7 @@ interface WaitlistEntry {
   useCaseDescription?: string;
   requestReport?: boolean;
   supportNote?: string;
+  stripe_customer_id?: string;
 }
 
 // Define ChatSession interface for the frontend, including portalType
@@ -115,6 +116,7 @@ interface User {
   taskCount?: number;
   workflowCount?: number;
   isOAuthUser?: boolean; // Ensured from API structure
+  stripe_customer_id?: string; // Added stripe_customer_id
 }
 
 // Define an interface for the task data shown in the admin tasks tab
@@ -1103,6 +1105,7 @@ export default function AdminDashboard() {
               <TableHead>
                 <TableRow>
                   <TableCell>Email</TableCell>
+                  <TableCell>Stripe Customer ID</TableCell>
                   <TableCell>Created</TableCell>
                   <TableCell>Roles</TableCell>
                   <TableCell>Tasks</TableCell>
@@ -1132,6 +1135,7 @@ export default function AdminDashboard() {
                     return (
                       <TableRow key={user.userId}>
                         <TableCell>{user.email}</TableCell>
+                        <TableCell>{user.stripe_customer_id || "-"}</TableCell>
                         <TableCell>
                           {new Date(user.createdAt).toLocaleDateString()}
                         </TableCell>
@@ -1263,6 +1267,7 @@ export default function AdminDashboard() {
                   <TableCell>Full Name</TableCell>
                   <TableCell>Company Name</TableCell>
                   <TableCell>Phone Number</TableCell>
+                  <TableCell>Stripe Customer ID</TableCell>
                   <TableCell>
                     <Box
                       sx={{
@@ -1308,6 +1313,7 @@ export default function AdminDashboard() {
                         <TableCell>{entry.fullName || "-"}</TableCell>
                         <TableCell>{entry.companyName || "-"}</TableCell>
                         <TableCell>{entry.phoneNumber || "-"}</TableCell>
+                        <TableCell>{entry.stripe_customer_id || "-"}</TableCell>
                         <TableCell>
                           {entry.joinedAt
                             ? new Date(entry.joinedAt).toLocaleDateString()
