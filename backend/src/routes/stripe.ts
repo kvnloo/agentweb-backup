@@ -4,7 +4,6 @@ import dotenv from "dotenv";
 import { waitlistDb } from "../services/waitlistDb"; // Import waitlistDb
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth"; // Added AuthenticatedRequest and authenticateToken
 import { userDb } from "../services/db"; // Added userDb
-import { handleStripeWebhook } from "../controllers/stripeWebhookController"; // Added import for webhook handler
 
 dotenv.config();
 
@@ -29,24 +28,6 @@ const stripe = stripeSecretKey
       apiVersion: "2025-05-28.basil", // Using the version suggested by the linter
     })
   : null;
-
-// Stripe Webhook Handler
-// IMPORTANT: This route needs to be before any global express.json() middleware
-// or specifically use express.raw for body parsing.
-router.post(
-  "/webhook",
-  // Use express.raw to get the raw body as a Buffer, which Stripe needs for signature verification
-  // The express.raw middleware should be applied in app.ts before express.json() for this route path
-  // or used directly here if the router setup allows for it without conflicting with app.ts.
-  // For simplicity in this edit, we assume it's handled in app.ts or by using the body directly
-  // if the global middleware is express.json() but constructEvent can handle stringified JSON from req.body.
-  // Stripe's constructEvent can take a string or a buffer.
-  // If express.json() has already parsed it, req.body will be an object. stripe.webhooks.constructEvent expects the raw string or buffer.
-  // The controller (stripeWebhookController.ts) currently uses req.body. This means app.ts
-  // MUST use express.raw({type: 'application/json'}) for the '/api/stripe/webhook' path.
-  express.raw({ type: "application/json" }), // Ensure raw body is available
-  handleStripeWebhook
-);
 
 /**
  * @route GET /api/stripe/session/:sessionId
