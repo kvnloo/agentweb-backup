@@ -43,7 +43,8 @@ const handleDynamoDbError = (error: any, operation: string) => {
   throw error;
 };
 
-interface User {
+// Ensure the User interface is exported
+export interface User {
   userId: string;
   email: string;
   password: string;
@@ -53,6 +54,8 @@ interface User {
   createdAt: string;
   roles?: ("partner" | "customer")[];
   stripe_customer_id?: string;
+  companyName?: string;
+  useCaseCategories?: string[];
 }
 
 interface UserInteraction {
@@ -134,8 +137,10 @@ class UserDB {
     roles: ("partner" | "customer")[] = ["partner"],
     displayName?: string,
     googleId?: string,
-    stripe_customer_id?: string
-  ) {
+    stripe_customer_id?: string,
+    companyName?: string,
+    useCaseCategories?: string[]
+  ): Promise<User | undefined> {
     const itemToCreate: any = {
       userId,
       email: email.toLowerCase(),
@@ -156,13 +161,26 @@ class UserDB {
     if (stripe_customer_id) {
       itemToCreate.stripe_customer_id = stripe_customer_id;
     }
+    if (companyName) {
+      itemToCreate.companyName = companyName;
+    }
+    if (useCaseCategories && useCaseCategories.length > 0) {
+      itemToCreate.useCaseCategories = useCaseCategories;
+    }
 
     const params = {
       TableName: this.tableName,
       Item: itemToCreate,
+      ConditionExpression: "attribute_not_exists(email)",
     };
 
-    await this.docClient.put(params).promise();
+    try {
+      await this.docClient.put(params).promise();
+      return params.Item as User;
+    } catch (error) {
+      handleDynamoDbError(error, "createUser");
+      return undefined;
+    }
   }
 
   async getUserByEmail(email: string) {
@@ -288,55 +306,53 @@ class UserDB {
     }
   }
 
-  async updateUser(
-    userId: string,
-    updates: Partial<{
-      roles: ("partner" | "customer")[];
-      isAdmin: boolean;
-      isActive: boolean;
-      email: string;
-      stripe_customer_id: string;
-    }>
-  ) {
-    try {
-      // First get the user
-      const user = await this.getUserById(userId);
-      if (!user) {
-        throw new Error("User not found");
-      }
+  async updateUser(userId: string, updates: Partial<User>) {
+    // Filter out keys that should not be updated directly or are part of the key
+    const {
+      userId: _,
+      email: __,
+      password: ___,
+      createdAt: ____,
+      ...updatableFields
+    } = updates;
 
-      // Create update expression and attribute values dynamically
-      const updateExpressionParts: string[] = [];
-      const expressionAttributeNames: Record<string, string> = {};
-      const expressionAttributeValues: Record<string, any> = {};
+    if (Object.keys(updatableFields).length === 0) {
+      return this.getUserById(userId); // Or return the user object if already fetched
+    }
 
-      // Process each update field
-      Object.entries(updates).forEach(([key, value]) => {
-        updateExpressionParts.push(`#${key} = :${key}`);
+    const updateExpressions: string[] = [];
+    const expressionAttributeNames: { [key: string]: string } = {};
+    const expressionAttributeValues: { [key: string]: any } = {};
+
+    Object.entries(updatableFields).forEach(([key, value]) => {
+      // Ensure value is not undefined. Allow null to explicitly remove/set a field to null.
+      if (value !== undefined) {
+        updateExpressions.push(`#${key} = :${key}`);
         expressionAttributeNames[`#${key}`] = key;
         expressionAttributeValues[`:${key}`] = value;
-      });
-
-      if (updateExpressionParts.length === 0) {
-        return user; // Nothing to update
       }
+    });
 
-      const params = {
-        TableName: this.tableName,
-        Key: {
-          email: user.email, // Use email as the primary key, matching the schema
-        },
-        UpdateExpression: `set ${updateExpressionParts.join(", ")}`,
-        ExpressionAttributeNames: expressionAttributeNames,
-        ExpressionAttributeValues: expressionAttributeValues,
-        ReturnValues: "ALL_NEW",
-      };
+    if (updateExpressions.length === 0) {
+      // This case might be redundant due to the initial check, but good for safety
+      return this.getUserById(userId);
+    }
 
+    const params = {
+      TableName: this.tableName,
+      Key: { userId: userId }, // Assuming userId is the primary key for the User table
+      UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+      ExpressionAttributeNames: expressionAttributeNames,
+      ExpressionAttributeValues: expressionAttributeValues,
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
       const result = await this.docClient.update(params).promise();
-      return result.Attributes;
+      return result.Attributes as User;
     } catch (error) {
-      console.error("Error in updateUser:", error);
-      throw error;
+      handleDynamoDbError(error, "updateUser");
+      throw error; // Re-throw after logging or specific handling
     }
   }
 

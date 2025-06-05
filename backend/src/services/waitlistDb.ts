@@ -20,7 +20,8 @@ AWS.config.update({
 
 const dynamodb = new AWS.DynamoDB.DocumentClient();
 
-interface WaitlistEntry {
+// Ensure the WaitlistEntry interface is exported
+export interface WaitlistEntry {
   email: string;
   joinedAt: string;
   status?: string;
@@ -33,6 +34,7 @@ interface WaitlistEntry {
   useCaseDescription?: string;
   supportNote?: string;
   stripe_customer_id?: string;
+  productUsagePlan?: string;
 }
 
 // Helper function to handle DynamoDB errors
@@ -63,6 +65,7 @@ export const waitlistDb = {
         useCaseDescription: entry.useCaseDescription || "",
         supportNote: entry.supportNote || "",
         stripe_customer_id: entry.stripe_customer_id,
+        productUsagePlan: entry.productUsagePlan,
       },
       ConditionExpression: "attribute_not_exists(email)",
     };

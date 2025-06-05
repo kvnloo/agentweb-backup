@@ -4,10 +4,16 @@ import jwt from "jsonwebtoken";
 import { userDb } from "../services/db";
 import { Profile } from "passport-google-oauth20";
 import { waitlistDb } from "../services/waitlistDb";
+import { v4 as uuidv4 } from "uuid";
 
 export const register = async (req: Request, res: Response) => {
   try {
-    let { email, password, roles: reqRoles } = req.body;
+    let {
+      email,
+      password,
+      roles: reqRoles,
+      displayName: reqDisplayName,
+    } = req.body;
 
     if (!email || !password) {
       return res
@@ -42,41 +48,43 @@ export const register = async (req: Request, res: Response) => {
       });
     }
 
+    // If waitlist entry exists and status is invited
+    const userId = uuidv4();
     const hashedPassword = await bcrypt.hash(password, 10);
-    const userId = Date.now().toString();
 
-    // Validate roles if provided, default to ['partner']
-    const validRolesSet = new Set(["partner", "customer"]);
-    let userRoles: ("partner" | "customer")[] = ["partner"]; // Default roles
+    // Extract additional details from waitlist entry to pass to createUser
+    const stripe_customer_id = waitlistEntry.stripe_customer_id;
+    const companyNameFromWaitlist = waitlistEntry.companyName;
+    const useCaseCategoriesFromWaitlist = waitlistEntry.useCaseCategories;
+    const displayNameFromWaitlist = waitlistEntry.fullName; // Assuming fullName from waitlist is a good default for displayName
 
-    if (
-      reqRoles &&
-      Array.isArray(reqRoles) &&
-      reqRoles.length > 0 &&
-      reqRoles.every((r) => validRolesSet.has(r))
-    ) {
-      userRoles = reqRoles as ("partner" | "customer")[]; // Explicitly cast reqRoles
-    }
+    // Determine roles: use reqRoles if provided, otherwise default to ["customer"]
+    // This also depends on your logic for how partner roles are assigned, adjust if necessary
+    const finalRoles =
+      reqRoles && Array.isArray(reqRoles) && reqRoles.length > 0
+        ? reqRoles
+        : ["customer"];
 
-    // Get stripe_customer_id from waitlist entry if available
-    const stripeCustomerIdFromWaitlist = waitlistEntry.stripe_customer_id;
+    const finalDisplayName =
+      reqDisplayName || displayNameFromWaitlist || email.split("@")[0];
 
-    // Create user in DynamoDB, passing stripe_customer_id if it exists
-    await userDb.createUser(
+    const newUser = await userDb.createUser(
       email,
       userId,
       hashedPassword,
       false, // isOAuthUser
-      false, // isAdmin
-      userRoles,
-      undefined, // displayName - assuming not collected here, or handle if it is
-      undefined, // googleId - assuming not collected here
-      stripeCustomerIdFromWaitlist // Pass the ID from waitlist
+      false, // isAdmin (default, adjust if admin status can come from waitlist/req)
+      finalRoles,
+      finalDisplayName,
+      undefined, // googleId
+      stripe_customer_id, // from waitlist
+      companyNameFromWaitlist, // from waitlist
+      useCaseCategoriesFromWaitlist // from waitlist
     );
 
     // JWT includes roles array
     const token = jwt.sign(
-      { userId, email, roles: userRoles, isAdmin: false }, // Include isAdmin=false for clarity
+      { userId, email, roles: finalRoles, isAdmin: false }, // Include isAdmin=false for clarity
       process.env.JWT_SECRET || "your-secret-key"
     );
 
@@ -86,7 +94,7 @@ export const register = async (req: Request, res: Response) => {
         userId,
         email,
         isAdmin: false,
-        roles: userRoles, // Send roles array
+        roles: finalRoles, // Send roles array
         isOAuthUser: false,
         createdAt: new Date().toISOString(),
       },
@@ -185,47 +193,52 @@ export const googleCallback = async (
       if (!waitlistEntry) {
         const landingSiteUrl =
           process.env.LANDING_SITE_URL || "https://agentweb.pro";
-        const errorObj = {
-          statusCode: 403,
+        return done(null, false, {
           message: `Please join our waitlist first at ${landingSiteUrl}`,
           code: "not_in_waitlist",
-        };
-        return done(errorObj, null);
+        });
       }
 
       if (waitlistEntry.status !== "invited") {
-        const errorObj = {
-          statusCode: 403,
-          message:
-            "Your account is on our waitlist but hasn't been invited yet. Please look out for an invitation email.",
+        return done(null, false, {
+          message: "You are on the waitlist but not yet invited.",
           code: "not_invited",
-        };
-        return done(errorObj, null);
+        });
       }
 
-      const userId = Date.now().toString();
-      const defaultRolesForNewOAuthUser: ("partner" | "customer")[] =
-        portalOrigin === "customer" ? ["customer"] : ["partner"];
+      const userId = uuidv4();
+      const placeholderPassword = `oauth_placeholder_${uuidv4()}`;
 
-      // Get stripe_customer_id from waitlist entry if available
-      const stripeCustomerIdFromWaitlist = waitlistEntry.stripe_customer_id;
+      const stripe_customer_id = waitlistEntry.stripe_customer_id;
+      const companyNameFromWaitlist = waitlistEntry.companyName;
+      const useCaseCategoriesFromWaitlist = waitlistEntry.useCaseCategories;
+      const finalDisplayName =
+        profile.displayName || waitlistEntry.fullName || email.split("@")[0];
 
-      await userDb.createUser(
+      const roles: ("partner" | "customer")[] = ["customer"];
+
+      user = await userDb.createUser(
         email,
         userId,
-        "",
+        placeholderPassword,
         true,
         false,
-        defaultRolesForNewOAuthUser,
-        profile.displayName,
+        roles,
+        finalDisplayName,
         profile.id,
-        stripeCustomerIdFromWaitlist
+        stripe_customer_id,
+        companyNameFromWaitlist,
+        useCaseCategoriesFromWaitlist
       );
-      user = await userDb.getUserByEmail(email);
+      console.log("New user created via Google OAuth:", user?.email);
 
       if (!user) {
+        console.error(
+          "Failed to create user via Google OAuth for email:",
+          email
+        );
         return done(
-          new Error("Failed to create or find user after creation attempt."),
+          new Error("User creation failed after Google OAuth process."),
           null
         );
       }
