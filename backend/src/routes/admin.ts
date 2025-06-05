@@ -622,4 +622,44 @@ router.get("/analytics/chatbot-summary", async (req, res) => {
   // ... existing code ...
 });
 
+// Admin: Delete a user
+router.delete("/users/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    // It's good practice to check if the user exists before attempting to delete
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Prevent deletion of admin users as an additional safeguard
+    if (user.isAdmin) {
+      return res
+        .status(403)
+        .json({ message: "Cannot delete admin users. Deactivate instead." });
+    }
+
+    // Perform the deletion
+    const deleteResult = await userDb.deleteUserById(userId);
+
+    if (deleteResult.success) {
+      res.status(200).json({ message: `User ${userId} deleted successfully.` });
+    } else {
+      res
+        .status(500)
+        .json({ message: deleteResult.message || "Failed to delete user." });
+    }
+  } catch (error) {
+    console.error(`Error deleting user ${req.params.userId}:`, error);
+    const errorMessage =
+      typeof error === "object" && error !== null && "message" in error
+        ? (error as { message: string }).message
+        : "Internal server error during user deletion";
+    res
+      .status(500)
+      .json({ message: "Error deleting user", error: errorMessage });
+  }
+});
+
 export default router;

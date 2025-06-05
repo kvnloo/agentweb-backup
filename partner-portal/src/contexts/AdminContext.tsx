@@ -18,8 +18,20 @@ interface WaitlistEntry {
   supportNote?: string;
 }
 
+interface User {
+  userId: string;
+  email: string;
+  isAdmin: boolean;
+  isActive: boolean;
+  createdAt: string;
+  roles?: ("partner" | "customer")[];
+  taskCount?: number;
+  workflowCount?: number;
+  isOAuthUser?: boolean;
+}
+
 interface AdminContextType {
-  users: any[];
+  users: User[];
   waitlist: WaitlistEntry[];
   taskAnalytics: any;
   userAnalytics: any;
@@ -32,10 +44,11 @@ interface AdminContextType {
     supportNote: string
   ) => Promise<void>;
   deleteWaitlistEntry: (email: string) => Promise<void>;
+  deleteUser: (userId: string) => Promise<void>;
   loading: boolean;
   error: string | null;
   isAdmin: boolean;
-  setUsers: React.Dispatch<React.SetStateAction<any[]>>;
+  setUsers: React.Dispatch<React.SetStateAction<User[]>>;
 }
 
 const AdminContext = createContext<AdminContextType | undefined>(undefined);
@@ -52,7 +65,7 @@ export function useAdmin() {
 export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
   children,
 }) => {
-  const [users, setUsers] = useState<any[]>([]);
+  const [users, setUsers] = useState<User[]>([]);
   const [waitlist, setWaitlist] = useState<WaitlistEntry[]>([]);
   const [taskAnalytics, setTaskAnalytics] = useState<any>(null);
   const [userAnalytics, setUserAnalytics] = useState<any>(null);
@@ -181,6 +194,23 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
     [api, loadWaitlist]
   );
 
+  const deleteUser = useCallback(
+    async (userId: string) => {
+      try {
+        setLoading(true);
+        await api.delete(`/api/admin/users/${userId}`);
+        await loadUsers(); // Reload users after deletion
+        setError(null);
+      } catch (err: any) {
+        setError(err.response?.data?.message || "Failed to delete user");
+        throw err; // Re-throw to allow component-level error handling
+      } finally {
+        setLoading(false);
+      }
+    },
+    [api, loadUsers]
+  );
+
   const value = {
     users,
     waitlist,
@@ -192,6 +222,7 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
     updateWaitlistStatus,
     updateWaitlistSupportNote,
     deleteWaitlistEntry,
+    deleteUser,
     loading,
     error,
     isAdmin: user?.isAdmin || false,

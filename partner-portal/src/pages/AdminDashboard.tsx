@@ -368,6 +368,8 @@ export default function AdminDashboard() {
   const [noteEditLoading, setNoteEditLoading] = useState(false);
   const [emailToDelete, setEmailToDelete] = useState<string | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [userIdToDelete, setUserIdToDelete] = useState<string | null>(null);
+  const [userDeleteConfirmOpen, setUserDeleteConfirmOpen] = useState(false);
   const { token } = useAuth();
 
   const {
@@ -383,6 +385,7 @@ export default function AdminDashboard() {
     error: adminError,
     updateWaitlistSupportNote,
     deleteWaitlistEntry,
+    deleteUser,
   } = useAdmin();
 
   useEffect(() => {
@@ -630,6 +633,38 @@ export default function AdminDashboard() {
       setLoading(false);
       setDeactivateDialogOpen(false);
       setSelectedUser(null);
+    }
+  };
+
+  const handleOpenUserDeleteConfirm = (userId: string) => {
+    setUserIdToDelete(userId);
+    setUserDeleteConfirmOpen(true);
+  };
+
+  const handleCloseUserDeleteConfirm = () => {
+    setUserIdToDelete(null);
+    setUserDeleteConfirmOpen(false);
+  };
+
+  const handleUserDeleteConfirmed = async () => {
+    if (userIdToDelete) {
+      try {
+        setLoading(true);
+        await deleteUser(userIdToDelete);
+        setSuccess(`User ${userIdToDelete} deleted successfully.`); // Consider showing email or a more user-friendly identifier
+        await loadUsers(); // Ensure user list is refreshed
+        handleCloseUserDeleteConfirm();
+      } catch (error) {
+        let errorMessage = "Failed to delete user";
+        if (axios.isAxiosError(error) && error.response?.data?.message) {
+          errorMessage = error.response.data.message;
+        } else if (error instanceof Error) {
+          errorMessage = error.message;
+        }
+        setError(errorMessage);
+      } finally {
+        setLoading(false);
+      }
     }
   };
 
@@ -1182,6 +1217,20 @@ export default function AdminDashboard() {
                                 startIcon={<PersonOffIcon />}
                               >
                                 Deactivate
+                              </Button>
+                            )}
+                            {!user.isAdmin && ( // Prevent deleting admin users
+                              <Button
+                                variant="outlined"
+                                color="error"
+                                size="small"
+                                onClick={() =>
+                                  handleOpenUserDeleteConfirm(user.userId)
+                                }
+                                startIcon={<DeleteIcon />}
+                                sx={{ ml: 1 }} // Add some margin if deactivate is also present
+                              >
+                                Delete User
                               </Button>
                             )}
                           </Box>
@@ -1829,6 +1878,31 @@ export default function AdminDashboard() {
           <Button onClick={handleCloseDeleteConfirm}>Cancel</Button>
           <Button onClick={handleDeleteConfirmed} color="error" autoFocus>
             Delete
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* User Delete Confirmation Dialog */}
+      <Dialog
+        open={userDeleteConfirmOpen}
+        onClose={handleCloseUserDeleteConfirm}
+        aria-labelledby="user-delete-dialog-title"
+        aria-describedby="user-delete-dialog-description"
+      >
+        <DialogTitle id="user-delete-dialog-title">
+          {"Confirm User Deletion"}
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText id="user-delete-dialog-description">
+            Are you sure you want to permanently delete this user (
+            {userIdToDelete})? This action cannot be undone and will remove all
+            associated data.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleCloseUserDeleteConfirm}>Cancel</Button>
+          <Button onClick={handleUserDeleteConfirmed} color="error" autoFocus>
+            Delete User
           </Button>
         </DialogActions>
       </Dialog>

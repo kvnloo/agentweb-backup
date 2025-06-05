@@ -1,30 +1,30 @@
-import AWS from 'aws-sdk';
-import dotenv from 'dotenv';
-import path from 'path';
-import { S3 } from 'aws-sdk';
+import AWS from "aws-sdk";
+import dotenv from "dotenv";
+import path from "path";
+import { S3 } from "aws-sdk";
 
 // Load environment variables from .env file
-dotenv.config({ path: path.resolve(__dirname, '../../.env') });
+dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
 // Get table prefix based on NODE_ENV (defaults to empty string for production)
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
 // For debugging
-console.log('Environment variables loaded:', {
-  environment: process.env.NODE_ENV || 'production',
+console.log("Environment variables loaded:", {
+  environment: process.env.NODE_ENV || "production",
   hasAccessKey: !!process.env.AWS_ACCESS_KEY_ID,
   hasSecretKey: !!process.env.AWS_SECRET_ACCESS_KEY,
   region: process.env.AWS_REGION,
-  tablePrefix: TABLE_PREFIX
+  tablePrefix: TABLE_PREFIX,
 });
 
 // Configure AWS SDK
 AWS.config.update({
-  region: process.env.AWS_REGION || 'us-west-2',
+  region: process.env.AWS_REGION || "us-west-2",
   credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || ''
-  }
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
+  },
 });
 
 const dynamodb = new AWS.DynamoDB.DocumentClient();
@@ -35,8 +35,10 @@ const s3 = new S3();
 // Helper function to handle DynamoDB errors
 const handleDynamoDbError = (error: any, operation: string) => {
   console.error(`DynamoDB ${operation} error:`, error);
-  if (error.code === 'CredentialsError') {
-    throw new Error('AWS credentials are invalid or missing. Please check your .env file');
+  if (error.code === "CredentialsError") {
+    throw new Error(
+      "AWS credentials are invalid or missing. Please check your .env file"
+    );
   }
   throw error;
 };
@@ -49,14 +51,14 @@ interface User {
   isAdmin: boolean;
   isActive: boolean;
   createdAt: string;
-  roles?: ('partner' | 'customer')[];
+  roles?: ("partner" | "customer")[];
 }
 
 interface UserInteraction {
   id: string;
   question: string;
   response?: string;
-  status: 'pending' | 'answered';
+  status: "pending" | "answered";
   timestamp: number;
 }
 
@@ -101,18 +103,21 @@ class UserDB {
   private tableName: string;
 
   constructor() {
-    console.log('Initializing DynamoDB with region:', process.env.AWS_REGION || 'us-west-2');
+    console.log(
+      "Initializing DynamoDB with region:",
+      process.env.AWS_REGION || "us-west-2"
+    );
     this.docClient = dynamodb;
     this.tableName = `${TABLE_PREFIX}AW-Users`;
   }
 
   private handleError(error: any, operation: string) {
     console.error(`DynamoDB ${operation} error:`, error);
-    if (error.code === 'ValidationException') {
+    if (error.code === "ValidationException") {
       throw new Error(`Validation error during ${operation}: ${error.message}`);
-    } else if (error.code === 'ResourceNotFoundException') {
+    } else if (error.code === "ResourceNotFoundException") {
       throw new Error(`Table not found during ${operation}: ${error.message}`);
-    } else if (error.code === 'AccessDeniedException') {
+    } else if (error.code === "AccessDeniedException") {
       throw new Error(`Access denied during ${operation}: ${error.message}`);
     } else {
       throw new Error(`Error during ${operation}: ${error.message}`);
@@ -120,12 +125,12 @@ class UserDB {
   }
 
   async createUser(
-    email: string, 
-    userId: string, 
-    password: string, 
-    isOAuthUser: boolean = false, 
+    email: string,
+    userId: string,
+    password: string,
+    isOAuthUser: boolean = false,
     isAdmin: boolean = false,
-    roles: ('partner' | 'customer')[] = ['partner'],
+    roles: ("partner" | "customer")[] = ["partner"],
     displayName?: string,
     googleId?: string
   ) {
@@ -137,7 +142,7 @@ class UserDB {
       isAdmin,
       isActive: true,
       createdAt: new Date().toISOString(),
-      roles
+      roles,
     };
 
     if (displayName) {
@@ -149,7 +154,7 @@ class UserDB {
 
     const params = {
       TableName: this.tableName,
-      Item: itemToCreate
+      Item: itemToCreate,
     };
 
     await this.docClient.put(params).promise();
@@ -158,11 +163,11 @@ class UserDB {
   async getUserByEmail(email: string) {
     const params = {
       TableName: this.tableName,
-      IndexName: 'EmailIndex',
-      KeyConditionExpression: 'email = :email',
+      IndexName: "EmailIndex",
+      KeyConditionExpression: "email = :email",
       ExpressionAttributeValues: {
-        ':email': email.toLowerCase()
-      }
+        ":email": email.toLowerCase(),
+      },
     };
 
     const result = await this.docClient.query(params).promise();
@@ -173,17 +178,17 @@ class UserDB {
     try {
       const params = {
         TableName: this.tableName,
-        IndexName: 'UserIdIndex',
-        KeyConditionExpression: 'userId = :userId',
+        IndexName: "UserIdIndex",
+        KeyConditionExpression: "userId = :userId",
         ExpressionAttributeValues: {
-          ':userId': userId
-        }
+          ":userId": userId,
+        },
       };
 
       const result = await this.docClient.query(params).promise();
       return result.Items?.[0];
     } catch (error) {
-      console.error('Error in getUserById:', error);
+      console.error("Error in getUserById:", error);
       throw error;
     }
   }
@@ -192,30 +197,34 @@ class UserDB {
     try {
       const params = {
         TableName: this.tableName,
-        Limit: 50
+        Limit: 50,
       };
 
       const result = await this.docClient.scan(params).promise();
       const users = result.Items || [];
 
       // Get task and workflow counts for each user
-      const usersWithCounts = await Promise.all(users.map(async (user) => {
-        // Get user's tasks
-        const tasks = await taskDb.getTasksByUserId(user.userId);
-        
-        // Get user's workflow count
-        const workflowCount = await workflowDb.getUserWorkflowCount(user.userId);
-        
-        return {
-          ...user,
-          taskCount: tasks ? tasks.length : 0,
-          workflowCount
-        } as UserWithCounts;
-      }));
+      const usersWithCounts = await Promise.all(
+        users.map(async (user) => {
+          // Get user's tasks
+          const tasks = await taskDb.getTasksByUserId(user.userId);
+
+          // Get user's workflow count
+          const workflowCount = await workflowDb.getUserWorkflowCount(
+            user.userId
+          );
+
+          return {
+            ...user,
+            taskCount: tasks ? tasks.length : 0,
+            workflowCount,
+          } as UserWithCounts;
+        })
+      );
 
       return usersWithCounts;
     } catch (error) {
-      console.error('Error in getAllUsers:', error);
+      console.error("Error in getAllUsers:", error);
       throw error;
     }
   }
@@ -223,7 +232,7 @@ class UserDB {
   async getUserAnalytics(startDate: string, endDate: string) {
     try {
       const params = {
-        TableName: this.tableName
+        TableName: this.tableName,
       };
 
       const result = await this.docClient.scan(params).promise();
@@ -231,13 +240,18 @@ class UserDB {
 
       return {
         totalUsers: users.length,
-        newUsers: users.filter(u => u.createdAt >= startDate && u.createdAt <= endDate).length,
-        oauthUsers: users.filter(u => u.isOAuthUser).length,
-        newOauthUsers: users.filter(u => u.isOAuthUser && u.createdAt >= startDate && u.createdAt <= endDate).length,
-        adminUsers: users.filter(u => u.isAdmin).length
+        newUsers: users.filter(
+          (u) => u.createdAt >= startDate && u.createdAt <= endDate
+        ).length,
+        oauthUsers: users.filter((u) => u.isOAuthUser).length,
+        newOauthUsers: users.filter(
+          (u) =>
+            u.isOAuthUser && u.createdAt >= startDate && u.createdAt <= endDate
+        ).length,
+        adminUsers: users.filter((u) => u.isAdmin).length,
       };
     } catch (error) {
-      console.error('Error in getUserAnalytics:', error);
+      console.error("Error in getUserAnalytics:", error);
       throw error;
     }
   }
@@ -247,39 +261,42 @@ class UserDB {
       // First get the user to get the email (primary key)
       const user = await this.getUserById(userId);
       if (!user) {
-        throw new Error('User not found');
+        throw new Error("User not found");
       }
 
       const params = {
         TableName: this.tableName,
         Key: {
-          email: user.email  // Using email as the primary key
+          email: user.email, // Using email as the primary key
         },
-        UpdateExpression: 'set isActive = :isActive',
+        UpdateExpression: "set isActive = :isActive",
         ExpressionAttributeValues: {
-          ':isActive': false
+          ":isActive": false,
         },
-        ReturnValues: 'ALL_NEW'
+        ReturnValues: "ALL_NEW",
       };
 
       const result = await this.docClient.update(params).promise();
       return result.Attributes;
     } catch (error) {
-      this.handleError(error, 'deactivateUser');
+      this.handleError(error, "deactivateUser");
     }
   }
 
-  async updateUser(userId: string, updates: Partial<{
-    roles: ('partner' | 'customer')[];
-    isAdmin: boolean;
-    isActive: boolean;
-    email: string;
-  }>) {
+  async updateUser(
+    userId: string,
+    updates: Partial<{
+      roles: ("partner" | "customer")[];
+      isAdmin: boolean;
+      isActive: boolean;
+      email: string;
+    }>
+  ) {
     try {
       // First get the user
       const user = await this.getUserById(userId);
       if (!user) {
-        throw new Error('User not found');
+        throw new Error("User not found");
       }
 
       // Create update expression and attribute values dynamically
@@ -301,19 +318,57 @@ class UserDB {
       const params = {
         TableName: this.tableName,
         Key: {
-          email: user.email  // Use email as the primary key, matching the schema
+          email: user.email, // Use email as the primary key, matching the schema
         },
-        UpdateExpression: `set ${updateExpressionParts.join(', ')}`,
+        UpdateExpression: `set ${updateExpressionParts.join(", ")}`,
         ExpressionAttributeNames: expressionAttributeNames,
         ExpressionAttributeValues: expressionAttributeValues,
-        ReturnValues: 'ALL_NEW'
+        ReturnValues: "ALL_NEW",
       };
 
       const result = await this.docClient.update(params).promise();
       return result.Attributes;
     } catch (error) {
-      console.error('Error in updateUser:', error);
+      console.error("Error in updateUser:", error);
       throw error;
+    }
+  }
+
+  async deleteUserById(
+    userId: string
+  ): Promise<{ success: boolean; message?: string }> {
+    try {
+      // First, get the user by userId to retrieve their email (the primary key)
+      const user = await this.getUserById(userId);
+      if (!user || !user.email) {
+        // This case should ideally not happen if userId is valid and user has an email
+        return { success: false, message: "User not found or email missing." };
+      }
+
+      // Prevent deletion of admin users as a safeguard, mirroring route logic
+      if (user.isAdmin) {
+        return {
+          success: false,
+          message: "Admin users cannot be deleted through this method.",
+        };
+      }
+
+      const params = {
+        TableName: this.tableName,
+        Key: {
+          email: user.email, // Use email as the primary key for deletion
+        },
+      };
+
+      await this.docClient.delete(params).promise();
+      return { success: true };
+    } catch (error: any) {
+      console.error(`Error deleting user ${userId}:`, error);
+      // It might be better to use this.handleError if it's adapted to return or set a structured error
+      return {
+        success: false,
+        message: error.message || `Failed to delete user ${userId}.`,
+      };
     }
   }
 }
@@ -350,13 +405,13 @@ export const taskDb = {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Tasks`,
-        Item: task
+        Item: task,
       };
 
       await dynamodb.put(params).promise();
       return task;
     } catch (error) {
-      handleDynamoDbError(error, 'createTask');
+      handleDynamoDbError(error, "createTask");
     }
   },
 
@@ -364,20 +419,21 @@ export const taskDb = {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Tasks`,
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, #epc, #vo, #adm',
+        ProjectionExpression:
+          "taskId, userId, #n, prompt, #s, createdAt, #epc, #vo, #adm",
         ExpressionAttributeNames: {
-          '#n': 'name',
-          '#s': 'status',
-          '#epc': 'extractPageContent',
-          '#vo': 'validateOutput',
-          '#adm': 'isAgenticDevMode'
-        }
+          "#n": "name",
+          "#s": "status",
+          "#epc": "extractPageContent",
+          "#vo": "validateOutput",
+          "#adm": "isAgenticDevMode",
+        },
       };
 
       const result = await dynamodb.scan(params).promise();
       return result.Items || [];
     } catch (error) {
-      handleDynamoDbError(error, 'getAllTasks');
+      handleDynamoDbError(error, "getAllTasks");
     }
   },
 
@@ -385,17 +441,17 @@ export const taskDb = {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-        IndexName: 'TaskIdIndex',
-        KeyConditionExpression: 'taskId = :taskId',
+        IndexName: "TaskIdIndex",
+        KeyConditionExpression: "taskId = :taskId",
         ExpressionAttributeValues: {
-          ':taskId': taskId
-        }
+          ":taskId": taskId,
+        },
       };
 
       const result = await dynamodb.query(params).promise();
       return result.Items || [];
     } catch (error) {
-      handleDynamoDbError(error, 'getTaskSchedules');
+      handleDynamoDbError(error, "getTaskSchedules");
     }
   },
 
@@ -403,51 +459,56 @@ export const taskDb = {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Tasks`,
-        IndexName: 'UserTasksIndex',
-        KeyConditionExpression: 'userId = :userId',
+        IndexName: "UserTasksIndex",
+        KeyConditionExpression: "userId = :userId",
         ExpressionAttributeValues: {
-          ':userId': userId
+          ":userId": userId,
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, #adm, category, description, templateId',
+        ProjectionExpression:
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, #adm, category, description, templateId",
         ExpressionAttributeNames: {
-          '#n': 'name',
-          '#s': 'status',
-          '#e': 'error',
-          '#sum': 'summary',
-          '#epc': 'extractPageContent',
-          '#vo': 'validateOutput',
-          '#oaj': 'outputAsJson',
-          '#oah': 'outputAsHtml',
-          '#adm': 'isAgenticDevMode'
-        }
+          "#n": "name",
+          "#s": "status",
+          "#e": "error",
+          "#sum": "summary",
+          "#epc": "extractPageContent",
+          "#vo": "validateOutput",
+          "#oaj": "outputAsJson",
+          "#oah": "outputAsHtml",
+          "#adm": "isAgenticDevMode",
+        },
       };
 
       const result = await dynamodb.query(params).promise();
       const tasks = result.Items || [];
 
       // Get latest execution, schedules and subscribers for each task
-      const tasksWithDetails = await Promise.all(tasks.map(async (task) => {
-        const [executions, schedules, subscribers] = await Promise.all([
-          this.getTaskExecutions(task.taskId),
-          this.getTaskSchedules(task.taskId),
-          subscriberDb.getTaskSubscribers(task.taskId)
-        ]);
-        
-        // Filter out archived executions and get the latest one
-        const nonArchivedExecutions = executions?.filter(exec => !exec.archived) || [];
-        const latestExecution = nonArchivedExecutions.length > 0 ? nonArchivedExecutions[0] : null;
-        
-        return {
-          ...task,
-          latestExecution,
-          scheduleCount: schedules ? schedules.length : 0,
-          subscriberCount: subscribers ? subscribers.length : 0
-        };
-      }));
+      const tasksWithDetails = await Promise.all(
+        tasks.map(async (task) => {
+          const [executions, schedules, subscribers] = await Promise.all([
+            this.getTaskExecutions(task.taskId),
+            this.getTaskSchedules(task.taskId),
+            subscriberDb.getTaskSubscribers(task.taskId),
+          ]);
+
+          // Filter out archived executions and get the latest one
+          const nonArchivedExecutions =
+            executions?.filter((exec) => !exec.archived) || [];
+          const latestExecution =
+            nonArchivedExecutions.length > 0 ? nonArchivedExecutions[0] : null;
+
+          return {
+            ...task,
+            latestExecution,
+            scheduleCount: schedules ? schedules.length : 0,
+            subscriberCount: subscribers ? subscribers.length : 0,
+          };
+        })
+      );
 
       return tasksWithDetails;
     } catch (error) {
-      handleDynamoDbError(error, 'getTasksByUserId');
+      handleDynamoDbError(error, "getTasksByUserId");
     }
   },
 
@@ -456,56 +517,60 @@ export const taskDb = {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Tasks`,
         Key: {
-          taskId
+          taskId,
         },
-        ProjectionExpression: 'taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase',
+        ProjectionExpression:
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase",
         ExpressionAttributeNames: {
-          '#n': 'name',
-          '#s': 'status',
-          '#e': 'error',
-          '#sum': 'summary',
-          '#en': 'emailNotification',
-          '#i': 'isInteractive',
-          '#dr': 'isDeepResearch',
-          '#llm': 'llmName',
-          '#ct': 'isComplexTask',
-          '#epc': 'extractPageContent',
-          '#vo': 'validateOutput',
-          '#oaj': 'outputAsJson',
-          '#oah': 'outputAsHtml',
-          '#adm': 'isAgenticDevMode'
-        }
+          "#n": "name",
+          "#s": "status",
+          "#e": "error",
+          "#sum": "summary",
+          "#en": "emailNotification",
+          "#i": "isInteractive",
+          "#dr": "isDeepResearch",
+          "#llm": "llmName",
+          "#ct": "isComplexTask",
+          "#epc": "extractPageContent",
+          "#vo": "validateOutput",
+          "#oaj": "outputAsJson",
+          "#oah": "outputAsHtml",
+          "#adm": "isAgenticDevMode",
+        },
       };
 
       const result = await dynamodb.get(params).promise();
       return result.Item;
     } catch (error) {
-      handleDynamoDbError(error, 'getTaskById');
+      handleDynamoDbError(error, "getTaskById");
     }
   },
 
-  async updateTask(taskId: string, updates: Partial<{
-    name: string;
-    prompt: string;
-    status: string;
-    error: string;
-    summary: string;
-    emailNotification: boolean;
-    isInteractive: boolean;
-    isDeepResearch: boolean;
-    isComplexTask: boolean;
-    extractPageContent: boolean;
-    validateOutput: boolean;
-    outputAsJson: boolean;
-    outputAsHtml: boolean;
-    isAgenticDevMode: boolean;
-    llmName: string | null;
-    attachments: TaskAttachment[];
-    selectedLLMs?: string[];
-    useSharedBrowser?: boolean;
-    turnOffHeadless?: boolean;
-    knowledgeBase?: string;
-  }>) {
+  async updateTask(
+    taskId: string,
+    updates: Partial<{
+      name: string;
+      prompt: string;
+      status: string;
+      error: string;
+      summary: string;
+      emailNotification: boolean;
+      isInteractive: boolean;
+      isDeepResearch: boolean;
+      isComplexTask: boolean;
+      extractPageContent: boolean;
+      validateOutput: boolean;
+      outputAsJson: boolean;
+      outputAsHtml: boolean;
+      isAgenticDevMode: boolean;
+      llmName: string | null;
+      attachments: TaskAttachment[];
+      selectedLLMs?: string[];
+      useSharedBrowser?: boolean;
+      turnOffHeadless?: boolean;
+      knowledgeBase?: string;
+    }>
+  ) {
     try {
       const setClauses: string[] = [];
       const removeClauses: string[] = [];
@@ -513,10 +578,12 @@ export const taskDb = {
       const expressionAttributeValues: { [key: string]: any } = {};
 
       Object.entries(updates).forEach(([key, value]) => {
-        if (value === null) { // Attribute to be removed
+        if (value === null) {
+          // Attribute to be removed
           removeClauses.push(`#${key}`);
           expressionAttributeNames[`#${key}`] = key;
-        } else if (value !== undefined) { // Attribute to be set/updated
+        } else if (value !== undefined) {
+          // Attribute to be set/updated
           setClauses.push(`#${key} = :${key}`);
           expressionAttributeNames[`#${key}`] = key;
           expressionAttributeValues[`:${key}`] = value;
@@ -524,48 +591,53 @@ export const taskDb = {
       });
 
       if (setClauses.length === 0 && removeClauses.length === 0) {
-        console.warn(`[db.ts] updateTask called for taskId ${taskId} with no effective update operations. Returning current task attributes.`);
+        console.warn(
+          `[db.ts] updateTask called for taskId ${taskId} with no effective update operations. Returning current task attributes.`
+        );
         // Optionally, you might want to fetch and return the current task if no updates are made.
         const currentTaskAttributes = await this.getTaskById(taskId);
         return currentTaskAttributes;
       }
 
-      let updateExpression = '';
+      let updateExpression = "";
       if (setClauses.length > 0) {
-        updateExpression += `SET ${setClauses.join(', ')}`;
+        updateExpression += `SET ${setClauses.join(", ")}`;
       }
       if (removeClauses.length > 0) {
         if (updateExpression.length > 0) {
-          updateExpression += ' '; // Add space if SET clauses exist
+          updateExpression += " "; // Add space if SET clauses exist
         }
-        updateExpression += `REMOVE ${removeClauses.join(', ')}`;
+        updateExpression += `REMOVE ${removeClauses.join(", ")}`;
       }
 
       const params: AWS.DynamoDB.DocumentClient.UpdateItemInput = {
         TableName: `${TABLE_PREFIX}AW-Tasks`,
         Key: { taskId },
         UpdateExpression: updateExpression,
-        ReturnValues: 'ALL_NEW'
+        ReturnValues: "ALL_NEW",
       };
 
       if (Object.keys(expressionAttributeNames).length > 0) {
         params.ExpressionAttributeNames = expressionAttributeNames;
       }
-      
+
       // ExpressionAttributeValues should only be added if there are value placeholders (i.e., if setClauses is not empty)
       // This also means expressionAttributeValues will not be empty if setClauses is not empty.
       if (Object.keys(expressionAttributeValues).length > 0) {
         params.ExpressionAttributeValues = expressionAttributeValues;
       }
-      
-      console.log(`[db.ts] DynamoDB updateTask params for taskId ${taskId}:`, JSON.stringify(params, null, 2)); // Added log
+
+      console.log(
+        `[db.ts] DynamoDB updateTask params for taskId ${taskId}:`,
+        JSON.stringify(params, null, 2)
+      ); // Added log
 
       const result = await dynamodb.update(params).promise();
-      console.log('[db.ts] DynamoDB updateTask result:', result);
+      console.log("[db.ts] DynamoDB updateTask result:", result);
       return result.Attributes;
     } catch (error) {
       console.error(`[db.ts] Error in updateTask for taskId ${taskId}:`, error);
-      handleDynamoDbError(error, 'updateTask');
+      handleDynamoDbError(error, "updateTask");
     }
   },
 
@@ -574,13 +646,13 @@ export const taskDb = {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Tasks`,
         Key: {
-          taskId
-        }
+          taskId,
+        },
       };
 
       await dynamodb.delete(params).promise();
     } catch (error) {
-      handleDynamoDbError(error, 'deleteTask');
+      handleDynamoDbError(error, "deleteTask");
     }
   },
 
@@ -595,13 +667,13 @@ export const taskDb = {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
-        Item: execution
+        Item: execution,
       };
 
       await dynamodb.put(params).promise();
       return execution;
     } catch (error) {
-      handleDynamoDbError(error, 'createTaskExecution');
+      handleDynamoDbError(error, "createTaskExecution");
     }
   },
 
@@ -610,27 +682,30 @@ export const taskDb = {
       const params = {
         TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
         Key: {
-          executionId
-        }
+          executionId,
+        },
       };
 
       const result = await dynamodb.get(params).promise();
       return result.Item;
     } catch (error) {
-      handleDynamoDbError(error, 'getTaskExecutionById');
+      handleDynamoDbError(error, "getTaskExecutionById");
     }
   },
 
-  async updateTaskExecution(executionId: string, updates: Partial<{
-    status: string;
-    error: string;
-    result: string;
-    completedAt: string;
-    feedback: 'accepted' | 'rejected' | null;
-    userInteractions: UserInteraction[];
-    shareToken: string;
-    knowledge_base_updated_at: string;
-  }>) {
+  async updateTaskExecution(
+    executionId: string,
+    updates: Partial<{
+      status: string;
+      error: string;
+      result: string;
+      completedAt: string;
+      feedback: "accepted" | "rejected" | null;
+      userInteractions: UserInteraction[];
+      shareToken: string;
+      knowledge_base_updated_at: string;
+    }>
+  ) {
     try {
       const updateExpressions: string[] = [];
       const expressionAttributeNames: { [key: string]: string } = {};
@@ -650,20 +725,20 @@ export const taskDb = {
       const params = {
         TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
         Key: {
-          executionId
+          executionId,
         },
-        UpdateExpression: updateExpressions.join(', '),
+        UpdateExpression: updateExpressions.join(", "),
         ExpressionAttributeNames: expressionAttributeNames,
         ...(Object.keys(expressionAttributeValues).length > 0 && {
-          ExpressionAttributeValues: expressionAttributeValues
+          ExpressionAttributeValues: expressionAttributeValues,
         }),
-        ReturnValues: 'ALL_NEW'
+        ReturnValues: "ALL_NEW",
       };
 
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
     } catch (error) {
-      handleDynamoDbError(error, 'updateTaskExecution');
+      handleDynamoDbError(error, "updateTaskExecution");
     }
   },
 
@@ -671,20 +746,20 @@ export const taskDb = {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
-        IndexName: 'StatusCreatedAtIndex',
-        KeyConditionExpression: '#status = :status',
+        IndexName: "StatusCreatedAtIndex",
+        KeyConditionExpression: "#status = :status",
         ExpressionAttributeNames: {
-          '#status': 'status'
+          "#status": "status",
         },
         ExpressionAttributeValues: {
-          ':status': 'pending'
-        }
+          ":status": "pending",
+        },
       };
 
       const result = await dynamodb.query(params).promise();
       return result.Items;
     } catch (error) {
-      handleDynamoDbError(error, 'getPendingTaskExecutions');
+      handleDynamoDbError(error, "getPendingTaskExecutions");
     }
   },
 
@@ -692,18 +767,18 @@ export const taskDb = {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
-        IndexName: 'TaskIdIndex',
-        KeyConditionExpression: 'taskId = :taskId',
+        IndexName: "TaskIdIndex",
+        KeyConditionExpression: "taskId = :taskId",
         ExpressionAttributeValues: {
-          ':taskId': taskId
+          ":taskId": taskId,
         },
-        ScanIndexForward: false  // Get latest executions first
+        ScanIndexForward: false, // Get latest executions first
       };
 
       const result = await dynamodb.query(params).promise();
       return result.Items || [];
     } catch (error) {
-      handleDynamoDbError(error, 'getTaskExecutions');
+      handleDynamoDbError(error, "getTaskExecutions");
     }
   },
 
@@ -711,7 +786,7 @@ export const taskDb = {
     try {
       // Get all tasks (no date filter)
       const taskParams = {
-        TableName: `${TABLE_PREFIX}AW-Tasks`
+        TableName: `${TABLE_PREFIX}AW-Tasks`,
       };
 
       const taskResult = await dynamodb.scan(taskParams).promise();
@@ -719,7 +794,7 @@ export const taskDb = {
 
       // Get all executions (no date filter)
       const executionParams = {
-        TableName: `${TABLE_PREFIX}AW-TaskExecutions`
+        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
       };
 
       const executionResult = await dynamodb.scan(executionParams).promise();
@@ -727,126 +802,177 @@ export const taskDb = {
 
       // Get all schedules (no date filter)
       const scheduleParams = {
-        TableName: `${TABLE_PREFIX}AW-TaskSchedules`
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
       };
-      
+
       const scheduleResult = await dynamodb.scan(scheduleParams).promise();
       const schedules = scheduleResult.Items || [];
 
       // Get all templates (no date filter)
       const templateParams = {
-        TableName: `${TABLE_PREFIX}AW-TaskTemplates`
+        TableName: `${TABLE_PREFIX}AW-TaskTemplates`,
       };
-      
+
       const templateResult = await dynamodb.scan(templateParams).promise();
       const templates = templateResult.Items || [];
 
       // Get all configurations (no date filter)
       const configParams = {
-        TableName: `${TABLE_PREFIX}AW-Configs`
+        TableName: `${TABLE_PREFIX}AW-Configs`,
       };
-      
+
       const configResult = await dynamodb.scan(configParams).promise();
       const configs = configResult.Items || [];
-      
+
       // Get all workflows (no date filter)
       const workflowParams = {
-        TableName: `${TABLE_PREFIX}AW-Workflows`
+        TableName: `${TABLE_PREFIX}AW-Workflows`,
       };
-      
+
       const workflowResult = await dynamodb.scan(workflowParams).promise();
       const workflows = workflowResult.Items || [];
-      
+
       // Get all workflow executions (no date filter)
       const workflowExecParams = {
-        TableName: `${TABLE_PREFIX}AW-WorkflowExecutions`
+        TableName: `${TABLE_PREFIX}AW-WorkflowExecutions`,
       };
-      
-      const workflowExecResult = await dynamodb.scan(workflowExecParams).promise();
+
+      const workflowExecResult = await dynamodb
+        .scan(workflowExecParams)
+        .promise();
       const workflowExecutions = workflowExecResult.Items || [];
 
       return {
         totalTasks: tasks.length,
-        newTasks: tasks.filter(t => t.createdAt >= startDate && t.createdAt <= endDate).length,
+        newTasks: tasks.filter(
+          (t) => t.createdAt >= startDate && t.createdAt <= endDate
+        ).length,
         totalExecutions: executions.length,
-        successfulExecutions: executions.filter(e => e.status === 'completed').length,
-        failedExecutions: executions.filter(e => e.status === 'failed').length,
-        newExecutions: executions.filter(e => e.startTime >= startDate && e.startTime <= endDate).length,
+        successfulExecutions: executions.filter((e) => e.status === "completed")
+          .length,
+        failedExecutions: executions.filter((e) => e.status === "failed")
+          .length,
+        newExecutions: executions.filter(
+          (e) => e.startTime >= startDate && e.startTime <= endDate
+        ).length,
         scheduledTasks: schedules.length,
-        newScheduledTasks: schedules.filter(s => s.createdAt >= startDate && s.createdAt <= endDate).length,
+        newScheduledTasks: schedules.filter(
+          (s) => s.createdAt >= startDate && s.createdAt <= endDate
+        ).length,
         templates: templates.length,
-        newTemplates: templates.filter(t => t.createdAt >= startDate && t.createdAt <= endDate).length,
-        websiteConfigs: configs.filter(c => !c.isApiConfig).length,
-        newWebsiteConfigs: configs.filter(c => !c.isApiConfig && c.createdAt >= startDate && c.createdAt <= endDate).length,
-        apiConfigs: configs.filter(c => c.isApiConfig === true).length,
-        newApiConfigs: configs.filter(c => c.isApiConfig === true && c.createdAt >= startDate && c.createdAt <= endDate).length,
-        sharedConfigs: configs.filter(c => c.sharedBy || c.sharedConfigIds).length,
+        newTemplates: templates.filter(
+          (t) => t.createdAt >= startDate && t.createdAt <= endDate
+        ).length,
+        websiteConfigs: configs.filter((c) => !c.isApiConfig).length,
+        newWebsiteConfigs: configs.filter(
+          (c) =>
+            !c.isApiConfig && c.createdAt >= startDate && c.createdAt <= endDate
+        ).length,
+        apiConfigs: configs.filter((c) => c.isApiConfig === true).length,
+        newApiConfigs: configs.filter(
+          (c) =>
+            c.isApiConfig === true &&
+            c.createdAt >= startDate &&
+            c.createdAt <= endDate
+        ).length,
+        sharedConfigs: configs.filter((c) => c.sharedBy || c.sharedConfigIds)
+          .length,
         totalWorkflows: workflows.length,
-        newWorkflows: workflows.filter(w => w.createdAt >= startDate && w.createdAt <= endDate).length,
+        newWorkflows: workflows.filter(
+          (w) => w.createdAt >= startDate && w.createdAt <= endDate
+        ).length,
         workflowExecutions: workflowExecutions.length,
-        newWorkflowExecutions: workflowExecutions.filter(e => e.startTime >= startDate && e.startTime <= endDate).length,
-        successfulWorkflowExecutions: workflowExecutions.filter(e => e.status === 'success' || e.status === 'completed').length,
-        failedWorkflowExecutions: workflowExecutions.filter(e => e.status === 'failed').length,
-        pendingWorkflowExecutions: workflowExecutions.filter(e => e.status === 'pending' || e.status === 'running').length,
+        newWorkflowExecutions: workflowExecutions.filter(
+          (e) => e.startTime >= startDate && e.startTime <= endDate
+        ).length,
+        successfulWorkflowExecutions: workflowExecutions.filter(
+          (e) => e.status === "success" || e.status === "completed"
+        ).length,
+        failedWorkflowExecutions: workflowExecutions.filter(
+          (e) => e.status === "failed"
+        ).length,
+        pendingWorkflowExecutions: workflowExecutions.filter(
+          (e) => e.status === "pending" || e.status === "running"
+        ).length,
         workflowExecutionStatusBreakdown: Object.entries(
           workflowExecutions.reduce<Record<string, number>>((acc, exec) => {
-            acc[exec.status || 'unknown'] = (acc[exec.status || 'unknown'] || 0) + 1;
+            acc[exec.status || "unknown"] =
+              (acc[exec.status || "unknown"] || 0) + 1;
             return acc;
           }, {})
         ),
-        averageExecutionTime: executions
-          .filter(e => e.status === 'completed' && e.completedAt)
-          .reduce((acc, e) => {
-            return acc + (new Date(e.completedAt!).getTime() - new Date(e.startTime).getTime());
-          }, 0) / (executions.filter(e => e.status === 'completed' && e.completedAt).length || 1)
+        averageExecutionTime:
+          executions
+            .filter((e) => e.status === "completed" && e.completedAt)
+            .reduce((acc, e) => {
+              return (
+                acc +
+                (new Date(e.completedAt!).getTime() -
+                  new Date(e.startTime).getTime())
+              );
+            }, 0) /
+          (executions.filter((e) => e.status === "completed" && e.completedAt)
+            .length || 1),
       };
     } catch (error) {
-      console.error('Error in getTaskAnalytics:', error);
+      console.error("Error in getTaskAnalytics:", error);
       throw error;
     }
   },
 
-  async addAttachment(taskId: string, file: {
-    originalname: string;
-    buffer: Buffer;
-    mimetype: string;
-  }) {
+  async addAttachment(
+    taskId: string,
+    file: {
+      originalname: string;
+      buffer: Buffer;
+      mimetype: string;
+    }
+  ) {
     try {
       // Get current task to check attachment count
       const task = await this.getTaskById(taskId);
-      if (!task) throw new Error('Task not found');
+      if (!task) throw new Error("Task not found");
 
       // Check attachment limit
       const currentAttachments = task.attachments || [];
       if (currentAttachments.length >= 5) {
-        throw new Error('Maximum number of attachments (5) reached');
+        throw new Error("Maximum number of attachments (5) reached");
       }
 
       // Generate a random token (32 characters)
       const randomToken = Array.from(crypto.getRandomValues(new Uint8Array(16)))
-        .map(b => b.toString(16).padStart(2, '0'))
-        .join('');
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
 
-      const key = `tasks/${taskId}/attachments/${Date.now()}-${randomToken}-${file.originalname}`;
-      
+      const key = `tasks/${taskId}/attachments/${Date.now()}-${randomToken}-${
+        file.originalname
+      }`;
+
       // Upload to S3 without ACL setting
-      await s3.putObject({
-        Bucket: process.env.AWS_S3_BUCKET || 'agentweb-user-files',
-        Key: key,
-        Body: file.buffer,
-        ContentType: file.mimetype
-      }).promise();
+      await s3
+        .putObject({
+          Bucket: process.env.AWS_S3_BUCKET || "agentweb-user-files",
+          Key: key,
+          Body: file.buffer,
+          ContentType: file.mimetype,
+        })
+        .promise();
 
       // Generate regular S3 URL
-      const url = `https://${process.env.AWS_S3_BUCKET || 'agentweb-user-files'}.s3.${process.env.AWS_REGION || 'us-west-2'}.amazonaws.com/${key}`;
+      const url = `https://${
+        process.env.AWS_S3_BUCKET || "agentweb-user-files"
+      }.s3.${process.env.AWS_REGION || "us-west-2"}.amazonaws.com/${key}`;
 
       // Update task with attachment URL
-      const attachments = [...currentAttachments, {
-        url,
-        key,
-        filename: file.originalname,
-        uploadedAt: new Date().toISOString()
-      }];
+      const attachments = [
+        ...currentAttachments,
+        {
+          url,
+          key,
+          filename: file.originalname,
+          uploadedAt: new Date().toISOString(),
+        },
+      ];
 
       await this.updateTask(taskId, { attachments });
 
@@ -855,26 +981,30 @@ export const taskDb = {
       if (error instanceof Error) {
         throw error; // Re-throw the attachment limit error
       }
-      handleDynamoDbError(error, 'addAttachment');
+      handleDynamoDbError(error, "addAttachment");
     }
   },
 
   async deleteAttachment(taskId: string, key: string) {
     try {
       // Delete from S3
-      await s3.deleteObject({
-        Bucket: process.env.AWS_S3_BUCKET || 'agentweb-user-files',
-        Key: key
-      }).promise();
+      await s3
+        .deleteObject({
+          Bucket: process.env.AWS_S3_BUCKET || "agentweb-user-files",
+          Key: key,
+        })
+        .promise();
 
       // Update task to remove attachment
       const task = await this.getTaskById(taskId);
-      if (!task) throw new Error('Task not found');
+      if (!task) throw new Error("Task not found");
 
-      const attachments = (task.attachments || []).filter((a: TaskAttachment) => a.key !== key);
+      const attachments = (task.attachments || []).filter(
+        (a: TaskAttachment) => a.key !== key
+      );
       await this.updateTask(taskId, { attachments });
     } catch (error) {
-      handleDynamoDbError(error, 'deleteAttachment');
+      handleDynamoDbError(error, "deleteAttachment");
     }
   },
 
@@ -882,13 +1012,13 @@ export const taskDb = {
     const params = {
       TableName: `${TABLE_PREFIX}AW-Tasks`,
       Key: {
-        taskId
+        taskId,
       },
-      UpdateExpression: 'set userId = :userId',
+      UpdateExpression: "set userId = :userId",
       ExpressionAttributeValues: {
-        ':userId': newOwnerId
+        ":userId": newOwnerId,
       },
-      ReturnValues: 'ALL_NEW'
+      ReturnValues: "ALL_NEW",
     };
 
     const result = await dynamodb.update(params).promise();
@@ -899,14 +1029,14 @@ export const taskDb = {
     const params = {
       TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
       Key: {
-        executionId
+        executionId,
       },
-      UpdateExpression: 'SET archived = :archived, archivedAt = :archivedAt',
+      UpdateExpression: "SET archived = :archived, archivedAt = :archivedAt",
       ExpressionAttributeValues: {
-        ':archived': true,
-        ':archivedAt': new Date().toISOString()
+        ":archived": true,
+        ":archivedAt": new Date().toISOString(),
       },
-      ReturnValues: 'ALL_NEW'
+      ReturnValues: "ALL_NEW",
     };
 
     const result = await dynamodb.update(params).promise();
@@ -917,10 +1047,10 @@ export const taskDb = {
     const params = {
       TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
       Key: {
-        executionId
+        executionId,
       },
-      UpdateExpression: 'REMOVE archived, archivedAt',
-      ReturnValues: 'ALL_NEW'
+      UpdateExpression: "REMOVE archived, archivedAt",
+      ReturnValues: "ALL_NEW",
     };
 
     const result = await dynamodb.update(params).promise();
@@ -932,21 +1062,21 @@ export const taskDb = {
       const params = {
         TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
         Key: {
-          executionId
+          executionId,
         },
-        UpdateExpression: 'SET killRequested = :killRequested',
+        UpdateExpression: "SET killRequested = :killRequested",
         ExpressionAttributeValues: {
-          ':killRequested': new Date().toISOString()
+          ":killRequested": new Date().toISOString(),
         },
-        ReturnValues: 'UPDATED_NEW'
+        ReturnValues: "UPDATED_NEW",
       };
 
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
     } catch (error) {
-      handleDynamoDbError(error, 'killTaskExecution');
+      handleDynamoDbError(error, "killTaskExecution");
     }
-  }
+  },
 };
 
 export const waitlistDb = {
@@ -954,13 +1084,13 @@ export const waitlistDb = {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Waitlist`,
-        Item: entry
+        Item: entry,
       };
 
       await dynamodb.put(params).promise();
       return entry;
     } catch (error) {
-      handleDynamoDbError(error, 'addToWaitlist');
+      handleDynamoDbError(error, "addToWaitlist");
     }
   },
 
@@ -969,14 +1099,14 @@ export const waitlistDb = {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Waitlist`,
         Key: {
-          email
-        }
+          email,
+        },
       };
 
       const result = await dynamodb.get(params).promise();
       return result.Item;
     } catch (error) {
-      handleDynamoDbError(error, 'getWaitlistByEmail');
+      handleDynamoDbError(error, "getWaitlistByEmail");
     }
   },
 
@@ -985,19 +1115,19 @@ export const waitlistDb = {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Waitlist`,
         Limit: 50,
-        ...(lastEvaluatedKey && { ExclusiveStartKey: lastEvaluatedKey })
+        ...(lastEvaluatedKey && { ExclusiveStartKey: lastEvaluatedKey }),
       };
 
       const result = await dynamodb.scan(params).promise();
       return {
         items: result.Items || [],
-        lastEvaluatedKey: result.LastEvaluatedKey
+        lastEvaluatedKey: result.LastEvaluatedKey,
       };
     } catch (error) {
-      console.error('Error listing waitlist:', error);
+      console.error("Error listing waitlist:", error);
       throw error;
     }
-  }
+  },
 };
 
 export const scheduleDb = {
@@ -1005,9 +1135,9 @@ export const scheduleDb = {
     scheduleId: string;
     taskId: string;
     userId: string;
-    frequency: string;  // 'daily', 'weekly', 'monthly', or cron expression
+    frequency: string; // 'daily', 'weekly', 'monthly', or cron expression
     nextRunTime: string;
-    status: string;  // 'active' or 'inactive'
+    status: string; // 'active' or 'inactive'
     createdAt: string;
     lastRunTime?: string;
     timezone?: string;
@@ -1015,13 +1145,13 @@ export const scheduleDb = {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-        Item: schedule
+        Item: schedule,
       };
 
       await dynamodb.put(params).promise();
       return schedule;
     } catch (error) {
-      handleDynamoDbError(error, 'createSchedule');
+      handleDynamoDbError(error, "createSchedule");
     }
   },
 
@@ -1029,17 +1159,17 @@ export const scheduleDb = {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-        IndexName: 'TaskIdIndex',
-        KeyConditionExpression: 'taskId = :taskId',
+        IndexName: "TaskIdIndex",
+        KeyConditionExpression: "taskId = :taskId",
         ExpressionAttributeValues: {
-          ':taskId': taskId
-        }
+          ":taskId": taskId,
+        },
       };
 
       const result = await dynamodb.query(params).promise();
       return result.Items || [];
     } catch (error) {
-      handleDynamoDbError(error, 'getSchedulesByTaskId');
+      handleDynamoDbError(error, "getSchedulesByTaskId");
     }
   },
 
@@ -1048,24 +1178,27 @@ export const scheduleDb = {
       const params = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: {
-          scheduleId
-        }
+          scheduleId,
+        },
       };
 
       const result = await dynamodb.get(params).promise();
       return result.Item;
     } catch (error) {
-      handleDynamoDbError(error, 'getScheduleById');
+      handleDynamoDbError(error, "getScheduleById");
     }
   },
 
-  async updateSchedule(scheduleId: string, updates: Partial<{
-    frequency: string;
-    nextRunTime: string;
-    status: string;
-    lastRunTime: string;
-    timezone: string;
-  }>) {
+  async updateSchedule(
+    scheduleId: string,
+    updates: Partial<{
+      frequency: string;
+      nextRunTime: string;
+      status: string;
+      lastRunTime: string;
+      timezone: string;
+    }>
+  ) {
     try {
       const updateExpressions: string[] = [];
       const expressionAttributeNames: { [key: string]: string } = {};
@@ -1080,18 +1213,18 @@ export const scheduleDb = {
       const params = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: {
-          scheduleId
+          scheduleId,
         },
-        UpdateExpression: `SET ${updateExpressions.join(', ')}`,
+        UpdateExpression: `SET ${updateExpressions.join(", ")}`,
         ExpressionAttributeNames: expressionAttributeNames,
         ExpressionAttributeValues: expressionAttributeValues,
-        ReturnValues: 'ALL_NEW'
+        ReturnValues: "ALL_NEW",
       };
 
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
     } catch (error) {
-      handleDynamoDbError(error, 'updateSchedule');
+      handleDynamoDbError(error, "updateSchedule");
     }
   },
 
@@ -1100,13 +1233,13 @@ export const scheduleDb = {
       const params = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: {
-          scheduleId
-        }
+          scheduleId,
+        },
       };
 
       await dynamodb.delete(params).promise();
     } catch (error) {
-      handleDynamoDbError(error, 'deleteSchedule');
+      handleDynamoDbError(error, "deleteSchedule");
     }
   },
 
@@ -1115,24 +1248,24 @@ export const scheduleDb = {
       const now = new Date().toISOString();
       const params = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-        IndexName: 'StatusNextRunTimeIndex',
-        KeyConditionExpression: '#status = :status AND #nextRunTime <= :now',
+        IndexName: "StatusNextRunTimeIndex",
+        KeyConditionExpression: "#status = :status AND #nextRunTime <= :now",
         ExpressionAttributeNames: {
-          '#status': 'status',
-          '#nextRunTime': 'nextRunTime'
+          "#status": "status",
+          "#nextRunTime": "nextRunTime",
         },
         ExpressionAttributeValues: {
-          ':status': 'active',
-          ':now': now
-        }
+          ":status": "active",
+          ":now": now,
+        },
       };
 
       const result = await dynamodb.query(params).promise();
       return result.Items || [];
     } catch (error) {
-      handleDynamoDbError(error, 'getPendingSchedules');
+      handleDynamoDbError(error, "getPendingSchedules");
     }
-  }
+  },
 };
 
 export const subscriberDb = {
@@ -1144,18 +1277,19 @@ export const subscriberDb = {
         Item: {
           taskId,
           email,
-          subscribedAt
+          subscribedAt,
         },
-        ConditionExpression: 'attribute_not_exists(taskId) AND attribute_not_exists(email)'
+        ConditionExpression:
+          "attribute_not_exists(taskId) AND attribute_not_exists(email)",
       };
 
       await dynamodb.put(params).promise();
       return { taskId, email, subscribedAt };
     } catch (error: any) {
-      if (error.code === 'ConditionalCheckFailedException') {
+      if (error.code === "ConditionalCheckFailedException") {
         throw new Error(`Email ${email} is already subscribed to this task`);
       }
-      handleDynamoDbError(error, 'addSubscriber');
+      handleDynamoDbError(error, "addSubscriber");
     }
   },
 
@@ -1165,13 +1299,13 @@ export const subscriberDb = {
         TableName: `${TABLE_PREFIX}AW-Subscribers`,
         Key: {
           taskId,
-          email
-        }
+          email,
+        },
       };
 
       await dynamodb.delete(params).promise();
     } catch (error) {
-      handleDynamoDbError(error, 'removeSubscriber');
+      handleDynamoDbError(error, "removeSubscriber");
     }
   },
 
@@ -1179,16 +1313,16 @@ export const subscriberDb = {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Subscribers`,
-        KeyConditionExpression: 'taskId = :taskId',
+        KeyConditionExpression: "taskId = :taskId",
         ExpressionAttributeValues: {
-          ':taskId': taskId
-        }
+          ":taskId": taskId,
+        },
       };
 
       const result = await dynamodb.query(params).promise();
       return result.Items || [];
     } catch (error) {
-      handleDynamoDbError(error, 'getTaskSubscribers');
+      handleDynamoDbError(error, "getTaskSubscribers");
     }
   },
 };
@@ -1199,21 +1333,21 @@ export const workflowDb = {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Workflows`,
-        IndexName: 'UserWorkflowsIndex',
-        KeyConditionExpression: 'userId = :userId',
+        IndexName: "UserWorkflowsIndex",
+        KeyConditionExpression: "userId = :userId",
         ExpressionAttributeValues: {
-          ':userId': userId
+          ":userId": userId,
         },
-        Select: 'COUNT'
+        Select: "COUNT",
       };
 
       const result = await dynamodb.query(params).promise();
       return result.Count || 0;
     } catch (error) {
-      console.error('Error getting workflow count:', error);
+      console.error("Error getting workflow count:", error);
       return 0;
     }
-  }
+  },
 };
 
 class TaskTemplateDB {
@@ -1228,14 +1362,14 @@ class TaskTemplateDB {
   async createTemplate(template: TaskTemplate) {
     const params = {
       TableName: this.tableName,
-      Item: template
+      Item: template,
     };
 
     try {
       await this.docClient.put(params).promise();
       return template;
     } catch (error) {
-      handleDynamoDbError(error, 'createTemplate');
+      handleDynamoDbError(error, "createTemplate");
       throw error;
     }
   }
@@ -1243,32 +1377,32 @@ class TaskTemplateDB {
   async getTemplatesByUserId(userId: string) {
     const params = {
       TableName: this.tableName,
-      IndexName: 'UserIdIndex',
-      KeyConditionExpression: 'userId = :userId',
+      IndexName: "UserIdIndex",
+      KeyConditionExpression: "userId = :userId",
       ExpressionAttributeValues: {
-        ':userId': userId
-      }
+        ":userId": userId,
+      },
     };
 
     try {
       const result = await this.docClient.query(params).promise();
       return result.Items as TaskTemplate[];
     } catch (error) {
-      handleDynamoDbError(error, 'getTemplatesByUserId');
+      handleDynamoDbError(error, "getTemplatesByUserId");
       throw error;
     }
   }
 
   async getAllTemplates() {
     const params = {
-      TableName: this.tableName
+      TableName: this.tableName,
     };
 
     try {
       const result = await this.docClient.scan(params).promise();
       return result.Items as TaskTemplate[];
     } catch (error) {
-      handleDynamoDbError(error, 'getAllTemplates');
+      handleDynamoDbError(error, "getAllTemplates");
       throw error;
     }
   }
@@ -1276,17 +1410,17 @@ class TaskTemplateDB {
   async getPublishedTemplates() {
     const params = {
       TableName: this.tableName,
-      FilterExpression: 'published = :published',
+      FilterExpression: "published = :published",
       ExpressionAttributeValues: {
-        ':published': true
-      }
+        ":published": true,
+      },
     };
 
     try {
       const result = await this.docClient.scan(params).promise();
       return result.Items as TaskTemplate[];
     } catch (error) {
-      handleDynamoDbError(error, 'getPublishedTemplates');
+      handleDynamoDbError(error, "getPublishedTemplates");
       throw error;
     }
   }
@@ -1295,20 +1429,23 @@ class TaskTemplateDB {
     const params = {
       TableName: this.tableName,
       Key: {
-        templateId
-      }
+        templateId,
+      },
     };
 
     try {
       const result = await this.docClient.get(params).promise();
       return result.Item as TaskTemplate;
     } catch (error) {
-      handleDynamoDbError(error, 'getTemplateById');
+      handleDynamoDbError(error, "getTemplateById");
       throw error;
     }
   }
 
-  async updateTemplate(templateId: string, updates: Partial<Omit<TaskTemplate, 'templateId' | 'userId' | 'createdAt'>>) {
+  async updateTemplate(
+    templateId: string,
+    updates: Partial<Omit<TaskTemplate, "templateId" | "userId" | "createdAt">>
+  ) {
     const updateExpressions: string[] = [];
     const expressionAttributeNames: Record<string, string> = {};
     const expressionAttributeValues: Record<string, any> = {};
@@ -1322,26 +1459,26 @@ class TaskTemplateDB {
     });
 
     // Always update the updatedAt timestamp
-    updateExpressions.push('#updatedAt = :updatedAt');
-    expressionAttributeNames['#updatedAt'] = 'updatedAt';
-    expressionAttributeValues[':updatedAt'] = new Date().toISOString();
+    updateExpressions.push("#updatedAt = :updatedAt");
+    expressionAttributeNames["#updatedAt"] = "updatedAt";
+    expressionAttributeValues[":updatedAt"] = new Date().toISOString();
 
     const params = {
       TableName: this.tableName,
       Key: {
-        templateId
+        templateId,
       },
-      UpdateExpression: `SET ${updateExpressions.join(', ')}`,
+      UpdateExpression: `SET ${updateExpressions.join(", ")}`,
       ExpressionAttributeNames: expressionAttributeNames,
       ExpressionAttributeValues: expressionAttributeValues,
-      ReturnValues: 'ALL_NEW'
+      ReturnValues: "ALL_NEW",
     };
 
     try {
       const result = await this.docClient.update(params).promise();
       return result.Attributes as TaskTemplate;
     } catch (error) {
-      handleDynamoDbError(error, 'updateTemplate');
+      handleDynamoDbError(error, "updateTemplate");
       throw error;
     }
   }
@@ -1350,18 +1487,18 @@ class TaskTemplateDB {
     const params = {
       TableName: this.tableName,
       Key: {
-        templateId
-      }
+        templateId,
+      },
     };
 
     try {
       await this.docClient.delete(params).promise();
       return { success: true };
     } catch (error) {
-      handleDynamoDbError(error, 'deleteTemplate');
+      handleDynamoDbError(error, "deleteTemplate");
       throw error;
     }
   }
 }
 
-export const taskTemplateDb = new TaskTemplateDB(); 
+export const taskTemplateDb = new TaskTemplateDB();
