@@ -37,29 +37,46 @@ const Register = () => {
     const emailParam = searchParams.get("email");
 
     if (sessionId) {
-      setIsLoading(true); // Optionally indicate loading while fetching email
+      setIsLoading(true);
       axios
         .get(buildApiUrl(`/api/stripe/session/${sessionId}`))
         .then((response) => {
           if (response.data && response.data.email) {
-            setEmail(response.data.email);
-            setIsEmailFromStripe(true); // Mark that email came from Stripe
+            if (response.data.existingUser === true) {
+              // User already exists, redirect to login
+              console.log(
+                "User already exists, redirecting to login with email:",
+                response.data.email
+              );
+              navigate(
+                `/login?email=${encodeURIComponent(
+                  response.data.email
+                )}&info=payment_success&stripe_customer_id=${encodeURIComponent(
+                  response.data.stripe_customer_id || ""
+                )}`
+              );
+            } else {
+              // New user or only on waitlist, pre-fill email for registration
+              setEmail(response.data.email);
+              setIsEmailFromStripe(true);
+            }
           }
         })
         .catch((err) => {
-          console.error("Failed to fetch email from Stripe session:", err);
-          // Optionally set a specific formError here
-          // If fetching email fails, user can still type it manually
+          console.error(
+            "Failed to fetch email/status from Stripe session:",
+            err
+          );
+          // Potentially set formError here if the API call itself fails significantly
+          // e.g., if (err.response && err.response.status === 404) { setFormError("Invalid payment session.") }
         })
         .finally(() => {
           setIsLoading(false);
         });
     } else if (emailParam) {
       setEmail(emailParam);
-      // Decide if emailParam from URL should also make the field read-only or behave differently
-      // For now, if 'email' param is present, it's not considered "from Stripe" for disabling logic.
     }
-  }, [searchParams]);
+  }, [searchParams, navigate]); // Added navigate to dependency array
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

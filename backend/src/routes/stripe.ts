@@ -51,9 +51,6 @@ router.get("/session/:sessionId", async (req: Request, res: Response) => {
   }
 
   try {
-    // Retrieve the session with expanded customer information
-    // Also expanding payment_intent.customer for cases where customer might be attached there
-    // and setup_intent.customer for subscription setups
     const session = await stripe.checkout.sessions.retrieve(sessionId, {
       expand: ["customer", "payment_intent.customer", "setup_intent.customer"],
     });
@@ -61,9 +58,8 @@ router.get("/session/:sessionId", async (req: Request, res: Response) => {
     let email: string | null = null;
     let fullName: string | undefined = undefined;
     let phoneNumber: string | undefined = undefined;
-    let stripeCustomerIdFromSession: string | undefined = undefined; // Variable to hold the customer ID
+    let stripeCustomerIdFromSession: string | undefined = undefined;
 
-    // Extract Stripe Customer ID first
     if (session.customer) {
       if (typeof session.customer === "string") {
         stripeCustomerIdFromSession = session.customer;
@@ -72,7 +68,7 @@ router.get("/session/:sessionId", async (req: Request, res: Response) => {
       }
     }
 
-    // 1. Check customer object directly attached to the session
+    // Extract email from various possible locations in the session object
     if (
       session.customer &&
       typeof session.customer === "object" &&
@@ -80,17 +76,13 @@ router.get("/session/:sessionId", async (req: Request, res: Response) => {
       session.customer.email
     ) {
       email = session.customer.email;
-      fullName = session.customer.name || undefined; // Get name from customer object
-      phoneNumber = session.customer.phone || undefined; // Get phone from customer object
-    }
-    // 2. Check customer_details (often used for guest checkouts)
-    else if (session.customer_details && session.customer_details.email) {
+      fullName = session.customer.name || undefined;
+      phoneNumber = session.customer.phone || undefined;
+    } else if (session.customer_details && session.customer_details.email) {
       email = session.customer_details.email;
-      fullName = session.customer_details.name || undefined; // Get name from customer_details
-      phoneNumber = session.customer_details.phone || undefined; // Get phone from customer_details
-    }
-    // 3. Check customer object on the PaymentIntent (if it exists)
-    else if (
+      fullName = session.customer_details.name || undefined;
+      phoneNumber = session.customer_details.phone || undefined;
+    } else if (
       session.payment_intent &&
       typeof session.payment_intent === "object" &&
       session.payment_intent.customer &&
@@ -101,9 +93,7 @@ router.get("/session/:sessionId", async (req: Request, res: Response) => {
       email = session.payment_intent.customer.email;
       fullName = session.payment_intent.customer.name || undefined;
       phoneNumber = session.payment_intent.customer.phone || undefined;
-    }
-    // 4. Check customer object on the SetupIntent (if it exists, e.g., for subscriptions)
-    else if (
+    } else if (
       session.setup_intent &&
       typeof session.setup_intent === "object" &&
       session.setup_intent.customer &&
@@ -117,98 +107,118 @@ router.get("/session/:sessionId", async (req: Request, res: Response) => {
     }
 
     if (email) {
-      // Attempt to add to waitlist before sending response
-      try {
-        const waitlistEntryData: any = {
-          // Use any type temporarily for easier object construction
+      email = email.toLowerCase(); // Normalize email
+      const existingUser = await userDb.getUserByEmail(email);
+
+      if (existingUser && existingUser.userId) {
+        console.log(
+          `Stripe session email ${email} matches existing user ${existingUser.userId}.`
+        );
+        let userStripeIdUpdated = false;
+        if (
+          stripeCustomerIdFromSession &&
+          existingUser.stripe_customer_id !== stripeCustomerIdFromSession
+        ) {
+          try {
+            await userDb.updateUser(existingUser.userId, {
+              stripe_customer_id: stripeCustomerIdFromSession,
+            });
+            console.log(
+              `Updated existing user ${existingUser.userId} with stripe_customer_id ${stripeCustomerIdFromSession}.`
+            );
+            userStripeIdUpdated = true;
+          } catch (userUpdateError) {
+            console.error(
+              `Failed to update stripe_customer_id for existing user ${existingUser.userId}:`,
+              userUpdateError
+            );
+          }
+        }
+
+        // Also update waitlist entry for consistency if user exists
+        if (stripeCustomerIdFromSession) {
+          // Only proceed if there's a stripe ID from the session
+          try {
+            const waitlistEntryForUser = await waitlistDb.getByEmail(email);
+            if (
+              waitlistEntryForUser &&
+              waitlistEntryForUser.stripe_customer_id !==
+                stripeCustomerIdFromSession
+            ) {
+              await waitlistDb.updateDetails(email, {
+                stripe_customer_id: stripeCustomerIdFromSession,
+              });
+              console.log(
+                `Updated waitlist entry for user ${email} with stripe_customer_id ${stripeCustomerIdFromSession}.`
+              );
+            } else if (
+              waitlistEntryForUser &&
+              waitlistEntryForUser.stripe_customer_id ===
+                stripeCustomerIdFromSession
+            ) {
+              console.log(
+                `Waitlist entry for user ${email} already has the correct stripe_customer_id.`
+              );
+            } else if (!waitlistEntryForUser) {
+              // If user exists but somehow no waitlist entry, we could create one, or log. For now, just log.
+              console.log(
+                `User ${email} exists but no corresponding waitlist entry found to update stripe_customer_id.`
+              );
+            }
+          } catch (waitlistUpdateError) {
+            console.error(
+              `Failed to update stripe_customer_id for waitlist entry of user ${email}:`,
+              waitlistUpdateError
+            );
+          }
+        }
+
+        return res.json({
+          email,
+          existingUser: true,
+          stripe_customer_id:
+            stripeCustomerIdFromSession || existingUser.stripe_customer_id, // Return session one if updated, else existing one
+        });
+      } else {
+        // No existing user, proceed with waitlist logic
+        console.log(
+          `Stripe session email ${email} does not match an existing user. Proceeding with waitlist logic.`
+        );
+        const existingWaitlistEntry = await waitlistDb.getByEmail(email);
+        const waitlistDataForUpsert: any = {
           email: email,
           fullName: fullName,
           phoneNumber: phoneNumber,
-          companyName: "Freelancer", // As requested
-          supportNote: "Joined directly from Stripe", // As requested
-          joinedAt: new Date().toISOString(),
-          // status will default to 'pending' in waitlistDb.add
+          companyName: "Freelancer",
+          supportNote:
+            existingWaitlistEntry?.supportNote || "Joined/Updated from Stripe",
+          joinedAt: existingWaitlistEntry?.joinedAt || new Date().toISOString(),
+          status: "invited", // Always ensure status is invited
+          invitedAt: new Date().toISOString(),
         };
-
         if (stripeCustomerIdFromSession) {
-          waitlistEntryData.stripe_customer_id = stripeCustomerIdFromSession;
+          waitlistDataForUpsert.stripe_customer_id =
+            stripeCustomerIdFromSession;
         }
 
-        await waitlistDb.add(waitlistEntryData); // Pass the object that matches WaitlistEntry structure
-        console.log(
-          `Successfully added ${email} to waitlist from Stripe session.`
-        );
-        // After adding, immediately update status to invited
-        try {
-          await waitlistDb.updateStatus(
-            email,
-            "invited",
-            new Date().toISOString()
-          );
-          console.log(
-            `Successfully updated ${email} status to 'invited' in waitlist.`
-          );
-        } catch (updateError: any) {
-          console.error(
-            `Failed to update status to 'invited' for ${email}:`,
-            updateError.message
-          );
-          // Continue even if status update fails, primary goal is email pre-fill
-        }
-      } catch (waitlistError: any) {
-        if (waitlistError.code === "ConditionalCheckFailedException") {
-          console.log(
-            `User ${email} from Stripe session is already on the waitlist.`
-          );
-          // If user already exists, still try to update their status to invited
-          try {
-            // Check current status first to avoid unnecessary updates if already invited or beyond
-            const existingEntry = await waitlistDb.getByEmail(email);
-            if (
-              existingEntry &&
-              existingEntry.status !== "invited" &&
-              existingEntry.status !== "onboarded"
-            ) {
-              // Example: don't downgrade if already 'onboarded'
-              await waitlistDb.updateStatus(
-                email,
-                "invited",
-                new Date().toISOString()
-              );
-              console.log(
-                `Successfully updated existing user ${email} status to 'invited' in waitlist.`
-              );
-            } else if (existingEntry) {
-              console.log(
-                `User ${email} status is already '${existingEntry.status}', no update needed or appropriate.`
-              );
-            }
-          } catch (updateError: any) {
-            console.error(
-              `Failed to update status to 'invited' for existing user ${email}:`,
-              updateError.message
-            );
-          }
+        if (existingWaitlistEntry) {
+          console.log(`Updating existing waitlist entry for ${email}.`);
+          await waitlistDb.updateDetails(email, waitlistDataForUpsert);
         } else {
-          console.error(
-            "Failed to add user to waitlist from Stripe session:",
-            waitlistError.message
-          );
+          console.log(`Creating new waitlist entry for ${email}.`);
+          await waitlistDb.add(waitlistDataForUpsert); // add handles the toLowerCase for email internally
         }
+        return res.json({
+          email,
+          existingUser: false,
+          stripe_customer_id: stripeCustomerIdFromSession,
+        });
       }
-
-      res.json({ email });
     } else {
       console.warn(
         `Email not found for session ID: ${sessionId}. Relevant session fields:`,
         {
-          customer_id: session.customer
-            ? typeof session.customer === "string"
-              ? session.customer
-              : !session.customer.deleted
-              ? session.customer.id
-              : "deleted"
-            : null,
+          customer_id: stripeCustomerIdFromSession, // Log the extracted ID
           customer_details_email: session.customer_details?.email,
           payment_intent_id: session.payment_intent
             ? typeof session.payment_intent === "string"
@@ -222,7 +232,7 @@ router.get("/session/:sessionId", async (req: Request, res: Response) => {
             : null,
         }
       );
-      res.status(404).json({
+      return res.status(404).json({
         error:
           "Email not found for this session. The session may not have an associated email or customer.",
       });
@@ -233,9 +243,9 @@ router.get("/session/:sessionId", async (req: Request, res: Response) => {
       error.type === "StripeInvalidRequestError" &&
       error.code === "resource_missing"
     ) {
-      res.status(404).json({ error: "Stripe session not found." });
+      return res.status(404).json({ error: "Stripe session not found." });
     } else {
-      res
+      return res
         .status(500)
         .json({ error: "Failed to retrieve session details from Stripe." });
     }

@@ -157,6 +157,53 @@ export const waitlistDb = {
     }
   },
 
+  async updateDetails(email: string, details: Partial<WaitlistEntry>) {
+    const { email: _email, joinedAt: _joinedAt, ...writableDetails } = details;
+
+    if (Object.keys(writableDetails).length === 0) {
+      return this.getByEmail(email.toLowerCase());
+    }
+
+    const updateExpressions: string[] = [];
+    const expressionAttributeNames: { [key: string]: string } = {};
+    const expressionAttributeValues: { [key: string]: any } = {};
+
+    Object.entries(writableDetails).forEach(([key, value]) => {
+      if (value !== undefined) {
+        updateExpressions.push(`#${key} = :${key}`);
+        expressionAttributeNames[`#${key}`] = key;
+        expressionAttributeValues[`:${key}`] = value;
+      } else {
+        // If you want to explicitly remove fields by passing undefined/null
+        // updateExpressions.push(`REMOVE #${key}`);
+        // expressionAttributeNames[`#${key}`] = key;
+      }
+    });
+
+    if (updateExpressions.length === 0) {
+      return this.getByEmail(email.toLowerCase());
+    }
+
+    const params = {
+      TableName: `${TABLE_PREFIX}AW-Waitlist`,
+      Key: { email: email.toLowerCase() },
+      UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+      ExpressionAttributeNames: expressionAttributeNames,
+      ExpressionAttributeValues: expressionAttributeValues,
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as WaitlistEntry;
+    } catch (error) {
+      // Check if the error is because the item doesn't exist, then maybe create it?
+      // For now, let it throw if update is called on non-existent item, or rely on prior getByEmail check.
+      handleDynamoDbError(error, "updateWaitlistDetails");
+      throw error;
+    }
+  },
+
   async deleteByEmail(
     email: string
   ): Promise<{ success: boolean; message?: string }> {
