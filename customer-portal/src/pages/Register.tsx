@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useNavigate, useSearchParams, Link } from "react-router-dom";
-import { useAuth } from "@/contexts/AuthContext";
+import { useAuth, AuthErrorCode } from "../contexts/AuthContext";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -17,6 +17,8 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import GoogleSignInButton from "@/components/auth/GoogleSignInButton";
 import { Separator } from "@/components/ui/separator";
 import AgentWebLogo from "@/assets/AgentWeb-Logo-189x62.svg";
+import axios from "axios";
+import { buildApiUrl } from "@/config";
 
 const Register = () => {
   const [searchParams] = useSearchParams();
@@ -25,16 +27,56 @@ const Register = () => {
   const [confirmPassword, setConfirmPassword] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [formError, setFormError] = useState("");
+  const [isEmailFromStripe, setIsEmailFromStripe] = useState(false);
   const { error, register, errorCode, landingSiteUrl } = useAuth();
   const navigate = useNavigate();
 
-  // Pre-fill email from URL params
+  // Pre-fill email from URL params (session_id or email)
   useEffect(() => {
+    const sessionId = searchParams.get("session_id");
     const emailParam = searchParams.get("email");
-    if (emailParam) {
+
+    if (sessionId) {
+      setIsLoading(true);
+      axios
+        .get(buildApiUrl(`/api/stripe/session/${sessionId}`))
+        .then((response) => {
+          if (response.data && response.data.email) {
+            if (response.data.existingUser === true) {
+              // User already exists, redirect to login
+              console.log(
+                "User already exists, redirecting to login with email:",
+                response.data.email
+              );
+              navigate(
+                `/login?email=${encodeURIComponent(
+                  response.data.email
+                )}&info=payment_success&stripe_customer_id=${encodeURIComponent(
+                  response.data.stripe_customer_id || ""
+                )}`
+              );
+            } else {
+              // New user or only on waitlist, pre-fill email for registration
+              setEmail(response.data.email);
+              setIsEmailFromStripe(true);
+            }
+          }
+        })
+        .catch((err) => {
+          console.error(
+            "Failed to fetch email/status from Stripe session:",
+            err
+          );
+          // Potentially set formError here if the API call itself fails significantly
+          // e.g., if (err.response && err.response.status === 404) { setFormError("Invalid payment session.") }
+        })
+        .finally(() => {
+          setIsLoading(false);
+        });
+    } else if (emailParam) {
       setEmail(emailParam);
     }
-  }, [searchParams]);
+  }, [searchParams, navigate]); // Added navigate to dependency array
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -64,6 +106,40 @@ const Register = () => {
     }
 
     if (error) {
+      // Specifically ignore errors that indicate a general unauthenticated state
+      // or session issues, as these are expected on a register page for a new user.
+      // Only show errors that are relevant to the registration attempt itself (e.g., from the register function call).
+      const ignorableErrorMessages = [
+        "Session validation failed. Please log in again.",
+        "Failed to load user data. Session may be invalid.",
+        "No token provided", // If your API or context might set this
+        "User not found", // If context sets this generally before registration attempt
+        "Invalid token", // If context sets this
+      ];
+
+      // Also, consider ignoring if errorCode is a generic auth one not specific to registration problems
+      const ignorableErrorCodes: (AuthErrorCode | null)[] = [
+        "server_error",
+        "access_denied",
+      ]; // Initially, but not if it's from a failed register() call
+
+      // If the error is one of the generic unauthenticated messages and there isn't a specific registration-related errorCode,
+      // it's likely from the initial AuthContext load and should be ignored on the Register page.
+      // However, if an error occurs *after* a registration attempt (which useAuth() also manages),
+      // then `error` and `errorCode` will be updated by the register function in AuthContext, and those should be shown.
+      // The current logic in AuthContext's register function re-throws the error, so `error` will be populated.
+
+      if (
+        ignorableErrorMessages.includes(error) &&
+        (errorCode === null || ignorableErrorCodes.includes(errorCode)) &&
+        !isLoading // Only ignore if not actively trying to submit (isLoading would be true during submit)
+      ) {
+        // This error is likely from initial load of AuthContext when no user is authenticated.
+        // Don't show it on the register page unless it resulted from the actual registration attempt.
+        // The register() call in AuthContext.tsx itself handles setting specific errors for registration failures.
+        return null;
+      }
+
       // For waitlist errors with URLs
       if (errorCode === "not_in_waitlist" && landingSiteUrl) {
         return (
@@ -174,7 +250,7 @@ const Register = () => {
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   required
-                  disabled={!!searchParams.get("email")}
+                  disabled={!isEmailFromStripe && !!searchParams.get("email")}
                   className="rounded-[8px] border border-[#7A6999] focus:border-[#ECAC5F] focus:shadow-[0_0_4px_#ECAC5F] transition-all duration-300 ease-in-out"
                 />
               </div>

@@ -10,13 +10,16 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-import { Settings, LogOut, User } from "lucide-react";
+import { Settings, LogOut, User, CreditCard } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import axios from "axios";
+import { buildApiUrl } from "@/config";
 
 const UserProfileDropdown = () => {
-  const { user, logout } = useAuth();
+  const { user, logout, token } = useAuth();
   const navigate = useNavigate();
   const [menuOpen, setMenuOpen] = useState(false);
+  const [isPortalLoading, setIsPortalLoading] = useState(false);
 
   if (!user) return null;
 
@@ -34,6 +37,35 @@ const UserProfileDropdown = () => {
   const handleSettings = () => {
     navigate("/settings");
     setMenuOpen(false);
+  };
+
+  const handleCustomerPortalClick = async () => {
+    if (!token) {
+      console.error("No auth token found for customer portal request.");
+      return;
+    }
+    setIsPortalLoading(true);
+    try {
+      const response = await axios.post(
+        buildApiUrl("/api/stripe/create-customer-portal-session"),
+        {},
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        }
+      );
+      if (response.data && response.data.url) {
+        window.location.href = response.data.url;
+      } else {
+        console.error("Failed to retrieve Customer Portal URL.");
+      }
+    } catch (error) {
+      console.error("Error creating Stripe Customer Portal session:", error);
+    } finally {
+      setIsPortalLoading(false);
+      setMenuOpen(false);
+    }
   };
 
   return (
@@ -63,6 +95,14 @@ const UserProfileDropdown = () => {
           </div>
         </DropdownMenuLabel>
         <DropdownMenuSeparator />
+        <DropdownMenuItem
+          onClick={handleCustomerPortalClick}
+          className="cursor-pointer px-3 py-2"
+          disabled={isPortalLoading}
+        >
+          <CreditCard className="mr-3 h-5 w-5" />
+          <span>{isPortalLoading ? "Loading..." : "Manage Billing"}</span>
+        </DropdownMenuItem>
         <DropdownMenuItem
           onClick={handleSettings}
           className="cursor-pointer px-3 py-2"
