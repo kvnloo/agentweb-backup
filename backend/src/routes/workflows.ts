@@ -281,10 +281,6 @@ router.put('/:workflowId/executions/:executionId/tasks/:taskId/rerun', authentic
     } else {
       taskPrompt = taskToRerun.prompt;
     }
-    // Remove any previous dependent task results from the prompt
-    if (taskPrompt.includes('Dependent task results:')) {
-      taskPrompt = taskPrompt.split('Dependent task results:')[0].trim();
-    }
     if (dependentResults.length > 0) {
       taskPrompt = `Current task:
 ${taskPrompt}
