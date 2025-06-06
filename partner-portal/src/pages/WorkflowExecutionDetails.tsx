@@ -16,7 +16,8 @@ import {
   Dialog,
   DialogTitle,
   DialogContent,
-  DialogActions
+  DialogActions,
+  TextField
 } from '@mui/material';
 import {
   ArrowBack as ArrowBackIcon,
@@ -44,6 +45,7 @@ interface WorkflowTask {
   result?: string;
   executionId?: string;
   prompt?: string;
+  originalPrompt?: string;
   details_gif?: string;
   browser_use_log?: string;
   startTime?: string;
@@ -138,6 +140,10 @@ export default function WorkflowExecutionDetails() {
   const [killDialogOpen, setKillDialogOpen] = useState(false);
   const [killLoading, setKillLoading] = useState(false);
   const [rerunLoading, setRerunLoading] = useState<string | null>(null);
+  const [rerunDialogOpen, setRerunDialogOpen] = useState(false);
+  const [selectedTask, setSelectedTask] = useState<WorkflowTask | null>(null);
+  const [editedPrompt, setEditedPrompt] = useState('');
+  const [isPromptChanged, setIsPromptChanged] = useState(false);
 
   const fetchData = useCallback(async () => {
     console.log('fetchData called with:', { workflowId, executionId });
@@ -191,7 +197,10 @@ export default function WorkflowExecutionDetails() {
           console.log('Processing task:', task);
           if (!task.executionId) {
             console.log('No executionId for task:', task.taskId);
-            return task;
+            return {
+              ...task,
+              originalPrompt: task.taskId.startsWith('task-') ? task.prompt : ''
+            };
           }
 
           try {
@@ -209,6 +218,7 @@ export default function WorkflowExecutionDetails() {
                 ...task,
                 status: taskExecutionData.status,
                 prompt: taskExecutionData.prompt,
+                originalPrompt: task.taskId.startsWith('task-') ? task.prompt : '',
                 details_gif: taskExecutionData.details_gif,
                 browser_use_log: taskExecutionData.browser_use_log,
                 result: taskExecutionData.result,
@@ -224,7 +234,10 @@ export default function WorkflowExecutionDetails() {
           } catch (error) {
             console.error(`Error fetching task execution details for task ${task.taskId}:`, error);
           }
-          return task;
+          return {
+            ...task,
+            originalPrompt: task.taskId.startsWith('task-') ? task.prompt : ''
+          };
         })
       );
 
@@ -371,19 +384,77 @@ export default function WorkflowExecutionDetails() {
   };
 
   const handleRerunTask = async (taskId: string) => {
-    if (!workflowId || !executionId || !token) return;
+    if (!workflowId || !executionId || !token) {
+      setError('Missing required parameters');
+      return;
+    }
 
-    setRerunLoading(taskId);
+    const task = execution?.tasks.find(t => t.taskId === taskId);
+    if (!task) {
+      setError('Task not found in execution');
+      return;
+    }
+
+    setSelectedTask(task);
+    
+    // If taskId doesn't start with "task-" and originalPrompt is not set, fetch the task details
+    if (!taskId.startsWith('task-') && !task.originalPrompt) {
+      try {
+        const baseUrl = API_URL;
+        const response = await fetch(`${baseUrl}/api/tasks/${taskId}`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+
+        if (!response.ok) {
+          throw new Error('Failed to fetch task details');
+        }
+
+        const taskData = await response.json();
+        const prompt = taskData.prompt || '';
+        // Store the loaded prompt in originalPrompt
+        task.originalPrompt = prompt;
+        setEditedPrompt(prompt);
+      } catch (error) {
+        console.error('Error fetching task details:', error);
+        setError(error instanceof Error ? error.message : 'Failed to fetch task details');
+        return;
+      }
+    } else {
+      setEditedPrompt(task.originalPrompt || '');
+    }
+    
+    setIsPromptChanged(false);
+    setRerunDialogOpen(true);
+  };
+
+  const handlePromptChange = (newPrompt: string) => {
+    setEditedPrompt(newPrompt);
+    setIsPromptChanged(newPrompt !== selectedTask?.originalPrompt);
+  };
+
+  const handleConfirmRerun = async () => {
+    if (!workflowId || !executionId || !token || !selectedTask) return;
+
+    setRerunLoading(selectedTask.taskId);
     try {
       const baseUrl = API_URL;
+      const body: any = {};
+      
+      if (isPromptChanged) {
+        body.prompt = editedPrompt;
+      }
+
       const response = await fetch(
-        `${baseUrl}/api/workflows/${workflowId}/executions/${executionId}/tasks/${taskId}/rerun`,
+        `${baseUrl}/api/workflows/${workflowId}/executions/${executionId}/tasks/${selectedTask.taskId}/rerun`,
         {
           method: 'PUT',
           headers: {
             'Authorization': `Bearer ${token}`,
             'Content-Type': 'application/json'
-          }
+          },
+          body: Object.keys(body).length > 0 ? JSON.stringify(body) : undefined
         }
       );
 
@@ -394,6 +465,7 @@ export default function WorkflowExecutionDetails() {
 
       // Refresh the execution data
       await fetchData();
+      setRerunDialogOpen(false);
     } catch (error) {
       console.error('Error rerunning task:', error);
       setError(error instanceof Error ? error.message : 'Failed to rerun task');
@@ -738,6 +810,44 @@ export default function WorkflowExecutionDetails() {
             autoFocus
           >
             {killLoading ? 'Killing Tasks...' : 'Kill All Tasks'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Rerun Task Dialog */}
+      <Dialog
+        open={rerunDialogOpen}
+        onClose={() => setRerunDialogOpen(false)}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle>Rerun Task</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" color="text.secondary" gutterBottom>
+            You can modify the task prompt before rerunning. The task will be executed with the updated prompt.
+          </Typography>
+          <TextField
+            fullWidth
+            multiline
+            rows={6}
+            value={editedPrompt}
+            onChange={(e) => handlePromptChange(e.target.value)}
+            variant="outlined"
+            label="Task Prompt"
+            sx={{ mt: 2 }}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setRerunDialogOpen(false)}>
+            Cancel
+          </Button>
+          <Button
+            onClick={handleConfirmRerun}
+            variant="contained"
+            disabled={rerunLoading === selectedTask?.taskId}
+            startIcon={rerunLoading === selectedTask?.taskId ? <CircularProgress size={20} /> : null}
+          >
+            {rerunLoading === selectedTask?.taskId ? 'Rerunning...' : 'Rerun Task'}
           </Button>
         </DialogActions>
       </Dialog>

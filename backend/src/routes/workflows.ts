@@ -200,6 +200,7 @@ router.put('/:workflowId/executions/:executionId/kill', authenticateToken, async
 router.put('/:workflowId/executions/:executionId/tasks/:taskId/rerun', authenticateToken, async (req: Request, res: Response) => {
   try {
     const { workflowId, executionId, taskId } = req.params;
+    const { prompt } = req.body;
     const userId = (req as AuthenticatedRequest).user?.userId;
 
     if (!userId) {
@@ -272,15 +273,22 @@ router.put('/:workflowId/executions/:executionId/tasks/:taskId/rerun', authentic
 
     // Create the prompt with dependent results
     let taskPrompt;
-    if (!taskToRerun.taskId.startsWith('task-')) {
+    if (prompt) {
+      // Use the provided prompt if it was changed
+      taskPrompt = prompt;
+    } else if (!taskToRerun.taskId.startsWith('task-')) {
+      // For referenced tasks, fetch the original prompt
       const task = await taskDb.getTaskById(taskToRerun.taskId);
       if (!task) {
         return res.status(404).json({ message: 'Referenced task not found' });
       }
       taskPrompt = task.prompt;
     } else {
+      // For new tasks, use the original prompt from the workflow task
       taskPrompt = taskToRerun.prompt;
     }
+
+    // Add dependent results to prompt if any exist
     if (dependentResults.length > 0) {
       taskPrompt = `Current task:
 ${taskPrompt}
