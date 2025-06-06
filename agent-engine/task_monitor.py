@@ -1350,8 +1350,14 @@ async def process_workflow_executions():
                     
                     # Request kill for all running tasks in the workflow
                     for task in workflow_execution['tasks']:
-                        if task.get('status') in ['running', 'pending'] and task.get('executionId'):
-                            await request_kill_task_execution(task['executionId'])
+                        if task.get('status') in ['running', 'pending']:
+                            if task.get('executionId'):
+                                # For tasks with execution ID, request kill through the execution
+                                await request_kill_task_execution(task['executionId'])
+                            else:
+                                # For tasks without execution ID, mark them as killed directly
+                                task['status'] = 'killed'
+                                task['error'] = 'Task was killed before execution started'
                     
                     # Update workflow execution status to killed
                     await update_workflow_execution(
@@ -1360,7 +1366,8 @@ async def process_workflow_executions():
                         {
                             'status': 'killed',
                             'error': 'Workflow execution was killed by user',
-                            'completedAt': datetime.utcnow().isoformat()
+                            'completedAt': datetime.utcnow().isoformat(),
+                            'tasks': workflow_execution['tasks']  # Include updated tasks
                         }
                     )
                     continue
