@@ -543,12 +543,29 @@ What would you like to do?`
                   fontSize: '0.9rem',
                   color: '#d4d4d4',
                   backgroundColor: '#252525',
+                  minHeight: '300px',
+                  padding: '0 !important',
+                  '& textarea': {
+                    whiteSpace: 'pre',
+                    overflowX: 'hidden',
+                    lineHeight: '1.5',
+                    padding: '8px 8px 8px 16px',
+                    width: '100%',
+                    boxSizing: 'border-box',
+                    tabSize: 2
+                  }
                 },
                 '& .MuiOutlinedInput-notchedOutline': {
                   borderColor: '#333',
                 },
                 '& .MuiInputBase-input': {
                   padding: 2,
+                }
+              }}
+              InputProps={{
+                style: {
+                  height: '100%',
+                  alignItems: 'flex-start'
                 }
               }}
             />
