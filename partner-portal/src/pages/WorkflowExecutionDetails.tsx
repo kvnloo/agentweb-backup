@@ -250,7 +250,12 @@ export default function WorkflowExecutionDetails() {
     console.log('Polling useEffect triggered with execution status:', execution?.status);
     let intervalId: NodeJS.Timeout | null = null;
     
-    if (execution && ['running', 'pending'].includes(execution.status.toLowerCase())) {
+    // Check if any task is in pending or running state
+    const hasActiveTasks = execution?.tasks.some(task => 
+      ['pending', 'running'].includes(task.status.toLowerCase())
+    );
+    
+    if (execution && (['running', 'pending'].includes(execution.status.toLowerCase()) || hasActiveTasks)) {
       setIsAutoRefreshing(true);
       intervalId = setInterval(fetchData, 5000);
     } else {
@@ -263,7 +268,7 @@ export default function WorkflowExecutionDetails() {
         setIsAutoRefreshing(false);
       }
     };
-  }, [execution?.status, fetchData]);
+  }, [execution?.status, execution?.tasks, fetchData]);
 
   const getStatusColor = (status: string) => {
     switch (status.toLowerCase()) {
@@ -348,6 +353,11 @@ export default function WorkflowExecutionDetails() {
     
     // Check if workflow execution is in a state that allows rerunning tasks
     if (['pending', 'running'].includes(execution.status)) {
+      return false;
+    }
+
+    // Check if the task itself is in pending or running state
+    if (['pending', 'running'].includes(task.status.toLowerCase())) {
       return false;
     }
 
