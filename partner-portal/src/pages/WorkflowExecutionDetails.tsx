@@ -16,17 +16,19 @@ import {
   Dialog,
   DialogTitle,
   DialogContent,
-  DialogActions
+  DialogActions,
+  TextField
 } from '@mui/material';
 import {
   ArrowBack as ArrowBackIcon,
+  Autorenew as AutorenewIcon,
   CheckCircle as CheckCircleIcon,
   Error as ErrorIcon,
-  Pending as PendingIcon,
-  Timeline as TimelineIcon,
-  Autorenew as AutorenewIcon,
   PowerOff as PowerOffIcon,
-  Screenshot as ScreenshotIcon
+  Screenshot as ScreenshotIcon,
+  Refresh as RefreshIcon,
+  Timeline as TimelineIcon,
+  HourglassEmpty as PendingIcon
 } from '@mui/icons-material';
 import { useAuth } from '../contexts/AuthContext';
 import { intervalToDuration } from 'date-fns';
@@ -43,6 +45,7 @@ interface WorkflowTask {
   result?: string;
   executionId?: string;
   prompt?: string;
+  originalPrompt?: string;
   details_gif?: string;
   browser_use_log?: string;
   startTime?: string;
@@ -136,6 +139,14 @@ export default function WorkflowExecutionDetails() {
   const [isAutoRefreshing, setIsAutoRefreshing] = useState(false);
   const [killDialogOpen, setKillDialogOpen] = useState(false);
   const [killLoading, setKillLoading] = useState(false);
+  const [rerunLoading, setRerunLoading] = useState<string | null>(null);
+  const [rerunDialogOpen, setRerunDialogOpen] = useState(false);
+  const [selectedTask, setSelectedTask] = useState<WorkflowTask | null>(null);
+  const [editedPrompt, setEditedPrompt] = useState('');
+  const [isPromptChanged, setIsPromptChanged] = useState(false);
+  const [killTaskDialogOpen, setKillTaskDialogOpen] = useState(false);
+  const [selectedTaskToKill, setSelectedTaskToKill] = useState<any>(null);
+  const [killTaskLoading, setKillTaskLoading] = useState(false);
 
   const fetchData = useCallback(async () => {
     console.log('fetchData called with:', { workflowId, executionId });
@@ -189,7 +200,10 @@ export default function WorkflowExecutionDetails() {
           console.log('Processing task:', task);
           if (!task.executionId) {
             console.log('No executionId for task:', task.taskId);
-            return task;
+            return {
+              ...task,
+              originalPrompt: task.taskId.startsWith('task-') ? task.prompt : ''
+            };
           }
 
           try {
@@ -207,6 +221,7 @@ export default function WorkflowExecutionDetails() {
                 ...task,
                 status: taskExecutionData.status,
                 prompt: taskExecutionData.prompt,
+                originalPrompt: task.taskId.startsWith('task-') ? task.prompt : '',
                 details_gif: taskExecutionData.details_gif,
                 browser_use_log: taskExecutionData.browser_use_log,
                 result: taskExecutionData.result,
@@ -222,7 +237,10 @@ export default function WorkflowExecutionDetails() {
           } catch (error) {
             console.error(`Error fetching task execution details for task ${task.taskId}:`, error);
           }
-          return task;
+          return {
+            ...task,
+            originalPrompt: task.taskId.startsWith('task-') ? task.prompt : ''
+          };
         })
       );
 
@@ -248,7 +266,12 @@ export default function WorkflowExecutionDetails() {
     console.log('Polling useEffect triggered with execution status:', execution?.status);
     let intervalId: NodeJS.Timeout | null = null;
     
-    if (execution && ['running', 'pending'].includes(execution.status.toLowerCase())) {
+    // Check if any task is in pending or running state
+    const hasActiveTasks = execution?.tasks.some(task => 
+      ['pending', 'running'].includes(task.status.toLowerCase())
+    );
+    
+    if (execution && (['running', 'pending'].includes(execution.status.toLowerCase()) || hasActiveTasks)) {
       setIsAutoRefreshing(true);
       intervalId = setInterval(fetchData, 5000);
     } else {
@@ -261,7 +284,7 @@ export default function WorkflowExecutionDetails() {
         setIsAutoRefreshing(false);
       }
     };
-  }, [execution?.status, fetchData]);
+  }, [execution?.status, execution?.tasks, fetchData]);
 
   const getStatusColor = (status: string) => {
     switch (status.toLowerCase()) {
@@ -339,6 +362,159 @@ export default function WorkflowExecutionDetails() {
     } finally {
       setKillLoading(false);
     }
+  };
+
+  const canRerunTask = (task: WorkflowTask) => {
+    if (!execution) return false;
+    
+    // Check if workflow execution is in a state that allows rerunning tasks
+    if (['pending', 'running'].includes(execution.status)) {
+      return false;
+    }
+
+    // Check if the task itself is in pending or running state
+    if (['pending', 'running'].includes(task.status.toLowerCase())) {
+      return false;
+    }
+
+    // Check if all dependent tasks are completed
+    if (task.dependsOn) {
+      const dependentTasks = execution.tasks.filter(t => task.dependsOn?.includes(t.taskId));
+      return dependentTasks.every(t => t.status === 'completed');
+    }
+
+    return true;
+  };
+
+  const handleRerunTask = async (taskId: string) => {
+    if (!workflowId || !executionId || !token) {
+      setError('Missing required parameters');
+      return;
+    }
+
+    const task = execution?.tasks.find(t => t.taskId === taskId);
+    if (!task) {
+      setError('Task not found in execution');
+      return;
+    }
+
+    setSelectedTask(task);
+    
+    // If taskId doesn't start with "task-" and originalPrompt is not set, fetch the task details
+    if (!taskId.startsWith('task-') && !task.originalPrompt) {
+      try {
+        const baseUrl = API_URL;
+        const response = await fetch(`${baseUrl}/api/tasks/${taskId}`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+
+        if (!response.ok) {
+          throw new Error('Failed to fetch task details');
+        }
+
+        const taskData = await response.json();
+        const prompt = taskData.prompt || '';
+        // Store the loaded prompt in originalPrompt
+        task.originalPrompt = prompt;
+        setEditedPrompt(prompt);
+      } catch (error) {
+        console.error('Error fetching task details:', error);
+        setError(error instanceof Error ? error.message : 'Failed to fetch task details');
+        return;
+      }
+    } else {
+      setEditedPrompt(task.originalPrompt || '');
+    }
+    
+    setIsPromptChanged(false);
+    setRerunDialogOpen(true);
+  };
+
+  const handlePromptChange = (newPrompt: string) => {
+    setEditedPrompt(newPrompt);
+    setIsPromptChanged(newPrompt !== selectedTask?.originalPrompt);
+  };
+
+  const handleConfirmRerun = async () => {
+    if (!workflowId || !executionId || !token || !selectedTask) return;
+
+    setRerunLoading(selectedTask.taskId);
+    try {
+      const baseUrl = API_URL;
+      const body: any = {};
+      
+      if (isPromptChanged) {
+        body.prompt = editedPrompt;
+      }
+
+      const response = await fetch(
+        `${baseUrl}/api/workflows/${workflowId}/executions/${executionId}/tasks/${selectedTask.taskId}/rerun`,
+        {
+          method: 'PUT',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          },
+          body: Object.keys(body).length > 0 ? JSON.stringify(body) : undefined
+        }
+      );
+
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.message || 'Failed to rerun task');
+      }
+
+      // Refresh the execution data
+      await fetchData();
+      setRerunDialogOpen(false);
+    } catch (error) {
+      console.error('Error rerunning task:', error);
+      setError(error instanceof Error ? error.message : 'Failed to rerun task');
+    } finally {
+      setRerunLoading(null);
+    }
+  };
+
+  const handleKillTaskClick = (task: any) => {
+    setSelectedTaskToKill(task);
+    setKillTaskDialogOpen(true);
+  };
+
+  const handleConfirmKillTask = async () => {
+    if (!selectedTaskToKill?.taskId || !selectedTaskToKill?.executionId || !token) return;
+
+    setKillTaskLoading(true);
+    setError(null);
+
+    try {
+      await axios.put(
+        `${API_URL}/api/tasks/${selectedTaskToKill.taskId}/executions/${selectedTaskToKill.executionId}/kill`,
+        {},
+        {
+          headers: {
+            Authorization: `Bearer ${token}`
+          }
+        }
+      );
+
+      // Refresh execution data
+      fetchData();
+      setKillTaskDialogOpen(false);
+    } catch (error: any) {
+      console.error('Error killing task:', error);
+      setError(error.response?.data?.message || 'Failed to kill task');
+    } finally {
+      setKillTaskLoading(false);
+    }
+  };
+
+  const canKillTask = (task: any) => {
+    // Only allow killing tasks when workflow is completed or failed
+    return task.status === 'running' && 
+           execution?.status && 
+           ['completed', 'failed'].includes(execution.status.toLowerCase());
   };
 
   if (loading) {
@@ -426,24 +602,50 @@ export default function WorkflowExecutionDetails() {
         <Typography variant="h6" gutterBottom>
           Tasks
         </Typography>
-        {execution?.tasks.map((task, index) => (
+        {execution?.tasks?.map((task, index) => (
           <Box key={task.taskId} sx={{ mb: 3 }}>
             <Paper sx={{ p: 2, mb: 2 }}>
               <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
-                <Typography variant="h6">
-                  Task {index + 1}
-                </Typography>
-                <Box sx={{ display: 'flex', gap: 1 }}>
+                <Typography variant="h6">Task {index + 1}</Typography>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                   <Chip
                     icon={getStatusIcon(task.status)}
                     label={task.status}
                     color={getStatusColor(task.status)}
+                    size="small"
                   />
                   {task.llmName && (
                     <Chip
                       label={`LLM: ${task.llmName}`}
                       variant="outlined"
+                      size="small"
                     />
+                  )}
+                  {canKillTask(task) && (
+                    <Tooltip title="Kill task">
+                      <IconButton
+                        onClick={() => handleKillTaskClick(task)}
+                        color="error"
+                        size="small"
+                      >
+                        <PowerOffIcon />
+                      </IconButton>
+                    </Tooltip>
+                  )}
+                  {canRerunTask(task) && (
+                    <Tooltip title="Rerun Task">
+                      <IconButton
+                        onClick={() => handleRerunTask(task.taskId)}
+                        disabled={rerunLoading === task.taskId}
+                        color="primary"
+                      >
+                        {rerunLoading === task.taskId ? (
+                          <CircularProgress size={24} />
+                        ) : (
+                          <RefreshIcon />
+                        )}
+                      </IconButton>
+                    </Tooltip>
                   )}
                 </Box>
               </Box>
@@ -662,6 +864,79 @@ export default function WorkflowExecutionDetails() {
             autoFocus
           >
             {killLoading ? 'Killing Tasks...' : 'Kill All Tasks'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Rerun Task Dialog */}
+      <Dialog
+        open={rerunDialogOpen}
+        onClose={() => setRerunDialogOpen(false)}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle>Rerun Task</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" color="text.secondary" gutterBottom>
+            You can modify the task prompt before rerunning. The task will be executed with the updated prompt.
+          </Typography>
+          <TextField
+            fullWidth
+            multiline
+            rows={6}
+            value={editedPrompt}
+            onChange={(e) => handlePromptChange(e.target.value)}
+            variant="outlined"
+            label="Task Prompt"
+            sx={{ mt: 2 }}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setRerunDialogOpen(false)}>
+            Cancel
+          </Button>
+          <Button
+            onClick={handleConfirmRerun}
+            variant="contained"
+            disabled={rerunLoading === selectedTask?.taskId}
+            startIcon={rerunLoading === selectedTask?.taskId ? <CircularProgress size={20} /> : null}
+          >
+            {rerunLoading === selectedTask?.taskId ? 'Rerunning...' : 'Rerun Task'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Kill Task Dialog */}
+      <Dialog
+        open={killTaskDialogOpen}
+        onClose={() => setKillTaskDialogOpen(false)}
+        aria-labelledby="kill-task-dialog-title"
+        aria-describedby="kill-task-dialog-description"
+      >
+        <DialogTitle id="kill-task-dialog-title">{"Kill Task?"}</DialogTitle>
+        <DialogContent>
+          {error && (
+            <Alert severity="error" sx={{ mb: 2 }}>
+              {error}
+            </Alert>
+          )}
+          <Typography>
+            Are you sure you want to kill this task? This action cannot be undone.
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setKillTaskDialogOpen(false)} color="primary">
+            Cancel
+          </Button>
+          <Button
+            onClick={handleConfirmKillTask}
+            color="error" 
+            variant="contained" 
+            disabled={killTaskLoading}
+            startIcon={killTaskLoading ? <CircularProgress size={20} color="inherit" /> : <PowerOffIcon />}
+            autoFocus
+          >
+            {killTaskLoading ? 'Killing...' : 'Kill Task'}
           </Button>
         </DialogActions>
       </Dialog>

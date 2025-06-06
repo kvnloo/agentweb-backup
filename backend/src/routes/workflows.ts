@@ -1,5 +1,5 @@
 import express, { Request, Response } from 'express';
-import { authenticateToken } from '../middleware/auth';
+import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import {
   listWorkflows,
   getWorkflow,
@@ -32,6 +32,24 @@ interface WorkflowNode {
 interface WorkflowEdge {
   source: string;
   target: string;
+}
+
+// Extend the WorkflowExecution interface to include the fields we need
+interface ExtendedWorkflowTask {
+  nodeId: string;
+  taskId: string;
+  status: 'pending' | 'running' | 'completed' | 'failed';
+  startTime: string;
+  endTime?: string;
+  error?: string;
+  result?: string;
+  executionId?: string;
+  dependsOn?: string[];
+  prompt: string;
+}
+
+interface ExtendedWorkflowExecution extends Omit<WorkflowExecution, 'tasks'> {
+  tasks: ExtendedWorkflowTask[];
 }
 
 type RequestHandlerAuth = (req: Request, res: Response, next: express.NextFunction) => void;
@@ -176,6 +194,147 @@ router.put('/:workflowId/executions/:executionId/kill', authenticateToken, async
   } catch (error) {
     console.error('Error killing workflow execution:', error);
     res.status(500).json({ message: 'Failed to kill workflow execution' });
+  }
+});
+
+router.put('/:workflowId/executions/:executionId/tasks/:taskId/rerun', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { workflowId, executionId, taskId } = req.params;
+    const { prompt } = req.body;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Get workflow execution
+    const workflowExecution = await workflowDb.getWorkflowExecution(executionId) as ExtendedWorkflowExecution;
+    if (!workflowExecution) {
+      return res.status(404).json({ message: 'Workflow execution not found' });
+    }
+
+    // Check if workflow execution is in a state that allows rerunning tasks
+    if (['pending', 'running'].includes(workflowExecution.status)) {
+      return res.status(400).json({ message: 'Cannot rerun tasks while workflow is pending or running' });
+    }
+
+    // Find the task to rerun
+    const taskToRerun = workflowExecution.tasks.find(t => t.taskId === taskId);
+    if (!taskToRerun) {
+      return res.status(404).json({ message: 'Task not found in workflow execution' });
+    }
+
+    // Check if all dependent tasks are completed
+    if (taskToRerun.dependsOn) {
+      const dependentTasks = workflowExecution.tasks.filter(t => taskToRerun.dependsOn?.includes(t.taskId));
+      const allDependenciesCompleted = dependentTasks.every(t => t.status === 'completed');
+      if (!allDependenciesCompleted) {
+        return res.status(400).json({ message: 'Cannot rerun task: not all dependent tasks are completed' });
+      }
+    }
+
+    // Get dependent task results and files for the prompt
+    const dependentResults = [];
+    if (taskToRerun.dependsOn) {
+      for (const depTaskId of taskToRerun.dependsOn) {
+        const depTask = workflowExecution.tasks.find(t => t.taskId === depTaskId);
+        if (!depTask) continue;
+
+        const resultParts = [];
+        
+        // Add task result if available
+        if (depTask.result) {
+          resultParts.push(depTask.result);
+        }
+
+        // Get result files from the task execution if available
+        if (depTask.executionId) {
+          const depExecution = await taskDb.getTaskExecutionById(depTask.executionId);
+          if (depExecution?.result_files) {
+            for (const fileInfo of depExecution.result_files) {
+              try {
+                const response = await fetch(fileInfo.url);
+                if (response.ok) {
+                  const content = await response.text();
+                  resultParts.push(`Result file content:\n${content}`);
+                }
+              } catch (error) {
+                console.error(`Error downloading file from ${fileInfo.url}:`, error);
+              }
+            }
+          }
+        }
+
+        if (resultParts.length > 0) {
+          dependentResults.push(`Task ${depTaskId}:\n${resultParts.join('\n\n')}`);
+        }
+      }
+    }
+
+    // Create the prompt with dependent results
+    let taskPrompt;
+    if (prompt) {
+      // Use the provided prompt if it was changed
+      taskPrompt = prompt;
+    } else if (!taskToRerun.taskId.startsWith('task-')) {
+      // For referenced tasks, fetch the original prompt
+      const task = await taskDb.getTaskById(taskToRerun.taskId);
+      if (!task) {
+        return res.status(404).json({ message: 'Referenced task not found' });
+      }
+      taskPrompt = task.prompt;
+    } else {
+      // For new tasks, use the original prompt from the workflow task
+      taskPrompt = taskToRerun.prompt;
+    }
+
+    // Add dependent results to prompt if any exist
+    if (dependentResults.length > 0) {
+      taskPrompt = `Current task:
+${taskPrompt}
+
+Dependent task results:
+${dependentResults.join('\n\n')}`;
+    }
+
+    // Create a new task execution
+    const newExecution = {
+      executionId: Date.now().toString(),
+      taskId,
+      userId: workflowExecution.userId,
+      run_user_id: userId,
+      status: 'pending',
+      startTime: new Date().toISOString(),
+      workflowExecutionId: executionId,
+      prompt: taskPrompt
+    };
+
+    await taskDb.createTaskExecution(newExecution);
+
+    // Update the task in the workflow execution
+    const updatedTasks = workflowExecution.tasks.map(t => {
+      if (t.taskId === taskId) {
+        return {
+          ...t,
+          status: 'pending' as const,
+          executionId: newExecution.executionId,
+          error: undefined,
+          result: undefined,
+          completedAt: undefined
+        };
+      }
+      return t;
+    });
+
+    // Update workflow execution
+    const updatedExecution = await workflowDb.updateWorkflowExecution(executionId, {
+      tasks: updatedTasks
+    });
+
+    res.json(updatedExecution);
+  } catch (error) {
+    console.error('Error rerunning task:', error);
+    res.status(500).json({ message: 'Error rerunning task' });
   }
 });
 

@@ -693,6 +693,8 @@ export const taskDb = {
     run_user_id?: string;
     status: string;
     startTime: string;
+    workflowExecutionId?: string;
+    prompt?: string;
   }) {
     try {
       const params = {

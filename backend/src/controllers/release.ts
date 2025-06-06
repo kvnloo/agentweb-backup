@@ -8,6 +8,18 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-06-06",
+    changes: [
+      "Added support for task rerun in Workflows",
+      "- Users can now rerun individual tasks with modified prompts after an execution",
+      "- Avoids the need to run a complete workflow which could take much longer time and consume more tokens",
+      "- Added ability to kill a task when rerunning it",
+      "Enhanced Admin capabilities with workflow management",
+      "- Added Workflows tab in Admin page for viewing and managing user workflows",
+      "- Admins can help users debug by running workflows and rerun tasks on their behalf"
+    ]
+  },
+  {
     date: "2025-06-04",
     changes: [
       "Improved the workflow feature",

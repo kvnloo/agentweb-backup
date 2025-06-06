@@ -6,6 +6,7 @@ import { waitlistDb } from "../services/waitlistDb";
 import { emailService } from "../services/emailService";
 import { chatbotDb, ChatSession } from "../services/chatbotService";
 import { DynamoDB } from "aws-sdk";
+import { workflowDb } from "../services/workflowDb";
 
 const router = express.Router();
 
@@ -659,6 +660,56 @@ router.delete("/users/:userId", async (req, res) => {
     res
       .status(500)
       .json({ message: "Error deleting user", error: errorMessage });
+  }
+});
+
+// Get all workflows
+router.get("/workflows", async (req, res) => {
+  try {
+    const workflows = await workflowDb.getAllWorkflows();
+
+    // Get latest execution for each workflow
+    const workflowsWithLatestExecution = await Promise.all(
+      (workflows || []).map(async (workflow) => {
+        const executions = await workflowDb.getWorkflowExecutions(workflow.workflowId);
+        const latestExecution = executions && executions.length > 0 ? executions[0] : null;
+
+        // Count completed and total runs
+        const totalRuns = executions ? executions.length : 0;
+        const completedRuns = executions
+          ? executions.filter((exec) => exec.status === "completed").length
+          : 0;
+
+        // Count completed and total tasks
+        const totalTasks = latestExecution?.tasks?.length || 0;
+        const completedTasks = latestExecution?.tasks
+          ? latestExecution.tasks.filter((task) => task.status === "completed").length
+          : 0;
+
+        return {
+          ...workflow,
+          latestRunStatus: latestExecution ? latestExecution.status : "none",
+          latestRunTime: latestExecution ? latestExecution.startTime : null,
+          completedRuns,
+          totalRuns,
+          completedTasks,
+          totalTasks,
+        };
+      })
+    );
+
+    // Sort workflows by latest run time in descending order
+    workflowsWithLatestExecution.sort((a, b) => {
+      if (!a.latestRunTime && !b.latestRunTime) return 0;
+      if (!a.latestRunTime) return 1;
+      if (!b.latestRunTime) return -1;
+      return new Date(b.latestRunTime).getTime() - new Date(a.latestRunTime).getTime();
+    });
+
+    res.json(workflowsWithLatestExecution);
+  } catch (error) {
+    console.error("Error getting workflows:", error);
+    res.status(500).json({ message: "Error fetching workflows" });
   }
 });
 
