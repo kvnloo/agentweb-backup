@@ -28,7 +28,8 @@ import {
   Autorenew as AutorenewIcon,
   PowerOff as PowerOffIcon,
   Screenshot as ScreenshotIcon,
-  Refresh as RefreshIcon
+  Refresh as RefreshIcon,
+  Replay as ReplayIcon
 } from '@mui/icons-material';
 import { useAuth } from '../contexts/AuthContext';
 import { intervalToDuration } from 'date-fns';
@@ -144,6 +145,9 @@ export default function WorkflowExecutionDetails() {
   const [selectedTask, setSelectedTask] = useState<WorkflowTask | null>(null);
   const [editedPrompt, setEditedPrompt] = useState('');
   const [isPromptChanged, setIsPromptChanged] = useState(false);
+  const [killTaskDialogOpen, setKillTaskDialogOpen] = useState(false);
+  const [selectedTaskToKill, setSelectedTaskToKill] = useState<any>(null);
+  const [killTaskLoading, setKillTaskLoading] = useState(false);
 
   const fetchData = useCallback(async () => {
     console.log('fetchData called with:', { workflowId, executionId });
@@ -474,6 +478,46 @@ export default function WorkflowExecutionDetails() {
     }
   };
 
+  const handleKillTaskClick = (task: any) => {
+    setSelectedTaskToKill(task);
+    setKillTaskDialogOpen(true);
+  };
+
+  const handleConfirmKillTask = async () => {
+    if (!selectedTaskToKill?.taskId || !selectedTaskToKill?.executionId || !token) return;
+
+    setKillTaskLoading(true);
+    setError(null);
+
+    try {
+      await axios.put(
+        `${API_URL}/api/tasks/${selectedTaskToKill.taskId}/executions/${selectedTaskToKill.executionId}/kill`,
+        {},
+        {
+          headers: {
+            Authorization: `Bearer ${token}`
+          }
+        }
+      );
+
+      // Refresh execution data
+      fetchData();
+      setKillTaskDialogOpen(false);
+    } catch (error: any) {
+      console.error('Error killing task:', error);
+      setError(error.response?.data?.message || 'Failed to kill task');
+    } finally {
+      setKillTaskLoading(false);
+    }
+  };
+
+  const canKillTask = (task: any) => {
+    // Only allow killing tasks when workflow is completed or failed
+    return task.status === 'running' && 
+           execution?.status && 
+           ['completed', 'failed'].includes(execution.status.toLowerCase());
+  };
+
   if (loading) {
     return (
       <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh' }}>
@@ -559,12 +603,12 @@ export default function WorkflowExecutionDetails() {
         <Typography variant="h6" gutterBottom>
           Tasks
         </Typography>
-        {execution?.tasks.map((task, index) => (
+        {execution?.tasks?.map((task, index) => (
           <Box key={task.taskId} sx={{ mb: 3 }}>
             <Paper sx={{ p: 2, mb: 2 }}>
               <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+                <Typography variant="h6">Task {index + 1}</Typography>
                 <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                  <Typography variant="h6">Task {index + 1}</Typography>
                   <Chip
                     icon={getStatusIcon(task.status)}
                     label={task.status}
@@ -578,22 +622,33 @@ export default function WorkflowExecutionDetails() {
                       size="small"
                     />
                   )}
+                  {canKillTask(task) && (
+                    <Tooltip title="Kill task">
+                      <IconButton
+                        onClick={() => handleKillTaskClick(task)}
+                        color="error"
+                        size="small"
+                      >
+                        <PowerOffIcon />
+                      </IconButton>
+                    </Tooltip>
+                  )}
+                  {canRerunTask(task) && (
+                    <Tooltip title="Rerun Task">
+                      <IconButton
+                        onClick={() => handleRerunTask(task.taskId)}
+                        disabled={rerunLoading === task.taskId}
+                        color="primary"
+                      >
+                        {rerunLoading === task.taskId ? (
+                          <CircularProgress size={24} />
+                        ) : (
+                          <RefreshIcon />
+                        )}
+                      </IconButton>
+                    </Tooltip>
+                  )}
                 </Box>
-                {canRerunTask(task) && (
-                  <Tooltip title="Rerun Task">
-                    <IconButton
-                      onClick={() => handleRerunTask(task.taskId)}
-                      disabled={rerunLoading === task.taskId}
-                      color="primary"
-                    >
-                      {rerunLoading === task.taskId ? (
-                        <CircularProgress size={24} />
-                      ) : (
-                        <RefreshIcon />
-                      )}
-                    </IconButton>
-                  </Tooltip>
-                )}
               </Box>
 
               {/* Task Timing Details */}
@@ -848,6 +903,41 @@ export default function WorkflowExecutionDetails() {
             startIcon={rerunLoading === selectedTask?.taskId ? <CircularProgress size={20} /> : null}
           >
             {rerunLoading === selectedTask?.taskId ? 'Rerunning...' : 'Rerun Task'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Kill Task Dialog */}
+      <Dialog
+        open={killTaskDialogOpen}
+        onClose={() => setKillTaskDialogOpen(false)}
+        aria-labelledby="kill-task-dialog-title"
+        aria-describedby="kill-task-dialog-description"
+      >
+        <DialogTitle id="kill-task-dialog-title">{"Kill Task?"}</DialogTitle>
+        <DialogContent>
+          {error && (
+            <Alert severity="error" sx={{ mb: 2 }}>
+              {error}
+            </Alert>
+          )}
+          <Typography>
+            Are you sure you want to kill this task? This action cannot be undone.
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setKillTaskDialogOpen(false)} color="primary">
+            Cancel
+          </Button>
+          <Button
+            onClick={handleConfirmKillTask}
+            color="error" 
+            variant="contained" 
+            disabled={killTaskLoading}
+            startIcon={killTaskLoading ? <CircularProgress size={20} color="inherit" /> : <PowerOffIcon />}
+            autoFocus
+          >
+            {killTaskLoading ? 'Killing...' : 'Kill Task'}
           </Button>
         </DialogActions>
       </Dialog>
