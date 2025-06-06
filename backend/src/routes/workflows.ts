@@ -271,7 +271,20 @@ router.put('/:workflowId/executions/:executionId/tasks/:taskId/rerun', authentic
     }
 
     // Create the prompt with dependent results
-    let taskPrompt = taskToRerun.prompt;
+    let taskPrompt;
+    if (!taskToRerun.taskId.startsWith('task-')) {
+      const task = await taskDb.getTaskById(taskToRerun.taskId);
+      if (!task) {
+        return res.status(404).json({ message: 'Referenced task not found' });
+      }
+      taskPrompt = task.prompt;
+    } else {
+      taskPrompt = taskToRerun.prompt;
+    }
+    // Remove any previous dependent task results from the prompt
+    if (taskPrompt.includes('Dependent task results:')) {
+      taskPrompt = taskPrompt.split('Dependent task results:')[0].trim();
+    }
     if (dependentResults.length > 0) {
       taskPrompt = `Current task:
 ${taskPrompt}
