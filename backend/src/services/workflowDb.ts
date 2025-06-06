@@ -24,7 +24,7 @@ export interface WorkflowExecution {
   executionId: string;
   workflowId: string;
   userId: string;
-  status: 'pending' | 'success' | 'failed' | 'running';
+  status: 'pending' | 'completed' | 'failed' | 'running';
   startTime: string;
   endTime?: string;
   duration?: string;
@@ -33,7 +33,7 @@ export interface WorkflowExecution {
   tasks: {
     nodeId: string;
     taskId: string;
-    status: 'pending' | 'success' | 'failed' | 'running';
+    status: 'pending' | 'completed' | 'failed' | 'running';
     startTime: string;
     endTime?: string;
     error?: string;

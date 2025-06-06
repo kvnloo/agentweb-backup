@@ -26,7 +26,8 @@ import {
   Timeline as TimelineIcon,
   Autorenew as AutorenewIcon,
   PowerOff as PowerOffIcon,
-  Screenshot as ScreenshotIcon
+  Screenshot as ScreenshotIcon,
+  Refresh as RefreshIcon
 } from '@mui/icons-material';
 import { useAuth } from '../contexts/AuthContext';
 import { intervalToDuration } from 'date-fns';
@@ -136,6 +137,7 @@ export default function WorkflowExecutionDetails() {
   const [isAutoRefreshing, setIsAutoRefreshing] = useState(false);
   const [killDialogOpen, setKillDialogOpen] = useState(false);
   const [killLoading, setKillLoading] = useState(false);
+  const [rerunLoading, setRerunLoading] = useState<string | null>(null);
 
   const fetchData = useCallback(async () => {
     console.log('fetchData called with:', { workflowId, executionId });
@@ -341,6 +343,55 @@ export default function WorkflowExecutionDetails() {
     }
   };
 
+  const canRerunTask = (task: WorkflowTask) => {
+    if (!execution) return false;
+    
+    // Check if workflow execution is in a state that allows rerunning tasks
+    if (['pending', 'running'].includes(execution.status)) {
+      return false;
+    }
+
+    // Check if all dependent tasks are completed
+    if (task.dependsOn) {
+      const dependentTasks = execution.tasks.filter(t => task.dependsOn?.includes(t.taskId));
+      return dependentTasks.every(t => t.status === 'completed');
+    }
+
+    return true;
+  };
+
+  const handleRerunTask = async (taskId: string) => {
+    if (!workflowId || !executionId || !token) return;
+
+    setRerunLoading(taskId);
+    try {
+      const baseUrl = API_URL;
+      const response = await fetch(
+        `${baseUrl}/api/workflows/${workflowId}/executions/${executionId}/tasks/${taskId}/rerun`,
+        {
+          method: 'PUT',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.message || 'Failed to rerun task');
+      }
+
+      // Refresh the execution data
+      await fetchData();
+    } catch (error) {
+      console.error('Error rerunning task:', error);
+      setError(error instanceof Error ? error.message : 'Failed to rerun task');
+    } finally {
+      setRerunLoading(null);
+    }
+  };
+
   if (loading) {
     return (
       <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh' }}>
@@ -430,22 +481,37 @@ export default function WorkflowExecutionDetails() {
           <Box key={task.taskId} sx={{ mb: 3 }}>
             <Paper sx={{ p: 2, mb: 2 }}>
               <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
-                <Typography variant="h6">
-                  Task {index + 1}
-                </Typography>
-                <Box sx={{ display: 'flex', gap: 1 }}>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                  <Typography variant="h6">Task {index + 1}</Typography>
                   <Chip
                     icon={getStatusIcon(task.status)}
                     label={task.status}
                     color={getStatusColor(task.status)}
+                    size="small"
                   />
                   {task.llmName && (
                     <Chip
                       label={`LLM: ${task.llmName}`}
                       variant="outlined"
+                      size="small"
                     />
                   )}
                 </Box>
+                {canRerunTask(task) && (
+                  <Tooltip title="Rerun Task">
+                    <IconButton
+                      onClick={() => handleRerunTask(task.taskId)}
+                      disabled={rerunLoading === task.taskId}
+                      color="primary"
+                    >
+                      {rerunLoading === task.taskId ? (
+                        <CircularProgress size={24} />
+                      ) : (
+                        <RefreshIcon />
+                      )}
+                    </IconButton>
+                  </Tooltip>
+                )}
               </Box>
 
               {/* Task Timing Details */}
