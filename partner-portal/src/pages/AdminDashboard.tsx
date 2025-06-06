@@ -444,12 +444,6 @@ export default function AdminDashboard() {
   }, [tabValue, token]);
 
   useEffect(() => {
-    if (tabValue === 5) {
-      loadChatSessions();
-    }
-  }, [tabValue]);
-
-  useEffect(() => {
     const loadWorkflows = async () => {
       try {
         const response = await axios.get(buildApiUrl("/api/admin/workflows"), {
@@ -463,8 +457,27 @@ export default function AdminDashboard() {
       }
     };
 
-    if (tabValue === 6) { // New tab index for Workflows
+    if (tabValue === 5) { // Workflows tab
       loadWorkflows();
+    }
+  }, [tabValue, token]);
+
+  useEffect(() => {
+    const loadChatSessions = async () => {
+      try {
+        const response = await axios.get(buildApiUrl("/api/admin/chat-sessions"), {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+        setChatSessions(response.data);
+      } catch (error) {
+        console.error("Error loading chat sessions:", error);
+      }
+    };
+
+    if (tabValue === 6) { // Chat History tab
+      loadChatSessions();
     }
   }, [tabValue, token]);
 
@@ -703,21 +716,6 @@ export default function AdminDashboard() {
       } finally {
         setLoading(false);
       }
-    }
-  };
-
-  const loadChatSessions = async () => {
-    try {
-      setLoading(true);
-      const response = await axios.get(
-        buildApiUrl("/api/admin/chat-sessions"),
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      setChatSessions(response.data);
-    } catch (error: any) {
-      setError(error.response?.data?.message || "Failed to load chat sessions");
-    } finally {
-      setLoading(false);
     }
   };
 
