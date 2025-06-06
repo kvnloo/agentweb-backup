@@ -21,15 +21,14 @@ import {
 } from '@mui/material';
 import {
   ArrowBack as ArrowBackIcon,
+  Autorenew as AutorenewIcon,
   CheckCircle as CheckCircleIcon,
   Error as ErrorIcon,
-  Pending as PendingIcon,
-  Timeline as TimelineIcon,
-  Autorenew as AutorenewIcon,
   PowerOff as PowerOffIcon,
   Screenshot as ScreenshotIcon,
   Refresh as RefreshIcon,
-  Replay as ReplayIcon
+  Timeline as TimelineIcon,
+  HourglassEmpty as PendingIcon
 } from '@mui/icons-material';
 import { useAuth } from '../contexts/AuthContext';
 import { intervalToDuration } from 'date-fns';
