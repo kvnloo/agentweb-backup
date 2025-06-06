@@ -824,8 +824,8 @@ export default function AdminDashboard() {
             <Tab label="Users" {...a11yProps(2)} />
             <Tab label="Waitlist" {...a11yProps(3)} />
             <Tab label="Tasks" {...a11yProps(4)} />
-            <Tab label="Chat History" {...a11yProps(5)} />
-            <Tab label="Workflows" {...a11yProps(6)} />
+            <Tab label="Workflows" {...a11yProps(5)} />
+            <Tab label="Chat History" {...a11yProps(6)} />
           </Tabs>
         </Box>
 
@@ -1683,99 +1683,6 @@ export default function AdminDashboard() {
         </TabPanel>
 
         <TabPanel value={tabValue} index={5}>
-          {error && (
-            <Alert severity="error" sx={{ mb: 3 }}>
-              {error}
-            </Alert>
-          )}
-          <TableContainer component={Paper}>
-            <Table>
-              <TableHead>
-                <TableRow>
-                  <TableCell>Session ID</TableCell>
-                  <TableCell>User ID</TableCell>
-                  <TableCell>Portal Type</TableCell>
-                  <TableCell>Created At</TableCell>
-                  <TableCell>Updated At</TableCell>
-                  <TableCell>Message Count</TableCell>
-                  <TableCell>Actions</TableCell>
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {loading ? (
-                  <TableRow>
-                    <TableCell colSpan={6} align="center">
-                      <CircularProgress />
-                    </TableCell>
-                  </TableRow>
-                ) : (
-                  chatSessions.map((session) => (
-                    <TableRow key={session.sessionId}>
-                      <TableCell component="th" scope="row">
-                        <Tooltip title={session.sessionId}>
-                          <span>{`${session.sessionId.substring(
-                            0,
-                            8
-                          )}...`}</span>
-                        </Tooltip>
-                      </TableCell>
-                      <TableCell>
-                        <Link
-                          to={`/profile/${session.userId}`}
-                          style={{ textDecoration: "none" }}
-                        >
-                          {session.userId}
-                        </Link>
-                      </TableCell>
-                      <TableCell>
-                        {session.portalType ? (
-                          <Chip
-                            label={
-                              session.portalType.charAt(0).toUpperCase() +
-                              session.portalType.slice(1)
-                            }
-                            color={
-                              session.portalType === "customer"
-                                ? "secondary"
-                                : "primary"
-                            }
-                            size="small"
-                          />
-                        ) : (
-                          <Chip label="Partner" color="primary" size="small" />
-                        )}
-                      </TableCell>
-                      <TableCell>
-                        {format(new Date(session.createdAt), "Pp")}
-                      </TableCell>
-                      <TableCell>
-                        {format(new Date(session.updatedAt), "Pp")}
-                      </TableCell>
-                      <TableCell>
-                        <Chip
-                          label={session.messages?.length || 0}
-                          color="primary"
-                          size="small"
-                        />
-                      </TableCell>
-                      <TableCell>
-                        <Button
-                          variant="outlined"
-                          size="small"
-                          onClick={() => handleViewChat(session)}
-                        >
-                          View Chat
-                        </Button>
-                      </TableCell>
-                    </TableRow>
-                  ))
-                )}
-              </TableBody>
-            </Table>
-          </TableContainer>
-        </TabPanel>
-
-        <TabPanel value={tabValue} index={6}>
           <TableContainer component={Paper}>
             <Table>
               <TableHead>
@@ -1901,6 +1808,99 @@ export default function AdminDashboard() {
                         >
                           View Details
                         </Link>
+                      </TableCell>
+                    </TableRow>
+                  ))
+                )}
+              </TableBody>
+            </Table>
+          </TableContainer>
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={6}>
+          {error && (
+            <Alert severity="error" sx={{ mb: 3 }}>
+              {error}
+            </Alert>
+          )}
+          <TableContainer component={Paper}>
+            <Table>
+              <TableHead>
+                <TableRow>
+                  <TableCell>Session ID</TableCell>
+                  <TableCell>User ID</TableCell>
+                  <TableCell>Portal Type</TableCell>
+                  <TableCell>Created At</TableCell>
+                  <TableCell>Updated At</TableCell>
+                  <TableCell>Message Count</TableCell>
+                  <TableCell>Actions</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {loading ? (
+                  <TableRow>
+                    <TableCell colSpan={6} align="center">
+                      <CircularProgress />
+                    </TableCell>
+                  </TableRow>
+                ) : (
+                  chatSessions.map((session) => (
+                    <TableRow key={session.sessionId}>
+                      <TableCell component="th" scope="row">
+                        <Tooltip title={session.sessionId}>
+                          <span>{`${session.sessionId.substring(
+                            0,
+                            8
+                          )}...`}</span>
+                        </Tooltip>
+                      </TableCell>
+                      <TableCell>
+                        <Link
+                          to={`/profile/${session.userId}`}
+                          style={{ textDecoration: "none" }}
+                        >
+                          {session.userId}
+                        </Link>
+                      </TableCell>
+                      <TableCell>
+                        {session.portalType ? (
+                          <Chip
+                            label={
+                              session.portalType.charAt(0).toUpperCase() +
+                              session.portalType.slice(1)
+                            }
+                            color={
+                              session.portalType === "customer"
+                                ? "secondary"
+                                : "primary"
+                            }
+                            size="small"
+                          />
+                        ) : (
+                          <Chip label="Partner" color="primary" size="small" />
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        {format(new Date(session.createdAt), "Pp")}
+                      </TableCell>
+                      <TableCell>
+                        {format(new Date(session.updatedAt), "Pp")}
+                      </TableCell>
+                      <TableCell>
+                        <Chip
+                          label={session.messages?.length || 0}
+                          color="primary"
+                          size="small"
+                        />
+                      </TableCell>
+                      <TableCell>
+                        <Button
+                          variant="outlined"
+                          size="small"
+                          onClick={() => handleViewChat(session)}
+                        >
+                          View Chat
+                        </Button>
                       </TableCell>
                     </TableRow>
                   ))
