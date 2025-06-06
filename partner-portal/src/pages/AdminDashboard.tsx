@@ -133,6 +133,22 @@ interface AdminTask {
   [key: string]: any; // Allow other properties if necessary
 }
 
+// Define an interface for the workflow data shown in the admin workflows tab
+interface AdminWorkflow {
+  workflowId: string;
+  name: string;
+  description: string;
+  userId: string;
+  createdAt: string;
+  latestRunStatus?: string;
+  latestRunTime?: string | null;
+  completedRuns?: number;
+  totalRuns?: number;
+  completedTasks?: number;
+  totalTasks?: number;
+  [key: string]: any; // Allow other properties if necessary
+}
+
 const ChatDialog = ({
   session,
   open,
@@ -372,6 +388,7 @@ export default function AdminDashboard() {
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [userIdToDelete, setUserIdToDelete] = useState<string | null>(null);
   const [userDeleteConfirmOpen, setUserDeleteConfirmOpen] = useState(false);
+  const [workflows, setWorkflows] = useState<AdminWorkflow[]>([]);
   const { token } = useAuth();
 
   const {
@@ -431,6 +448,25 @@ export default function AdminDashboard() {
       loadChatSessions();
     }
   }, [tabValue]);
+
+  useEffect(() => {
+    const loadWorkflows = async () => {
+      try {
+        const response = await axios.get(buildApiUrl("/api/admin/workflows"), {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+        setWorkflows(response.data as AdminWorkflow[]);
+      } catch (error) {
+        console.error("Error loading workflows:", error);
+      }
+    };
+
+    if (tabValue === 6) { // New tab index for Workflows
+      loadWorkflows();
+    }
+  }, [tabValue, token]);
 
   const handleTabChange = (_event: React.SyntheticEvent, newValue: number) => {
     setTabValue(newValue);
@@ -789,6 +825,7 @@ export default function AdminDashboard() {
             <Tab label="Waitlist" {...a11yProps(3)} />
             <Tab label="Tasks" {...a11yProps(4)} />
             <Tab label="Chat History" {...a11yProps(5)} />
+            <Tab label="Workflows" {...a11yProps(6)} />
           </Tabs>
         </Box>
 
@@ -1729,6 +1766,141 @@ export default function AdminDashboard() {
                         >
                           View Chat
                         </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))
+                )}
+              </TableBody>
+            </Table>
+          </TableContainer>
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={6}>
+          <TableContainer component={Paper}>
+            <Table>
+              <TableHead>
+                <TableRow>
+                  <TableCell>
+                    <SortLabel property="workflowId" label="Workflow ID" />
+                  </TableCell>
+                  <TableCell>
+                    <SortLabel property="name" label="Name" />
+                  </TableCell>
+                  <TableCell>
+                    <SortLabel property="description" label="Description" />
+                  </TableCell>
+                  <TableCell>
+                    <SortLabel property="userId" label="Owner" />
+                  </TableCell>
+                  <TableCell>
+                    <SortLabel property="createdAt" label="Created At" />
+                  </TableCell>
+                  <TableCell>
+                    <SortLabel
+                      property="latestRunStatus"
+                      label="Latest Run Status"
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <SortLabel
+                      property="latestRunTime"
+                      label="Latest Run Time"
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <SortLabel
+                      property="completedRuns"
+                      label="Completed/Total Runs"
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <SortLabel
+                      property="completedTasks"
+                      label="Completed/Total Tasks"
+                    />
+                  </TableCell>
+                  <TableCell>Details</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {adminLoading ? (
+                  <TableRow>
+                    <TableCell colSpan={10} align="center">
+                      <CircularProgress />
+                    </TableCell>
+                  </TableRow>
+                ) : (
+                  workflows.map((workflow) => (
+                    <TableRow key={workflow.workflowId}>
+                      <TableCell>{workflow.workflowId}</TableCell>
+                      <TableCell>{workflow.name}</TableCell>
+                      <TableCell>
+                        {workflow.description?.length > 100
+                          ? `${workflow.description.substring(0, 100)}...`
+                          : workflow.description}
+                      </TableCell>
+                      <TableCell>{workflow.userId}</TableCell>
+                      <TableCell>
+                        {new Date(workflow.createdAt).toLocaleDateString()}
+                      </TableCell>
+                      <TableCell>
+                        <Chip
+                          label={workflow.latestRunStatus || "none"}
+                          color={
+                            workflow.latestRunStatus === "completed"
+                              ? "success"
+                              : workflow.latestRunStatus === "failed"
+                              ? "error"
+                              : workflow.latestRunStatus === "pending"
+                              ? "warning"
+                              : workflow.latestRunStatus === "running"
+                              ? "info"
+                              : "default"
+                          }
+                          size="small"
+                        />
+                      </TableCell>
+                      <TableCell>
+                        {workflow.latestRunTime
+                          ? new Date(workflow.latestRunTime).toLocaleString()
+                          : "Never"}
+                      </TableCell>
+                      <TableCell>
+                        {workflow.completedRuns || 0}/{workflow.totalRuns || 0}
+                        {workflow.totalRuns != null && workflow.totalRuns > 0 && (
+                          <Box component="span" sx={{ ml: 1 }}>
+                            (
+                            {Math.round(
+                              ((workflow.completedRuns || 0) / workflow.totalRuns) * 100
+                            )}
+                            %)
+                          </Box>
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        {workflow.completedTasks || 0}/{workflow.totalTasks || 0}
+                        {workflow.totalTasks != null && workflow.totalTasks > 0 && (
+                          <Box component="span" sx={{ ml: 1 }}>
+                            (
+                            {Math.round(
+                              ((workflow.completedTasks || 0) / workflow.totalTasks) * 100
+                            )}
+                            %)
+                          </Box>
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        <Link
+                          to={`/workflows/${workflow.workflowId}/run`}
+                          style={{
+                            color: "#1976d2",
+                            textDecoration: "none",
+                          }}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          View Details
+                        </Link>
                       </TableCell>
                     </TableRow>
                   ))

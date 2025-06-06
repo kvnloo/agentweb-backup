@@ -239,4 +239,23 @@ export class WorkflowService {
 
     return newWorkflow;
   }
-} 
+
+  async getWorkflowById(workflowId: string): Promise<Workflow | null> {
+    const result = await this.dynamodb.get({
+      TableName: `${TABLE_PREFIX}AW-Workflows`,
+      Key: { workflowId },
+    }).promise();
+
+    return (result.Item as Workflow) || null;
+  }
+
+  async getAllWorkflows(): Promise<Workflow[]> {
+    const result = await this.dynamodb.scan({
+      TableName: `${TABLE_PREFIX}AW-Workflows`,
+    }).promise();
+
+    return (result.Items as Workflow[]) || [];
+  }
+}
+
+export const workflowDb = new WorkflowService(); 
