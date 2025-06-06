@@ -598,6 +598,7 @@ export const taskDb = {
       useSharedBrowser?: boolean;
       turnOffHeadless?: boolean;
       knowledgeBase?: string;
+      knowledgeBaseSize?: number;
     }>
   ) {
     try {

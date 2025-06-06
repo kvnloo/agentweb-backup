@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-06-05',
+    changes: [
+      'Added Stripe payment integration for subscriptions',
+      '- Users can now start a two-week free trial without booking a demo',
+      '- Automatic payment starts after the free trial period',
+      '- Customers can cancel during the free trial to avoid any charges'
+    ],
+  },
+  {
     date: '2025-06-03',
     changes: [
       'Made Emma chat window collapsable',

@@ -1174,16 +1174,14 @@ export default function AdminDashboard() {
                           <Chip
                             label={user.taskCount || 0}
                             size="small"
-                            color={user.taskCount > 0 ? "primary" : "default"}
+                            color={(user.taskCount ?? 0) > 0 ? "primary" : "default"}
                           />
                         </TableCell>
                         <TableCell>
                           <Chip
                             label={user.workflowCount || 0}
                             size="small"
-                            color={
-                              user.workflowCount > 0 ? "primary" : "default"
-                            }
+                            color={(user.workflowCount ?? 0) > 0 ? "primary" : "default"}
                           />
                         </TableCell>
                         <TableCell>{user.isOAuthUser ? "Yes" : "No"}</TableCell>
