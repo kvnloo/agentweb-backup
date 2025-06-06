@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { WorkflowService, Workflow } from '../services/workflowDb';
 import { AuthenticatedRequest } from '../middleware/auth';
 import { generateWorkflowFromDescription } from '../services/workflowGenerator';
+import { userDb } from '../services/db';
 
 const workflowService = new WorkflowService();
 
@@ -24,7 +25,13 @@ export async function getWorkflow(req: AuthenticatedRequest, res: Response) {
       return res.status(404).json({ error: 'Workflow not found' });
     }
 
-    if (workflow.userId !== req.user.userId) {
+    // Check if user is admin or workflow owner
+    const user = await userDb.getUserById(req.user.userId);
+    if (!user) {
+      return res.status(401).json({ error: 'User not found' });
+    }
+
+    if (!user.isAdmin && workflow.userId !== req.user.userId) {
       return res.status(403).json({ error: 'Not authorized to access this workflow' });
     }
 
@@ -121,7 +128,14 @@ export async function getWorkflowExecutions(req: AuthenticatedRequest, res: Resp
     if (!workflow) {
       return res.status(404).json({ error: 'Workflow not found' });
     }
-    if (workflow.userId !== req.user.userId) {
+
+    // Check if user is admin or workflow owner
+    const user = await userDb.getUserById(req.user.userId);
+    if (!user) {
+      return res.status(401).json({ error: 'User not found' });
+    }
+
+    if (!user.isAdmin && workflow.userId !== req.user.userId) {
       return res.status(403).json({ error: 'Not authorized to view this workflow' });
     }
 

@@ -117,7 +117,7 @@ const CollapsibleText = ({ text, maxLength = 150 }: { text: string, maxLength?: 
 export default function WorkflowRun() {
   const { id } = useParams();
   const navigate = useNavigate();
-  const { token } = useAuth();
+  const { token, user } = useAuth();
   const [workflow, setWorkflow] = useState<Workflow | null>(null);
   const [executions, setExecutions] = useState<WorkflowExecution[]>([]);
   const [loading, setLoading] = useState(true);
@@ -291,6 +291,17 @@ export default function WorkflowRun() {
         <Typography variant="body1" color="text.secondary">
           {workflow?.description}
         </Typography>
+        {/* Admin viewing indicator */}
+        {user?.isAdmin && workflow && user?.userId !== workflow.userId && (
+          <Alert severity="info" sx={{ mt: 2 }}>
+            You are viewing another user's workflow as an administrator.
+            <Box sx={{ mt: 1 }}>
+              Workflow Owner: <Link href={`/profile/${workflow.userId}`} target="_blank" rel="noopener noreferrer">
+                {workflow.userId}
+              </Link>
+            </Box>
+          </Alert>
+        )}
       </Paper>
 
       {error && (
