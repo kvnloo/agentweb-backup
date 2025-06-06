@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { useNavigate, Link } from "react-router-dom";
+import { useState, useEffect } from "react";
+import { useNavigate, Link, useSearchParams } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -19,11 +19,19 @@ import { Separator } from "@/components/ui/separator";
 import AgentWebLogo from "@/assets/AgentWeb-Logo-189x62.svg";
 
 const Login = () => {
+  const [searchParams] = useSearchParams();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const { login, error, errorCode } = useAuth();
   const navigate = useNavigate();
+
+  useEffect(() => {
+    const emailParam = searchParams.get("email");
+    if (emailParam) {
+      setEmail(emailParam);
+    }
+  }, [searchParams]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

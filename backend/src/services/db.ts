@@ -308,7 +308,14 @@ class UserDB {
   }
 
   async updateUser(userId: string, updates: Partial<User>) {
-    // Filter out keys that should not be updated directly or are part of the key
+    // First, get the user by userId to ensure they exist and to get their email
+    const user = await this.getUserById(userId);
+    if (!user || !user.email) {
+      // This will be caught by the generic error handler, but good to be explicit
+      throw new Error(`User with ID '${userId}' not found or has no email.`);
+    }
+
+    // Filter out keys that are part of the key or should not be updated directly
     const {
       userId: _,
       email: __,
@@ -318,7 +325,7 @@ class UserDB {
     } = updates;
 
     if (Object.keys(updatableFields).length === 0) {
-      return this.getUserById(userId); // Or return the user object if already fetched
+      return user; // Return the fetched user object if no updates are needed
     }
 
     const updateExpressions: string[] = [];
@@ -335,13 +342,12 @@ class UserDB {
     });
 
     if (updateExpressions.length === 0) {
-      // This case might be redundant due to the initial check, but good for safety
-      return this.getUserById(userId);
+      return user;
     }
 
     const params = {
       TableName: this.tableName,
-      Key: { userId: userId }, // Assuming userId is the primary key for the User table
+      Key: { email: user.email }, // Use email as the primary key
       UpdateExpression: `SET ${updateExpressions.join(", ")}`,
       ExpressionAttributeNames: expressionAttributeNames,
       ExpressionAttributeValues: expressionAttributeValues,
@@ -353,7 +359,7 @@ class UserDB {
       return result.Attributes as User;
     } catch (error) {
       handleDynamoDbError(error, "updateUser");
-      throw error; // Re-throw after logging or specific handling
+      throw error; // Re-throw after logging
     }
   }
 
@@ -532,28 +538,6 @@ export const taskDb = {
       return tasksWithDetails;
     } catch (error) {
       handleDynamoDbError(error, "getTasksByUserId");
-    }
-  },
-
-  async getAvailableTasks(userId: string) {
-    try {
-      const tasks = await this.getTasksByUserId(userId);
-      if (!tasks) return [];
-      return tasks.filter((task: any) => task.status === "active");
-    } catch (error) {
-      handleDynamoDbError(error, "getAvailableTasks");
-      return [];
-    }
-  },
-
-  async getAvailableTasks(userId: string) {
-    try {
-      const tasks = await this.getTasksByUserId(userId);
-      if (!tasks) return [];
-      return tasks.filter((task: any) => task.status === "active");
-    } catch (error) {
-      handleDynamoDbError(error, "getAvailableTasks");
-      return [];
     }
   },
 
@@ -1131,6 +1115,17 @@ export const taskDb = {
       return result.Attributes;
     } catch (error) {
       handleDynamoDbError(error, "killTaskExecution");
+    }
+  },
+
+  async getAvailableTasks(userId: string) {
+    try {
+      const tasks = await this.getTasksByUserId(userId);
+      if (!tasks) return [];
+      return tasks.filter((task: any) => task.status === "active");
+    } catch (error) {
+      handleDynamoDbError(error, "getAvailableTasks");
+      return [];
     }
   },
 };
