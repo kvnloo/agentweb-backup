@@ -598,6 +598,7 @@ export const taskDb = {
       useSharedBrowser?: boolean;
       turnOffHeadless?: boolean;
       knowledgeBase?: string;
+      knowledgeBaseSize?: number;
     }>
   ) {
     try {
@@ -692,6 +693,8 @@ export const taskDb = {
     run_user_id?: string;
     status: string;
     startTime: string;
+    workflowExecutionId?: string;
+    prompt?: string;
   }) {
     try {
       const params = {

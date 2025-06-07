@@ -433,17 +433,16 @@ export default function TaskDetails() {
 
   // Control polling interval based on execution status
   useEffect(() => {
-    // Only poll if there are pending or running executions
-    const hasActiveExecutions = executions.some(
-      execution => execution.status === 'pending' || execution.status === 'running'
-    );
+    // Only poll if the latest execution is pending or running
+    const latestExecution = getLatestExecution();
+    const shouldPoll = Boolean(latestExecution && ['pending', 'running'].includes(latestExecution.status.toLowerCase()));
     
-    setShouldPoll(hasActiveExecutions);
+    setShouldPoll(shouldPoll);
     
-    if (hasActiveExecutions) {
-      console.log('Active executions found - polling enabled');
+    if (shouldPoll) {
+      console.log('Latest execution is active - polling enabled');
     } else {
-      console.log('No active executions - polling disabled');
+      console.log('No active latest execution - polling disabled');
     }
   }, [executions]);
 
