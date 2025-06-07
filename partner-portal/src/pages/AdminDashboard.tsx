@@ -90,6 +90,8 @@ interface WaitlistEntry {
   requestReport?: boolean;
   supportNote?: string;
   stripe_customer_id?: string;
+  monthlyMarketingSpend?: string;
+  businessArea?: string;
 }
 
 // Define ChatSession interface for the frontend, including portalType
@@ -538,30 +540,22 @@ export default function AdminDashboard() {
   };
 
   const getTimeAgo = (dateString?: string) => {
-    if (!dateString) return "Never";
-
+    if (!dateString) return "N/A";
     const date = new Date(dateString);
     const now = new Date();
-    const diffMs = now.getTime() - date.getTime();
+    const seconds = Math.floor((now.getTime() - date.getTime()) / 1000);
 
-    // Convert to appropriate time unit
-    const diffSec = Math.floor(diffMs / 1000);
-    const diffMin = Math.floor(diffSec / 60);
-    const diffHours = Math.floor(diffMin / 60);
-    const diffDays = Math.floor(diffHours / 24);
-
-    if (diffDays > 30) {
-      const diffMonths = Math.floor(diffDays / 30);
-      return `${diffMonths} month${diffMonths > 1 ? "s" : ""} ago`;
-    } else if (diffDays > 0) {
-      return `${diffDays} day${diffDays > 1 ? "s" : ""} ago`;
-    } else if (diffHours > 0) {
-      return `${diffHours} hour${diffHours > 1 ? "s" : ""} ago`;
-    } else if (diffMin > 0) {
-      return `${diffMin} minute${diffMin > 1 ? "s" : ""} ago`;
-    } else {
-      return "Just now";
-    }
+    let interval = seconds / 31536000;
+    if (interval > 1) return `${Math.floor(interval)} years ago`;
+    interval = seconds / 2592000;
+    if (interval > 1) return `${Math.floor(interval)} months ago`;
+    interval = seconds / 86400;
+    if (interval > 1) return `${Math.floor(interval)} days ago`;
+    interval = seconds / 3600;
+    if (interval > 1) return `${Math.floor(interval)} hours ago`;
+    interval = seconds / 60;
+    if (interval > 1) return `${Math.floor(interval)} minutes ago`;
+    return `${Math.floor(seconds)} seconds ago`;
   };
 
   const handleSort = (property: string) => {
@@ -1283,12 +1277,12 @@ export default function AdminDashboard() {
 
         <TabPanel value={tabValue} index={3}>
           {error && (
-            <Alert severity="error" sx={{ mb: 3 }}>
+            <Alert severity="error" sx={{ mb: 2 }}>
               {error}
             </Alert>
           )}
           {success && (
-            <Alert severity="success" sx={{ mb: 3 }}>
+            <Alert severity="success" sx={{ mb: 2 }}>
               {success}
             </Alert>
           )}
@@ -1296,35 +1290,34 @@ export default function AdminDashboard() {
             <Table>
               <TableHead>
                 <TableRow>
-                  <TableCell>Email</TableCell>
-                  <TableCell>Full Name</TableCell>
-                  <TableCell>Company Name</TableCell>
-                  <TableCell>Phone Number</TableCell>
-                  <TableCell>Stripe Customer ID</TableCell>
                   <TableCell>
-                    <Box
-                      sx={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 0.5,
-                        fontWeight: "bold",
-                      }}
-                    >
-                      Joined At
-                      <Box
-                        component="span"
-                        sx={{ ml: 0.5, fontSize: "0.75rem" }}
-                      >
-                        ↓
-                      </Box>
-                    </Box>
+                    <SortLabel property="email" label="Email" />
                   </TableCell>
-                  <TableCell>Use Cases</TableCell>
-                  <TableCell>Use Case Description</TableCell>
-                  <TableCell>Last Invited</TableCell>
+                  <TableCell>
+                    <SortLabel property="fullName" label="Full Name" />
+                  </TableCell>
+                  <TableCell>
+                    <SortLabel property="companyName" label="Company" />
+                  </TableCell>
+                  <TableCell>
+                    <SortLabel
+                      property="monthlyMarketingSpend"
+                      label="Marketing Spend"
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <SortLabel property="businessArea" label="Business Area" />
+                  </TableCell>
+                  <TableCell>
+                    <SortLabel property="joinedAt" label="Joined" />
+                  </TableCell>
+                  <TableCell>Details</TableCell>
+                  <TableCell>Use Case</TableCell>
                   <TableCell>Request Report</TableCell>
                   <TableCell>Support Note</TableCell>
-                  <TableCell>Status</TableCell>
+                  <TableCell>
+                    <SortLabel property="status" label="Status" />
+                  </TableCell>
                   <TableCell>Actions</TableCell>
                 </TableRow>
               </TableHead>
@@ -1345,12 +1338,25 @@ export default function AdminDashboard() {
                         <TableCell>{entry.email}</TableCell>
                         <TableCell>{entry.fullName || "-"}</TableCell>
                         <TableCell>{entry.companyName || "-"}</TableCell>
-                        <TableCell>{entry.phoneNumber || "-"}</TableCell>
-                        <TableCell>{entry.stripe_customer_id || "-"}</TableCell>
+                        <TableCell>
+                          {entry.monthlyMarketingSpend || "N/A"}
+                        </TableCell>
+                        <TableCell>{entry.businessArea || "N/A"}</TableCell>
                         <TableCell>
                           {entry.joinedAt
                             ? new Date(entry.joinedAt).toLocaleDateString()
                             : "-"}
+                        </TableCell>
+                        <TableCell>
+                          <Tooltip
+                            title={
+                              entry.phoneNumber
+                                ? `Phone: ${entry.phoneNumber}`
+                                : "No phone number"
+                            }
+                          >
+                            <InfoIcon color="action" />
+                          </Tooltip>
                         </TableCell>
                         <TableCell>
                           {entry.useCaseCategories &&
@@ -1430,7 +1436,6 @@ export default function AdminDashboard() {
                             </Typography>
                           )}
                         </TableCell>
-                        <TableCell>{getTimeAgo(entry.invitedAt)}</TableCell>
                         <TableCell>
                           <Chip
                             label={
@@ -1453,38 +1458,34 @@ export default function AdminDashboard() {
                         <TableCell>
                           <Box
                             sx={{
+                              maxWidth: 200,
+                              whiteSpace: "nowrap",
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
                               display: "flex",
                               alignItems: "center",
-                              justifyContent: "space-between",
-                              minHeight: "40px",
                             }}
                           >
-                            <Tooltip
-                              title={entry.supportNote || "No note"}
-                              placement="top-start"
-                            >
-                              <Typography
-                                variant="body2"
-                                sx={{
-                                  flexGrow: 1,
-                                  maxWidth: 220, // Adjusted width
-                                  overflow: "hidden",
-                                  textOverflow: "ellipsis",
-                                  whiteSpace: "nowrap",
-                                  pr: 0.5, // Padding before button
-                                }}
-                              >
-                                {entry.supportNote || "-"}
-                              </Typography>
+                            <Tooltip title={entry.supportNote || "No note"}>
+                              <span>
+                                {entry.supportNote || (
+                                  <Typography
+                                    variant="body2"
+                                    color="text.secondary"
+                                  >
+                                    No note
+                                  </Typography>
+                                )}
+                              </span>
                             </Tooltip>
                             <IconButton
+                              size="small"
                               onClick={() =>
                                 handleEditNoteClick(
                                   entry.email,
                                   entry.supportNote || ""
                                 )
                               }
-                              size="small"
                             >
                               <EditIcon fontSize="small" />
                             </IconButton>
@@ -1492,7 +1493,7 @@ export default function AdminDashboard() {
                         </TableCell>
                         <TableCell>
                           <Chip
-                            label={entry.status || "pending"}
+                            label={entry.status}
                             color={
                               entry.status === "invited"
                                 ? "success"
