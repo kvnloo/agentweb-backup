@@ -449,7 +449,7 @@ export const taskDb = {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Tasks`,
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, #epc, #vo, #adm",
+          "taskId, userId, #n, prompt, #s, createdAt, #epc, #vo, #adm, knowledgeBaseSize, updatedAt",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",

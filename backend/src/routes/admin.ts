@@ -799,4 +799,39 @@ router.get("/workflows", async (req, res) => {
   }
 });
 
+// Get knowledge base metrics
+router.get("/knowledge-base-metrics", async (req, res) => {
+  try {
+    // Get all tasks
+    const tasks = await taskDb.getAllTasks() || [];
+    
+    // Calculate metrics
+    const totalTasks = tasks.length;
+    const tasksWithKnowledgeBase = tasks.filter(task => task.knowledgeBaseSize && task.knowledgeBaseSize > 0).length;
+    const totalKnowledgeBaseSize = tasks.reduce((sum, task) => sum + (task.knowledgeBaseSize || 0), 0);
+    const averageKnowledgeBaseSize = tasksWithKnowledgeBase > 0 ? totalKnowledgeBaseSize / tasksWithKnowledgeBase : 0;
+    
+    // Get tasks with knowledge base details
+    const tasksWithDetails = tasks
+      .filter(task => task.knowledgeBaseSize && task.knowledgeBaseSize > 0)
+      .map(task => ({
+        taskId: task.taskId,
+        name: task.name,
+        knowledgeBaseSize: task.knowledgeBaseSize || 0,
+        owner: task.userId
+      }));
+
+    res.json({
+      totalTasks,
+      tasksWithKnowledgeBase,
+      totalKnowledgeBaseSize,
+      averageKnowledgeBaseSize,
+      tasks: tasksWithDetails
+    });
+  } catch (error) {
+    console.error("Error getting knowledge base metrics:", error);
+    res.status(500).json({ message: "Error fetching knowledge base metrics" });
+  }
+});
+
 export default router;
