@@ -30,6 +30,11 @@ import {
   IconButton,
   FormControlLabel,
   Checkbox,
+  FormControl,
+  InputLabel,
+  Select,
+  MenuItem,
+  FormGroup,
 } from "@mui/material";
 import { format } from "date-fns";
 import { Link } from "react-router-dom";
@@ -45,6 +50,7 @@ import {
   Edit as EditIcon,
   PersonOff as PersonOffIcon,
   Delete as DeleteIcon,
+  PersonAdd as PersonAddIcon,
 } from "@mui/icons-material";
 
 interface TabPanelProps {
@@ -407,7 +413,26 @@ export default function AdminDashboard() {
     updateWaitlistSupportNote,
     deleteWaitlistEntry,
     deleteUser,
+    addToWaitlist,
   } = useAdmin();
+
+  // Manual invite modal state
+  const [manualInviteOpen, setManualInviteOpen] = useState(false);
+  const [manualInviteForm, setManualInviteForm] = useState({
+    email: "",
+    fullName: "",
+    phoneNumber: "",
+    companyName: "",
+    useCaseCategories: [] as string[],
+    useCaseDescription: "",
+    requestReport: false,
+    supportNote: "",
+    monthlyMarketingSpend: "",
+    businessArea: "",
+    stripe_customer_id: "",
+    sendInvitation: true,
+  });
+  const [manualInviteLoading, setManualInviteLoading] = useState(false);
 
   useEffect(() => {
     const loadData = async () => {
@@ -779,6 +804,54 @@ export default function AdminDashboard() {
       setNoteEditLoading(false);
     }
   };
+
+  const handleManualInviteOpen = () => {
+    setManualInviteOpen(true);
+  };
+
+  const handleManualInviteClose = () => {
+    setManualInviteOpen(false);
+    setManualInviteForm({
+      email: "",
+      fullName: "",
+      phoneNumber: "",
+      companyName: "",
+      useCaseCategories: [],
+      useCaseDescription: "",
+      requestReport: false,
+      supportNote: "",
+      monthlyMarketingSpend: "",
+      businessArea: "",
+      stripe_customer_id: "",
+      sendInvitation: true,
+    });
+  };
+
+  const handleManualInviteSubmit = async () => {
+    try {
+      setManualInviteLoading(true);
+      await addToWaitlist(manualInviteForm);
+      setSuccess("Successfully added to waitlist!");
+      handleManualInviteClose();
+    } catch (error) {
+      // Error is already handled in the context
+    } finally {
+      setManualInviteLoading(false);
+    }
+  };
+
+  const useCaseOptions = [
+    "Content Marketing",
+    "SEO",
+    "Lead Generation",
+    "Social Media Marketing",
+    "Email Marketing",
+    "PPC Advertising",
+    "Analytics & Reporting",
+    "Market Research",
+    "Competitor Analysis",
+    "Other",
+  ];
 
   if (adminError) {
     return <Alert severity="error">{adminError}</Alert>;
@@ -1278,6 +1351,19 @@ export default function AdminDashboard() {
               {success}
             </Alert>
           )}
+
+          {/* Manual Invite Button */}
+          <Box sx={{ display: "flex", justifyContent: "flex-end", mb: 2 }}>
+            <Button
+              variant="contained"
+              startIcon={<PersonAddIcon />}
+              onClick={handleManualInviteOpen}
+              disabled={adminLoading}
+            >
+              Manual Invite
+            </Button>
+          </Box>
+
           <TableContainer component={Paper}>
             <Table>
               <TableHead>
@@ -2079,6 +2165,231 @@ export default function AdminDashboard() {
           <Button onClick={handleCloseUserDeleteConfirm}>Cancel</Button>
           <Button onClick={handleUserDeleteConfirmed} color="error" autoFocus>
             Delete User
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Manual Invite Dialog */}
+      <Dialog
+        open={manualInviteOpen}
+        onClose={handleManualInviteClose}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle>
+          Manually Add to Waitlist
+          <IconButton
+            aria-label="close"
+            onClick={handleManualInviteClose}
+            sx={{ position: "absolute", right: 8, top: 8 }}
+          >
+            <CloseIcon />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent dividers>
+          <Grid container spacing={2}>
+            <Grid item xs={12} sm={6}>
+              <TextField
+                fullWidth
+                label="Email *"
+                type="email"
+                value={manualInviteForm.email}
+                onChange={(e) =>
+                  setManualInviteForm({
+                    ...manualInviteForm,
+                    email: e.target.value,
+                  })
+                }
+                required
+              />
+            </Grid>
+            <Grid item xs={12} sm={6}>
+              <TextField
+                fullWidth
+                label="Full Name"
+                value={manualInviteForm.fullName}
+                onChange={(e) =>
+                  setManualInviteForm({
+                    ...manualInviteForm,
+                    fullName: e.target.value,
+                  })
+                }
+              />
+            </Grid>
+            <Grid item xs={12} sm={6}>
+              <TextField
+                fullWidth
+                label="Phone Number"
+                value={manualInviteForm.phoneNumber}
+                onChange={(e) =>
+                  setManualInviteForm({
+                    ...manualInviteForm,
+                    phoneNumber: e.target.value,
+                  })
+                }
+              />
+            </Grid>
+            <Grid item xs={12} sm={6}>
+              <TextField
+                fullWidth
+                label="Company Name"
+                value={manualInviteForm.companyName}
+                onChange={(e) =>
+                  setManualInviteForm({
+                    ...manualInviteForm,
+                    companyName: e.target.value,
+                  })
+                }
+              />
+            </Grid>
+            <Grid item xs={12} sm={6}>
+              <FormControl fullWidth>
+                <InputLabel>Use Case Categories</InputLabel>
+                <Select
+                  multiple
+                  value={manualInviteForm.useCaseCategories}
+                  onChange={(e) =>
+                    setManualInviteForm({
+                      ...manualInviteForm,
+                      useCaseCategories:
+                        typeof e.target.value === "string"
+                          ? [e.target.value]
+                          : e.target.value,
+                    })
+                  }
+                  renderValue={(selected) => (
+                    <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5 }}>
+                      {selected.map((value) => (
+                        <Chip key={value} label={value} size="small" />
+                      ))}
+                    </Box>
+                  )}
+                >
+                  {useCaseOptions.map((option) => (
+                    <MenuItem key={option} value={option}>
+                      {option}
+                    </MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+            </Grid>
+            <Grid item xs={12} sm={6}>
+              <TextField
+                fullWidth
+                label="Monthly Marketing Spend"
+                value={manualInviteForm.monthlyMarketingSpend}
+                onChange={(e) =>
+                  setManualInviteForm({
+                    ...manualInviteForm,
+                    monthlyMarketingSpend: e.target.value,
+                  })
+                }
+              />
+            </Grid>
+            <Grid item xs={12} sm={6}>
+              <TextField
+                fullWidth
+                label="Stripe Customer ID"
+                value={manualInviteForm.stripe_customer_id}
+                onChange={(e) =>
+                  setManualInviteForm({
+                    ...manualInviteForm,
+                    stripe_customer_id: e.target.value,
+                  })
+                }
+                placeholder="cus_..."
+              />
+            </Grid>
+            <Grid item xs={12}>
+              <TextField
+                fullWidth
+                label="Business Area"
+                value={manualInviteForm.businessArea}
+                onChange={(e) =>
+                  setManualInviteForm({
+                    ...manualInviteForm,
+                    businessArea: e.target.value,
+                  })
+                }
+              />
+            </Grid>
+            <Grid item xs={12}>
+              <TextField
+                fullWidth
+                label="Use Case Description"
+                multiline
+                rows={3}
+                value={manualInviteForm.useCaseDescription}
+                onChange={(e) =>
+                  setManualInviteForm({
+                    ...manualInviteForm,
+                    useCaseDescription: e.target.value,
+                  })
+                }
+              />
+            </Grid>
+            <Grid item xs={12}>
+              <TextField
+                fullWidth
+                label="Support Note"
+                multiline
+                rows={2}
+                value={manualInviteForm.supportNote}
+                onChange={(e) =>
+                  setManualInviteForm({
+                    ...manualInviteForm,
+                    supportNote: e.target.value,
+                  })
+                }
+                placeholder="Internal notes about this entry..."
+              />
+            </Grid>
+            <Grid item xs={12}>
+              <FormGroup>
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      checked={manualInviteForm.requestReport}
+                      onChange={(e) =>
+                        setManualInviteForm({
+                          ...manualInviteForm,
+                          requestReport: e.target.checked,
+                        })
+                      }
+                    />
+                  }
+                  label="Request Report"
+                />
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      checked={manualInviteForm.sendInvitation}
+                      onChange={(e) =>
+                        setManualInviteForm({
+                          ...manualInviteForm,
+                          sendInvitation: e.target.checked,
+                        })
+                      }
+                    />
+                  }
+                  label="Send Invitation Email Immediately"
+                />
+              </FormGroup>
+            </Grid>
+          </Grid>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleManualInviteClose}>Cancel</Button>
+          <Button
+            onClick={handleManualInviteSubmit}
+            variant="contained"
+            disabled={!manualInviteForm.email || manualInviteLoading}
+          >
+            {manualInviteLoading ? (
+              <CircularProgress size={24} />
+            ) : (
+              "Add to Waitlist"
+            )}
           </Button>
         </DialogActions>
       </Dialog>
