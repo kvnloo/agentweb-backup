@@ -12,6 +12,12 @@ At the heart of AgentWeb's web automation capabilities lies the browser-use libr
 CTO, AgentWeb
 \end{quote}
 
+## Architecture Overview
+
+The following diagram illustrates how browser-use powers AgentWeb's marketing automation capabilities:
+
+![AgentWeb Browser-Use Architecture](agentweb_browser_use_architecture.png)
+
 ## The Power of Browser-Use
 
 Browser-use is more than just a browser automation library—it's a comprehensive framework that enables AI agents to:
@@ -70,23 +76,40 @@ Browser-use enables AgentWeb to provide comprehensive transparency through:
 
 ## Real-World Applications
 
-### 1. Web Navigation and Interaction
-- Automated website navigation
-- Form filling and submission
-- Data extraction and processing
-- File uploads and downloads
+### 1. Marketing Automation
+- Automated social media posting and engagement
+- Content research and curation
+- Competitor analysis and market research
+- Automated email marketing campaigns
+- Social media account management
 
-### 2. Authentication and Security
-- Secure login handling
-- Session management
-- Credential protection
-- Cookie management
+### 2. Lead Generation and Research
+- Automated lead research and qualification
+- Market trend analysis
+- Customer behavior tracking
+- Industry news monitoring
+- Competitor pricing analysis
 
-### 3. Complex Workflows
-- Multi-step processes
-- Conditional logic
-- Error recovery
-- Result validation
+### 3. Content Management
+- Automated content scheduling
+- Social media content creation
+- Blog post research and drafting
+- Content performance tracking
+- Multi-platform content distribution
+
+### 4. Analytics and Reporting
+- Automated report generation
+- Campaign performance tracking
+- ROI analysis
+- Social media metrics collection
+- Marketing funnel analysis
+
+### 5. Customer Engagement
+- Automated customer support
+- Social media response management
+- Customer feedback collection
+- Engagement metrics tracking
+- Community management
 
 ## Technical Implementation
 

@@ -1,0 +1,59 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'fontSize': '24px', 'fontFamily': 'arial', 'primaryColor': '#fff', 'primaryTextColor': '#000', 'primaryBorderColor': '#000', 'lineColor': '#000', 'secondaryColor': '#fff', 'tertiaryColor': '#fff' }}}%%
+graph TD
+    subgraph "AgentWeb Platform"
+        direction TB
+        
+        subgraph "Frontend Portals"
+            direction TB
+            CP[Customer Portal] --> |API Requests| BE[Backend]
+            PP[Partner Portal] --> |API Requests| BE
+        end
+        
+        subgraph "Backend Services"
+            direction TB
+            BE --> |Store Data| DB[(Database)]
+            BE --> |Trigger Tasks| AE[Agent Engine]
+            
+            subgraph "Authentication"
+                direction TB
+                BE --> |OAuth| AUTH[Auth Service]
+                AUTH --> |User Roles| DB
+            end
+        end
+        
+        subgraph "Agent Engine"
+            direction TB
+            AE --> |Execute Tasks| BU[Browser-Use]
+            
+            subgraph "Browser-Use Core"
+                direction TB
+                BU --> SM[Session Manager]
+                BU --> VE[Vision Engine]
+                BU --> AR[Action Registry]
+                BU --> SEC[Security Layer]
+            end
+            
+            subgraph "Task Execution"
+                direction TB
+                SM --> |Browser Control| BC[Browser Control]
+                VE --> |Visual Analysis| VA[Visual Analysis]
+                AR --> |Action Execution| AE2[Action Execution]
+                SEC --> |Data Protection| DP[Data Protection]
+            end
+        end
+        
+        subgraph "Cloud Services"
+            direction TB
+            DB --> |Store Files| S3[(S3 Storage)]
+            AE --> |Store Results| S3
+            BU --> |Store Artifacts| S3
+        end
+    end
+    
+    style CP fill:#f9f,stroke:#333,stroke-width:4px
+    style PP fill:#f9f,stroke:#333,stroke-width:4px
+    style BE fill:#bbf,stroke:#333,stroke-width:4px
+    style AE fill:#bfb,stroke:#333,stroke-width:4px
+    style BU fill:#bfb,stroke:#333,stroke-width:4px
+    style DB fill:#fbb,stroke:#333,stroke-width:4px
+    style S3 fill:#fbb,stroke:#333,stroke-width:4px 
