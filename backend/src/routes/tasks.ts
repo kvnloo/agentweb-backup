@@ -40,7 +40,8 @@ const openai = new OpenAI({
 });
 
 // Ensure bucket exists
-const BUCKET_NAME = process.env.GCS_BUCKET || 'agentweb-knowledge-base-dev';
+const BUCKET_NAME = process.env.GCS_BUCKET_NAME || 'agentweb-knowledge-base-dev';
+const PRIVATE_BUCKET_NAME = process.env.GCS_BUCKET_NAME_PRIVATE || 'agentweb-knowledge-base-private-dev';
 
 type FileRequest = AuthenticatedRequest & {
   file?: Express.Multer.File;
@@ -355,17 +356,67 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
       return res.status(403).json({ message: 'Not authorized to access this task' });
     }
 
-    const bucket = storage.bucket(BUCKET_NAME);
-    const filePath = `tasks/${taskId}/knowledge-base.txt`;
-    const file = bucket.file(filePath);
+    // Try private bucket first
+    const privateBucket = storage.bucket(PRIVATE_BUCKET_NAME);
+    const privateFilePath = `tasks/${taskId}/knowledge-base.txt`;
+    const privateFile = privateBucket.file(privateFilePath);
 
-    // Check if file exists
-    const [exists] = await file.exists();
+    // Check if file exists in private bucket
+    const [privateExists] = await privateFile.exists();
     
-    // If file doesn't exist and no knowledge base link exists, create a new one
-    if (!exists && !task.knowledgeBase) {
-      // Create empty file
-      await file.save('', {
+    if (privateExists) {
+      // If file exists in private bucket, get its content
+      const [content] = await privateFile.download();
+      const contentStr = content.toString();
+      
+      // If private file has content, return it
+      if (contentStr.trim()) {
+        res.json({ content: contentStr, url: task.knowledgeBase });
+        return;
+      }
+    }
+
+    // If private file doesn't exist or is empty, try public bucket
+    const publicBucket = storage.bucket(BUCKET_NAME);
+    const publicFilePath = `tasks/${taskId}/knowledge-base.txt`;
+    const publicFile = publicBucket.file(publicFilePath);
+
+    // Check if file exists in public bucket
+    const [publicExists] = await publicFile.exists();
+    
+    if (publicExists) {
+      // If file exists in public bucket, copy it to private bucket
+      const [content] = await publicFile.download();
+      const contentStr = content.toString();
+
+      // Save to private bucket
+      await privateFile.save(contentStr, {
+        contentType: 'text/plain',
+        metadata: {
+          taskId,
+          userId,
+          createdAt: new Date().toISOString(),
+          copiedFrom: 'public'
+        }
+      });
+
+      // Get the public URL
+      const [url] = await privateFile.getSignedUrl({
+        action: 'read',
+        expires: '03-01-2500' // Far future expiration
+      });
+
+      // Update task with the new knowledge base link
+      await taskDb.updateTask(taskId, { knowledgeBase: url, knowledgeBaseSize: Buffer.byteLength(contentStr, 'utf8') });
+
+      res.json({ content: contentStr, url });
+      return;
+    }
+
+    // If file doesn't exist in either bucket and no knowledge base link exists, create a new one in private bucket
+    if (!task.knowledgeBase) {
+      // Create empty file in private bucket
+      await privateFile.save('', {
         contentType: 'text/plain',
         metadata: {
           taskId,
@@ -375,7 +426,7 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
       });
 
       // Get the public URL
-      const [url] = await file.getSignedUrl({
+      const [url] = await privateFile.getSignedUrl({
         action: 'read',
         expires: '03-01-2500' // Far future expiration
       });
@@ -386,15 +437,8 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
       return res.json({ content: '', url });
     }
 
-    // If file exists, get the content
-    if (exists) {
-      const [content] = await file.download();
-      const contentStr = content.toString();
-      res.json({ content: contentStr, url: task.knowledgeBase });
-    } else {
-      // If file doesn't exist but task has a knowledge base link, return 404
-      res.status(404).json({ message: 'Knowledge base file not found' });
-    }
+    // If file doesn't exist but task has a knowledge base link, return 404
+    res.status(404).json({ message: 'Knowledge base file not found' });
   } catch (error) {
     console.error('Error in knowledge base GET:', error);
     res.status(500).json({ message: 'Internal server error' });
@@ -423,12 +467,13 @@ router.put('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
       return res.status(403).json({ message: 'Not authorized to modify this task' });
     }
 
-    const bucket = storage.bucket(BUCKET_NAME);
-    const filePath = `tasks/${taskId}/knowledge-base.txt`;
-    const file = bucket.file(filePath);
+    // Always save to private bucket
+    const privateBucket = storage.bucket(PRIVATE_BUCKET_NAME);
+    const privateFilePath = `tasks/${taskId}/knowledge-base.txt`;
+    const privateFile = privateBucket.file(privateFilePath);
 
-    // Save content to file
-    await file.save(contentToSave, {
+    // Save content to private bucket
+    await privateFile.save(contentToSave, {
       contentType: 'text/plain',
       metadata: {
         taskId,
@@ -439,7 +484,7 @@ router.put('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
 
     // Get the public URL if it's a new file
     if (!task.knowledgeBase) {
-      const [url] = await file.getSignedUrl({
+      const [url] = await privateFile.getSignedUrl({
         action: 'read',
         expires: '03-01-2500' // Far future expiration
       });
