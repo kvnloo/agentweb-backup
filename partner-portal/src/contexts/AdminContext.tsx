@@ -46,6 +46,12 @@ interface AdminContextType {
   ) => Promise<void>;
   deleteWaitlistEntry: (email: string) => Promise<void>;
   deleteUser: (userId: string) => Promise<void>;
+  addToWaitlist: (
+    waitlistData: Partial<WaitlistEntry> & {
+      email: string;
+      sendInvitation?: boolean;
+    }
+  ) => Promise<void>;
   loading: boolean;
   error: string | null;
   isAdmin: boolean;
@@ -212,6 +218,28 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
     [api, loadUsers]
   );
 
+  const addToWaitlist = useCallback(
+    async (
+      waitlistData: Partial<WaitlistEntry> & {
+        email: string;
+        sendInvitation?: boolean;
+      }
+    ) => {
+      try {
+        setLoading(true);
+        await api.post("/api/admin/waitlist/invite", waitlistData);
+        await loadWaitlist(); // Reload waitlist after adding
+        setError(null);
+      } catch (err: any) {
+        setError(err.response?.data?.message || "Failed to add to waitlist");
+        throw err; // Re-throw to allow component-level error handling
+      } finally {
+        setLoading(false);
+      }
+    },
+    [api, loadWaitlist]
+  );
+
   const value = {
     users,
     waitlist,
@@ -224,6 +252,7 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
     updateWaitlistSupportNote,
     deleteWaitlistEntry,
     deleteUser,
+    addToWaitlist,
     loading,
     error,
     isAdmin: user?.isAdmin || false,

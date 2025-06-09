@@ -244,6 +244,85 @@ router.post("/waitlist/resend-invitation", async (req, res) => {
   }
 });
 
+// Manually add someone to waitlist
+router.post("/waitlist/invite", async (req, res) => {
+  try {
+    const {
+      email,
+      fullName,
+      phoneNumber,
+      companyName,
+      useCaseCategories,
+      useCaseDescription,
+      requestReport,
+      supportNote,
+      monthlyMarketingSpend,
+      businessArea,
+      stripe_customer_id,
+      sendInvitation = true,
+    } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ message: "Email is required" });
+    }
+
+    // Check if email already exists in waitlist
+    const existingEntry = await waitlistDb.getByEmail(email);
+    if (existingEntry) {
+      return res
+        .status(409)
+        .json({ message: "Email already exists in waitlist" });
+    }
+
+    // Check if user already exists
+    const existingUser = await userDb.getUserByEmail(email);
+    if (existingUser) {
+      return res.status(409).json({ message: "User already exists" });
+    }
+
+    // Create waitlist entry
+    const now = new Date().toISOString();
+    const waitlistData = {
+      email: email.toLowerCase(),
+      joinedAt: now,
+      status: sendInvitation ? "invited" : "pending",
+      invitedAt: sendInvitation ? now : undefined,
+      fullName: fullName || "",
+      phoneNumber: phoneNumber || "",
+      companyName: companyName || "",
+      useCaseCategories: useCaseCategories || [],
+      useCaseDescription: useCaseDescription || "",
+      requestReport: requestReport || false,
+      supportNote: supportNote || "Manually added by admin",
+      monthlyMarketingSpend: monthlyMarketingSpend || "",
+      businessArea: businessArea || "",
+      stripe_customer_id: stripe_customer_id || "",
+    };
+
+    const entry = await waitlistDb.add(waitlistData);
+
+    // Send invitation email if requested
+    if (sendInvitation) {
+      try {
+        await emailService.sendInvitation(email);
+      } catch (emailError) {
+        console.error("Error sending invitation email:", emailError);
+        // Optionally delete the entry or update status back to pending
+        await waitlistDb.updateStatus(email, "pending");
+        return res.status(500).json({
+          message: "Waitlist entry created but failed to send invitation email",
+          entry,
+        });
+      }
+    }
+
+    res.status(201).json(entry);
+  } catch (error) {
+    console.error("Error manually adding to waitlist:", error);
+    res.status(500).json({ message: "Failed to add to waitlist" });
+  }
+});
+
 // Get all tasks
 router.get("/tasks", async (req, res) => {
   try {
@@ -671,8 +750,11 @@ router.get("/workflows", async (req, res) => {
     // Get latest execution for each workflow
     const workflowsWithLatestExecution = await Promise.all(
       (workflows || []).map(async (workflow) => {
-        const executions = await workflowDb.getWorkflowExecutions(workflow.workflowId);
-        const latestExecution = executions && executions.length > 0 ? executions[0] : null;
+        const executions = await workflowDb.getWorkflowExecutions(
+          workflow.workflowId
+        );
+        const latestExecution =
+          executions && executions.length > 0 ? executions[0] : null;
 
         // Count completed and total runs
         const totalRuns = executions ? executions.length : 0;
@@ -683,7 +765,8 @@ router.get("/workflows", async (req, res) => {
         // Count completed and total tasks
         const totalTasks = latestExecution?.tasks?.length || 0;
         const completedTasks = latestExecution?.tasks
-          ? latestExecution.tasks.filter((task) => task.status === "completed").length
+          ? latestExecution.tasks.filter((task) => task.status === "completed")
+              .length
           : 0;
 
         return {
@@ -703,7 +786,10 @@ router.get("/workflows", async (req, res) => {
       if (!a.latestRunTime && !b.latestRunTime) return 0;
       if (!a.latestRunTime) return 1;
       if (!b.latestRunTime) return -1;
-      return new Date(b.latestRunTime).getTime() - new Date(a.latestRunTime).getTime();
+      return (
+        new Date(b.latestRunTime).getTime() -
+        new Date(a.latestRunTime).getTime()
+      );
     });
 
     res.json(workflowsWithLatestExecution);
