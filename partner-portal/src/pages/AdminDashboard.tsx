@@ -459,7 +459,8 @@ export default function AdminDashboard() {
       }
     };
 
-    if (tabValue === 5) { // Workflows tab
+    if (tabValue === 5) {
+      // Workflows tab
       loadWorkflows();
     }
   }, [tabValue, token]);
@@ -467,18 +468,22 @@ export default function AdminDashboard() {
   useEffect(() => {
     const loadChatSessions = async () => {
       try {
-        const response = await axios.get(buildApiUrl("/api/admin/chat-sessions"), {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        });
+        const response = await axios.get(
+          buildApiUrl("/api/admin/chat-sessions"),
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          }
+        );
         setChatSessions(response.data);
       } catch (error) {
         console.error("Error loading chat sessions:", error);
       }
     };
 
-    if (tabValue === 6) { // Chat History tab
+    if (tabValue === 6) {
+      // Chat History tab
       loadChatSessions();
     }
   }, [tabValue, token]);
@@ -1184,14 +1189,20 @@ export default function AdminDashboard() {
                           <Chip
                             label={user.taskCount || 0}
                             size="small"
-                            color={(user.taskCount ?? 0) > 0 ? "primary" : "default"}
+                            color={
+                              (user.taskCount ?? 0) > 0 ? "primary" : "default"
+                            }
                           />
                         </TableCell>
                         <TableCell>
                           <Chip
                             label={user.workflowCount || 0}
                             size="small"
-                            color={(user.workflowCount ?? 0) > 0 ? "primary" : "default"}
+                            color={
+                              (user.workflowCount ?? 0) > 0
+                                ? "primary"
+                                : "default"
+                            }
                           />
                         </TableCell>
                         <TableCell>{user.isOAuthUser ? "Yes" : "No"}</TableCell>
@@ -1274,6 +1285,7 @@ export default function AdminDashboard() {
                   <TableCell>
                     <SortLabel property="email" label="Email" />
                   </TableCell>
+                  <TableCell>Stripe Customer ID</TableCell>
                   <TableCell>
                     <SortLabel property="fullName" label="Full Name" />
                   </TableCell>
@@ -1305,7 +1317,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={11} align="center">
+                    <TableCell colSpan={12} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -1317,6 +1329,7 @@ export default function AdminDashboard() {
                     return (
                       <TableRow key={entry.email}>
                         <TableCell>{entry.email}</TableCell>
+                        <TableCell>{entry.stripe_customer_id || "-"}</TableCell>
                         <TableCell>{entry.fullName || "-"}</TableCell>
                         <TableCell>{entry.companyName || "-"}</TableCell>
                         <TableCell>
@@ -1754,27 +1767,34 @@ export default function AdminDashboard() {
                       </TableCell>
                       <TableCell>
                         {workflow.completedRuns || 0}/{workflow.totalRuns || 0}
-                        {workflow.totalRuns != null && workflow.totalRuns > 0 && (
-                          <Box component="span" sx={{ ml: 1 }}>
-                            (
-                            {Math.round(
-                              ((workflow.completedRuns || 0) / workflow.totalRuns) * 100
-                            )}
-                            %)
-                          </Box>
-                        )}
+                        {workflow.totalRuns != null &&
+                          workflow.totalRuns > 0 && (
+                            <Box component="span" sx={{ ml: 1 }}>
+                              (
+                              {Math.round(
+                                ((workflow.completedRuns || 0) /
+                                  workflow.totalRuns) *
+                                  100
+                              )}
+                              %)
+                            </Box>
+                          )}
                       </TableCell>
                       <TableCell>
-                        {workflow.completedTasks || 0}/{workflow.totalTasks || 0}
-                        {workflow.totalTasks != null && workflow.totalTasks > 0 && (
-                          <Box component="span" sx={{ ml: 1 }}>
-                            (
-                            {Math.round(
-                              ((workflow.completedTasks || 0) / workflow.totalTasks) * 100
-                            )}
-                            %)
-                          </Box>
-                        )}
+                        {workflow.completedTasks || 0}/
+                        {workflow.totalTasks || 0}
+                        {workflow.totalTasks != null &&
+                          workflow.totalTasks > 0 && (
+                            <Box component="span" sx={{ ml: 1 }}>
+                              (
+                              {Math.round(
+                                ((workflow.completedTasks || 0) /
+                                  workflow.totalTasks) *
+                                  100
+                              )}
+                              %)
+                            </Box>
+                          )}
                       </TableCell>
                       <TableCell>
                         <Link
