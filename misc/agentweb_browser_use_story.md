@@ -27,11 +27,10 @@ Browser-use is more than just a browser automation library—it's a comprehensiv
 
 One of AgentWeb's key advantages is our support for multiple Large Language Model (LLM) providers:
 
-- OpenAI (GPT-4, GPT-3.5)
+- OpenAI (GPT-4o, GPT-4.1)
 - Anthropic (Claude 3.7, Claude 3.5)
-- Google (Gemini 2.5 Pro, Gemini 2.0)
+- Google (Gemini 2.5 Pro, Gemini Flash 2.0)
 - DeepSeek
-- Llama
 
 This multi-model approach allows us to:
 
@@ -130,9 +129,10 @@ agent = Agent(
 - Automatic session cleanup
 
 ### 2. Credential Protection
-- Zero permanent storage
-- Secure credential injection
-- Encrypted transmission
+- Sensitive data handling through browser-use's built-in features
+- Secure credential injection and management
+- Automatic filtering of sensitive information in logs
+- Encrypted transmission of credentials
 
 ### 3. Error Handling
 - Automatic retry mechanisms
