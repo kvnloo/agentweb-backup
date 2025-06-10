@@ -180,7 +180,6 @@ class WebAgent:
         self.output_as_html = False # Initialize output_as_html property
         self.turn_off_headless = False  # Initialize turn_off_headless property
         self.use_knowledge_base = False  # Initialize use_knowledge_base property
-        self.kb_manager = get_knowledge_base_manager()
 
     def setup_execution_logging(self, execution_id: str):
         """Setup logging for the current execution"""
@@ -1352,10 +1351,28 @@ Once the PR is approved and merged, this code will be available through the 'Run
             def search_knowledge_base(query: str) -> ActionResult:
                 """Search the knowledge base for relevant information"""              
                 try:
-                    results = self.kb_manager.search_knowledge(query)
+                    # Search both public and private knowledge bases
+                    public_kb = get_knowledge_base_manager('public')
+                    public_results = public_kb.search_knowledge(query)
+                    
+                    private_results = []
+                    # Only search private knowledge base if user is authenticated
+                    if self.user_id:
+                        private_kb = get_knowledge_base_manager('private', self.user_id)
+                        private_results = private_kb.search_knowledge(query)
+                    
+                    # Combine results
+                    all_results = public_results + private_results
+                    
+                    # Format results with source information
+                    formatted_results = []
+                    for i, result in enumerate(all_results):
+                        source = "public" if i < len(public_results) else "private"
+                        formatted_results.append(f"Result {i+1} (Source: {source}):\n{result['content']}")
+                    
                     return ActionResult(
-                        extracted_content=f"Found {len(results)} results for query '{query}':\n\n" + 
-                        "\n\n".join(f"Result {i+1}:\n{result['content']}" for i, result in enumerate(results))
+                        extracted_content=f"Found {len(all_results)} results for query '{query}':\n\n" + 
+                        "\n\n".join(formatted_results)
                     )
                 except Exception as e:
                     return ActionResult(error=f"Failed to search knowledge base: {str(e)}")
