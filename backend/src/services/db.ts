@@ -453,14 +453,38 @@ export const taskDb = {
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
+          "#e": "error",
+          "#sum": "summary",
+          "#en": "emailNotification",
+          "#i": "isInteractive",
+          "#dr": "isDeepResearch",
+          "#llm": "llmName",
+          "#ct": "isComplexTask",
           "#epc": "extractPageContent",
           "#vo": "validateOutput",
+          "#oaj": "outputAsJson",
+          "#oah": "outputAsHtml",
           "#adm": "isAgenticDevMode",
         },
       };
 
-      const result = await dynamodb.scan(params).promise();
-      return result.Items || [];
+      let allItems: any[] = [];
+      let lastEvaluatedKey: any = undefined;
+
+      do {
+        const result = await dynamodb.scan({
+          ...params,
+          ExclusiveStartKey: lastEvaluatedKey
+        }).promise();
+        
+        if (result.Items) {
+          allItems = allItems.concat(result.Items);
+        }
+        
+        lastEvaluatedKey = result.LastEvaluatedKey;
+      } while (lastEvaluatedKey);
+
+      return allItems;
     } catch (error) {
       handleDynamoDbError(error, "getAllTasks");
     }
