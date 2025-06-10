@@ -607,4 +607,80 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
   }
 });
 
+// Add the knowledge base type toggle endpoint
+router.put('/:id/knowledge-base-type', authenticateToken, async (req: Request, res: Response) => {
+  const taskId = req.params.id;
+  const { knowledgeBaseType } = req.body;
+  const userId = (req as AuthenticatedRequest).user?.userId;
+
+  if (!userId) {
+    return res.status(401).json({ message: 'Unauthorized' });
+  }
+
+  if (!knowledgeBaseType || !['public', 'private'].includes(knowledgeBaseType)) {
+    return res.status(400).json({ message: 'Invalid knowledge base type' });
+  }
+
+  try {
+    // Get the task to check ownership
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Check if user owns the task
+    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+      return res.status(403).json({ message: 'Not authorized to modify this task' });
+    }
+
+    // Only move file if type is actually changing
+    if (task.knowledgeBaseType !== knowledgeBaseType) {
+      const filePath = `tasks/${taskId}/knowledge-base.txt`;
+      const currentBucket = storage.bucket(task.knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
+      const newBucket = storage.bucket(knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
+      const currentFile = currentBucket.file(filePath);
+      const newFile = newBucket.file(filePath);
+      // Check if current file exists
+      const [exists] = await currentFile.exists();
+      if (exists) {
+        // Download current content
+        const [content] = await currentFile.download();
+        // Upload to new bucket
+        await newFile.save(content, {
+          contentType: 'text/plain',
+          metadata: {
+            taskId,
+            userId,
+            updatedAt: new Date().toISOString(),
+            sourceBucket: task.knowledgeBaseType
+          }
+        });
+        // Get the new URL
+        const [url] = await newFile.getSignedUrl({
+          action: 'read',
+          expires: '03-01-2500'
+        });
+        // Update task with new bucket type and URL
+        await taskDb.updateTask(taskId, {
+          knowledgeBaseType,
+          knowledgeBase: url
+        });
+        // Delete the old file
+        await currentFile.delete();
+        return res.json({ message: 'Knowledge base type and file moved successfully', knowledgeBaseType, url });
+      } else {
+        // If no file exists, just update the type
+        await taskDb.updateTask(taskId, { knowledgeBaseType });
+        return res.json({ message: 'Knowledge base type updated (no file to move)', knowledgeBaseType });
+      }
+    } else {
+      // If type is not changing, just return success
+      return res.json({ message: 'Knowledge base type unchanged', knowledgeBaseType });
+    }
+  } catch (error) {
+    console.error('Error updating knowledge base type:', error);
+    res.status(500).json({ message: 'Failed to update knowledge base type' });
+  }
+});
+
 export default router; 

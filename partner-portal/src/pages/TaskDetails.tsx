@@ -53,6 +53,9 @@ import ScheduleForm from '../components/ScheduleForm';
 import ScheduleList from '../components/ScheduleList';
 import { buildApiUrl, getLLMsForTask } from '../config';
 import { toast } from 'react-hot-toast';
+import PublicIcon from '@mui/icons-material/Public';
+import LockIcon from '@mui/icons-material/Lock';
+import LockOpenIcon from '@mui/icons-material/LockOpen';
 
 interface Task {
   taskId: string;
@@ -1286,6 +1289,23 @@ export default function TaskDetails() {
     }
   };
 
+  const handleKnowledgeBaseTypeToggle = async () => {
+    if (!task || !token) return;
+    const newKnowledgeBaseType = task.knowledgeBaseType === 'public' ? 'private' : 'public';
+    try {
+      await axios.put(
+        buildApiUrl(`/api/tasks/${task.taskId}/knowledge-base-type`),
+        { knowledgeBaseType: newKnowledgeBaseType },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      await fetchTask(); // Re-fetch task data to update UI from source of truth
+      setError(''); // Clear previous errors
+    } catch (err) {
+      console.error('Failed to update knowledge base type:', err);
+      setError('Failed to update knowledge base type. Please try again.');
+    }
+  };
+
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
@@ -1836,20 +1856,30 @@ export default function TaskDetails() {
             <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
               <Box>
                 <Typography variant="h6" gutterBottom>
-                  Knowledge Base
+                  Knowledge Base {task.knowledgeBaseType && `(${task.knowledgeBaseType.charAt(0).toUpperCase() + task.knowledgeBaseType.slice(1)})`}
                 </Typography>
-                {task.knowledgeBaseType && (
-                  <Typography variant="body2" color="text.secondary">
-                    Type: {task.knowledgeBaseType.charAt(0).toUpperCase() + task.knowledgeBaseType.slice(1)}
-                  </Typography>
-                )}
               </Box>
               {showActions && !isEditingKnowledgeBase && (
-                <Tooltip title="Edit knowledge base">
-                  <IconButton onClick={handleKnowledgeBaseEdit} size="small">
-                    <EditIcon />
-                  </IconButton>
-                </Tooltip>
+                <Box sx={{ display: 'flex', gap: 1 }}>
+                  <Tooltip title={
+                    task.knowledgeBaseType === 'public' 
+                      ? "The knowledge base is currently public (accessible to all accounts on AgentWeb). Click to make it private (only accessible to this account)."
+                      : "The knowledge base is currently private (only accessible to this account). Click to make it public (accessible to all accounts on AgentWeb)."
+                  }>
+                    <IconButton
+                      size="small"
+                      onClick={handleKnowledgeBaseTypeToggle}
+                      disabled={!task.knowledgeBase}
+                    >
+                      {task.knowledgeBaseType === 'public' ? <LockOpenIcon /> : <LockIcon />}
+                    </IconButton>
+                  </Tooltip>
+                  <Tooltip title="Edit knowledge base">
+                    <IconButton onClick={handleKnowledgeBaseEdit} size="small">
+                      <EditIcon />
+                    </IconButton>
+                  </Tooltip>
+                </Box>
               )}
             </Box>
             {knowledgeBaseError && (
