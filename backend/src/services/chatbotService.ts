@@ -945,11 +945,6 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
       privateClient.search({ ...searchRequest, servingConfig: privateServingConfig })
     ]);
 
-    // Log raw private knowledge base response
-    console.log("\n=== Raw Private Knowledge Base Response ===");
-    console.log(JSON.stringify(privateResults[0], null, 2));
-    console.log("=========================================\n");
-
     const results: ContextChunk[] = [];
 
     // Process public results
