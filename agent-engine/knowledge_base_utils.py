@@ -9,18 +9,16 @@ import json
 import html
 
 class KnowledgeBaseManager:
-    def __init__(self, project_id: str, location: str, data_store_id: str, search_app_id: str):
+    def __init__(self, project_id: str, location: str, search_app_id: str):
         """Initialize the Knowledge Base Manager.
         
         Args:
             project_id: Google Cloud project ID
             location: Location of the Vertex AI Search instance (e.g., 'global')
-            data_store_id: ID of the Vertex AI Search datastore
             search_app_id: ID of the Vertex AI Search app (engine)
         """
         self.project_id = project_id
         self.location = location
-        self.data_store_id = data_store_id
         self.search_app_id = search_app_id
         self.storage_client = storage.Client()
         # Set client options for non-global locations
@@ -114,11 +112,24 @@ class KnowledgeBaseManager:
                 })
         return results
 
-def get_knowledge_base_manager() -> KnowledgeBaseManager:
-    """Get a configured KnowledgeBaseManager instance using environment variables."""
-    return KnowledgeBaseManager(
-        project_id=os.getenv("GOOGLE_CLOUD_PROJECT"),
-        location=os.getenv("VERTEX_AI_LOCATION", "global"),
-        data_store_id=os.getenv("VERTEX_AI_DATASTORE_ID"),
-        search_app_id=os.getenv("VERTEX_AI_SEARCH_APP_ID")
-    ) 
+def get_knowledge_base_manager(bucket_type: str = 'public') -> KnowledgeBaseManager:
+    """Get a configured KnowledgeBaseManager instance using environment variables.
+    
+    Args:
+        bucket_type (str): Type of knowledge base to get ('public' or 'private')
+        
+    Returns:
+        KnowledgeBaseManager: Configured knowledge base manager instance
+    """
+    if bucket_type == 'private':
+        return KnowledgeBaseManager(
+            project_id=os.getenv("GOOGLE_CLOUD_PROJECT"),
+            location=os.getenv("VERTEX_AI_LOCATION_PRIVATE", "global"),
+            search_app_id=os.getenv("VERTEX_AI_SEARCH_APP_ID_PRIVATE")
+        )
+    else:
+        return KnowledgeBaseManager(
+            project_id=os.getenv("GOOGLE_CLOUD_PROJECT"),
+            location=os.getenv("VERTEX_AI_LOCATION", "global"),
+            search_app_id=os.getenv("VERTEX_AI_SEARCH_APP_ID")
+        ) 
