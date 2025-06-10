@@ -805,11 +805,23 @@ router.get("/knowledge-base-metrics", async (req, res) => {
     // Get all tasks
     const tasks = await taskDb.getAllTasks() || [];
     
-    // Calculate metrics
+    // Calculate overall metrics
     const totalTasks = tasks.length;
     const tasksWithKnowledgeBase = tasks.filter(task => task.knowledgeBaseSize && task.knowledgeBaseSize > 0).length;
     const totalKnowledgeBaseSize = tasks.reduce((sum, task) => sum + (task.knowledgeBaseSize || 0), 0);
     const averageKnowledgeBaseSize = tasksWithKnowledgeBase > 0 ? totalKnowledgeBaseSize / tasksWithKnowledgeBase : 0;
+    
+    // Calculate public knowledge base metrics
+    const publicTasks = tasks.filter(task => task.knowledgeBaseType === 'public');
+    const publicTasksWithKnowledgeBase = publicTasks.filter(task => task.knowledgeBaseSize && task.knowledgeBaseSize > 0).length;
+    const totalPublicKnowledgeBaseSize = publicTasks.reduce((sum, task) => sum + (task.knowledgeBaseSize || 0), 0);
+    const averagePublicKnowledgeBaseSize = publicTasksWithKnowledgeBase > 0 ? totalPublicKnowledgeBaseSize / publicTasksWithKnowledgeBase : 0;
+    
+    // Calculate private knowledge base metrics
+    const privateTasks = tasks.filter(task => task.knowledgeBaseType === 'private');
+    const privateTasksWithKnowledgeBase = privateTasks.filter(task => task.knowledgeBaseSize && task.knowledgeBaseSize > 0).length;
+    const totalPrivateKnowledgeBaseSize = privateTasks.reduce((sum, task) => sum + (task.knowledgeBaseSize || 0), 0);
+    const averagePrivateKnowledgeBaseSize = privateTasksWithKnowledgeBase > 0 ? totalPrivateKnowledgeBaseSize / privateTasksWithKnowledgeBase : 0;
     
     // Get tasks with knowledge base details
     const tasksWithDetails = tasks
@@ -818,7 +830,8 @@ router.get("/knowledge-base-metrics", async (req, res) => {
         taskId: task.taskId,
         name: task.name,
         knowledgeBaseSize: task.knowledgeBaseSize || 0,
-        owner: task.userId
+        owner: task.userId,
+        type: task.knowledgeBaseType || 'private'
       }));
 
     res.json({
@@ -826,6 +839,18 @@ router.get("/knowledge-base-metrics", async (req, res) => {
       tasksWithKnowledgeBase,
       totalKnowledgeBaseSize,
       averageKnowledgeBaseSize,
+      public: {
+        tasks: publicTasks.length,
+        tasksWithKnowledgeBase: publicTasksWithKnowledgeBase,
+        totalSize: totalPublicKnowledgeBaseSize,
+        averageSize: averagePublicKnowledgeBaseSize
+      },
+      private: {
+        tasks: privateTasks.length,
+        tasksWithKnowledgeBase: privateTasksWithKnowledgeBase,
+        totalSize: totalPrivateKnowledgeBaseSize,
+        averageSize: averagePrivateKnowledgeBaseSize
+      },
       tasks: tasksWithDetails
     });
   } catch (error) {

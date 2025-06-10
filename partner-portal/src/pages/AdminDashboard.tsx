@@ -164,11 +164,24 @@ interface KnowledgeBaseMetrics {
   tasksWithKnowledgeBase: number;
   totalKnowledgeBaseSize: number;
   averageKnowledgeBaseSize: number;
+  public: {
+    tasks: number;
+    tasksWithKnowledgeBase: number;
+    totalSize: number;
+    averageSize: number;
+  };
+  private: {
+    tasks: number;
+    tasksWithKnowledgeBase: number;
+    totalSize: number;
+    averageSize: number;
+  };
   tasks: {
     taskId: string;
     name: string;
     knowledgeBaseSize: number;
     owner: string;
+    type: 'public' | 'private';
   }[];
 }
 
@@ -2045,19 +2058,45 @@ export default function AdminDashboard() {
                     <Table>
                       <TableHead>
                         <TableRow>
+                          <TableCell>Category</TableCell>
                           <TableCell>Total Tasks</TableCell>
                           <TableCell>Tasks with Knowledge Base</TableCell>
-                          <TableCell>Total Knowledge Base Size</TableCell>
-                          <TableCell>Average Knowledge Base Size</TableCell>
+                          <TableCell>Total Size</TableCell>
+                          <TableCell>Average Size</TableCell>
                         </TableRow>
                       </TableHead>
                       <TableBody>
-                        {knowledgeBaseMetrics && (
+                        {knowledgeBaseMetrics ? (
+                          <>
+                            <TableRow>
+                              <TableCell>Overall</TableCell>
+                              <TableCell>{knowledgeBaseMetrics.totalTasks}</TableCell>
+                              <TableCell>{knowledgeBaseMetrics.tasksWithKnowledgeBase}</TableCell>
+                              <TableCell>{(knowledgeBaseMetrics.totalKnowledgeBaseSize / 1024).toFixed(2)} KB</TableCell>
+                              <TableCell>{(knowledgeBaseMetrics.averageKnowledgeBaseSize / 1024).toFixed(2)} KB</TableCell>
+                            </TableRow>
+                            <TableRow>
+                              <TableCell>Public</TableCell>
+                              <TableCell>{knowledgeBaseMetrics.public.tasks}</TableCell>
+                              <TableCell>{knowledgeBaseMetrics.public.tasksWithKnowledgeBase}</TableCell>
+                              <TableCell>{(knowledgeBaseMetrics.public.totalSize / 1024).toFixed(2)} KB</TableCell>
+                              <TableCell>{(knowledgeBaseMetrics.public.averageSize / 1024).toFixed(2)} KB</TableCell>
+                            </TableRow>
+                            <TableRow>
+                              <TableCell>Private</TableCell>
+                              <TableCell>{knowledgeBaseMetrics.private.tasks}</TableCell>
+                              <TableCell>{knowledgeBaseMetrics.private.tasksWithKnowledgeBase}</TableCell>
+                              <TableCell>{(knowledgeBaseMetrics.private.totalSize / 1024).toFixed(2)} KB</TableCell>
+                              <TableCell>{(knowledgeBaseMetrics.private.averageSize / 1024).toFixed(2)} KB</TableCell>
+                            </TableRow>
+                          </>
+                        ) : (
                           <TableRow>
-                            <TableCell>{knowledgeBaseMetrics.totalTasks}</TableCell>
-                            <TableCell>{knowledgeBaseMetrics.tasksWithKnowledgeBase}</TableCell>
-                            <TableCell>{(knowledgeBaseMetrics.totalKnowledgeBaseSize / 1024).toFixed(2)} KB</TableCell>
-                            <TableCell>{(knowledgeBaseMetrics.averageKnowledgeBaseSize / 1024).toFixed(2)} KB</TableCell>
+                            <TableCell colSpan={5} align="center">
+                              <Typography variant="body2" color="text.secondary">
+                                Loading metrics...
+                              </Typography>
+                            </TableCell>
                           </TableRow>
                         )}
                       </TableBody>
@@ -2080,34 +2119,43 @@ export default function AdminDashboard() {
                           <TableCell>Task ID</TableCell>
                           <TableCell>Name</TableCell>
                           <TableCell>Owner</TableCell>
+                          <TableCell>Type</TableCell>
                           <TableCell>Knowledge Base Size</TableCell>
                           <TableCell>Actions</TableCell>
                         </TableRow>
                       </TableHead>
                       <TableBody>
-                        {knowledgeBaseMetrics?.tasks.map((task) => (
-                          <TableRow key={task.taskId}>
-                            <TableCell>{task.taskId}</TableCell>
-                            <TableCell>{task.name}</TableCell>
-                            <TableCell>{task.owner}</TableCell>
-                            <TableCell>{(task.knowledgeBaseSize / 1024).toFixed(2)} KB</TableCell>
-                            <TableCell>
-                              <Button
-                                size="small"
-                                component={RouterLink}
-                                to={`/tasks/${task.taskId}`}
-                                target="_blank"
-                              >
-                                View Details
-                              </Button>
-                            </TableCell>
-                          </TableRow>
-                        ))}
-                        {(!knowledgeBaseMetrics?.tasks || knowledgeBaseMetrics.tasks.length === 0) && (
+                        {knowledgeBaseMetrics?.tasks ? (
+                          knowledgeBaseMetrics.tasks.map((task) => (
+                            <TableRow key={task.taskId}>
+                              <TableCell>{task.taskId}</TableCell>
+                              <TableCell>{task.name}</TableCell>
+                              <TableCell>{task.owner}</TableCell>
+                              <TableCell>
+                                {task.type === 'public' ? (
+                                  <Chip size="small" label="Public" color="primary" />
+                                ) : (
+                                  <Chip size="small" label="Private" color="default" />
+                                )}
+                              </TableCell>
+                              <TableCell>{(task.knowledgeBaseSize / 1024).toFixed(2)} KB</TableCell>
+                              <TableCell>
+                                <Button
+                                  size="small"
+                                  component={RouterLink}
+                                  to={`/tasks/${task.taskId}`}
+                                  target="_blank"
+                                >
+                                  View Details
+                                </Button>
+                              </TableCell>
+                            </TableRow>
+                          ))
+                        ) : (
                           <TableRow>
-                            <TableCell colSpan={5} align="center">
+                            <TableCell colSpan={6} align="center">
                               <Typography variant="body2" color="text.secondary">
-                                No knowledge bases found
+                                {knowledgeBaseMetrics === null ? 'Loading tasks...' : 'No knowledge bases found'}
                               </Typography>
                             </TableCell>
                           </TableRow>
