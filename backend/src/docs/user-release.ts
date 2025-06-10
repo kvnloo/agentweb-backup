@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-06-10',
+    changes: [
+      'Supported dynamic loading templates based on categories',
+      '- More templates can be made available to customers',
+      '- Improved template discovery and management'
+    ],
+  },
+  {
     date: '2025-06-05',
     changes: [
       'Added Stripe payment integration for subscriptions',
