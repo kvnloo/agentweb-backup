@@ -7,7 +7,7 @@ import { RequestHandler as ExpressRequestHandler } from 'express-serve-static-co
 import { isAdmin } from '../middleware/admin';
 import { userDb } from '../services/db';
 import { emailService } from '../services/emailService';
-import { Storage } from '@google-cloud/storage';
+import { Storage, Bucket } from '@google-cloud/storage';
 import OpenAI from 'openai';
 import axios from 'axios';
 
@@ -337,6 +337,16 @@ router.put('/:taskId/executions/:executionId/unarchive', authenticateToken, asyn
   }
 });
 
+// Helper function to check file size
+async function getFileSize(bucket: Bucket, filePath: string): Promise<number> {
+  const file = bucket.file(filePath);
+  const [exists] = await file.exists();
+  if (!exists) return 0;
+  
+  const [metadata] = await file.getMetadata();
+  return parseInt(metadata.size);
+}
+
 // Knowledge Base routes
 router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, res: Response) => {
   try {
@@ -356,89 +366,54 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
       return res.status(403).json({ message: 'Not authorized to access this task' });
     }
 
-    // Try private bucket first
-    const privateBucket = storage.bucket(PRIVATE_BUCKET_NAME);
-    const privateFilePath = `tasks/${taskId}/knowledge-base.txt`;
-    const privateFile = privateBucket.file(privateFilePath);
+    // If knowledgeBaseType is not set, determine it based on file content
+    if (!task.knowledgeBaseType) {
+      const publicBucket = storage.bucket(BUCKET_NAME);
+      const privateBucket = storage.bucket(PRIVATE_BUCKET_NAME);
+      const filePath = `tasks/${taskId}/knowledge-base.txt`;
 
-    // Check if file exists in private bucket
-    const [privateExists] = await privateFile.exists();
-    
-    if (privateExists) {
-      // If file exists in private bucket, get its content
-      const [content] = await privateFile.download();
-      const contentStr = content.toString();
+      const publicSize = await getFileSize(publicBucket, filePath);
+      const privateSize = await getFileSize(privateBucket, filePath);
+
+      // Set type based on file content
+      const type = publicSize > 0 ? 'public' : 'private';
+      const size = type === 'public' ? publicSize : privateSize;
+
+      await taskDb.updateTask(taskId, { 
+        knowledgeBaseType: type,
+        knowledgeBaseSize: size
+      });
+      task.knowledgeBaseType = type;
+    }
+
+    // Use the appropriate bucket based on knowledgeBaseType
+    const bucket = storage.bucket(task.knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
+    const filePath = `tasks/${taskId}/knowledge-base.txt`;
+    const file = bucket.file(filePath);
+
+    // Check if file exists
+    const [exists] = await file.exists();
+    let contentStr = '';
+    let url = '';
+    let size = 0;
+    if (exists) {
+      // If file exists, get its content and size
+      const [content] = await file.download();
+      contentStr = content.toString();
+      size = await getFileSize(bucket, filePath);
       
-      // If private file has content, return it
-      if (contentStr.trim()) {
-        res.json({ content: contentStr, url: task.knowledgeBase });
-        return;
-      }
+      // Generate signed URL
+      const [url] = await file.getSignedUrl({
+        action: 'read',
+        expires: '03-01-2500' // Far future expiration
+      });
     }
-
-    // If private file doesn't exist or is empty, try public bucket
-    const publicBucket = storage.bucket(BUCKET_NAME);
-    const publicFilePath = `tasks/${taskId}/knowledge-base.txt`;
-    const publicFile = publicBucket.file(publicFilePath);
-
-    // Check if file exists in public bucket
-    const [publicExists] = await publicFile.exists();
+    // Update size if it doesn't match
+    if (size !== task.knowledgeBaseSize) {
+      await taskDb.updateTask(taskId, { knowledgeBaseSize: size });
+    }
     
-    if (publicExists) {
-      // If file exists in public bucket, copy it to private bucket
-      const [content] = await publicFile.download();
-      const contentStr = content.toString();
-
-      // Save to private bucket
-      await privateFile.save(contentStr, {
-        contentType: 'text/plain',
-        metadata: {
-          taskId,
-          userId,
-          createdAt: new Date().toISOString(),
-          copiedFrom: 'public'
-        }
-      });
-
-      // Get the public URL
-      const [url] = await privateFile.getSignedUrl({
-        action: 'read',
-        expires: '03-01-2500' // Far future expiration
-      });
-
-      // Update task with the new knowledge base link
-      await taskDb.updateTask(taskId, { knowledgeBase: url, knowledgeBaseSize: Buffer.byteLength(contentStr, 'utf8') });
-
-      res.json({ content: contentStr, url });
-      return;
-    }
-
-    // If file doesn't exist in either bucket and no knowledge base link exists, create a new one in private bucket
-    if (!task.knowledgeBase) {
-      // Create empty file in private bucket
-      await privateFile.save('', {
-        contentType: 'text/plain',
-        metadata: {
-          taskId,
-          userId,
-          createdAt: new Date().toISOString()
-        }
-      });
-
-      // Get the public URL
-      const [url] = await privateFile.getSignedUrl({
-        action: 'read',
-        expires: '03-01-2500' // Far future expiration
-      });
-
-      // Update task with the new knowledge base link
-      await taskDb.updateTask(taskId, { knowledgeBase: url, knowledgeBaseSize: 0 });
-
-      return res.json({ content: '', url });
-    }
-
-    // If file doesn't exist but task has a knowledge base link, return 404
-    res.status(404).json({ message: 'Knowledge base file not found' });
+    res.json({ content: contentStr, url: task.knowledgeBase || url });
   } catch (error) {
     console.error('Error in knowledge base GET:', error);
     res.status(500).json({ message: 'Internal server error' });
@@ -467,13 +442,17 @@ router.put('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
       return res.status(403).json({ message: 'Not authorized to modify this task' });
     }
 
-    // Always save to private bucket
-    const privateBucket = storage.bucket(PRIVATE_BUCKET_NAME);
-    const privateFilePath = `tasks/${taskId}/knowledge-base.txt`;
-    const privateFile = privateBucket.file(privateFilePath);
+    if (!task.knowledgeBaseType) {
+      return res.status(400).json({ message: 'Knowledge base type not defined' });
+    }
 
-    // Save content to private bucket
-    await privateFile.save(contentToSave, {
+    // Use the appropriate bucket based on knowledgeBaseType
+    const bucket = storage.bucket(task.knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
+    const filePath = `tasks/${taskId}/knowledge-base.txt`;
+    const file = bucket.file(filePath);
+
+    // Save content to bucket
+    await file.save(contentToSave, {
       contentType: 'text/plain',
       metadata: {
         taskId,
@@ -482,20 +461,19 @@ router.put('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
       }
     });
 
-    // Get the public URL if it's a new file
-    if (!task.knowledgeBase) {
-      const [url] = await privateFile.getSignedUrl({
-        action: 'read',
-        expires: '03-01-2500' // Far future expiration
-      });
-      
-      // Update task with the new knowledge base link
-      await taskDb.updateTask(taskId, { knowledgeBase: url, knowledgeBaseSize: Buffer.byteLength(contentToSave, 'utf8') });
-      
-      res.json({ content: contentToSave, url });
-    } else {
-      res.json({ content: contentToSave, url: task.knowledgeBase });
-    }
+    // Get the public URL
+    const [url] = await file.getSignedUrl({
+      action: 'read',
+      expires: '03-01-2500' // Far future expiration
+    });
+    
+    // Update task with the new knowledge base size
+    await taskDb.updateTask(taskId, { 
+      knowledgeBaseSize: Buffer.byteLength(contentToSave, 'utf8'),
+      knowledgeBase: url
+    });
+    
+    res.json({ content: contentToSave, url: task.knowledgeBase || url });
   } catch (error) {
     console.error('Error in knowledge base PUT:', error);
     res.status(500).json({ message: 'Internal server error' });
@@ -512,6 +490,10 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
+    if (!taskId || !executionId) {
+      return res.status(400).json({ message: 'Task ID and Execution ID are required' });
+    }
+
     const task = await taskDb.getTaskById(taskId);
     if (!task) {
       return res.status(404).json({ message: 'Task not found' });
@@ -526,8 +508,9 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
       return res.status(404).json({ message: 'Execution not found' });
     }
 
-    // Get the current knowledge base content
-    const bucket = storage.bucket(BUCKET_NAME);
+    // Determine which bucket to use based on knowledgeBaseType
+    let bucketType = task.knowledgeBaseType;
+    const bucket = storage.bucket(bucketType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
     const filePath = `tasks/${taskId}/knowledge-base.txt`;
     const file = bucket.file(filePath);
     const [exists] = await file.exists();
@@ -595,9 +578,16 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
       }
     });
 
-    // Update the task with knowledge base size
-    await taskDb.updateTask(taskId, {
-      knowledgeBaseSize
+    // Get the public URL
+    const [url] = await file.getSignedUrl({
+      action: 'read',
+      expires: '03-01-2500'
+    });
+
+    // Update the task with knowledge base size, type, and URL
+    await taskDb.updateTask(taskId as string, {
+      knowledgeBaseSize,
+      knowledgeBase: url
     });
 
     // Update the execution record with knowledge base update info
@@ -607,7 +597,7 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
 
     res.json({ 
       content: updatedContent,
-      url: task.knowledgeBase,
+      url,
       message: 'Knowledge base updated successfully',
       size: knowledgeBaseSize
     });

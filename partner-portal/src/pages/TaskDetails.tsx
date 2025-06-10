@@ -80,6 +80,7 @@ interface Task {
   useKnowledgeBase?: boolean; // Flag for using knowledge base
   knowledgeBase?: string; // The content of the task's knowledge base
   knowledgeBaseSize?: number; // Size of the knowledge base in bytes
+  knowledgeBaseType?: 'public' | 'private'; // Type of knowledge base
 }
 
 interface TaskAttachment {
@@ -1833,9 +1834,16 @@ export default function TaskDetails() {
           {/* Knowledge Base Section */}
           <Grid item xs={12}>
             <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
-              <Typography variant="h6" gutterBottom>
-                Knowledge Base
-              </Typography>
+              <Box>
+                <Typography variant="h6" gutterBottom>
+                  Knowledge Base
+                </Typography>
+                {task.knowledgeBaseType && (
+                  <Typography variant="body2" color="text.secondary">
+                    Type: {task.knowledgeBaseType.charAt(0).toUpperCase() + task.knowledgeBaseType.slice(1)}
+                  </Typography>
+                )}
+              </Box>
               {showActions && !isEditingKnowledgeBase && (
                 <Tooltip title="Edit knowledge base">
                   <IconButton onClick={handleKnowledgeBaseEdit} size="small">

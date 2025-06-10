@@ -449,7 +449,7 @@ export const taskDb = {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Tasks`,
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, #epc, #vo, #adm, knowledgeBaseSize, updatedAt",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, knowledgeBase, knowledgeBaseSize, knowledgeBaseType",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -549,7 +549,7 @@ export const taskDb = {
           taskId,
         },
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, knowledgeBase, knowledgeBaseSize, knowledgeBaseType",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -599,6 +599,7 @@ export const taskDb = {
       turnOffHeadless?: boolean;
       knowledgeBase?: string;
       knowledgeBaseSize?: number;
+      knowledgeBaseType?: 'public' | 'private';
     }>
   ) {
     try {

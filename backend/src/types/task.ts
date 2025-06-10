@@ -21,6 +21,7 @@ export interface Task {
   useKnowledgeBase?: boolean; // Whether the task can use the knowledge base
   knowledgeBase?: string; // The GCS URL of the task's knowledge base file
   knowledgeBaseSize?: number; // Size of the knowledge base in bytes
+  knowledgeBaseType?: 'public' | 'private'; // Whether the knowledge base is stored in public or private bucket
   description?: string; // Description of the task
   category?: string; // Category of the task
 }
@@ -46,4 +47,5 @@ export interface TaskUpdate {
   useKnowledgeBase?: boolean;
   knowledgeBase?: string;
   knowledgeBaseSize?: number; // Size of the knowledge base in bytes
+  knowledgeBaseType?: 'public' | 'private'; // Whether the knowledge base is stored in public or private bucket
 } 

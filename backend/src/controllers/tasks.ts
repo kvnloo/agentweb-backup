@@ -88,6 +88,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           useSharedBrowser: useSharedBrowser !== undefined ? Boolean(useSharedBrowser) : template.useSharedBrowser,
           turnOffHeadless: turnOffHeadless !== undefined ? Boolean(turnOffHeadless) : template.turnOffHeadless,
           useKnowledgeBase: useKnowledgeBase !== undefined ? Boolean(useKnowledgeBase) : template.useKnowledgeBase,
+          knowledgeBaseType: 'private', // Default to private for new tasks
           createdAt: new Date().toISOString(),
           llmName: req.body.llmName || null,
           category: category || template.category,
@@ -125,6 +126,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       useSharedBrowser: Boolean(useSharedBrowser),
       turnOffHeadless: Boolean(turnOffHeadless),
       useKnowledgeBase: Boolean(useKnowledgeBase),
+      knowledgeBaseType: 'private', // Default to private for new tasks
       createdAt: new Date().toISOString(),
       llmName: req.body.llmName || null,
       category: category,
@@ -256,6 +258,10 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
 
     if (req.body.useKnowledgeBase !== undefined) {
       updates.useKnowledgeBase = Boolean(req.body.useKnowledgeBase);
+    }
+
+    if (req.body.knowledgeBaseType !== undefined) {
+      updates.knowledgeBaseType = req.body.knowledgeBaseType;
     }
 
     // Handle outputAsJson and outputAsHtml mutual exclusivity
