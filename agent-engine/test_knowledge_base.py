@@ -70,9 +70,15 @@ def test_search_knowledge(query=None, max_results=5, max_content_length=200, buc
     for i, result in enumerate(results, 1):
         print(f"\nResult {i}:")
         content = result.get('content', '')
-        if len(content) > max_content_length:
-            content = content[:max_content_length] + "..."
-        print(f"Content: {content}")
+        content_length = len(content)
+        print(f"Content Size: {content_length} characters")
+        
+        if content_length > max_content_length:
+            print(f"Content (first 100 chars): {content[:100]}...")
+            print(f"Content (last 100 chars): ...{content[-100:]}")
+        else:
+            print(f"Content: {content}")
+            
         print(f"Score: {result.get('score', 'N/A')}")
         print(f"Source: {result.get('source', 'N/A')}")
 
