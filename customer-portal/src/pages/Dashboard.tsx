@@ -55,7 +55,7 @@ const Dashboard = () => {
   const [promptTextState, setPromptTextState] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [isTemplateOpen, setIsTemplateOpen] = useState(true);
-  const [activeCategory, setActiveCategory] = useState("Market Research");
+  const [activeCategory, setActiveCategory] = useState("");
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [selectedTemplate, setSelectedTemplate] =
     useState<DisplayTemplate | null>(null);
@@ -129,6 +129,44 @@ const Dashboard = () => {
     });
     setGroupedTemplates(newGroupedTemplates);
   }, [allFetchedTemplates]);
+
+  // Update active category when templates change
+  useEffect(() => {
+    const availableCategories = Object.keys(groupedTemplates).filter(
+      (categoryId) =>
+        groupedTemplates[categoryId] && groupedTemplates[categoryId].length > 0
+    );
+
+    // Define preferred order for categories
+    const categoryOrder = [
+      "Market Research",
+      "Creative Research",
+      "Data Analysis",
+      "Social Listening",
+      "Productivity",
+      "Life",
+    ];
+
+    // Sort available categories by preferred order
+    const sortedCategories = availableCategories.sort((a, b) => {
+      const aIndex = categoryOrder.indexOf(a);
+      const bIndex = categoryOrder.indexOf(b);
+
+      if (aIndex !== -1 && bIndex !== -1) {
+        return aIndex - bIndex;
+      }
+      if (aIndex !== -1) return -1;
+      if (bIndex !== -1) return 1;
+      return a.localeCompare(b);
+    });
+
+    // If current active category is not available or not set, use the first available one
+    if (!activeCategory || !availableCategories.includes(activeCategory)) {
+      if (sortedCategories.length > 0) {
+        setActiveCategory(sortedCategories[0]);
+      }
+    }
+  }, [groupedTemplates, activeCategory]);
 
   // This function will now handle creating a task from the main dashboard prompt
   const handleCreateTaskFromDashboardPrompt = async (e: React.FormEvent) => {
