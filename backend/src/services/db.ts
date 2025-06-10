@@ -96,6 +96,7 @@ interface TaskTemplate {
   useSharedBrowser?: boolean;
   turnOffHeadless?: boolean;
   useKnowledgeBase?: boolean;
+  updateKnowledgeBase?: boolean;
 }
 
 interface UserWithCounts extends User {
@@ -449,7 +450,7 @@ export const taskDb = {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Tasks`,
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, knowledgeBase, knowledgeBaseSize, knowledgeBaseType",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, knowledgeBase, knowledgeBaseSize, knowledgeBaseType",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -573,7 +574,7 @@ export const taskDb = {
           taskId,
         },
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, knowledgeBase, knowledgeBaseSize, knowledgeBaseType",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, knowledgeBase, knowledgeBaseSize, knowledgeBaseType",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -624,6 +625,8 @@ export const taskDb = {
       knowledgeBase?: string;
       knowledgeBaseSize?: number;
       knowledgeBaseType?: 'public' | 'private';
+      useKnowledgeBase?: boolean;
+      updateKnowledgeBase?: boolean;
     }>
   ) {
     try {

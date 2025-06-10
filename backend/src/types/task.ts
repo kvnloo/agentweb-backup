@@ -45,6 +45,7 @@ export interface TaskUpdate {
   useSharedBrowser?: boolean;
   turnOffHeadless?: boolean;
   useKnowledgeBase?: boolean;
+  updateKnowledgeBase?: boolean;
   knowledgeBase?: string;
   knowledgeBaseSize?: number; // Size of the knowledge base in bytes
   knowledgeBaseType?: 'public' | 'private'; // Whether the knowledge base is stored in public or private bucket

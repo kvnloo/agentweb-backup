@@ -81,6 +81,7 @@ interface Task {
   useSharedBrowser?: boolean; // Flag for using shared browser
   turnOffHeadless?: boolean; // Flag for turning off headless mode
   useKnowledgeBase?: boolean; // Flag for using knowledge base
+  updateKnowledgeBase?: boolean; // Flag for updating knowledge base
   knowledgeBase?: string; // The content of the task's knowledge base
   knowledgeBaseSize?: number; // Size of the knowledge base in bytes
   knowledgeBaseType?: 'public' | 'private'; // Type of knowledge base
@@ -1306,6 +1307,23 @@ export default function TaskDetails() {
     }
   };
 
+  // Add the handler function after handleUseKnowledgeBaseToggle
+  const handleUpdateKnowledgeBaseToggle = async () => {
+    if (!task || !token) return;
+    const newUpdateKnowledgeBaseValue = !(task?.updateKnowledgeBase || false);
+    try {
+      await axios.put(buildApiUrl(`/api/tasks/${task.taskId}`), 
+        { updateKnowledgeBase: newUpdateKnowledgeBaseValue },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      await fetchTask(); // Re-fetch task data to update UI from source of truth
+      setError(''); // Clear previous errors
+    } catch (err) {
+      console.error('Failed to update knowledge base update setting:', err);
+      setError('Failed to update knowledge base update setting. Please try again.');
+    }
+  };
+
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
@@ -1640,6 +1658,12 @@ export default function TaskDetails() {
                     <FormControlLabel
                       control={<Switch checked={task?.useKnowledgeBase || false} onChange={handleUseKnowledgeBaseToggle} />}
                       label="Use Knowledge Base"
+                    />
+                  </Tooltip>
+                  <Tooltip title="When enabled, the agent will update the knowledge base with new information after each successful task execution">
+                    <FormControlLabel
+                      control={<Switch checked={task?.updateKnowledgeBase || false} onChange={handleUpdateKnowledgeBaseToggle} />}
+                      label="Update Knowledge Base"
                     />
                   </Tooltip>
                 </Box>
