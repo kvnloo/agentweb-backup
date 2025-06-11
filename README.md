@@ -162,6 +162,11 @@ SMTP_PASS=your_smtp_password
 FROM_EMAIL=your_from_email
 ADMIN_EMAIL=your_admin_email
 ADMIN_PASSWORD=your_admin_password
+GCS_BUCKET_NAME=agentweb-knowledge-base-dev
+GCS_BUCKET_NAME_PRIVATE=agentweb-knowledge-base-private-dev
+GCS_PROJECT_ID=your_gcs_project_id
+GCS_CLIENT_EMAIL=your_gcs_client_email
+GCS_PRIVATE_KEY=your_gcs_private_key
 ```
 
 3. Create DynamoDB tables:
@@ -294,6 +299,11 @@ SMTP_PASS=your_smtp_password
 FROM_EMAIL=your_from_email
 ADMIN_EMAIL=your_admin_email
 ADMIN_PASSWORD=your_admin_password
+GCS_BUCKET_NAME=agentweb-knowledge-base-dev
+GCS_BUCKET_NAME_PRIVATE=agentweb-knowledge-base-private-dev
+GCS_PROJECT_ID=your_gcs_project_id
+GCS_CLIENT_EMAIL=your_gcs_client_email
+GCS_PRIVATE_KEY=your_gcs_private_key
 ```
 
 Frontend Production:

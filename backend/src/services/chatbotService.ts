@@ -12,7 +12,7 @@ import { Request, Response } from "express";
 import { EngineServiceClient } from '@google-cloud/discoveryengine';
 import { Storage } from '@google-cloud/storage';
 import { SearchServiceClient, protos } from '@google-cloud/discoveryengine';
-
+import { taskDb } from '../services/db';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -97,6 +97,7 @@ export interface ContextChunk {
   content: string;
   metadata: {
     source: string;
+    taskId?: string;
   };
 }
 
@@ -893,12 +894,12 @@ export async function searchKnowledgeBase(query: string, maxResults: number = 5)
 }
 
 // Function to search platform-wide knowledge base using Vertex AI Search
-export async function searchPlatformKnowledgeBase(query: string, maxResults: number = 5): Promise<ContextChunk[]> {
+export async function searchPlatformKnowledgeBase(query: string, maxResults: number = 10, userId?: string): Promise<ContextChunk[]> {
   try {
-    // Initialize the Search Service client
+    // Initialize the Search Service clients
     const privateKey = process.env.GCS_PRIVATE_KEY?.replace(/\[NEWLINE\]/g, '\n');
 
-    const client = new SearchServiceClient({
+    const publicClient = new SearchServiceClient({
       apiEndpoint: process.env.VERTEX_AI_LOCATION === 'global' 
         ? 'discoveryengine.googleapis.com'
         : `${process.env.VERTEX_AI_LOCATION}-discoveryengine.googleapis.com`,
@@ -908,12 +909,22 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
       }
     });
 
-    // Build the serving config path
-    const servingConfig = `projects/${process.env.GOOGLE_CLOUD_PROJECT}/locations/${process.env.VERTEX_AI_LOCATION}/collections/default_collection/engines/${process.env.VERTEX_AI_SEARCH_APP_ID}/servingConfigs/default_config`;
+    const privateClient = new SearchServiceClient({
+      apiEndpoint: process.env.VERTEX_AI_LOCATION_PRIVATE === 'global'
+        ? 'discoveryengine.googleapis.com'
+        : `${process.env.VERTEX_AI_LOCATION_PRIVATE}-discoveryengine.googleapis.com`,
+      credentials: {
+        client_email: process.env.GCS_CLIENT_EMAIL,
+        private_key: privateKey
+      }
+    });
+
+    // Build the serving config paths for both public and private knowledge bases
+    const publicServingConfig = `projects/${process.env.GOOGLE_CLOUD_PROJECT}/locations/${process.env.VERTEX_AI_LOCATION}/collections/default_collection/engines/${process.env.VERTEX_AI_SEARCH_APP_ID}/servingConfigs/default_config`;
+    const privateServingConfig = `projects/${process.env.GOOGLE_CLOUD_PROJECT}/locations/${process.env.VERTEX_AI_LOCATION_PRIVATE}/collections/default_collection/engines/${process.env.VERTEX_AI_SEARCH_APP_ID_PRIVATE}/servingConfigs/default_config`;
 
     // Create the search request with proper types
-    const request: protos.google.cloud.discoveryengine.v1.ISearchRequest = {
-      servingConfig,
+    const searchRequest: protos.google.cloud.discoveryengine.v1.ISearchRequest = {
       query,
       contentSearchSpec: {
         extractiveContentSpec: {
@@ -928,19 +939,21 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
       }
     };
 
-    // Execute the search
-    const [searchResults] = await client.search(request);
+    // Search both knowledge bases in parallel
+    const [publicResults, privateResults] = await Promise.all([
+      publicClient.search({ ...searchRequest, servingConfig: publicServingConfig }),
+      privateClient.search({ ...searchRequest, servingConfig: privateServingConfig })
+    ]);
 
-    // Process and transform the results
     const results: ContextChunk[] = [];
-    
-    for (const result of searchResults) {
+
+    // Process public results
+    for (const result of publicResults[0]) {
       const structData = result.document?.derivedStructData;
       if (!structData?.fields?.extractive_segments?.listValue?.values) {
         continue;
       }
 
-      // Process each segment in the list
       for (const segment of structData.fields.extractive_segments.listValue.values) {
         if (!segment.structValue?.fields?.content?.stringValue) {
           continue;
@@ -948,10 +961,56 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
 
         const content = segment.structValue.fields.content.stringValue;
         results.push({
-          id: `kb-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+          id: `kb-public-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
           content: content,
           metadata: {
-            source: 'platform-knowledge-base'
+            source: 'public-knowledge-base'
+          }
+        });
+      }
+    }
+
+    // Process private results
+    for (const result of privateResults[0]) {
+      const structData = result.document?.derivedStructData;
+      if (!structData?.fields?.extractive_segments?.listValue?.values) {
+        continue;
+      }
+
+      // Extract taskId from the link
+      const link = structData.fields?.link?.stringValue;
+      if (!link) continue;
+
+      // Extract taskId from the link path (e.g., gs://bucket/tasks/1740437136262/knowledge-base.txt)
+      const taskIdMatch = link.match(/\/tasks\/(\d+)\//);
+      if (!taskIdMatch) continue;
+
+      const taskId = taskIdMatch[1];
+      
+      // Check if task belongs to current user
+      try {
+        const task = await taskDb.getTaskById(taskId);
+        if (!task || task.userId !== userId) {
+          console.log(`Skipping task ${taskId} - not owned by user ${userId}`);
+          continue;
+        }
+      } catch (error) {
+        console.error(`Error checking task ownership for ${taskId}:`, error);
+        continue;
+      }
+
+      for (const segment of structData.fields.extractive_segments.listValue.values) {
+        if (!segment.structValue?.fields?.content?.stringValue) {
+          continue;
+        }
+
+        const content = segment.structValue.fields.content.stringValue;
+        results.push({
+          id: `kb-private-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+          content: content,
+          metadata: {
+            source: 'private-knowledge-base',
+            taskId: taskId
           }
         });
       }
@@ -970,7 +1029,8 @@ export async function generateChatResponse(
   userMessage: string,
   currentUrl?: string,
   pageContent?: string,
-  portalType: "customer" | "partner" = "partner"
+  portalType: "customer" | "partner" = "partner",
+  userId?: string
 ): Promise<string> {
   try {
     const timestamp = new Date().toISOString();
@@ -1050,7 +1110,7 @@ export async function generateChatResponse(
       }
 
       // Always try platform-wide KB and append results
-      const platformChunks = await searchPlatformKnowledgeBase(userMessage);
+      const platformChunks = await searchPlatformKnowledgeBase(userMessage, 10, userId);
       if (platformChunks.length > 0) {
         const platformContext = platformChunks
           .map((chunk) => `${chunk.content} (Source: ${chunk.metadata.source})`)
@@ -1135,3 +1195,4 @@ export async function generateChatResponse(
     throw error;
   }
 }
+

@@ -7,7 +7,7 @@ import { RequestHandler as ExpressRequestHandler } from 'express-serve-static-co
 import { isAdmin } from '../middleware/admin';
 import { userDb } from '../services/db';
 import { emailService } from '../services/emailService';
-import { Storage } from '@google-cloud/storage';
+import { Storage, Bucket } from '@google-cloud/storage';
 import OpenAI from 'openai';
 import axios from 'axios';
 
@@ -40,7 +40,8 @@ const openai = new OpenAI({
 });
 
 // Ensure bucket exists
-const BUCKET_NAME = process.env.GCS_BUCKET || 'agentweb-knowledge-base-dev';
+const BUCKET_NAME = process.env.GCS_BUCKET_NAME || 'agentweb-knowledge-base-dev';
+const PRIVATE_BUCKET_NAME = process.env.GCS_BUCKET_NAME_PRIVATE || 'agentweb-knowledge-base-private-dev';
 
 type FileRequest = AuthenticatedRequest & {
   file?: Express.Multer.File;
@@ -336,6 +337,19 @@ router.put('/:taskId/executions/:executionId/unarchive', authenticateToken, asyn
   }
 });
 
+// Helper function to check file size
+async function getFileSize(bucket: Bucket, filePath: string): Promise<number> {
+  const file = bucket.file(filePath);
+  const [exists] = await file.exists();
+  if (!exists) return 0;
+  
+  const [metadata] = await file.getMetadata();
+  if (!metadata || !metadata.size) {
+    return 0;
+  }
+  return parseInt(String(metadata.size));
+}
+
 // Knowledge Base routes
 router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, res: Response) => {
   try {
@@ -355,46 +369,61 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
       return res.status(403).json({ message: 'Not authorized to access this task' });
     }
 
-    const bucket = storage.bucket(BUCKET_NAME);
+    // If knowledgeBaseType is not set, determine it based on file content
+    if (!task.knowledgeBaseType) {
+      const publicBucket = storage.bucket(BUCKET_NAME);
+      const privateBucket = storage.bucket(PRIVATE_BUCKET_NAME);
+      const filePath = `tasks/${taskId}/knowledge-base.txt`;
+
+      const publicSize = await getFileSize(publicBucket, filePath);
+      const privateSize = await getFileSize(privateBucket, filePath);
+
+      // Set type based on file content
+      const type = publicSize > 0 ? 'public' : 'private';
+      const size = type === 'public' ? publicSize : privateSize;
+
+      await taskDb.updateTask(taskId, { 
+        knowledgeBaseType: type,
+        knowledgeBaseSize: size
+      });
+      task.knowledgeBaseType = type;
+    }
+
+    // Use the appropriate bucket based on knowledgeBaseType
+    const bucket = storage.bucket(task.knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
     const filePath = `tasks/${taskId}/knowledge-base.txt`;
     const file = bucket.file(filePath);
 
     // Check if file exists
     const [exists] = await file.exists();
-    
-    // If file doesn't exist and no knowledge base link exists, create a new one
-    if (!exists && !task.knowledgeBase) {
-      // Create empty file
-      await file.save('', {
-        contentType: 'text/plain',
-        metadata: {
-          taskId,
-          userId,
-          createdAt: new Date().toISOString()
-        }
-      });
-
-      // Get the public URL
+    let contentStr = '';
+    let url = '';
+    let size = 0;
+    if (exists) {
+      // If file exists, get its content and size
+      const [content] = await file.download();
+      contentStr = content.toString();
+      size = await getFileSize(bucket, filePath);
+      
+      // Generate signed URL
       const [url] = await file.getSignedUrl({
         action: 'read',
         expires: '03-01-2500' // Far future expiration
       });
-
-      // Update task with the new knowledge base link
-      await taskDb.updateTask(taskId, { knowledgeBase: url, knowledgeBaseSize: 0 });
-
-      return res.json({ content: '', url });
     }
-
-    // If file exists, get the content
-    if (exists) {
-      const [content] = await file.download();
-      const contentStr = content.toString();
-      res.json({ content: contentStr, url: task.knowledgeBase });
-    } else {
-      // If file doesn't exist but task has a knowledge base link, return 404
-      res.status(404).json({ message: 'Knowledge base file not found' });
+    // Update size if it doesn't match
+    if (size !== task.knowledgeBaseSize) {
+      await taskDb.updateTask(taskId, { 
+        knowledgeBaseSize: size,
+        knowledgeBaseUpdatedAt: new Date().toISOString()
+      });
     }
+    
+    res.json({ 
+      content: contentStr, 
+      url: task.knowledgeBase || url,
+      knowledgeBaseUpdatedAt: task.knowledgeBaseUpdatedAt
+    });
   } catch (error) {
     console.error('Error in knowledge base GET:', error);
     res.status(500).json({ message: 'Internal server error' });
@@ -423,11 +452,16 @@ router.put('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
       return res.status(403).json({ message: 'Not authorized to modify this task' });
     }
 
-    const bucket = storage.bucket(BUCKET_NAME);
+    if (!task.knowledgeBaseType) {
+      return res.status(400).json({ message: 'Knowledge base type not defined' });
+    }
+
+    // Use the appropriate bucket based on knowledgeBaseType
+    const bucket = storage.bucket(task.knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
     const filePath = `tasks/${taskId}/knowledge-base.txt`;
     const file = bucket.file(filePath);
 
-    // Save content to file
+    // Save content to bucket
     await file.save(contentToSave, {
       contentType: 'text/plain',
       metadata: {
@@ -437,20 +471,24 @@ router.put('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
       }
     });
 
-    // Get the public URL if it's a new file
-    if (!task.knowledgeBase) {
-      const [url] = await file.getSignedUrl({
-        action: 'read',
-        expires: '03-01-2500' // Far future expiration
-      });
-      
-      // Update task with the new knowledge base link
-      await taskDb.updateTask(taskId, { knowledgeBase: url, knowledgeBaseSize: Buffer.byteLength(contentToSave, 'utf8') });
-      
-      res.json({ content: contentToSave, url });
-    } else {
-      res.json({ content: contentToSave, url: task.knowledgeBase });
-    }
+    // Get the public URL
+    const [url] = await file.getSignedUrl({
+      action: 'read',
+      expires: '03-01-2500' // Far future expiration
+    });
+    
+    // Update task with the new knowledge base size
+    await taskDb.updateTask(taskId, { 
+      knowledgeBaseSize: Buffer.byteLength(contentToSave, 'utf8'),
+      knowledgeBase: url,
+      knowledgeBaseUpdatedAt: new Date().toISOString()
+    });
+    
+    res.json({ 
+      content: contentToSave, 
+      url: task.knowledgeBase || url,
+      knowledgeBaseUpdatedAt: new Date().toISOString()
+    });
   } catch (error) {
     console.error('Error in knowledge base PUT:', error);
     res.status(500).json({ message: 'Internal server error' });
@@ -467,6 +505,10 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
+    if (!taskId || !executionId) {
+      return res.status(400).json({ message: 'Task ID and Execution ID are required' });
+    }
+
     const task = await taskDb.getTaskById(taskId);
     if (!task) {
       return res.status(404).json({ message: 'Task not found' });
@@ -481,8 +523,9 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
       return res.status(404).json({ message: 'Execution not found' });
     }
 
-    // Get the current knowledge base content
-    const bucket = storage.bucket(BUCKET_NAME);
+    // Determine which bucket to use based on knowledgeBaseType
+    let bucketType = task.knowledgeBaseType;
+    const bucket = storage.bucket(bucketType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
     const filePath = `tasks/${taskId}/knowledge-base.txt`;
     const file = bucket.file(filePath);
     const [exists] = await file.exists();
@@ -550,9 +593,17 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
       }
     });
 
-    // Update the task with knowledge base size
+    // Get the public URL
+    const [url] = await file.getSignedUrl({
+      action: 'read',
+      expires: '03-01-2500'
+    });
+
+    // Update the task with knowledge base size, type, and URL
     await taskDb.updateTask(taskId, {
-      knowledgeBaseSize
+      knowledgeBaseSize,
+      knowledgeBase: url,
+      knowledgeBaseUpdatedAt: new Date().toISOString()
     });
 
     // Update the execution record with knowledge base update info
@@ -562,13 +613,93 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
 
     res.json({ 
       content: updatedContent,
-      url: task.knowledgeBase,
+      url,
       message: 'Knowledge base updated successfully',
       size: knowledgeBaseSize
     });
   } catch (error) {
     console.error('Error updating knowledge base from execution:', error);
     res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Add the knowledge base type toggle endpoint
+router.put('/:id/knowledge-base-type', authenticateToken, async (req: Request, res: Response) => {
+  const taskId = req.params.id;
+  const { knowledgeBaseType } = req.body;
+  const userId = (req as AuthenticatedRequest).user?.userId;
+
+  if (!userId) {
+    return res.status(401).json({ message: 'Unauthorized' });
+  }
+
+  if (!knowledgeBaseType || !['public', 'private'].includes(knowledgeBaseType)) {
+    return res.status(400).json({ message: 'Invalid knowledge base type' });
+  }
+
+  try {
+    // Get the task to check ownership
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Check if user owns the task
+    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+      return res.status(403).json({ message: 'Not authorized to modify this task' });
+    }
+
+    // Only move file if type is actually changing
+    if (task.knowledgeBaseType !== knowledgeBaseType) {
+      const filePath = `tasks/${taskId}/knowledge-base.txt`;
+      const currentBucket = storage.bucket(task.knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
+      const newBucket = storage.bucket(knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
+      const currentFile = currentBucket.file(filePath);
+      const newFile = newBucket.file(filePath);
+      // Check if current file exists
+      const [exists] = await currentFile.exists();
+      if (exists) {
+        // Download current content
+        const [content] = await currentFile.download();
+        // Upload to new bucket
+        await newFile.save(content, {
+          contentType: 'text/plain',
+          metadata: {
+            taskId,
+            userId,
+            updatedAt: new Date().toISOString(),
+            sourceBucket: task.knowledgeBaseType
+          }
+        });
+        // Get the new URL
+        const [url] = await newFile.getSignedUrl({
+          action: 'read',
+          expires: '03-01-2500'
+        });
+        // Update task with new bucket type and URL
+        await taskDb.updateTask(taskId, {
+          knowledgeBaseType,
+          knowledgeBase: url,
+          knowledgeBaseUpdatedAt: new Date().toISOString()
+        });
+        // Delete the old file
+        await currentFile.delete();
+        return res.json({ message: 'Knowledge base type and file moved successfully', knowledgeBaseType, url });
+      } else {
+        // If no file exists, just update the type
+        await taskDb.updateTask(taskId, { 
+          knowledgeBaseType,
+          knowledgeBaseUpdatedAt: new Date().toISOString()
+        });
+        return res.json({ message: 'Knowledge base type updated (no file to move)', knowledgeBaseType });
+      }
+    } else {
+      // If type is not changing, just return success
+      return res.json({ message: 'Knowledge base type unchanged', knowledgeBaseType });
+    }
+  } catch (error) {
+    console.error('Error updating knowledge base type:', error);
+    res.status(500).json({ message: 'Failed to update knowledge base type' });
   }
 });
 

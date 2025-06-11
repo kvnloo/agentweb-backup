@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate, useLocation, Link as RouterLink } from 'react-router-dom';
 import {
   Container,
@@ -53,6 +53,8 @@ import ScheduleForm from '../components/ScheduleForm';
 import ScheduleList from '../components/ScheduleList';
 import { buildApiUrl, getLLMsForTask } from '../config';
 import { toast } from 'react-hot-toast';
+import LockIcon from '@mui/icons-material/Lock';
+import LockOpenIcon from '@mui/icons-material/LockOpen';
 
 interface Task {
   taskId: string;
@@ -78,8 +80,11 @@ interface Task {
   useSharedBrowser?: boolean; // Flag for using shared browser
   turnOffHeadless?: boolean; // Flag for turning off headless mode
   useKnowledgeBase?: boolean; // Flag for using knowledge base
+  updateKnowledgeBase?: boolean; // Flag for updating knowledge base
   knowledgeBase?: string; // The content of the task's knowledge base
   knowledgeBaseSize?: number; // Size of the knowledge base in bytes
+  knowledgeBaseType?: 'public' | 'private'; // Type of knowledge base
+  knowledgeBaseUpdatedAt?: string; // Timestamp of the last update to the knowledge base
 }
 
 interface TaskAttachment {
@@ -370,7 +375,8 @@ export default function TaskDetails() {
   const [editedName, setEditedName] = useState('');
   const [uploadError, setUploadError] = useState<string>('');
   const [isUploading, setIsUploading] = useState(false);
-  const [shouldPoll, setShouldPoll] = useState(true);
+  const [shouldPoll, setShouldPoll] = useState(false);
+  const hasReloaded = useRef(false);
   const [success, setSuccess] = useState('');
   const [ownerChangeDialogOpen, setOwnerChangeDialogOpen] = useState(false);
   const [newOwnerEmail, setNewOwnerEmail] = useState('');
@@ -435,14 +441,19 @@ export default function TaskDetails() {
   useEffect(() => {
     // Only poll if the latest execution is pending or running
     const latestExecution = getLatestExecution();
-    const shouldPoll = Boolean(latestExecution && ['pending', 'running'].includes(latestExecution.status.toLowerCase()));
+    const newShouldPoll = Boolean(latestExecution && ['pending', 'running'].includes(latestExecution.status.toLowerCase()));
     
-    setShouldPoll(shouldPoll);
-    
-    if (shouldPoll) {
+    if (newShouldPoll) {
       console.log('Latest execution is active - polling enabled');
-    } else {
-      console.log('No active latest execution - polling disabled');
+      setShouldPoll(true);
+      hasReloaded.current = false;  // Reset reload flag when polling starts
+    } else if (shouldPoll && !hasReloaded.current) {  // If we were polling but now we shouldn't, and haven't reloaded yet
+      console.log('Execution completed - reloading page in 1s');
+      setShouldPoll(false);
+      hasReloaded.current = true;  // Mark that we've reloaded
+      setTimeout(() => {
+        window.location.reload();
+      }, 1000);
     }
   }, [executions]);
 
@@ -1203,7 +1214,11 @@ export default function TaskDetails() {
       );
       
       // Update task with the new knowledge base URL and content
-      const updatedTask = { ...task, knowledgeBase: response.data.url };
+      const updatedTask = { 
+        ...task, 
+        knowledgeBase: response.data.url,
+        knowledgeBaseUpdatedAt: response.data.knowledgeBaseUpdatedAt
+      };
       setTask(updatedTask);
       // Update the edited content
       setEditedKnowledgeBase(response.data.content || '');
@@ -1231,10 +1246,12 @@ export default function TaskDetails() {
             // Set the edited content
             setEditedKnowledgeBase(response.data.content || '');
             // Update task with the knowledge base URL if it's new
-            if (response.data.url && !taskData.knowledgeBase) {
-              const updatedTask = { ...taskData, knowledgeBase: response.data.url };
-              setTask(updatedTask);
-            }
+            const updatedTask = { 
+              ...taskData, 
+              knowledgeBase: response.data.url,
+              knowledgeBaseUpdatedAt: response.data.knowledgeBaseUpdatedAt
+            };
+            setTask(updatedTask);
           } catch (error: any) {
             console.error('Error loading knowledge base:', error);
             // Only show error if it's not a 404 (file doesn't exist yet)
@@ -1282,6 +1299,40 @@ export default function TaskDetails() {
       console.error('Error updating knowledge base:', error);
       toast.error(error.response?.data?.message || 'Failed to update knowledge base');
       setIsUpdatingKnowledgeBase(null);
+    }
+  };
+
+  const handleKnowledgeBaseTypeToggle = async () => {
+    if (!task || !token) return;
+    const newKnowledgeBaseType = task.knowledgeBaseType === 'public' ? 'private' : 'public';
+    try {
+      await axios.put(
+        buildApiUrl(`/api/tasks/${task.taskId}/knowledge-base-type`),
+        { knowledgeBaseType: newKnowledgeBaseType },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      await fetchTask(); // Re-fetch task data to update UI from source of truth
+      setError(''); // Clear previous errors
+    } catch (err) {
+      console.error('Failed to update knowledge base type:', err);
+      setError('Failed to update knowledge base type. Please try again.');
+    }
+  };
+
+  // Add the handler function after handleUseKnowledgeBaseToggle
+  const handleUpdateKnowledgeBaseToggle = async () => {
+    if (!task || !token) return;
+    const newUpdateKnowledgeBaseValue = !(task?.updateKnowledgeBase || false);
+    try {
+      await axios.put(buildApiUrl(`/api/tasks/${task.taskId}`), 
+        { updateKnowledgeBase: newUpdateKnowledgeBaseValue },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      await fetchTask(); // Re-fetch task data to update UI from source of truth
+      setError(''); // Clear previous errors
+    } catch (err) {
+      console.error('Failed to update knowledge base update setting:', err);
+      setError('Failed to update knowledge base update setting. Please try again.');
     }
   };
 
@@ -1621,6 +1672,12 @@ export default function TaskDetails() {
                       label="Use Knowledge Base"
                     />
                   </Tooltip>
+                  <Tooltip title="When enabled, the agent will update the knowledge base with new information after each successful task execution">
+                    <FormControlLabel
+                      control={<Switch checked={task?.updateKnowledgeBase || false} onChange={handleUpdateKnowledgeBaseToggle} />}
+                      label="Update Knowledge Base"
+                    />
+                  </Tooltip>
                 </Box>
                 <Tooltip title={
                   <div>
@@ -1833,15 +1890,37 @@ export default function TaskDetails() {
           {/* Knowledge Base Section */}
           <Grid item xs={12}>
             <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
-              <Typography variant="h6" gutterBottom>
-                Knowledge Base
-              </Typography>
+              <Box>
+                <Typography variant="h6" gutterBottom>
+                  Knowledge Base {task.knowledgeBaseType && `(${task.knowledgeBaseType.charAt(0).toUpperCase() + task.knowledgeBaseType.slice(1)})`}
+                </Typography>
+                {task.knowledgeBaseUpdatedAt && (
+                  <Typography variant="caption" color="textSecondary">
+                    Last updated: {new Date(task.knowledgeBaseUpdatedAt).toLocaleString()}
+                  </Typography>
+                )}
+              </Box>
               {showActions && !isEditingKnowledgeBase && (
-                <Tooltip title="Edit knowledge base">
-                  <IconButton onClick={handleKnowledgeBaseEdit} size="small">
-                    <EditIcon />
-                  </IconButton>
-                </Tooltip>
+                <Box sx={{ display: 'flex', gap: 1 }}>
+                  <Tooltip title={
+                    task.knowledgeBaseType === 'public' 
+                      ? "The knowledge base is currently public (accessible to all accounts on AgentWeb). Click to make it private (only accessible to this account)."
+                      : "The knowledge base is currently private (only accessible to this account). Click to make it public (accessible to all accounts on AgentWeb)."
+                  }>
+                    <IconButton
+                      size="small"
+                      onClick={handleKnowledgeBaseTypeToggle}
+                      disabled={false}
+                    >
+                      {task.knowledgeBaseType === 'public' ? <LockOpenIcon /> : <LockIcon />}
+                    </IconButton>
+                  </Tooltip>
+                  <Tooltip title="Edit knowledge base">
+                    <IconButton onClick={handleKnowledgeBaseEdit} size="small">
+                      <EditIcon />
+                    </IconButton>
+                  </Tooltip>
+                </Box>
               )}
             </Box>
             {knowledgeBaseError && (

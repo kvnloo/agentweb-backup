@@ -21,6 +21,8 @@ export interface Task {
   useKnowledgeBase?: boolean; // Whether the task can use the knowledge base
   knowledgeBase?: string; // The GCS URL of the task's knowledge base file
   knowledgeBaseSize?: number; // Size of the knowledge base in bytes
+  knowledgeBaseType?: 'public' | 'private'; // Whether the knowledge base is stored in public or private bucket
+  knowledgeBaseUpdatedAt?: string; // When the knowledge base was last updated
   description?: string; // Description of the task
   category?: string; // Category of the task
 }
@@ -44,6 +46,9 @@ export interface TaskUpdate {
   useSharedBrowser?: boolean;
   turnOffHeadless?: boolean;
   useKnowledgeBase?: boolean;
+  updateKnowledgeBase?: boolean;
   knowledgeBase?: string;
   knowledgeBaseSize?: number; // Size of the knowledge base in bytes
+  knowledgeBaseType?: 'public' | 'private'; // Whether the knowledge base is stored in public or private bucket
+  knowledgeBaseUpdatedAt?: string; // When the knowledge base was last updated
 } 

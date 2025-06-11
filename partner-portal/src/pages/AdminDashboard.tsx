@@ -35,9 +35,10 @@ import {
   Select,
   MenuItem,
   FormGroup,
+  Link,
 } from "@mui/material";
 import { format } from "date-fns";
-import { Link } from "react-router-dom";
+import { Link as RouterLink } from "react-router-dom";
 import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
 import { buildApiUrl } from "../config";
@@ -157,6 +158,33 @@ interface AdminWorkflow {
   [key: string]: any; // Allow other properties if necessary
 }
 
+// Define an interface for knowledge base metrics
+interface KnowledgeBaseMetrics {
+  totalTasks: number;
+  tasksWithKnowledgeBase: number;
+  totalKnowledgeBaseSize: number;
+  averageKnowledgeBaseSize: number;
+  public: {
+    tasks: number;
+    tasksWithKnowledgeBase: number;
+    totalSize: number;
+    averageSize: number;
+  };
+  private: {
+    tasks: number;
+    tasksWithKnowledgeBase: number;
+    totalSize: number;
+    averageSize: number;
+  };
+  tasks: {
+    taskId: string;
+    name: string;
+    knowledgeBaseSize: number;
+    owner: string;
+    type: 'public' | 'private';
+  }[];
+}
+
 const ChatDialog = ({
   session,
   open,
@@ -187,13 +215,10 @@ const ChatDialog = ({
             <Typography variant="subtitle2" gutterBottom>
               User ID:{" "}
               <Link
+                component={RouterLink}
                 to={`/profile/${session.userId}`}
-                style={{
-                  color: "#1976d2",
-                  textDecoration: "none",
-                }}
-                target="_blank"
-                rel="noopener noreferrer"
+                color="primary"
+                underline="hover"
               >
                 {session.userId}
               </Link>
@@ -397,6 +422,7 @@ export default function AdminDashboard() {
   const [userIdToDelete, setUserIdToDelete] = useState<string | null>(null);
   const [userDeleteConfirmOpen, setUserDeleteConfirmOpen] = useState(false);
   const [workflows, setWorkflows] = useState<AdminWorkflow[]>([]);
+  const [knowledgeBaseMetrics, setKnowledgeBaseMetrics] = useState<KnowledgeBaseMetrics | null>(null);
   const { token } = useAuth();
 
   const {
@@ -510,6 +536,25 @@ export default function AdminDashboard() {
     if (tabValue === 6) {
       // Chat History tab
       loadChatSessions();
+    }
+  }, [tabValue, token]);
+
+  useEffect(() => {
+    const loadKnowledgeBaseMetrics = async () => {
+      try {
+        const response = await axios.get(buildApiUrl("/api/admin/knowledge-base-metrics"), {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+        setKnowledgeBaseMetrics(response.data);
+      } catch (error) {
+        console.error("Error loading knowledge base metrics:", error);
+      }
+    };
+
+    if (tabValue === 7) { // Knowledge Base tab
+      loadKnowledgeBaseMetrics();
     }
   }, [tabValue, token]);
 
@@ -877,6 +922,7 @@ export default function AdminDashboard() {
             <Tab label="Tasks" {...a11yProps(4)} />
             <Tab label="Workflows" {...a11yProps(5)} />
             <Tab label="Chat History" {...a11yProps(6)} />
+            <Tab label="Knowledge Base" {...a11yProps(7)} />
           </Tabs>
         </Box>
 
@@ -1741,17 +1787,14 @@ export default function AdminDashboard() {
                         )}
                       </TableCell>
                       <TableCell>
-                        <Link
+                        <Button
+                          size="small"
+                          component={RouterLink}
                           to={`/tasks/${task.taskId}`}
-                          style={{
-                            color: "#1976d2",
-                            textDecoration: "none",
-                          }}
                           target="_blank"
-                          rel="noopener noreferrer"
                         >
                           View Details
-                        </Link>
+                        </Button>
                       </TableCell>
                     </TableRow>
                   ))
@@ -1884,13 +1927,10 @@ export default function AdminDashboard() {
                       </TableCell>
                       <TableCell>
                         <Link
+                          component={RouterLink}
                           to={`/workflows/${workflow.workflowId}/run`}
-                          style={{
-                            color: "#1976d2",
-                            textDecoration: "none",
-                          }}
-                          target="_blank"
-                          rel="noopener noreferrer"
+                          color="primary"
+                          underline="hover"
                         >
                           View Details
                         </Link>
@@ -1942,8 +1982,10 @@ export default function AdminDashboard() {
                       </TableCell>
                       <TableCell>
                         <Link
+                          component={RouterLink}
                           to={`/profile/${session.userId}`}
-                          style={{ textDecoration: "none" }}
+                          color="primary"
+                          underline="hover"
                         >
                           {session.userId}
                         </Link>
@@ -1994,6 +2036,137 @@ export default function AdminDashboard() {
               </TableBody>
             </Table>
           </TableContainer>
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={7}>
+          {error && (
+            <Alert severity="error" sx={{ mb: 3 }}>
+              {error}
+            </Alert>
+          )}
+          <Grid container spacing={3}>
+            <Grid item xs={12}>
+              <Card>
+                <CardContent>
+                  <Typography variant="h6" gutterBottom>
+                    Knowledge Base Overview
+                  </Typography>
+                  <Typography variant="body2" color="text.secondary" paragraph>
+                    The knowledge base is the collection of all knowledge bases from all the tasks on the AgentWeb platform. It is indexed daily with Google Vertex AI Search and thus updates to the knowledge base will be available for use next day.
+                  </Typography>
+                  <TableContainer component={Paper}>
+                    <Table>
+                      <TableHead>
+                        <TableRow>
+                          <TableCell>Category</TableCell>
+                          <TableCell>Total Tasks</TableCell>
+                          <TableCell>Tasks with Knowledge Base</TableCell>
+                          <TableCell>Total Size</TableCell>
+                          <TableCell>Average Size</TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {knowledgeBaseMetrics ? (
+                          <>
+                            <TableRow>
+                              <TableCell>Overall</TableCell>
+                              <TableCell>{knowledgeBaseMetrics.totalTasks}</TableCell>
+                              <TableCell>{knowledgeBaseMetrics.tasksWithKnowledgeBase}</TableCell>
+                              <TableCell>{(knowledgeBaseMetrics.totalKnowledgeBaseSize / 1024).toFixed(2)} KB</TableCell>
+                              <TableCell>{(knowledgeBaseMetrics.averageKnowledgeBaseSize / 1024).toFixed(2)} KB</TableCell>
+                            </TableRow>
+                            <TableRow>
+                              <TableCell>Public</TableCell>
+                              <TableCell>{knowledgeBaseMetrics.public.tasks}</TableCell>
+                              <TableCell>{knowledgeBaseMetrics.public.tasksWithKnowledgeBase}</TableCell>
+                              <TableCell>{(knowledgeBaseMetrics.public.totalSize / 1024).toFixed(2)} KB</TableCell>
+                              <TableCell>{(knowledgeBaseMetrics.public.averageSize / 1024).toFixed(2)} KB</TableCell>
+                            </TableRow>
+                            <TableRow>
+                              <TableCell>Private</TableCell>
+                              <TableCell>{knowledgeBaseMetrics.private.tasks}</TableCell>
+                              <TableCell>{knowledgeBaseMetrics.private.tasksWithKnowledgeBase}</TableCell>
+                              <TableCell>{(knowledgeBaseMetrics.private.totalSize / 1024).toFixed(2)} KB</TableCell>
+                              <TableCell>{(knowledgeBaseMetrics.private.averageSize / 1024).toFixed(2)} KB</TableCell>
+                            </TableRow>
+                          </>
+                        ) : (
+                          <TableRow>
+                            <TableCell colSpan={5} align="center">
+                              <Typography variant="body2" color="text.secondary">
+                                Loading metrics...
+                              </Typography>
+                            </TableCell>
+                          </TableRow>
+                        )}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                </CardContent>
+              </Card>
+            </Grid>
+
+            <Grid item xs={12}>
+              <Card>
+                <CardContent>
+                  <Typography variant="h6" gutterBottom>
+                    Tasks with Knowledge Base
+                  </Typography>
+                  <TableContainer component={Paper}>
+                    <Table>
+                      <TableHead>
+                        <TableRow>
+                          <TableCell>Task ID</TableCell>
+                          <TableCell>Name</TableCell>
+                          <TableCell>Owner</TableCell>
+                          <TableCell>Type</TableCell>
+                          <TableCell>Knowledge Base Size</TableCell>
+                          <TableCell>Actions</TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {knowledgeBaseMetrics?.tasks ? (
+                          knowledgeBaseMetrics.tasks.map((task) => (
+                            <TableRow key={task.taskId}>
+                              <TableCell>{task.taskId}</TableCell>
+                              <TableCell>{task.name}</TableCell>
+                              <TableCell>{task.owner}</TableCell>
+                              <TableCell>
+                                {task.type === 'public' ? (
+                                  <Chip size="small" label="Public" color="primary" />
+                                ) : (
+                                  <Chip size="small" label="Private" color="default" />
+                                )}
+                              </TableCell>
+                              <TableCell>{(task.knowledgeBaseSize / 1024).toFixed(2)} KB</TableCell>
+                              <TableCell>
+                                <Button
+                                  size="small"
+                                  component={RouterLink}
+                                  to={`/tasks/${task.taskId}`}
+                                  target="_blank"
+                                >
+                                  View Details
+                                </Button>
+                              </TableCell>
+                            </TableRow>
+                          ))
+                        ) : (
+                          <TableRow>
+                            <TableCell colSpan={6} align="center">
+                              <Typography variant="body2" color="text.secondary">
+                                {knowledgeBaseMetrics === null ? 'Loading tasks...' : 'No knowledge bases found'}
+                              </Typography>
+                            </TableCell>
+                          </TableRow>
+                        )}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                </CardContent>
+              </Card>
+            </Grid>
+          </Grid>
         </TabPanel>
       </Paper>
 

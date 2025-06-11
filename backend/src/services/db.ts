@@ -96,6 +96,7 @@ interface TaskTemplate {
   useSharedBrowser?: boolean;
   turnOffHeadless?: boolean;
   useKnowledgeBase?: boolean;
+  updateKnowledgeBase?: boolean;
 }
 
 interface UserWithCounts extends User {
@@ -449,18 +450,42 @@ export const taskDb = {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Tasks`,
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, #epc, #vo, #adm",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, knowledgeBase, knowledgeBaseSize, knowledgeBaseType",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
+          "#e": "error",
+          "#sum": "summary",
+          "#en": "emailNotification",
+          "#i": "isInteractive",
+          "#dr": "isDeepResearch",
+          "#llm": "llmName",
+          "#ct": "isComplexTask",
           "#epc": "extractPageContent",
           "#vo": "validateOutput",
+          "#oaj": "outputAsJson",
+          "#oah": "outputAsHtml",
           "#adm": "isAgenticDevMode",
         },
       };
 
-      const result = await dynamodb.scan(params).promise();
-      return result.Items || [];
+      let allItems: any[] = [];
+      let lastEvaluatedKey: any = undefined;
+
+      do {
+        const result = await dynamodb.scan({
+          ...params,
+          ExclusiveStartKey: lastEvaluatedKey
+        }).promise();
+        
+        if (result.Items) {
+          allItems = allItems.concat(result.Items);
+        }
+        
+        lastEvaluatedKey = result.LastEvaluatedKey;
+      } while (lastEvaluatedKey);
+
+      return allItems;
     } catch (error) {
       handleDynamoDbError(error, "getAllTasks");
     }
@@ -549,7 +574,7 @@ export const taskDb = {
           taskId,
         },
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -599,6 +624,10 @@ export const taskDb = {
       turnOffHeadless?: boolean;
       knowledgeBase?: string;
       knowledgeBaseSize?: number;
+      knowledgeBaseType?: 'public' | 'private';
+      useKnowledgeBase?: boolean;
+      updateKnowledgeBase?: boolean;
+      knowledgeBaseUpdatedAt?: string;
     }>
   ) {
     try {

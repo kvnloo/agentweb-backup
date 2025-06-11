@@ -18,7 +18,7 @@ import yaml
 import random
 from typing import Dict, Any, List, Optional
 from deep_research_agent import DeepResearchAgentWrapper  # Import the wrapper class
-from task_utils import upload_activity_log, upload_gif, check_new_information, LogSyncManager, start_log_sync  # Import utility functions
+from task_utils import get_downloads_path, upload_activity_log, upload_gif, check_new_information, LogSyncManager, start_log_sync  # Import utility functions
 import subprocess
 import tempfile
 import shutil
@@ -28,6 +28,10 @@ import threading
 import resource
 from email_utils import get_task_subscribers
 import requests
+from google.cloud import storage
+from openai import AzureOpenAI
+from task_utils import get_azure_openai_llm2
+from knowledge_base_utils import get_knowledge_base_manager
 
 # Increase file descriptor limit
 soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -473,7 +477,7 @@ async def update_workflow_execution(workflow_id: str, execution_id: str, updates
         logger.error(f"Error updating workflow execution: {e}")
         return False
 
-async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str, run_user_id: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False, use_knowledge_base: bool = False) -> Dict[str, Any]:
+async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str, run_user_id: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False, use_knowledge_base: bool = False, update_knowledge_base: bool = False) -> Dict[str, Any]:
     global running_processes
     log_sync_manager = None
     process = None
@@ -535,6 +539,8 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
             cmd.append('--turn-off-headless')
         if use_knowledge_base:
             cmd.append('--use-knowledge-base')
+        if update_knowledge_base:
+            cmd.append('--update-knowledge-base')
         
         # Run command with output redirection
         logger.info(f"Running command: {' '.join(cmd)}")
@@ -953,6 +959,7 @@ async def execute_task(execution):
                         use_shared_browser = bool(task.get('useSharedBrowser', False)) if task else False
                         turn_off_headless = bool(task.get('turnOffHeadless', False)) if task else False
                         use_knowledge_base = bool(task.get('useKnowledgeBase', False)) if task else False
+                        update_knowledge_base = bool(task.get('updateKnowledgeBase', False)) if task else False
                         
                         # Set filtered activity log path for later reference
                         filtered_activity_log = f'logs/execution_{execution_id}_browser_use.filtered.log'
@@ -975,7 +982,8 @@ async def execute_task(execution):
                             output_as_html,
                             use_shared_browser,
                             turn_off_headless,
-                            use_knowledge_base
+                            use_knowledge_base,
+                            update_knowledge_base
                         )
                     except Exception as e:
                         logger.error(f"Error running web agent: {str(e)}")
@@ -1004,8 +1012,112 @@ async def execute_task(execution):
                             output_as_json=output_as_json
                         )
                         logger.info(f"Updated execution status to completed for {execution_id}")
+
+                        # Update knowledge base if enabled
+                        if update_knowledge_base:
+                            try:
+                                logger.info(f"Starting knowledge base update for task {task_id}")
+                                # Initialize clients
+                                storage_client = storage.Client()
+                                openai_client = get_azure_openai_llm2('gpt-4.1')
+
+                                # Determine which bucket to use based on knowledgeBaseType
+                                bucket_type = task.get('knowledgeBaseType', 'private')
+                                bucket_name = os.getenv('GCS_BUCKET_NAME') if bucket_type == 'public' else os.getenv('GCS_BUCKET_NAME_PRIVATE')
+                                bucket = storage_client.bucket(bucket_name)
+                                file_name = f"tasks/{task_id}/knowledge-base.txt"
+                                blob = bucket.blob(file_name)
+
+                                # Get current content if exists
+                                current_content = ''
+                                if blob.exists():
+                                    current_content = blob.download_as_text()
+
+                                # Process result files
+                                result_files_content = ''
+                                if result.get('result_files'):
+                                    text_files = [f for f in result['result_files'] if f['filename'].endswith(('.html', '.txt', '.md'))]
+                                    for file in text_files:
+                                        try:
+                                            # Get the download path for the file
+                                            downloads_path = get_downloads_path(user_id=user_id, execution_id=execution_id)
+                                            file_path = os.path.join(downloads_path, file['filename'])
+                                            with open(file_path, 'r') as f:
+                                                content = f.read()
+                                                result_files_content += f"\n\nContent from {file['filename']}:\n{content}"
+                                        except Exception as e:
+                                            logger.error(f"Error reading file {file['filename']}: {e}")
+
+                                # Use OpenAI to analyze the execution and suggest knowledge base updates
+                                prompt = f"""Analyze the following task execution and suggest updates to the knowledge base. 
+                                Current knowledge base content:
+                                {current_content}
+                                
+                                Task execution details:
+                                Task: {task['name']}
+                                Prompt: {task['prompt']}
+                                Result: {result.get('summary', '')}
+                                Error: {result.get('error', 'None')}
+                                {result_files_content if result_files_content else ''}
+                                
+                                Based on the above information, provide ONLY the updated markdown content for the knowledge base. Do not include any explanations, notes, or additional text. Output only the markdown content that should replace the current knowledge base content."""
+
+                                try:
+                                    # Call OpenAI to get the updated content
+                                    from langchain_core.messages import HumanMessage
+                                    messages = [HumanMessage(content=prompt)]
+                                    completion = openai_client.invoke(messages)
+                                    updated_content = completion.content or ''
+
+                                    # Calculate knowledge base size
+                                    knowledge_base_size = len(updated_content.encode('utf-8'))
+
+                                    # Use KnowledgeBaseManager to save the content
+                                    from knowledge_base_utils import get_knowledge_base_manager
+                                    kb_manager = get_knowledge_base_manager(bucket_type=bucket_type, user_id=user_id)
+                                    
+                                    # Save updated knowledge base
+                                    kb_manager.save_knowledge(
+                                        content=updated_content,
+                                        bucket_name=bucket_name,
+                                        file_path=file_name
+                                    )
+
+                                    # Update the task record with knowledge base information
+                                    try:
+                                        tasks_table.update_item(
+                                            Key={'taskId': task_id},
+                                            UpdateExpression='SET knowledgeBase = :url, knowledgeBaseSize = :size, knowledgeBaseUpdatedAt = :updatedAt',
+                                            ExpressionAttributeValues={
+                                                ':url': "", # Not used
+                                                ':size': knowledge_base_size,
+                                                ':updatedAt': datetime.now(timezone.utc).isoformat()
+                                            }
+                                        )
+                                    except Exception as task_update_error:
+                                        logger.error(f"Failed to update task record: {str(task_update_error)}")
+
+                                    # Update the execution record with knowledge base information
+                                    try:
+                                        executions_table.update_item(
+                                            Key={'executionId': execution_id},
+                                            UpdateExpression='SET knowledge_base_updated_at = :updatedAt',
+                                            ExpressionAttributeValues={
+                                                ':updatedAt': datetime.now(timezone.utc).isoformat()
+                                            }
+                                        )
+                                    except Exception as execution_update_error:
+                                        logger.error(f"Failed to update execution record: {str(execution_update_error)}")
+
+                                    logger.info("Knowledge base update completed successfully")
+                                except Exception as e:
+                                    logger.error(f"Error updating knowledge base: {e}")
+                                    raise
+                            except Exception as e:
+                                logger.error(f"Error updating execution status: {e}")
+                                raise
                     except Exception as e:
-                        logger.error(f"Error updating execution status: {e}", exc_info=True)
+                        logger.error(f"Error updating execution status: {e}")
                     
                     # Update task with successful LLM name if it's not a workflow task
                     if not execution.get('workflowExecutionId') and task and task.get('llmName') != llm_name:
