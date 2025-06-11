@@ -53,7 +53,6 @@ import ScheduleForm from '../components/ScheduleForm';
 import ScheduleList from '../components/ScheduleList';
 import { buildApiUrl, getLLMsForTask } from '../config';
 import { toast } from 'react-hot-toast';
-import PublicIcon from '@mui/icons-material/Public';
 import LockIcon from '@mui/icons-material/Lock';
 import LockOpenIcon from '@mui/icons-material/LockOpen';
 

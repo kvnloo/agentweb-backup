@@ -344,7 +344,10 @@ async function getFileSize(bucket: Bucket, filePath: string): Promise<number> {
   if (!exists) return 0;
   
   const [metadata] = await file.getMetadata();
-  return parseInt(metadata.size);
+  if (!metadata || !metadata.size) {
+    return 0;
+  }
+  return parseInt(String(metadata.size));
 }
 
 // Knowledge Base routes
