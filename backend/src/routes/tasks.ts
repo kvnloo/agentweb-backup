@@ -410,10 +410,17 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
     }
     // Update size if it doesn't match
     if (size !== task.knowledgeBaseSize) {
-      await taskDb.updateTask(taskId, { knowledgeBaseSize: size });
+      await taskDb.updateTask(taskId, { 
+        knowledgeBaseSize: size,
+        knowledgeBaseUpdatedAt: new Date().toISOString()
+      });
     }
     
-    res.json({ content: contentStr, url: task.knowledgeBase || url });
+    res.json({ 
+      content: contentStr, 
+      url: task.knowledgeBase || url,
+      knowledgeBaseUpdatedAt: task.knowledgeBaseUpdatedAt
+    });
   } catch (error) {
     console.error('Error in knowledge base GET:', error);
     res.status(500).json({ message: 'Internal server error' });
@@ -470,10 +477,15 @@ router.put('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
     // Update task with the new knowledge base size
     await taskDb.updateTask(taskId, { 
       knowledgeBaseSize: Buffer.byteLength(contentToSave, 'utf8'),
-      knowledgeBase: url
+      knowledgeBase: url,
+      knowledgeBaseUpdatedAt: new Date().toISOString()
     });
     
-    res.json({ content: contentToSave, url: task.knowledgeBase || url });
+    res.json({ 
+      content: contentToSave, 
+      url: task.knowledgeBase || url,
+      knowledgeBaseUpdatedAt: new Date().toISOString()
+    });
   } catch (error) {
     console.error('Error in knowledge base PUT:', error);
     res.status(500).json({ message: 'Internal server error' });
@@ -585,9 +597,10 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
     });
 
     // Update the task with knowledge base size, type, and URL
-    await taskDb.updateTask(taskId as string, {
+    await taskDb.updateTask(taskId, {
       knowledgeBaseSize,
-      knowledgeBase: url
+      knowledgeBase: url,
+      knowledgeBaseUpdatedAt: new Date().toISOString()
     });
 
     // Update the execution record with knowledge base update info
@@ -663,14 +676,18 @@ router.put('/:id/knowledge-base-type', authenticateToken, async (req: Request, r
         // Update task with new bucket type and URL
         await taskDb.updateTask(taskId, {
           knowledgeBaseType,
-          knowledgeBase: url
+          knowledgeBase: url,
+          knowledgeBaseUpdatedAt: new Date().toISOString()
         });
         // Delete the old file
         await currentFile.delete();
         return res.json({ message: 'Knowledge base type and file moved successfully', knowledgeBaseType, url });
       } else {
         // If no file exists, just update the type
-        await taskDb.updateTask(taskId, { knowledgeBaseType });
+        await taskDb.updateTask(taskId, { 
+          knowledgeBaseType,
+          knowledgeBaseUpdatedAt: new Date().toISOString()
+        });
         return res.json({ message: 'Knowledge base type updated (no file to move)', knowledgeBaseType });
       }
     } else {

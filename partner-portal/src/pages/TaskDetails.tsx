@@ -85,6 +85,7 @@ interface Task {
   knowledgeBase?: string; // The content of the task's knowledge base
   knowledgeBaseSize?: number; // Size of the knowledge base in bytes
   knowledgeBaseType?: 'public' | 'private'; // Type of knowledge base
+  knowledgeBaseUpdatedAt?: string; // Timestamp of the last update to the knowledge base
 }
 
 interface TaskAttachment {
@@ -1214,7 +1215,11 @@ export default function TaskDetails() {
       );
       
       // Update task with the new knowledge base URL and content
-      const updatedTask = { ...task, knowledgeBase: response.data.url };
+      const updatedTask = { 
+        ...task, 
+        knowledgeBase: response.data.url,
+        knowledgeBaseUpdatedAt: response.data.knowledgeBaseUpdatedAt
+      };
       setTask(updatedTask);
       // Update the edited content
       setEditedKnowledgeBase(response.data.content || '');
@@ -1242,10 +1247,12 @@ export default function TaskDetails() {
             // Set the edited content
             setEditedKnowledgeBase(response.data.content || '');
             // Update task with the knowledge base URL if it's new
-            if (response.data.url && !taskData.knowledgeBase) {
-              const updatedTask = { ...taskData, knowledgeBase: response.data.url };
-              setTask(updatedTask);
-            }
+            const updatedTask = { 
+              ...taskData, 
+              knowledgeBase: response.data.url,
+              knowledgeBaseUpdatedAt: response.data.knowledgeBaseUpdatedAt
+            };
+            setTask(updatedTask);
           } catch (error: any) {
             console.error('Error loading knowledge base:', error);
             // Only show error if it's not a 404 (file doesn't exist yet)
@@ -1888,6 +1895,11 @@ export default function TaskDetails() {
                 <Typography variant="h6" gutterBottom>
                   Knowledge Base {task.knowledgeBaseType && `(${task.knowledgeBaseType.charAt(0).toUpperCase() + task.knowledgeBaseType.slice(1)})`}
                 </Typography>
+                {task.knowledgeBaseUpdatedAt && (
+                  <Typography variant="caption" color="textSecondary">
+                    Last updated: {new Date(task.knowledgeBaseUpdatedAt).toLocaleString()}
+                  </Typography>
+                )}
               </Box>
               {showActions && !isEditingKnowledgeBase && (
                 <Box sx={{ display: 'flex', gap: 1 }}>
