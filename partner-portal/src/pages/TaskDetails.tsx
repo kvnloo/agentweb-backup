@@ -1899,7 +1899,7 @@ export default function TaskDetails() {
                     <IconButton
                       size="small"
                       onClick={handleKnowledgeBaseTypeToggle}
-                      disabled={!task.knowledgeBase}
+                      disabled={false}
                     >
                       {task.knowledgeBaseType === 'public' ? <LockOpenIcon /> : <LockIcon />}
                     </IconButton>
