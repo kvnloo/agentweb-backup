@@ -41,30 +41,32 @@ class KnowledgeBaseManager:
         self.discovery_client = discoveryengine.SearchServiceClient(client_options=client_options)
         self.dynamodb = get_dynamodb_resource()
         
-    def save_knowledge(self, content: str, bucket_name: str) -> str:
+    def save_knowledge(self, content: str, bucket_name: str, file_path: str = None) -> str:
         """Save new knowledge to GCS bucket for indexing.
         
         Args:
             content: The knowledge content to save
             bucket_name: Name of the GCS bucket
+            file_path: Optional file path to use. If None, a unique name will be generated.
             
         Returns:
             str: The GCS object path
         """
         bucket = self.storage_client.bucket(bucket_name)
         
-        # Create a unique filename with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")  # Added microseconds for uniqueness
-        filename = f"knowledge_{timestamp}.txt"
+        if file_path is None:
+            # Create a unique filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")  # Added microseconds for uniqueness
+            file_path = f"knowledge_{timestamp}.txt"
         
         # Upload raw content to GCS
-        blob = bucket.blob(filename)
+        blob = bucket.blob(file_path)
         blob.upload_from_string(
             content,
             content_type='text/plain'
         )
         
-        return f"gs://{bucket_name}/{filename}"
+        return f"gs://{bucket_name}/{file_path}"
     
     def search_knowledge(self, query: str, max_results: int = 5) -> List[Dict]:
         """Search the knowledge base using Vertex AI Search.

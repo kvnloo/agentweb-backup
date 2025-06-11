@@ -180,6 +180,7 @@ class WebAgent:
         self.output_as_html = False # Initialize output_as_html property
         self.turn_off_headless = False  # Initialize turn_off_headless property
         self.use_knowledge_base = False  # Initialize use_knowledge_base property
+        self.update_knowledge_base = False  # Initialize update_knowledge_base property
 
     def setup_execution_logging(self, execution_id: str):
         """Setup logging for the current execution"""
@@ -247,7 +248,7 @@ class WebAgent:
         # Clear the reference to the log filter thread to help with garbage collection
         self.log_filter_thread = None
 
-    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False, use_knowledge_base: bool = False) -> Dict[str, Any]:
+    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False, use_knowledge_base: bool = False, update_knowledge_base: bool = False) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
         log_file = None
         try:
@@ -261,6 +262,7 @@ class WebAgent:
             self.use_shared_browser = use_shared_browser
             self.turn_off_headless = turn_off_headless
             self.use_knowledge_base = use_knowledge_base
+            self.update_knowledge_base = update_knowledge_base
             # Set up logging
             log_file = self.setup_execution_logging(execution_id)
             
@@ -1547,6 +1549,7 @@ async def main():
     parser.add_argument('--use-shared-browser', action='store_true', help='Use shared browser')
     parser.add_argument('--turn-off-headless', action='store_true', help='Turn off headless mode')
     parser.add_argument('--use-knowledge-base', action='store_true', help='Enable knowledge base usage')
+    parser.add_argument('--update-knowledge-base', action='store_true', help='Enable knowledge base updates')
 
     args = parser.parse_args()
 
@@ -1579,7 +1582,8 @@ async def main():
             output_as_html=args.output_as_html,
             use_shared_browser=args.use_shared_browser,
             turn_off_headless=args.turn_off_headless,
-            use_knowledge_base=args.use_knowledge_base
+            use_knowledge_base=args.use_knowledge_base,
+            update_knowledge_base=args.update_knowledge_base
         )
         print(json.dumps(result))
         sys.exit(0 if result["success"] else 1)
