@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate, useLocation, Link as RouterLink } from 'react-router-dom';
 import {
   Container,
@@ -375,7 +375,8 @@ export default function TaskDetails() {
   const [editedName, setEditedName] = useState('');
   const [uploadError, setUploadError] = useState<string>('');
   const [isUploading, setIsUploading] = useState(false);
-  const [shouldPoll, setShouldPoll] = useState(true);
+  const [shouldPoll, setShouldPoll] = useState(false);
+  const hasReloaded = useRef(false);
   const [success, setSuccess] = useState('');
   const [ownerChangeDialogOpen, setOwnerChangeDialogOpen] = useState(false);
   const [newOwnerEmail, setNewOwnerEmail] = useState('');
@@ -440,14 +441,19 @@ export default function TaskDetails() {
   useEffect(() => {
     // Only poll if the latest execution is pending or running
     const latestExecution = getLatestExecution();
-    const shouldPoll = Boolean(latestExecution && ['pending', 'running'].includes(latestExecution.status.toLowerCase()));
+    const newShouldPoll = Boolean(latestExecution && ['pending', 'running'].includes(latestExecution.status.toLowerCase()));
     
-    setShouldPoll(shouldPoll);
-    
-    if (shouldPoll) {
+    if (newShouldPoll) {
       console.log('Latest execution is active - polling enabled');
-    } else {
-      console.log('No active latest execution - polling disabled');
+      setShouldPoll(true);
+      hasReloaded.current = false;  // Reset reload flag when polling starts
+    } else if (shouldPoll && !hasReloaded.current) {  // If we were polling but now we shouldn't, and haven't reloaded yet
+      console.log('Execution completed - reloading page in 1s');
+      setShouldPoll(false);
+      hasReloaded.current = true;  // Mark that we've reloaded
+      setTimeout(() => {
+        window.location.reload();
+      }, 1000);
     }
   }, [executions]);
 
