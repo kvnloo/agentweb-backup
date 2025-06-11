@@ -1239,6 +1239,7 @@ export default function AdminDashboard() {
               <TableHead>
                 <TableRow>
                   <TableCell>Email</TableCell>
+                  <TableCell>User ID</TableCell>
                   <TableCell>Stripe Customer ID</TableCell>
                   <TableCell>Created</TableCell>
                   <TableCell>Roles</TableCell>
@@ -1253,7 +1254,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={9} align="center">
+                    <TableCell colSpan={11} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -1269,6 +1270,7 @@ export default function AdminDashboard() {
                     return (
                       <TableRow key={user.userId}>
                         <TableCell>{user.email}</TableCell>
+                        <TableCell>{user.userId}</TableCell>
                         <TableCell>{user.stripe_customer_id || "-"}</TableCell>
                         <TableCell>
                           {new Date(user.createdAt).toLocaleDateString()}
