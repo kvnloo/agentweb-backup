@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-06-12',
+    changes: [
+      'Enhanced Result Reports with Visualizations',
+      '- Added support for tables, diagrams, and charts in result reports',
+      '- Improved report display in Execution Result page',
+    ],
+  },
+  {
     date: '2025-06-10',
     changes: [
       'Supported dynamic loading templates based on categories',
