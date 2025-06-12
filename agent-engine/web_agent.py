@@ -284,7 +284,7 @@ class WebAgent:
             if output_as_json:
                 prompt = f"{prompt}\n\nRequirement: Output result as JSON instead of free text."
             elif self.output_as_html:
-                prompt = f"{prompt}\n\nRequirement: The final output for this task MUST be in well-formatted HTML5. You MUST use the 'Write file' action to save this HTML content into a file with an .html extension."
+                prompt = f"{prompt}\n\nRequirement: The final output for this task MUST be in well-formatted HTML5 with modern styling. You MUST use the 'Write file' action to save this HTML content into a file with an .html extension. The HTML output should include:\n1. A clean, modern layout with proper spacing and typography\n2. Visual elements like tables, charts or diagrams to represent data (using Chart.js)\n3. Clear section headers and organized content structure\n4. CSS styling for visual appeal"
 
             # Add knowledge base instruction if enabled
             if self.use_knowledge_base:
