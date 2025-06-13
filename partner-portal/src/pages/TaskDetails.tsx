@@ -34,6 +34,7 @@ import {
   DialogTitle,
   DialogContent,
   DialogActions,
+  DialogContentText,
 } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import ArchiveIcon from '@mui/icons-material/Archive';
@@ -63,6 +64,7 @@ interface Task {
   prompt: string;
   status: string;  // Task status: active, archived, etc.
   createdAt: string;
+  updatedAt?: string;
   summary?: string;
   error?: string;
   emailNotification?: boolean;
@@ -82,10 +84,13 @@ interface Task {
   useKnowledgeBase?: boolean; // Flag for using knowledge base
   updateKnowledgeBase?: boolean; // Flag for updating knowledge base
   updateLeadList?: boolean; // Flag for updating lead list
+  leadListIdentifier?: string;
   knowledgeBase?: string; // The content of the task's knowledge base
   knowledgeBaseSize?: number; // Size of the knowledge base in bytes
   knowledgeBaseType?: 'public' | 'private'; // Type of knowledge base
   knowledgeBaseUpdatedAt?: string; // Timestamp of the last update to the knowledge base
+  description?: string;
+  category?: string;
 }
 
 interface TaskAttachment {
@@ -387,6 +392,9 @@ export default function TaskDetails() {
   const [editedKnowledgeBase, setEditedKnowledgeBase] = useState('');
   const [knowledgeBaseError, setKnowledgeBaseError] = useState('');
   const [isUpdatingKnowledgeBase, setIsUpdatingKnowledgeBase] = useState<string | null>(null);
+  const [isLeadListDialogOpen, setIsLeadListDialogOpen] = useState(false);
+  const [leadListIdentifier, setLeadListIdentifier] = useState('');
+  const [leadListIdentifierError, setLeadListIdentifierError] = useState('');
 
   const isAdminRoute = location.pathname.startsWith('/admin/');
   const showActions = !isAdminRoute || (task && user && task.userId === user.userId);
@@ -1338,19 +1346,80 @@ export default function TaskDetails() {
   };
 
   // Add the handler function after handleUpdateKnowledgeBaseToggle
-  const handleUpdateLeadListToggle = async () => {
-    if (!task || !token) return;
-    const newUpdateLeadListValue = !(task?.updateLeadList || false);
+  const handleUpdateLeadListToggle = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const newValue = event.target.checked;
+    
+    if (newValue) {
+      // If enabling and no identifier exists, open the dialog
+      if (!task?.leadListIdentifier) {
+        setIsLeadListDialogOpen(true);
+      } else {
+        // If identifier exists, just update the toggle
+        try {
+          await axios.put(buildApiUrl(`/api/tasks/${taskId}`), {
+            updateLeadList: true
+          }, {
+            headers: { Authorization: `Bearer ${token}` }
+          });
+          await fetchTask();
+        } catch (error) {
+          console.error('Error updating lead list settings:', error);
+          toast.error('Failed to update lead list settings');
+        }
+      }
+    } else {
+      // If disabling, just update the toggle
+      try {
+        await axios.put(buildApiUrl(`/api/tasks/${taskId}`), {
+          updateLeadList: false
+        }, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        await fetchTask();
+      } catch (error) {
+        console.error('Error updating lead list settings:', error);
+        toast.error('Failed to update lead list settings');
+      }
+    }
+  };
+
+  // Add validation function
+  const validateLeadListIdentifier = (value: string) => {
+    if (!value) {
+      return 'Identifier is required';
+    }
+    if (!/^[a-z-]+$/.test(value)) {
+      return 'Identifier must be lowercase and can only contain letters and hyphens';
+    }
+    return '';
+  };
+
+  // Add handler for the dialog
+  const handleLeadListDialogClose = () => {
+    setIsLeadListDialogOpen(false);
+    setLeadListIdentifier('');
+    setLeadListIdentifierError('');
+  };
+
+  const handleLeadListDialogConfirm = async () => {
+    const error = validateLeadListIdentifier(leadListIdentifier);
+    if (error) {
+      setLeadListIdentifierError(error);
+      return;
+    }
+
     try {
-      await axios.put(buildApiUrl(`/api/tasks/${task.taskId}`), 
-        { updateLeadList: newUpdateLeadListValue },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      await fetchTask(); // Re-fetch task data to update UI from source of truth
-      setError(''); // Clear previous errors
-    } catch (err) {
-      console.error('Failed to update lead list update setting:', err);
-      setError('Failed to update lead list update setting. Please try again.');
+      await axios.put(buildApiUrl(`/api/tasks/${taskId}`), {
+        updateLeadList: true,
+        leadListIdentifier: leadListIdentifier
+      }, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      await fetchTask();
+      handleLeadListDialogClose();
+    } catch (error) {
+      console.error('Error updating lead list settings:', error);
+      toast.error('Failed to update lead list settings');
     }
   };
 
@@ -1698,8 +1767,26 @@ export default function TaskDetails() {
                   </Tooltip>
                   <Tooltip title="When enabled, the agent will update the lead list with new information after each successful task execution">
                     <FormControlLabel
-                      control={<Switch checked={task?.updateLeadList || false} onChange={handleUpdateLeadListToggle} />}
-                      label="Update Lead List"
+                      control={
+                        <Switch
+                          checked={task?.updateLeadList || false}
+                          onChange={handleUpdateLeadListToggle}
+                          color="primary"
+                        />
+                      }
+                      label={
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                          <Typography>Update Lead List</Typography>
+                          {task?.updateLeadList && task?.leadListIdentifier && (
+                            <Chip
+                              label={`Identifier: ${task.leadListIdentifier}`}
+                              size="small"
+                              color="primary"
+                              variant="outlined"
+                            />
+                          )}
+                        </Box>
+                      }
                     />
                   </Tooltip>
                 </Box>
@@ -2264,6 +2351,45 @@ export default function TaskDetails() {
           {success}
         </Alert>
       )}
+
+      {/* Lead List Dialog */}
+      <Dialog
+        open={isLeadListDialogOpen}
+        onClose={handleLeadListDialogClose}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>Configure Lead List Identifier</DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ mb: 2 }}>
+            Enter a unique identifier for deduplication and lookup purposes. It must be lowercase and can only contain letters and hyphens (e.g., email, full-name, etc.).
+            <Box component="span" sx={{ color: 'warning.main', display: 'block', mt: 1 }}>
+              ⚠️ Warning: The identifier cannot be changed after it is set.
+            </Box>
+          </DialogContentText>
+          <TextField
+            autoFocus
+            margin="dense"
+            label="Identifier"
+            type="text"
+            fullWidth
+            variant="outlined"
+            value={leadListIdentifier}
+            onChange={(e) => {
+              setLeadListIdentifier(e.target.value.toLowerCase());
+              setLeadListIdentifierError('');
+            }}
+            error={!!leadListIdentifierError}
+            helperText={leadListIdentifierError}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleLeadListDialogClose}>Cancel</Button>
+          <Button onClick={handleLeadListDialogConfirm} variant="contained" color="primary">
+            Confirm
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Container>
   );
 } 

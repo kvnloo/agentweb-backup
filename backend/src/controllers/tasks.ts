@@ -274,6 +274,10 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
       updates.updateLeadList = Boolean(req.body.updateLeadList);
     }
 
+    if (req.body.leadListIdentifier !== undefined) {
+      updates.leadListIdentifier = req.body.leadListIdentifier;
+    }
+
     if (req.body.knowledgeBaseType !== undefined) {
       updates.knowledgeBaseType = req.body.knowledgeBaseType;
     }

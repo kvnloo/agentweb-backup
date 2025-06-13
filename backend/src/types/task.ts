@@ -21,6 +21,7 @@ export interface Task {
   useKnowledgeBase?: boolean; // Whether the task can use the knowledge base
   updateKnowledgeBase?: boolean; // Whether to update the knowledge base after each execution
   updateLeadList?: boolean; // Whether to update the lead list after each execution
+  leadListIdentifier?: string; // The identifier field for the lead list
   knowledgeBase?: string; // The GCS URL of the task's knowledge base file
   knowledgeBaseSize?: number; // Size of the knowledge base in bytes
   knowledgeBaseType?: 'public' | 'private'; // Whether the knowledge base is stored in public or private bucket
@@ -50,6 +51,7 @@ export interface TaskUpdate {
   useKnowledgeBase?: boolean;
   updateKnowledgeBase?: boolean;
   updateLeadList?: boolean;
+  leadListIdentifier?: string | null;
   knowledgeBase?: string;
   knowledgeBaseSize?: number; // Size of the knowledge base in bytes
   knowledgeBaseType?: 'public' | 'private'; // Whether the knowledge base is stored in public or private bucket
