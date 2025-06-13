@@ -1415,6 +1415,7 @@ Once the PR is approved and merged, this code will be available through the 'Run
                     # Track new and merged records
                     added_records = []
                     merged_records = []
+                    identical_records = []
                     
                     # Process each record
                     for record in records:
@@ -1455,7 +1456,13 @@ Once the PR is approved and merged, this code will be available through the 'Run
                                         ':updatedAt': datetime.now(timezone.utc).isoformat()
                                     }
                                 )
-                            merged_records.append(merged_data)
+                                merged_records.append(merged_data)
+                            else:
+                                # Data is identical, track it
+                                identical_records.append({
+                                    'identifier': record.get(self.lead_list_identifier),
+                                    'data': record
+                                })
                         else:
                             # Add new record
                             new_record = {
@@ -1474,6 +1481,8 @@ Once the PR is approved and merged, this code will be available through the 'Run
                         response_parts.append(f"Successfully added {len(added_records)} new records to the lead list.")
                     if merged_records:
                         response_parts.append(f"Found {len(merged_records)} records with the same identifier and merged them.")
+                    if identical_records:
+                        response_parts.append(f"{len(identical_records)} records that were identical to existing records and were not added.")
                     
                     return ActionResult(
                         extracted_content="\n".join(response_parts)
