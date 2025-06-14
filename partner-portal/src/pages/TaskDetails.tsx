@@ -56,6 +56,8 @@ import { buildApiUrl, getLLMsForTask } from '../config';
 import { toast } from 'react-hot-toast';
 import LockIcon from '@mui/icons-material/Lock';
 import LockOpenIcon from '@mui/icons-material/LockOpen';
+import { TaskDetailsSection } from "../components/tasks/TaskDetailsSection";
+import { LeadListSection } from "../components/tasks/LeadListSection";
 
 interface Task {
   taskId: string;
@@ -1388,8 +1390,8 @@ export default function TaskDetails() {
     if (!value) {
       return 'Identifier is required';
     }
-    if (!/^[a-z-]+$/.test(value)) {
-      return 'Identifier must be lowercase and can only contain letters and hyphens';
+    if (!/^[a-z_]+$/.test(value)) {
+      return 'Identifier must be lowercase and can only contain letters and underscores';
     }
     return '';
   };
@@ -1998,6 +2000,15 @@ export default function TaskDetails() {
             </Grid>
           )}
 
+          {/* Lead List Section */}
+          <Grid item xs={12}>
+            <LeadListSection
+              taskId={taskId}
+              updateLeadList={task.updateLeadList || false}
+              leadListIdentifier={task.leadListIdentifier || ''}
+            />
+          </Grid>
+
           {/* Knowledge Base Section */}
           <Grid item xs={12}>
             <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
@@ -2362,7 +2373,7 @@ export default function TaskDetails() {
         <DialogTitle>Configure Lead List Identifier</DialogTitle>
         <DialogContent>
           <DialogContentText sx={{ mb: 2 }}>
-            Enter a unique identifier for deduplication and lookup purposes. It must be lowercase and can only contain letters and hyphens (e.g., email, full-name, etc.).
+            Enter a unique identifier for deduplication and lookup purposes. It must be lowercase and can only contain letters and underscores (e.g., email, full-name, etc.).
             <Box component="span" sx={{ color: 'warning.main', display: 'block', mt: 1 }}>
               ⚠️ Warning: The identifier cannot be changed after it is set.
             </Box>
