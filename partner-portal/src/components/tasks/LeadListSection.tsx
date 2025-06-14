@@ -30,10 +30,8 @@ export const LeadListSection: React.FC<LeadListSectionProps> = ({
   const [editedContent, setEditedContent] = useState('');
 
   useEffect(() => {
-    if (updateLeadList) {
-      fetchLeadList();
-    }
-  }, [taskId, updateLeadList]);
+    fetchLeadList();
+  }, [taskId]);
 
   const fetchLeadList = async () => {
     setLoading(true);
@@ -104,7 +102,11 @@ export const LeadListSection: React.FC<LeadListSectionProps> = ({
     setError(null);
   };
 
-  if (!updateLeadList) return null;
+  // If updateLeadList is off and there are no records, don't show the section
+  // If updateLeadList is on, show the section even if empty
+  if (!updateLeadList && records.length === 0) {
+    return null;
+  }
 
   return (
     <Card>
@@ -151,8 +153,6 @@ export const LeadListSection: React.FC<LeadListSectionProps> = ({
           </Box>
         ) : error ? (
           <Alert severity="error">{error}</Alert>
-        ) : records.length === 0 ? (
-          <div style={{ color: 'text.secondary' }}>No records found</div>
         ) : isEditing ? (
           <Box>
             <Typography variant="caption" color="text.secondary" sx={{ mb: 1, display: 'block' }}>
@@ -174,6 +174,10 @@ export const LeadListSection: React.FC<LeadListSectionProps> = ({
               }}
             />
           </Box>
+        ) : records.length === 0 ? (
+          <Typography color="text.secondary" sx={{ textAlign: 'center', mt: 2 }}>
+            No records found. Click the edit button to add records.
+          </Typography>
         ) : (
           <Box sx={{ fontFamily: 'monospace' }}>
             {records.map((record) => (
