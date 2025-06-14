@@ -110,8 +110,8 @@ export const LeadListSection: React.FC<LeadListSectionProps> = ({
 
   return (
     <Card>
-      <CardHeader 
-        title="Lead List"
+      <CardHeader
+        title={`Lead List (${records.length} records)`}
         action={
           !isEditing ? (
             <IconButton onClick={handleEdit} color="primary">
@@ -180,7 +180,7 @@ export const LeadListSection: React.FC<LeadListSectionProps> = ({
           </Typography>
         ) : (
           <Box sx={{ fontFamily: 'monospace' }}>
-            {records.map((record) => (
+            {records.map((record, index) => (
               <Box key={record.identifier} sx={{ mb: 2 }}>
                 <Box sx={{ 
                   display: 'flex', 
@@ -190,9 +190,14 @@ export const LeadListSection: React.FC<LeadListSectionProps> = ({
                   color: 'text.secondary',
                   fontSize: '0.875rem'
                 }}>
-                  <Typography variant="subtitle2" color="primary">
-                    {record.identifier}
-                  </Typography>
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                    <Typography variant="subtitle2" color="text.secondary">
+                      #{index + 1}
+                    </Typography>
+                    <Typography variant="subtitle2" color="primary">
+                      {record.identifier}
+                    </Typography>
+                  </Box>
                   <Typography variant="caption">
                     Last updated: {new Date(record.updatedAt).toLocaleString()}
                   </Typography>
