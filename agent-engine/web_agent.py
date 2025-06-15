@@ -301,7 +301,7 @@ class WebAgent:
 
             # Add lead list instruction if enabled
             if self.update_lead_list:
-                prompt = f"{prompt}\n\nImportant: For this task, you MUST use the update_lead_list action to store your findings instead of reporting them in the final result. Each record should contain the identifier field {self.lead_list_identifier}. The action will handle both adding new records and updating existing ones."
+                prompt = f"{prompt}\n\nImportant: For this task, you MUST use the update_lead_list action to store your findings instead of reporting them in the final result. Each record should contain the identifier field {self.lead_list_identifier}. The action will handle both adding new records and updating existing ones. You can use the get_lead_list_identifiers action to get the list of existing identifiers."
 
             # Create task
             self.task = prompt
@@ -1394,6 +1394,41 @@ Once the PR is approved and merged, this code will be available through the 'Run
 
         # Add lead list actions if update_lead_list is enabled
         if self.update_lead_list:
+            @self.controller.registry.action('Get lead list identifiers')
+            def get_lead_list_identifiers() -> ActionResult:
+                """Get the list of lead list identifiers for the current task"""
+                if not self.lead_list_identifier:
+                    logger.error("Lead list identifier is not configured for this task")
+                    return ActionResult(error="Lead list identifier is not configured for this task")
+                
+                try:
+                    logger.info(f"Getting lead list identifiers for task {self.current_task_id}")
+                    lead_list_table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskLeadList')
+                    response = lead_list_table.query(
+                        KeyConditionExpression='taskId = :taskId',
+                        ExpressionAttributeValues={
+                            ':taskId': self.current_task_id
+                        }
+                    )
+                    items = response.get('Items', [])
+                    
+                    if not items:
+                        logger.warning(f"No lead list records found for task {self.current_task_id}")
+                        return ActionResult(error="No lead list records found")
+                    
+                    identifiers = [item['identifier'] for item in items]
+                    
+                    return ActionResult(
+                        extracted_content=json.dumps({
+                            'message': f"Found {len(identifiers)} lead list identifiers",
+                            'identifier_name': self.lead_list_identifier,
+                            'identifiers': identifiers
+                        }, indent=2)
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to retrieve lead list identifiers: {str(e)}", exc_info=True)
+                    return ActionResult(error=f"Failed to retrieve lead list identifiers: {str(e)}")
+
             @self.controller.registry.action('Update records in lead list. For new records, they will be appended. For existing records with the same identifier, they will be merged with existing data.', param_model=UpdateLeadListParams)
             async def update_lead_list(params: UpdateLeadListParams) -> ActionResult:
                 """Update records in the lead list. For new records, they will be appended. For existing records with the same identifier, they will be merged with existing data.
