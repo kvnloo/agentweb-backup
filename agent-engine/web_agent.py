@@ -53,6 +53,10 @@ class IntegrationTestParams(BaseModel):
     app_names: List[str]
     python_code: str
 
+class UpdateLeadListParams(BaseModel):
+    """Parameters for updating lead list records."""
+    records: list[dict]
+
 class LogFilterThread(threading.Thread):
     """Thread that continuously filters the log file in real-time"""
     
@@ -1390,12 +1394,12 @@ Once the PR is approved and merged, this code will be available through the 'Run
 
         # Add lead list actions if update_lead_list is enabled
         if self.update_lead_list:
-            @self.controller.registry.action('Update records in lead list. For new records, they will be appended. For existing records with the same identifier, they will be merged with existing data.')
-            async def update_lead_list(records: list) -> ActionResult:
+            @self.controller.registry.action('Update records in lead list. For new records, they will be appended. For existing records with the same identifier, they will be merged with existing data.', param_model=UpdateLeadListParams)
+            async def update_lead_list(params: UpdateLeadListParams) -> ActionResult:
                 """Update records in the lead list. For new records, they will be appended. For existing records with the same identifier, they will be merged with existing data.
                 
                 Parameters:
-                - records: List of records to update
+                - params: UpdateLeadListParams containing the list of records to update
                 
                 Returns:
                 - ActionResult with summary of added, updated records.
@@ -1404,21 +1408,19 @@ Once the PR is approved and merged, this code will be available through the 'Run
                     if not self.lead_list_identifier:
                         return ActionResult(error="Lead list identifier is not configured for this task")
                     
-                    # Validate that each record is a dictionary
-                    for record in records:
-                        if not isinstance(record, dict):
-                            return ActionResult(error=f"Each record must be a dictionary, got {type(record).__name__}")
-                    
                     # Get the lead list table
                     lead_list_table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskLeadList')
-                    
+
                     # Track new and merged records
                     added_records = []
                     merged_records = []
                     identical_records = []
-                    
-                    # Process each record
-                    for record in records:
+
+                    # Validate that each record is a dictionary
+                    for record in params.records:
+                        if not isinstance(record, dict):
+                            return ActionResult(error=f"Each record must be a dictionary, got {type(record).__name__}")
+                        
                         if self.lead_list_identifier not in record:
                             return ActionResult(error=f"Record is missing required identifier field '{self.lead_list_identifier}'")
                         
