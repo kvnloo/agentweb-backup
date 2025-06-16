@@ -301,7 +301,7 @@ class WebAgent:
 
             # Add lead list instruction if enabled
             if self.update_lead_list:
-                prompt = f"{prompt}\n\nImportant: For this task, you MUST use the update_lead_list action to store your findings instead of reporting them in the final result. Each record should contain the identifier field {self.lead_list_identifier}. The action will handle both adding new records and updating existing ones. You can use the get_lead_list_identifiers action to get the list of existing identifiers."
+                prompt = f"{prompt}\n\nImportant: For this task, you MUST use the {'update_lead_list_json' if 'gemini' in self.llm_name.lower() else 'update_lead_list'} action to store your findings instead of reporting them in the final result. Each record should contain the identifier field {self.lead_list_identifier}. The action will handle both adding new records and updating existing ones. You can use the get_lead_list_identifiers action to get the list of existing identifiers."
 
             # Create task
             self.task = prompt
@@ -1395,20 +1395,28 @@ Once the PR is approved and merged, this code will be available through the 'Run
         # Add lead list actions if update_lead_list is enabled
         if self.update_lead_list:
             @self.controller.registry.action('Get lead list identifiers')
-            def get_lead_list_identifiers() -> ActionResult:
-                """Get the list of lead list identifiers for the current task"""
+            def get_lead_list_identifiers(limit: int = 1000) -> ActionResult:
+                """Get the list of lead list identifiers for the current task
+                
+                Parameters:
+                - limit: Maximum number of identifiers to return (default: 1000)
+                
+                Returns:
+                - ActionResult with list of identifiers
+                """
                 if not self.lead_list_identifier:
                     logger.error("Lead list identifier is not configured for this task")
                     return ActionResult(error="Lead list identifier is not configured for this task")
                 
                 try:
-                    logger.info(f"Getting lead list identifiers for task {self.current_task_id}")
+                    logger.info(f"Getting lead list identifiers for task {self.current_task_id} with limit {limit}")
                     lead_list_table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskLeadList')
                     response = lead_list_table.query(
                         KeyConditionExpression='taskId = :taskId',
                         ExpressionAttributeValues={
                             ':taskId': self.current_task_id
-                        }
+                        },
+                        Limit=limit
                     )
                     items = response.get('Items', [])
                     
@@ -1429,16 +1437,9 @@ Once the PR is approved and merged, this code will be available through the 'Run
                     logger.error(f"Failed to retrieve lead list identifiers: {str(e)}", exc_info=True)
                     return ActionResult(error=f"Failed to retrieve lead list identifiers: {str(e)}")
 
-            @self.controller.registry.action('Update records in lead list. For new records, they will be appended. For existing records with the same identifier, they will be merged with existing data.', param_model=UpdateLeadListParams)
-            async def update_lead_list(params: UpdateLeadListParams) -> ActionResult:
-                """Update records in the lead list. For new records, they will be appended. For existing records with the same identifier, they will be merged with existing data.
-                
-                Parameters:
-                - params: UpdateLeadListParams containing the list of records to update
-                
-                Returns:
-                - ActionResult with summary of added, updated records.
-                """
+            # Helper function to process lead list updates
+            async def _process_lead_list_update(records: list) -> ActionResult:
+                """Process lead list updates for both JSON and non-JSON inputs"""
                 try:
                     if not self.lead_list_identifier:
                         return ActionResult(error="Lead list identifier is not configured for this task")
@@ -1452,7 +1453,7 @@ Once the PR is approved and merged, this code will be available through the 'Run
                     identical_records = []
 
                     # Validate that each record is a dictionary
-                    for record in params.records:
+                    for record in records:
                         if not isinstance(record, dict):
                             return ActionResult(error=f"Each record must be a dictionary, got {type(record).__name__}")
                         
@@ -1529,6 +1530,37 @@ Once the PR is approved and merged, this code will be available through the 'Run
                     logger.error(f"Error appending to lead list: {str(e)}")
                     return ActionResult(error=f"Failed to append to lead list: {str(e)}")
 
+            if "gemini" in self.llm_name.lower():
+                @self.controller.registry.action('Update records in lead list using JSON string. For new records, they will be appended. For existing records with the same identifier, they will be merged with existing data.')
+                async def update_lead_list_json(records_json: str) -> ActionResult:
+                    """Update records in the lead list using a JSON string. For new records, they will be appended. For existing records with the same identifier, they will be merged with existing data.
+                    
+                    Parameters:
+                    - records_json: JSON string containing an array of records to update
+                    
+                    Returns:
+                    - ActionResult with summary of added, updated records.
+                    """
+                    try:
+                        records = json.loads(records_json)
+                        if not isinstance(records, list):
+                            return ActionResult(error="Input must be a JSON array of records")
+                        return await _process_lead_list_update(records)
+                    except json.JSONDecodeError as e:
+                        return ActionResult(error=f"Invalid JSON format: {str(e)}")
+            else:
+                @self.controller.registry.action('Update records in lead list. For new records, they will be appended. For existing records with the same identifier, they will be merged with existing data.', param_model=UpdateLeadListParams)
+                async def update_lead_list(params: UpdateLeadListParams) -> ActionResult:
+                    """Update records in the lead list. For new records, they will be appended. For existing records with the same identifier, they will be merged with existing data.
+                    
+                    Parameters:
+                    - params: UpdateLeadListParams containing the list of records to update
+                    
+                    Returns:
+                    - ActionResult with summary of added, updated records.
+                    """
+                    return await _process_lead_list_update(params.records)
+            
     def _get_cookies_path(self):
         """Get the path to the user's cookies file"""
         if not self.user_id:
