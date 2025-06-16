@@ -37,6 +37,7 @@ export interface WaitlistEntry {
   productUsagePlan?: string;
   monthlyMarketingSpend?: string;
   businessArea?: string;
+  marketingChannels?: string[];
 }
 
 // Helper function to handle DynamoDB errors
@@ -70,6 +71,7 @@ export const waitlistDb = {
         productUsagePlan: entry.productUsagePlan,
         monthlyMarketingSpend: entry.monthlyMarketingSpend,
         businessArea: entry.businessArea,
+        marketingChannels: entry.marketingChannels || [],
       },
       ConditionExpression: "attribute_not_exists(email)",
     };

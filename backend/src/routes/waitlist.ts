@@ -6,53 +6,52 @@ const router = express.Router();
 
 router.post("/", async (req, res) => {
   try {
-    const { email, useCaseInfo } = req.body;
+    const {
+      email,
+      fullName,
+      phoneNumber,
+      companyName,
+      useCaseCategories,
+      useCaseDescription,
+      requestReport,
+      monthlyMarketingSpend,
+      businessArea,
+      marketingChannels,
+    } = req.body;
 
     if (!email || !validateEmail(email)) {
-      return res.status(400).json({ message: "Invalid email address" });
+      return res.status(400).json({ message: "Invalid email" });
     }
 
-    // Parse the useCaseInfo string into an object
-    let parsedUseCaseInfo;
-    try {
-      parsedUseCaseInfo = JSON.parse(useCaseInfo);
-    } catch (error) {
-      return res
-        .status(400)
-        .json({ message: "Invalid use case information format" });
-    }
-
-    // Validate required fields
-    if (!parsedUseCaseInfo.fullName || !parsedUseCaseInfo.companyName) {
-      return res
-        .status(400)
-        .json({ message: "Full name and company name are required" });
-    }
-
-    // Check if email already exists
-    const existing = await waitlistDb.getByEmail(email);
-    if (existing) {
+    // Check if email already exists in waitlist
+    const existingEntry = await waitlistDb.getByEmail(email);
+    if (existingEntry) {
       return res.status(409).json({ message: "Email already registered" });
     }
 
     // Add to waitlist
-    const entry = await waitlistDb.add({
-      email,
-      joinedAt: new Date().toISOString(),
-      fullName: parsedUseCaseInfo.fullName,
-      phoneNumber: parsedUseCaseInfo.phoneNumber,
-      companyName: parsedUseCaseInfo.companyName,
-      requestReport: parsedUseCaseInfo.requestReport,
-      useCaseCategories: parsedUseCaseInfo.categories,
-      useCaseDescription: parsedUseCaseInfo.description,
-      monthlyMarketingSpend: parsedUseCaseInfo.monthlyMarketingSpend,
-      businessArea: parsedUseCaseInfo.businessArea,
-    });
+    const now = new Date().toISOString();
+    const waitlistData = {
+      email: email.toLowerCase(),
+      joinedAt: now,
+      status: "pending",
+      fullName: fullName || "",
+      phoneNumber: phoneNumber || "",
+      companyName: companyName || "",
+      useCaseCategories: useCaseCategories || [],
+      useCaseDescription: useCaseDescription || "",
+      requestReport: requestReport || false,
+      monthlyMarketingSpend: monthlyMarketingSpend || "",
+      businessArea: businessArea || "",
+      marketingChannels: marketingChannels || [],
+    };
+
+    const entry = await waitlistDb.add(waitlistData);
 
     res.status(201).json(entry);
   } catch (error) {
     console.error("Error adding to waitlist:", error);
-    res.status(500).json({ message: "Failed to join waitlist" });
+    res.status(500).json({ message: "Internal server error" });
   }
 });
 

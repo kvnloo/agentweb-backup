@@ -260,6 +260,7 @@ router.post("/waitlist/invite", async (req, res) => {
       businessArea,
       stripe_customer_id,
       sendInvitation = true,
+      marketingChannels,
     } = req.body;
 
     if (!email) {
@@ -297,6 +298,7 @@ router.post("/waitlist/invite", async (req, res) => {
       monthlyMarketingSpend: monthlyMarketingSpend || "",
       businessArea: businessArea || "",
       stripe_customer_id: stripe_customer_id || "",
+      marketingChannels: marketingChannels || [],
     };
 
     const entry = await waitlistDb.add(waitlistData);

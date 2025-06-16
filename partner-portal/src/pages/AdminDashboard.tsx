@@ -98,6 +98,7 @@ interface WaitlistEntry {
   stripe_customer_id?: string;
   monthlyMarketingSpend?: string;
   businessArea?: string;
+  marketingChannels?: string[];
 }
 
 // Define ChatSession interface for the frontend, including portalType
@@ -431,6 +432,7 @@ export default function AdminDashboard() {
     businessArea: "",
     stripe_customer_id: "",
     sendInvitation: true,
+    marketingChannels: [] as string[],
   });
   const [manualInviteLoading, setManualInviteLoading] = useState(false);
 
@@ -824,6 +826,7 @@ export default function AdminDashboard() {
       businessArea: "",
       stripe_customer_id: "",
       sendInvitation: true,
+      marketingChannels: [],
     });
   };
 
@@ -850,6 +853,16 @@ export default function AdminDashboard() {
     "Analytics & Reporting",
     "Market Research",
     "Competitor Analysis",
+    "Other",
+  ];
+
+  const marketingChannelOptions = [
+    "Meta",
+    "Youtube",
+    "LinkedIn",
+    "Email",
+    "TikTok",
+    "Google Search",
     "Other",
   ];
 
@@ -1385,6 +1398,12 @@ export default function AdminDashboard() {
                     />
                   </TableCell>
                   <TableCell>
+                    <SortLabel
+                      property="marketingChannels"
+                      label="Marketing Channels"
+                    />
+                  </TableCell>
+                  <TableCell>
                     <SortLabel property="businessArea" label="Business Area" />
                   </TableCell>
                   <TableCell>
@@ -1420,6 +1439,30 @@ export default function AdminDashboard() {
                         <TableCell>{entry.companyName || "-"}</TableCell>
                         <TableCell>
                           {entry.monthlyMarketingSpend || "N/A"}
+                        </TableCell>
+                        <TableCell>
+                          {entry.marketingChannels &&
+                          entry.marketingChannels.length > 0 ? (
+                            <Box
+                              sx={{
+                                display: "flex",
+                                flexWrap: "wrap",
+                                gap: 0.5,
+                              }}
+                            >
+                              {entry.marketingChannels.map((channel) => (
+                                <Chip
+                                  key={channel}
+                                  label={channel}
+                                  size="small"
+                                />
+                              ))}
+                            </Box>
+                          ) : (
+                            <Typography variant="body2" color="text.secondary">
+                              Not specified
+                            </Typography>
+                          )}
                         </TableCell>
                         <TableCell>{entry.businessArea || "N/A"}</TableCell>
                         <TableCell>
@@ -2266,6 +2309,37 @@ export default function AdminDashboard() {
                   )}
                 >
                   {useCaseOptions.map((option) => (
+                    <MenuItem key={option} value={option}>
+                      {option}
+                    </MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+            </Grid>
+            <Grid item xs={12} sm={6}>
+              <FormControl fullWidth>
+                <InputLabel>Marketing Channels</InputLabel>
+                <Select
+                  multiple
+                  value={manualInviteForm.marketingChannels}
+                  onChange={(e) => {
+                    setManualInviteForm({
+                      ...manualInviteForm,
+                      marketingChannels:
+                        typeof e.target.value === "string"
+                          ? [e.target.value]
+                          : e.target.value,
+                    });
+                  }}
+                  renderValue={(selected) => (
+                    <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5 }}>
+                      {selected.map((value) => (
+                        <Chip key={value} label={value} size="small" />
+                      ))}
+                    </Box>
+                  )}
+                >
+                  {marketingChannelOptions.map((option) => (
                     <MenuItem key={option} value={option}>
                       {option}
                     </MenuItem>
