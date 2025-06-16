@@ -7,21 +7,31 @@ from google.api_core.client_options import ClientOptions
 from datetime import datetime
 import json
 import html
+import re
+import logging
+from aws_utils import get_dynamodb_resource
+
+logger = logging.getLogger(__name__)
+
+# Get table prefix based on NODE_ENV
+TABLE_PREFIX = 'Dev-' if os.getenv('NODE_ENV') == 'development' else ''
 
 class KnowledgeBaseManager:
-    def __init__(self, project_id: str, location: str, data_store_id: str, search_app_id: str):
+    def __init__(self, project_id: str, location: str, search_app_id: str, bucket_type: str, user_id: str = None):
         """Initialize the Knowledge Base Manager.
         
         Args:
             project_id: Google Cloud project ID
             location: Location of the Vertex AI Search instance (e.g., 'global')
-            data_store_id: ID of the Vertex AI Search datastore
             search_app_id: ID of the Vertex AI Search app (engine)
+            bucket_type: Type of knowledge base ('public' or 'private')
+            user_id: User ID for private knowledge base access
         """
         self.project_id = project_id
         self.location = location
-        self.data_store_id = data_store_id
         self.search_app_id = search_app_id
+        self.bucket_type = bucket_type
+        self.user_id = user_id
         self.storage_client = storage.Client()
         # Set client options for non-global locations
         if self.location != "global":
@@ -29,31 +39,34 @@ class KnowledgeBaseManager:
         else:
             client_options = None
         self.discovery_client = discoveryengine.SearchServiceClient(client_options=client_options)
+        self.dynamodb = get_dynamodb_resource()
         
-    def save_knowledge(self, content: str, bucket_name: str) -> str:
+    def save_knowledge(self, content: str, bucket_name: str, file_path: str = None) -> str:
         """Save new knowledge to GCS bucket for indexing.
         
         Args:
             content: The knowledge content to save
             bucket_name: Name of the GCS bucket
+            file_path: Optional file path to use. If None, a unique name will be generated.
             
         Returns:
             str: The GCS object path
         """
         bucket = self.storage_client.bucket(bucket_name)
         
-        # Create a unique filename with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")  # Added microseconds for uniqueness
-        filename = f"knowledge_{timestamp}.txt"
+        if file_path is None:
+            # Create a unique filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")  # Added microseconds for uniqueness
+            file_path = f"knowledge_{timestamp}.txt"
         
         # Upload raw content to GCS
-        blob = bucket.blob(filename)
+        blob = bucket.blob(file_path)
         blob.upload_from_string(
             content,
             content_type='text/plain'
         )
         
-        return f"gs://{bucket_name}/{filename}"
+        return f"gs://{bucket_name}/{file_path}"
     
     def search_knowledge(self, query: str, max_results: int = 5) -> List[Dict]:
         """Search the knowledge base using Vertex AI Search.
@@ -103,10 +116,46 @@ class KnowledgeBaseManager:
                     # Get the content field from the segment
                     content = segment.get("content", "")
                     if content:
-                        results.append({
-                            "content": content,
-                            "raw": dict(struct_data)
-                        })
+                        # For private knowledge base, check task ownership
+                        if self.bucket_type == 'private':
+                            # Extract taskId from the link
+                            link = struct_data.get("link", "")
+                            if not link:
+                                continue
+                                
+                            # Extract taskId from the link path (e.g., gs://bucket/tasks/1740437136262/knowledge-base.txt)
+                            task_id_match = re.search(r'/tasks/(\d+)/', link)
+                            if not task_id_match:
+                                continue
+                                
+                            task_id = task_id_match.group(1)
+                            
+                            # Check if task belongs to current user
+                            try:
+                                # Get task from DynamoDB using aws_utils
+                                table = self.dynamodb.Table(f'{TABLE_PREFIX}AW-Tasks')
+                                response = table.get_item(Key={'taskId': task_id})
+                                task = response.get('Item')
+                                
+                                if not task or task.get('userId') != self.user_id:
+                                    logger.info(f"Skipping task {task_id} - not owned by user {self.user_id}")
+                                    continue
+                                    
+                                # Task belongs to user, add to results
+                                results.append({
+                                    "content": content,
+                                    "raw": dict(struct_data)
+                                })
+                                
+                            except Exception as e:
+                                logger.error(f"Error checking task ownership for {task_id}: {str(e)}")
+                                continue
+                        else:
+                            # For public knowledge base, no ownership check needed
+                            results.append({
+                                "content": content,
+                                "raw": dict(struct_data)
+                            })
             else:
                 results.append({
                     "content": "",
@@ -114,11 +163,30 @@ class KnowledgeBaseManager:
                 })
         return results
 
-def get_knowledge_base_manager() -> KnowledgeBaseManager:
-    """Get a configured KnowledgeBaseManager instance using environment variables."""
-    return KnowledgeBaseManager(
-        project_id=os.getenv("GOOGLE_CLOUD_PROJECT"),
-        location=os.getenv("VERTEX_AI_LOCATION", "global"),
-        data_store_id=os.getenv("VERTEX_AI_DATASTORE_ID"),
-        search_app_id=os.getenv("VERTEX_AI_SEARCH_APP_ID")
-    ) 
+def get_knowledge_base_manager(bucket_type: str = 'public', user_id: str = None) -> KnowledgeBaseManager:
+    """Get a configured KnowledgeBaseManager instance using environment variables.
+    
+    Args:
+        bucket_type (str): Type of knowledge base to get ('public' or 'private')
+        user_id (str, optional): User ID for private knowledge base access
+        
+    Returns:
+        KnowledgeBaseManager: Configured knowledge base manager instance
+    """
+    if bucket_type == 'private':
+        if not user_id:
+            raise ValueError("user_id is required for private knowledge base access")
+        return KnowledgeBaseManager(
+            project_id=os.getenv("GOOGLE_CLOUD_PROJECT"),
+            location=os.getenv("VERTEX_AI_LOCATION_PRIVATE", "global"),
+            search_app_id=os.getenv("VERTEX_AI_SEARCH_APP_ID_PRIVATE"),
+            bucket_type='private',
+            user_id=user_id
+        )
+    else:
+        return KnowledgeBaseManager(
+            project_id=os.getenv("GOOGLE_CLOUD_PROJECT"),
+            location=os.getenv("VERTEX_AI_LOCATION", "global"),
+            search_app_id=os.getenv("VERTEX_AI_SEARCH_APP_ID"),
+            bucket_type='public'
+        ) 

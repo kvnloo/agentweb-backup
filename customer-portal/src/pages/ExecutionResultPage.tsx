@@ -155,60 +155,11 @@ const ExecutionResultPage = () => {
               ),
               { responseType: "text" }
             );
-            // Sanitize the fetched HTML
-            let sanitizedHtml = DOMPurify.sanitize(fileContentResponse.data);
+            // Get the raw HTML content
+            let rawHtml = fileContentResponse.data;
 
-            // Check if the parent document is in dark mode and inject styles if necessary
-            if (document.documentElement.classList.contains("dark")) {
-              const darkModeStyles = `
-                <style>
-                  body {
-                    background-color: #1e293b; /* slate-800 */
-                    color: #f8fafc; /* slate-50 */
-                  }
-                  /* Add more specific dark mode styles if needed */
-                  a { color: #94a3b8; } /* slate-400 */
-                </style>
-              `;
-              // Prepend styles to the head or body if they exist, otherwise just prepend
-              if (sanitizedHtml.includes("<head>")) {
-                sanitizedHtml = sanitizedHtml.replace(
-                  "<head>",
-                  "<head>" + darkModeStyles
-                );
-              } else if (sanitizedHtml.includes("<body>")) {
-                sanitizedHtml = sanitizedHtml.replace(
-                  "<body>",
-                  "<body>" + darkModeStyles
-                );
-              } else {
-                sanitizedHtml = darkModeStyles + sanitizedHtml;
-              }
-            }
+            setHtmlContent(rawHtml);
 
-            // Ensure links in the HTML open in a new tab
-            try {
-              const parser = new DOMParser();
-              // Parse the potentially style-injected HTML
-              const tempDoc = parser.parseFromString(
-                sanitizedHtml,
-                "text/html"
-              );
-              const links = tempDoc.querySelectorAll("a");
-              links.forEach((link) => {
-                const href = link.getAttribute("href");
-                if (href && !href.startsWith("#")) {
-                  link.setAttribute("target", "_blank");
-                  link.setAttribute("rel", "noopener");
-                }
-              });
-              // Re-serialize the *entire modified document* to preserve head/styles
-              sanitizedHtml = tempDoc.documentElement.outerHTML;
-            } catch (domError) {
-              console.error("Error processing HTML links:", domError);
-            }
-
-            setHtmlContent(sanitizedHtml);
             if (primaryHtmlFile) {
               setPrimaryHtmlFileInfo({
                 url: primaryHtmlFile.url,
@@ -315,8 +266,13 @@ const ExecutionResultPage = () => {
               <iframe
                 srcDoc={htmlContent}
                 title="Execution Result HTML"
-                style={{ width: "100%", height: "600px", border: "none" }}
-                sandbox="allow-same-origin allow-scripts allow-popups"
+                style={{ 
+                  width: "100%", 
+                  height: "600px", 
+                  border: "none",
+                  backgroundColor: "white"
+                }}
+                sandbox="allow-scripts"
               />
             </>
           ) : execution?.result ? (

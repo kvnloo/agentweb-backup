@@ -81,13 +81,23 @@ io.on('connection', (socket: Socket) => {
     portal?: 'customer' | 'partner';
   }) => {
     try {
+      // Get user ID from socket auth
+      const token = socket.handshake.auth.token;
+      if (!token) {
+        throw new Error('No authentication token provided');
+      }
+
+      const decoded = jwt.verify(token, process.env.JWT_SECRET || '') as { userId: string };
+      const userId = decoded.userId;
+
       const portalType = data.portal || 'partner';
       const response = await generateChatResponse(
         data.sessionId,
         data.message,
         data.currentUrl,
         data.pageContent,
-        portalType
+        portalType,
+        userId
       );
 
       // Send response back to the client

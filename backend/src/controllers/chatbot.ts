@@ -120,7 +120,7 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
     
     try {
       // Generate response
-      const response = await generateChatResponse(sessionId, message, currentUrl, pageContext, portalType);
+      const response = await generateChatResponse(sessionId, message, currentUrl, pageContext, portalType, userId);
       
       // Get updated session with the new messages
       const updatedSession = await chatbotDb.getChatSession(sessionId);

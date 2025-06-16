@@ -180,7 +180,7 @@ class WebAgent:
         self.output_as_html = False # Initialize output_as_html property
         self.turn_off_headless = False  # Initialize turn_off_headless property
         self.use_knowledge_base = False  # Initialize use_knowledge_base property
-        self.kb_manager = get_knowledge_base_manager()
+        self.update_knowledge_base = False  # Initialize update_knowledge_base property
 
     def setup_execution_logging(self, execution_id: str):
         """Setup logging for the current execution"""
@@ -248,7 +248,7 @@ class WebAgent:
         # Clear the reference to the log filter thread to help with garbage collection
         self.log_filter_thread = None
 
-    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False, use_knowledge_base: bool = False) -> Dict[str, Any]:
+    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False, use_knowledge_base: bool = False, update_knowledge_base: bool = False) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
         log_file = None
         try:
@@ -262,6 +262,7 @@ class WebAgent:
             self.use_shared_browser = use_shared_browser
             self.turn_off_headless = turn_off_headless
             self.use_knowledge_base = use_knowledge_base
+            self.update_knowledge_base = update_knowledge_base
             # Set up logging
             log_file = self.setup_execution_logging(execution_id)
             
@@ -283,7 +284,7 @@ class WebAgent:
             if output_as_json:
                 prompt = f"{prompt}\n\nRequirement: Output result as JSON instead of free text."
             elif self.output_as_html:
-                prompt = f"{prompt}\n\nRequirement: The final output for this task MUST be in well-formatted HTML5. You MUST use the 'Write file' action to save this HTML content into a file with an .html extension."
+                prompt = f"{prompt}\n\nRequirement: The final output for this task MUST be in well-formatted HTML5 with modern styling. You MUST use the 'Write file' action to save this HTML content into a file with an .html extension. The HTML output should include:\n1. A clean, modern layout with proper spacing and typography\n2. Visual elements like tables, charts or diagrams to represent data (using Chart.js)\n3. Clear section headers and organized content structure\n4. CSS styling for visual appeal\n5. Proper citations and references for any external sources or data"
 
             # Add knowledge base instruction if enabled
             if self.use_knowledge_base:
@@ -1352,10 +1353,28 @@ Once the PR is approved and merged, this code will be available through the 'Run
             def search_knowledge_base(query: str) -> ActionResult:
                 """Search the knowledge base for relevant information"""              
                 try:
-                    results = self.kb_manager.search_knowledge(query)
+                    # Search both public and private knowledge bases
+                    public_kb = get_knowledge_base_manager('public')
+                    public_results = public_kb.search_knowledge(query)
+                    
+                    private_results = []
+                    # Only search private knowledge base if user is authenticated
+                    if self.user_id:
+                        private_kb = get_knowledge_base_manager('private', self.user_id)
+                        private_results = private_kb.search_knowledge(query)
+                    
+                    # Combine results
+                    all_results = public_results + private_results
+                    
+                    # Format results with source information
+                    formatted_results = []
+                    for i, result in enumerate(all_results):
+                        source = "public" if i < len(public_results) else "private"
+                        formatted_results.append(f"Result {i+1} (Source: {source}):\n{result['content']}")
+                    
                     return ActionResult(
-                        extracted_content=f"Found {len(results)} results for query '{query}':\n\n" + 
-                        "\n\n".join(f"Result {i+1}:\n{result['content']}" for i, result in enumerate(results))
+                        extracted_content=f"Found {len(all_results)} results for query '{query}':\n\n" + 
+                        "\n\n".join(formatted_results)
                     )
                 except Exception as e:
                     return ActionResult(error=f"Failed to search knowledge base: {str(e)}")
@@ -1530,6 +1549,7 @@ async def main():
     parser.add_argument('--use-shared-browser', action='store_true', help='Use shared browser')
     parser.add_argument('--turn-off-headless', action='store_true', help='Turn off headless mode')
     parser.add_argument('--use-knowledge-base', action='store_true', help='Enable knowledge base usage')
+    parser.add_argument('--update-knowledge-base', action='store_true', help='Enable knowledge base updates')
 
     args = parser.parse_args()
 
@@ -1562,7 +1582,8 @@ async def main():
             output_as_html=args.output_as_html,
             use_shared_browser=args.use_shared_browser,
             turn_off_headless=args.turn_off_headless,
-            use_knowledge_base=args.use_knowledge_base
+            use_knowledge_base=args.use_knowledge_base,
+            update_knowledge_base=args.update_knowledge_base
         )
         print(json.dumps(result))
         sys.exit(0 if result["success"] else 1)

@@ -8,6 +8,17 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-06-11",
+    changes: [
+      "Enhanced Knowledge Base features",
+      "- Added support for private knowledge base",
+      "- Added Knowledge Base tab to admin page for metrics and management",
+      "- Enhanced Task Details page with knowledge base creation and management",
+      "- Added automatic knowledge base updates from execution records",
+      "- Added support for private knowledge base access to both web agents and Emma chatbot"
+    ]
+  },
+  {
     date: "2025-06-06",
     changes: [
       "Added support for task rerun in Workflows",

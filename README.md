@@ -162,6 +162,11 @@ SMTP_PASS=your_smtp_password
 FROM_EMAIL=your_from_email
 ADMIN_EMAIL=your_admin_email
 ADMIN_PASSWORD=your_admin_password
+GCS_BUCKET_NAME=agentweb-knowledge-base-dev
+GCS_BUCKET_NAME_PRIVATE=agentweb-knowledge-base-private-dev
+GCS_PROJECT_ID=your_gcs_project_id
+GCS_CLIENT_EMAIL=your_gcs_client_email
+GCS_PRIVATE_KEY=your_gcs_private_key
 ```
 
 3. Create DynamoDB tables:
@@ -294,6 +299,11 @@ SMTP_PASS=your_smtp_password
 FROM_EMAIL=your_from_email
 ADMIN_EMAIL=your_admin_email
 ADMIN_PASSWORD=your_admin_password
+GCS_BUCKET_NAME=agentweb-knowledge-base-dev
+GCS_BUCKET_NAME_PRIVATE=agentweb-knowledge-base-private-dev
+GCS_PROJECT_ID=your_gcs_project_id
+GCS_CLIENT_EMAIL=your_gcs_client_email
+GCS_PRIVATE_KEY=your_gcs_private_key
 ```
 
 Frontend Production:
@@ -315,7 +325,7 @@ VITE_API_URL=https://agentweb.pro
 cd partner-portal && \
 VITE_API_URL=https://api.agentweb.pro \
 VITE_DEBUG=false \
-VITE_LIST_FULL_LLM_NAMES="azure->openai->gpt-4o,aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0,openai->openai->gpt-4o,aws->anthropic->us.anthropic.claude-3-7-sonnet-20250219-v1:0,google->google->gemini-2.0-flash,google->google->gemini-2.5-pro-preview-03-25,google->google->gemini-2.5-pro-preview-05-06,azure->openai->gpt-4.1" \
+VITE_LIST_FULL_LLM_NAMES="azure->openai->gpt-4.1,google->google->gemini-2.5-pro-preview-05-06,azure->openai->gpt-4o,aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0,openai->openai->gpt-4o,aws->anthropic->us.anthropic.claude-3-7-sonnet-20250219-v1:0,google->google->gemini-2.0-flash,google->google->gemini-2.5-pro-preview-03-25" \
 VITE_DEEP_RESEARCH_LLM_NAMES="azure->openai->o1-mini,azure->openai->gpt-4o" \
 npm run build && \
 VERSION="0.21" && \

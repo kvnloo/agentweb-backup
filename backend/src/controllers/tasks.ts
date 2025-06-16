@@ -42,7 +42,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       selectedLLMs,
       useSharedBrowser,
       turnOffHeadless,
-      useKnowledgeBase
+      useKnowledgeBase,
+      updateKnowledgeBase
     } = req.body;
     
     // If templateId is provided, fetch the template and use its values
@@ -88,6 +89,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           useSharedBrowser: useSharedBrowser !== undefined ? Boolean(useSharedBrowser) : template.useSharedBrowser,
           turnOffHeadless: turnOffHeadless !== undefined ? Boolean(turnOffHeadless) : template.turnOffHeadless,
           useKnowledgeBase: useKnowledgeBase !== undefined ? Boolean(useKnowledgeBase) : template.useKnowledgeBase,
+          updateKnowledgeBase: req.body.updateKnowledgeBase !== undefined ? Boolean(req.body.updateKnowledgeBase) : template.updateKnowledgeBase,
+          knowledgeBaseType: 'private', // Default to private for new tasks
           createdAt: new Date().toISOString(),
           llmName: req.body.llmName || null,
           category: category || template.category,
@@ -125,6 +128,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       useSharedBrowser: Boolean(useSharedBrowser),
       turnOffHeadless: Boolean(turnOffHeadless),
       useKnowledgeBase: Boolean(useKnowledgeBase),
+      updateKnowledgeBase: Boolean(req.body.updateKnowledgeBase),
+      knowledgeBaseType: 'private', // Default to private for new tasks
       createdAt: new Date().toISOString(),
       llmName: req.body.llmName || null,
       category: category,
@@ -256,6 +261,14 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
 
     if (req.body.useKnowledgeBase !== undefined) {
       updates.useKnowledgeBase = Boolean(req.body.useKnowledgeBase);
+    }
+
+    if (req.body.updateKnowledgeBase !== undefined) {
+      updates.updateKnowledgeBase = Boolean(req.body.updateKnowledgeBase);
+    }
+
+    if (req.body.knowledgeBaseType !== undefined) {
+      updates.knowledgeBaseType = req.body.knowledgeBaseType;
     }
 
     // Handle outputAsJson and outputAsHtml mutual exclusivity
