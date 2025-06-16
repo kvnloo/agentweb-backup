@@ -30,6 +30,7 @@ import boto3  # Add at the top with other imports
 from urllib.parse import quote
 from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content, generate_content_hash, get_agent_code_base_path, call_github_api, run_python_code_in_sandbox, fetch_api_credentials, decrypt_password, get_all_configs, parse_json
 from knowledge_base_utils import get_knowledge_base_manager
+from datetime import datetime, timezone
 # Load environment variables
 load_dotenv()
 
@@ -51,6 +52,10 @@ controller = Controller()
 class IntegrationTestParams(BaseModel):
     app_names: List[str]
     python_code: str
+
+class UpdateLeadListParams(BaseModel):
+    """Parameters for updating lead list records."""
+    records: list[dict]
 
 class LogFilterThread(threading.Thread):
     """Thread that continuously filters the log file in real-time"""
@@ -181,6 +186,8 @@ class WebAgent:
         self.turn_off_headless = False  # Initialize turn_off_headless property
         self.use_knowledge_base = False  # Initialize use_knowledge_base property
         self.update_knowledge_base = False  # Initialize update_knowledge_base property
+        self.update_lead_list = False  # Initialize update_lead_list property
+        self.lead_list_identifier = None  # Initialize lead_list_identifier property
 
     def setup_execution_logging(self, execution_id: str):
         """Setup logging for the current execution"""
@@ -248,7 +255,7 @@ class WebAgent:
         # Clear the reference to the log filter thread to help with garbage collection
         self.log_filter_thread = None
 
-    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False, use_knowledge_base: bool = False, update_knowledge_base: bool = False) -> Dict[str, Any]:
+    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False, use_knowledge_base: bool = False, update_knowledge_base: bool = False, update_lead_list: bool = False, lead_list_identifier: str = None) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
         log_file = None
         try:
@@ -263,6 +270,8 @@ class WebAgent:
             self.turn_off_headless = turn_off_headless
             self.use_knowledge_base = use_knowledge_base
             self.update_knowledge_base = update_knowledge_base
+            self.update_lead_list = update_lead_list
+            self.lead_list_identifier = lead_list_identifier
             # Set up logging
             log_file = self.setup_execution_logging(execution_id)
             
@@ -288,7 +297,11 @@ class WebAgent:
 
             # Add knowledge base instruction if enabled
             if self.use_knowledge_base:
-                prompt = f"{prompt}\n\nImportant: Before browsing the web, you MUST first search the knowledge base using the 'Search knowledge base' action to find relevant information. Only proceed with web browsing if the knowledge base search doesn't provide sufficient information."
+                prompt = f"{prompt}\n\nImportant: Before browsing the web, you MUST first search the knowledge base using the search_knowledge_base action to find relevant information. Only proceed with web browsing if the knowledge base search doesn't provide sufficient information."
+
+            # Add lead list instruction if enabled
+            if self.update_lead_list:
+                prompt = f"{prompt}\n\nImportant: For this task, you MUST use the {'update_lead_list_json' if 'gemini' in self.llm_name.lower() else 'update_lead_list'} action to store your findings instead of reporting them in the final result. Each record should contain the identifier field {self.lead_list_identifier}. The action will handle both adding new records and updating existing ones. You can use the get_lead_list_identifiers action to get the list of existing identifiers."
 
             # Create task
             self.task = prompt
@@ -1379,6 +1392,175 @@ Once the PR is approved and merged, this code will be available through the 'Run
                 except Exception as e:
                     return ActionResult(error=f"Failed to search knowledge base: {str(e)}")
 
+        # Add lead list actions if update_lead_list is enabled
+        if self.update_lead_list:
+            @self.controller.registry.action('Get lead list identifiers')
+            def get_lead_list_identifiers(limit: int = 1000) -> ActionResult:
+                """Get the list of lead list identifiers for the current task
+                
+                Parameters:
+                - limit: Maximum number of identifiers to return (default: 1000)
+                
+                Returns:
+                - ActionResult with list of identifiers
+                """
+                if not self.lead_list_identifier:
+                    logger.error("Lead list identifier is not configured for this task")
+                    return ActionResult(error="Lead list identifier is not configured for this task")
+                
+                try:
+                    logger.info(f"Getting lead list identifiers for task {self.current_task_id} with limit {limit}")
+                    lead_list_table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskLeadList')
+                    response = lead_list_table.query(
+                        KeyConditionExpression='taskId = :taskId',
+                        ExpressionAttributeValues={
+                            ':taskId': self.current_task_id
+                        },
+                        Limit=limit
+                    )
+                    items = response.get('Items', [])
+                    
+                    if not items:
+                        logger.warning(f"No lead list records found for task {self.current_task_id}")
+                        return ActionResult(error="No lead list records found")
+                    
+                    identifiers = [item['identifier'] for item in items]
+                    
+                    return ActionResult(
+                        extracted_content=json.dumps({
+                            'message': f"Found {len(identifiers)} lead list identifiers",
+                            'identifier_name': self.lead_list_identifier,
+                            'identifiers': identifiers
+                        }, indent=2)
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to retrieve lead list identifiers: {str(e)}", exc_info=True)
+                    return ActionResult(error=f"Failed to retrieve lead list identifiers: {str(e)}")
+
+            # Helper function to process lead list updates
+            async def _process_lead_list_update(records: list) -> ActionResult:
+                """Process lead list updates for both JSON and non-JSON inputs"""
+                try:
+                    if not self.lead_list_identifier:
+                        return ActionResult(error="Lead list identifier is not configured for this task")
+                    
+                    # Get the lead list table
+                    lead_list_table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskLeadList')
+
+                    # Track new and merged records
+                    added_records = []
+                    merged_records = []
+                    identical_records = []
+
+                    # Validate that each record is a dictionary
+                    for record in records:
+                        if not isinstance(record, dict):
+                            return ActionResult(error=f"Each record must be a dictionary, got {type(record).__name__}")
+                        
+                        if self.lead_list_identifier not in record:
+                            return ActionResult(error=f"Record is missing required identifier field '{self.lead_list_identifier}'")
+                        
+                        # Check if record with this identifier value exists
+                        response = lead_list_table.query(
+                            KeyConditionExpression='taskId = :taskId AND identifier = :identifier',
+                            ExpressionAttributeValues={
+                                ':taskId': self.current_task_id,
+                                ':identifier': record.get(self.lead_list_identifier)
+                            }
+                        )
+                        
+                        if response.get('Items'):
+                            # Get existing record data
+                            existing_record = response['Items'][0]
+                            existing_data = existing_record.get('data', {})
+                            
+                            # Check if data is different
+                            if existing_data != record:
+                                # Merge old and new data, with new data taking precedence
+                                merged_data = {**existing_data, **record}
+                                
+                                # Update the record with merged data
+                                lead_list_table.update_item(
+                                    Key={
+                                        'taskId': self.current_task_id,
+                                        'identifier': record.get(self.lead_list_identifier)
+                                    },
+                                    UpdateExpression='SET #data = :data, updatedAt = :updatedAt',
+                                    ExpressionAttributeNames={
+                                        '#data': 'data'
+                                    },
+                                    ExpressionAttributeValues={
+                                        ':data': merged_data,
+                                        ':updatedAt': datetime.now(timezone.utc).isoformat()
+                                    }
+                                )
+                                merged_records.append(merged_data)
+                            else:
+                                # Data is identical, track it
+                                identical_records.append({
+                                    'identifier': record.get(self.lead_list_identifier),
+                                    'data': record
+                                })
+                        else:
+                            # Add new record
+                            new_record = {
+                                'taskId': self.current_task_id,
+                                'identifier': record.get(self.lead_list_identifier),
+                                'data': record,
+                                'createdAt': datetime.now(timezone.utc).isoformat(),
+                                'updatedAt': datetime.now(timezone.utc).isoformat()
+                            }
+                            lead_list_table.put_item(Item=new_record)
+                            added_records.append(record)
+                    
+                    # Build response message
+                    response_parts = []
+                    if added_records:
+                        response_parts.append(f"Successfully added {len(added_records)} new records to the lead list.")
+                    if merged_records:
+                        response_parts.append(f"Found {len(merged_records)} records with the same identifier and merged them.")
+                    if identical_records:
+                        response_parts.append(f"{len(identical_records)} records that were identical to existing records and were not added.")
+                    
+                    return ActionResult(
+                        extracted_content="\n".join(response_parts)
+                    )
+                    
+                except Exception as e:
+                    logger.error(f"Error appending to lead list: {str(e)}")
+                    return ActionResult(error=f"Failed to append to lead list: {str(e)}")
+
+            if "gemini" in self.llm_name.lower():
+                @self.controller.registry.action('Update records in lead list using JSON string. For new records, they will be appended. For existing records with the same identifier, they will be merged with existing data.')
+                async def update_lead_list_json(records_json: str) -> ActionResult:
+                    """Update records in the lead list using a JSON string. For new records, they will be appended. For existing records with the same identifier, they will be merged with existing data.
+                    
+                    Parameters:
+                    - records_json: JSON string containing an array of records to update
+                    
+                    Returns:
+                    - ActionResult with summary of added, updated records.
+                    """
+                    try:
+                        records = json.loads(records_json)
+                        if not isinstance(records, list):
+                            return ActionResult(error="Input must be a JSON array of records")
+                        return await _process_lead_list_update(records)
+                    except json.JSONDecodeError as e:
+                        return ActionResult(error=f"Invalid JSON format: {str(e)}")
+            else:
+                @self.controller.registry.action('Update records in lead list. For new records, they will be appended. For existing records with the same identifier, they will be merged with existing data.', param_model=UpdateLeadListParams)
+                async def update_lead_list(params: UpdateLeadListParams) -> ActionResult:
+                    """Update records in the lead list. For new records, they will be appended. For existing records with the same identifier, they will be merged with existing data.
+                    
+                    Parameters:
+                    - params: UpdateLeadListParams containing the list of records to update
+                    
+                    Returns:
+                    - ActionResult with summary of added, updated records.
+                    """
+                    return await _process_lead_list_update(params.records)
+            
     def _get_cookies_path(self):
         """Get the path to the user's cookies file"""
         if not self.user_id:
@@ -1548,9 +1730,10 @@ async def main():
     parser.add_argument('--output-as-html', action='store_true', help='Output result as HTML5')
     parser.add_argument('--use-shared-browser', action='store_true', help='Use shared browser')
     parser.add_argument('--turn-off-headless', action='store_true', help='Turn off headless mode')
-    parser.add_argument('--use-knowledge-base', action='store_true', help='Enable knowledge base usage')
-    parser.add_argument('--update-knowledge-base', action='store_true', help='Enable knowledge base updates')
-
+    parser.add_argument('--use-knowledge-base', action='store_true', help='Use knowledge base for task execution')
+    parser.add_argument('--update-knowledge-base', action='store_true', help='Update knowledge base during task execution')
+    parser.add_argument('--update-lead-list', action='store_true', help='Enable lead list updates during task execution')
+    parser.add_argument('--lead-list-identifier', help='Identifier field name for lead list records')
     args = parser.parse_args()
 
     # Read prompt from file
@@ -1583,7 +1766,9 @@ async def main():
             use_shared_browser=args.use_shared_browser,
             turn_off_headless=args.turn_off_headless,
             use_knowledge_base=args.use_knowledge_base,
-            update_knowledge_base=args.update_knowledge_base
+            update_knowledge_base=args.update_knowledge_base,
+            update_lead_list=args.update_lead_list,
+            lead_list_identifier=args.lead_list_identifier
         )
         print(json.dumps(result))
         sys.exit(0 if result["success"] else 1)

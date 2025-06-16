@@ -8,6 +8,16 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-06-16",
+    changes: [
+      "Added support for scalable lead generation list at task level",
+      "- Enable Update Lead List option to allow agents to add records to the lead list",
+      "- Users can manually maintain the list by editing it",
+      "- Each record requires a unique identifier field for tracking",
+      "- Records are automatically merged when duplicates are found"
+    ]
+  },
+  {
     date: "2025-06-11",
     changes: [
       "Enhanced Knowledge Base features",

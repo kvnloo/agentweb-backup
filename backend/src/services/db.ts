@@ -97,6 +97,7 @@ interface TaskTemplate {
   turnOffHeadless?: boolean;
   useKnowledgeBase?: boolean;
   updateKnowledgeBase?: boolean;
+  updateLeadList?: boolean;
 }
 
 interface UserWithCounts extends User {
@@ -574,7 +575,7 @@ export const taskDb = {
           taskId,
         },
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, updateLeadList, leadListIdentifier, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -627,6 +628,8 @@ export const taskDb = {
       knowledgeBaseType?: 'public' | 'private';
       useKnowledgeBase?: boolean;
       updateKnowledgeBase?: boolean;
+      updateLeadList?: boolean;
+      leadListIdentifier?: string | null;
       knowledgeBaseUpdatedAt?: string;
     }>
   ) {

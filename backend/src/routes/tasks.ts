@@ -10,6 +10,12 @@ import { emailService } from '../services/emailService';
 import { Storage, Bucket } from '@google-cloud/storage';
 import OpenAI from 'openai';
 import axios from 'axios';
+import { dynamodb } from '../config/aws';
+import { TABLE_PREFIX } from '../config/constants';
+
+interface AuthRequest extends Request {
+  user?: { userId: string; email: string };
+}
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -700,6 +706,155 @@ router.put('/:id/knowledge-base-type', authenticateToken, async (req: Request, r
   } catch (error) {
     console.error('Error updating knowledge base type:', error);
     res.status(500).json({ message: 'Failed to update knowledge base type' });
+  }
+});
+
+// Get task lead list
+router.get("/:taskId/lead-list", authenticateToken, async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const taskId = req.params.taskId;
+    const task = await taskDb.getTaskById(taskId);
+
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Check if user is admin or task owner
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Query the lead list table
+    const params = {
+      TableName: `${TABLE_PREFIX}AW-TaskLeadList`,
+      KeyConditionExpression: 'taskId = :taskId',
+      ExpressionAttributeValues: {
+        ':taskId': taskId
+      }
+    };
+
+    const result = await dynamodb.query(params).promise();
+    res.json({ records: result.Items || [] });
+  } catch (error) {
+    console.error('Error in getTaskLeadList:', error);
+    res.status(500).json({ message: 'Error fetching lead list' });
+  }
+});
+
+// Update lead list
+router.put("/:taskId/lead-list", authenticateToken, async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { taskId } = req.params;
+    const { records } = req.body;
+
+    if (!Array.isArray(records)) {
+      return res.status(400).json({ message: 'Records must be an array' });
+    }
+
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Check if user is admin or task owner
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Get existing records
+    const existingParams = {
+      TableName: `${TABLE_PREFIX}AW-TaskLeadList`,
+      KeyConditionExpression: 'taskId = :taskId',
+      ExpressionAttributeValues: {
+        ':taskId': taskId
+      }
+    };
+
+    const existingResult = await dynamodb.query(existingParams).promise();
+    const existingRecords = existingResult.Items || [];
+
+    // Create a map of existing records by identifier for easy lookup
+    const existingRecordsMap = new Map(
+      existingRecords.map(record => [record.identifier, record])
+    );
+
+    // Process each record in the request
+    const updatedRecords = [];
+    const now = new Date().toISOString();
+
+    for (const record of records) {
+      const identifier = record[task.leadListIdentifier];
+      if (!identifier) {
+        return res.status(400).json({ 
+          message: `Each record must have a ${task.leadListIdentifier || 'leadListIdentifier'} field` 
+        });
+      }
+
+      const existingRecord = existingRecordsMap.get(identifier);
+      let updatedRecord;
+
+      // Only update if the data has changed
+      if (!existingRecord || JSON.stringify(existingRecord.data) !== JSON.stringify(record)) {
+        updatedRecord = {
+          taskId,
+          identifier,
+          data: record,
+          updatedAt: now,
+          ...(existingRecord ? {} : { createdAt: now })
+        };
+
+        const params = {
+          TableName: `${TABLE_PREFIX}AW-TaskLeadList`,
+          Item: updatedRecord
+        };
+
+        await dynamodb.put(params).promise();
+      } else {
+        // Use existing record if no changes
+        updatedRecord = existingRecord;
+      }
+
+      updatedRecords.push(updatedRecord);
+    }
+
+    // Delete records that are no longer in the list
+    const newIdentifiers = new Set(records.map(r => r[task.leadListIdentifier]));
+    for (const existingRecord of existingRecords) {
+      if (!newIdentifiers.has(existingRecord.identifier)) {
+        await dynamodb.delete({
+          TableName: `${TABLE_PREFIX}AW-TaskLeadList`,
+          Key: {
+            taskId,
+            identifier: existingRecord.identifier
+          }
+        }).promise();
+      }
+    }
+
+    res.json({ records: updatedRecords });
+  } catch (error) {
+    console.error('Error in updateLeadList:', error);
+    res.status(500).json({ message: 'Error updating lead list' });
   }
 });
 
