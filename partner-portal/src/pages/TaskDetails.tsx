@@ -56,7 +56,6 @@ import { buildApiUrl, getLLMsForTask } from '../config';
 import { toast } from 'react-hot-toast';
 import LockIcon from '@mui/icons-material/Lock';
 import LockOpenIcon from '@mui/icons-material/LockOpen';
-import { TaskDetailsSection } from "../components/tasks/TaskDetailsSection";
 import { LeadListSection } from "../components/tasks/LeadListSection";
 
 interface Task {

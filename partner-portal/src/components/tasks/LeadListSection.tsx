@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Card, CardContent, CardHeader, Box, IconButton, Button, TextField, Typography, CircularProgress, Alert } from "@mui/material";
+import { Card, CardContent, CardHeader, Box, IconButton, TextField, Typography, CircularProgress, Alert } from "@mui/material";
 import { useAuth } from "../../contexts/AuthContext";
 import { buildApiUrl } from "../../config";
 import axios from "axios";
@@ -219,14 +219,4 @@ export const LeadListSection: React.FC<LeadListSectionProps> = ({
       </CardContent>
     </Card>
   );
-};
-
-// Helper function to validate JSON
-function isValidJSON(str: string): boolean {
-  try {
-    JSON.parse(str);
-    return true;
-  } catch (e) {
-    return false;
-  }
-} 
+}; 
