@@ -26,7 +26,10 @@ const upload = multer({ storage: multer.memoryStorage() });
 // 1. Replace all newlines in the private key with [NEWLINE]
 // 2. Example format:
 //    -----BEGIN PRIVATE KEY-----[NEWLINE]MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC9QFi67K6Z...[NEWLINE]...[NEWLINE]-----END PRIVATE KEY-----[NEWLINE]
-const privateKey = process.env.GCS_PRIVATE_KEY?.replace(/\[NEWLINE\]/g, '\n');
+// Function to get GCP private key with proper formatting
+function getGCPPrivateKey(): string {
+  const privateKey = process.env.GCS_PRIVATE_KEY;
+  if (!privateKey) {
     throw new Error('GCS_PRIVATE_KEY environment variable is not set');
   }
   return privateKey.replace(/\[NEWLINE\]/g, '\n');
