@@ -13,3 +13,4 @@ cryptography
 watchdog
 google-cloud-storage
 google-cloud-discoveryengine
+PyPDF2
