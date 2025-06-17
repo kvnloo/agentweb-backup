@@ -1,8 +1,8 @@
 import os
 from typing import List, Dict, Optional
 from google.cloud import storage
-from google.cloud import discoveryengine_v1 as discoveryengine
-from google.cloud.discoveryengine_v1 import SearchRequest
+from google.cloud import discoveryengine
+from google.cloud.discoveryengine import DocumentServiceClient
 from google.api_core.client_options import ClientOptions
 from datetime import datetime
 import json
@@ -10,14 +10,20 @@ import html
 import re
 import logging
 from aws_utils import get_dynamodb_resource
+from google.oauth2 import service_account
 
 logger = logging.getLogger(__name__)
 
 # Get table prefix based on NODE_ENV
 TABLE_PREFIX = 'Dev-' if os.getenv('NODE_ENV') == 'development' else ''
 
+def get_gcp_private_key():
+    """Get the GCP private key from environment variable, replacing [NEWLINE] with actual newlines"""
+    private_key = os.getenv('GCS_PRIVATE_KEY', '')
+    return private_key.replace('[NEWLINE]', '\n')
+
 class KnowledgeBaseManager:
-    def __init__(self, project_id: str, location: str, search_app_id: str, bucket_type: str, user_id: str = None):
+    def __init__(self, project_id: str, location: str, search_app_id: str, bucket_type: str, datastore_id: str, collection_id: str, user_id: str = None):
         """Initialize the Knowledge Base Manager.
         
         Args:
@@ -25,12 +31,16 @@ class KnowledgeBaseManager:
             location: Location of the Vertex AI Search instance (e.g., 'global')
             search_app_id: ID of the Vertex AI Search app (engine)
             bucket_type: Type of knowledge base ('public' or 'private')
+            datastore_id: ID of the Vertex AI Search datastore
+            collection_id: ID of the Vertex AI Search collection
             user_id: User ID for private knowledge base access
         """
         self.project_id = project_id
         self.location = location
         self.search_app_id = search_app_id
         self.bucket_type = bucket_type
+        self.datastore_id = datastore_id
+        self.collection_id = collection_id
         self.user_id = user_id
         self.storage_client = storage.Client()
         # Set client options for non-global locations
@@ -38,8 +48,11 @@ class KnowledgeBaseManager:
             client_options = ClientOptions(api_endpoint=f"{self.location}-discoveryengine.googleapis.com")
         else:
             client_options = None
-        self.discovery_client = discoveryengine.SearchServiceClient(client_options=client_options)
+        self.document_client = DocumentServiceClient(client_options=client_options)
         self.dynamodb = get_dynamodb_resource()
+        
+        self.bucket_name = os.getenv('GCS_BUCKET_NAME_PRIVATE' if bucket_type == 'private' else 'GCS_BUCKET_NAME')
+        self.bucket = self.storage_client.bucket(self.bucket_name)
         
     def save_knowledge(self, content: str, bucket_name: str, file_path: str = None) -> str:
         """Save new knowledge to GCS bucket for indexing.
@@ -103,7 +116,7 @@ class KnowledgeBaseManager:
             ),
         )
 
-        response = self.discovery_client.search(request)
+        response = self.document_client.search(request)
 
         results = []
         for result in response.results:
@@ -163,6 +176,49 @@ class KnowledgeBaseManager:
                 })
         return results
 
+    def sync_knowledge(self):
+        """Sync the knowledge base with Vertex AI Search
+        
+        Returns:
+            dict: Result of the sync operation
+        """
+        try:
+            if not self.datastore_id or not self.collection_id:
+                raise ValueError(f"Missing required environment variables for {self.bucket_type} knowledge base sync")
+            
+            # Get the GCS URI for the bucket
+            gcs_uri = f"gs://{self.bucket_name}/**"
+            
+            # Create the import request
+            request = discoveryengine.ImportDocumentsRequest(
+                parent=f"projects/{self.project_id}/locations/{self.location}/collections/{self.collection_id}/dataStores/{self.datastore_id}/branches/default_branch",
+                gcs_source=discoveryengine.GcsSource(
+                    input_uris=[gcs_uri],
+                    data_schema="custom"
+                ),
+                reconciliation_mode=discoveryengine.ImportDocumentsRequest.ReconciliationMode.INCREMENTAL
+            )
+            
+            # Start the import operation
+            operation = self.document_client.import_documents(request=request)
+            
+            # Wait for the operation to complete
+            result = operation.result()
+            
+            return {
+                "success": True,
+                "message": f"Successfully synced {self.bucket_type} knowledge base",
+                "result": result
+            }
+            
+        except Exception as e:
+            print(f"Error syncing {self.bucket_type} knowledge base: {str(e)}")
+            return {
+                "success": False,
+                "message": f"Error syncing {self.bucket_type} knowledge base: {str(e)}",
+                "error": str(e)
+            }
+
 def get_knowledge_base_manager(bucket_type: str = 'public', user_id: str = None) -> KnowledgeBaseManager:
     """Get a configured KnowledgeBaseManager instance using environment variables.
     
@@ -181,6 +237,8 @@ def get_knowledge_base_manager(bucket_type: str = 'public', user_id: str = None)
             location=os.getenv("VERTEX_AI_LOCATION_PRIVATE", "global"),
             search_app_id=os.getenv("VERTEX_AI_SEARCH_APP_ID_PRIVATE"),
             bucket_type='private',
+            datastore_id=os.getenv('VERTEX_AI_DATASTORE_ID_PRIVATE'),
+            collection_id=os.getenv('VERTEX_AI_COLLECTION_ID_PRIVATE'),
             user_id=user_id
         )
     else:
@@ -188,5 +246,7 @@ def get_knowledge_base_manager(bucket_type: str = 'public', user_id: str = None)
             project_id=os.getenv("GOOGLE_CLOUD_PROJECT"),
             location=os.getenv("VERTEX_AI_LOCATION", "global"),
             search_app_id=os.getenv("VERTEX_AI_SEARCH_APP_ID"),
-            bucket_type='public'
+            bucket_type='public',
+            datastore_id=os.getenv('VERTEX_AI_DATASTORE_ID'),
+            collection_id=os.getenv('VERTEX_AI_COLLECTION_ID')
         ) 

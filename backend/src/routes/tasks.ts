@@ -12,6 +12,7 @@ import OpenAI from 'openai';
 import axios from 'axios';
 import { dynamodb } from '../config/aws';
 import { TABLE_PREFIX } from '../config/constants';
+import { DocumentServiceClient } from '@google-cloud/discoveryengine';
 
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
@@ -26,12 +27,17 @@ const upload = multer({ storage: multer.memoryStorage() });
 // 2. Example format:
 //    -----BEGIN PRIVATE KEY-----[NEWLINE]MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC9QFi67K6Z...[NEWLINE]...[NEWLINE]-----END PRIVATE KEY-----[NEWLINE]
 const privateKey = process.env.GCS_PRIVATE_KEY?.replace(/\[NEWLINE\]/g, '\n');
+    throw new Error('GCS_PRIVATE_KEY environment variable is not set');
+  }
+  return privateKey.replace(/\[NEWLINE\]/g, '\n');
+}
 
+// Initialize GCS with service account credentials
 const storage = new Storage({
   projectId: process.env.GCS_PROJECT_ID,
   credentials: {
     client_email: process.env.GCS_CLIENT_EMAIL,
-    private_key: privateKey
+    private_key: getGCPPrivateKey()
   }
 });
 
@@ -436,6 +442,36 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
   }
 });
 
+// Function to sync data store
+async function syncDataStore(datastoreId: string, location: string, collectionId: string) {
+  try {
+    const client = new DocumentServiceClient({
+      apiEndpoint: location === 'global' 
+        ? 'discoveryengine.googleapis.com'
+        : `${location}-discoveryengine.googleapis.com`,
+      credentials: {
+        client_email: process.env.GCS_CLIENT_EMAIL,
+        private_key: getGCPPrivateKey()
+      }
+    });
+
+    const [operation] = await client.importDocuments({
+      parent: `projects/${process.env.GOOGLE_CLOUD_PROJECT}/locations/${location}/collections/${collectionId}/dataStores/${datastoreId}/branches/default_branch`,
+      gcsSource: {
+        inputUris: [`gs://${BUCKET_NAME}/**`],
+        dataSchema: 'custom'
+      },
+      reconciliationMode: 'INCREMENTAL'
+    });
+
+    console.log(`Started data store sync for ${datastoreId} in location ${location} and collection ${collectionId}`);
+    return operation;
+  } catch (error) {
+    console.error('Error syncing data store:', error);
+    throw error;
+  }
+}
+
 router.put('/:taskId/knowledge-base', authenticateToken, async (req: Request, res: Response) => {
   try {
     const { taskId } = req.params;
@@ -489,6 +525,25 @@ router.put('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
       knowledgeBase: url,
       knowledgeBaseUpdatedAt: new Date().toISOString()
     });
+
+    // Trigger data store sync based on knowledge base type
+    try {
+      const datastoreId = task.knowledgeBaseType === 'public' 
+        ? process.env.VERTEX_AI_DATASTORE_ID 
+        : process.env.VERTEX_AI_DATASTORE_ID_PRIVATE;
+      const location = task.knowledgeBaseType === 'public'
+        ? process.env.VERTEX_AI_LOCATION
+        : process.env.VERTEX_AI_LOCATION_PRIVATE;
+      const collectionId = task.knowledgeBaseType === 'public'
+        ? process.env.VERTEX_AI_COLLECTION_ID
+        : process.env.VERTEX_AI_COLLECTION_ID_PRIVATE;
+      if (datastoreId && location && collectionId) {
+        await syncDataStore(datastoreId, location, collectionId);
+      }
+    } catch (syncError) {
+      console.error('Error syncing data store:', syncError);
+      // Don't throw the error as the main operation succeeded
+    }
     
     res.json({ 
       content: contentToSave, 
@@ -617,6 +672,25 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
       knowledge_base_updated_at: new Date().toISOString()
     });
 
+    // Trigger data store sync based on knowledge base type
+    try {
+      const datastoreId = task.knowledgeBaseType === 'public' 
+        ? process.env.VERTEX_AI_DATASTORE_ID 
+        : process.env.VERTEX_AI_DATASTORE_ID_PRIVATE;
+      const location = task.knowledgeBaseType === 'public'
+        ? process.env.VERTEX_AI_LOCATION
+        : process.env.VERTEX_AI_LOCATION_PRIVATE;
+      const collectionId = task.knowledgeBaseType === 'public'
+        ? process.env.VERTEX_AI_COLLECTION_ID
+        : process.env.VERTEX_AI_COLLECTION_ID_PRIVATE;
+      if (datastoreId && location && collectionId) {
+        await syncDataStore(datastoreId, location, collectionId);
+      }
+    } catch (syncError) {
+      console.error('Error syncing data store:', syncError);
+      // Don't throw the error as the main operation succeeded
+    }
+
     res.json({ 
       content: updatedContent,
       url,
@@ -690,6 +764,27 @@ router.put('/:id/knowledge-base-type', authenticateToken, async (req: Request, r
         });
         // Delete the old file
         await currentFile.delete();
+
+        // Sync both data stores after moving the file
+        try {
+          const publicDatastoreId = process.env.VERTEX_AI_DATASTORE_ID;
+          const privateDatastoreId = process.env.VERTEX_AI_DATASTORE_ID_PRIVATE;
+          const publicLocation = process.env.VERTEX_AI_LOCATION;
+          const privateLocation = process.env.VERTEX_AI_LOCATION_PRIVATE;
+          const publicCollectionId = process.env.VERTEX_AI_COLLECTION_ID;
+          const privateCollectionId = process.env.VERTEX_AI_COLLECTION_ID_PRIVATE;
+
+          if (publicDatastoreId && publicLocation && publicCollectionId) {
+            await syncDataStore(publicDatastoreId, publicLocation, publicCollectionId);
+          }
+          if (privateDatastoreId && privateLocation && privateCollectionId) {
+            await syncDataStore(privateDatastoreId, privateLocation, privateCollectionId);
+          }
+        } catch (syncError) {
+          console.error('Error syncing data stores:', syncError);
+          // Don't throw the error as the main operation succeeded
+        }
+
         return res.json({ message: 'Knowledge base type and file moved successfully', knowledgeBaseType, url });
       } else {
         // If no file exists, just update the type

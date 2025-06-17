@@ -2,6 +2,7 @@ import os
 import time
 from dotenv import load_dotenv
 from knowledge_base_utils import get_knowledge_base_manager
+from google.cloud import discoveryengine
 
 # Load environment variables from .env file
 load_dotenv()
@@ -95,6 +96,34 @@ def test_both_knowledge_bases():
     print("\n=== Testing Combined Search ===")
     test_search_knowledge(query="Python", bucket_type='both')
 
+def test_sync_knowledge(bucket_type='both'):
+    """Test syncing knowledge base with Vertex AI Search
+    
+    Args:
+        bucket_type (str, optional): Type of bucket to sync ('public', 'private', or 'both'). Defaults to 'both'.
+    """
+    try:
+        if bucket_type == 'both':
+            # Sync both knowledge bases
+            print("\n=== Syncing Public Knowledge Base ===")
+            public_kb = get_knowledge_base_manager('public')
+            public_result = public_kb.sync_knowledge()
+            print(f"Public sync result: {public_result}")
+            
+            print("\n=== Syncing Private Knowledge Base ===")
+            private_kb = get_knowledge_base_manager('private')
+            private_result = private_kb.sync_knowledge()
+            print(f"Private sync result: {private_result}")
+        else:
+            # Sync single knowledge base
+            kb_manager = get_knowledge_base_manager(bucket_type)
+            result = kb_manager.sync_knowledge()
+            print(f"\nSync result for {bucket_type} knowledge base: {result}")
+            
+    except Exception as e:
+        print(f"Error syncing knowledge base: {str(e)}")
+        raise
+
 if __name__ == "__main__":
     import sys
     
@@ -110,10 +139,14 @@ if __name__ == "__main__":
             test_search_knowledge(query, bucket_type=bucket_type)
         elif test_type == "test_both":
             test_both_knowledge_bases()
+        elif test_type == "sync":
+            bucket_type = sys.argv[2] if len(sys.argv) > 2 else 'both'
+            test_sync_knowledge(bucket_type)
         else:
-            print("Invalid test type. Use 'save_freetext', 'search', or 'test_both'")
+            print("Invalid test type. Use 'save_freetext', 'search', 'test_both', or 'sync'")
     else:
-        print("Please specify test type: 'save_freetext', 'search', or 'test_both'")
+        print("Please specify test type: 'save_freetext', 'search', 'test_both', or 'sync'")
         print("Example: python test_knowledge_base.py save_freetext [public|private]")
         print("Example: python test_knowledge_base.py search [query] [public|private|both]")
-        print("Example: python test_knowledge_base.py test_both") 
+        print("Example: python test_knowledge_base.py test_both")
+        print("Example: python test_knowledge_base.py sync [public|private|both]") 
