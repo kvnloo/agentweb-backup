@@ -377,6 +377,38 @@ mkdir -p builds && \
 zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json .env.example
 ```
 
+### AWS Elastic Beanstalk Permissions
+
+To grant a user permission to deploy to AWS Elastic Beanstalk, follow these steps:
+
+1. Create an IAM User:
+   - Go to IAM Console > Users > Add User
+   - Enter username (e.g., "eb-deployer")
+   - Select "Access key - Programmatic access"
+   - Click "Next: Permissions"
+
+2. Attach the Managed Policy:
+   - Choose "Attach existing policies directly"
+   - Search for "AdministratorAccess-AWSElasticBeanstalk"
+   - Select the policy
+   - Click "Next: Tags" (optional)
+   - Click "Next: Review"
+   - Click "Create User"
+
+3. Save Credentials:
+   - Download the CSV file containing the Access Key ID and Secret Access Key
+   - Store these credentials securely
+   - Configure AWS CLI with these credentials:
+   ```bash
+   aws configure
+   AWS Access Key ID: [Your Access Key ID]
+   AWS Secret Access Key: [Your Secret Access Key]
+   Default region name: [Your AWS Region]
+   Default output format: json
+   ```
+
+Note: The managed policy grants broad permissions for development purposes. Consider using more restrictive permissions in future.
+
 2. Create a new application in Elastic Beanstalk:
    - Go to AWS Management Console > Elastic Beanstalk
    - Click "Create application"

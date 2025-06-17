@@ -22,7 +22,7 @@ export const createTemplate = async (req: AuthRequest, res: Response) => {
     }
 
 
-    const { name, description, prompt, isInteractive, isDeepResearch, nameParameter, category, outputAsJson, outputAsHtml, isComplexTask, selectedLLMs, useSharedBrowser } = req.body;
+    const { name, description, prompt, isInteractive, isDeepResearch, nameParameter, category, outputAsJson, outputAsHtml, isComplexTask, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, updateLeadList } = req.body;
 
     if (!name || !prompt) {
       return res.status(400).json({ message: 'Name and prompt are required' });
@@ -53,6 +53,9 @@ export const createTemplate = async (req: AuthRequest, res: Response) => {
       outputAsHtml: outputAsHtml ? true : (outputAsJson ? false : false), // Handle mutual exclusivity
       isComplexTask: Boolean(isComplexTask), // Added isComplexTask
       useSharedBrowser: Boolean(useSharedBrowser), // ADDED useSharedBrowser
+      useKnowledgeBase: Boolean(useKnowledgeBase),
+      updateKnowledgeBase: Boolean(updateKnowledgeBase),
+      updateLeadList: Boolean(updateLeadList),
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       category: category || undefined, // Add category, default to undefined if not provided
@@ -166,7 +169,7 @@ export const updateTemplate = async (req: AuthRequest, res: Response) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    const { name, description, prompt, isInteractive, isDeepResearch, isComplexTask, published, nameParameter, category, outputAsJson, outputAsHtml, selectedLLMs, useSharedBrowser, turnOffHeadless } = req.body;
+    const { name, description, prompt, isInteractive, isDeepResearch, isComplexTask, published, nameParameter, category, outputAsJson, outputAsHtml, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, updateLeadList } = req.body;
 
     const updates: any = {};
     if (name !== undefined) updates.name = name;
@@ -218,6 +221,9 @@ export const updateTemplate = async (req: AuthRequest, res: Response) => {
     if (selectedLLMs !== undefined) updates.selectedLLMs = selectedLLMs;
     if (useSharedBrowser !== undefined) updates.useSharedBrowser = Boolean(useSharedBrowser);
     if (turnOffHeadless !== undefined) updates.turnOffHeadless = Boolean(turnOffHeadless);
+    if (useKnowledgeBase !== undefined) updates.useKnowledgeBase = Boolean(useKnowledgeBase);
+    if (updateKnowledgeBase !== undefined) updates.updateKnowledgeBase = Boolean(updateKnowledgeBase);
+    if (updateLeadList !== undefined) updates.updateLeadList = Boolean(updateLeadList);
     
     // Only allow admins to update the published status
     if (published !== undefined && user.isAdmin) {

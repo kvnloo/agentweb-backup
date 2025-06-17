@@ -33,9 +33,9 @@ import Api from './pages/Api';
 import Marketing from './pages/marketing';
 import { useEffect } from 'react';
 
-const RedirectToAgentWeb = () => {
+const RedirectToTasks = () => {
   useEffect(() => {
-    window.location.href = 'https://www.agentweb.pro';
+    window.location.href = '/tasks';
   }, []);
 
   return null;
@@ -52,7 +52,7 @@ export default function App() {
               <Box sx={{ display: 'flex', flexDirection: 'column', minHeight: '100vh' }}>
                 <Routes>
                   <Route path="/" element={<Layout />}>
-                    <Route index element={<RedirectToAgentWeb />} />
+                    <Route index element={<RedirectToTasks />} />
                     <Route path="login" element={<Login />} />
                     <Route path="register" element={<Register />} />
                     <Route path="oauth-callback" element={<OAuthCallback />} />

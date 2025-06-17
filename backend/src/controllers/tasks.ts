@@ -43,7 +43,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       useSharedBrowser,
       turnOffHeadless,
       useKnowledgeBase,
-      updateKnowledgeBase
+      updateKnowledgeBase,
+      updateLeadList
     } = req.body;
     
     // If templateId is provided, fetch the template and use its values
@@ -90,6 +91,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           turnOffHeadless: turnOffHeadless !== undefined ? Boolean(turnOffHeadless) : template.turnOffHeadless,
           useKnowledgeBase: useKnowledgeBase !== undefined ? Boolean(useKnowledgeBase) : template.useKnowledgeBase,
           updateKnowledgeBase: req.body.updateKnowledgeBase !== undefined ? Boolean(req.body.updateKnowledgeBase) : template.updateKnowledgeBase,
+          updateLeadList: req.body.updateLeadList !== undefined ? Boolean(req.body.updateLeadList) : template.updateLeadList,
           knowledgeBaseType: 'private', // Default to private for new tasks
           createdAt: new Date().toISOString(),
           llmName: req.body.llmName || null,
@@ -129,6 +131,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       turnOffHeadless: Boolean(turnOffHeadless),
       useKnowledgeBase: Boolean(useKnowledgeBase),
       updateKnowledgeBase: Boolean(req.body.updateKnowledgeBase),
+      updateLeadList: Boolean(req.body.updateLeadList),
       knowledgeBaseType: 'private', // Default to private for new tasks
       createdAt: new Date().toISOString(),
       llmName: req.body.llmName || null,
@@ -265,6 +268,14 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
 
     if (req.body.updateKnowledgeBase !== undefined) {
       updates.updateKnowledgeBase = Boolean(req.body.updateKnowledgeBase);
+    }
+
+    if (req.body.updateLeadList !== undefined) {
+      updates.updateLeadList = Boolean(req.body.updateLeadList);
+    }
+
+    if (req.body.leadListIdentifier !== undefined) {
+      updates.leadListIdentifier = req.body.leadListIdentifier;
     }
 
     if (req.body.knowledgeBaseType !== undefined) {

@@ -600,6 +600,36 @@ const createChatSessionsTable = async () => {
   }
 };
 
+// Create Task Lead List table
+const createTaskLeadListTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-TaskLeadList`,
+    AttributeDefinitions: [
+      { AttributeName: 'taskId', AttributeType: 'S' },     // Partition key
+      { AttributeName: 'identifier', AttributeType: 'S' }   // Sort key
+    ],
+    KeySchema: [
+      { AttributeName: 'taskId', KeyType: 'HASH' },        // Partition key
+      { AttributeName: 'identifier', KeyType: 'RANGE' }     // Sort key
+    ],
+    ProvisionedThroughput: {
+      ReadCapacityUnits: 5,
+      WriteCapacityUnits: 5
+    }
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 const main = async () => {
   try {
     console.log(`Creating tables for environment: ${process.env.NODE_ENV || 'production'}`);
@@ -614,6 +644,7 @@ const main = async () => {
     await createWorkflowExecutionsTable();
     await createTaskTemplatesTable();
     await createChatSessionsTable();
+    await createTaskLeadListTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);

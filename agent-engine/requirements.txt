@@ -13,3 +13,7 @@ cryptography
 watchdog
 google-cloud-storage
 google-cloud-discoveryengine
+PyPDF2
+python-docx
+openpyxl
+PyYAML
