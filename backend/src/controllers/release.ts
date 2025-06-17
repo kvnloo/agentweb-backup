@@ -1,4 +1,4 @@
-import { Request, Response } from 'express';
+import { Request, Response } from "express";
 
 interface Release {
   date: string;
@@ -8,6 +8,16 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-06-17",
+    changes: [
+      "Enhanced Admin Dashboard with Waitlist Analytics",
+      "- Added marketing channels tracking in waitlist management",
+      "- Implemented visualization of user acquisition sources",
+      "- Added ability to filter and analyze waitlist entries by marketing channel",
+      "- Enhanced admin insights for better marketing strategy optimization",
+    ],
+  },
+  {
     date: "2025-06-11",
     changes: [
       "Enhanced Knowledge Base features",
@@ -15,8 +25,8 @@ const releases: Release[] = [
       "- Added Knowledge Base tab to admin page for metrics and management",
       "- Enhanced Task Details page with knowledge base creation and management",
       "- Added automatic knowledge base updates from execution records",
-      "- Added support for private knowledge base access to both web agents and Emma chatbot"
-    ]
+      "- Added support for private knowledge base access to both web agents and Emma chatbot",
+    ],
   },
   {
     date: "2025-06-06",
@@ -27,8 +37,8 @@ const releases: Release[] = [
       "- Added ability to kill a task when rerunning it",
       "Enhanced Admin capabilities with workflow management",
       "- Added Workflows tab in Admin page for viewing and managing user workflows",
-      "- Admins can help users debug by running workflows and rerun tasks on their behalf"
-    ]
+      "- Admins can help users debug by running workflows and rerun tasks on their behalf",
+    ],
   },
   {
     date: "2025-06-04",
@@ -38,8 +48,8 @@ const releases: Release[] = [
       "- Enhanced Workflow to support referencing existing tasks of the user",
       "Tasks page shows knowledge size for better knowledge base management",
       "Enhanced admin functions for better customer support",
-      "- Added ability for admins to archive and kill task executions"
-    ]
+      "- Added ability for admins to archive and kill task executions",
+    ],
   },
   {
     date: "2025-05-30",
@@ -50,8 +60,8 @@ const releases: Release[] = [
       "- Manual knowledge base updates available on Task Details page",
       "- Enable 'Use Knowledge Base' option when running tasks",
       "- Agents can search platform-wide knowledge base during web navigation",
-      "- Chatbots now have access to platform-wide knowledge base for more comprehensive support"
-    ]
+      "- Chatbots now have access to platform-wide knowledge base for more comprehensive support",
+    ],
   },
   {
     date: "2025-05-23",
@@ -59,8 +69,8 @@ const releases: Release[] = [
       "Support Turn Off Headless toggle",
       "- Added new toggle in Task Details page of Partner Portal and Templates",
       "- When creating a new task based on a template, this setting will be enabled based on template",
-      "- Useful for tasks which visit sites that require headless to be off such as x.com, circle.so"
-    ]
+      "- Useful for tasks which visit sites that require headless to be off such as x.com, circle.so",
+    ],
   },
   {
     date: "2025-05-22",
@@ -72,8 +82,8 @@ const releases: Release[] = [
       "Improved task ownership change notifications",
       "- Fixed a bug",
       "- Single email sent to new owner with old owner and admin CC'd",
-      "- Updated email links to point to customer portal instead of partner portal"
-    ]
+      "- Updated email links to point to customer portal instead of partner portal",
+    ],
   },
   {
     date: "2025-05-19",
@@ -81,8 +91,8 @@ const releases: Release[] = [
       "Added new models for task runs",
       "- OpenAI GPT-4.1 from Azure",
       "- Google Gemini Pro 2.5 Preview 05-06",
-      "Fixed bugs"
-    ]
+      "Fixed bugs",
+    ],
   },
   {
     date: "2025-05-15",
@@ -91,8 +101,8 @@ const releases: Release[] = [
       "- Updated email notifications to display HTML file content directly in the email",
       "- Added email feature in Execution Details of Partner Portal",
       "- Makes it easier to share task results with clients or team members",
-      "- Useful for sending leads detailed results of task runs to help convert them"
-    ]
+      "- Useful for sending leads detailed results of task runs to help convert them",
+    ],
   },
   {
     date: "2025-05-02",
@@ -100,8 +110,8 @@ const releases: Release[] = [
       "Added Agentic Dev Mode to Task Details page",
       "- Enables agents to access current page content",
       "- Allows running JavaScript on the current page",
-      "- Enhances developer capabilities for advanced web automation tasks"
-    ]
+      "- Enhances developer capabilities for advanced web automation tasks",
+    ],
   },
   {
     date: "2025-05-01",
@@ -112,8 +122,8 @@ const releases: Release[] = [
       "- Enhances user experience with live execution updates",
       "Updated Gemini 2.5 Pro model from experimental to preview status",
       "- Resolves rate limit issues with the experimental model",
-      "- Improves stability and reliability for Gemini-powered tasks"
-    ]
+      "- Improves stability and reliability for Gemini-powered tasks",
+    ],
   },
   {
     date: "2025-04-29",
@@ -123,8 +133,8 @@ const releases: Release[] = [
       "- Real-time access to product documentation and guides",
       "- Page-specific help based on user's current location",
       "- Integration with knowledge base for accurate responses",
-      "- Powered by the advanced GPT-4.1 model from OpenAI"
-    ]
+      "- Powered by the advanced GPT-4.1 model from OpenAI",
+    ],
   },
   {
     date: "2025-04-17",
@@ -133,8 +143,8 @@ const releases: Release[] = [
       "- When enabled, the agent will output results in structured JSON format",
       "- Useful for programmatic processing of agent outputs",
       "- Task will fail if agent cannot produce valid JSON output",
-      "Improved reliability of agent login by providing the list of domains with valid credentials to the agent"
-    ]
+      "Improved reliability of agent login by providing the list of domains with valid credentials to the agent",
+    ],
   },
   {
     date: "2025-03-26",
@@ -143,8 +153,8 @@ const releases: Release[] = [
       "- Agents can now use submit_python_code to submit code to GitHub, subject for admin review",
       "- Once merged, the code can be loaded with get_approved_python_code() and run with run_approved_python_code",
       "Added support for the latest Gemini 2.5 Pro LLM",
-      "Fixed various bugs and improved stability"
-    ]
+      "Fixed various bugs and improved stability",
+    ],
   },
   {
     date: "2025-03-18",
@@ -153,8 +163,8 @@ const releases: Release[] = [
       "- Users can now connect to external APIs without writing any code",
       "- Simply provide API name, key, and documentation link in the Config page",
       "- Agents then can use the API in their tasks",
-      "- Share API configurations while maintaining security"
-    ]
+      "- Share API configurations while maintaining security",
+    ],
   },
   {
     date: "2025-03-17",
@@ -164,8 +174,8 @@ const releases: Release[] = [
       "- Enable this option to automatically extract structured data from web pages",
       "Added Validate Output option on Task Details page",
       "- When enabled, the agent will validate its output to ensure higher accuracy",
-      "Bug fixes"
-    ]
+      "Bug fixes",
+    ],
   },
   {
     date: "2025-03-13",
@@ -173,8 +183,8 @@ const releases: Release[] = [
       "Added execution details sharing functionality",
       "- Users can now share execution details via a secure URL",
       "- Share button added to Execution Details page",
-      "- Shared executions can be viewed without requiring login"
-    ]
+      "- Shared executions can be viewed without requiring login",
+    ],
   },
   {
     date: "2025-03-11",
@@ -187,16 +197,16 @@ const releases: Release[] = [
       "- Templates can now be configured with Complex Task option",
       "Added new models for running regular tasks: Anthropic 3.7 sonnet and Google Gemini 2.0 flash",
       "- Note: These models are not available for deep research yet",
-      "- Expanded model selection provides more options for different task types"
-    ]
+      "- Expanded model selection provides more options for different task types",
+    ],
   },
   {
     date: "2025-03-10",
     changes: [
       "Added Complex Task toggle on Task Details page",
       "- Allows agents to run up to 100 steps (instead of default 25)",
-      "- Enables completion of more complex tasks requiring more actions"
-    ]
+      "- Enables completion of more complex tasks requiring more actions",
+    ],
   },
   {
     date: "2025-03-09",
@@ -204,15 +214,12 @@ const releases: Release[] = [
       "Introduced Templates for task creation",
       "- Pre-configured templates with customizable parameters",
       "- Parameter values can be included in task names",
-      "- Saves time and ensures consistency across similar tasks"
-    ]
+      "- Saves time and ensures consistency across similar tasks",
+    ],
   },
   {
     date: "2025-03-07",
-    changes: [
-      "Added User Guide page",
-      "Fixed various UI bugs"
-    ]
+    changes: ["Added User Guide page", "Fixed various UI bugs"],
   },
   {
     date: "2025-03-05",
@@ -225,8 +232,8 @@ const releases: Release[] = [
       "Enhanced email notifications for task executions",
       "- Email titles of task executions now include summary of new information",
       "- This informative subject works for both users and subscribers",
-      "- It helps easily identify important emails"
-    ]
+      "- It helps easily identify important emails",
+    ],
   },
   {
     date: "2025-03-03",
@@ -234,8 +241,8 @@ const releases: Release[] = [
       "Improved Deep Research reports",
       "- Reduced hallucination on citations",
       "- Added support for Azure OpenAI o1-mini model, which offers improved reasoning capabilities",
-      "Optimized polling for Task Details page to reduce unnecessary traffic"
-    ]
+      "Optimized polling for Task Details page to reduce unnecessary traffic",
+    ],
   },
   {
     date: "2025-02-28",
@@ -243,8 +250,8 @@ const releases: Release[] = [
       "Added public credential sharing feature",
       "- Users can share their configured website credentials with everyone in Config page",
       "- Shared credentials remain securely encrypted and protected",
-      "- Enhanced security with session isolation for shared credentials"
-    ]
+      "- Enhanced security with session isolation for shared credentials",
+    ],
   },
   {
     date: "2025-02-26",
@@ -258,24 +265,24 @@ const releases: Release[] = [
       "- Users can edit task name on Task Details page",
       "Implemented preferred LLM selection for tasks",
       "- Users can choose specific LLM for task execution",
-      "- Automatic fallback to other LLMs if preferred one fails"
-    ]
+      "- Automatic fallback to other LLMs if preferred one fails",
+    ],
   },
   {
     date: "2025-02-13",
     changes: [
       "Added execution log display for better task debugging visibility",
       "Enhanced user experience with detailed execution logs",
-      "Improved error tracking and troubleshooting capabilities"
-    ]
+      "Improved error tracking and troubleshooting capabilities",
+    ],
   },
   {
     date: "2025-02-12",
     changes: [
       "Added support for file attachments in tasks",
       "Implemented file download functionality for task results",
-      "Enhanced task interface to manage attachments and downloads"
-    ]
+      "Enhanced task interface to manage attachments and downloads",
+    ],
   },
   {
     date: "2025-02-11",
@@ -284,16 +291,16 @@ const releases: Release[] = [
       "Added support for creating workflows using natural programming language",
       "Implemented workflow execution engine",
       "Added workflow management interface",
-      "Support for tasks running in predefined order within workflows"
-    ]
+      "Support for tasks running in predefined order within workflows",
+    ],
   },
   {
     date: "2025-02-02",
     changes: [
       "Implemented parallel task execution",
       "Improved task scheduling and management",
-      "Enhanced system performance for concurrent tasks"
-    ]
+      "Enhanced system performance for concurrent tasks",
+    ],
   },
   {
     date: "2025-01-31",
@@ -301,8 +308,8 @@ const releases: Release[] = [
       "Added support for editable task prompts",
       "Implemented per-user cookie file system",
       "Enhanced user isolation and security",
-      "Improved user experience with customizable tasks"
-    ]
+      "Improved user experience with customizable tasks",
+    ],
   },
   {
     date: "2025-01-30",
@@ -311,8 +318,8 @@ const releases: Release[] = [
       "- AWS Anthropic Claude 3.5 Sonnet",
       "- Azure OpenAI GPT-4o",
       "- OpenAI GPT-4o",
-      "Enhanced AI model selection and fallback system"
-    ]
+      "Enhanced AI model selection and fallback system",
+    ],
   },
   {
     date: "2025-01-29",
@@ -320,8 +327,8 @@ const releases: Release[] = [
       "Implemented task subscription system via email",
       "Added email notifications for task results",
       "Support for non-registered users to receive task updates",
-      "Enhanced collaboration features for team usage"
-    ]
+      "Enhanced collaboration features for team usage",
+    ],
   },
   {
     date: "2025-01-27",
@@ -330,16 +337,18 @@ const releases: Release[] = [
       "Initial UI implementation",
       "Core backend services deployment",
       "Agent engine development and integration",
-      "Basic task management system"
-    ]
-  }
+      "Basic task management system",
+    ],
+  },
 ];
 
 export const getReleases = (req: Request, res: Response) => {
   try {
     return res.status(200).json({ success: true, data: releases });
   } catch (error) {
-    console.error('Error fetching release data:', error);
-    return res.status(500).json({ success: false, message: 'Error fetching release data' });
+    console.error("Error fetching release data:", error);
+    return res
+      .status(500)
+      .json({ success: false, message: "Error fetching release data" });
   }
-}; 
+};
