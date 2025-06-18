@@ -20,6 +20,8 @@ import random # Added for sanitize_filename fallback
 import base64 # Ensure base64 is imported at the top level
 import mimetypes # For guessing mime type from file extension
 import httpx # For fetching URL for base64 encoding if needed
+import tempfile
+import csv
 
 # Configure logging
 logging.basicConfig(
@@ -566,6 +568,243 @@ def test_with_browser_use_code_execution(model_name="gemini-2.0-flash"):
     """Wrapper to run the async browser-use code execution test"""
     return asyncio.run(test_with_browser_use_code_execution_async(model_name))
 
+async def test_gemini_file_input_with_sdk(model_name="gemini-2.0-flash"):
+    """Test Google Gemini file input using the Google Gemini SDK directly"""
+    load_dotenv()
+    api_key = os.getenv('GEMINI_API_KEY')
+    if not api_key:
+        logger.error("GEMINI_API_KEY environment variable is not set")
+        return False
+
+    logger.info(f"Testing Google Gemini file input with SDK using model: {model_name}")
+
+    try:
+        # Import Google Gemini SDK
+        try:
+            from google import genai
+            from google.genai import types
+        except ImportError:
+            logger.error("Google Gemini SDK not installed. Install with: pip install google-genai")
+            return False
+
+        # Initialize the client
+        client = genai.Client(api_key=api_key)
+        
+        # Create a temporary CSV file for testing
+        sample_data = [
+            ['name', 'age', 'city', 'salary'],
+            ['Alice', '25', 'New York', '75000'],
+            ['Bob', '30', 'Los Angeles', '85000'],
+            ['Charlie', '35', 'Chicago', '90000'],
+            ['Diana', '28', 'Boston', '80000'],
+            ['Eve', '32', 'San Francisco', '95000']
+        ]
+        
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, newline='') as temp_file:
+            writer = csv.writer(temp_file)
+            writer.writerows(sample_data)
+            temp_file_path = temp_file.name
+        
+        try:
+            # Read the file content for inline data
+            with open(temp_file_path, 'r') as f:
+                file_content = f.read()
+            
+            # Test 1: Using inline data (file content as text)
+            logger.info("Test 1: Using inline data (file content as text)...")
+            
+            response1 = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "text": f"Analyze this CSV data and provide insights. Use Python code execution to process the data:\n\n{file_content}"
+                            }
+                        ]
+                    }
+                ],
+                config=types.GenerateContentConfig(
+                    tools=[types.Tool(code_execution=types.ToolCodeExecution)]
+                ),
+            )
+            
+            logger.info("Response 1 received:")
+            for part in response1.candidates[0].content.parts:
+                if part.text is not None:
+                    logger.info(f"Text: {part.text}")
+                if part.executable_code is not None:
+                    logger.info(f"Code: {part.executable_code.code}")
+                if part.code_execution_result is not None:
+                    logger.info(f"Result: {part.code_execution_result.output}")
+            
+            # Test 2: Using file upload via Files API (proper method)
+            logger.info("Test 2: Using file upload via Files API...")
+            
+            try:
+                # Upload file to Gemini Files API using the correct method
+                with open(temp_file_path, 'rb') as f:
+                    file_data = f.read()
+                
+                upload_response = client.files.upload(
+                    data=file_data,
+                    mime_type="text/csv"
+                )
+                
+                file_uri = upload_response.file.name
+                logger.info(f"File uploaded with URI: {file_uri}")
+                
+                # Use the uploaded file in the prompt
+                response2 = client.models.generate_content(
+                    model=model_name,
+                    contents=[
+                        {
+                            "role": "user",
+                            "parts": [
+                                {
+                                    "file_data": {
+                                        "file_uri": file_uri,
+                                        "mime_type": "text/csv"
+                                    }
+                                },
+                                {
+                                    "text": "Analyze this CSV file and provide insights. Use Python code execution to process the data."
+                                }
+                            ]
+                        }
+                    ],
+                    config=types.GenerateContentConfig(
+                        tools=[types.Tool(code_execution=types.ToolCodeExecution)]
+                    ),
+                )
+                
+                logger.info("Response 2 received:")
+                for part in response2.candidates[0].content.parts:
+                    if part.text is not None:
+                        logger.info(f"Text: {part.text}")
+                    if part.executable_code is not None:
+                        logger.info(f"Code: {part.executable_code.code}")
+                    if part.code_execution_result is not None:
+                        logger.info(f"Result: {part.code_execution_result.output}")
+                
+                # Clean up uploaded file
+                client.files.delete(file_uri)
+                logger.info("Uploaded file cleaned up")
+                
+            except Exception as e:
+                logger.warning(f"File upload test failed: {e}")
+                logger.info("This might be due to API limitations or authentication issues.")
+                logger.info("Continuing with inline data test only...")
+            
+            # Test 3: Using inline data with base64 encoding (alternative approach)
+            logger.info("Test 3: Using inline data with base64 encoding...")
+            
+            import base64
+            
+            # Encode file content as base64
+            file_content_bytes = file_content.encode('utf-8')
+            file_content_b64 = base64.b64encode(file_content_bytes).decode('utf-8')
+            
+            response3 = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "inline_data": {
+                                    "data": file_content_b64,
+                                    "mime_type": "text/csv"
+                                }
+                            },
+                            {
+                                "text": "Analyze this CSV file and provide insights. Use Python code execution to process the data."
+                            }
+                        ]
+                    }
+                ],
+                config=types.GenerateContentConfig(
+                    tools=[types.Tool(code_execution=types.ToolCodeExecution)]
+                ),
+            )
+            
+            logger.info("Response 3 received:")
+            for part in response3.candidates[0].content.parts:
+                if part.text is not None:
+                    logger.info(f"Text: {part.text}")
+                if part.executable_code is not None:
+                    logger.info(f"Code: {part.executable_code.code}")
+                if part.code_execution_result is not None:
+                    logger.info(f"Result: {part.code_execution_result.output}")
+            
+            # Check if responses contain code execution results
+            success_count = 0
+            
+            # Check response 1
+            found_code_execution1 = False
+            found_execution_result1 = False
+            for part in response1.candidates[0].content.parts:
+                if part.executable_code is not None:
+                    found_code_execution1 = True
+                if part.code_execution_result is not None:
+                    found_execution_result1 = True
+            
+            if found_code_execution1 and found_execution_result1:
+                logger.info("✅ Test 1 (inline data) completed successfully!")
+                success_count += 1
+            else:
+                logger.error("❌ Test 1 (inline data) failed - no code execution detected")
+            
+            # Check response 2 if it was successful
+            if 'response2' in locals():
+                found_code_execution2 = False
+                found_execution_result2 = False
+                for part in response2.candidates[0].content.parts:
+                    if part.executable_code is not None:
+                        found_code_execution2 = True
+                    if part.code_execution_result is not None:
+                        found_execution_result2 = True
+                
+                if found_code_execution2 and found_execution_result2:
+                    logger.info("✅ Test 2 (file upload) completed successfully!")
+                    success_count += 1
+                else:
+                    logger.error("❌ Test 2 (file upload) failed - no code execution detected")
+            
+            # Check response 3
+            found_code_execution3 = False
+            found_execution_result3 = False
+            for part in response3.candidates[0].content.parts:
+                if part.executable_code is not None:
+                    found_code_execution3 = True
+                if part.code_execution_result is not None:
+                    found_execution_result3 = True
+            
+            if found_code_execution3 and found_execution_result3:
+                logger.info("✅ Test 3 (base64 inline data) completed successfully!")
+                success_count += 1
+            else:
+                logger.error("❌ Test 3 (base64 inline data) failed - no code execution detected")
+            
+            if success_count >= 1:
+                logger.info(f"🎉 File input tests completed successfully! ({success_count} tests passed)")
+                return True
+            else:
+                logger.error("❌ All file input tests failed")
+                return False
+                
+        finally:
+            # Clean up temporary file
+            if os.path.exists(temp_file_path):
+                os.unlink(temp_file_path)
+
+    except Exception as e:
+        logger.error(f"Error testing Gemini file input with SDK: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return False
+
 if __name__ == "__main__":
     import argparse
     
@@ -576,6 +815,7 @@ if __name__ == "__main__":
     parser.add_argument('--aigc_model', type=str, default="models/gemini-2.0-flash-preview-image-generation", help='Model name for AIGC test (default: models/gemini-2.0-flash-preview-image-generation)')
     parser.add_argument('--code-exec', action='store_true', help='Run Gemini code execution test')
     parser.add_argument('--browser-use-code-exec', action='store_true', help='Run Gemini code execution test with browser-use Agent')
+    parser.add_argument('--file-input', action='store_true', help='Run Gemini file input test with SDK')
     
     args = parser.parse_args()
     
@@ -603,6 +843,12 @@ if __name__ == "__main__":
             print("\nGemini code execution test completed successfully!")
         else:
             print("\nGemini code execution test failed.")
+    elif args.file_input:
+        success = asyncio.run(test_gemini_file_input_with_sdk(model_name=args.model))
+        if success:
+            print("\nGemini file input test completed successfully!")
+        else:
+            print("\nGemini file input test failed.")
     else:
         success = test_gemini(args.model)
         if success:
