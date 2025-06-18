@@ -198,6 +198,7 @@ class WebAgent:
         self.update_lead_list = False  # Initialize update_lead_list property
         self.lead_list_identifier = None  # Initialize lead_list_identifier property
         self.has_attachments = False  # Initialize has_attachments property
+        self.code_execution = False  # Initialize code_execution property
 
     def setup_execution_logging(self, execution_id: str):
         """Setup logging for the current execution"""
@@ -783,319 +784,320 @@ class WebAgent:
                 logger.error(f"Error in sleep: {str(e)}")
                 return ActionResult(error=f"Failed to sleep: {str(e)}")
 
-        @self.controller.registry.action('Get approved Python code')
-        async def get_approved_python_code() -> ActionResult:
-            """
-            Retrieve a list of available Python code from GitHub that the agent is allowed to run.
-            
-            This action searches the GitHub repository and returns a list of available Python code files.
-            
-            Returns:
-                A list of available Python code files with their filenames.
-                You should use just the filename when calling run_approved_python_code or submit_python_code.
-            """
-            try:
-                # Check if user_id is available
-                if not self.user_id:
-                    return ActionResult(error="User ID not available")
+        if self.code_execution:
+            @self.controller.registry.action('Get approved Python code')
+            async def get_approved_python_code() -> ActionResult:
+                """
+                Retrieve a list of available Python code from GitHub that the agent is allowed to run.
                 
-                # Get the base path using the utility function
-                base_path = get_agent_code_base_path(self.user_id, self.current_task_id)
+                This action searches the GitHub repository and returns a list of available Python code files.
                 
-                # Create the GitHub API endpoint
-                endpoint = f"repos/john-the-dev/agentweb-agentcode/contents/{base_path}"
-                
-                # Call GitHub API
-                status, content, error = await call_github_api("get", endpoint)
-                
-                if status == 404:
-                    # Special handling for 404 - no files available yet
-                    message = "No Python code files are available yet for this user/task."
-                    return ActionResult(extracted_content=message)
-                elif error:
-                    return ActionResult(error=f"Failed to fetch code list: {status}. Path {base_path} may not exist.")
-                
-                # Filter for Python files only
-                python_files = [
-                    {
-                        "name": item["name"],
-                        "size": item["size"]
-                    }
-                    for item in content if item["name"].endswith(".py")
-                ]
-                
-                # Format the result
-                if python_files:
-                    result_text = "Available Python code:\n\n"
-                    for file in python_files:
-                        result_text += f"  Filename: {file['name']}\n"
-                        result_text += f"  Size: {file['size']} bytes\n\n"
-                    
-                    result_text += "Note: Use only the filename when calling run_approved_python_code or submit_python_code."
-                else:
-                    result_text = f"No Python code files found"
-                
-                logger.info(f"Found {len(python_files)} Python files")
-                return ActionResult(extracted_content=result_text)
-                
-            except Exception as e:
-                logger.error(f"Error retrieving Python code list: {str(e)}")
-                return ActionResult(error=f"Failed to retrieve Python code list: {str(e)}")
-
-        @self.controller.registry.action('Run approved Python code')
-        async def run_approved_python_code(code_file_name: str) -> ActionResult:
-            """
-            Run Python code identified by the provided filename.
-            
-            The function retrieves the code from GitHub and executes it in a sandboxed environment.
-            API credentials will be loaded from environment variables.
-            
-            Parameters:
-                code_file_name: The filename of the Python code to run (e.g., "script.py").
-                               Do not include any path information, just the filename.
-                
-            Returns:
-                The output of the executed Python code
-            """
-            try:
-                # Check if user_id is available
-                if not self.user_id:
-                    return ActionResult(error="User ID not available")
-                
-                # Validate that code_file_name is just a filename, not a path
-                if "/" in code_file_name or "\\" in code_file_name:
-                    return ActionResult(error="Invalid filename. Please provide just the filename without any path (e.g., 'script.py')")
-                
-                # Ensure filename ends with .py
-                if not code_file_name.endswith('.py'):
-                    return ActionResult(error="Invalid filename. The file must have a .py extension")
-                
-                # Get the base path using the utility function
-                base_path = get_agent_code_base_path(self.user_id, self.current_task_id)
-                full_path = f"{base_path}/{code_file_name}"
-                
-                logger.info(f"Using filename: {code_file_name}, full path: {full_path}")
-                
-                # Create GitHub API endpoint
-                endpoint = f"repos/john-the-dev/agentweb-agentcode/contents/{full_path}"
-                
-                # Call GitHub API to get file content
-                status, content, error = await call_github_api("get", endpoint)
-                
-                # Return error if file not found
-                if status == 404:
-                    return ActionResult(error=f"File '{code_file_name}' not found")
-                elif error:
-                    return ActionResult(error=f"Failed to fetch code: {status}")
-                
-                # Decode content from base64
-                if content.get("encoding") == "base64" and content.get("content"):
-                    python_code = base64.b64decode(content["content"]).decode("utf-8")
-                else:
-                    return ActionResult(error="Invalid content format received from GitHub")
-                
-                # Create header comment with metadata
-                header_parts = [
-                    f"# GitHub code execution from {code_file_name}",
-                    f"# Executed at: {time.strftime('%Y-%m-%d %H:%M:%S')}"
-                ]
-                
-                # Get all API credentials
+                Returns:
+                    A list of available Python code files with their filenames.
+                    You should use just the filename when calling run_approved_python_code or submit_python_code.
+                """
                 try:
-                    # Get all available API credentials
-                    api_credentials, api_key_names = fetch_api_credentials(self.user_id)
+                    # Check if user_id is available
+                    if not self.user_id:
+                        return ActionResult(error="User ID not available")
                     
-                    if api_credentials:
-                        # Create environment variables for the credentials
-                        env_vars = {}
-                        for app_name, cred_info in api_credentials.items():
-                            env_var_name = f"{app_name.upper()}_API_CREDENTIAL"
-                            env_vars[env_var_name] = cred_info["value"]
-                            header_parts.append(f"# API credential available: {app_name}")
-                            header_parts.append(f"# API credential field name: {api_key_names[app_name]}")
-                            header_parts.append(f"# Environment variable: {env_var_name}")
-                            header_parts.append("")
+                    # Get the base path using the utility function
+                    base_path = get_agent_code_base_path(self.user_id, self.current_task_id)
+                    
+                    # Create the GitHub API endpoint
+                    endpoint = f"repos/john-the-dev/agentweb-agentcode/contents/{base_path}"
+                    
+                    # Call GitHub API
+                    status, content, error = await call_github_api("get", endpoint)
+                    
+                    if status == 404:
+                        # Special handling for 404 - no files available yet
+                        message = "No Python code files are available yet for this user/task."
+                        return ActionResult(extracted_content=message)
+                    elif error:
+                        return ActionResult(error=f"Failed to fetch code list: {status}. Path {base_path} may not exist.")
+                    
+                    # Filter for Python files only
+                    python_files = [
+                        {
+                            "name": item["name"],
+                            "size": item["size"]
+                        }
+                        for item in content if item["name"].endswith(".py")
+                    ]
+                    
+                    # Format the result
+                    if python_files:
+                        result_text = "Available Python code:\n\n"
+                        for file in python_files:
+                            result_text += f"  Filename: {file['name']}\n"
+                            result_text += f"  Size: {file['size']} bytes\n\n"
                         
-                        header_parts.append("# Note: API credentials are available as environment variables")
+                        result_text += "Note: Use only the filename when calling run_approved_python_code or submit_python_code."
+                    else:
+                        result_text = f"No Python code files found"
+                    
+                    logger.info(f"Found {len(python_files)} Python files")
+                    return ActionResult(extracted_content=result_text)
+                    
                 except Exception as e:
-                    logger.warning(f"Error processing API credentials: {str(e)}")
-                    # Continue without credential setup
+                    logger.error(f"Error retrieving Python code list: {str(e)}")
+                    return ActionResult(error=f"Failed to retrieve Python code list: {str(e)}")
 
-                # Create a header comment for the script
-                header_comment = "\n".join(header_parts)
+            @self.controller.registry.action('Run approved Python code')
+            async def run_approved_python_code(code_file_name: str) -> ActionResult:
+                """
+                Run Python code identified by the provided filename.
+                
+                The function retrieves the code from GitHub and executes it in a sandboxed environment.
+                API credentials will be loaded from environment variables.
+                
+                Parameters:
+                    code_file_name: The filename of the Python code to run (e.g., "script.py").
+                                Do not include any path information, just the filename.
+                    
+                Returns:
+                    The output of the executed Python code
+                """
+                try:
+                    # Check if user_id is available
+                    if not self.user_id:
+                        return ActionResult(error="User ID not available")
+                    
+                    # Validate that code_file_name is just a filename, not a path
+                    if "/" in code_file_name or "\\" in code_file_name:
+                        return ActionResult(error="Invalid filename. Please provide just the filename without any path (e.g., 'script.py')")
+                    
+                    # Ensure filename ends with .py
+                    if not code_file_name.endswith('.py'):
+                        return ActionResult(error="Invalid filename. The file must have a .py extension")
+                    
+                    # Get the base path using the utility function
+                    base_path = get_agent_code_base_path(self.user_id, self.current_task_id)
+                    full_path = f"{base_path}/{code_file_name}"
+                    
+                    logger.info(f"Using filename: {code_file_name}, full path: {full_path}")
+                    
+                    # Create GitHub API endpoint
+                    endpoint = f"repos/john-the-dev/agentweb-agentcode/contents/{full_path}"
+                    
+                    # Call GitHub API to get file content
+                    status, content, error = await call_github_api("get", endpoint)
+                    
+                    # Return error if file not found
+                    if status == 404:
+                        return ActionResult(error=f"File '{code_file_name}' not found")
+                    elif error:
+                        return ActionResult(error=f"Failed to fetch code: {status}")
+                    
+                    # Decode content from base64
+                    if content.get("encoding") == "base64" and content.get("content"):
+                        python_code = base64.b64decode(content["content"]).decode("utf-8")
+                    else:
+                        return ActionResult(error="Invalid content format received from GitHub")
+                    
+                    # Create header comment with metadata
+                    header_parts = [
+                        f"# GitHub code execution from {code_file_name}",
+                        f"# Executed at: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                    ]
+                    
+                    # Get all API credentials
+                    try:
+                        # Get all available API credentials
+                        api_credentials, api_key_names = fetch_api_credentials(self.user_id)
+                        
+                        if api_credentials:
+                            # Create environment variables for the credentials
+                            env_vars = {}
+                            for app_name, cred_info in api_credentials.items():
+                                env_var_name = f"{app_name.upper()}_API_CREDENTIAL"
+                                env_vars[env_var_name] = cred_info["value"]
+                                header_parts.append(f"# API credential available: {app_name}")
+                                header_parts.append(f"# API credential field name: {api_key_names[app_name]}")
+                                header_parts.append(f"# Environment variable: {env_var_name}")
+                                header_parts.append("")
+                            
+                            header_parts.append("# Note: API credentials are available as environment variables")
+                    except Exception as e:
+                        logger.warning(f"Error processing API credentials: {str(e)}")
+                        # Continue without credential setup
 
-                # Execute the Python code in a sandboxed environment using the utility function
-                return run_python_code_in_sandbox(
-                    python_code=python_code,
-                    execution_id=self.current_execution_id,
-                    user_id=self.user_id,
-                    script_type="approved",
-                    header_comment=header_comment,
-                    additional_env_vars=env_vars
-                )
-                
-            except Exception as e:
-                logger.error(f"Error running Python code: {str(e)}")
-                return ActionResult(error=f"Failed to run Python code: {str(e)}")
+                    # Create a header comment for the script
+                    header_comment = "\n".join(header_parts)
 
-        @self.controller.registry.action('Submit Python code')
-        async def submit_python_code(python_code: str, code_file_name: str, is_new_file: bool = False) -> ActionResult:
-            """
-            Submit Python code to GitHub as a pull request.
-            
-            The function creates or updates a file in the GitHub repository via a PR.
-            
-            Parameters:
-                python_code: The Python code to submit
-                code_file_name: The filename to use. Should be just a filename (e.g., "script.py") without any path.
-                                This parameter is required.
-                is_new_file: Boolean indicating whether to create a new file (True) or update an existing one (False).
-                             If set to True and a file with the same name already exists, a new file with a timestamp
-                             will be created instead.
-                
-            Returns:
-                The URL of the created pull request
-            """
-            try:
-                # Check if user_id is available
-                if not self.user_id:
-                    return ActionResult(error="User ID not available")
-                
-                # Get the base path using the utility function
-                base_path = get_agent_code_base_path(self.user_id, self.current_task_id)
-                
-                # GitHub API endpoints
-                api_base = "https://api.github.com"
-                
-                # Validate that code_file_name is just a filename, not a path
-                if "/" in code_file_name or "\\" in code_file_name:
-                    return ActionResult(error="Invalid filename. Please provide just the filename without any path (e.g., 'script.py')")
-                
-                # Ensure filename ends with .py
-                if not code_file_name.endswith('.py'):
-                    code_file_name += '.py'
-                
-                # Construct the full path
-                full_path = f"{base_path}/{code_file_name}"
-                logger.info(f"Using filename: {code_file_name}, full path: {full_path}")
-                
-                # Create a unique branch name for the PR
-                timestamp = int(time.time())
-                random_suffix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=6))
-                branch_name = f"agent-code-submission-{timestamp}-{random_suffix}"
-                
-                # 1. Get the default branch (usually 'main' or 'master')
-                repo_endpoint = "repos/john-the-dev/agentweb-agentcode"
-                repo_status, repo_info, repo_error = await call_github_api("get", repo_endpoint)
-                
-                if repo_error:
-                    return ActionResult(error=f"Failed to get repository info: {repo_status}")
-                
-                default_branch = repo_info["default_branch"]
-                
-                # 2. Get the latest commit SHA on the default branch
-                ref_endpoint = f"repos/john-the-dev/agentweb-agentcode/git/ref/heads/{default_branch}"
-                ref_status, ref_data, ref_error = await call_github_api("get", ref_endpoint)
-                
-                if ref_error:
-                    return ActionResult(error=f"Failed to get reference: {ref_status}")
-                
-                sha = ref_data["object"]["sha"]
-                
-                # 3. Create a new branch
-                branch_endpoint = "repos/john-the-dev/agentweb-agentcode/git/refs"
-                branch_data = {
-                    "ref": f"refs/heads/{branch_name}",
-                    "sha": sha
-                }
-                
-                branch_status, branch_result, branch_error = await call_github_api("post", branch_endpoint, json_data=branch_data)
-                
-                if branch_error:
-                    return ActionResult(error=f"Failed to create branch: {branch_status}")
-                
-                logger.info(f"Created branch: {branch_name}")
-                
-                # 4. Check if file exists to get its SHA (for updates)
-                file_sha = None
-                file_exists = False
-                
-                check_file_endpoint = f"repos/john-the-dev/agentweb-agentcode/contents/{full_path}"
-                file_status, file_info, file_error = await call_github_api("get", check_file_endpoint)
-                
-                if file_status == 200:
-                    file_exists = True
-                    file_sha = file_info.get("sha")
-                    logger.info(f"Existing file found, SHA: {file_sha}")
-                
-                # If is_new_file is True and file exists, create a new filename with timestamp
-                if is_new_file and file_exists:
-                    return ActionResult(error=f"File '{code_file_name}' already exists. Please choose a different filename or set is_new_file to False to update the existing file.")
-                
-                # If file exists and is_new_file is False, we need the SHA to update
-                if not is_new_file and not file_exists:
-                    return ActionResult(error=f"File '{code_file_name}' does not exist. Please choose an existing filename from get_approved_python_code or set is_new_file to True to create a new file.")
-                
-                # 5. Create or update the file
-                # Add header comment with metadata
-                python_code_with_header = f"""#!/usr/bin/env python3
-# Agent-generated Python code
-# Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}
-# Description: Code submitted by AgentWeb
+                    # Execute the Python code in a sandboxed environment using the utility function
+                    return run_python_code_in_sandbox(
+                        python_code=python_code,
+                        execution_id=self.current_execution_id,
+                        user_id=self.user_id,
+                        script_type="approved",
+                        header_comment=header_comment,
+                        additional_env_vars=env_vars
+                    )
+                    
+                except Exception as e:
+                    logger.error(f"Error running Python code: {str(e)}")
+                    return ActionResult(error=f"Failed to run Python code: {str(e)}")
 
-{python_code}
-"""
+            @self.controller.registry.action('Submit Python code')
+            async def submit_python_code(python_code: str, code_file_name: str, is_new_file: bool = False) -> ActionResult:
+                """
+                Submit Python code to GitHub as a pull request.
                 
-                file_data = {
-                    "message": f"Agent submission: {code_file_name}",
-                    "content": base64.b64encode(python_code_with_header.encode()).decode(),
-                    "branch": branch_name
-                }
+                The function creates or updates a file in the GitHub repository via a PR.
                 
-                if file_sha:
-                    file_data["sha"] = file_sha
-                
-                put_file_endpoint = f"repos/john-the-dev/agentweb-agentcode/contents/{full_path}"
-                put_status, put_result, put_error = await call_github_api("put", put_file_endpoint, json_data=file_data)
-                
-                if put_error:
-                    return ActionResult(error=f"Failed to create/update file: {put_status}")
-                
-                logger.info(f"Successfully {'created' if not file_sha else 'updated'} file: {code_file_name}")
-                
-                # 6. Create a pull request
-                pr_endpoint = "repos/john-the-dev/agentweb-agentcode/pulls"
-                pr_data = {
-                    "title": f"Agent Code Submission: {code_file_name}",
-                    "body": "This PR contains Python code generated or submitted by the AgentWeb agent.\n\nPlease review the code carefully before merging.",
-                    "head": branch_name,
-                    "base": default_branch
-                }
-                
-                pr_status, pr_info, pr_error = await call_github_api("post", pr_endpoint, json_data=pr_data)
-                
-                if pr_error:
-                    return ActionResult(error=f"Failed to create PR: {pr_status}")
-                
-                pr_html_url = pr_info["html_url"]
-                logger.info(f"Created PR: {pr_html_url}")
-                
-                result_message = f"""
-Python code successfully submitted to GitHub.
-                
-Filename: {code_file_name}
-Branch: {branch_name}
-Pull Request: {pr_html_url}
-Operation: {'Created new file' if (is_new_file or not file_exists) else 'Updated existing file'}
+                Parameters:
+                    python_code: The Python code to submit
+                    code_file_name: The filename to use. Should be just a filename (e.g., "script.py") without any path.
+                                    This parameter is required.
+                    is_new_file: Boolean indicating whether to create a new file (True) or update an existing one (False).
+                                If set to True and a file with the same name already exists, a new file with a timestamp
+                                will be created instead.
+                    
+                Returns:
+                    The URL of the created pull request
+                """
+                try:
+                    # Check if user_id is available
+                    if not self.user_id:
+                        return ActionResult(error="User ID not available")
+                    
+                    # Get the base path using the utility function
+                    base_path = get_agent_code_base_path(self.user_id, self.current_task_id)
+                    
+                    # GitHub API endpoints
+                    api_base = "https://api.github.com"
+                    
+                    # Validate that code_file_name is just a filename, not a path
+                    if "/" in code_file_name or "\\" in code_file_name:
+                        return ActionResult(error="Invalid filename. Please provide just the filename without any path (e.g., 'script.py')")
+                    
+                    # Ensure filename ends with .py
+                    if not code_file_name.endswith('.py'):
+                        code_file_name += '.py'
+                    
+                    # Construct the full path
+                    full_path = f"{base_path}/{code_file_name}"
+                    logger.info(f"Using filename: {code_file_name}, full path: {full_path}")
+                    
+                    # Create a unique branch name for the PR
+                    timestamp = int(time.time())
+                    random_suffix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=6))
+                    branch_name = f"agent-code-submission-{timestamp}-{random_suffix}"
+                    
+                    # 1. Get the default branch (usually 'main' or 'master')
+                    repo_endpoint = "repos/john-the-dev/agentweb-agentcode"
+                    repo_status, repo_info, repo_error = await call_github_api("get", repo_endpoint)
+                    
+                    if repo_error:
+                        return ActionResult(error=f"Failed to get repository info: {repo_status}")
+                    
+                    default_branch = repo_info["default_branch"]
+                    
+                    # 2. Get the latest commit SHA on the default branch
+                    ref_endpoint = f"repos/john-the-dev/agentweb-agentcode/git/ref/heads/{default_branch}"
+                    ref_status, ref_data, ref_error = await call_github_api("get", ref_endpoint)
+                    
+                    if ref_error:
+                        return ActionResult(error=f"Failed to get reference: {ref_status}")
+                    
+                    sha = ref_data["object"]["sha"]
+                    
+                    # 3. Create a new branch
+                    branch_endpoint = "repos/john-the-dev/agentweb-agentcode/git/refs"
+                    branch_data = {
+                        "ref": f"refs/heads/{branch_name}",
+                        "sha": sha
+                    }
+                    
+                    branch_status, branch_result, branch_error = await call_github_api("post", branch_endpoint, json_data=branch_data)
+                    
+                    if branch_error:
+                        return ActionResult(error=f"Failed to create branch: {branch_status}")
+                    
+                    logger.info(f"Created branch: {branch_name}")
+                    
+                    # 4. Check if file exists to get its SHA (for updates)
+                    file_sha = None
+                    file_exists = False
+                    
+                    check_file_endpoint = f"repos/john-the-dev/agentweb-agentcode/contents/{full_path}"
+                    file_status, file_info, file_error = await call_github_api("get", check_file_endpoint)
+                    
+                    if file_status == 200:
+                        file_exists = True
+                        file_sha = file_info.get("sha")
+                        logger.info(f"Existing file found, SHA: {file_sha}")
+                    
+                    # If is_new_file is True and file exists, create a new filename with timestamp
+                    if is_new_file and file_exists:
+                        return ActionResult(error=f"File '{code_file_name}' already exists. Please choose a different filename or set is_new_file to False to update the existing file.")
+                    
+                    # If file exists and is_new_file is False, we need the SHA to update
+                    if not is_new_file and not file_exists:
+                        return ActionResult(error=f"File '{code_file_name}' does not exist. Please choose an existing filename from get_approved_python_code or set is_new_file to True to create a new file.")
+                    
+                    # 5. Create or update the file
+                    # Add header comment with metadata
+                    python_code_with_header = f"""#!/usr/bin/env python3
+    # Agent-generated Python code
+    # Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}
+    # Description: Code submitted by AgentWeb
 
-Once the PR is approved and merged, this code will be available through the 'Run approved Python code' action using the filename: {code_file_name}
-"""
-                
-                return ActionResult(extracted_content=result_message)
-                
-            except Exception as e:
-                logger.error(f"Error submitting Python code: {str(e)}")
-                return ActionResult(error=f"Failed to submit Python code: {str(e)}")
+    {python_code}
+    """
+                    
+                    file_data = {
+                        "message": f"Agent submission: {code_file_name}",
+                        "content": base64.b64encode(python_code_with_header.encode()).decode(),
+                        "branch": branch_name
+                    }
+                    
+                    if file_sha:
+                        file_data["sha"] = file_sha
+                    
+                    put_file_endpoint = f"repos/john-the-dev/agentweb-agentcode/contents/{full_path}"
+                    put_status, put_result, put_error = await call_github_api("put", put_file_endpoint, json_data=file_data)
+                    
+                    if put_error:
+                        return ActionResult(error=f"Failed to create/update file: {put_status}")
+                    
+                    logger.info(f"Successfully {'created' if not file_sha else 'updated'} file: {code_file_name}")
+                    
+                    # 6. Create a pull request
+                    pr_endpoint = "repos/john-the-dev/agentweb-agentcode/pulls"
+                    pr_data = {
+                        "title": f"Agent Code Submission: {code_file_name}",
+                        "body": "This PR contains Python code generated or submitted by the AgentWeb agent.\n\nPlease review the code carefully before merging.",
+                        "head": branch_name,
+                        "base": default_branch
+                    }
+                    
+                    pr_status, pr_info, pr_error = await call_github_api("post", pr_endpoint, json_data=pr_data)
+                    
+                    if pr_error:
+                        return ActionResult(error=f"Failed to create PR: {pr_status}")
+                    
+                    pr_html_url = pr_info["html_url"]
+                    logger.info(f"Created PR: {pr_html_url}")
+                    
+                    result_message = f"""
+    Python code successfully submitted to GitHub.
+                    
+    Filename: {code_file_name}
+    Branch: {branch_name}
+    Pull Request: {pr_html_url}
+    Operation: {'Created new file' if (is_new_file or not file_exists) else 'Updated existing file'}
+
+    Once the PR is approved and merged, this code will be available through the 'Run approved Python code' action using the filename: {code_file_name}
+    """
+                    
+                    return ActionResult(extracted_content=result_message)
+                    
+                except Exception as e:
+                    logger.error(f"Error submitting Python code: {str(e)}")
+                    return ActionResult(error=f"Failed to submit Python code: {str(e)}")
 
         @self.controller.registry.action('Upload file')
         async def upload_file(file_name: str, index: int, browser: BrowserContext) -> ActionResult:
