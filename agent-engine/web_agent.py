@@ -655,9 +655,9 @@ class WebAgent:
             except Exception as e:
                 return ActionResult(error=f"Error retrieving integration details: {str(e)}")
                 
-        @self.controller.registry.action('Run integration test with API credentials, load the API credentials from environment variables with names like GITHUB_API_CREDENTIAL, STRIPE_API_CREDENTIAL, etc.', param_model=IntegrationTestParams)
+        @self.controller.registry.action('Run integration test with API credentials, load the API credentials from environment variables with names like GITHUB_API_CREDENTIAL, STRIPE_API_CREDENTIAL, etc. Do not use it for general purpose code execution.', param_model=IntegrationTestParams)
         def run_integration_test(params: IntegrationTestParams) -> ActionResult:
-            """Run Python code with API credentials loaded from environment variables
+            """Run Python code with API credentials loaded from environment variables.
             
             Parameters:
             - params: IntegrationTestParams containing:
@@ -1689,139 +1689,145 @@ class WebAgent:
                     logger.error(f"Error reading attached file: {e}")
                     return ActionResult(error=f"Failed to read file: {str(e)}")
 
-            @self.controller.registry.action('Perform data analysis on attached files')
-            async def perform_data_analysis(file_names: List[str], analysis_task: str) -> ActionResult:
-                """Perform data analysis on attached files using Google Gemini SDK with code execution.
-                
-                This action uses the Google Gemini SDK to analyze files with code execution capabilities.
-                Files are sent as inline data (base64 encoded) to the Gemini model for analysis.
-                
-                Parameters:
-                - file_names: List of attached file names to analyze
-                - analysis_task: Description of the analysis task to perform
-                
-                Returns:
-                - ActionResult with the analysis results or error message
-                """
+        @self.controller.registry.action('Perform data analysis with code execution on attached and downloaded files.')
+        async def perform_data_analysis(file_names: List[str], analysis_task: str) -> ActionResult:
+            """Perform data analysis on files using Google Gemini SDK with code execution.
+            
+            This action uses the Google Gemini SDK to analyze files with code execution capabilities.
+            Files are sent as inline data (base64 encoded) to the Gemini model for analysis.
+            
+            Parameters:
+            - file_names: List of file names to analyze. If the file is not attached, it will be searched in the downloads folder.
+            - analysis_task: Description of the analysis task to perform
+            
+            Returns:
+            - ActionResult with the analysis results or error message
+            """
+            try:
+                # Import Google Gemini SDK
                 try:
-                    # Import Google Gemini SDK
+                    from google import genai
+                    from google.genai import types
+                except ImportError:
+                    return ActionResult(error="Google Gemini SDK not installed. Install with: pip install google-genai")
+
+                # Get API key
+                api_key = os.getenv('GEMINI_API_KEY')
+                if not api_key:
+                    return ActionResult(error="GEMINI_API_KEY environment variable is not set")
+
+                # Initialize the client
+                client = genai.Client(api_key=api_key)
+                
+                # Prepare file data for analysis
+                file_parts = []
+                
+                for file_name in file_names:
+                    # Try to get file path from attachments first, then downloads
+                    file_path = await self._get_attachment_path(file_name)
+                    
+                    if not file_path:
+                        # If not found in attachments, try downloads path
+                        downloads_path = self._get_downloads_path()
+                        file_path = Path(downloads_path) / file_name
+                        
+                        if not file_path.exists():
+                            return ActionResult(error=f"File {file_name} not found in task attachments or downloads folder")
+
+                    # Read file content
                     try:
-                        from google import genai
-                        from google.genai import types
-                    except ImportError:
-                        return ActionResult(error="Google Gemini SDK not installed. Install with: pip install google-genai")
-
-                    # Get API key
-                    api_key = os.getenv('GEMINI_API_KEY')
-                    if not api_key:
-                        return ActionResult(error="GEMINI_API_KEY environment variable is not set")
-
-                    # Initialize the client
-                    client = genai.Client(api_key=api_key)
-                    
-                    # Prepare file data for analysis
-                    file_parts = []
-                    
-                    for file_name in file_names:
-                        # Get attachment path
-                        file_path = await self._get_attachment_path(file_name)
-                        if not file_path:
-                            return ActionResult(error=f"File {file_name} not found in task attachments")
-
-                        # Read file content
-                        try:
-                            with open(file_path, 'r', encoding='utf-8') as f:
-                                file_content = f.read()
-                            # Encode as base64 for inline_data
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            file_content = f.read()
+                        # Encode as base64 for inline_data
+                        import base64
+                        file_content = base64.b64encode(file_content.encode('utf-8')).decode('utf-8')
+                    except UnicodeDecodeError:
+                        # Try binary mode for non-text files
+                        with open(file_path, 'rb') as f:
+                            file_content = f.read()
+                            # For binary files, we'll encode as base64
                             import base64
-                            file_content = base64.b64encode(file_content.encode('utf-8')).decode('utf-8')
-                        except UnicodeDecodeError:
-                            # Try binary mode for non-text files
-                            with open(file_path, 'rb') as f:
-                                file_content = f.read()
-                                # For binary files, we'll encode as base64
-                                import base64
-                                file_content = base64.b64encode(file_content).decode('utf-8')
-                        
-                        # Determine MIME type based on file extension
-                        file_ext = Path(file_name).suffix.lower()
-                        mime_type_map = {
-                            '.csv': 'text/csv',
-                            '.txt': 'text/plain',
-                            '.json': 'application/json',
-                            '.jsonl': 'application/jsonl',
-                            '.xml': 'application/xml',
-                            '.yaml': 'application/x-yaml',
-                            '.yml': 'application/x-yaml',
-                            '.html': 'text/html',
-                            '.htm': 'text/html',
-                            '.md': 'text/markdown',
-                            '.log': 'text/plain',
-                            '.py': 'text/x-python',
-                            '.js': 'text/javascript',
-                            '.ts': 'text/typescript',
-                            '.java': 'text/x-java-source',
-                            '.cpp': 'text/x-c++src',
-                            '.c': 'text/x-csrc'
+                            file_content = base64.b64encode(file_content).decode('utf-8')
+                    
+                    # Determine MIME type based on file extension
+                    file_ext = Path(file_name).suffix.lower()
+                    mime_type_map = {
+                        '.csv': 'text/csv',
+                        '.txt': 'text/plain',
+                        '.json': 'application/json',
+                        '.jsonl': 'application/jsonl',
+                        '.xml': 'application/xml',
+                        '.yaml': 'application/x-yaml',
+                        '.yml': 'application/x-yaml',
+                        '.html': 'text/html',
+                        '.htm': 'text/html',
+                        '.md': 'text/markdown',
+                        '.log': 'text/plain',
+                        '.py': 'text/x-python',
+                        '.js': 'text/javascript',
+                        '.ts': 'text/typescript',
+                        '.java': 'text/x-java-source',
+                        '.cpp': 'text/x-c++src',
+                        '.c': 'text/x-csrc'
+                    }
+                    mime_type = mime_type_map.get(file_ext, 'text/plain')
+                    
+                    # Create file part
+                    file_part = {
+                        "inline_data": {
+                            "data": file_content,
+                            "mime_type": mime_type
                         }
-                        mime_type = mime_type_map.get(file_ext, 'text/plain')
-                        
-                        # Create file part
-                        file_part = {
-                            "inline_data": {
-                                "data": file_content,
-                                "mime_type": mime_type
-                            }
-                        }
-                        file_parts.append(file_part)
-                    
-                    # Call Gemini API
-                    model_name = os.getenv('DATA_ANALYSIS_LLM_NAME', 'gemini-2.5-pro')
-                    
-                    # Create the content parts properly
-                    content_parts = []
-                    
-                    # Add file parts
-                    for file_part in file_parts:
-                        content_parts.append(file_part)
-                    
-                    # Add text part
-                    content_parts.append({
-                        "text": f"Please perform the following analysis task on the provided files:\n\n{analysis_task}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present."
-                    })
-                    
-                    response = client.models.generate_content(
-                        model=model_name,  # Use environment variable or default to gemini-2.5-pro
-                        contents=content_parts,
-                        config=types.GenerateContentConfig(
-                            tools=[types.Tool(code_execution=types.ToolCodeExecution)]
-                        ),
-                    )
-                    
-                    # Extract and format the response
-                    result_parts = []
-                    code_executed = False
-                    
-                    for part in response.candidates[0].content.parts:
-                        if part.text is not None:
-                            result_parts.append(f"**Analysis:** {part.text}")
-                        if part.executable_code is not None:
-                            result_parts.append(f"**Code Executed:**\n```python\n{part.executable_code.code}\n```")
-                            code_executed = True
-                        if part.code_execution_result is not None:
-                            result_parts.append(f"**Code Output:**\n```\n{part.code_execution_result.output}\n```")
-                    
-                    if not result_parts:
-                        return ActionResult(error="No analysis results received from Gemini")
-                    
-                    # Combine all results
-                    analysis_result = "\n\n".join(result_parts)
-                    
-                    return ActionResult(extracted_content=f"{analysis_result}{'\n\nNo code execution was performed.' if not code_executed else ''}")
+                    }
+                    file_parts.append(file_part)
+                
+                # Call Gemini API
+                model_name = os.getenv('DATA_ANALYSIS_LLM_NAME', 'gemini-2.5-pro')
+                
+                # Create the content parts properly
+                content_parts = []
+                
+                # Add file parts
+                for file_part in file_parts:
+                    content_parts.append(file_part)
+                
+                # Add text part
+                content_parts.append({
+                    "text": f"Please perform the following analysis task on the provided files:\n\n{analysis_task}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present."
+                })
+                
+                response = client.models.generate_content(
+                    model=model_name,  # Use environment variable or default to gemini-2.5-pro
+                    contents=content_parts,
+                    config=types.GenerateContentConfig(
+                        tools=[types.Tool(code_execution=types.ToolCodeExecution)]
+                    ),
+                )
+                
+                # Extract and format the response
+                result_parts = []
+                code_executed = False
+                
+                for part in response.candidates[0].content.parts:
+                    if part.text is not None:
+                        result_parts.append(f"**Analysis:** {part.text}")
+                    if part.executable_code is not None:
+                        result_parts.append(f"**Code Executed:**\n```python\n{part.executable_code.code}\n```")
+                        code_executed = True
+                    if part.code_execution_result is not None:
+                        result_parts.append(f"**Code Output:**\n```\n{part.code_execution_result.output}\n```")
+                
+                if not result_parts:
+                    return ActionResult(error="No analysis results received from Gemini")
+                
+                # Combine all results
+                analysis_result = "\n\n".join(result_parts)
+                
+                return ActionResult(extracted_content=f"{analysis_result}{'\n\nNo code execution was performed.' if not code_executed else ''}")
 
-                except Exception as e:
-                    logger.error(f"Error performing data analysis: {e}")
-                    return ActionResult(error=f"Failed to perform data analysis: {str(e)}")
+            except Exception as e:
+                logger.error(f"Error performing data analysis: {e}")
+                return ActionResult(error=f"Failed to perform data analysis: {str(e)}")
 
     def _get_cookies_path(self):
         """Get the path to the user's cookies file"""
