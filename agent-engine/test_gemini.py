@@ -441,6 +441,131 @@ async def test_gemini_aigc(model_id="models/gemini-2.0-flash-preview-image-gener
         logger.error(traceback.format_exc())
         return False
 
+async def test_gemini_code_execution(model_name="gemini-2.0-flash"):
+    """Test the Google Gemini code execution integration"""
+    load_dotenv()
+    api_key = os.getenv('GEMINI_API_KEY')
+    if not api_key:
+        logger.error("GEMINI_API_KEY environment variable is not set")
+        return False
+
+    logger.info(f"Testing Google Gemini code execution with model: {model_name}")
+
+    try:
+        from task_utils import get_gemini_llm
+
+        # Use the same LLM initialization to ensure tools are bound
+        llm = get_gemini_llm(model_name, code_execution=True)
+        
+        # Test with a simple prompt that should trigger code execution
+        logger.info("Sending code execution prompt to Gemini model...")
+        response = llm.invoke("What is 2*2, use python")
+
+        logger.info("Response received:")
+        logger.info(response.content)
+
+        # Assert that the response contains the code execution result
+        if isinstance(response.content, list):
+            found_code_execution = any(
+                c.get("type") == "executable_code" for c in response.content if isinstance(c, dict)
+            )
+            found_execution_result = any(
+                c.get("type") == "code_execution_result" for c in response.content if isinstance(c, dict)
+            )
+            if found_code_execution and found_execution_result:
+                logger.info("Test completed successfully!")
+                return True
+            else:
+                logger.error("Response did not contain expected code execution output.")
+                return False
+        else:
+            logger.error(f"Unexpected response format: {type(response.content)}")
+            return False
+
+    except Exception as e:
+        logger.error(f"Error testing Gemini code execution: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return False
+
+async def test_with_browser_use_code_execution_async(model_name="gemini-2.0-flash"):
+    """Test using Gemini with browser-use for web automation with code execution enabled"""
+    load_dotenv()
+    api_key = os.getenv('GEMINI_API_KEY')
+    if not api_key:
+        logger.error("GEMINI_API_KEY environment variable is not set")
+        return False
+
+    logger.info(f"Testing Google Gemini with browser-use and code execution using model: {model_name}")
+
+    try:
+        from task_utils import get_gemini_llm
+
+        # Use the same LLM initialization as web_agent.py to ensure consistency
+        llm = get_gemini_llm(model_name, code_execution=True)
+        
+        # Initialize Agent with the Gemini model and controller
+        logger.info("Initializing Agent with Gemini model (with code execution)...")
+        agent = Agent(
+            task="Calculate what 2 * 2 equals using Python code execution. Return the result.",
+            llm=llm
+        )
+        
+        # Run the agent
+        logger.info("Executing browser automation task with code execution...")
+        result = await agent.run(max_steps=25)
+        
+        # Check if task completed successfully
+        task_is_done = result.is_done()
+        
+        # Get agent message
+        agent_message = None
+        if task_is_done:
+            agent_message = result.history[-1].result[-1].extracted_content
+        
+        if agent_message is None:
+            agent_message = 'Oops! Something went wrong while running the test.'
+        
+        # Print the result
+        logger.info(f"Task completed: {task_is_done}")
+        logger.info(f"Message: {agent_message}")
+        
+        # Check if code execution was used
+        code_execution_used = False
+        for step in result.history:
+            if hasattr(step, 'result') and step.result:
+                for action in step.result:
+                    if hasattr(action, 'function_call'):
+                        logger.info(f"Function called: {action.function_call}")
+                        # Check if any code execution occurred
+                        if hasattr(action, 'content') and isinstance(action.content, list):
+                            for content_item in action.content:
+                                if isinstance(content_item, dict):
+                                    if content_item.get("type") == "executable_code":
+                                        code_execution_used = True
+                                        logger.info("Code execution detected in response!")
+                                    elif content_item.get("type") == "code_execution_result":
+                                        code_execution_used = True
+                                        logger.info("Code execution result detected in response!")
+        
+        if code_execution_used:
+            logger.info("✅ Code execution test with browser-use completed successfully!")
+            return True
+        else:
+            logger.warning("⚠️ Task completed but no code execution was detected")
+            logger.info("This might indicate the browser-use Agent is not properly handling the bound LLM")
+            return False
+        
+    except Exception as e:
+        logger.error(f"Error testing with browser-use and code execution: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return False
+
+def test_with_browser_use_code_execution(model_name="gemini-2.0-flash"):
+    """Wrapper to run the async browser-use code execution test"""
+    return asyncio.run(test_with_browser_use_code_execution_async(model_name))
+
 if __name__ == "__main__":
     import argparse
     
@@ -449,6 +574,9 @@ if __name__ == "__main__":
     parser.add_argument('--model', type=str, default="gemini-2.0-flash", help='Model name to use for basic or browser-use tests (default: gemini-2.0-flash)')
     parser.add_argument('--aigc', action='store_true', help='Run interactive Gemini AIGC (image generation) test') 
     parser.add_argument('--aigc_model', type=str, default="models/gemini-2.0-flash-preview-image-generation", help='Model name for AIGC test (default: models/gemini-2.0-flash-preview-image-generation)')
+    parser.add_argument('--code-exec', action='store_true', help='Run Gemini code execution test')
+    parser.add_argument('--browser-use-code-exec', action='store_true', help='Run Gemini code execution test with browser-use Agent')
+    
     args = parser.parse_args()
     
     if args.aigc: # Prioritize AIGC if flag is set
@@ -457,12 +585,24 @@ if __name__ == "__main__":
             print("\nGemini AIGC test completed.")
         else:
             print("\nGemini AIGC test failed or exited early.")
+    elif args.browser_use_code_exec:
+        success = test_with_browser_use_code_execution(args.model)
+        if success:
+            print("\nBrowser-use code execution test completed successfully!")
+        else:
+            print("\nBrowser-use code execution test failed. This confirms the bug.")
     elif args.browser_use:
         success = test_with_browser_use(args.model)
         if success:
             print("\nBrowser-use test completed successfully!")
         else:
             print("\nBrowser-use test failed. Please check the logs for details.")
+    elif args.code_exec:
+        success = asyncio.run(test_gemini_code_execution(model_name=args.model))
+        if success:
+            print("\nGemini code execution test completed successfully!")
+        else:
+            print("\nGemini code execution test failed.")
     else:
         success = test_gemini(args.model)
         if success:
