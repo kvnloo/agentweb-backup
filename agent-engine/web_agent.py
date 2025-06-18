@@ -1721,6 +1721,9 @@ class WebAgent:
                 
                 # Prepare file data for analysis
                 file_parts = []
+                total_size = 0
+                # Get file size limit from environment variable, default to 50MB
+                max_total_size = int(os.getenv('DATA_ANALYSIS_FILE_SIZE', '52428800'))  # 50MB in bytes
                 
                 for file_name in file_names:
                     # Try to get file path from attachments first, then downloads
@@ -1733,6 +1736,13 @@ class WebAgent:
                         
                         if not file_path.exists():
                             return ActionResult(error=f"File {file_name} not found in task attachments or downloads folder")
+
+                    # Check file size before processing
+                    file_size = file_path.stat().st_size
+                    total_size += file_size
+                    
+                    if total_size > max_total_size:
+                        return ActionResult(error=f"Total file size ({total_size} bytes) exceeds the {max_total_size} bytes limit. Please reduce the number or size of files.")
 
                     # Read file content
                     try:
