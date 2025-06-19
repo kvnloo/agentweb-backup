@@ -182,7 +182,7 @@ interface KnowledgeBaseMetrics {
     name: string;
     knowledgeBaseSize: number;
     owner: string;
-    type: 'public' | 'private';
+    type: "public" | "private";
   }[];
 }
 
@@ -423,7 +423,8 @@ export default function AdminDashboard() {
   const [userIdToDelete, setUserIdToDelete] = useState<string | null>(null);
   const [userDeleteConfirmOpen, setUserDeleteConfirmOpen] = useState(false);
   const [workflows, setWorkflows] = useState<AdminWorkflow[]>([]);
-  const [knowledgeBaseMetrics, setKnowledgeBaseMetrics] = useState<KnowledgeBaseMetrics | null>(null);
+  const [knowledgeBaseMetrics, setKnowledgeBaseMetrics] =
+    useState<KnowledgeBaseMetrics | null>(null);
   const { token } = useAuth();
 
   const {
@@ -544,18 +545,22 @@ export default function AdminDashboard() {
   useEffect(() => {
     const loadKnowledgeBaseMetrics = async () => {
       try {
-        const response = await axios.get(buildApiUrl("/api/admin/knowledge-base-metrics"), {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        });
+        const response = await axios.get(
+          buildApiUrl("/api/admin/knowledge-base-metrics"),
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          }
+        );
         setKnowledgeBaseMetrics(response.data);
       } catch (error) {
         console.error("Error loading knowledge base metrics:", error);
       }
     };
 
-    if (tabValue === 7) { // Knowledge Base tab
+    if (tabValue === 7) {
+      // Knowledge Base tab
       loadKnowledgeBaseMetrics();
     }
   }, [tabValue, token]);
@@ -1440,6 +1445,9 @@ export default function AdminDashboard() {
                     <SortLabel property="companyName" label="Company" />
                   </TableCell>
                   <TableCell>
+                    <SortLabel property="phoneNumber" label="Phone Number" />
+                  </TableCell>
+                  <TableCell>
                     <SortLabel
                       property="monthlyMarketingSpend"
                       label="Marketing Spend"
@@ -1485,6 +1493,7 @@ export default function AdminDashboard() {
                         <TableCell>{entry.stripe_customer_id || "-"}</TableCell>
                         <TableCell>{entry.fullName || "-"}</TableCell>
                         <TableCell>{entry.companyName || "-"}</TableCell>
+                        <TableCell>{entry.phoneNumber || "-"}</TableCell>
                         <TableCell>
                           {entry.monthlyMarketingSpend || "N/A"}
                         </TableCell>
@@ -2097,7 +2106,10 @@ export default function AdminDashboard() {
                     Knowledge Base Overview
                   </Typography>
                   <Typography variant="body2" color="text.secondary" paragraph>
-                    The knowledge base is the collection of all knowledge bases from all the tasks on the AgentWeb platform. It is indexed daily with Google Vertex AI Search and thus updates to the knowledge base will be available for use next day.
+                    The knowledge base is the collection of all knowledge bases
+                    from all the tasks on the AgentWeb platform. It is indexed
+                    daily with Google Vertex AI Search and thus updates to the
+                    knowledge base will be available for use next day.
                   </Typography>
                   <TableContainer component={Paper}>
                     <Table>
@@ -2115,30 +2127,84 @@ export default function AdminDashboard() {
                           <>
                             <TableRow>
                               <TableCell>Overall</TableCell>
-                              <TableCell>{knowledgeBaseMetrics.totalTasks}</TableCell>
-                              <TableCell>{knowledgeBaseMetrics.tasksWithKnowledgeBase}</TableCell>
-                              <TableCell>{(knowledgeBaseMetrics.totalKnowledgeBaseSize / 1024).toFixed(2)} KB</TableCell>
-                              <TableCell>{(knowledgeBaseMetrics.averageKnowledgeBaseSize / 1024).toFixed(2)} KB</TableCell>
+                              <TableCell>
+                                {knowledgeBaseMetrics.totalTasks}
+                              </TableCell>
+                              <TableCell>
+                                {knowledgeBaseMetrics.tasksWithKnowledgeBase}
+                              </TableCell>
+                              <TableCell>
+                                {(
+                                  knowledgeBaseMetrics.totalKnowledgeBaseSize /
+                                  1024
+                                ).toFixed(2)}{" "}
+                                KB
+                              </TableCell>
+                              <TableCell>
+                                {(
+                                  knowledgeBaseMetrics.averageKnowledgeBaseSize /
+                                  1024
+                                ).toFixed(2)}{" "}
+                                KB
+                              </TableCell>
                             </TableRow>
                             <TableRow>
                               <TableCell>Public</TableCell>
-                              <TableCell>{knowledgeBaseMetrics.public.tasks}</TableCell>
-                              <TableCell>{knowledgeBaseMetrics.public.tasksWithKnowledgeBase}</TableCell>
-                              <TableCell>{(knowledgeBaseMetrics.public.totalSize / 1024).toFixed(2)} KB</TableCell>
-                              <TableCell>{(knowledgeBaseMetrics.public.averageSize / 1024).toFixed(2)} KB</TableCell>
+                              <TableCell>
+                                {knowledgeBaseMetrics.public.tasks}
+                              </TableCell>
+                              <TableCell>
+                                {
+                                  knowledgeBaseMetrics.public
+                                    .tasksWithKnowledgeBase
+                                }
+                              </TableCell>
+                              <TableCell>
+                                {(
+                                  knowledgeBaseMetrics.public.totalSize / 1024
+                                ).toFixed(2)}{" "}
+                                KB
+                              </TableCell>
+                              <TableCell>
+                                {(
+                                  knowledgeBaseMetrics.public.averageSize / 1024
+                                ).toFixed(2)}{" "}
+                                KB
+                              </TableCell>
                             </TableRow>
                             <TableRow>
                               <TableCell>Private</TableCell>
-                              <TableCell>{knowledgeBaseMetrics.private.tasks}</TableCell>
-                              <TableCell>{knowledgeBaseMetrics.private.tasksWithKnowledgeBase}</TableCell>
-                              <TableCell>{(knowledgeBaseMetrics.private.totalSize / 1024).toFixed(2)} KB</TableCell>
-                              <TableCell>{(knowledgeBaseMetrics.private.averageSize / 1024).toFixed(2)} KB</TableCell>
+                              <TableCell>
+                                {knowledgeBaseMetrics.private.tasks}
+                              </TableCell>
+                              <TableCell>
+                                {
+                                  knowledgeBaseMetrics.private
+                                    .tasksWithKnowledgeBase
+                                }
+                              </TableCell>
+                              <TableCell>
+                                {(
+                                  knowledgeBaseMetrics.private.totalSize / 1024
+                                ).toFixed(2)}{" "}
+                                KB
+                              </TableCell>
+                              <TableCell>
+                                {(
+                                  knowledgeBaseMetrics.private.averageSize /
+                                  1024
+                                ).toFixed(2)}{" "}
+                                KB
+                              </TableCell>
                             </TableRow>
                           </>
                         ) : (
                           <TableRow>
                             <TableCell colSpan={5} align="center">
-                              <Typography variant="body2" color="text.secondary">
+                              <Typography
+                                variant="body2"
+                                color="text.secondary"
+                              >
                                 Loading metrics...
                               </Typography>
                             </TableCell>
@@ -2177,13 +2243,23 @@ export default function AdminDashboard() {
                               <TableCell>{task.name}</TableCell>
                               <TableCell>{task.owner}</TableCell>
                               <TableCell>
-                                {task.type === 'public' ? (
-                                  <Chip size="small" label="Public" color="primary" />
+                                {task.type === "public" ? (
+                                  <Chip
+                                    size="small"
+                                    label="Public"
+                                    color="primary"
+                                  />
                                 ) : (
-                                  <Chip size="small" label="Private" color="default" />
+                                  <Chip
+                                    size="small"
+                                    label="Private"
+                                    color="default"
+                                  />
                                 )}
                               </TableCell>
-                              <TableCell>{(task.knowledgeBaseSize / 1024).toFixed(2)} KB</TableCell>
+                              <TableCell>
+                                {(task.knowledgeBaseSize / 1024).toFixed(2)} KB
+                              </TableCell>
                               <TableCell>
                                 <Button
                                   size="small"
@@ -2199,8 +2275,13 @@ export default function AdminDashboard() {
                         ) : (
                           <TableRow>
                             <TableCell colSpan={6} align="center">
-                              <Typography variant="body2" color="text.secondary">
-                                {knowledgeBaseMetrics === null ? 'Loading tasks...' : 'No knowledge bases found'}
+                              <Typography
+                                variant="body2"
+                                color="text.secondary"
+                              >
+                                {knowledgeBaseMetrics === null
+                                  ? "Loading tasks..."
+                                  : "No knowledge bases found"}
                               </Typography>
                             </TableCell>
                           </TableRow>
