@@ -1689,8 +1689,8 @@ class WebAgent:
                     logger.error(f"Error reading attached file: {e}")
                     return ActionResult(error=f"Failed to read file: {str(e)}")
 
-        @self.controller.registry.action('Perform data analysis with code execution on attached and downloaded files.')
-        async def perform_data_analysis(file_names: List[str], analysis_task: str) -> ActionResult:
+        @self.controller.registry.action('Perform data analysis with code execution on attached and downloaded files. Output in text only. No output files will be saved.')
+        async def perform_data_analysis(file_names: List[str], analysis_task: str, include_lead_list: bool = False) -> ActionResult:
             """Perform data analysis on files using Google Gemini SDK with code execution.
             
             This action uses the Google Gemini SDK to analyze files with code execution capabilities.
@@ -1699,6 +1699,7 @@ class WebAgent:
             Parameters:
             - file_names: List of file names to analyze. If the file is not attached, it will be searched in the downloads folder.
             - analysis_task: Description of the analysis task to perform
+            - include_lead_list: If True, save the lead list as a JSON file and include it for analysis (default: False)
             
             Returns:
             - ActionResult with the analysis results or error message
@@ -1725,6 +1726,70 @@ class WebAgent:
                 # Get file size limit from environment variable, default to 50MB
                 max_total_size = int(os.getenv('DATA_ANALYSIS_FILE_SIZE', '52428800'))  # 50MB in bytes
                 
+                # Handle lead list data if requested
+                if include_lead_list:                    
+                    try:
+                        # Get lead list data from DynamoDB
+                        lead_list_table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskLeadList')
+                        response = lead_list_table.query(
+                            KeyConditionExpression='taskId = :taskId',
+                            ExpressionAttributeValues={
+                                ':taskId': self.current_task_id
+                            }
+                        )
+                        items = response.get('Items', [])
+                        
+                        if items:
+                            # Create CSV file with the data records
+                            import csv
+                            import io
+                            
+                            # Get all unique field names from all records
+                            all_fields = set()
+                            for item in items:
+                                record_data = item.get('data', {})
+                                all_fields.update(record_data.keys())
+                            
+                            # Sort fields for consistent ordering
+                            field_names = sorted(list(all_fields))
+                            
+                            # Create CSV content
+                            csv_buffer = io.StringIO()
+                            csv_writer = csv.writer(csv_buffer)
+                            
+                            # Write header
+                            csv_writer.writerow(field_names)
+                            
+                            # Write data rows
+                            for item in items:
+                                record_data = item.get('data', {})
+                                row = [record_data.get(field, '') for field in field_names]
+                                csv_writer.writerow(row)
+                            
+                            csv_content = csv_buffer.getvalue()
+                            csv_buffer.close()
+                            
+                            lead_list_file_name = f"lead_list.csv"
+                            
+                            # Add lead list file to the analysis
+                            file_content = base64.b64encode(csv_content.encode('utf-8')).decode('utf-8')
+                            file_part = {
+                                "inline_data": {
+                                    "data": file_content,
+                                    "mime_type": "text/csv"
+                                }
+                            }
+                            file_parts.append(file_part)
+                            
+                            # Update analysis task to mention lead list data with metadata
+                            analysis_task = f"{analysis_task}\n\nNote: Lead list data has been included as '{lead_list_file_name}' with {len(items)} records. The identifier field is '{self.lead_list_identifier}'."
+                        else:
+                            analysis_task = f"{analysis_task}\n\nNote: Lead list was requested but no records were found."
+                            
+                    except Exception as e:
+                        logger.error(f"Error retrieving lead list data: {e}")
+                        return ActionResult(error=f"Failed to retrieve lead list data: {str(e)}")
+                
                 for file_name in file_names:
                     # Try to get file path from attachments first, then downloads
                     file_path = await self._get_attachment_path(file_name)
@@ -1749,14 +1814,12 @@ class WebAgent:
                         with open(file_path, 'r', encoding='utf-8') as f:
                             file_content = f.read()
                         # Encode as base64 for inline_data
-                        import base64
                         file_content = base64.b64encode(file_content.encode('utf-8')).decode('utf-8')
                     except UnicodeDecodeError:
                         # Try binary mode for non-text files
                         with open(file_path, 'rb') as f:
                             file_content = f.read()
                             # For binary files, we'll encode as base64
-                            import base64
                             file_content = base64.b64encode(file_content).decode('utf-8')
                     
                     # Determine MIME type based on file extension
