@@ -257,7 +257,7 @@ def get_openai_llm_think(model_name: str):
         logger.error("Please ensure OPENAI_API_KEY environment variable is set correctly.")
         sys.exit(1)
 
-def get_gemini_llm(model_name: str, code_execution: bool = False):
+def get_gemini_llm(model_name: str):
     """Initialize Google Gemini language model"""
     try:
         api_key = os.getenv('GEMINI_API_KEY')
@@ -267,18 +267,11 @@ def get_gemini_llm(model_name: str, code_execution: bool = False):
         # Import here to avoid requiring the package for all users
         from langchain_google_genai import ChatGoogleGenerativeAI
         
-        llm = ChatGoogleGenerativeAI(
+        return ChatGoogleGenerativeAI(
             model=model_name,
             api_key=SecretStr(api_key),
             temperature=0.0
         )
-
-        # Enable code execution for Gemini models only if requested
-        if code_execution:
-            return llm.bind(code_execution=True)
-        else:
-            return llm
-
     except ImportError:
         logger.error("langchain_google_genai package is not installed. Install it with: pip install langchain-google-genai")
         sys.exit(1)
