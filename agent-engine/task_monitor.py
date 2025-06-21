@@ -743,8 +743,6 @@ async def execute_task(execution):
             else:
                 running_task_ids[execution_id] = 'standard'
 
-            lead_list_identifier = task.get('leadListIdentifier') if task else None
-
             # Get both accepted and rejected executions
             accepted_executions = executions_table.query(
                 IndexName='TaskFeedbackIndex',
@@ -801,25 +799,6 @@ async def execute_task(execution):
             if has_attachments:
                 attachment_list = "\n".join([f"- {attachment['filename']}" for attachment in task['attachments']])
                 prompt += f"\n\nThe following files are attached to this task:\n{attachment_list}"
-            
-            # Check for lead list data
-            try:
-                lead_list_table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskLeadList')
-                lead_list_response = lead_list_table.query(
-                    KeyConditionExpression='taskId = :taskId',
-                    ExpressionAttributeValues={
-                        ':taskId': task_id
-                    },
-                    Select='COUNT'
-                )
-                lead_count = lead_list_response.get('Count', 0)
-                
-                if lead_count > 0:
-                    prompt += f"\n\nNote: This task has a lead list with {lead_count} records. Each record is uniquely identified by field {lead_list_identifier}. You can use the perform_data_analysis action with include_lead_list=True to analyze this lead list data along with any available files."
-                    logger.info(f"Task {task_id} has {lead_count} lead list records available for analysis")
-            except Exception as e:
-                logger.warning(f"Error checking lead list for task {task_id}: {e}")
-                # Continue execution even if lead list check fails
             
             # Update execution status to running and include the prompt
             update_execution_status(execution_id, 'running', prompt=prompt)
@@ -990,6 +969,7 @@ async def execute_task(execution):
                         use_knowledge_base = bool(task.get('useKnowledgeBase', False)) if task else False
                         update_knowledge_base = bool(task.get('updateKnowledgeBase', False)) if task else False
                         update_lead_list = bool(task.get('updateLeadList', False)) if task else False
+                        lead_list_identifier = task.get('leadListIdentifier') if task else None
                         
                         # Set filtered activity log path for later reference
                         filtered_activity_log = f'logs/execution_{execution_id}_browser_use.filtered.log'
