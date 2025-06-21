@@ -66,6 +66,12 @@ class UpdateLeadListParams(BaseModel):
     """Parameters for updating lead list records."""
     records: list[dict]
 
+class DataAnalysisParams(BaseModel):
+    """Parameters for performing data analysis."""
+    file_names: List[str]
+    analysis_task: str
+    include_lead_list: bool = False
+
 class LogFilterThread(threading.Thread):
     """Thread that continuously filters the log file in real-time"""
     
@@ -1686,6 +1692,220 @@ Once the PR is approved and merged, this code will be available through the 'Run
                 except Exception as e:
                     logger.error(f"Error reading attached file: {e}")
                     return ActionResult(error=f"Failed to read file: {str(e)}")
+
+        @self.controller.registry.action('Perform data analysis with code execution on attached and downloaded files. Output in text only. No output files will be saved.', param_model=DataAnalysisParams)
+        async def perform_data_analysis(params: DataAnalysisParams) -> ActionResult:
+            """Perform data analysis on files using Google Gemini SDK with code execution.
+            
+            This action uses the Google Gemini SDK to analyze files with code execution capabilities.
+            Files are sent as inline data (base64 encoded) to the Gemini model for analysis.
+            
+            Parameters:
+            - params: DataAnalysisParams containing:
+              - file_names: List of file names to analyze. If the file is not attached, it will be searched in the downloads folder.
+              - analysis_task: Description of the analysis task to perform
+              - include_lead_list: If True, save the lead list as a JSON file and include it for analysis (default: False)
+            
+            Returns:
+            - ActionResult with the analysis results or error message
+            """
+            try:
+                # Import Google Gemini SDK
+                try:
+                    from google import genai
+                    from google.genai import types
+                except ImportError:
+                    return ActionResult(error="Google Gemini SDK not installed. Install with: pip install google-genai")
+
+                # Get API key
+                api_key = os.getenv('GEMINI_API_KEY')
+                if not api_key:
+                    return ActionResult(error="GEMINI_API_KEY environment variable is not set")
+
+                # Initialize the client
+                client = genai.Client(api_key=api_key)
+                
+                # Prepare file data for analysis
+                file_parts = []
+                total_size = 0
+                # Get file size limit from environment variable, default to 50MB
+                max_total_size = int(os.getenv('DATA_ANALYSIS_FILE_SIZE', '52428800'))  # 50MB in bytes
+                
+                # Handle lead list data if requested
+                if params.include_lead_list:                    
+                    try:
+                        # Get lead list data from DynamoDB
+                        lead_list_table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskLeadList')
+                        response = lead_list_table.query(
+                            KeyConditionExpression='taskId = :taskId',
+                            ExpressionAttributeValues={
+                                ':taskId': self.current_task_id
+                            }
+                        )
+                        items = response.get('Items', [])
+                        
+                        if items:
+                            # Create CSV file with the data records
+                            import csv
+                            import io
+                            
+                            # Get all unique field names from all records
+                            all_fields = set()
+                            for item in items:
+                                record_data = item.get('data', {})
+                                all_fields.update(record_data.keys())
+                            
+                            # Sort fields for consistent ordering
+                            field_names = sorted(list(all_fields))
+                            
+                            # Create CSV content
+                            csv_buffer = io.StringIO()
+                            csv_writer = csv.writer(csv_buffer)
+                            
+                            # Write header
+                            csv_writer.writerow(field_names)
+                            
+                            # Write data rows
+                            for item in items:
+                                record_data = item.get('data', {})
+                                row = [record_data.get(field, '') for field in field_names]
+                                csv_writer.writerow(row)
+                            
+                            csv_content = csv_buffer.getvalue()
+                            csv_buffer.close()
+                            
+                            lead_list_file_name = f"lead_list.csv"
+                            
+                            # Add lead list file to the analysis
+                            file_content = base64.b64encode(csv_content.encode('utf-8')).decode('utf-8')
+                            file_part = {
+                                "inline_data": {
+                                    "data": file_content,
+                                    "mime_type": "text/csv"
+                                }
+                            }
+                            file_parts.append(file_part)
+                            
+                            # Update analysis task to mention lead list data with metadata
+                            params.analysis_task = f"{params.analysis_task}\n\nNote: Lead list data has been included as '{lead_list_file_name}' with {len(items)} records. The identifier field is '{self.lead_list_identifier}'."
+                        else:
+                            params.analysis_task = f"{params.analysis_task}\n\nNote: Lead list was requested but no records were found."
+                            
+                    except Exception as e:
+                        logger.error(f"Error retrieving lead list data: {e}")
+                        return ActionResult(error=f"Failed to retrieve lead list data: {str(e)}")
+                
+                for file_name in params.file_names:
+                    # Try to get file path from attachments first, then downloads
+                    file_path = await self._get_attachment_path(file_name)
+                    
+                    if not file_path:
+                        # If not found in attachments, try downloads path
+                        downloads_path = self._get_downloads_path()
+                        file_path = Path(downloads_path) / file_name
+                        
+                        if not file_path.exists():
+                            return ActionResult(error=f"File {file_name} not found in task attachments or downloads folder")
+
+                    # Check file size before processing
+                    file_size = file_path.stat().st_size
+                    total_size += file_size
+                    
+                    if total_size > max_total_size:
+                        return ActionResult(error=f"Total file size ({total_size} bytes) exceeds the {max_total_size} bytes limit. Please reduce the number or size of files.")
+
+                    # Read file content
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            file_content = f.read()
+                        # Encode as base64 for inline_data
+                        file_content = base64.b64encode(file_content.encode('utf-8')).decode('utf-8')
+                    except UnicodeDecodeError:
+                        # Try binary mode for non-text files
+                        with open(file_path, 'rb') as f:
+                            file_content = f.read()
+                            # For binary files, we'll encode as base64
+                            file_content = base64.b64encode(file_content).decode('utf-8')
+                    
+                    # Determine MIME type based on file extension
+                    file_ext = Path(file_name).suffix.lower()
+                    mime_type_map = {
+                        '.csv': 'text/csv',
+                        '.txt': 'text/plain',
+                        '.json': 'application/json',
+                        '.jsonl': 'application/jsonl',
+                        '.xml': 'application/xml',
+                        '.yaml': 'application/x-yaml',
+                        '.yml': 'application/x-yaml',
+                        '.html': 'text/html',
+                        '.htm': 'text/html',
+                        '.md': 'text/markdown',
+                        '.log': 'text/plain',
+                        '.py': 'text/x-python',
+                        '.js': 'text/javascript',
+                        '.ts': 'text/typescript',
+                        '.java': 'text/x-java-source',
+                        '.cpp': 'text/x-c++src',
+                        '.c': 'text/x-csrc'
+                    }
+                    mime_type = mime_type_map.get(file_ext, 'text/plain')
+                    
+                    # Create file part
+                    file_part = {
+                        "inline_data": {
+                            "data": file_content,
+                            "mime_type": mime_type
+                        }
+                    }
+                    file_parts.append(file_part)
+                
+                # Call Gemini API
+                model_name = os.getenv('DATA_ANALYSIS_LLM_NAME', 'gemini-2.5-pro')
+                
+                # Create the content parts properly
+                content_parts = []
+                
+                # Add file parts
+                for file_part in file_parts:
+                    content_parts.append(file_part)
+                
+                # Add text part
+                content_parts.append({
+                    "text": f"Please perform the following analysis task on the provided files:\n\n{params.analysis_task}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present."
+                })
+                
+                response = client.models.generate_content(
+                    model=model_name,  # Use environment variable or default to gemini-2.5-pro
+                    contents=content_parts,
+                    config=types.GenerateContentConfig(
+                        tools=[types.Tool(code_execution=types.ToolCodeExecution)]
+                    ),
+                )
+                
+                # Extract and format the response
+                result_parts = []
+                code_executed = False
+                
+                for part in response.candidates[0].content.parts:
+                    if part.text is not None:
+                        result_parts.append(f"**Analysis:** {part.text}")
+                    if part.executable_code is not None:
+                        result_parts.append(f"**Code Executed:**\n```python\n{part.executable_code.code}\n```")
+                        code_executed = True
+                    if part.code_execution_result is not None:
+                        result_parts.append(f"**Code Output:**\n```\n{part.code_execution_result.output}\n```")
+                
+                if not result_parts:
+                    return ActionResult(error="No analysis results received from Gemini")
+                
+                # Combine all results
+                analysis_result = "\n\n".join(result_parts)
+                
+                return ActionResult(extracted_content=f"{analysis_result}{'\n\nNo code execution was performed.' if not code_executed else ''}")
+
+            except Exception as e:
+                logger.error(f"Error performing data analysis: {e}")
+                return ActionResult(error=f"Failed to perform data analysis: {str(e)}")
 
     def _get_cookies_path(self):
         """Get the path to the user's cookies file"""
