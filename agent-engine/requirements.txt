@@ -17,4 +17,3 @@ PyPDF2
 python-docx
 openpyxl
 PyYAML
-google-genai
