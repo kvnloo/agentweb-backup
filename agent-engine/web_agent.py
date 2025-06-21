@@ -66,6 +66,12 @@ class UpdateLeadListParams(BaseModel):
     """Parameters for updating lead list records."""
     records: list[dict]
 
+class DataAnalysisParams(BaseModel):
+    """Parameters for performing data analysis."""
+    file_names: List[str]
+    analysis_task: str
+    include_lead_list: bool = False
+
 class LogFilterThread(threading.Thread):
     """Thread that continuously filters the log file in real-time"""
     
@@ -1689,17 +1695,18 @@ class WebAgent:
                     logger.error(f"Error reading attached file: {e}")
                     return ActionResult(error=f"Failed to read file: {str(e)}")
 
-        @self.controller.registry.action('Perform data analysis with code execution on attached and downloaded files. Output in text only. No output files will be saved.')
-        async def perform_data_analysis(file_names: List[str], analysis_task: str, include_lead_list: bool = False) -> ActionResult:
+        @self.controller.registry.action('Perform data analysis with code execution on attached and downloaded files. Output in text only. No output files will be saved.', param_model=DataAnalysisParams)
+        async def perform_data_analysis(params: DataAnalysisParams) -> ActionResult:
             """Perform data analysis on files using Google Gemini SDK with code execution.
             
             This action uses the Google Gemini SDK to analyze files with code execution capabilities.
             Files are sent as inline data (base64 encoded) to the Gemini model for analysis.
             
             Parameters:
-            - file_names: List of file names to analyze. If the file is not attached, it will be searched in the downloads folder.
-            - analysis_task: Description of the analysis task to perform
-            - include_lead_list: If True, save the lead list as a JSON file and include it for analysis (default: False)
+            - params: DataAnalysisParams containing:
+              - file_names: List of file names to analyze. If the file is not attached, it will be searched in the downloads folder.
+              - analysis_task: Description of the analysis task to perform
+              - include_lead_list: If True, save the lead list as a JSON file and include it for analysis (default: False)
             
             Returns:
             - ActionResult with the analysis results or error message
@@ -1727,7 +1734,7 @@ class WebAgent:
                 max_total_size = int(os.getenv('DATA_ANALYSIS_FILE_SIZE', '52428800'))  # 50MB in bytes
                 
                 # Handle lead list data if requested
-                if include_lead_list:                    
+                if params.include_lead_list:                    
                     try:
                         # Get lead list data from DynamoDB
                         lead_list_table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskLeadList')
@@ -1782,15 +1789,15 @@ class WebAgent:
                             file_parts.append(file_part)
                             
                             # Update analysis task to mention lead list data with metadata
-                            analysis_task = f"{analysis_task}\n\nNote: Lead list data has been included as '{lead_list_file_name}' with {len(items)} records. The identifier field is '{self.lead_list_identifier}'."
+                            params.analysis_task = f"{params.analysis_task}\n\nNote: Lead list data has been included as '{lead_list_file_name}' with {len(items)} records. The identifier field is '{self.lead_list_identifier}'."
                         else:
-                            analysis_task = f"{analysis_task}\n\nNote: Lead list was requested but no records were found."
+                            params.analysis_task = f"{params.analysis_task}\n\nNote: Lead list was requested but no records were found."
                             
                     except Exception as e:
                         logger.error(f"Error retrieving lead list data: {e}")
                         return ActionResult(error=f"Failed to retrieve lead list data: {str(e)}")
                 
-                for file_name in file_names:
+                for file_name in params.file_names:
                     # Try to get file path from attachments first, then downloads
                     file_path = await self._get_attachment_path(file_name)
                     
@@ -1866,7 +1873,7 @@ class WebAgent:
                 
                 # Add text part
                 content_parts.append({
-                    "text": f"Please perform the following analysis task on the provided files:\n\n{analysis_task}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present."
+                    "text": f"Please perform the following analysis task on the provided files:\n\n{params.analysis_task}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present."
                 })
                 
                 response = client.models.generate_content(
