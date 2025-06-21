@@ -7,7 +7,7 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
-    date: '2025-06-18',
+    date: '2025-06-21',
     changes: [
       'Supported data analysis at task level',
       '- Our agent will execute code to perform analysis on data files when running a task in order to find insights',
