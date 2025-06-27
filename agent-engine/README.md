@@ -309,3 +309,6 @@ def test_new_feature(self, mock_table):
 
 # Upgrade a python package
 pip install --upgrade <package_name, e.g., browser use>
+
+# To reverse a python package to a specific version
+pip install <package_name, e.g., browser use>==<version>
