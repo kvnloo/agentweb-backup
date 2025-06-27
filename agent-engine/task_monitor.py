@@ -724,9 +724,6 @@ async def execute_task(execution):
     log_sync_manager = None  # Initialize to None
     
     try:
-        running_task_count += 1
-        running_user_ids.add(user_id)
-        
         # Get task details from tasks table if taskId doesn't start with 'task-'
         task_id = execution['taskId']
         if not task_id.startswith('task-'):
@@ -1609,13 +1606,22 @@ async def monitor_executions():
             
             # Run up to MAX_CONCURRENT tasks, ensuring no duplicate userIds
             executed_count = 0
-            if pending_executions and running_task_count < MAX_CONCURRENT:
+            if pending_executions:
                 for execution in pending_executions:
                     user_id = execution['userId']
                     
-                    if user_id not in running_user_ids and running_task_count < MAX_CONCURRENT:
+                    if running_task_count < MAX_CONCURRENT:
+                        # Increment the counter to reserve the slot
+                        running_task_count += 1
+                        running_user_ids.add(user_id)
+                        logger.info(f"Running task count: {running_task_count}, user_id: {user_id}")
+
                         task = asyncio.create_task(execute_task(execution))
+
                         executed_count += 1
+                    else:
+                        # If we can't start more tasks, break out of the loop
+                        break
                 
                 # Only update last_execution_time if we executed all pending executions
                 if executed_count == len(pending_executions):
