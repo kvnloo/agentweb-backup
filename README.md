@@ -809,3 +809,133 @@ If you encounter browser initialization errors:
    Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
    export DISPLAY=:99
    ```
+
+#### GUI Access Setup (Optional)
+
+Some AgentWeb features require GUI access for browser automation. To enable GUI access on your Debian/GNU Linux 12 Google Cloud VM:
+
+##### Option 1: VNC Client (Recommended for Production)
+
+1. **Install VNC Server**
+   ```bash
+   # Install TigerVNC server
+   sudo apt-get update
+   sudo apt-get install -y tigervnc-standalone-server tigervnc-common
+   
+   # Install xterm terminal
+   sudo apt-get install -y xterm
+   ```
+
+2. **Configure VNC**
+   ```bash
+   # Set VNC password
+   vncpasswd
+   ```
+
+3. **Start VNC Server**
+   ```bash
+   # Start VNC server with xterm (simple and reliable)
+   tigervncserver :1 -geometry 1920x1080 -depth 24 -xstartup /usr/bin/xterm
+   ```
+
+4. **Configure Firewall Rules**
+   - In Google Cloud Console, go to "VPC network" > "Firewall"
+   - Create a new firewall rule:
+     - Name: `vnc-access`
+     - Network: `default`
+     - Priority: `1000`
+     - Direction: `Ingress`
+     - Action: `Allow`
+     - Targets: `All instances in the network`
+     - Source IP ranges: `0.0.0.0/0` (or your specific IP for security)
+     - Protocols and ports: `tcp:5901`
+   - Click "Create"
+
+5. **Connect with VNC Client**
+   - **Windows**: Download RealVNC Viewer or TightVNC
+   - **macOS**: Download RealVNC Viewer (https://www.realvnc.com/en/connect/download/viewer/)
+   - **Linux**: `sudo apt-get install tigervnc-viewer`
+   - Connect to: `your-vm-external-ip:5901`
+   - Enter the VNC password you set with `vncpasswd`
+
+##### Option 2: NoVNC (Web-based VNC)
+
+1. **Install Desktop Environment**
+   ```bash
+   # Install XFCE desktop environment (recommended for Debian)
+   sudo apt-get update
+   sudo apt-get install -y xfce4 xfce4-goodies
+   
+   # Install additional GUI components
+   sudo apt-get install -y \
+       gnome-terminal \
+       firefox-esr \
+       chromium \
+       vino \
+       dconf-editor \
+       lightdm
+   ```
+
+2. **Install NoVNC**
+   ```bash
+   # Install dependencies
+   sudo apt-get install -y \
+       python3-websockify \
+       python3-numpy \
+       python3-pil \
+       python3-pil.imagetk
+   
+   # Clone NoVNC (no installation needed - runs directly from repo)
+   cd ~
+   git clone https://github.com/novnc/noVNC.git
+   cd noVNC
+   
+   # Clone websockify (required for NoVNC proxy)
+   git clone https://github.com/novnc/websockify
+   ```
+
+3. **Configure VNC (if not already done)**
+   ```bash
+   # Set VNC password
+   vncpasswd
+   
+   # Create VNC startup script
+   mkdir -p ~/.vnc
+   echo '#!/bin/bash' > ~/.vnc/xstartup
+   echo 'unset SESSION_MANAGER' >> ~/.vnc/xstartup
+   echo 'unset DBUS_SESSION_BUS_ADDRESS' >> ~/.vnc/xstartup
+   echo 'export XKL_XMODMAP_DISABLE=1' >> ~/.vnc/xstartup
+   echo 'xsetroot -solid grey' >> ~/.vnc/xstartup
+   echo 'startxfce4 &' >> ~/.vnc/xstartup
+   chmod +x ~/.vnc/xstartup
+   ```
+
+4. **Configure Firewall Rules**
+   - In Google Cloud Console, go to "VPC network" > "Firewall"
+   - Create a new firewall rule:
+     - Name: `novnc-access`
+     - Network: `default`
+     - Priority: `1000`
+     - Direction: `Ingress`
+     - Action: `Allow`
+     - Targets: `All instances in the network`
+     - Source IP ranges: `0.0.0.0/0` (or your specific IP for security)
+     - Protocols and ports: `tcp:8080`
+   - Click "Create"
+
+5. **Start VNC and NoVNC**
+   ```bash
+   # Start VNC server
+   tigervncserver :1 -geometry 1920x1080 -depth 24 -xstartup /usr/bin/xterm
+   
+   # Start NoVNC proxy
+   cd ~/noVNC
+   websockify --web . 0.0.0.0:8080 localhost:5901
+   ```
+
+6. **Access via Browser**
+   - Open your browser and go to: `http://your-vm-external-ip:8080/vnc.html`
+   - Enter the VNC password when prompted
+   - You'll have full desktop access through your browser
+
+**Note**: VNC Client (Option 1) is recommended for production use as it provides more reliable and secure access without browser limitations.
