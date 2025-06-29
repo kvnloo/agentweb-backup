@@ -889,12 +889,21 @@ Some AgentWeb features require GUI access for browser automation. To enable GUI 
      - Priority: `1000`
      - Direction: `Ingress`
      - Action: `Allow`
-     - Targets: `All instances in the network`
+     - Targets: `Specified target tags`
+     - Target tags: `agentengine-vnc-access`
      - Source IP ranges: `0.0.0.0/0` (or your specific IP for security)
      - Protocols and ports: `tcp:5901` (for display :1)
    - Click "Create"
 
-6. **Connect with VNC Client**
+6. **Add Network Tag to VM Instance**
+   - In Google Cloud Console, go to "Compute Engine" > "VM instances"
+   - Click on your agent-engine instance
+   - Click "Edit"
+   - Under "Networking" section, add the network tag: `agentengine-vnc-access`
+   - Click "Save"
+   - The instance will be restarted to apply the network changes
+
+7. **Connect with VNC Client**
    - **Windows**: Download RealVNC Viewer or TightVNC
    - **macOS**: Download RealVNC Viewer (https://www.realvnc.com/en/connect/download/viewer/)
      - **Note**: macOS Screen Sharing can connect but has limited keyboard input support
@@ -903,7 +912,7 @@ Some AgentWeb features require GUI access for browser automation. To enable GUI 
    - Connect to: `your-vm-external-ip:5901` (port 5901 for display :1)
    - Enter the VNC password you set with `vncpasswd`
 
-7. **Test Connection**
+8. **Test Connection**
    ```bash
    # Test if VNC port is accessible (from your local machine)
    # For display :1, use port 5901
