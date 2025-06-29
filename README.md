@@ -774,9 +774,8 @@ playwright install
 cd ~/agentweb/agent-engine
 conda activate agent-engine
 
-# Start Xvfb in the background (if running on a headless server)
-Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
-export DISPLAY=:99
+# Set display to VNC server (display :1)
+export DISPLAY=:1
 
 # Start the agent engine
 python task_monitor.py
@@ -801,14 +800,35 @@ pip install -r requirements.txt
 #### Troubleshooting
 
 If you encounter browser initialization errors:
-1. Make sure Xvfb is running: `ps aux | grep Xvfb`
+1. Make sure VNC server is running: `ps aux | grep vnc`
 2. Check if DISPLAY is set: `echo $DISPLAY`
-3. Restart Xvfb if needed:
+3. Restart VNC server if needed:
    ```bash
-   pkill Xvfb
-   Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
-   export DISPLAY=:99
+   # Kill current VNC server
+   vncserver -kill :1
+   
+   # Start VNC server again
+   tigervncserver :1 -geometry 1920x1080 -depth 24
+   
+   # Set display and restart Agent Engine
+   export DISPLAY=:1
+   python task_monitor.py
    ```
+
+**VNC Server Restart Instructions:**
+```bash
+# Stop current VNC server
+vncserver -kill :1
+
+# Start VNC server again
+tigervncserver :1 -geometry 1920x1080 -depth 24
+
+# Verify VNC server is running
+ps aux | grep vnc
+
+# Check VNC port is listening
+netstat -tlnp | grep 5901
+```
 
 #### GUI Access Setup (Optional)
 
@@ -834,7 +854,7 @@ Some AgentWeb features require GUI access for browser automation. To enable GUI 
 
 3. **Start VNC Server**
    ```bash
-   # Start VNC server with xterm (simple and reliable)
+   # Start VNC server on display :1 (standard VNC port 5901)
    # For local access only (default):
    tigervncserver :1 -geometry 1920x1080 -depth 24 -xstartup /usr/bin/xterm
    
@@ -842,9 +862,26 @@ Some AgentWeb features require GUI access for browser automation. To enable GUI 
    tigervncserver :1 -geometry 1920x1080 -depth 24 -xstartup /usr/bin/xterm -localhost=0
    ```
 
+   **Important**: Use display `:1` to use the standard VNC port 5901. This allows you to see the browser automation in action.
+
    **Note**: The `-localhost=0` flag disables the localhost-only restriction and allows remote connections. Without this flag, VNC will only accept connections from localhost, which works for local testing but not for remote access.
 
-4. **Configure Firewall Rules**
+4. **Coordinate with Agent Engine**
+   ```bash
+   # If Agent Engine is already running, stop it first
+   pkill -f task_monitor.py
+   
+   # Start VNC server first (display :1)
+   tigervncserver :1 -geometry 1920x1080 -depth 24 -xstartup /usr/bin/xterm -localhost=0
+   
+   # Then start Agent Engine (it will use the same display :1)
+   cd ~/agentweb/agent-engine
+   conda activate agent-engine
+   export DISPLAY=:1
+   python task_monitor.py
+   ```
+
+5. **Configure Firewall Rules**
    - In Google Cloud Console, go to "VPC network" > "Firewall"
    - Create a new firewall rule:
      - Name: `vnc-access`
@@ -854,21 +891,22 @@ Some AgentWeb features require GUI access for browser automation. To enable GUI 
      - Action: `Allow`
      - Targets: `All instances in the network`
      - Source IP ranges: `0.0.0.0/0` (or your specific IP for security)
-     - Protocols and ports: `tcp:5901`
+     - Protocols and ports: `tcp:5901` (for display :1)
    - Click "Create"
 
-5. **Connect with VNC Client**
+6. **Connect with VNC Client**
    - **Windows**: Download RealVNC Viewer or TightVNC
    - **macOS**: Download RealVNC Viewer (https://www.realvnc.com/en/connect/download/viewer/)
      - **Note**: macOS Screen Sharing can connect but has limited keyboard input support
      - **Recommended**: Use RealVNC Viewer for full functionality
    - **Linux**: `sudo apt-get install tigervnc-viewer`
-   - Connect to: `your-vm-external-ip:5901`
+   - Connect to: `your-vm-external-ip:5901` (port 5901 for display :1)
    - Enter the VNC password you set with `vncpasswd`
 
-6. **Test Connection**
+7. **Test Connection**
    ```bash
    # Test if VNC port is accessible (from your local machine)
+   # For display :1, use port 5901
    curl -v telnet://your-vm-external-ip:5901
    
    # Example:
@@ -877,19 +915,7 @@ Some AgentWeb features require GUI access for browser automation. To enable GUI 
 
 **Note**: VNC Client (Option 1) is recommended for production use as it provides more reliable and secure access without browser limitations.
 
-**VNC Server Compatibility Troubleshooting:**
-
-**If TigerVNC server doesn't work with your VNC viewer:**
-1. **Stop previous TigerVNC server:**
-   ```bash
-   # Kill all TigerVNC processes
-   pkill -f tigervncserver
-   
-   # Or kill specific display
-   vncserver -kill :1
-   
-   # Check if any VNC processes are still running
-   ps aux | grep vnc
-   ```
-
-2. **Try different VNC server:**
+**VNC Port Mapping**: 
+- Display `:1` uses port `5901`
+- Display `:99` uses port `5999`
+- General rule: Display `:N` uses port `5900 + N`
