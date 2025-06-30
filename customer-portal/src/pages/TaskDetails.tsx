@@ -62,6 +62,7 @@ interface Execution {
     filename: string;
     is_html?: boolean;
   }[];
+  archived?: boolean;
 }
 
 // Add Interaction type for userInteractions
@@ -537,11 +538,13 @@ const TaskDetailsPage: React.FC = () => {
     );
   }
 
-  const latestExecution = executions.length > 0 ? executions[0] : null;
+  // Filter out archived executions like in partner-portal
+  const nonArchivedExecutions = executions.filter(execution => !execution.archived);
+  const latestExecution = nonArchivedExecutions.length > 0 ? nonArchivedExecutions[0] : null;
 
   return (
     <div className="container mx-auto py-8 space-y-6 relative">
-      {executions.map(
+      {nonArchivedExecutions.map(
         (exec, index) =>
           exec.result && (
             <div
@@ -712,9 +715,9 @@ const TaskDetailsPage: React.FC = () => {
 
       <div>
         <h2 className="text-2xl font-semibold mb-4">Executions</h2>
-        {executions && executions.length > 0 ? (
+        {nonArchivedExecutions && nonArchivedExecutions.length > 0 ? (
           <div className="space-y-4">
-            {executions.map((exec) => (
+            {nonArchivedExecutions.map((exec) => (
               <Card
                 key={exec.executionId}
                 className="bg-slate-50 dark:bg-slate-800/50 hover:shadow-md transition-shadow cursor-pointer"

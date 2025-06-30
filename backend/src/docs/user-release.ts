@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-07-01',
+    changes: [
+      'Bug fix on filtering archived task executions',
+      '- Fixed an issue where archived task executions were still being displayed in the Task Details page',
+      '- Latest execution logic now correctly identifies the most recent non-archived execution'
+    ],
+  },
+  {
     date: '2025-06-21',
     changes: [
       'Supported data analysis at task level',
