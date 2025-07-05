@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useState, useEffect } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   Container,
   Typography,
@@ -23,15 +23,15 @@ import {
   Collapse,
   Tab,
   Tabs,
-} from '@mui/material';
+} from "@mui/material";
 import {
   ExpandMore as ExpandMoreIcon,
   Check as CheckIcon,
   Description as DescriptionIcon,
-} from '@mui/icons-material';
-import axios from 'axios';
-import { useAuth } from '../contexts/AuthContext';
-import { buildApiUrl } from '../config';
+} from "@mui/icons-material";
+import axios from "axios";
+import { useAuth } from "../contexts/AuthContext";
+import { buildApiUrl } from "../config";
 
 interface Template {
   templateId: string;
@@ -54,8 +54,8 @@ interface Template {
 }
 
 export default function CreateTask() {
-  const [name, setName] = useState('');
-  const [prompt, setPrompt] = useState('');
+  const [name, setName] = useState("");
+  const [prompt, setPrompt] = useState("");
   const [isInteractive, setIsInteractive] = useState(false);
   const [isDeepResearch, setIsDeepResearch] = useState(false);
   const [isComplexTask, setIsComplexTask] = useState(false);
@@ -63,13 +63,19 @@ export default function CreateTask() {
   const [outputAsHtml, setOutputAsHtml] = useState(false);
   const [useSharedBrowser, setUseSharedBrowser] = useState(false);
   const [turnOffHeadless, setTurnOffHeadless] = useState(false);
-  const [error, setError] = useState('');
-  const [selectedTemplate, setSelectedTemplate] = useState('');
+  const [error, setError] = useState("");
+  const [selectedTemplate, setSelectedTemplate] = useState("");
   const [templates, setTemplates] = useState<Template[]>([]);
   const [loadingTemplates, setLoadingTemplates] = useState(false);
-  const [parameterValues, setParameterValues] = useState<Record<string, string>>({});
-  const [currentTemplateParams, setCurrentTemplateParams] = useState<string[]>([]);
-  const [expandedTemplateId, setExpandedTemplateId] = useState<string | null>(null);
+  const [parameterValues, setParameterValues] = useState<
+    Record<string, string>
+  >({});
+  const [currentTemplateParams, setCurrentTemplateParams] = useState<string[]>(
+    []
+  );
+  const [expandedTemplateId, setExpandedTemplateId] = useState<string | null>(
+    null
+  );
   const [tabValue, setTabValue] = useState(0);
   const { token } = useAuth();
   const navigate = useNavigate();
@@ -81,12 +87,15 @@ export default function CreateTask() {
   const fetchTemplates = async () => {
     setLoadingTemplates(true);
     try {
-      const response = await axios.get<Template[]>(buildApiUrl('/api/templates'), {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const response = await axios.get<Template[]>(
+        buildApiUrl("/api/templates"),
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
       setTemplates(response.data);
     } catch (err) {
-      console.error('Failed to fetch templates:', err);
+      console.error("Failed to fetch templates:", err);
     } finally {
       setLoadingTemplates(false);
     }
@@ -95,9 +104,9 @@ export default function CreateTask() {
   const handleTemplateChange = (templateId: string) => {
     // If selecting the same template, deselect it
     if (selectedTemplate === templateId) {
-      setSelectedTemplate('');
-      setName('');
-      setPrompt('');
+      setSelectedTemplate("");
+      setName("");
+      setPrompt("");
       setIsInteractive(false);
       setIsDeepResearch(false);
       setIsComplexTask(false);
@@ -108,16 +117,16 @@ export default function CreateTask() {
       setParameterValues({});
       return;
     }
-    
+
     setSelectedTemplate(templateId);
-    
+
     // Reset parameter values when template changes
     setParameterValues({});
-    
+
     if (!templateId) {
       // Clear form if "None" is selected
-      setName('');
-      setPrompt('');
+      setName("");
+      setPrompt("");
       setIsInteractive(false);
       setIsDeepResearch(false);
       setIsComplexTask(false);
@@ -127,9 +136,9 @@ export default function CreateTask() {
       setCurrentTemplateParams([]);
       return;
     }
-    
+
     // Find the selected template
-    const template = templates.find(t => t.templateId === templateId);
+    const template = templates.find((t) => t.templateId === templateId);
     if (template) {
       // Populate form with template values
       setName(template.name);
@@ -141,15 +150,15 @@ export default function CreateTask() {
       setOutputAsHtml(template.outputAsHtml || false);
       setUseSharedBrowser(template.useSharedBrowser || false);
       setTurnOffHeadless(template.turnOffHeadless || false);
-      
+
       // Set current template parameters
       setCurrentTemplateParams(template.parameters || []);
-      
+
       // Initialize parameter values object with empty strings
       const initialParamValues: Record<string, string> = {};
       if (template.parameters) {
-        template.parameters.forEach(param => {
-          initialParamValues[param] = '';
+        template.parameters.forEach((param) => {
+          initialParamValues[param] = "";
         });
       }
       setParameterValues(initialParamValues);
@@ -157,24 +166,26 @@ export default function CreateTask() {
   };
 
   const handleExpandTemplate = (templateId: string) => {
-    setExpandedTemplateId(expandedTemplateId === templateId ? null : templateId);
+    setExpandedTemplateId(
+      expandedTemplateId === templateId ? null : templateId
+    );
   };
 
   const handleParameterChange = (param: string, value: string) => {
-    setParameterValues(prev => ({
+    setParameterValues((prev) => ({
       ...prev,
-      [param]: value
+      [param]: value,
     }));
   };
 
   const handleTabChange = (_event: React.SyntheticEvent, newValue: number) => {
     setTabValue(newValue);
-    
+
     // If switching to "From Scratch" tab, deselect any template
     if (newValue === 1) {
-      setSelectedTemplate('');
-      setName('');
-      setPrompt('');
+      setSelectedTemplate("");
+      setName("");
+      setPrompt("");
       setIsInteractive(false);
       setIsDeepResearch(false);
       setIsComplexTask(false);
@@ -188,13 +199,19 @@ export default function CreateTask() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setError('');
+    setError("");
 
     // Validate that all parameters have values if a template is selected
     if (selectedTemplate && currentTemplateParams.length > 0) {
-      const missingParams = currentTemplateParams.filter(param => !parameterValues[param]);
+      const missingParams = currentTemplateParams.filter(
+        (param) => !parameterValues[param]
+      );
       if (missingParams.length > 0) {
-        setError(`Please provide values for all parameters: ${missingParams.join(', ')}`);
+        setError(
+          `Please provide values for all parameters: ${missingParams.join(
+            ", "
+          )}`
+        );
         return;
       }
     }
@@ -202,15 +219,14 @@ export default function CreateTask() {
     try {
       // Email notification is automatically enabled for Deep Research tasks
       const emailNotification = isDeepResearch;
-      
+
       // Get the final prompt with parameters substituted if needed
-      const finalPrompt = selectedTemplate && currentTemplateParams.length > 0 
-        ? getPreviewPrompt() 
-        : prompt;
-      
-      const finalName = selectedTemplate 
-        ? getPreviewTaskName() 
-        : name;
+      const finalPrompt =
+        selectedTemplate && currentTemplateParams.length > 0
+          ? getPreviewPrompt()
+          : prompt;
+
+      const finalName = selectedTemplate ? getPreviewTaskName() : name;
 
       const taskData: any = {
         name: finalName,
@@ -224,27 +240,31 @@ export default function CreateTask() {
         turnOffHeadless: turnOffHeadless,
         emailNotification,
         // Only include templateId if a template is selected AND we are on the template tab
-        templateId: tabValue === 0 && selectedTemplate ? selectedTemplate : undefined,
+        templateId:
+          tabValue === 0 && selectedTemplate ? selectedTemplate : undefined,
         // Pass parameterValues only if a template is selected AND we are on the template tab
-        parameterValues: tabValue === 0 && selectedTemplate && currentTemplateParams.length > 0 ? parameterValues : undefined,
+        parameterValues:
+          tabValue === 0 && selectedTemplate && currentTemplateParams.length > 0
+            ? parameterValues
+            : undefined,
       };
-      
+
       // If a template is selected, include its ID, parameter values, category, and description
       if (selectedTemplate) {
-        taskData.category = templates.find(t => t.templateId === selectedTemplate)?.category;
-        taskData.description = templates.find(t => t.templateId === selectedTemplate)?.description;
+        taskData.category = templates.find(
+          (t) => t.templateId === selectedTemplate
+        )?.category;
+        taskData.description = templates.find(
+          (t) => t.templateId === selectedTemplate
+        )?.description;
       }
 
-      await axios.post(
-        buildApiUrl('/api/tasks'),
-        taskData,
-        {
-          headers: { Authorization: `Bearer ${token}` },
-        }
-      );
-      navigate('/tasks');
+      await axios.post(buildApiUrl("/api/tasks"), taskData, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      navigate("/tasks");
     } catch (err) {
-      setError('Failed to create task');
+      setError("Failed to create task");
     }
   };
 
@@ -254,13 +274,13 @@ export default function CreateTask() {
       return prompt;
     }
 
-    const template = templates.find(t => t.templateId === selectedTemplate);
+    const template = templates.find((t) => t.templateId === selectedTemplate);
     if (!template) return prompt;
 
     let previewPrompt = template.prompt;
-    currentTemplateParams.forEach(param => {
+    currentTemplateParams.forEach((param) => {
       const value = parameterValues[param] || `[${param}]`;
-      const paramRegex = new RegExp(`\\[${param}\\]`, 'g');
+      const paramRegex = new RegExp(`\\[${param}\\]`, "g");
       previewPrompt = previewPrompt.replace(paramRegex, value);
     });
 
@@ -270,23 +290,25 @@ export default function CreateTask() {
   // Get the selected template object
   const getSelectedTemplate = () => {
     if (!selectedTemplate) return null;
-    return templates.find(t => t.templateId === selectedTemplate) || null;
+    return templates.find((t) => t.templateId === selectedTemplate) || null;
   };
 
   // Get the preview task name with parameter value if applicable
   const getPreviewTaskName = () => {
     const template = getSelectedTemplate();
-    if (!template) return '';
-    
+    if (!template) return "";
+
     let taskName = template.name;
-    
+
     // If template has a nameParameter and the parameter has a value, append it to the name
-    if (template.nameParameter && 
-        parameterValues && 
-        parameterValues[template.nameParameter]) {
+    if (
+      template.nameParameter &&
+      parameterValues &&
+      parameterValues[template.nameParameter]
+    ) {
       taskName = `${taskName} - ${parameterValues[template.nameParameter]}`;
     }
-    
+
     return taskName;
   };
 
@@ -296,16 +318,16 @@ export default function CreateTask() {
         <Typography variant="h4" component="h1" gutterBottom>
           Create New Task
         </Typography>
-        
+
         {error && (
           <Alert severity="error" sx={{ mb: 2 }}>
             {error}
           </Alert>
         )}
 
-        <Tabs 
-          value={tabValue} 
-          onChange={handleTabChange} 
+        <Tabs
+          value={tabValue}
+          onChange={handleTabChange}
           sx={{ mb: 3 }}
           variant="fullWidth"
         >
@@ -316,49 +338,52 @@ export default function CreateTask() {
         {tabValue === 0 && (
           <>
             <Box sx={{ mb: 3 }}>
-              <Typography variant="h6">
-                Choose a Template
-              </Typography>
+              <Typography variant="h6">Choose a Template</Typography>
             </Box>
 
             {loadingTemplates ? (
-              <Box sx={{ display: 'flex', justifyContent: 'center', p: 3 }}>
+              <Box sx={{ display: "flex", justifyContent: "center", p: 3 }}>
                 <CircularProgress />
               </Box>
             ) : templates.length === 0 ? (
               <Alert severity="info" sx={{ mb: 3 }}>
-                No templates are available. Please check back later or create a task from scratch.
+                No templates are available. Please check back later or create a
+                task from scratch.
               </Alert>
             ) : (
               <Grid container spacing={3} sx={{ mb: 4 }}>
                 {templates.map((template) => (
                   <Grid item xs={12} md={6} key={template.templateId}>
-                    <Card 
-                      variant="outlined" 
-                      sx={{ 
-                        height: '100%',
-                        display: 'flex',
-                        flexDirection: 'column',
-                        borderColor: selectedTemplate === template.templateId ? 'primary.main' : 'divider',
-                        borderWidth: selectedTemplate === template.templateId ? 2 : 1,
-                        position: 'relative',
-                        '&:hover': {
-                          boxShadow: 2
-                        }
+                    <Card
+                      variant="outlined"
+                      sx={{
+                        height: "100%",
+                        display: "flex",
+                        flexDirection: "column",
+                        borderColor:
+                          selectedTemplate === template.templateId
+                            ? "primary.main"
+                            : "divider",
+                        borderWidth:
+                          selectedTemplate === template.templateId ? 2 : 1,
+                        position: "relative",
+                        "&:hover": {
+                          boxShadow: 2,
+                        },
                       }}
                     >
                       {selectedTemplate === template.templateId && (
-                        <Chip 
-                          icon={<CheckIcon />} 
-                          label="Selected" 
-                          color="primary" 
+                        <Chip
+                          icon={<CheckIcon />}
+                          label="Selected"
+                          color="primary"
                           size="small"
-                          sx={{ 
-                            position: 'absolute', 
-                            top: 8, 
+                          sx={{
+                            position: "absolute",
+                            top: 8,
                             right: 8,
-                            zIndex: 1
-                          }} 
+                            zIndex: 1,
+                          }}
                         />
                       )}
                       <CardHeader
@@ -366,88 +391,132 @@ export default function CreateTask() {
                         subheader={
                           <Box sx={{ mt: 1 }}>
                             {template.isInteractive && (
-                              <Chip 
-                                label="Interactive" 
-                                size="small" 
-                                sx={{ mr: 0.5, mb: 0.5 }} 
+                              <Chip
+                                label="Interactive"
+                                size="small"
+                                sx={{ mr: 0.5, mb: 0.5 }}
                               />
                             )}
-                            {template.isDeepResearch && (
+                            {/* {template.isDeepResearch && (
                               <Chip 
                                 label="Deep Research" 
                                 size="small" 
                                 sx={{ mr: 0.5, mb: 0.5 }} 
                               />
-                            )}
-                            {template.parameters && template.parameters.length > 0 && (
-                              <Chip 
-                                label={`${template.parameters.length} Parameter${template.parameters.length > 1 ? 's' : ''}`} 
-                                size="small" 
-                                sx={{ mb: 0.5 }} 
-                              />
-                            )}
+                            )} */}
+                            {template.parameters &&
+                              template.parameters.length > 0 && (
+                                <Chip
+                                  label={`${
+                                    template.parameters.length
+                                  } Parameter${
+                                    template.parameters.length > 1 ? "s" : ""
+                                  }`}
+                                  size="small"
+                                  sx={{ mb: 0.5 }}
+                                />
+                              )}
                           </Box>
                         }
                       />
                       <CardContent sx={{ flexGrow: 1 }}>
-                        <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
-                          {template.description || 'No description provided'}
+                        <Typography
+                          variant="body2"
+                          color="text.secondary"
+                          sx={{ mb: 1 }}
+                        >
+                          {template.description || "No description provided"}
                         </Typography>
                         <Divider sx={{ my: 1 }} />
-                        <Box sx={{ display: 'flex', alignItems: 'center', mb: 1 }}>
-                          <DescriptionIcon fontSize="small" sx={{ mr: 1, color: 'text.secondary' }} />
+                        <Box
+                          sx={{ display: "flex", alignItems: "center", mb: 1 }}
+                        >
+                          <DescriptionIcon
+                            fontSize="small"
+                            sx={{ mr: 1, color: "text.secondary" }}
+                          />
                           <Typography variant="body2" fontWeight="medium">
                             Prompt Preview
                           </Typography>
                           <IconButton
                             size="small"
-                            onClick={() => handleExpandTemplate(template.templateId)}
+                            onClick={() =>
+                              handleExpandTemplate(template.templateId)
+                            }
                             sx={{
-                              ml: 'auto',
-                              transform: expandedTemplateId === template.templateId ? 'rotate(180deg)' : 'rotate(0deg)',
-                              transition: 'transform 0.2s'
+                              ml: "auto",
+                              transform:
+                                expandedTemplateId === template.templateId
+                                  ? "rotate(180deg)"
+                                  : "rotate(0deg)",
+                              transition: "transform 0.2s",
                             }}
                           >
                             <ExpandMoreIcon />
                           </IconButton>
                         </Box>
-                        <Collapse in={expandedTemplateId === template.templateId}>
-                          <Typography 
-                            variant="body2" 
-                            color="text.secondary" 
-                            sx={{ 
-                              whiteSpace: 'pre-wrap',
+                        <Collapse
+                          in={expandedTemplateId === template.templateId}
+                        >
+                          <Typography
+                            variant="body2"
+                            color="text.secondary"
+                            sx={{
+                              whiteSpace: "pre-wrap",
                               mb: 2,
                               p: 1,
-                              backgroundColor: 'action.hover',
+                              backgroundColor: "action.hover",
                               borderRadius: 1,
-                              maxHeight: '150px',
-                              overflow: 'auto'
+                              maxHeight: "150px",
+                              overflow: "auto",
                             }}
                           >
                             {template.prompt}
                           </Typography>
-                          {template.parameters && template.parameters.length > 0 && (
-                            <Box sx={{ mt: 1 }}>
-                              <Typography variant="body2" fontWeight="medium" gutterBottom>
-                                Parameters:
-                              </Typography>
-                              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
-                                {template.parameters.map(param => (
-                                  <Chip key={param} label={param} size="small" />
-                                ))}
+                          {template.parameters &&
+                            template.parameters.length > 0 && (
+                              <Box sx={{ mt: 1 }}>
+                                <Typography
+                                  variant="body2"
+                                  fontWeight="medium"
+                                  gutterBottom
+                                >
+                                  Parameters:
+                                </Typography>
+                                <Box
+                                  sx={{
+                                    display: "flex",
+                                    flexWrap: "wrap",
+                                    gap: 0.5,
+                                  }}
+                                >
+                                  {template.parameters.map((param) => (
+                                    <Chip
+                                      key={param}
+                                      label={param}
+                                      size="small"
+                                    />
+                                  ))}
+                                </Box>
                               </Box>
-                            </Box>
-                          )}
+                            )}
                         </Collapse>
                       </CardContent>
                       <CardActions>
-                        <Button 
-                          fullWidth 
-                          variant={selectedTemplate === template.templateId ? "contained" : "outlined"}
-                          onClick={() => handleTemplateChange(template.templateId)}
+                        <Button
+                          fullWidth
+                          variant={
+                            selectedTemplate === template.templateId
+                              ? "contained"
+                              : "outlined"
+                          }
+                          onClick={() =>
+                            handleTemplateChange(template.templateId)
+                          }
                         >
-                          {selectedTemplate === template.templateId ? "Deselect" : "Use Template"}
+                          {selectedTemplate === template.templateId
+                            ? "Deselect"
+                            : "Use Template"}
                         </Button>
                       </CardActions>
                     </Card>
@@ -469,17 +538,23 @@ export default function CreateTask() {
                     <Typography variant="h6" gutterBottom>
                       Template Parameters
                     </Typography>
-                    <Typography variant="body2" color="text.secondary" paragraph>
+                    <Typography
+                      variant="body2"
+                      color="text.secondary"
+                      paragraph
+                    >
                       Please provide values for the following parameters:
                     </Typography>
                     <Grid container spacing={2}>
-                      {currentTemplateParams.map(param => (
+                      {currentTemplateParams.map((param) => (
                         <Grid item xs={12} sm={6} key={param}>
                           <TextField
                             fullWidth
                             label={param}
-                            value={parameterValues[param] || ''}
-                            onChange={(e) => handleParameterChange(param, e.target.value)}
+                            value={parameterValues[param] || ""}
+                            onChange={(e) =>
+                              handleParameterChange(param, e.target.value)
+                            }
                             required
                             helperText={`Value for [${param}]`}
                           />
@@ -499,7 +574,7 @@ export default function CreateTask() {
                   <Typography variant="body2" color="text.secondary" paragraph>
                     This is how your task will look with the parameters applied:
                   </Typography>
-                  
+
                   <Box sx={{ mb: 3 }}>
                     <Typography variant="subtitle2" gutterBottom>
                       Task Name:
@@ -508,59 +583,94 @@ export default function CreateTask() {
                       {getPreviewTaskName()}
                     </Typography>
                     {getSelectedTemplate()?.nameParameter && (
-                      <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                        {parameterValues[getSelectedTemplate()?.nameParameter || ''] 
-                          ? `Using parameter [${getSelectedTemplate()?.nameParameter}] in the task name`
-                          : `Will include parameter [${getSelectedTemplate()?.nameParameter}] when provided`}
+                      <Typography
+                        variant="body2"
+                        color="text.secondary"
+                        sx={{ mt: 0.5 }}
+                      >
+                        {parameterValues[
+                          getSelectedTemplate()?.nameParameter || ""
+                        ]
+                          ? `Using parameter [${
+                              getSelectedTemplate()?.nameParameter
+                            }] in the task name`
+                          : `Will include parameter [${
+                              getSelectedTemplate()?.nameParameter
+                            }] when provided`}
                       </Typography>
                     )}
                   </Box>
-                  
+
                   <Box>
                     <Typography variant="subtitle2" gutterBottom>
                       Task Prompt:
                     </Typography>
-                    <Typography 
-                      variant="body1" 
-                      sx={{ 
-                        whiteSpace: 'pre-wrap',
+                    <Typography
+                      variant="body1"
+                      sx={{
+                        whiteSpace: "pre-wrap",
                         p: 2,
-                        backgroundColor: 'action.hover',
-                        borderRadius: 1
+                        backgroundColor: "action.hover",
+                        borderRadius: 1,
                       }}
                     >
                       {getPreviewPrompt()}
                     </Typography>
                   </Box>
-                  
+
                   <Box sx={{ mt: 3 }}>
                     <Typography variant="subtitle2" gutterBottom>
                       Task Settings:
                     </Typography>
-                    <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
+                    <Box sx={{ display: "flex", flexWrap: "wrap", gap: 1 }}>
                       {getSelectedTemplate()?.isInteractive && (
                         <Chip label="Interactive Mode" size="small" />
                       )}
-                      {getSelectedTemplate()?.isDeepResearch && (
+                      {/* {getSelectedTemplate()?.isDeepResearch && (
                         <Chip label="Deep Research" size="small" />
-                      )}
+                      )} */}
                       {getSelectedTemplate()?.isComplexTask && (
-                        <Chip label="Complex Task" size="small" color="info" variant="outlined" />
+                        <Chip
+                          label="Complex Task"
+                          size="small"
+                          color="info"
+                          variant="outlined"
+                        />
                       )}
                       {getSelectedTemplate()?.isDeepResearch && (
                         <Chip label="Email Notifications" size="small" />
                       )}
                       {getSelectedTemplate()?.outputAsJson && (
-                        <Chip label="Output as JSON" size="small" color="info" variant="outlined" />
+                        <Chip
+                          label="Output as JSON"
+                          size="small"
+                          color="info"
+                          variant="outlined"
+                        />
                       )}
                       {getSelectedTemplate()?.outputAsHtml && (
-                        <Chip label="Output as HTML5" size="small" color="info" variant="outlined" />
+                        <Chip
+                          label="Output as HTML5"
+                          size="small"
+                          color="info"
+                          variant="outlined"
+                        />
                       )}
                       {getSelectedTemplate()?.useSharedBrowser && (
-                        <Chip label="Use Shared Browser" size="small" color="info" variant="outlined" />
+                        <Chip
+                          label="Use Shared Browser"
+                          size="small"
+                          color="info"
+                          variant="outlined"
+                        />
                       )}
                       {getSelectedTemplate()?.turnOffHeadless && (
-                        <Chip label="Turn Off Headless" size="small" color="info" variant="outlined" />
+                        <Chip
+                          label="Turn Off Headless"
+                          size="small"
+                          color="info"
+                          variant="outlined"
+                        />
                       )}
                     </Box>
                   </Box>
@@ -570,7 +680,7 @@ export default function CreateTask() {
           )}
 
           {/* When no template is selected or in "From Scratch" tab, show editable fields */}
-          {(tabValue === 1) && (
+          {tabValue === 1 && (
             <>
               <TextField
                 margin="normal"
@@ -583,7 +693,7 @@ export default function CreateTask() {
                 value={name}
                 onChange={(e) => setName(e.target.value)}
               />
-              
+
               <TextField
                 margin="normal"
                 required
@@ -598,8 +708,10 @@ export default function CreateTask() {
                 onChange={(e) => setPrompt(e.target.value)}
                 helperText="Write your task instructions in natural language. The AI agent will request more information if needed."
               />
-              
-              <Box sx={{ mt: 2, display: 'flex', flexDirection: 'column', gap: 1 }}>
+
+              <Box
+                sx={{ mt: 2, display: "flex", flexDirection: "column", gap: 1 }}
+              >
                 <Tooltip title="When enabled, the AI agent can ask for additional information during task execution">
                   <FormControlLabel
                     control={
@@ -614,7 +726,7 @@ export default function CreateTask() {
                     sx={{ opacity: isDeepResearch ? 0.5 : 1 }}
                   />
                 </Tooltip>
-                <Tooltip title="When enabled, the task will use advanced AI to perform comprehensive research on your topic using public web data only. Currently does not use your uploads or web accounts (Config), but will support these in the future.">
+                {/* <Tooltip title="When enabled, the task will use advanced AI to perform comprehensive research on your topic using public web data only. Currently does not use your uploads or web accounts (Config), but will support these in the future.">
                   <FormControlLabel
                     control={
                       <Switch
@@ -632,7 +744,7 @@ export default function CreateTask() {
                     }
                     label="Perform Deep Research"
                   />
-                </Tooltip>
+                </Tooltip> */}
                 <Tooltip title="When enabled, the task will use a more complex system prompt and have a higher step limit for handling complex tasks">
                   <FormControlLabel
                     control={
@@ -648,25 +760,45 @@ export default function CreateTask() {
                   />
                 </Tooltip>
               </Box>
-              {isDeepResearch && (
+              {/* {isDeepResearch && (
                 <Alert severity="info" sx={{ mt: 2 }}>
                   Deep Research Mode is enabled. When you run this task, it will use advanced AI to perform comprehensive research on your topic using public web data only. Currently does not use your uploads or web accounts (Config), but will support these in the future. Email notifications are automatically enabled for Deep Research tasks. Interactive Mode and Complex Task options are not applicable for Deep Research tasks.
                 </Alert>
-              )}
-              <Box sx={{ mt: 2, display: 'flex', flexDirection: 'column', gap: 1 }}>
-                <Tooltip title="Output as JSON"
+              )} */}
+              <Box
+                sx={{ mt: 2, display: "flex", flexDirection: "column", gap: 1 }}
+              >
+                <Tooltip
+                  title="Output as JSON"
                   sx={{ opacity: isDeepResearch ? 0.5 : 1 }}
                 >
                   <FormControlLabel
-                    control={<Switch checked={outputAsJson} onChange={(e) => { setOutputAsJson(e.target.checked); if (e.target.checked) setOutputAsHtml(false); }} />}
+                    control={
+                      <Switch
+                        checked={outputAsJson}
+                        onChange={(e) => {
+                          setOutputAsJson(e.target.checked);
+                          if (e.target.checked) setOutputAsHtml(false);
+                        }}
+                      />
+                    }
                     label="Output as JSON"
                   />
                 </Tooltip>
-                <Tooltip title="Output as HTML5"
+                <Tooltip
+                  title="Output as HTML5"
                   sx={{ opacity: isDeepResearch ? 0.5 : 1 }}
                 >
                   <FormControlLabel
-                    control={<Switch checked={outputAsHtml} onChange={(e) => { setOutputAsHtml(e.target.checked); if (e.target.checked) setOutputAsJson(false); }} />}
+                    control={
+                      <Switch
+                        checked={outputAsHtml}
+                        onChange={(e) => {
+                          setOutputAsHtml(e.target.checked);
+                          if (e.target.checked) setOutputAsJson(false);
+                        }}
+                      />
+                    }
                     label="Output as HTML5"
                   />
                 </Tooltip>
@@ -682,9 +814,10 @@ export default function CreateTask() {
           )}
 
           <Alert severity="info" sx={{ mt: 2, mb: 2 }}>
-            All settings including task name, prompt, and modes can be modified later in the Task Details page.
+            All settings including task name, prompt, and modes can be modified
+            later in the Task Details page.
           </Alert>
-          <Box sx={{ mt: 3, display: 'flex', gap: 2 }}>
+          <Box sx={{ mt: 3, display: "flex", gap: 2 }}>
             <Button
               type="submit"
               variant="contained"
@@ -697,7 +830,7 @@ export default function CreateTask() {
             <Button
               variant="outlined"
               size="large"
-              onClick={() => navigate('/tasks')}
+              onClick={() => navigate("/tasks")}
             >
               Cancel
             </Button>
@@ -706,4 +839,4 @@ export default function CreateTask() {
       </Paper>
     </Container>
   );
-} 
+}
