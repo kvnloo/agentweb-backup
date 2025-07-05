@@ -60,13 +60,13 @@ def test_basic_image_generation():
     load_dotenv()
     
     # Get API key from environment
-    api_key = os.getenv('OPENAI_API_KEY')
+    api_key = os.getenv('OPENAI_IMAGE_API_KEY')
     if not api_key:
-        logger.error("OPENAI_API_KEY environment variable is not set")
+        logger.error("OPENAI_IMAGE_API_KEY environment variable is not set")
         return False
     
     # Print last 4 characters of API key for verification
-    logger.info(f"Using OpenAI API key ending with: ...{api_key[-4:]}")
+    logger.info(f"Using OpenAI Image API key ending with: ...{api_key[-4:]}")
     
     try:
         # Import OpenAI client
@@ -144,13 +144,13 @@ def test_input_images():
     load_dotenv()
     
     # Get API key from environment
-    api_key = os.getenv('OPENAI_API_KEY')
+    api_key = os.getenv('OPENAI_IMAGE_API_KEY')
     if not api_key:
-        logger.error("OPENAI_API_KEY environment variable is not set")
+        logger.error("OPENAI_IMAGE_API_KEY environment variable is not set")
         return False
     
     # Print last 4 characters of API key for verification
-    logger.info(f"Using OpenAI API key ending with: ...{api_key[-4:]}")
+    logger.info(f"Using OpenAI Image API key ending with: ...{api_key[-4:]}")
     
     try:
         # Import OpenAI client
