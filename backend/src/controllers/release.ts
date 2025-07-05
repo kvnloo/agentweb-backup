@@ -8,6 +8,12 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-06-18",
+    changes: [
+      "Temporarily removed the 'Perform Deep Research' toggle from the Create Task and Task Details pages to prevent accidental use.",
+    ],
+  },
+  {
     date: "2025-06-17",
     changes: [
       "Enhanced Admin Dashboard with Waitlist Analytics",
