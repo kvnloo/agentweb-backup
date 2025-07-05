@@ -7,6 +7,26 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-07-01',
+    changes: [
+      'Bug fix on filtering archived task executions',
+      '- Fixed an issue where archived task executions were still being displayed in the Task Details page',
+      '- Latest execution logic now correctly identifies the most recent non-archived execution'
+    ],
+  },
+  {
+    date: '2025-06-21',
+    changes: [
+      'Supported data analysis at task level',
+      '- Our agent will execute code to perform analysis on data files when running a task in order to find insights',
+      '- Supports various file formats including CSV, JSON, text files, and more',
+      '- Uses Google Gemini with code execution capabilities for advanced data analysis',
+      '- Lead list data will be included in data analysis if it is available',
+      'Fixed bar chart issue with HTML reports when data range is large',
+      '- Rerun to get better visualized HTML reports'
+    ],
+  },
+  {
     date: '2025-06-12',
     changes: [
       'Enhanced Result Reports with Visualizations',

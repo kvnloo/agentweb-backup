@@ -9,3 +9,14 @@ June 04, 2025: another outage of the backend. To resolve the issue and improve r
 June 16, 2025:
 # Known issues of Gemini model with browser use
 Gemini models cannot work with the BaseModel argument with function call. Also it has a strange issue that require minimum 1 argument. We needed to add patch to use simpler argument for gemini models.
+
+June 19, 2025
+The latest version of browser-use (0.2.7) has an issue of using the same persistent storage for session data which mixed the cookie files from different users. 
+
+June 21, 2025
+When restoring a previous good version of browser-use, an issue about old_history table or index crash arised. It was initially suspected to be issue with browser use or playwright but after several round of testings the issue was with the memory dependency of browser use. Uninstall the component solved the issue as this is not a hard dependency:
+`pip uninstall -y mem0ai`
+To reinstall it, run
+`pip install "browser-use[memory]"`
+
+Issue with reverted PRs: when there are reverted PRs, there is risk that changes may mess up, possibly due to accumulated changes are too many that github seems may start truncate. We encountered such issue when deploying the data analysis PR. A resolution was to start clean which causes much less confusion.
