@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Test script for OpenAI GPT Image generation.
-This script tests the GPT Image 1 model for generating, editing, and manipulating images.
+This script tests the GPT Image 1 model for generating and editing images.
 Based on the OpenAI cookbook: https://cookbook.openai.com/examples/generate_images_with_gpt_image
 """
 
@@ -138,8 +138,8 @@ def test_basic_image_generation():
         logger.error(traceback.format_exc())
         return False
 
-def test_customized_image_generation():
-    """Test image generation with custom parameters"""
+def test_input_images():
+    """Test image generation with input images (e.g., logo editing)"""
     # Load environment variables
     load_dotenv()
     
@@ -166,173 +166,41 @@ def test_customized_image_generation():
         # Create images folder
         create_images_folder()
         
-        # Test prompt with custom parameters
-        prompt2 = "generate a portrait, pixel-art style, of a grey tabby cat dressed as a blond woman on a dark background."
-        img_path2 = "generated_images/cat_portrait_pixel.jpg"
-        
-        logger.info("Generating customized image with GPT Image 1...")
-        logger.info(f"Prompt: {prompt2}")
-        
-        # Generate the image with custom parameters
-        result2 = client.images.generate(
-            model="gpt-image-1",
-            prompt=prompt2,
-            quality="low",
-            output_compression=50,
-            output_format="jpeg",
-            size="1024x1536"
-        )
-        
-        # Save the image
-        if result2.data and len(result2.data) > 0:
-            image_base64 = result2.data[0].b64_json
-            success = save_and_resize_image(image_base64, img_path2, size=(250, 375))
-            if success:
-                logger.info("✅ Customized image generation test completed successfully!")
-                return True
-            else:
-                logger.error("❌ Failed to save customized image")
-                return False
-        else:
-            logger.error("❌ No image data received from API")
-            return False
-            
-    except Exception as e:
-        logger.error(f"Error testing customized image generation: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return False
-
-def test_transparent_background():
-    """Test image generation with transparent background"""
-    # Load environment variables
-    load_dotenv()
-    
-    # Get API key from environment
-    api_key = os.getenv('OPENAI_API_KEY')
-    if not api_key:
-        logger.error("OPENAI_API_KEY environment variable is not set")
-        return False
-    
-    # Print last 4 characters of API key for verification
-    logger.info(f"Using OpenAI API key ending with: ...{api_key[-4:]}")
-    
-    try:
-        # Import OpenAI client
-        try:
-            from openai import OpenAI
-        except ImportError:
-            logger.error("openai package is not installed. Install it with: pip install openai")
+        # Check if we have a logo image to work with
+        logo_path = "input_images/test-logo.png"  # You can place your logo here
+        if not os.path.exists(logo_path):
+            logger.error(f"Logo file not found at {logo_path}")
+            logger.error("Please add a logo file at input_images/test-logo.png")
             return False
         
-        # Create OpenAI client
-        client = OpenAI(api_key=api_key)
-        
-        # Create images folder
-        create_images_folder()
-        
-        # Test prompt for transparent background
-        prompt3 = "generate a pixel-art style picture of a green bucket hat with a pink quill on a transparent background."
-        img_path3 = "generated_images/hat.png"
-        
-        logger.info("Generating image with transparent background...")
-        logger.info(f"Prompt: {prompt3}")
-        
-        # Generate the image with PNG format for transparency
-        result3 = client.images.generate(
-            model="gpt-image-1",
-            prompt=prompt3,
-            quality="low",
-            output_format="png",
-            size="1024x1024"
-        )
-        
-        # Save the image
-        if result3.data and len(result3.data) > 0:
-            image_base64 = result3.data[0].b64_json
-            success = save_and_resize_image(image_base64, img_path3, size=(250, 250))
-            if success:
-                logger.info("✅ Transparent background test completed successfully!")
-                return True
-            else:
-                logger.error("❌ Failed to save transparent image")
-                return False
-        else:
-            logger.error("❌ No image data received from API")
-            return False
-            
-    except Exception as e:
-        logger.error(f"Error testing transparent background: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return False
-
-def test_image_editing():
-    """Test image editing with multiple input images"""
-    # Load environment variables
-    load_dotenv()
-    
-    # Get API key from environment
-    api_key = os.getenv('OPENAI_API_KEY')
-    if not api_key:
-        logger.error("OPENAI_API_KEY environment variable is not set")
-        return False
-    
-    # Print last 4 characters of API key for verification
-    logger.info(f"Using OpenAI API key ending with: ...{api_key[-4:]}")
-    
-    try:
-        # Import OpenAI client
-        try:
-            from openai import OpenAI
-        except ImportError:
-            logger.error("openai package is not installed. Install it with: pip install openai")
-            return False
-        
-        # Create OpenAI client
-        client = OpenAI(api_key=api_key)
-        
-        # Create images folder
-        create_images_folder()
-        
-        # Check if required images exist
-        img_path2 = "generated_images/cat_portrait_pixel.jpg"
-        img_path3 = "generated_images/hat.png"
-        
-        if not os.path.exists(img_path2) or not os.path.exists(img_path3):
-            logger.warning("Required images for editing test not found. Running basic generation first...")
-            if not test_customized_image_generation():
-                logger.error("Failed to generate required images for editing test")
-                return False
-            if not test_transparent_background():
-                logger.error("Failed to generate required images for editing test")
-                return False
-        
-        # Test image editing
+        # Test prompt for logo editing
         prompt_edit = """
-        Combine the images of the cat and the hat to show the cat wearing the hat while being perched in a tree, still in pixel-art style.
+        Take this logo and create a modern, minimalist version with a gradient background. 
+        Make it suitable for a tech startup. Use clean lines and contemporary design principles.
         """
-        img_path_edit = "generated_images/cat_with_hat.jpg"
         
-        logger.info("Testing image editing with multiple inputs...")
+        output_path = "generated_images/edited_logo.png"
+        
+        logger.info("Testing image editing with input logo...")
+        logger.info(f"Input image: {logo_path}")
         logger.info(f"Prompt: {prompt_edit}")
         
-        # Open the input images
-        with open(img_path2, "rb") as img1, open(img_path3, "rb") as img2:
-            # Generate the new image
-            result_edit = client.images.edit(
+        # Open the input image
+        with open(logo_path, "rb") as img_input:
+            # Generate the edited image
+            result = client.images.edit(
                 model="gpt-image-1",
-                image=[img1, img2], 
+                image=img_input,
                 prompt=prompt_edit,
-                size="1024x1536"
+                size="1024x1024"
             )
         
         # Save the edited image
-        if result_edit.data and len(result_edit.data) > 0:
-            image_base64 = result_edit.data[0].b64_json
-            success = save_and_resize_image(image_base64, img_path_edit, size=(250, 375))
+        if result.data and len(result.data) > 0:
+            image_base64 = result.data[0].b64_json
+            success = save_and_resize_image(image_base64, output_path, size=(400, 400))
             if success:
-                logger.info("✅ Image editing test completed successfully!")
+                logger.info("✅ Input images test completed successfully!")
                 return True
             else:
                 logger.error("❌ Failed to save edited image")
@@ -342,130 +210,18 @@ def test_image_editing():
             return False
             
     except Exception as e:
-        logger.error(f"Error testing image editing: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return False
-
-def test_image_editing_with_mask():
-    """Test image editing with a mask"""
-    # Load environment variables
-    load_dotenv()
-    
-    # Get API key from environment
-    api_key = os.getenv('OPENAI_API_KEY')
-    if not api_key:
-        logger.error("OPENAI_API_KEY environment variable is not set")
-        return False
-    
-    # Print last 4 characters of API key for verification
-    logger.info(f"Using OpenAI API key ending with: ...{api_key[-4:]}")
-    
-    try:
-        # Import OpenAI client
-        try:
-            from openai import OpenAI
-        except ImportError:
-            logger.error("openai package is not installed. Install it with: pip install openai")
-            return False
-        
-        # Create OpenAI client
-        client = OpenAI(api_key=api_key)
-        
-        # Create images folder
-        create_images_folder()
-        
-        # Check if required image exists
-        img_path1 = "generated_images/glorptak.jpg"
-        
-        if not os.path.exists(img_path1):
-            logger.warning("Required image for mask editing test not found. Running basic generation first...")
-            if not test_basic_image_generation():
-                logger.error("Failed to generate required image for mask editing test")
-                return False
-        
-        # Generate mask
-        img_path_mask = "generated_images/mask.png"
-        prompt_mask = "generate a mask delimiting the entire character in the picture, using white where the character is and black for the background. Return an image in the same size as the input image."
-        
-        logger.info("Generating mask for image editing...")
-        
-        with open(img_path1, "rb") as img_input:
-            # Generate the mask
-            result_mask = client.images.edit(
-                model="gpt-image-1",
-                image=img_input, 
-                prompt=prompt_mask
-            )
-        
-        # Save the mask
-        if result_mask.data and len(result_mask.data) > 0:
-            image_base64 = result_mask.data[0].b64_json
-            success = save_and_resize_image(image_base64, img_path_mask, size=(300, 300))
-            if not success:
-                logger.error("❌ Failed to save mask")
-                return False
-        else:
-            logger.error("❌ No mask data received from API")
-            return False
-        
-        # Create alpha channel for mask
-        logger.info("Creating alpha channel for mask...")
-        mask = Image.open(img_path_mask).convert("L")
-        mask_rgba = mask.convert("RGBA")
-        mask_rgba.putalpha(mask)
-        
-        # Save mask with alpha channel
-        img_path_mask_alpha = "generated_images/mask_alpha.png"
-        mask_rgba.save(img_path_mask_alpha, format="PNG")
-        logger.info(f"Mask with alpha channel saved to: {img_path_mask_alpha}")
-        
-        # Edit image with mask
-        prompt_mask_edit = "A strange character on a colorful galaxy background, with lots of stars and planets."
-        img_path_mask_edit = "generated_images/mask_edit.png"
-        
-        logger.info("Editing image with mask...")
-        logger.info(f"Prompt: {prompt_mask_edit}")
-        
-        with open(img_path1, "rb") as img_input, open(img_path_mask_alpha, "rb") as mask:
-            result_mask_edit = client.images.edit(
-                model="gpt-image-1",         
-                prompt=prompt_mask_edit,
-                image=img_input,
-                mask=mask,
-                size="1024x1024"
-            )
-        
-        # Save the edited image
-        if result_mask_edit.data and len(result_mask_edit.data) > 0:
-            image_base64 = result_mask_edit.data[0].b64_json
-            success = save_and_resize_image(image_base64, img_path_mask_edit, size=(300, 300))
-            if success:
-                logger.info("✅ Image editing with mask test completed successfully!")
-                return True
-            else:
-                logger.error("❌ Failed to save masked edited image")
-                return False
-        else:
-            logger.error("❌ No masked edited image data received from API")
-            return False
-            
-    except Exception as e:
-        logger.error(f"Error testing image editing with mask: {e}")
+        logger.error(f"Error testing input images: {e}")
         import traceback
         logger.error(traceback.format_exc())
         return False
 
 def test_all_image_generation():
     """Run all image generation tests"""
-    logger.info("🚀 Starting comprehensive GPT Image generation tests...")
+    logger.info("🚀 Starting GPT Image generation tests...")
     
     tests = [
         ("Basic Image Generation", test_basic_image_generation),
-        ("Customized Image Generation", test_customized_image_generation),
-        ("Transparent Background", test_transparent_background),
-        ("Image Editing", test_image_editing),
-        ("Image Editing with Mask", test_image_editing_with_mask),
+        ("Input Images", test_input_images),
     ]
     
     results = []
@@ -511,10 +267,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description='Test OpenAI GPT Image generation')
     parser.add_argument('--basic', action='store_true', help='Test basic image generation')
-    parser.add_argument('--customized', action='store_true', help='Test customized image generation')
-    parser.add_argument('--transparent', action='store_true', help='Test transparent background generation')
-    parser.add_argument('--editing', action='store_true', help='Test image editing')
-    parser.add_argument('--mask', action='store_true', help='Test image editing with mask')
+    parser.add_argument('--input-images', action='store_true', help='Test image editing with input images')
     parser.add_argument('--all', action='store_true', help='Run all tests')
     
     args = parser.parse_args()
@@ -531,30 +284,12 @@ if __name__ == "__main__":
             print("\n✅ Basic image generation test completed successfully!")
         else:
             print("\n❌ Basic image generation test failed.")
-    elif args.customized:
-        success = test_customized_image_generation()
+    elif args.input_images:
+        success = test_input_images()
         if success:
-            print("\n✅ Customized image generation test completed successfully!")
+            print("\n✅ Input images test completed successfully!")
         else:
-            print("\n❌ Customized image generation test failed.")
-    elif args.transparent:
-        success = test_transparent_background()
-        if success:
-            print("\n✅ Transparent background test completed successfully!")
-        else:
-            print("\n❌ Transparent background test failed.")
-    elif args.editing:
-        success = test_image_editing()
-        if success:
-            print("\n✅ Image editing test completed successfully!")
-        else:
-            print("\n❌ Image editing test failed.")
-    elif args.mask:
-        success = test_image_editing_with_mask()
-        if success:
-            print("\n✅ Image editing with mask test completed successfully!")
-        else:
-            print("\n❌ Image editing with mask test failed.")
+            print("\n❌ Input images test failed.")
     else:
         # Default: run all tests
         success = test_all_image_generation()
