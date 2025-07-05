@@ -696,57 +696,57 @@ export default function TaskDetails() {
     }
   };
 
-  const handleDeepResearchToggle = async () => {
-    if (!task) return;
+  // const handleDeepResearchToggle = async () => {
+  //   if (!task) return;
 
-    try {
-      const newIsDeepResearch = !task.isDeepResearch;
+  //   try {
+  //     const newIsDeepResearch = !task.isDeepResearch;
 
-      // If enabling deep research, also enable email notifications
-      // and disable interactive mode and complex task
-      const updateData: any = {
-        isDeepResearch: newIsDeepResearch,
-      };
+  //     // If enabling deep research, also enable email notifications
+  //     // and disable interactive mode and complex task
+  //     const updateData: any = {
+  //       isDeepResearch: newIsDeepResearch,
+  //     };
 
-      // If enabling deep research, also enable email notifications
-      if (newIsDeepResearch) {
-        // Enable email notifications if not already enabled
-        if (!task.emailNotification) {
-          updateData.emailNotification = true;
-        }
+  //     // If enabling deep research, also enable email notifications
+  //     if (newIsDeepResearch) {
+  //       // Enable email notifications if not already enabled
+  //       if (!task.emailNotification) {
+  //         updateData.emailNotification = true;
+  //       }
 
-        // Disable interactive mode, complex task, extract page content, and validate output
-        updateData.isInteractive = false;
-        updateData.isComplexTask = false;
-        updateData.extractPageContent = false;
-        updateData.validateOutput = false;
-        updateData.outputAsJson = false;
-      }
+  //       // Disable interactive mode, complex task, extract page content, and validate output
+  //       updateData.isInteractive = false;
+  //       updateData.isComplexTask = false;
+  //       updateData.extractPageContent = false;
+  //       updateData.validateOutput = false;
+  //       updateData.outputAsJson = false;
+  //     }
 
-      // Reset LLM selection when toggling deep research mode
-      // This ensures the appropriate LLM list will be used
-      updateData.llmName = null;
+  //     // Reset LLM selection when toggling deep research mode
+  //     // This ensures the appropriate LLM list will be used
+  //     updateData.llmName = null;
 
-      await axios.put(buildApiUrl(`/api/tasks/${taskId}`), updateData, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+  //     await axios.put(buildApiUrl(`/api/tasks/${taskId}`), updateData, {
+  //       headers: { Authorization: `Bearer ${token}` },
+  //     });
 
-      // Update the task state with the response
-      const taskResponse = await axios.get(
-        buildApiUrl(`/api/tasks/${taskId}`),
-        {
-          headers: { Authorization: `Bearer ${token}` },
-        }
-      );
+  //     // Update the task state with the response
+  //     const taskResponse = await axios.get(
+  //       buildApiUrl(`/api/tasks/${taskId}`),
+  //       {
+  //         headers: { Authorization: `Bearer ${token}` },
+  //       }
+  //     );
 
-      setTask(taskResponse.data);
-    } catch (error: any) {
-      console.error("Error updating deep research mode:", error);
-      setError(
-        error.response?.data?.message || "Failed to update deep research mode"
-      );
-    }
-  };
+  //     setTask(taskResponse.data);
+  //   } catch (error: any) {
+  //     console.error("Error updating deep research mode:", error);
+  //     setError(
+  //       error.response?.data?.message || "Failed to update deep research mode"
+  //     );
+  //   }
+  // };
 
   const handleComplexTaskToggle = async () => {
     if (!task) return;
