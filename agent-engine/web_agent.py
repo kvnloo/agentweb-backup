@@ -72,6 +72,14 @@ class DataAnalysisParams(BaseModel):
     analysis_task: str
     include_lead_list: bool = False
 
+class GenerateImageParams(BaseModel):
+    """Parameters for generating images with input images."""
+    input_file_names: List[str]
+    prompt: str
+    output_file_name: str
+    size: str = "1024x1024"
+    quality: str = "high"
+
 class LogFilterThread(threading.Thread):
     """Thread that continuously filters the log file in real-time"""
     
@@ -1908,6 +1916,132 @@ class WebAgent:
             except Exception as e:
                 logger.error(f"Error performing data analysis: {e}")
                 return ActionResult(error=f"Failed to perform data analysis: {str(e)}")
+
+        @self.controller.registry.action('Generate image with input images using OpenAI GPT Image', param_model=GenerateImageParams)
+        async def generate_image(params: GenerateImageParams) -> ActionResult:
+            """Generate or edit images using OpenAI GPT Image with input images.
+            
+            This action uses OpenAI GPT Image to generate or edit images based on input images
+            from attachments or downloads folder. The generated image is saved to the downloads folder.
+            
+            Parameters:
+            - params: GenerateImageParams containing:
+              - input_file_names: List of input image file names. If the file is not attached, it will be searched in the downloads folder.
+              - prompt: Description of what to do with the input images
+              - output_file_name: Name of the output image file to save in downloads folder
+              - size: Image size (default: "1024x1024")
+              - quality: Image quality (default: "high")
+            
+            Returns:
+            - ActionResult with the generation results or error message
+            """
+            try:
+                # Import OpenAI client
+                try:
+                    from openai import OpenAI
+                except ImportError:
+                    return ActionResult(error="OpenAI package not installed. Install with: pip install openai")
+
+                # Get API key
+                api_key = os.getenv('OPENAI_IMAGE_API_KEY')
+                if not api_key:
+                    return ActionResult(error="OPENAI_IMAGE_API_KEY environment variable is not set")
+
+                # Initialize the client
+                client = OpenAI(api_key=api_key)
+                
+                # Validate parameters
+                # Validate quality
+                valid_qualities = ["low", "medium", "high", "auto"]
+                if params.quality not in valid_qualities:
+                    return ActionResult(error=f"Invalid quality '{params.quality}'. Must be one of: {', '.join(valid_qualities)}")
+                
+                # Validate size
+                valid_sizes = ["1024x1024", "1536x1024", "1024x1536", "auto"]
+                if params.size not in valid_sizes:
+                    return ActionResult(error=f"Invalid size '{params.size}'. Must be one of: {', '.join(valid_sizes)}")
+                
+
+                
+                # Validate output file extension (must end with .png)
+                output_ext = Path(params.output_file_name).suffix.lower()
+                if output_ext != ".png":
+                    return ActionResult(error=f"Output file extension '{output_ext}' must be '.png'. Please rename the file to end with .png")
+                
+                # Get downloads path for output
+                downloads_path = self._get_downloads_path()
+                output_path = Path(downloads_path) / params.output_file_name
+                
+                # Prepare input images
+                input_images = []
+                
+                for file_name in params.input_file_names:
+                    # Try to get file path from attachments first, then downloads
+                    file_path = await self._get_attachment_path(file_name)
+                    
+                    if not file_path:
+                        # If not found in attachments, try downloads path
+                        file_path = Path(downloads_path) / file_name
+                        
+                        if not file_path.exists():
+                            return ActionResult(error=f"Input image file {file_name} not found in task attachments or downloads folder")
+
+                    # Check if file is an image
+                    file_ext = Path(file_name).suffix.lower()
+                    if file_ext not in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp']:
+                        return ActionResult(error=f"File {file_name} is not a supported image format. Supported formats: PNG, JPG, JPEG, GIF, BMP, WEBP")
+
+                    input_images.append(file_path)
+                
+                # Determine the operation based on number of input images
+                if len(input_images) == 0:
+                    # Generate new image from prompt only
+                    logger.info("Generating new image from prompt...")
+                    result = client.images.generate(
+                        model="gpt-image-1",
+                        prompt=params.prompt,
+                        size=params.size,
+                        quality=params.quality
+                    )
+                elif len(input_images) == 1:
+                    # Edit single image
+                    logger.info("Editing single input image...")
+                    with open(input_images[0], "rb") as img_input:
+                        result = client.images.edit(
+                            model="gpt-image-1",
+                            image=img_input,
+                            prompt=params.prompt,
+                            size=params.size
+                        )
+                else:
+                    # Edit multiple images (combine them)
+                    logger.info("Editing multiple input images...")
+                    with open(input_images[0], "rb") as img1, open(input_images[1], "rb") as img2:
+                        result = client.images.edit(
+                            model="gpt-image-1",
+                            image=[img1, img2] + [open(img, "rb") for img in input_images[2:]],
+                            prompt=params.prompt,
+                            size=params.size
+                        )
+                
+                # Save the generated image
+                if result.data and len(result.data) > 0:
+                    image_base64 = result.data[0].b64_json
+                    image_bytes = base64.b64decode(image_base64)
+                    
+                    # Save the image
+                    with open(output_path, "wb") as f:
+                        f.write(image_bytes)
+                    
+                    logger.info(f"Generated image saved to: {output_path}")
+                    
+                    return ActionResult(extracted_content=f"✅ Image generated successfully!\n\n**Input files:** {', '.join(params.input_file_names)}\n**Prompt:** {params.prompt}\n**Output:** {params.output_file_name}\n**Size:** {params.size}\n**Quality:** {params.quality}\n\nGenerated image saved to downloads folder.")
+                else:
+                    return ActionResult(error="No image data received from OpenAI API")
+
+            except Exception as e:
+                logger.error(f"Error generating image: {e}")
+                return ActionResult(error=f"Failed to generate image: {str(e)}")
 
     def _get_cookies_path(self):
         """Get the path to the user's cookies file"""
