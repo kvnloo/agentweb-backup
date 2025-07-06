@@ -2035,7 +2035,27 @@ class WebAgent:
                     
                     logger.info(f"Generated image saved to: {output_path}")
                     
-                    return ActionResult(extracted_content=f"✅ Image generated successfully!\n\n**Input files:** {', '.join(params.input_file_names)}\n**Prompt:** {params.prompt}\n**Output:** {params.output_file_name}\n**Size:** {params.size}\n**Quality:** {params.quality}\n\nGenerated image saved to downloads folder.")
+                    # Upload the generated image to S3 and get the URL
+                    result_files = []
+                    if self.current_execution_id:
+                        result_files = upload_task_result_files(downloads_path, self.current_execution_id)
+                    
+                    # Find the uploaded file info for our generated image
+                    uploaded_file_info = None
+                    for file_info in result_files:
+                        if file_info.get('filename') == params.output_file_name:
+                            uploaded_file_info = file_info
+                            break
+                    
+                    # Create success message
+                    if uploaded_file_info and uploaded_file_info.get('url'):
+                        success_msg = f"✅ Image {params.output_file_name} generated successfully! It has been uploaded and available at {uploaded_file_info['url']}. You MUST use the URL to refer this image in any HTML or Markdown content."
+                        logger.info(f"Generated image uploaded to S3: {uploaded_file_info['url']}")
+                    else:
+                        success_msg = f"✅ Image {params.output_file_name} generated successfully and saved to downloads folder! "
+                        logger.warning("Could not retrieve S3 URL for generated image")
+                    
+                    return ActionResult(extracted_content=success_msg)
                 else:
                     return ActionResult(error="No image data received from OpenAI API")
 
