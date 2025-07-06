@@ -215,6 +215,91 @@ def test_input_images():
         logger.error(traceback.format_exc())
         return False
 
+def test_multiple_input_images():
+    """Test image generation with multiple input images (logo + landscape)"""
+    # Load environment variables
+    load_dotenv()
+    
+    # Get API key from environment
+    api_key = os.getenv('OPENAI_IMAGE_API_KEY')
+    if not api_key:
+        logger.error("OPENAI_IMAGE_API_KEY environment variable is not set")
+        return False
+    
+    # Print last 4 characters of API key for verification
+    logger.info(f"Using OpenAI Image API key ending with: ...{api_key[-4:]}")
+    
+    try:
+        # Import OpenAI client
+        try:
+            from openai import OpenAI
+        except ImportError:
+            logger.error("openai package is not installed. Install it with: pip install openai")
+            return False
+        
+        # Create OpenAI client
+        client = OpenAI(api_key=api_key)
+        
+        # Create images folder
+        create_images_folder()
+        
+        # Check if we have the required input images
+        logo_path = "input_images/test-logo.png"
+        landscape_path = "input_images/test-landscape.jpg"
+        
+        if not os.path.exists(logo_path):
+            logger.error(f"Logo file not found at {logo_path}")
+            logger.error("Please add a logo file at input_images/test-logo.png")
+            return False
+            
+        if not os.path.exists(landscape_path):
+            logger.error(f"Landscape file not found at {landscape_path}")
+            logger.error("Please add a landscape file at input_images/test-landscape.jpg")
+            return False
+        
+        # Test prompt for combining logo with landscape
+        prompt_combine = """
+        Take this logo and integrate it naturally into this landscape scene. 
+        Place the logo as a subtle watermark or as part of the landscape design.
+        Make it look professional and well-integrated.
+        """
+        
+        output_path = "generated_images/logo_landscape_combined.png"
+        
+        logger.info("Testing image editing with multiple input images...")
+        logger.info(f"Input images: {logo_path}, {landscape_path}")
+        logger.info(f"Prompt: {prompt_combine}")
+        
+        # Open both input images
+        with open(logo_path, "rb") as img1, open(landscape_path, "rb") as img2:
+            # Generate the combined image using multiple input images
+            result = client.images.edit(
+                model="gpt-image-1",
+                image=[img1, img2],  # Pass both images as a list
+                prompt=prompt_combine,
+                size="1024x1024"
+            )
+        
+        # Save the combined image
+        if result.data and len(result.data) > 0:
+            image_base64 = result.data[0].b64_json
+            success = save_and_resize_image(image_base64, output_path, size=(800, 600))
+            if success:
+                logger.info("✅ Multiple input images test completed successfully!")
+                return True
+            else:
+                logger.error("❌ Failed to save combined image")
+                return False
+        else:
+            logger.error("❌ No combined image data received from API")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error testing multiple input images: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return False
+
 def test_all_image_generation():
     """Run all image generation tests"""
     logger.info("🚀 Starting GPT Image generation tests...")
@@ -222,6 +307,7 @@ def test_all_image_generation():
     tests = [
         ("Basic Image Generation", test_basic_image_generation),
         ("Input Images", test_input_images),
+        ("Multiple Input Images", test_multiple_input_images),
     ]
     
     results = []
@@ -268,6 +354,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Test OpenAI GPT Image generation')
     parser.add_argument('--basic', action='store_true', help='Test basic image generation')
     parser.add_argument('--input-images', action='store_true', help='Test image editing with input images')
+    parser.add_argument('--multiple-input-images', action='store_true', help='Test image editing with multiple input images')
     parser.add_argument('--all', action='store_true', help='Run all tests')
     
     args = parser.parse_args()
@@ -290,6 +377,12 @@ if __name__ == "__main__":
             print("\n✅ Input images test completed successfully!")
         else:
             print("\n❌ Input images test failed.")
+    elif args.multiple_input_images:
+        success = test_multiple_input_images()
+        if success:
+            print("\n✅ Multiple input images test completed successfully!")
+        else:
+            print("\n❌ Multiple input images test failed.")
     else:
         # Default: run all tests
         success = test_all_image_generation()
