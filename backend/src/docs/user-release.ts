@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-07-07',
+    changes: [
+      'Added image generation at task level',
+      '- Our agent can now generate and edit images using OpenAI GPT Image during task execution',
+      '- Supports generating new images from text prompts',
+      '- Supports editing existing images with text prompts',
+      '- Images are saved in PNG format with configurable size and quality settings'
+    ],
+  },
+  {
     date: '2025-07-01',
     changes: [
       'Bug fix on filtering archived task executions',
