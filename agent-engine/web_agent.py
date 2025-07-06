@@ -78,7 +78,7 @@ class GenerateImageParams(BaseModel):
     prompt: str
     output_file_name: str
     size: str = "1024x1024"
-    quality: str = "high"
+    quality: str = "medium"
 
 class LogFilterThread(threading.Thread):
     """Thread that continuously filters the log file in real-time"""
@@ -1930,7 +1930,7 @@ class WebAgent:
               - prompt: Description of what to do with the input images
               - output_file_name: Name of the output image file to save in downloads folder
               - size: Image size (default: "1024x1024")
-              - quality: Image quality (default: "high")
+              - quality: Image quality (default: "medium")
             
             Returns:
             - ActionResult with the generation results or error message
