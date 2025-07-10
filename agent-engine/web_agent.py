@@ -80,6 +80,11 @@ class GenerateImageParams(BaseModel):
     size: str = "1024x1024"
     quality: str = "medium"
 
+class VideoAnalysisParams(BaseModel):
+    """Parameters for performing video analysis."""
+    video_url: str
+    prompt: str
+
 class LogFilterThread(threading.Thread):
     """Thread that continuously filters the log file in real-time"""
     
@@ -1916,6 +1921,157 @@ class WebAgent:
             except Exception as e:
                 logger.error(f"Error performing data analysis: {e}")
                 return ActionResult(error=f"Failed to perform data analysis: {str(e)}")
+
+        @self.controller.registry.action('Perform video analysis using Google Gemini 2.5 Pro', param_model=VideoAnalysisParams)
+        async def perform_video_analysis(params: VideoAnalysisParams) -> ActionResult:
+            """Perform video analysis using Google Gemini 2.5 Pro.
+            
+            This action analyzes videos from URLs using Google Gemini 2.5 Pro.
+            For YouTube videos, it sends the URL directly to Gemini.
+            For other video URLs, it downloads the video and sends it as a file to Gemini.
+            
+            Parameters:
+            - params: VideoAnalysisParams containing:
+              - video_url: URL of the video to analyze (YouTube or other video URL)
+              - prompt: Analysis prompt describing what to analyze in the video
+            
+            Returns:
+            - ActionResult with the video analysis results or error message
+            """
+            try:
+                # Import Google Gemini SDK
+                try:
+                    import google.generativeai as genai
+                except ImportError:
+                    return ActionResult(error="Google Generative AI package not installed. Install with: pip install google-generativeai")
+
+                # Get API key
+                api_key = os.getenv('GEMINI_API_KEY')
+                if not api_key:
+                    return ActionResult(error="GEMINI_API_KEY environment variable is not set")
+
+                # Configure the API
+                genai.configure(api_key=api_key)
+                
+                # Create the model
+                model_name = os.getenv('VIDEO_ANALYSIS_LLM_NAME', 'gemini-2.5-pro')
+                model = genai.GenerativeModel(model_name)
+                
+                # Check if it's a YouTube URL
+                is_youtube = 'youtube.com' in params.video_url or 'youtu.be' in params.video_url
+                
+                if is_youtube:
+                    # For YouTube videos, send URL directly to Gemini
+                    logger.info(f"Analyzing YouTube video: {params.video_url}")
+                    
+                    youtube_prompt = f"""
+                    Please analyze this YouTube video and provide a comprehensive analysis based on the following prompt:
+                    
+                    Video URL: {params.video_url}
+                    Analysis Prompt: {params.prompt}
+                    """
+                    
+                    response = model.generate_content(youtube_prompt)
+                    
+                    if response.text:
+                        logger.info("YouTube video analysis completed successfully")
+                        return ActionResult(extracted_content=response.text)
+                    else:
+                        return ActionResult(error="No analysis results received from Gemini for YouTube video")
+                        
+                else:
+                    # For other video URLs, download the video and send as file
+                    logger.info(f"Downloading and analyzing video: {params.video_url}")
+                    
+                    try:
+                        # Download the video
+                        import aiohttp
+                        import tempfile
+                        import os
+                        
+                        # Get file extension from URL or default to .mp4
+                        from urllib.parse import urlparse
+                        parsed_url = urlparse(params.video_url)
+                        file_extension = Path(parsed_url.path).suffix.lower()
+                        
+                        # Default to .mp4 if no extension found or not a video extension
+                        video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp']
+                        if not file_extension or file_extension not in video_extensions:
+                            return ActionResult(error="Unknown video file extension. Please provide a video file with one of the following extensions: " + ", ".join(video_extensions))
+                        
+                        # Create a temporary file for the video
+                        with tempfile.NamedTemporaryFile(suffix=file_extension, delete=False) as temp_file:
+                            temp_video_path = temp_file.name
+                        
+                        # Download the video
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(params.video_url) as response:
+                                if response.status != 200:
+                                    return ActionResult(error=f"Failed to download video: HTTP {response.status}")
+                                
+                                video_data = await response.read()
+                                
+                                # Write video data to temporary file
+                                with open(temp_video_path, 'wb') as f:
+                                    f.write(video_data)
+                        
+                        # Read the video file as binary data
+                        with open(temp_video_path, 'rb') as video_file:
+                            video_data = video_file.read()
+                        
+                        # Convert to base64 for API transmission
+                        import base64
+                        video_b64 = base64.b64encode(video_data).decode('utf-8')
+                        
+                        # Determine MIME type based on file extension
+                        mime_type_map = {
+                            '.mp4': 'video/mp4',
+                            '.avi': 'video/x-msvideo',
+                            '.mov': 'video/quicktime',
+                            '.mkv': 'video/x-matroska',
+                            '.wmv': 'video/x-ms-wmv',
+                            '.flv': 'video/x-flv',
+                            '.webm': 'video/webm',
+                            '.m4v': 'video/x-m4v',
+                            '.3gp': 'video/3gpp'
+                        }
+                        mime_type = mime_type_map.get(file_extension, 'video/mp4')
+                        
+                        # Create content parts for the video
+                        content_parts = [
+                            {
+                                "inline_data": {
+                                    "data": video_b64,
+                                    "mime_type": mime_type
+                                }
+                            },
+                            {
+                                "text": f"Please analyze this video based on the following prompt: {params.prompt}"
+                            }
+                        ]
+                        
+                        response = model.generate_content(content_parts)
+                        
+                        if response.text:
+                            logger.info("Video file analysis completed successfully")
+                            return ActionResult(extracted_content=response.text)
+                        else:
+                            return ActionResult(error="No analysis results received from Gemini for video file")
+                            
+                    except Exception as e:
+                        logger.error(f"Error downloading or processing video: {e}")
+                        return ActionResult(error=f"Failed to download or process video: {str(e)}")
+                    finally:
+                        # Clean up temporary file
+                        if 'temp_video_path' in locals() and os.path.exists(temp_video_path):
+                            try:
+                                os.unlink(temp_video_path)
+                            except Exception as e:
+                                logger.warning(f"Failed to clean up temporary video file: {e}")
+
+            except Exception as e:
+                logger.error(f"Error performing video analysis: {e}")
+                return ActionResult(error=f"Failed to perform video analysis: {str(e)}")
 
         @self.controller.registry.action('Generate image with input images using OpenAI GPT Image', param_model=GenerateImageParams)
         async def generate_image(params: GenerateImageParams) -> ActionResult:
