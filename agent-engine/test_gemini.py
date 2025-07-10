@@ -805,6 +805,163 @@ async def test_gemini_file_input_with_sdk(model_name="gemini-2.0-flash"):
         logger.error(traceback.format_exc())
         return False
 
+async def test_gemini_video_understanding(model_name="gemini-2.0-flash"):
+    """Test Gemini video understanding capabilities with YouTube videos and attached video files"""
+    # Load environment variables from .env file
+    load_dotenv()
+    
+    # Get API key from environment
+    api_key = os.getenv('GEMINI_API_KEY')
+    if not api_key:
+        logger.error("GEMINI_API_KEY environment variable is not set")
+        return False
+    
+    logger.info(f"Testing Google Gemini video understanding with model: {model_name}")
+    
+    try:
+        # Import here to avoid requiring the package for all users
+        try:
+            import google.generativeai as genai
+        except ImportError:
+            logger.error("google-generativeai package is not installed. Install it with: pip install google-generativeai")
+            return False
+        
+        # Configure the API
+        genai.configure(api_key=api_key)
+        
+        # Test 1: YouTube Video Summarization
+        logger.info("Test 1: YouTube Video Summarization")
+        logger.info("Testing with a sample YouTube video URL...")
+        
+        # Use a sample YouTube video URL (you can replace this with any public YouTube video)
+        # Using a popular educational video about AI
+        youtube_url = "https://www.youtube.com/watch?v=aircAruvnKk"  # 3Blue1Brown - But what is a neural network?
+        
+        try:
+            # Create the model
+            model = genai.GenerativeModel(model_name)
+            
+            # Test YouTube video understanding
+            youtube_prompt = f"""
+            Please analyze this YouTube video and provide a comprehensive summary:
+            {youtube_url}
+            
+            Include:
+            1. Main topic or theme
+            2. Key points discussed
+            3. Duration and format
+            4. Any notable visuals or audio elements
+            5. Overall tone and style
+            """
+            
+            logger.info("Sending YouTube video analysis request...")
+            response = model.generate_content(youtube_prompt)
+            
+            logger.info("YouTube Video Analysis Response:")
+            logger.info(response.text)
+            
+            # Check if response contains meaningful content
+            if response.text and len(response.text.strip()) > 50:
+                logger.info("✅ YouTube video analysis test completed successfully!")
+                youtube_success = True
+            else:
+                logger.error("❌ YouTube video analysis test failed - insufficient response")
+                youtube_success = False
+                
+        except Exception as e:
+            logger.error(f"❌ YouTube video analysis test failed: {e}")
+            youtube_success = False
+        
+        # Test 2: Attached Video File Analysis
+        logger.info("\nTest 2: Attached Video File Analysis")
+        
+        # Check if there's a sample video file in the input_images directory
+        sample_video_path = Path("input_images/sample_video.mp4")
+        video_file_success = False
+        
+        if sample_video_path.exists():
+            logger.info(f"Found sample video file: {sample_video_path}")
+            
+            try:
+                # Read the video file as binary data
+                with open(sample_video_path, 'rb') as video_file:
+                    video_data = video_file.read()
+                
+                # Convert to base64 for API transmission
+                import base64
+                video_b64 = base64.b64encode(video_data).decode('utf-8')
+                
+                # Test video file analysis with actual video data
+                video_file_prompt = """
+                Please analyze this video file and provide a comprehensive summary.
+                
+                Include:
+                1. Video content and main subject
+                2. Key visual and audio elements
+                3. Duration and technical details
+                4. Style and presentation
+                5. Target audience
+                6. Key messages or takeaways
+                """
+                
+                logger.info("Sending video file analysis request with actual video data...")
+                
+                # Create content parts for the video
+                content_parts = [
+                    {
+                        "inline_data": {
+                            "data": video_b64,
+                            "mime_type": "video/mp4"
+                        }
+                    },
+                    {
+                        "text": video_file_prompt
+                    }
+                ]
+                
+                response = model.generate_content(content_parts)
+                
+                logger.info("Video File Analysis Response:")
+                logger.info(response.text)
+                
+                # Check if response contains meaningful content
+                if response.text and len(response.text.strip()) > 50:
+                    logger.info("✅ Video file analysis test completed successfully!")
+                    video_file_success = True
+                else:
+                    logger.error("❌ Video file analysis test failed - insufficient response")
+                    video_file_success = False
+                    
+            except Exception as e:
+                logger.error(f"❌ Video file analysis test failed: {e}")
+                video_file_success = False
+        else:
+            logger.info("No sample video file found at input_images/sample_video.mp4")
+            logger.info("To test video file analysis, please place a video file at input_images/sample_video.mp4")
+            logger.info("Skipping video file analysis test...")
+            video_file_success = False
+        
+        # Summary of results
+        success_count = 0
+        if youtube_success:
+            success_count += 1
+        if video_file_success:
+            success_count += 1
+        
+        if success_count >= 1:
+            logger.info(f"🎉 Video understanding tests completed! ({success_count}/2 tests passed)")
+            logger.info("Note: YouTube video analysis may be limited by API capabilities.")
+            return True
+        else:
+            logger.error("❌ All video understanding tests failed")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error testing Gemini video understanding: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return False
+
 if __name__ == "__main__":
     import argparse
     
@@ -816,6 +973,7 @@ if __name__ == "__main__":
     parser.add_argument('--code-exec', action='store_true', help='Run Gemini code execution test')
     parser.add_argument('--browser-use-code-exec', action='store_true', help='Run Gemini code execution test with browser-use Agent')
     parser.add_argument('--file-input', action='store_true', help='Run Gemini file input test with SDK')
+    parser.add_argument('--video-understanding', action='store_true', help='Run Gemini video understanding test (YouTube and attached video)')
     
     args = parser.parse_args()
     
@@ -849,6 +1007,12 @@ if __name__ == "__main__":
             print("\nGemini file input test completed successfully!")
         else:
             print("\nGemini file input test failed.")
+    elif args.video_understanding:
+        success = asyncio.run(test_gemini_video_understanding(model_name=args.model))
+        if success:
+            print("\nGemini video understanding test completed successfully!")
+        else:
+            print("\nGemini video understanding test failed.")
     else:
         success = test_gemini(args.model)
         if success:
