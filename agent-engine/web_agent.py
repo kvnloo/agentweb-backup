@@ -2057,7 +2057,8 @@ class WebAgent:
                                 file_size = video_file.stat().st_size
                                 if file_size == 0:
                                     return ActionResult(error="Downloaded Instagram video file is empty")
-                                logger.info(f"Instagram video downloaded successfully: {file_size} bytes")
+                                
+                                logger.info(f"Instagram video downloaded successfully: {file_size} bytes ({file_size / (1024*1024):.1f} MB)")
                                 with open(video_file, 'rb') as video_file_handle:
                                     video_data = video_file_handle.read()
                                 file_extension = ".mp4"
@@ -2165,7 +2166,7 @@ class WebAgent:
                                 if file_size == 0:
                                     return ActionResult(error="Downloaded Google Drive video file is empty")
 
-                                logger.info(f"Google Drive video downloaded successfully: {file_size} bytes")
+                                logger.info(f"Google Drive video downloaded successfully: {file_size} bytes ({file_size / (1024*1024):.1f} MB)")
                                 logger.info(f"Downloaded file: {video_file.name}")
 
                                 # Read the video file as binary data and set up for existing analysis code
@@ -2221,6 +2222,9 @@ class WebAgent:
                                     if response.status != 200:
                                         return ActionResult(error=f"Failed to download video: HTTP {response.status}")
                                     video_data = await response.read()
+                                    
+                                    logger.info(f"Video downloaded successfully: {len(video_data)} bytes ({len(video_data) / (1024*1024):.1f} MB)")
+                                    
                                     with open(temp_video_path, 'wb') as f:
                                         f.write(video_data)
                             with open(temp_video_path, 'rb') as video_file:
@@ -2237,6 +2241,18 @@ class WebAgent:
                                 '.3gp': 'video/3gpp'
                             }
                             mime_type = mime_type_map.get(file_extension, 'video/mp4')
+
+                        # Check file size limit before analysis
+                        video_size = len(video_data)
+                        max_size_mb = int(os.getenv('MAX_DOWNLOADED_VIDEO_SIZE_MB', '100'))  # Default 100MB
+                        max_size_bytes = max_size_mb * 1024 * 1024
+                        
+                        if video_size > max_size_bytes:
+                            error_msg = f"Video file too large for analysis: {video_size} bytes ({video_size / (1024*1024):.1f} MB) exceeds limit of {max_size_mb} MB"
+                            logger.error(error_msg)
+                            return ActionResult(error=error_msg)
+                        
+                        logger.info(f"Size check passed (limit: {max_size_mb} MB)")
 
                         # --- Shared Gemini analysis code ---
                         contents = [
