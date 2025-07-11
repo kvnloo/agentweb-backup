@@ -1965,10 +1965,16 @@ class WebAgent:
                     logger.info(f"Analyzing YouTube video: {params.video_url}")
                     
                     youtube_prompt = f"""
-                    Please analyze this YouTube video and provide a comprehensive analysis based on the following prompt:
+                    Please analyze the YouTube video ({params.video_url}) and provide a comprehensive analysis based on the following prompt: 
                     
-                    Video URL: {params.video_url}
                     Analysis Prompt: {params.prompt}
+
+                    Include:
+                        1. Main topic or theme
+                        2. Key points discussed
+                        3. Duration and format
+                        4. Any notable visuals or audio elements
+                        5. Overall tone and style
                     """
                     
                     response = model.generate_content(youtube_prompt)
