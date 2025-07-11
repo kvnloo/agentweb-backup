@@ -838,30 +838,58 @@ async def test_gemini_video_understanding(model_name="gemini-2.0-flash"):
         youtube_url = "https://www.youtube.com/watch?v=aircAruvnKk"  # 3Blue1Brown - But what is a neural network?
         
         try:
-            # Create the model
-            model = genai.GenerativeModel(model_name)
+            # Import the proper Google Generative AI SDK
+            try:
+                from google import genai
+                from google.genai import types
+            except ImportError:
+                logger.error("google-genai package is not installed. Install with: pip install google-genai")
+                youtube_success = False
+                return False
             
-            # Test YouTube video understanding
-            youtube_prompt = f"""
-            Please analyze this YouTube video and provide a comprehensive summary:
-            {youtube_url}
+            # Create the client
+            client = genai.Client(api_key=api_key)
             
-            Include:
-            1. Main topic or theme
-            2. Key points discussed
-            3. Duration and format
-            4. Any notable visuals or audio elements
-            5. Overall tone and style
-            """
+            # Test YouTube video understanding using the proper API
+            contents = [
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(
+                            file_data=types.FileData(
+                                file_uri=youtube_url,
+                                mime_type="video/*",
+                            )
+                        ),
+                        types.Part.from_text(text="""give a summary of the youtube video"""),
+                    ],
+                ),
+            ]
+            
+            generate_content_config = types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(
+                    thinking_budget=-1,
+                ),
+                response_mime_type="text/plain",
+            )
             
             logger.info("Sending YouTube video analysis request...")
-            response = model.generate_content(youtube_prompt)
+            
+            # Collect the response
+            response_text = ""
+            for chunk in client.models.generate_content_stream(
+                model=model_name,
+                contents=contents,
+                config=generate_content_config,
+            ):
+                if chunk.text:
+                    response_text += chunk.text
             
             logger.info("YouTube Video Analysis Response:")
-            logger.info(response.text)
+            logger.info(response_text)
             
             # Check if response contains meaningful content
-            if response.text and len(response.text.strip()) > 50:
+            if response_text and len(response_text.strip()) > 50:
                 logger.info("✅ YouTube video analysis test completed successfully!")
                 youtube_success = True
             else:
