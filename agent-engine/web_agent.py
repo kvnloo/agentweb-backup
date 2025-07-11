@@ -1987,7 +1987,6 @@ class WebAgent:
                         # Download the video
                         import aiohttp
                         import tempfile
-                        import os
                         
                         # Get file extension from URL or default to .mp4
                         from urllib.parse import urlparse
