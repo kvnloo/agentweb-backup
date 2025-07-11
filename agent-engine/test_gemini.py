@@ -915,11 +915,7 @@ async def test_gemini_video_understanding(model_name="gemini-2.0-flash"):
                 with open(sample_video_path, 'rb') as video_file:
                     video_data = video_file.read()
                 
-                # Convert to base64 for API transmission
-                import base64
-                video_b64 = base64.b64encode(video_data).decode('utf-8')
-                
-                # Test video file analysis with actual video data
+                # Test video file analysis with actual video data using proper SDK
                 video_file_prompt = """
                 Please analyze this video file and provide a comprehensive summary.
                 
@@ -934,26 +930,42 @@ async def test_gemini_video_understanding(model_name="gemini-2.0-flash"):
                 
                 logger.info("Sending video file analysis request with actual video data...")
                 
-                # Create content parts for the video
-                content_parts = [
-                    {
-                        "inline_data": {
-                            "data": video_b64,
-                            "mime_type": "video/mp4"
-                        }
-                    },
-                    {
-                        "text": video_file_prompt
-                    }
+                # Create content using the proper Google Generative AI SDK
+                contents = [
+                    types.Content(
+                        role="user",
+                        parts=[
+                            types.Part.from_bytes(
+                                mime_type="video/mp4",
+                                data=video_data
+                            ),
+                            types.Part.from_text(text=video_file_prompt),
+                        ],
+                    ),
                 ]
                 
-                response = model.generate_content(content_parts)
+                generate_content_config = types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(
+                        thinking_budget=-1,
+                    ),
+                    response_mime_type="text/plain",
+                )
+                
+                # Collect the response
+                response_text = ""
+                for chunk in client.models.generate_content_stream(
+                    model=model_name,
+                    contents=contents,
+                    config=generate_content_config,
+                ):
+                    if chunk.text:
+                        response_text += chunk.text
                 
                 logger.info("Video File Analysis Response:")
-                logger.info(response.text)
+                logger.info(response_text)
                 
                 # Check if response contains meaningful content
-                if response.text and len(response.text.strip()) > 50:
+                if response_text and len(response_text.strip()) > 50:
                     logger.info("✅ Video file analysis test completed successfully!")
                     video_file_success = True
                 else:
