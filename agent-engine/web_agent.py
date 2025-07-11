@@ -1958,8 +1958,7 @@ class WebAgent:
                 model_name = os.getenv('VIDEO_ANALYSIS_LLM_NAME', 'gemini-2.5-pro')
                 
                 # Check if it's a YouTube URL
-                is_youtube = 'youtube.com' in params.video_url or 'youtu.be' in params.video_url
-                
+                is_youtube = 'youtube.com' in params.video_url or 'youtu.be' in params.video_url                
                 if is_youtube:
                     # For YouTube videos, send URL directly to Gemini using proper SDK
                     logger.info(f"Analyzing YouTube video: {params.video_url}")
@@ -2013,57 +2012,89 @@ class WebAgent:
                 else:
                     # For other video URLs, download the video and send as file
                     logger.info(f"Downloading and analyzing video: {params.video_url}")
-                    
+
                     try:
-                        # Download the video
-                        import aiohttp
-                        import tempfile
-                        
-                        # Get file extension from URL
-                        from urllib.parse import urlparse
-                        parsed_url = urlparse(params.video_url)
-                        file_extension = Path(parsed_url.path).suffix.lower()
-                        
-                        # Check if it's a known video extension
-                        video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp']
-                        if not file_extension or file_extension not in video_extensions:
-                            return ActionResult(error="Unknown video file extension. Please provide a video file with one of the following extensions: " + ", ".join(video_extensions))
-                        
-                        # Create a temporary file for the video
-                        with tempfile.NamedTemporaryFile(suffix=file_extension, delete=False) as temp_file:
-                            temp_video_path = temp_file.name
-                        
-                        # Download the video
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get(params.video_url) as response:
-                                if response.status != 200:
-                                    return ActionResult(error=f"Failed to download video: HTTP {response.status}")
-                                
-                                video_data = await response.read()
-                                
-                                # Write video data to temporary file
-                                with open(temp_video_path, 'wb') as f:
-                                    f.write(video_data)
-                        
-                        # Read the video file as binary data
-                        with open(temp_video_path, 'rb') as video_file:
-                            video_data = video_file.read()
-                        
-                        # Determine MIME type based on file extension
-                        mime_type_map = {
-                            '.mp4': 'video/mp4',
-                            '.avi': 'video/x-msvideo',
-                            '.mov': 'video/quicktime',
-                            '.mkv': 'video/x-matroska',
-                            '.wmv': 'video/x-ms-wmv',
-                            '.flv': 'video/x-flv',
-                            '.webm': 'video/webm',
-                            '.m4v': 'video/x-m4v',
-                            '.3gp': 'video/3gpp'
-                        }
-                        mime_type = mime_type_map.get(file_extension, 'video/mp4')
-                        
-                        # Create content using the proper Google Generative AI SDK
+                        is_instagram = 'instagram.com' in params.video_url
+
+                        if is_instagram:
+                            try:
+                                import instaloader
+                            except ImportError:
+                                return ActionResult(error="instaloader library not installed. Install with: pip install instaloader")
+
+                            L = instaloader.Instaloader(
+                                download_videos=True,
+                                download_video_thumbnails=False,
+                                download_geotags=False,
+                                download_comments=False,
+                                save_metadata=False,
+                                compress_json=False
+                            )
+
+                            shortcode = params.video_url.split('/p/')[-1].split('/')[0]
+                            logger.info(f"Extracted Instagram shortcode: {shortcode}")
+
+                            post = instaloader.Post.from_shortcode(L.context, shortcode)
+
+                            if not post.is_video:
+                                return ActionResult(error="This Instagram post is not a video")
+
+                            if not post.video_url:
+                                return ActionResult(error="No video URL found in Instagram post")
+
+                            logger.info(f"Found Instagram video URL: {post.video_url}")
+
+                            import tempfile
+                            with tempfile.TemporaryDirectory() as temp_dir:
+                                temp_dir_path = Path(temp_dir)
+                                logger.info("Downloading Instagram video...")
+                                L.download_post(post, target=temp_dir_path)
+                                video_files = list(temp_dir_path.glob("*.mp4"))
+                                if not video_files:
+                                    return ActionResult(error="No video file found after Instagram download")
+                                video_file = video_files[0]
+                                file_size = video_file.stat().st_size
+                                if file_size == 0:
+                                    return ActionResult(error="Downloaded Instagram video file is empty")
+                                logger.info(f"Instagram video downloaded successfully: {file_size} bytes")
+                                with open(video_file, 'rb') as video_file_handle:
+                                    video_data = video_file_handle.read()
+                                file_extension = ".mp4"
+                                mime_type = "video/mp4"
+                        else:
+                            import aiohttp
+                            import tempfile
+                            from urllib.parse import urlparse
+                            parsed_url = urlparse(params.video_url)
+                            file_extension = Path(parsed_url.path).suffix.lower()
+                            video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp']
+                            if not file_extension or file_extension not in video_extensions:
+                                return ActionResult(error="Unknown video file extension. Please provide a video file with one of the following extensions: " + ", ".join(video_extensions))
+                            with tempfile.NamedTemporaryFile(suffix=file_extension, delete=False) as temp_file:
+                                temp_video_path = temp_file.name
+                            async with aiohttp.ClientSession() as session:
+                                async with session.get(params.video_url) as response:
+                                    if response.status != 200:
+                                        return ActionResult(error=f"Failed to download video: HTTP {response.status}")
+                                    video_data = await response.read()
+                                    with open(temp_video_path, 'wb') as f:
+                                        f.write(video_data)
+                            with open(temp_video_path, 'rb') as video_file:
+                                video_data = video_file.read()
+                            mime_type_map = {
+                                '.mp4': 'video/mp4',
+                                '.avi': 'video/x-msvideo',
+                                '.mov': 'video/quicktime',
+                                '.mkv': 'video/x-matroska',
+                                '.wmv': 'video/x-ms-wmv',
+                                '.flv': 'video/x-flv',
+                                '.webm': 'video/webm',
+                                '.m4v': 'video/x-m4v',
+                                '.3gp': 'video/3gpp'
+                            }
+                            mime_type = mime_type_map.get(file_extension, 'video/mp4')
+
+                        # --- Shared Gemini analysis code ---
                         contents = [
                             types.Content(
                                 role="user",
@@ -2076,17 +2107,16 @@ class WebAgent:
                                 ],
                             ),
                         ]
-                        
+
                         generate_content_config = types.GenerateContentConfig(
                             thinking_config=types.ThinkingConfig(
                                 thinking_budget=-1,
                             ),
                             response_mime_type="text/plain",
                         )
-                        
+
                         logger.info("Sending video file analysis request...")
-                        
-                        # Collect the response
+
                         response_text = ""
                         for chunk in client.models.generate_content_stream(
                             model=model_name,
@@ -2095,13 +2125,13 @@ class WebAgent:
                         ):
                             if chunk.text:
                                 response_text += chunk.text
-                        
+
                         if response_text:
                             logger.info("Video file analysis completed successfully")
                             return ActionResult(extracted_content=response_text)
                         else:
                             return ActionResult(error="No analysis results received from Gemini for video file")
-                            
+
                     except Exception as e:
                         logger.error(f"Error downloading or processing video: {e}")
                         return ActionResult(error=f"Failed to download or process video: {str(e)}")
