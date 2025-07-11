@@ -18,4 +18,3 @@ python-docx
 openpyxl
 PyYAML
 google-genai
-google-generativeai

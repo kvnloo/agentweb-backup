@@ -1941,49 +1941,74 @@ class WebAgent:
             try:
                 # Import Google Gemini SDK
                 try:
-                    import google.generativeai as genai
+                    from google import genai
+                    from google.genai import types
                 except ImportError:
-                    return ActionResult(error="Google Generative AI package not installed. Install with: pip install google-generativeai")
+                    return ActionResult(error="Google Generative AI package not installed. Install with: pip install google-genai")
 
                 # Get API key
                 api_key = os.getenv('GEMINI_API_KEY')
                 if not api_key:
                     return ActionResult(error="GEMINI_API_KEY environment variable is not set")
 
-                # Configure the API
-                genai.configure(api_key=api_key)
+                # Initialize the client
+                client = genai.Client(api_key=api_key)
                 
-                # Create the model
+                # Get model name from environment
                 model_name = os.getenv('VIDEO_ANALYSIS_LLM_NAME', 'gemini-2.5-pro')
-                model = genai.GenerativeModel(model_name)
                 
                 # Check if it's a YouTube URL
                 is_youtube = 'youtube.com' in params.video_url or 'youtu.be' in params.video_url
                 
                 if is_youtube:
-                    # For YouTube videos, send URL directly to Gemini
+                    # For YouTube videos, send URL directly to Gemini using proper SDK
                     logger.info(f"Analyzing YouTube video: {params.video_url}")
                     
-                    youtube_prompt = f"""
-                    Please analyze the YouTube video ({params.video_url}) and provide a comprehensive analysis based on the following prompt: 
-                    
-                    Analysis Prompt: {params.prompt}
-
-                    Include:
-                        1. Main topic or theme
-                        2. Key points discussed
-                        3. Duration and format
-                        4. Any notable visuals or audio elements
-                        5. Overall tone and style
-                    """
-                    
-                    response = model.generate_content(youtube_prompt)
-                    
-                    if response.text:
-                        logger.info("YouTube video analysis completed successfully")
-                        return ActionResult(extracted_content=response.text)
-                    else:
-                        return ActionResult(error="No analysis results received from Gemini for YouTube video")
+                    try:
+                        # Create content using the proper Google Generative AI SDK
+                        contents = [
+                            types.Content(
+                                role="user",
+                                parts=[
+                                    types.Part(
+                                        file_data=types.FileData(
+                                            file_uri=params.video_url,
+                                            mime_type="video/*",
+                                        )
+                                    ),
+                                    types.Part.from_text(text=params.prompt),
+                                ],
+                            ),
+                        ]
+                        
+                        generate_content_config = types.GenerateContentConfig(
+                            thinking_config=types.ThinkingConfig(
+                                thinking_budget=-1,
+                            ),
+                            response_mime_type="text/plain",
+                        )
+                        
+                        logger.info("Sending YouTube video analysis request...")
+                        
+                        # Collect the response
+                        response_text = ""
+                        for chunk in client.models.generate_content_stream(
+                            model=model_name,
+                            contents=contents,
+                            config=generate_content_config,
+                        ):
+                            if chunk.text:
+                                response_text += chunk.text
+                        
+                        if response_text:
+                            logger.info("YouTube video analysis completed successfully")
+                            return ActionResult(extracted_content=response_text)
+                        else:
+                            return ActionResult(error="No analysis results received from Gemini for YouTube video")
+                            
+                    except Exception as e:
+                        logger.error(f"Error analyzing YouTube video: {e}")
+                        return ActionResult(error=f"Failed to analyze YouTube video: {str(e)}")
                         
                 else:
                     # For other video URLs, download the video and send as file
@@ -1994,12 +2019,12 @@ class WebAgent:
                         import aiohttp
                         import tempfile
                         
-                        # Get file extension from URL or default to .mp4
+                        # Get file extension from URL
                         from urllib.parse import urlparse
                         parsed_url = urlparse(params.video_url)
                         file_extension = Path(parsed_url.path).suffix.lower()
                         
-                        # Default to .mp4 if no extension found or not a video extension
+                        # Check if it's a known video extension
                         video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp']
                         if not file_extension or file_extension not in video_extensions:
                             return ActionResult(error="Unknown video file extension. Please provide a video file with one of the following extensions: " + ", ".join(video_extensions))
@@ -2024,10 +2049,6 @@ class WebAgent:
                         with open(temp_video_path, 'rb') as video_file:
                             video_data = video_file.read()
                         
-                        # Convert to base64 for API transmission
-                        import base64
-                        video_b64 = base64.b64encode(video_data).decode('utf-8')
-                        
                         # Determine MIME type based on file extension
                         mime_type_map = {
                             '.mp4': 'video/mp4',
@@ -2042,24 +2063,42 @@ class WebAgent:
                         }
                         mime_type = mime_type_map.get(file_extension, 'video/mp4')
                         
-                        # Create content parts for the video
-                        content_parts = [
-                            {
-                                "inline_data": {
-                                    "data": video_b64,
-                                    "mime_type": mime_type
-                                }
-                            },
-                            {
-                                "text": f"Please analyze this video based on the following prompt: {params.prompt}"
-                            }
+                        # Create content using the proper Google Generative AI SDK
+                        contents = [
+                            types.Content(
+                                role="user",
+                                parts=[
+                                    types.Part.from_bytes(
+                                        mime_type=mime_type,
+                                        data=video_data
+                                    ),
+                                    types.Part.from_text(text=params.prompt),
+                                ],
+                            ),
                         ]
                         
-                        response = model.generate_content(content_parts)
+                        generate_content_config = types.GenerateContentConfig(
+                            thinking_config=types.ThinkingConfig(
+                                thinking_budget=-1,
+                            ),
+                            response_mime_type="text/plain",
+                        )
                         
-                        if response.text:
+                        logger.info("Sending video file analysis request...")
+                        
+                        # Collect the response
+                        response_text = ""
+                        for chunk in client.models.generate_content_stream(
+                            model=model_name,
+                            contents=contents,
+                            config=generate_content_config,
+                        ):
+                            if chunk.text:
+                                response_text += chunk.text
+                        
+                        if response_text:
                             logger.info("Video file analysis completed successfully")
-                            return ActionResult(extracted_content=response.text)
+                            return ActionResult(extracted_content=response_text)
                         else:
                             return ActionResult(error="No analysis results received from Gemini for video file")
                             
