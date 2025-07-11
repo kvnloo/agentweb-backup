@@ -2015,6 +2015,7 @@ class WebAgent:
 
                     try:
                         is_instagram = 'instagram.com' in params.video_url
+                        is_google_drive = 'drive.google.com' in params.video_url
 
                         if is_instagram:
                             try:
@@ -2061,6 +2062,149 @@ class WebAgent:
                                     video_data = video_file_handle.read()
                                 file_extension = ".mp4"
                                 mime_type = "video/mp4"
+                        elif is_google_drive:
+                            try:
+                                import gdown
+                            except ImportError:
+                                return ActionResult(error="gdown library not installed. Install with: pip install gdown")
+
+                            # Extract file ID from URL
+                            if '/file/d/' in params.video_url:
+                                file_id = params.video_url.split('/file/d/')[1].split('/')[0]
+                            elif 'id=' in params.video_url:
+                                file_id = params.video_url.split('id=')[1].split('&')[0]
+                            else:
+                                return ActionResult(error="Could not extract file ID from Google Drive URL")
+
+                            logger.info(f"Extracted Google Drive file ID: {file_id}")
+
+                            import tempfile
+                            with tempfile.TemporaryDirectory() as temp_dir:
+                                temp_dir_path = Path(temp_dir)
+
+                                # Construct the direct download URL
+                                direct_url = f"https://drive.google.com/uc?id={file_id}"
+
+                                # First, try to get the actual filename from Google Drive
+                                logger.info("Getting file information from Google Drive...")
+                                
+                                # Use gdown to get file info first
+                                filename = None
+                                try:
+                                    import requests
+                                    
+                                    # Try to get file info using Google Drive API-like approach
+                                    info_url = f"https://drive.google.com/uc?id={file_id}&export=download"
+                                    response = requests.head(info_url, allow_redirects=True)
+                                    
+                                    # Check if we can get filename from Content-Disposition header
+                                    content_disposition = response.headers.get('Content-Disposition', '')
+                                    if 'filename=' in content_disposition:
+                                        filename = content_disposition.split('filename=')[1].strip('"')
+                                        logger.info(f"Found filename from headers: {filename}")
+                                    
+                                    # If no filename found, try a different approach
+                                    if not filename:
+                                        # Use gdown with --id flag to get file info
+                                        import subprocess
+                                        try:
+                                            result = subprocess.run([
+                                                'gdown', '--id', file_id, '--print-url'
+                                            ], capture_output=True, text=True, timeout=30)
+                                            
+                                            if result.returncode == 0 and result.stdout.strip():
+                                                # Parse the output to get filename
+                                                output_lines = result.stdout.strip().split('\n')
+                                                for line in output_lines:
+                                                    if 'filename=' in line:
+                                                        filename = line.split('filename=')[1].strip()
+                                                        logger.info(f"Found filename from gdown: {filename}")
+                                                        break
+                                        except Exception as e:
+                                            logger.warning(f"Could not get filename from gdown: {e}")
+                                    
+                                except Exception as e:
+                                    logger.warning(f"Could not get file info: {e}")
+                                
+                                # Download the video using gdown
+                                logger.info("Downloading Google Drive video...")
+                                
+                                # Use gdown with the actual filename if we found it
+                                if filename:
+                                    # Use the actual filename if we found it
+                                    output_path = str(temp_dir_path / filename)
+                                    logger.info(f"Using actual filename: {filename}")
+                                else:
+                                    return ActionResult(error="Could not get filename from Google Drive")
+                                
+                                result = gdown.download(
+                                    direct_url, 
+                                    output_path, 
+                                    quiet=True,
+                                    fuzzy=True,  # Use fuzzy matching to get the correct file
+                                    use_cookies=False  # Don't use cookies which can cause issues
+                                )
+
+                                if result is None:
+                                    return ActionResult(error="Download failed - gdown returned None")
+
+                                # Wait a moment for any file operations to complete
+                                import time
+                                time.sleep(2)
+
+                                # Find the downloaded file (filter out system files and hidden files)
+                                video_files = [f for f in temp_dir_path.glob("*") if not f.name.startswith('.') and f.name != '.DS_Store']
+                                if not video_files:
+                                    return ActionResult(error="No file found after Google Drive download")
+                                
+                                # Take the first file found
+                                video_file = video_files[0]
+                                logger.info(f"Found downloaded file: {video_file.name}")
+                                file_size = video_file.stat().st_size
+
+                                if file_size == 0:
+                                    return ActionResult(error="Downloaded Google Drive video file is empty")
+
+                                logger.info(f"Google Drive video downloaded successfully: {file_size} bytes")
+                                logger.info(f"Downloaded file: {video_file.name}")
+
+                                # Read the video file as binary data and set up for existing analysis code
+                                with open(video_file, 'rb') as video_file_handle:
+                                    video_data = video_file_handle.read()
+
+                                # Get the actual file extension from the downloaded file
+                                file_extension = video_file.suffix.lower()
+                                
+                                # If no extension or unknown extension, try to infer from filename
+                                if not file_extension or file_extension not in ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.mpg', '.mpeg', '.ogv']:
+                                    # Look for video extensions in the filename
+                                    filename_lower = video_file.name.lower()
+                                    for ext in ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.mpg', '.mpeg', '.ogv']:
+                                        if ext in filename_lower:
+                                            file_extension = ext
+                                            logger.info(f"Inferred extension from filename: {file_extension}")
+                                            break
+                                    else:
+                                        return ActionResult(error="Could not get file extension from Google Drive")
+                                
+                                # Determine MIME type based on actual file extension
+                                mime_type_map = {
+                                    '.mp4': 'video/mp4',
+                                    '.avi': 'video/x-msvideo',
+                                    '.mov': 'video/quicktime',
+                                    '.mkv': 'video/x-matroska',
+                                    '.wmv': 'video/x-ms-wmv',
+                                    '.flv': 'video/x-flv',
+                                    '.webm': 'video/webm',
+                                    '.m4v': 'video/x-m4v',
+                                    '.3gp': 'video/3gpp',
+                                    '.mpg': 'video/mpeg',
+                                    '.mpeg': 'video/mpeg',
+                                    '.ogv': 'video/ogg'
+                                }
+                                mime_type = mime_type_map.get(file_extension, 'video/mp4')
+                                
+                                logger.info(f"Detected file extension: {file_extension}, MIME type: {mime_type}")
                         else:
                             import aiohttp
                             import tempfile

@@ -207,10 +207,10 @@ async def test_google_drive_video_download():
             except Exception as e:
                 logger.warning(f"Could not get file info: {e}")
             
-            # Download the video using gdown with better options
+            # Download the video using gdown
             logger.info("Downloading video from Google Drive...")
             
-            # Use gdown with specific options to avoid .part files
+            # Use gdown with the actual filename if we found it
             if filename:
                 # Use the actual filename if we found it
                 output_path = str(downloads_dir / filename)
@@ -236,40 +236,15 @@ async def test_google_drive_video_download():
             import time
             time.sleep(2)
             
-            # Find the downloaded file(s)
-            video_files = list(downloads_dir.glob("*"))
+            # Find the downloaded file (filter out system files and hidden files)
+            video_files = [f for f in downloads_dir.glob("*") if not f.name.startswith('.') and f.name != '.DS_Store']
             if not video_files:
                 logger.error("❌ No file found after Google Drive download")
                 return False
             
-            # Filter out .part files and prefer files with video extensions
-            video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.mpg', '.mpeg', '.ogv']
-            
-            # First, try to find files with proper video extensions (excluding .part)
-            proper_video_files = [f for f in video_files if f.suffix.lower() in video_extensions and not f.name.endswith('.part')]
-            
-            # If no proper video files found, look for files without .part extension
-            non_part_files = [f for f in video_files if not f.name.endswith('.part')]
-            
-            # Choose the best file
-            if proper_video_files:
-                video_file = proper_video_files[0]
-                logger.info(f"Found video file with proper extension: {video_file.name}")
-            elif non_part_files:
-                video_file = non_part_files[0]
-                logger.info(f"Found file without .part extension: {video_file.name}")
-            else:
-                # If only .part files exist, try to find the completed one
-                # Look for .part files that might be complete (largest size)
-                part_files = [f for f in video_files if f.name.endswith('.part')]
-                if part_files:
-                    video_file = max(part_files, key=lambda f: f.stat().st_size)
-                    logger.info(f"Using largest .part file: {video_file.name}")
-                    logger.warning("⚠️ File has .part extension - download may be incomplete")
-                else:
-                    # Fallback to any file
-                    video_file = max(video_files, key=lambda f: f.stat().st_size)
-                    logger.info(f"Using largest file: {video_file.name}")
+            # Take the first file found
+            video_file = video_files[0]
+            logger.info(f"Found downloaded file: {video_file.name}")
             file_size = video_file.stat().st_size
             
             logger.info(f"✅ Video downloaded successfully!")
@@ -281,19 +256,19 @@ async def test_google_drive_video_download():
             file_extension = video_file.suffix.lower()
             logger.info(f"  - Detected extension: {file_extension}")
             
-            # If it's a .part file, try to determine the real extension from the filename
-            if file_extension == '.part':
+            # If no extension or unknown extension, try to infer from filename
+            if not file_extension or file_extension not in ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.mpg', '.mpeg', '.ogv']:
                 # Look for video extensions in the filename
                 filename_lower = video_file.name.lower()
                 for ext in ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.mpg', '.mpeg', '.ogv']:
                     if ext in filename_lower:
                         file_extension = ext
-                        logger.info(f"  - Detected real extension from filename: {file_extension}")
+                        logger.info(f"  - Inferred extension from filename: {file_extension}")
                         break
                 else:
                     # If no video extension found in filename, assume MP4
                     file_extension = '.mp4'
-                    logger.info(f"  - Assuming MP4 extension for .part file")
+                    logger.info(f"  - Assuming MP4 extension")
             
             # Determine MIME type based on actual file extension
             mime_type_map = {
