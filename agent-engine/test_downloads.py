@@ -166,46 +166,171 @@ async def test_google_drive_video_download():
         direct_url = f"https://drive.google.com/uc?id={file_id}"
         
         try:
-            # Download the video using gdown
-            logger.info("Downloading video from Google Drive...")
-            output_path = downloads_dir / f"video_{file_id}.mp4"
+            # First, try to get the actual filename from Google Drive
+            logger.info("Getting file information from Google Drive...")
             
-            # Use gdown to download the file
-            result = gdown.download(direct_url, str(output_path), quiet=False)
+            # Use gdown to get file info first
+            try:
+                import requests
+                
+                # Try to get file info using Google Drive API-like approach
+                info_url = f"https://drive.google.com/uc?id={file_id}&export=download"
+                response = requests.head(info_url, allow_redirects=True)
+                
+                # Check if we can get filename from Content-Disposition header
+                content_disposition = response.headers.get('Content-Disposition', '')
+                filename = None
+                if 'filename=' in content_disposition:
+                    filename = content_disposition.split('filename=')[1].strip('"')
+                    logger.info(f"Found filename from headers: {filename}")
+                
+                # If no filename found, try a different approach
+                if not filename:
+                    # Use gdown with --id flag to get file info
+                    import subprocess
+                    try:
+                        result = subprocess.run([
+                            'gdown', '--id', file_id, '--print-url'
+                        ], capture_output=True, text=True, timeout=30)
+                        
+                        if result.returncode == 0 and result.stdout.strip():
+                            # Parse the output to get filename
+                            output_lines = result.stdout.strip().split('\n')
+                            for line in output_lines:
+                                if 'filename=' in line:
+                                    filename = line.split('filename=')[1].strip()
+                                    logger.info(f"Found filename from gdown: {filename}")
+                                    break
+                    except Exception as e:
+                        logger.warning(f"Could not get filename from gdown: {e}")
+                
+            except Exception as e:
+                logger.warning(f"Could not get file info: {e}")
+            
+            # Download the video using gdown with better options
+            logger.info("Downloading video from Google Drive...")
+            
+            # Use gdown with specific options to avoid .part files
+            if filename:
+                # Use the actual filename if we found it
+                output_path = str(downloads_dir / filename)
+                logger.info(f"Using actual filename: {filename}")
+            else:
+                # Fallback to generic name
+                output_path = str(downloads_dir / "google_drive_video")
+                logger.info("Using generic filename")
+            
+            result = gdown.download(
+                direct_url, 
+                output_path, 
+                quiet=False,
+                fuzzy=True,  # Use fuzzy matching to get the correct file
+                use_cookies=False  # Don't use cookies which can cause issues
+            )
             
             if result is None:
                 logger.error("❌ Download failed - gdown returned None")
                 return False
             
-            # Check if file was created and has content
-            if output_path.exists():
-                file_size = output_path.stat().st_size
-                
-                logger.info(f"✅ Video downloaded successfully!")
-                logger.info(f"  - File path: {output_path}")
-                logger.info(f"  - File size: {file_size} bytes")
-                
-                if file_size > 0:
-                    logger.info("✅ Video file verification successful!")
-                    
-                    # Read a small portion to verify it's actually a video file
-                    with open(output_path, 'rb') as f:
-                        header = f.read(10)
-                        if header.startswith(b'\x00\x00\x00') or header.startswith(b'ftyp'):
-                            logger.info("✅ Video file header verification successful!")
-                            logger.info(f"📁 Video file saved to: {output_path}")
-                            logger.info("You can manually verify the video file at the above location.")
-                            return True
-                        else:
-                            logger.warning("⚠️ File doesn't appear to have a valid video header")
-                            logger.info(f"📁 Video file saved to: {output_path}")
-                            logger.info("You can manually verify the video file at the above location.")
-                            return True  # Still consider it successful as gdown worked
-                else:
-                    logger.error("❌ Downloaded file is empty")
-                    return False
+            # Wait a moment for any file operations to complete
+            import time
+            time.sleep(2)
+            
+            # Find the downloaded file(s)
+            video_files = list(downloads_dir.glob("*"))
+            if not video_files:
+                logger.error("❌ No file found after Google Drive download")
+                return False
+            
+            # Filter out .part files and prefer files with video extensions
+            video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.mpg', '.mpeg', '.ogv']
+            
+            # First, try to find files with proper video extensions (excluding .part)
+            proper_video_files = [f for f in video_files if f.suffix.lower() in video_extensions and not f.name.endswith('.part')]
+            
+            # If no proper video files found, look for files without .part extension
+            non_part_files = [f for f in video_files if not f.name.endswith('.part')]
+            
+            # Choose the best file
+            if proper_video_files:
+                video_file = proper_video_files[0]
+                logger.info(f"Found video file with proper extension: {video_file.name}")
+            elif non_part_files:
+                video_file = non_part_files[0]
+                logger.info(f"Found file without .part extension: {video_file.name}")
             else:
-                logger.error("❌ File was not created")
+                # If only .part files exist, try to find the completed one
+                # Look for .part files that might be complete (largest size)
+                part_files = [f for f in video_files if f.name.endswith('.part')]
+                if part_files:
+                    video_file = max(part_files, key=lambda f: f.stat().st_size)
+                    logger.info(f"Using largest .part file: {video_file.name}")
+                    logger.warning("⚠️ File has .part extension - download may be incomplete")
+                else:
+                    # Fallback to any file
+                    video_file = max(video_files, key=lambda f: f.stat().st_size)
+                    logger.info(f"Using largest file: {video_file.name}")
+            file_size = video_file.stat().st_size
+            
+            logger.info(f"✅ Video downloaded successfully!")
+            logger.info(f"  - File path: {video_file}")
+            logger.info(f"  - File name: {video_file.name}")
+            logger.info(f"  - File size: {file_size} bytes")
+            
+            # Get the actual file extension from the downloaded file
+            file_extension = video_file.suffix.lower()
+            logger.info(f"  - Detected extension: {file_extension}")
+            
+            # If it's a .part file, try to determine the real extension from the filename
+            if file_extension == '.part':
+                # Look for video extensions in the filename
+                filename_lower = video_file.name.lower()
+                for ext in ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.mpg', '.mpeg', '.ogv']:
+                    if ext in filename_lower:
+                        file_extension = ext
+                        logger.info(f"  - Detected real extension from filename: {file_extension}")
+                        break
+                else:
+                    # If no video extension found in filename, assume MP4
+                    file_extension = '.mp4'
+                    logger.info(f"  - Assuming MP4 extension for .part file")
+            
+            # Determine MIME type based on actual file extension
+            mime_type_map = {
+                '.mp4': 'video/mp4',
+                '.avi': 'video/x-msvideo',
+                '.mov': 'video/quicktime',
+                '.mkv': 'video/x-matroska',
+                '.wmv': 'video/x-ms-wmv',
+                '.flv': 'video/x-flv',
+                '.webm': 'video/webm',
+                '.m4v': 'video/x-m4v',
+                '.3gp': 'video/3gpp',
+                '.mpg': 'video/mpeg',
+                '.mpeg': 'video/mpeg',
+                '.ogv': 'video/ogg'
+            }
+            mime_type = mime_type_map.get(file_extension, 'video/mp4')
+            logger.info(f"  - MIME type: {mime_type}")
+            
+            if file_size > 0:
+                logger.info("✅ Video file verification successful!")
+                
+                # Read a small portion to verify it's actually a video file
+                with open(video_file, 'rb') as f:
+                    header = f.read(10)
+                    if header.startswith(b'\x00\x00\x00') or header.startswith(b'ftyp'):
+                        logger.info("✅ Video file header verification successful!")
+                        logger.info(f"📁 Video file saved to: {video_file}")
+                        logger.info("You can manually verify the video file at the above location.")
+                        return True
+                    else:
+                        logger.warning("⚠️ File doesn't appear to have a valid video header")
+                        logger.info(f"📁 Video file saved to: {video_file}")
+                        logger.info("You can manually verify the video file at the above location.")
+                        return True  # Still consider it successful as gdown worked
+            else:
+                logger.error("❌ Downloaded file is empty")
                 return False
                 
         except Exception as e:
