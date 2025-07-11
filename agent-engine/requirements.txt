@@ -18,3 +18,4 @@ python-docx
 openpyxl
 PyYAML
 google-genai
+instaloader
