@@ -796,7 +796,7 @@ async def execute_task(execution):
             # Add attachment information if present
             has_attachments = bool(task.get('attachments'))
             if has_attachments:
-                attachment_list = "\n".join([f"- {attachment['filename']}" for attachment in task['attachments']])
+                attachment_list = "\n".join([f"- {attachment['filename']} (URL: {attachment['url']})" for attachment in task['attachments']])
                 prompt += f"\n\nThe following files are attached to this task:\n{attachment_list}"
             
             # Check for lead list data

@@ -80,6 +80,11 @@ class GenerateImageParams(BaseModel):
     size: str = "1024x1024"
     quality: str = "medium"
 
+class VideoAnalysisParams(BaseModel):
+    """Parameters for performing video analysis."""
+    video_url: str
+    prompt: str
+
 class LogFilterThread(threading.Thread):
     """Thread that continuously filters the log file in real-time"""
     
@@ -1916,6 +1921,492 @@ class WebAgent:
             except Exception as e:
                 logger.error(f"Error performing data analysis: {e}")
                 return ActionResult(error=f"Failed to perform data analysis: {str(e)}")
+
+        @self.controller.registry.action('Perform video analysis using Google Gemini 2.5 Pro', param_model=VideoAnalysisParams)
+        async def perform_video_analysis(params: VideoAnalysisParams) -> ActionResult:
+            """Perform video analysis using Google Gemini 2.5 Pro.
+            
+            This action analyzes videos from URLs using Google Gemini 2.5 Pro.
+            For YouTube videos, it sends the URL directly to Gemini.
+            For other video URLs, it downloads the video and sends it as a file to Gemini.
+            
+            Parameters:
+            - params: VideoAnalysisParams containing:
+              - video_url: URL of the video to analyze (YouTube or other video URL)
+              - prompt: Analysis prompt describing what to analyze in the video
+            
+            Returns:
+            - ActionResult with the video analysis results or error message
+            """
+            try:
+                # Import Google Gemini SDK
+                try:
+                    from google import genai
+                    from google.genai import types
+                except ImportError:
+                    return ActionResult(error="Google Generative AI package not installed. Install with: pip install google-genai")
+
+                # Get API key
+                api_key = os.getenv('GEMINI_API_KEY')
+                if not api_key:
+                    return ActionResult(error="GEMINI_API_KEY environment variable is not set")
+
+                # Initialize the client
+                client = genai.Client(api_key=api_key)
+                
+                # Get model name from environment
+                model_name = os.getenv('VIDEO_ANALYSIS_LLM_NAME', 'gemini-2.5-pro')
+                
+                # Check if it's a YouTube URL
+                is_youtube = 'youtube.com' in params.video_url or 'youtu.be' in params.video_url                
+                if is_youtube:
+                    # For YouTube videos, send URL directly to Gemini using proper SDK
+                    logger.info(f"Analyzing YouTube video: {params.video_url}")
+                    
+                    try:
+                        # Create content using the proper Google Generative AI SDK
+                        contents = [
+                            types.Content(
+                                role="user",
+                                parts=[
+                                    types.Part(
+                                        file_data=types.FileData(
+                                            file_uri=params.video_url,
+                                            mime_type="video/*",
+                                        )
+                                    ),
+                                    types.Part.from_text(text=params.prompt),
+                                ],
+                            ),
+                        ]
+                        
+                        generate_content_config = types.GenerateContentConfig(
+                            thinking_config=types.ThinkingConfig(
+                                thinking_budget=-1,
+                            ),
+                            response_mime_type="text/plain",
+                        )
+                        
+                        logger.info("Sending YouTube video analysis request...")
+                        
+                        # Collect the response
+                        response_text = ""
+                        for chunk in client.models.generate_content_stream(
+                            model=model_name,
+                            contents=contents,
+                            config=generate_content_config,
+                        ):
+                            if chunk.text:
+                                response_text += chunk.text
+                        
+                        if response_text:
+                            logger.info("YouTube video analysis completed successfully")
+                            return ActionResult(extracted_content=response_text)
+                        else:
+                            return ActionResult(error="No analysis results received from Gemini for YouTube video")
+                            
+                    except Exception as e:
+                        logger.error(f"Error analyzing YouTube video: {e}")
+                        return ActionResult(error=f"Failed to analyze YouTube video: {str(e)}")
+                        
+                else:
+                    # For other video URLs, download the video and send as file
+                    logger.info(f"Downloading and analyzing video: {params.video_url}")
+
+                    try:
+                        is_instagram = 'instagram.com' in params.video_url
+                        is_facebook = 'facebook.com' in params.video_url
+                        is_google_drive = 'drive.google.com' in params.video_url
+
+                        if is_instagram:
+                            try:
+                                import instaloader
+                            except ImportError:
+                                return ActionResult(error="instaloader library not installed. Install with: pip install instaloader")
+
+                            L = instaloader.Instaloader(
+                                download_videos=True,
+                                download_video_thumbnails=False,
+                                download_geotags=False,
+                                download_comments=False,
+                                save_metadata=False,
+                                compress_json=False
+                            )
+
+                            shortcode = params.video_url.split('/p/')[-1].split('/')[0]
+                            logger.info(f"Extracted Instagram shortcode: {shortcode}")
+
+                            post = instaloader.Post.from_shortcode(L.context, shortcode)
+
+                            if not post.is_video:
+                                return ActionResult(error="This Instagram post is not a video")
+
+                            if not post.video_url:
+                                return ActionResult(error="No video URL found in Instagram post")
+
+                            logger.info(f"Found Instagram video URL: {post.video_url}")
+
+                            import tempfile
+                            with tempfile.TemporaryDirectory() as temp_dir:
+                                temp_dir_path = Path(temp_dir) / (self.current_execution_id or "unknown_execution")
+                                temp_dir_path.mkdir(exist_ok=True)
+                                logger.info(f"Downloading Instagram video to {temp_dir_path}")
+                                L.download_post(post, target=temp_dir_path)
+                                video_files = list(temp_dir_path.glob("*.mp4"))
+                                if not video_files:
+                                    return ActionResult(error="No video file found after Instagram download")
+                                video_file = video_files[0]
+                                file_size = video_file.stat().st_size
+                                if file_size == 0:
+                                    return ActionResult(error="Downloaded Instagram video file is empty")
+                                
+                                logger.info(f"Instagram video downloaded successfully: {file_size} bytes ({file_size / (1024*1024):.1f} MB)")
+                                with open(video_file, 'rb') as video_file_handle:
+                                    video_data = video_file_handle.read()
+                                file_extension = ".mp4"
+                                mime_type = "video/mp4"
+                        elif is_facebook:
+                            try:
+                                import yt_dlp
+                            except ImportError:
+                                return ActionResult(error="yt-dlp library not installed. Install with: pip install yt-dlp")
+
+                            logger.info(f"Downloading Facebook video: {params.video_url}")
+
+                            import tempfile
+                            with tempfile.TemporaryDirectory() as temp_dir:
+                                temp_dir_path = Path(temp_dir) / (self.current_execution_id or "unknown_execution")
+                                temp_dir_path.mkdir(exist_ok=True)
+                                logger.info(f"Downloading Facebook video to {temp_dir_path}")
+
+                                # Configure yt-dlp options
+                                ydl_opts = {
+                                    'outtmpl': str(temp_dir_path / '%(title)s.%(ext)s'),
+                                    'quiet': True,
+                                    'no_warnings': True,
+                                    'extract_flat': False,
+                                    'format': 'best[ext=mp4]/best',  # Prefer MP4 format
+                                    'writeinfojson': False,
+                                    'writesubtitles': False,
+                                    'writeautomaticsub': False,
+                                    'ignoreerrors': False,
+                                }
+
+                                # Download the video
+                                logger.info("Downloading Facebook video...")
+                                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                    # Get video info first
+                                    info = ydl.extract_info(params.video_url, download=False)
+                                    logger.info(f"Facebook video info:")
+                                    logger.info(f"  - Title: {info.get('title', 'Unknown')}")
+                                    logger.info(f"  - Duration: {info.get('duration', 'Unknown')} seconds")
+                                    logger.info(f"  - Uploader: {info.get('uploader', 'Unknown')}")
+                                    
+                                    # Download the video
+                                    ydl.download([params.video_url])
+
+                                # Find the downloaded video file
+                                video_files = list(temp_dir_path.glob("*.mp4"))
+                                if not video_files:
+                                    # Try other video extensions
+                                    video_files = list(temp_dir_path.glob("*.webm")) + list(temp_dir_path.glob("*.mkv")) + list(temp_dir_path.glob("*.avi"))
+                                
+                                if not video_files:
+                                    return ActionResult(error="No video file found after Facebook download")
+                                
+                                video_file = video_files[0]  # Take the first video file found
+                                file_size = video_file.stat().st_size
+                                
+                                if file_size == 0:
+                                    return ActionResult(error="Downloaded Facebook video file is empty")
+
+                                logger.info(f"Facebook video downloaded successfully: {file_size} bytes ({file_size / (1024*1024):.1f} MB)")
+                                logger.info(f"Downloaded file: {video_file.name}")
+
+                                # Read the video file as binary data and set up for existing analysis code
+                                with open(video_file, 'rb') as video_file_handle:
+                                    video_data = video_file_handle.read()
+
+                                # Get the actual file extension from the downloaded file
+                                file_extension = video_file.suffix.lower()
+                                
+                                # If no extension or unknown extension, try to infer from filename
+                                if not file_extension or file_extension not in ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.mpg', '.mpeg', '.ogv']:
+                                    # Look for video extensions in the filename
+                                    filename_lower = video_file.name.lower()
+                                    for ext in ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.mpg', '.mpeg', '.ogv']:
+                                        if ext in filename_lower:
+                                            file_extension = ext
+                                            logger.info(f"Inferred extension from filename: {file_extension}")
+                                            break
+                                    else:
+                                        # If no video extension found in filename, assume MP4
+                                        file_extension = '.mp4'
+                                        logger.info(f"Assuming MP4 extension")
+                                
+                                # Determine MIME type based on actual file extension
+                                mime_type_map = {
+                                    '.mp4': 'video/mp4',
+                                    '.avi': 'video/x-msvideo',
+                                    '.mov': 'video/quicktime',
+                                    '.mkv': 'video/x-matroska',
+                                    '.wmv': 'video/x-ms-wmv',
+                                    '.flv': 'video/x-flv',
+                                    '.webm': 'video/webm',
+                                    '.m4v': 'video/x-m4v',
+                                    '.3gp': 'video/3gpp',
+                                    '.mpg': 'video/mpeg',
+                                    '.mpeg': 'video/mpeg',
+                                    '.ogv': 'video/ogg'
+                                }
+                                mime_type = mime_type_map.get(file_extension, 'video/mp4')
+                                
+                                logger.info(f"Detected file extension: {file_extension}, MIME type: {mime_type}")
+                        elif is_google_drive:
+                            try:
+                                import gdown
+                            except ImportError:
+                                return ActionResult(error="gdown library not installed. Install with: pip install gdown")
+
+                            # Extract file ID from URL
+                            if '/file/d/' in params.video_url:
+                                file_id = params.video_url.split('/file/d/')[1].split('/')[0]
+                            elif 'id=' in params.video_url:
+                                file_id = params.video_url.split('id=')[1].split('&')[0]
+                            else:
+                                return ActionResult(error="Could not extract file ID from Google Drive URL")
+
+                            logger.info(f"Extracted Google Drive file ID: {file_id}")
+
+                            import tempfile
+                            with tempfile.TemporaryDirectory() as temp_dir:
+                                temp_dir_path = Path(temp_dir) / (self.current_execution_id or "unknown_execution")
+                                temp_dir_path.mkdir(exist_ok=True)
+                                logger.info(f"Downloading Google Drive video to {temp_dir_path}")
+
+                                # Construct the direct download URL
+                                direct_url = f"https://drive.google.com/uc?id={file_id}"
+
+                                # First, try to get the actual filename from Google Drive
+                                logger.info("Getting file information from Google Drive...")
+                                
+                                # Use gdown to get file info first
+                                filename = None
+                                try:
+                                    import requests
+                                    
+                                    # Try to get file info using Google Drive API-like approach
+                                    info_url = f"https://drive.google.com/uc?id={file_id}&export=download"
+                                    response = requests.head(info_url, allow_redirects=True)
+                                    
+                                    # Check if we can get filename from Content-Disposition header
+                                    content_disposition = response.headers.get('Content-Disposition', '')
+                                    if 'filename=' in content_disposition:
+                                        filename = content_disposition.split('filename=')[1].strip('"')
+                                        logger.info(f"Found filename from headers: {filename}")
+                                    
+                                    # If no filename found, try a different approach
+                                    if not filename:
+                                        # Use gdown with --id flag to get file info
+                                        import subprocess
+                                        try:
+                                            result = subprocess.run([
+                                                'gdown', '--id', file_id, '--print-url'
+                                            ], capture_output=True, text=True, timeout=30)
+                                            
+                                            if result.returncode == 0 and result.stdout.strip():
+                                                # Parse the output to get filename
+                                                output_lines = result.stdout.strip().split('\n')
+                                                for line in output_lines:
+                                                    if 'filename=' in line:
+                                                        filename = line.split('filename=')[1].strip()
+                                                        logger.info(f"Found filename from gdown: {filename}")
+                                                        break
+                                        except Exception as e:
+                                            logger.warning(f"Could not get filename from gdown: {e}")
+                                    
+                                except Exception as e:
+                                    logger.warning(f"Could not get file info: {e}")
+                                
+                                # Download the video using gdown
+                                logger.info("Downloading Google Drive video...")
+                                
+                                # Use gdown with the actual filename if we found it
+                                if filename:
+                                    # Use the actual filename if we found it
+                                    output_path = str(temp_dir_path / filename)
+                                    logger.info(f"Using actual filename: {filename}")
+                                else:
+                                    return ActionResult(error="Could not get filename from Google Drive")
+                                
+                                result = gdown.download(
+                                    direct_url, 
+                                    output_path, 
+                                    quiet=True,
+                                    fuzzy=True,  # Use fuzzy matching to get the correct file
+                                    use_cookies=False  # Don't use cookies which can cause issues
+                                )
+
+                                if result is None:
+                                    return ActionResult(error="Download failed - gdown returned None")
+
+                                # Wait a moment for any file operations to complete
+                                import time
+                                time.sleep(2)
+
+                                # Find the downloaded file (filter out system files and hidden files)
+                                video_files = [f for f in temp_dir_path.glob("*") if not f.name.startswith('.') and f.name != '.DS_Store']
+                                if not video_files:
+                                    return ActionResult(error="No file found after Google Drive download")
+                                
+                                # Take the first file found
+                                video_file = video_files[0]
+                                logger.info(f"Found downloaded file: {video_file.name}")
+                                file_size = video_file.stat().st_size
+
+                                if file_size == 0:
+                                    return ActionResult(error="Downloaded Google Drive video file is empty")
+
+                                logger.info(f"Google Drive video downloaded successfully: {file_size} bytes ({file_size / (1024*1024):.1f} MB)")
+                                logger.info(f"Downloaded file: {video_file.name}")
+
+                                # Read the video file as binary data and set up for existing analysis code
+                                with open(video_file, 'rb') as video_file_handle:
+                                    video_data = video_file_handle.read()
+
+                                # Get the actual file extension from the downloaded file
+                                file_extension = video_file.suffix.lower()
+                                
+                                # If no extension or unknown extension, try to infer from filename
+                                if not file_extension or file_extension not in ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.mpg', '.mpeg', '.ogv']:
+                                    # Look for video extensions in the filename
+                                    filename_lower = video_file.name.lower()
+                                    for ext in ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.mpg', '.mpeg', '.ogv']:
+                                        if ext in filename_lower:
+                                            file_extension = ext
+                                            logger.info(f"Inferred extension from filename: {file_extension}")
+                                            break
+                                    else:
+                                        return ActionResult(error="Could not get file extension from Google Drive")
+                                
+                                # Determine MIME type based on actual file extension
+                                mime_type_map = {
+                                    '.mp4': 'video/mp4',
+                                    '.avi': 'video/x-msvideo',
+                                    '.mov': 'video/quicktime',
+                                    '.mkv': 'video/x-matroska',
+                                    '.wmv': 'video/x-ms-wmv',
+                                    '.flv': 'video/x-flv',
+                                    '.webm': 'video/webm',
+                                    '.m4v': 'video/x-m4v',
+                                    '.3gp': 'video/3gpp',
+                                    '.mpg': 'video/mpeg',
+                                    '.mpeg': 'video/mpeg',
+                                    '.ogv': 'video/ogg'
+                                }
+                                mime_type = mime_type_map.get(file_extension, 'video/mp4')
+                                
+                                logger.info(f"Detected file extension: {file_extension}, MIME type: {mime_type}")
+                        else:
+                            import aiohttp
+                            import tempfile
+                            from urllib.parse import urlparse
+                            parsed_url = urlparse(params.video_url)
+                            file_extension = Path(parsed_url.path).suffix.lower()
+                            video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp']
+                            if not file_extension or file_extension not in video_extensions:
+                                return ActionResult(error="Unknown video file extension. Please provide a video file with one of the following extensions: " + ", ".join(video_extensions))
+                            
+                            with tempfile.TemporaryDirectory() as temp_dir:
+                                temp_dir_path = Path(temp_dir) / (self.current_execution_id or "unknown_execution")
+                                temp_dir_path.mkdir(exist_ok=True)
+                                temp_video_path = temp_dir_path / f"downloaded_video{file_extension}"
+                                logger.info(f"Downloading HTTP video to {temp_video_path}")
+                            async with aiohttp.ClientSession() as session:
+                                async with session.get(params.video_url) as response:
+                                    if response.status != 200:
+                                        return ActionResult(error=f"Failed to download video: HTTP {response.status}")
+                                    video_data = await response.read()
+                                    
+                                    logger.info(f"Video downloaded successfully: {len(video_data)} bytes ({len(video_data) / (1024*1024):.1f} MB)")
+                                    
+                                    with open(temp_video_path, 'wb') as f:
+                                        f.write(video_data)
+                            with open(temp_video_path, 'rb') as video_file:
+                                video_data = video_file.read()
+                            mime_type_map = {
+                                '.mp4': 'video/mp4',
+                                '.avi': 'video/x-msvideo',
+                                '.mov': 'video/quicktime',
+                                '.mkv': 'video/x-matroska',
+                                '.wmv': 'video/x-ms-wmv',
+                                '.flv': 'video/x-flv',
+                                '.webm': 'video/webm',
+                                '.m4v': 'video/x-m4v',
+                                '.3gp': 'video/3gpp'
+                            }
+                            mime_type = mime_type_map.get(file_extension, 'video/mp4')
+
+                        # Check file size limit before analysis
+                        video_size = len(video_data)
+                        max_size_mb = int(os.getenv('MAX_DOWNLOADED_VIDEO_SIZE_MB', '100'))  # Default 100MB
+                        max_size_bytes = max_size_mb * 1024 * 1024
+                        
+                        if video_size > max_size_bytes:
+                            error_msg = f"Video file too large for analysis: {video_size} bytes ({video_size / (1024*1024):.1f} MB) exceeds limit of {max_size_mb} MB"
+                            logger.error(error_msg)
+                            return ActionResult(error=error_msg)
+                        
+                        logger.info(f"Size check passed (limit: {max_size_mb} MB)")
+
+                        # --- Shared Gemini analysis code ---
+                        contents = [
+                            types.Content(
+                                role="user",
+                                parts=[
+                                    types.Part.from_bytes(
+                                        mime_type=mime_type,
+                                        data=video_data
+                                    ),
+                                    types.Part.from_text(text=params.prompt),
+                                ],
+                            ),
+                        ]
+
+                        generate_content_config = types.GenerateContentConfig(
+                            thinking_config=types.ThinkingConfig(
+                                thinking_budget=-1,
+                            ),
+                            response_mime_type="text/plain",
+                        )
+
+                        logger.info("Sending video file analysis request...")
+
+                        response_text = ""
+                        for chunk in client.models.generate_content_stream(
+                            model=model_name,
+                            contents=contents,
+                            config=generate_content_config,
+                        ):
+                            if chunk.text:
+                                response_text += chunk.text
+
+                        if response_text:
+                            logger.info("Video file analysis completed successfully")
+                            return ActionResult(extracted_content=response_text)
+                        else:
+                            return ActionResult(error="No analysis results received from Gemini for video file")
+
+                    except Exception as e:
+                        logger.error(f"Error downloading or processing video: {e}")
+                        return ActionResult(error=f"Failed to download or process video: {str(e)}")
+                    finally:
+                        # Cleanup is handled automatically by tempfile.TemporaryDirectory() contexts
+                        pass
+
+            except Exception as e:
+                logger.error(f"Error performing video analysis: {e}")
+                return ActionResult(error=f"Failed to perform video analysis: {str(e)}")
 
         @self.controller.registry.action('Generate image with input images using OpenAI GPT Image', param_model=GenerateImageParams)
         async def generate_image(params: GenerateImageParams) -> ActionResult:

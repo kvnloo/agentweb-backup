@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-07-14',
+    changes: [
+      'Added perform_video_analysis function call which uses Gemini 2.5 Pro to understand video content',
+      '- Any web agents can use the function to understand video content by providing a video url',
+      '- For youtube video, it will be analyzed directly',
+      '- For other videos, it will be downloaded and then sent as attached file to Gemini'
+    ],
+  },
+  {
     date: '2025-07-07',
     changes: [
       'Added image generation at task level',
