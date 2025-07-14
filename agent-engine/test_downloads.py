@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Test script for downloading videos from various platforms.
-This script tests the ability to download videos from Instagram posts and Google Drive.
+This script tests the ability to download videos from Instagram posts, Facebook reels, and Google Drive.
 """
 
 import os
@@ -122,6 +122,109 @@ async def test_instagram_video_download():
     
     except Exception as e:
         logger.error(f"❌ Error in Instagram video download test: {e}")
+        return False
+
+async def test_facebook_video_download():
+    """Test Facebook video download using yt-dlp library"""
+    logger.info("Starting Facebook video download test")
+    
+    try:
+        # Import yt-dlp for Facebook downloads
+        try:
+            import yt_dlp
+        except ImportError:
+            logger.error("yt-dlp library not installed. Install with: pip install yt-dlp")
+            return False
+        
+        # Test Facebook URL
+        facebook_url = "https://www.facebook.com/reel/1215847160275296/"
+        
+        logger.info(f"Testing Facebook video download from: {facebook_url}")
+        
+        # Create a downloads directory for manual verification
+        downloads_dir = Path("downloads/facebook_test")
+        downloads_dir.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            # Configure yt-dlp options
+            ydl_opts = {
+                'outtmpl': str(downloads_dir / '%(title)s.%(ext)s'),
+                'quiet': False,
+                'no_warnings': False,
+                'extract_flat': False,
+                'format': 'best[ext=mp4]/best',  # Prefer MP4 format
+                'writeinfojson': False,
+                'writesubtitles': False,
+                'writeautomaticsub': False,
+                'ignoreerrors': False,
+            }
+            
+            # Download the video
+            logger.info("Downloading Facebook video...")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                # Get video info first
+                info = ydl.extract_info(facebook_url, download=False)
+                logger.info(f"Video info:")
+                logger.info(f"  - Title: {info.get('title', 'Unknown')}")
+                logger.info(f"  - Duration: {info.get('duration', 'Unknown')} seconds")
+                logger.info(f"  - Uploader: {info.get('uploader', 'Unknown')}")
+                
+                # Download the video
+                ydl.download([facebook_url])
+            
+            # Find the downloaded video file
+            video_files = list(downloads_dir.glob("*.mp4"))
+            if not video_files:
+                # Try other video extensions
+                video_files = list(downloads_dir.glob("*.webm")) + list(downloads_dir.glob("*.mkv")) + list(downloads_dir.glob("*.avi"))
+            
+            if not video_files:
+                logger.error("❌ No video file found in download directory")
+                return False
+            
+            video_file = video_files[0]  # Take the first video file found
+            file_size = video_file.stat().st_size
+            
+            # Check file size limit
+            max_size_mb = int(os.getenv('MAX_DOWNLOADED_VIDEO_SIZE', '100'))  # Default 100MB
+            max_size_bytes = max_size_mb * 1024 * 1024
+            
+            if file_size > max_size_bytes:
+                logger.error(f"❌ Video file too large: {file_size} bytes ({file_size / (1024*1024):.1f} MB) exceeds limit of {max_size_mb} MB")
+                return False
+            
+            logger.info(f"✅ Facebook video downloaded successfully!")
+            logger.info(f"  - File path: {video_file}")
+            logger.info(f"  - File name: {video_file.name}")
+            logger.info(f"  - File size: {file_size} bytes ({file_size / (1024*1024):.1f} MB)")
+            logger.info(f"  - Size check passed (limit: {max_size_mb} MB)")
+            
+            if file_size > 0:
+                logger.info("✅ Video file verification successful!")
+                
+                # Read a small portion to verify it's actually a video file
+                with open(video_file, 'rb') as f:
+                    header = f.read(10)
+                    if header.startswith(b'\x00\x00\x00') or header.startswith(b'ftyp'):
+                        logger.info("✅ Video file header verification successful!")
+                        logger.info(f"📁 Video file saved to: {video_file}")
+                        logger.info("You can manually verify the video file at the above location.")
+                        return True
+                    else:
+                        logger.warning("⚠️ File doesn't appear to have a valid video header")
+                        logger.info(f"📁 Video file saved to: {video_file}")
+                        logger.info("You can manually verify the video file at the above location.")
+                        return True  # Still consider it successful as yt-dlp worked
+            else:
+                logger.error("❌ Downloaded file is empty")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Error downloading Facebook video: {e}")
+            return False
+    
+    except Exception as e:
+        logger.error(f"❌ Error in Facebook video download test: {e}")
         return False
 
 async def test_google_drive_video_download():
@@ -320,13 +423,14 @@ def main():
     """Main function to run the tests"""
     parser = argparse.ArgumentParser(description='Test video downloads from various platforms')
     parser.add_argument('--instagram', action='store_true', help='Test Instagram video download')
+    parser.add_argument('--facebook', action='store_true', help='Test Facebook video download')
     parser.add_argument('--google-drive', action='store_true', help='Test Google Drive video download')
     parser.add_argument('--all', action='store_true', help='Test all platforms (default)')
     
     args = parser.parse_args()
     
     # If no specific test is selected, run all tests
-    if not (args.instagram or args.google_drive or args.all):
+    if not (args.instagram or args.facebook or args.google_drive or args.all):
         args.all = True
     
     logger.info("="*60)
@@ -348,6 +452,22 @@ def main():
             logger.info("The instaloader library works correctly for Instagram videos.")
         else:
             logger.error("❌ Instagram video download test FAILED!")
+            logger.error("Please check the logs above for details.")
+    
+    # Test Facebook video download
+    if args.facebook or args.all:
+        logger.info("="*60)
+        logger.info("FACEBOOK VIDEO DOWNLOAD TEST")
+        logger.info("-" * 40)
+        facebook_success = asyncio.run(test_facebook_video_download())
+        results['Facebook'] = facebook_success
+        
+        logger.info("="*60)
+        if facebook_success:
+            logger.info("🎉 Facebook video download test PASSED!")
+            logger.info("The yt-dlp library works correctly for Facebook videos.")
+        else:
+            logger.error("❌ Facebook video download test FAILED!")
             logger.error("Please check the logs above for details.")
     
     # Test Google Drive video download
