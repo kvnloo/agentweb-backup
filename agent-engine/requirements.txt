@@ -20,3 +20,4 @@ PyYAML
 google-genai
 instaloader
 gdown
+yt-dlp
