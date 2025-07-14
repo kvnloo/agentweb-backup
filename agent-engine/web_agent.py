@@ -2048,8 +2048,9 @@ class WebAgent:
 
                             import tempfile
                             with tempfile.TemporaryDirectory() as temp_dir:
-                                temp_dir_path = Path(temp_dir)
-                                logger.info("Downloading Instagram video...")
+                                temp_dir_path = Path(temp_dir) / (self.current_execution_id or "unknown_execution")
+                                temp_dir_path.mkdir(exist_ok=True)
+                                logger.info(f"Downloading Instagram video to {temp_dir_path}")
                                 L.download_post(post, target=temp_dir_path)
                                 video_files = list(temp_dir_path.glob("*.mp4"))
                                 if not video_files:
@@ -2074,7 +2075,9 @@ class WebAgent:
 
                             import tempfile
                             with tempfile.TemporaryDirectory() as temp_dir:
-                                temp_dir_path = Path(temp_dir)
+                                temp_dir_path = Path(temp_dir) / (self.current_execution_id or "unknown_execution")
+                                temp_dir_path.mkdir(exist_ok=True)
+                                logger.info(f"Downloading Facebook video to {temp_dir_path}")
 
                                 # Configure yt-dlp options
                                 ydl_opts = {
@@ -2177,7 +2180,9 @@ class WebAgent:
 
                             import tempfile
                             with tempfile.TemporaryDirectory() as temp_dir:
-                                temp_dir_path = Path(temp_dir)
+                                temp_dir_path = Path(temp_dir) / (self.current_execution_id or "unknown_execution")
+                                temp_dir_path.mkdir(exist_ok=True)
+                                logger.info(f"Downloading Google Drive video to {temp_dir_path}")
 
                                 # Construct the direct download URL
                                 direct_url = f"https://drive.google.com/uc?id={file_id}"
@@ -2311,8 +2316,12 @@ class WebAgent:
                             video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp']
                             if not file_extension or file_extension not in video_extensions:
                                 return ActionResult(error="Unknown video file extension. Please provide a video file with one of the following extensions: " + ", ".join(video_extensions))
-                            with tempfile.NamedTemporaryFile(suffix=file_extension, delete=False) as temp_file:
-                                temp_video_path = temp_file.name
+                            
+                            with tempfile.TemporaryDirectory() as temp_dir:
+                                temp_dir_path = Path(temp_dir) / (self.current_execution_id or "unknown_execution")
+                                temp_dir_path.mkdir(exist_ok=True)
+                                temp_video_path = temp_dir_path / f"downloaded_video{file_extension}"
+                                logger.info(f"Downloading HTTP video to {temp_video_path}")
                             async with aiohttp.ClientSession() as session:
                                 async with session.get(params.video_url) as response:
                                     if response.status != 200:
@@ -2392,12 +2401,8 @@ class WebAgent:
                         logger.error(f"Error downloading or processing video: {e}")
                         return ActionResult(error=f"Failed to download or process video: {str(e)}")
                     finally:
-                        # Clean up temporary file
-                        if 'temp_video_path' in locals() and os.path.exists(temp_video_path):
-                            try:
-                                os.unlink(temp_video_path)
-                            except Exception as e:
-                                logger.warning(f"Failed to clean up temporary video file: {e}")
+                        # Cleanup is handled automatically by tempfile.TemporaryDirectory() contexts
+                        pass
 
             except Exception as e:
                 logger.error(f"Error performing video analysis: {e}")
