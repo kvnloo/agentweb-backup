@@ -2015,6 +2015,7 @@ class WebAgent:
 
                     try:
                         is_instagram = 'instagram.com' in params.video_url
+                        is_facebook = 'facebook.com' in params.video_url
                         is_google_drive = 'drive.google.com' in params.video_url
 
                         if is_instagram:
@@ -2063,6 +2064,101 @@ class WebAgent:
                                     video_data = video_file_handle.read()
                                 file_extension = ".mp4"
                                 mime_type = "video/mp4"
+                        elif is_facebook:
+                            try:
+                                import yt_dlp
+                            except ImportError:
+                                return ActionResult(error="yt-dlp library not installed. Install with: pip install yt-dlp")
+
+                            logger.info(f"Downloading Facebook video: {params.video_url}")
+
+                            import tempfile
+                            with tempfile.TemporaryDirectory() as temp_dir:
+                                temp_dir_path = Path(temp_dir)
+
+                                # Configure yt-dlp options
+                                ydl_opts = {
+                                    'outtmpl': str(temp_dir_path / '%(title)s.%(ext)s'),
+                                    'quiet': True,
+                                    'no_warnings': True,
+                                    'extract_flat': False,
+                                    'format': 'best[ext=mp4]/best',  # Prefer MP4 format
+                                    'writeinfojson': False,
+                                    'writesubtitles': False,
+                                    'writeautomaticsub': False,
+                                    'ignoreerrors': False,
+                                }
+
+                                # Download the video
+                                logger.info("Downloading Facebook video...")
+                                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                    # Get video info first
+                                    info = ydl.extract_info(params.video_url, download=False)
+                                    logger.info(f"Facebook video info:")
+                                    logger.info(f"  - Title: {info.get('title', 'Unknown')}")
+                                    logger.info(f"  - Duration: {info.get('duration', 'Unknown')} seconds")
+                                    logger.info(f"  - Uploader: {info.get('uploader', 'Unknown')}")
+                                    
+                                    # Download the video
+                                    ydl.download([params.video_url])
+
+                                # Find the downloaded video file
+                                video_files = list(temp_dir_path.glob("*.mp4"))
+                                if not video_files:
+                                    # Try other video extensions
+                                    video_files = list(temp_dir_path.glob("*.webm")) + list(temp_dir_path.glob("*.mkv")) + list(temp_dir_path.glob("*.avi"))
+                                
+                                if not video_files:
+                                    return ActionResult(error="No video file found after Facebook download")
+                                
+                                video_file = video_files[0]  # Take the first video file found
+                                file_size = video_file.stat().st_size
+                                
+                                if file_size == 0:
+                                    return ActionResult(error="Downloaded Facebook video file is empty")
+
+                                logger.info(f"Facebook video downloaded successfully: {file_size} bytes ({file_size / (1024*1024):.1f} MB)")
+                                logger.info(f"Downloaded file: {video_file.name}")
+
+                                # Read the video file as binary data and set up for existing analysis code
+                                with open(video_file, 'rb') as video_file_handle:
+                                    video_data = video_file_handle.read()
+
+                                # Get the actual file extension from the downloaded file
+                                file_extension = video_file.suffix.lower()
+                                
+                                # If no extension or unknown extension, try to infer from filename
+                                if not file_extension or file_extension not in ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.mpg', '.mpeg', '.ogv']:
+                                    # Look for video extensions in the filename
+                                    filename_lower = video_file.name.lower()
+                                    for ext in ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.mpg', '.mpeg', '.ogv']:
+                                        if ext in filename_lower:
+                                            file_extension = ext
+                                            logger.info(f"Inferred extension from filename: {file_extension}")
+                                            break
+                                    else:
+                                        # If no video extension found in filename, assume MP4
+                                        file_extension = '.mp4'
+                                        logger.info(f"Assuming MP4 extension")
+                                
+                                # Determine MIME type based on actual file extension
+                                mime_type_map = {
+                                    '.mp4': 'video/mp4',
+                                    '.avi': 'video/x-msvideo',
+                                    '.mov': 'video/quicktime',
+                                    '.mkv': 'video/x-matroska',
+                                    '.wmv': 'video/x-ms-wmv',
+                                    '.flv': 'video/x-flv',
+                                    '.webm': 'video/webm',
+                                    '.m4v': 'video/x-m4v',
+                                    '.3gp': 'video/3gpp',
+                                    '.mpg': 'video/mpeg',
+                                    '.mpeg': 'video/mpeg',
+                                    '.ogv': 'video/ogg'
+                                }
+                                mime_type = mime_type_map.get(file_extension, 'video/mp4')
+                                
+                                logger.info(f"Detected file extension: {file_extension}, MIME type: {mime_type}")
                         elif is_google_drive:
                             try:
                                 import gdown
