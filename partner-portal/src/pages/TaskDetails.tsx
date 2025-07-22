@@ -57,7 +57,7 @@ import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
 import ScheduleForm from "../components/ScheduleForm";
 import ScheduleList from "../components/ScheduleList";
-import { buildApiUrl, getLLMsForTask } from "../config";
+import { buildApiUrl, getLLMsForTask, MAX_FILE_SIZE } from "../config";
 import { toast } from "react-hot-toast";
 import LockIcon from "@mui/icons-material/Lock";
 import LockOpenIcon from "@mui/icons-material/LockOpen";
@@ -1064,12 +1064,11 @@ export default function TaskDetails() {
       return;
     }
 
-    // Check file sizes (1MB = 1024 * 1024 bytes)
-    const MAX_SIZE = 1 * 1024 * 1024; // 1MB limit for production
-    const oversizedFiles = files.filter((file) => file.size > MAX_SIZE);
+    // Check file sizes
+    const oversizedFiles = files.filter((file) => file.size > MAX_FILE_SIZE);
     if (oversizedFiles.length > 0) {
       setUploadError(
-        `Following files exceed 1MB limit: ${oversizedFiles
+        `Following files exceed ${MAX_FILE_SIZE / (1024 * 1024)}MB limit: ${oversizedFiles
           .map((f) => f.name)
           .join(", ")}`
       );
@@ -1108,7 +1107,7 @@ export default function TaskDetails() {
       await fetchTask(); // Refresh task to get updated attachments
     } catch (error: any) {
       if (error.response?.status === 413) {
-        setUploadError("File size too large. Maximum file size is 1MB.");
+        setUploadError(`File size too large. Maximum file size is ${MAX_FILE_SIZE / (1024 * 1024)}MB.`);
       } else {
         setUploadError(
           error.response?.data?.error || "Failed to upload file(s)"

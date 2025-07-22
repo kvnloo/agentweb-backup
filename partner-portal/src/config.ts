@@ -43,6 +43,9 @@ if (DEBUG) {
   console.log("import.meta.env:", import.meta.env);
 }
 
+// File upload limits
+export const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB in bytes
+
 // Helper function to build API endpoints
 export const buildApiUrl = (endpoint: string) => {
   const url = `${API_URL}${endpoint.startsWith("/") ? "" : "/"}${endpoint}`;
