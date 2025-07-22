@@ -6,7 +6,7 @@
 const DEBUG = import.meta.env.VITE_DEBUG !== "false";
 
 // Get the API URL from Vite environment variable or fallback to development URL
-export const API_URL = import.meta.env.VITE_API_URL || "https://api-stage.agentweb.pro";
+export const API_URL = import.meta.env.VITE_API_URL || "http://localhost:3001";
 
 // Discord Invite URL
 export const DISCORD_INVITE_URL = "https://discord.gg/kP2u6Wf9KQ";
