@@ -8,6 +8,14 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-07-18",
+    changes: [
+      "Lifted file size limit from 1MB to 5MB for task attachments",
+      "- Users can now upload larger files (up to 5MB) as task attachments",
+      "- Improved file upload experience for documents, images, and other larger files",
+    ],
+  },
+  {
     date: "2025-06-18",
     changes: [
       "Temporarily removed the 'Perform Deep Research' toggle from the Create Task and Task Details pages to prevent accidental use.",
