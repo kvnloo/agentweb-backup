@@ -12,11 +12,13 @@ import Register from "@/pages/Register";
 import OAuthCallback from "@/pages/OAuthCallback";
 import ProtectedRoute from "@/components/auth/ProtectedRoute";
 import { AuthProvider } from "@/contexts/AuthContext";
+import { TemplateProvider } from "@/contexts/TemplateContext";
 import TasksPage from "@/pages/Tasks.tsx";
 import TaskDetailsPage from "@/pages/TaskDetails.tsx";
 import GuidePage from "@/pages/GuidePage.tsx";
 import ExecutionResultPage from "@/pages/ExecutionResultPage.tsx";
 import ChangelogPage from "@/pages/ChangelogPage.tsx";
+import BrandGuidelines from "@/pages/BrandGuidelines.tsx";
 
 const queryClient = new QueryClient();
 
@@ -27,66 +29,99 @@ const App = () => (
       <Sonner />
       <BrowserRouter>
         <AuthProvider>
-          <Routes>
-            {/* Public routes */}
-            <Route path="/login" element={<Login />} />
-            <Route path="/register" element={<Register />} />
-            <Route path="/oauth-callback" element={<OAuthCallback />} />
-            
-            {/* Protected routes */}
-            <Route path="/" element={
-              <ProtectedRoute>
-                <Layout>
-                  <Dashboard />
-                </Layout>
-              </ProtectedRoute>
-            } />
-            <Route path="/settings" element={
-              <ProtectedRoute>
-                <Layout>
-                  <Settings />
-                </Layout>
-              </ProtectedRoute>
-            } />
-            <Route path="/tasks" element={
-              <ProtectedRoute>
-                <Layout>
-                  <TasksPage />
-                </Layout>
-              </ProtectedRoute>
-            } />
-            <Route path="/tasks/:taskId" element={
-              <ProtectedRoute>
-                <Layout>
-                  <TaskDetailsPage />
-                </Layout>
-              </ProtectedRoute>
-            } />
-            <Route path="/tasks/:taskId/executions/:executionId/result" element={
-              <ProtectedRoute>
-                <Layout>
-                  <ExecutionResultPage />
-                </Layout>
-              </ProtectedRoute>
-            } />
-            <Route path="/guide" element={
-              <ProtectedRoute>
-                <Layout>
-                  <GuidePage />
-                </Layout>
-              </ProtectedRoute>
-            } />
-            <Route path="/changelog" element={
-              <ProtectedRoute>
-                <Layout>
-                  <ChangelogPage />
-                </Layout>
-              </ProtectedRoute>
-            } />
-            
-            {/* 404 route */}
-            <Route path="*" element={<NotFound />} />
-          </Routes>
+          <TemplateProvider>
+            <Routes>
+              {/* Public routes */}
+              <Route path="/login" element={<Login />} />
+              <Route path="/register" element={<Register />} />
+              <Route path="/oauth-callback" element={<OAuthCallback />} />
+
+              {/* Protected routes */}
+              <Route
+                path="/"
+                element={
+                  <ProtectedRoute>
+                    <Layout>
+                      <Dashboard />
+                    </Layout>
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/settings"
+                element={
+                  <ProtectedRoute>
+                    <Layout>
+                      <Settings />
+                    </Layout>
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/brand-guidelines"
+                element={
+                  <ProtectedRoute>
+                    <Layout>
+                      <BrandGuidelines />
+                    </Layout>
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/tasks"
+                element={
+                  <ProtectedRoute>
+                    <Layout>
+                      <TasksPage />
+                    </Layout>
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/tasks/:taskId"
+                element={
+                  <ProtectedRoute>
+                    <Layout>
+                      <TaskDetailsPage />
+                    </Layout>
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/tasks/:taskId/executions/:executionId/result"
+                element={
+                  <ProtectedRoute>
+                    <Layout>
+                      <ExecutionResultPage />
+                    </Layout>
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/guide"
+                element={
+                  <ProtectedRoute>
+                    <Layout>
+                      <GuidePage />
+                    </Layout>
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/changelog"
+                element={
+                  <ProtectedRoute>
+                    <Layout>
+                      <ChangelogPage />
+                    </Layout>
+                  </ProtectedRoute>
+                }
+              />
+
+              {/* 404 route */}
+              <Route path="*" element={<NotFound />} />
+            </Routes>
+          </TemplateProvider>
         </AuthProvider>
       </BrowserRouter>
     </TooltipProvider>

@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useLocation } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
+import { useTemplates } from "@/contexts/TemplateContext";
 import { toast } from "@/components/ui/use-toast";
 import {
   TemplateModal,
@@ -12,27 +13,7 @@ import { MessageList } from "@/components/chat/MessageList";
 import { PromptForm } from "@/components/chat/PromptForm";
 import { TemplateSection } from "@/components/templates/TemplateSection";
 import axios from "axios";
-import { Info } from "lucide-react";
 import { buildApiUrl } from "@/config";
-
-// Extended to include fields from partner-portal's Template interface
-interface FetchedTemplate {
-  templateId: string;
-  name: string;
-  description: string;
-  prompt: string;
-  parameters: string[];
-  category?: string;
-  nameParameter?: string | null; // Added
-  isInteractive?: boolean; // Added
-  isDeepResearch?: boolean; // Added
-  isComplexTask?: boolean; // Added
-  outputAsJson?: boolean; // Added
-  outputAsHtml?: boolean; // Added
-  selectedLLMs?: string[]; // Added for template LLM selection
-  useSharedBrowser?: boolean; // Added useSharedBrowser
-  turnOffHeadless?: boolean;
-}
 
 // Define a new interface that correctly combines FrontendTemplateDef with additional fields
 interface DisplayTemplate extends FrontendTemplateDef {
@@ -51,7 +32,10 @@ interface DisplayTemplate extends FrontendTemplateDef {
 
 const Dashboard = () => {
   const navigate = useNavigate();
+  const location = useLocation();
   const { user, token } = useAuth();
+  const { groupedTemplates, isLoadingTemplates, templateError } =
+    useTemplates();
   const [promptTextState, setPromptTextState] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [isTemplateOpen, setIsTemplateOpen] = useState(true);
@@ -60,75 +44,15 @@ const Dashboard = () => {
   const [selectedTemplate, setSelectedTemplate] =
     useState<DisplayTemplate | null>(null);
 
-  const [allFetchedTemplates, setAllFetchedTemplates] = useState<
-    FetchedTemplate[]
-  >([]);
-  const [groupedTemplates, setGroupedTemplates] = useState<
-    Record<string, DisplayTemplate[]>
-  >({});
-  const [isLoadingTemplates, setIsLoadingTemplates] = useState(true);
-  const [templateError, setTemplateError] = useState<string | null>(null);
-
+  // Handle sidebar navigation state
   useEffect(() => {
-    const fetchTemplatesFromApi = async () => {
-      setIsLoadingTemplates(true);
-      setTemplateError(null);
-      try {
-        const response = await axios.get(buildApiUrl("/api/templates"), {
-          ...(token && { headers: { Authorization: `Bearer ${token}` } }),
-        });
-        const data: FetchedTemplate[] = response.data;
-        setAllFetchedTemplates(data.filter((t) => t.category));
-      } catch (err) {
-        console.error("Failed to fetch templates:", err);
-        setTemplateError("Failed to load templates. Please try again later.");
-        setAllFetchedTemplates([]);
-      } finally {
-        setIsLoadingTemplates(false);
-      }
-    };
-
-    fetchTemplatesFromApi();
-  }, [token]);
-
-  useEffect(() => {
-    const newGroupedTemplates: Record<string, DisplayTemplate[]> = {};
-    allFetchedTemplates.forEach((ft) => {
-      if (ft.category) {
-        if (!newGroupedTemplates[ft.category]) {
-          newGroupedTemplates[ft.category] = [];
-        }
-
-        const mappedParameters: TemplateParameter[] =
-          ft.parameters?.map((paramName) => ({
-            id: paramName,
-            name: paramName,
-            required: false, // Default, actual requirement might come from backend or be assumed true
-          })) || [];
-
-        const displayTemplate: DisplayTemplate = {
-          id: ft.templateId,
-          title: ft.name,
-          description: ft.description,
-          category: ft.category!, // Category is checked, so it's not undefined here
-          promptTemplate: ft.prompt,
-          parameters: mappedParameters,
-          icon: <Info size={24} />,
-          nameParameter: ft.nameParameter,
-          isInteractive: ft.isInteractive,
-          isDeepResearch: ft.isDeepResearch,
-          isComplexTask: ft.isComplexTask,
-          outputAsJson: ft.outputAsJson,
-          outputAsHtml: ft.outputAsHtml,
-          selectedLLMs: ft.selectedLLMs, // Map selectedLLMs
-          useSharedBrowser: ft.useSharedBrowser, // Added useSharedBrowser
-          turnOffHeadless: ft.turnOffHeadless, // Added turnOffHeadless
-        };
-        newGroupedTemplates[ft.category].push(displayTemplate);
-      }
-    });
-    setGroupedTemplates(newGroupedTemplates);
-  }, [allFetchedTemplates]);
+    if (location.state?.activeCategory) {
+      setActiveCategory(location.state.activeCategory);
+      setIsTemplateOpen(true); // Ensure templates are open when navigating from sidebar
+      // Clear the state to prevent it from persisting
+      navigate("/", { replace: true, state: undefined });
+    }
+  }, [location.state, navigate]);
 
   // Update active category when templates change
   useEffect(() => {
@@ -168,79 +92,51 @@ const Dashboard = () => {
     }
   }, [groupedTemplates, activeCategory]);
 
-  // This function will now handle creating a task from the main dashboard prompt
   const handleCreateTaskFromDashboardPrompt = async (e: React.FormEvent) => {
     e.preventDefault();
-    const promptContent = promptTextState;
+    const prompt = promptTextState.trim();
 
-    if (!user || !token) {
+    if (!prompt) {
       toast({
-        title: "Error",
-        description: "User not authenticated. Please log in again.",
+        title: "Empty Prompt",
+        description: "Please enter a prompt to create a task.",
         variant: "destructive",
       });
       return;
     }
 
-    if (!promptContent.trim()) {
-      toast({
-        title: "Input Required",
-        description: "Please enter task details or a question.",
-        variant: "default", // Changed to default as it's informational
-      });
-      return;
-    }
-
-    // Generate a name for the task
-    const taskName = `Task: ${promptContent.substring(0, 50)}${
-      promptContent.length > 50 ? "..." : ""
-    }`;
-
-    const taskPayload = {
-      name: taskName,
-      prompt: promptContent,
-      isInteractive: false,
-      isDeepResearch: false,
-      isComplexTask: true,
-      emailNotification: false,
-      extractPageContent: false,
-      category: "General",
-      description: "Task created from dashboard prompt.",
-      parameterValues: {},
-      outputAsHtml: true,
-      useSharedBrowser: true,
-    };
-
-    console.log(
-      "Attempting to create direct task from dashboard prompt with payload:",
-      taskPayload
-    );
-    setPromptTextState(""); // Clear input immediately
-
     try {
       const response = await axios.post(
         buildApiUrl("/api/tasks"),
-        taskPayload,
+        {
+          name: `Task - ${prompt.substring(0, 50)}${
+            prompt.length > 50 ? "..." : ""
+          }`,
+          prompt: prompt,
+          category: "General",
+          description: `User-generated task: ${prompt}`,
+        },
         {
           headers: { Authorization: `Bearer ${token}` },
         }
       );
-      console.log("Direct task creation API response:", response.data);
 
       toast({
         title: "Task Created Successfully",
-        description: `Task "${taskName}" has been created. You will be redirected.`,
+        description:
+          "Your task has been created. You will be redirected to the Tasks page.",
       });
 
-      navigate("/tasks"); // Navigate after success
+      setPromptTextState(""); // Clear the input
+      navigate("/tasks");
     } catch (error) {
-      console.error("Direct task creation failed:", error);
-      const errorMessageText =
+      console.error("Task creation failed:", error);
+      const errorMessage =
         error.response?.data?.message ||
         "Could not create the task. Please try again.";
       toast({
         title: "Task Creation Failed",
-        description: errorMessageText,
+        description: errorMessage,
         variant: "destructive",
       });
     }
@@ -399,7 +295,7 @@ const Dashboard = () => {
             setIsTemplateOpen={setIsTemplateOpen}
             activeCategory={activeCategory}
             setActiveCategory={setActiveCategory}
-            templates={groupedTemplates} // Now passes DisplayTemplate[]
+            templates={groupedTemplates} // Now passes Template[] from context
             isLoading={isLoadingTemplates}
             error={templateError}
             onSelectTemplate={handleTemplateClick} // Expects DisplayTemplate
@@ -407,12 +303,20 @@ const Dashboard = () => {
         </div>
       </div>
 
-      <TemplateModal
-        isOpen={isModalOpen}
-        setIsOpen={setIsModalOpen}
-        template={selectedTemplate} // Receives DisplayTemplate
-        onSubmit={handleTemplateSubmit} // Expects DisplayTemplate as first arg
-      />
+      {/* Template Modal */}
+      {selectedTemplate && (
+        <TemplateModal
+          isOpen={isModalOpen}
+          setIsOpen={(open) => {
+            setIsModalOpen(open);
+            if (!open) {
+              setSelectedTemplate(null);
+            }
+          }}
+          template={selectedTemplate}
+          onSubmit={handleTemplateSubmit}
+        />
+      )}
     </div>
   );
 };

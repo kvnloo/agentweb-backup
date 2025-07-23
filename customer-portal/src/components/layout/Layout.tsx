@@ -9,37 +9,134 @@ import {
   Bell,
   Activity,
   MessageSquare,
+  ChevronDown,
+  ChevronUp,
+  BarChart,
+  Target,
+  Users,
+  Search,
+  Lightbulb,
+  Palette,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import { useAuth } from "@/contexts/AuthContext";
+import { useTemplates } from "@/contexts/TemplateContext";
 import UserProfileDropdown from "./UserProfileDropdown";
 import ChatSupport from "../chat/ChatSupport";
 import { DISCORD_INVITE_URL } from "@/config";
 import AgentWebLogo from "@/assets/AgentWeb-Logo-189x62.svg";
 
+// Define consistent types for sidebar items
+type IconType =
+  | React.ComponentType<{ className?: string }>
+  | (() => React.ReactElement);
+
+interface SidebarItem {
+  icon: IconType;
+  label: string;
+  path: string;
+  id: string;
+}
+
+interface SidebarCategory {
+  key: string;
+  title: string;
+  items: SidebarItem[];
+}
+
 const Layout = ({ children }: { children: React.ReactNode }) => {
   const location = useLocation();
   const navigate = useNavigate();
   const { user } = useAuth();
+  const { availableCategories } = useTemplates();
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [isChatPanelCollapsed, setIsChatPanelCollapsed] = useState(false);
   const [activeItem, setActiveItem] = useState<string | null>(null);
+
+  // State for collapsible sections
+  const [openSections, setOpenSections] = useState<Record<string, boolean>>({
+    overview: true,
+    templates: true,
+    brand: true,
+    activities: true,
+    documents: true,
+    account: true,
+  });
 
   const toggleChatPanel = () => {
     setIsChatPanelCollapsed(!isChatPanelCollapsed);
   };
 
-  const categories = [
+  const toggleSection = (sectionKey: string) => {
+    setOpenSections((prev) => ({
+      ...prev,
+      [sectionKey]: !prev[sectionKey],
+    }));
+  };
+
+  // Icon mapping for categories
+  const getCategoryIcon = (category: string): IconType => {
+    const iconMap: Record<string, IconType> = {
+      "Market Research": BarChart,
+      "Creative Research": Target,
+      "Social Listening": Users,
+      "Data Analysis": Search,
+      Productivity: Lightbulb,
+      "Content Creation": FileText,
+      Life: Users,
+    };
+    return iconMap[category] || FileText;
+  };
+
+  // Generate template items dynamically from available categories
+  const templateItems: SidebarItem[] = availableCategories.map((category) => ({
+    icon: getCategoryIcon(category),
+    label: category,
+    path: `/?category=${category}`,
+    id: category.toLowerCase().replace(/\s+/g, "-"),
+  }));
+
+  const categories: SidebarCategory[] = [
     {
+      key: "overview",
       title: "OVERVIEW",
       items: [{ icon: Home, label: "Dashboard", path: "/", id: "dashboard" }],
     },
+    // Only show templates section if there are available categories
+    ...(availableCategories.length > 0
+      ? [
+          {
+            key: "templates",
+            title: "TEMPLATES",
+            items: templateItems,
+          },
+        ]
+      : []),
     {
+      key: "brand",
+      title: "BRAND",
+      items: [
+        {
+          icon: Palette,
+          label: "Brand Guidelines",
+          path: "/brand-guidelines",
+          id: "brand-guidelines",
+        },
+      ],
+    },
+    {
+      key: "activities",
       title: "ACTIVITIES",
       items: [{ icon: Activity, label: "Tasks", path: "/tasks", id: "tasks" }],
     },
     {
+      key: "documents",
       title: "DOCUMENTS",
       items: [
         { icon: FileText, label: "User Guide", path: "/guide", id: "guide" },
@@ -52,6 +149,7 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
       ],
     },
     {
+      key: "account",
       title: "ACCOUNT",
       items: [
         {
@@ -82,6 +180,38 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
     }
   });
 
+  const handleItemClick = (item: SidebarItem) => {
+    setActiveItem(item.id);
+
+    // Special handling for template categories - navigate to dashboard with category
+    if (item.path.startsWith("/?category=")) {
+      const categoryName = item.path.replace("/?category=", "");
+      navigate("/", { state: { activeCategory: categoryName } });
+    } else {
+      navigate(item.path);
+    }
+  };
+
+  const renderIcon = (item: SidebarItem) => {
+    const IconComponent = item.icon;
+    const iconClassName = cn(
+      "h-5 w-5",
+      isSidebarCollapsed ? "mx-auto" : "mr-3"
+    );
+
+    if (typeof IconComponent === "function" && IconComponent.length === 0) {
+      // Function component that returns JSX
+      return (
+        <span className={iconClassName}>
+          {(IconComponent as () => React.ReactElement)()}
+        </span>
+      );
+    } else {
+      // Regular component
+      return <IconComponent className={iconClassName} />;
+    }
+  };
+
   return (
     <div className="flex h-screen overflow-hidden bg-white dark:bg-[#1A1F2C]">
       {/* Sidebar (Left Nav) */}
@@ -108,40 +238,51 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
         {/* Navigation */}
         <div className="flex-1 overflow-auto py-2">
           {categories.map((category, categoryIndex) => (
-            <div key={categoryIndex} className="mb-4">
-              {!isSidebarCollapsed && (
-                <div className="px-4 py-1">
-                  <p className="text-xs font-semibold text-[#7E69AB] dark:text-[rgba(255,255,255,0.7)] tracking-wider">
-                    {category.title}
-                  </p>
-                </div>
-              )}
-              <div className="space-y-1 px-2">
-                {category.items.map((item, itemIndex) => (
-                  <Link
-                    key={`${categoryIndex}-${itemIndex}`}
-                    to={item.path}
-                    onClick={() => setActiveItem(item.id)}
-                    className={cn(
-                      "flex items-center py-2 px-2 rounded-md text-sm font-medium transition-colors",
-                      activeItem === item.id
-                        ? "sidebar-active-button text-[#7E69AB] dark:text-dark"
-                        : "text-gray-600 hover:bg-[#F3EFFD] hover:text-[#7E69AB] dark:text-[rgba(255,255,255,0.85)] dark:hover:bg-[rgba(255,255,255,0.1)] dark:hover:text-white"
-                    )}
-                  >
-                    <item.icon
+            <div key={categoryIndex} className="mb-2">
+              <Collapsible
+                open={openSections[category.key]}
+                onOpenChange={() => toggleSection(category.key)}
+              >
+                {!isSidebarCollapsed && (
+                  <div className="px-4 py-1">
+                    <CollapsibleTrigger asChild>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="w-full justify-between p-0 h-auto text-xs font-semibold text-[#7E69AB] dark:text-[rgba(255,255,255,0.7)] tracking-wider hover:bg-transparent"
+                      >
+                        {category.title}
+                        {openSections[category.key] ? (
+                          <ChevronUp className="h-3 w-3" />
+                        ) : (
+                          <ChevronDown className="h-3 w-3" />
+                        )}
+                      </Button>
+                    </CollapsibleTrigger>
+                  </div>
+                )}
+                <CollapsibleContent className="space-y-1 px-2">
+                  {category.items.map((item, itemIndex) => (
+                    <Button
+                      key={`${categoryIndex}-${itemIndex}`}
+                      variant="ghost"
+                      onClick={() => handleItemClick(item)}
                       className={cn(
-                        "h-5 w-5",
-                        isSidebarCollapsed ? "mx-auto" : "mr-3"
+                        "w-full justify-start py-2 px-2 rounded-md text-sm font-medium transition-colors relative",
+                        activeItem === item.id
+                          ? "sidebar-active-button text-[#7E69AB] dark:text-dark"
+                          : "text-gray-600 hover:bg-[#F3EFFD] hover:text-[#7E69AB] dark:text-[rgba(255,255,255,0.85)] dark:hover:bg-[rgba(255,255,255,0.1)] dark:hover:text-white"
                       )}
-                    />
-                    {!isSidebarCollapsed && <span>{item.label}</span>}
-                    {activeItem === item.id && !isSidebarCollapsed && (
-                      <div className="absolute left-0 h-6 w-1 agent-gradient rounded-r-full" />
-                    )}
-                  </Link>
-                ))}
-              </div>
+                    >
+                      {renderIcon(item)}
+                      {!isSidebarCollapsed && <span>{item.label}</span>}
+                      {activeItem === item.id && !isSidebarCollapsed && (
+                        <div className="absolute left-0 h-6 w-1 agent-gradient rounded-r-full" />
+                      )}
+                    </Button>
+                  ))}
+                </CollapsibleContent>
+              </Collapsible>
             </div>
           ))}
         </div>
