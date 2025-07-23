@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import {
-  Home,
   FileText,
   Settings,
   ChevronLeft,
@@ -61,7 +60,6 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
 
   // State for collapsible sections
   const [openSections, setOpenSections] = useState<Record<string, boolean>>({
-    overview: true,
     templates: true,
     brand: true,
     activities: true,
@@ -103,11 +101,6 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
   }));
 
   const categories: SidebarCategory[] = [
-    {
-      key: "overview",
-      title: "OVERVIEW",
-      items: [{ icon: Home, label: "Dashboard", path: "/", id: "dashboard" }],
-    },
     // Only show templates section if there are available categories
     ...(availableCategories.length > 0
       ? [
@@ -174,10 +167,7 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
         break;
       }
     }
-    // Default to dashboard if on home path
-    if (location.pathname === "/" && !activeItem) {
-      setActiveItem("dashboard");
-    }
+    // For root path, don't set any active item since Dashboard is no longer in sidebar
   });
 
   const handleItemClick = (item: SidebarItem) => {
@@ -334,9 +324,19 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
           <div className="absolute top-0 left-0 right-0 h-[2px] agent-gradient"></div>
           <div className="flex items-center">
             <h1 className="text-xl font-semibold text-gray-900 dark:text-[rgba(255,255,255,0.85)]">
-              {categories
-                .flatMap((category) => category.items)
-                .find((item) => item.id === activeItem)?.label || "Dashboard"}
+              {(() => {
+                // Check if we're on the root path
+                if (location.pathname === "/") {
+                  return "Dashboard";
+                }
+
+                // Find the active item label from sidebar
+                const activeItemLabel = categories
+                  .flatMap((category) => category.items)
+                  .find((item) => item.id === activeItem)?.label;
+
+                return activeItemLabel || "Dashboard";
+              })()}
             </h1>
           </div>
           <div className="flex items-center gap-2">
