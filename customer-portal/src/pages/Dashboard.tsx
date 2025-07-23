@@ -273,6 +273,7 @@ const Dashboard = () => {
               setIsTemplateOpen={() => {}} // Not used in main dashboard
               placeholder="Enter your prompt to create a new task"
               buttonText="Create Task"
+              showTemplatesButton={false}
             />
           </div>
         </div>
