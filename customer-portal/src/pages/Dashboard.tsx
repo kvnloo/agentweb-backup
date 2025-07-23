@@ -11,7 +11,8 @@ import {
 import { Message } from "@/types/chat";
 import { MessageList } from "@/components/chat/MessageList";
 import { PromptForm } from "@/components/chat/PromptForm";
-import { TemplateSection } from "@/components/templates/TemplateSection";
+import { TemplateGrid } from "@/components/templates/TemplateGrid";
+import { Separator } from "@/components/ui/separator";
 import axios from "axios";
 import { buildApiUrl } from "@/config";
 
@@ -38,7 +39,6 @@ const Dashboard = () => {
     useTemplates();
   const [promptTextState, setPromptTextState] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
-  const [isTemplateOpen, setIsTemplateOpen] = useState(true);
   const [activeCategory, setActiveCategory] = useState("");
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [selectedTemplate, setSelectedTemplate] =
@@ -46,49 +46,25 @@ const Dashboard = () => {
 
   // Handle sidebar navigation state
   useEffect(() => {
-    if (location.state?.activeCategory) {
-      setActiveCategory(location.state.activeCategory);
-      setIsTemplateOpen(true); // Ensure templates are open when navigating from sidebar
+    if (location.state && "activeCategory" in location.state) {
+      setActiveCategory(location.state.activeCategory || "");
       // Clear the state to prevent it from persisting
       navigate("/", { replace: true, state: undefined });
     }
   }, [location.state, navigate]);
 
-  // Update active category when templates change
+  // Update active category when templates change - removed automatic selection
+  // Templates are now only shown when explicitly navigated to from sidebar
   useEffect(() => {
+    // This effect is now only used for cleanup/validation
     const availableCategories = Object.keys(groupedTemplates).filter(
       (categoryId) =>
         groupedTemplates[categoryId] && groupedTemplates[categoryId].length > 0
     );
 
-    // Define preferred order for categories
-    const categoryOrder = [
-      "Market Research",
-      "Creative Research",
-      "Data Analysis",
-      "Social Listening",
-      "Productivity",
-      "Life",
-    ];
-
-    // Sort available categories by preferred order
-    const sortedCategories = availableCategories.sort((a, b) => {
-      const aIndex = categoryOrder.indexOf(a);
-      const bIndex = categoryOrder.indexOf(b);
-
-      if (aIndex !== -1 && bIndex !== -1) {
-        return aIndex - bIndex;
-      }
-      if (aIndex !== -1) return -1;
-      if (bIndex !== -1) return 1;
-      return a.localeCompare(b);
-    });
-
-    // If current active category is not available or not set, use the first available one
-    if (!activeCategory || !availableCategories.includes(activeCategory)) {
-      if (sortedCategories.length > 0) {
-        setActiveCategory(sortedCategories[0]);
-      }
+    // Clear active category if it's no longer available
+    if (activeCategory && !availableCategories.includes(activeCategory)) {
+      setActiveCategory("");
     }
   }, [groupedTemplates, activeCategory]);
 
@@ -251,57 +227,85 @@ const Dashboard = () => {
     }
   };
 
+  // Determine if we're showing main dashboard or a template category
+  const isMainDashboard = !activeCategory;
+  const pageTitle = isMainDashboard
+    ? "Welcome to Your Customer Portal"
+    : `${activeCategory} Templates`;
+  const pageDescription = isMainDashboard
+    ? user && (
+        <>
+          Hi, <span className="font-medium">{user.email.split("@")[0]}</span>.
+          Dive into your personalized dashboard to explore data-driven market
+          insights, creative research and strategic tools—all in one place.
+        </>
+      )
+    : `Explore ${activeCategory.toLowerCase()} templates to get started with your projects.`;
+
   return (
     <div className="p-6 space-y-6">
       <div className="space-y-1">
         <h1 className="text-4xl font-extrabold text-gray-900 dark:text-[rgba(255,255,255,0.85)]">
-          Welcome to Your Customer Portal
+          {pageTitle}
         </h1>
         <div className="h-0.5 w-1/4 agent-gradient rounded-full"></div>
         <p className="text-gray-500 dark:text-[rgba(255,255,255,0.7)]">
-          {user && (
-            <>
-              Hi,{" "}
-              <span className="font-medium">{user.email.split("@")[0]}</span>.
-              Dive into your personalized dashboard to explore data-driven
-              market insights, creative research and strategic tools—all in one
-              place.
-            </>
-          )}
+          {pageDescription}
         </p>
       </div>
 
-      <div className="flex flex-col flex-1 rounded-lg border overflow-hidden">
-        {/* Conditionally render the MessageList container only if there are messages */}
-        {messages.length > 0 && (
-          <div className="flex-1 overflow-hidden">
-            <MessageList messages={messages} />
+      {/* Main Dashboard View - Only Prompt Form */}
+      {isMainDashboard && (
+        <div className="flex flex-col flex-1 rounded-lg border overflow-hidden">
+          {/* Conditionally render the MessageList container only if there are messages */}
+          {messages.length > 0 && (
+            <div className="flex-1 overflow-hidden">
+              <MessageList messages={messages} />
+            </div>
+          )}
+
+          <div className="border-t">
+            <PromptForm
+              prompt={promptTextState}
+              setPrompt={setPromptTextState}
+              onSubmit={handleCreateTaskFromDashboardPrompt}
+              isTemplateOpen={false}
+              setIsTemplateOpen={() => {}} // Not used in main dashboard
+              placeholder="Enter your prompt to create a new task"
+              buttonText="Create Task"
+            />
           </div>
-        )}
-
-        <div className="border-t">
-          <PromptForm
-            prompt={promptTextState}
-            setPrompt={setPromptTextState}
-            onSubmit={handleCreateTaskFromDashboardPrompt}
-            isTemplateOpen={isTemplateOpen}
-            setIsTemplateOpen={setIsTemplateOpen}
-            placeholder="Enter your prompt to create a new task"
-            buttonText="Create Task"
-          />
-
-          <TemplateSection
-            isTemplateOpen={isTemplateOpen}
-            setIsTemplateOpen={setIsTemplateOpen}
-            activeCategory={activeCategory}
-            setActiveCategory={setActiveCategory}
-            templates={groupedTemplates} // Now passes Template[] from context
-            isLoading={isLoadingTemplates}
-            error={templateError}
-            onSelectTemplate={handleTemplateClick} // Expects DisplayTemplate
-          />
         </div>
-      </div>
+      )}
+
+      {/* Template Category View - Only Templates */}
+      {!isMainDashboard && (
+        <div className="space-y-4">
+          {isLoadingTemplates && <p>Loading templates...</p>}
+          {templateError && (
+            <p className="text-destructive">Error: {templateError}</p>
+          )}
+          {!isLoadingTemplates &&
+            !templateError &&
+            groupedTemplates[activeCategory] && (
+              <TemplateGrid
+                templates={groupedTemplates[activeCategory]}
+                categoryId={activeCategory}
+                onSelectTemplate={handleTemplateClick}
+              />
+            )}
+          {!isLoadingTemplates &&
+            !templateError &&
+            (!groupedTemplates[activeCategory] ||
+              groupedTemplates[activeCategory].length === 0) && (
+              <div className="text-center py-8">
+                <p className="text-gray-500 dark:text-gray-400">
+                  No templates available in this category.
+                </p>
+              </div>
+            )}
+        </div>
+      )}
 
       {/* Template Modal */}
       {selectedTemplate && (
