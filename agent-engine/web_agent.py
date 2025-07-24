@@ -806,24 +806,28 @@ class WebAgent:
             logger.info(f"Getting brand guidelines for user {self.user_id}")
             
             try:
-                # Get brand configuration from AW-Configs
-                table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
+                # Get brand guidelines from user record
+                table = dynamodb.Table(f'{TABLE_PREFIX}AW-Users')
                 response = table.query(
+                    IndexName='UserIdIndex',
                     KeyConditionExpression='userId = :userId',
-                    FilterExpression='isBrandConfig = :isBrandConfig',
                     ExpressionAttributeValues={
-                        ':userId': self.user_id,
-                        ':isBrandConfig': True
+                        ':userId': self.user_id
                     }
                 )
                 
-                brand_configs = response.get('Items', [])
-                if not brand_configs:
+                users = response.get('Items', [])
+                if not users:
+                    return ActionResult(error="User not found.")
+                
+                user = users[0]
+                brand_guidelines = user.get('brandGuidelines')
+                
+                if not brand_guidelines:
                     return ActionResult(error="No brand guidelines found for this account. Please set up brand guidelines in your account settings first.")
                 
-                brand_config = brand_configs[0]  # Get the first/primary brand config
-                brand_data = brand_config.get('brandData', {})
-                attachments = brand_config.get('attachments', [])
+                brand_data = brand_guidelines.get('brandData', {})
+                attachments = brand_guidelines.get('attachments', [])
                 
                 # Format brand information for the agent
                 brand_info = []

@@ -61,33 +61,37 @@ router.get("/guidelines", authenticateToken, async (req, res) => {
 
     const result = await dynamodb
       .query({
-        TableName: `${TABLE_PREFIX}AW-Configs`,
+        TableName: `${TABLE_PREFIX}AW-Users`,
+        IndexName: "UserIdIndex",
         KeyConditionExpression: "userId = :userId",
-        FilterExpression: "isBrandConfig = :isBrandConfig",
         ExpressionAttributeValues: {
           ":userId": userId,
-          ":isBrandConfig": true,
         },
       })
       .promise();
 
-    const brandConfigs = result.Items || [];
+    const users = result.Items || [];
 
-    if (brandConfigs.length === 0) {
+    if (users.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const user = users[0];
+    const brandGuidelines = user.brandGuidelines;
+
+    if (!brandGuidelines) {
       return res.json({
         exists: false,
         message: "No brand guidelines found",
       });
     }
 
-    // Return the first/primary brand configuration
-    const brandConfig = brandConfigs[0];
-    const { encryptedPassword, password, ...brandWithoutSensitive } =
-      brandConfig;
-
     res.json({
       exists: true,
-      ...brandWithoutSensitive,
+      brandData: brandGuidelines.brandData || {},
+      attachments: brandGuidelines.attachments || [],
+      createdAt: brandGuidelines.createdAt,
+      updatedAt: brandGuidelines.updatedAt,
     });
   } catch (error) {
     console.error("Error fetching brand guidelines:", error);
@@ -184,23 +188,24 @@ router.post(
         }
       }
 
-      // Check if brand config already exists
-      const existingResult = await dynamodb
+      // Get current user to access existing brand guidelines
+      const userResult = await dynamodb
         .query({
-          TableName: `${TABLE_PREFIX}AW-Configs`,
+          TableName: `${TABLE_PREFIX}AW-Users`,
+          IndexName: "UserIdIndex",
           KeyConditionExpression: "userId = :userId",
-          FilterExpression: "isBrandConfig = :isBrandConfig",
           ExpressionAttributeValues: {
             ":userId": userId,
-            ":isBrandConfig": true,
           },
         })
         .promise();
 
-      const configId =
-        existingResult.Items && existingResult.Items.length > 0
-          ? existingResult.Items[0].configId
-          : uuidv4();
+      if (!userResult.Items || userResult.Items.length === 0) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      const user = userResult.Items[0];
+      const existingBrandGuidelines = user.brandGuidelines;
 
       // Parse keyMessages if it's a string
       let parsedKeyMessages = [];
@@ -230,11 +235,7 @@ router.post(
         }
       }
 
-      const brandConfig = {
-        configId,
-        userId,
-        isBrandConfig: true,
-        appName: "Brand Guidelines",
+      const brandGuidelinesData = {
         brandData: {
           brandName: brandName || "",
           tagline: tagline || "",
@@ -248,28 +249,30 @@ router.post(
           brandPersonality: brandPersonality || "",
         },
         attachments: [
-          ...((existingResult.Items && existingResult.Items[0]?.attachments) ||
-            []),
+          ...(existingBrandGuidelines?.attachments || []),
           ...attachments,
         ],
-        shareWithEveryone: 0,
         createdAt:
-          existingResult.Items && existingResult.Items.length > 0
-            ? existingResult.Items[0].createdAt
-            : new Date().toISOString(),
+          existingBrandGuidelines?.createdAt || new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
 
+      // Update user record with brand guidelines
       await dynamodb
-        .put({
-          TableName: `${TABLE_PREFIX}AW-Configs`,
-          Item: brandConfig,
+        .update({
+          TableName: `${TABLE_PREFIX}AW-Users`,
+          Key: { email: user.email }, // Use email as primary key
+          UpdateExpression:
+            "SET brandGuidelines = :brandGuidelines, updatedAt = :updatedAt",
+          ExpressionAttributeValues: {
+            ":brandGuidelines": brandGuidelinesData,
+            ":updatedAt": new Date().toISOString(),
+          },
         })
         .promise();
 
       res.status(201).json({
         message: "Brand guidelines saved successfully",
-        configId,
         attachments: attachments.length,
       });
     } catch (error) {
@@ -289,27 +292,31 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       return res.status(401).json({ error: "User ID not provided" });
     }
 
-    // Get current brand config
+    // Get current user and brand guidelines
     const result = await dynamodb
       .query({
-        TableName: `${TABLE_PREFIX}AW-Configs`,
+        TableName: `${TABLE_PREFIX}AW-Users`,
+        IndexName: "UserIdIndex",
         KeyConditionExpression: "userId = :userId",
-        FilterExpression: "isBrandConfig = :isBrandConfig",
         ExpressionAttributeValues: {
           ":userId": userId,
-          ":isBrandConfig": true,
         },
       })
       .promise();
 
     if (!result.Items || result.Items.length === 0) {
-      return res.status(404).json({ error: "Brand configuration not found" });
+      return res.status(404).json({ error: "User not found" });
     }
 
-    const brandConfig = result.Items[0];
+    const user = result.Items[0];
+    const brandGuidelines = user.brandGuidelines;
+
+    if (!brandGuidelines) {
+      return res.status(404).json({ error: "Brand guidelines not found" });
+    }
 
     // Remove the asset from attachments
-    const updatedAttachments = (brandConfig.attachments || []).filter(
+    const updatedAttachments = (brandGuidelines.attachments || []).filter(
       (attachment: any) => attachment.key !== key
     );
 
@@ -326,18 +333,21 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       // Continue with database update even if S3 deletion fails
     }
 
-    // Update the brand config
+    // Update the user's brand guidelines
+    const updatedBrandGuidelines = {
+      ...brandGuidelines,
+      attachments: updatedAttachments,
+      updatedAt: new Date().toISOString(),
+    };
+
     await dynamodb
       .update({
-        TableName: `${TABLE_PREFIX}AW-Configs`,
-        Key: {
-          userId,
-          configId: brandConfig.configId,
-        },
+        TableName: `${TABLE_PREFIX}AW-Users`,
+        Key: { email: user.email },
         UpdateExpression:
-          "SET attachments = :attachments, updatedAt = :updatedAt",
+          "SET brandGuidelines = :brandGuidelines, updatedAt = :updatedAt",
         ExpressionAttributeValues: {
-          ":attachments": updatedAttachments,
+          ":brandGuidelines": updatedBrandGuidelines,
           ":updatedAt": new Date().toISOString(),
         },
       })
