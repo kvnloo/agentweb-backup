@@ -2775,7 +2775,7 @@ export default function AdminDashboard() {
                         <TableCell>Task ID</TableCell>
                         <TableCell>Name</TableCell>
                         <TableCell>Prompt</TableCell>
-                        <TableCell>Go To Task</TableCell>
+                        <TableCell>Details</TableCell>
                       </TableRow>
                     </TableHead>
                     <TableBody>
@@ -2797,7 +2797,7 @@ export default function AdminDashboard() {
                               rel="noopener noreferrer"
                               sx={{ textTransform: "none" }}
                             >
-                              Go To Task
+                              View Details
                             </Button>
                           </TableCell>
                         </TableRow>
