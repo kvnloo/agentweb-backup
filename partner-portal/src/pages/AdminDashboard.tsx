@@ -53,6 +53,7 @@ import {
   Delete as DeleteIcon,
   PersonAdd as PersonAddIcon,
 } from "@mui/icons-material";
+import Popover from "@mui/material/Popover";
 
 interface TabPanelProps {
   children?: React.ReactNode;
@@ -463,6 +464,11 @@ export default function AdminDashboard() {
   });
   const [manualInviteLoading, setManualInviteLoading] = useState(false);
 
+  // State for user tasks dialog
+  const [userTasksDialogOpen, setUserTasksDialogOpen] = useState(false);
+  const [userTasksDialogUserId, setUserTasksDialogUserId] = useState<string | null>(null);
+  const [userTasksDialogUserEmail, setUserTasksDialogUserEmail] = useState<string | null>(null);
+
   useEffect(() => {
     const loadData = async () => {
       await loadUsers();
@@ -494,10 +500,11 @@ export default function AdminDashboard() {
       }
     };
 
-    if (tabValue === 4) {
+    // Only load tasks when Users tab (2) is selected and not already loaded
+    if (tabValue === 2 && tasks.length === 0) {
       loadTasks();
     }
-  }, [tabValue, token]);
+  }, [tabValue, token, tasks.length]);
 
   useEffect(() => {
     const loadWorkflows = async () => {
@@ -1328,9 +1335,15 @@ export default function AdminDashboard() {
                           <Chip
                             label={user.taskCount || 0}
                             size="small"
-                            color={
-                              (user.taskCount ?? 0) > 0 ? "primary" : "default"
-                            }
+                            color={(user.taskCount ?? 0) > 0 ? "primary" : "default"}
+                            style={{ cursor: (user.taskCount ?? 0) > 0 ? "pointer" : undefined }}
+                            onClick={() => {
+                              if ((user.taskCount ?? 0) > 0) {
+                                setUserTasksDialogUserId(user.userId);
+                                setUserTasksDialogUserEmail(user.email);
+                                setUserTasksDialogOpen(true);
+                              }
+                            }}
                           />
                         </TableCell>
                         <TableCell>
@@ -2729,6 +2742,79 @@ export default function AdminDashboard() {
           {success}
         </Alert>
       )}
+
+      {/* User Tasks Dialog */}
+      <Dialog
+        open={userTasksDialogOpen}
+        onClose={() => setUserTasksDialogOpen(false)}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle>User Tasks{userTasksDialogUserEmail ? ` for ${userTasksDialogUserEmail}` : ""}</DialogTitle>
+        <DialogContent dividers>
+          {(() => {
+            const filteredTasks = tasks.filter((task) => task.userId === userTasksDialogUserId);
+            if (adminLoading) {
+              return (
+                <Box display="flex" justifyContent="center" alignItems="center" minHeight={60}>
+                  <CircularProgress size={24} />
+                </Box>
+              );
+            } else if (filteredTasks.length === 0) {
+              return (
+                <Typography variant="body2" color="text.secondary">
+                  No tasks found for this user.
+                </Typography>
+              );
+            } else {
+              return (
+                <TableContainer component={Paper}>
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell>Task ID</TableCell>
+                        <TableCell>Name</TableCell>
+                        <TableCell>Prompt</TableCell>
+                        <TableCell>Go To Task</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {filteredTasks.map((task: AdminTask) => (
+                        <TableRow key={task.taskId}>
+                          <TableCell>{task.taskId}</TableCell>
+                          <TableCell>{task.name}</TableCell>
+                          <TableCell>
+                            {task.prompt && task.prompt.length > 80
+                              ? `${task.prompt.substring(0, 80)}...`
+                              : task.prompt}
+                          </TableCell>
+                          <TableCell>
+                            <Button
+                              size="small"
+                              component="a"
+                              href={`/tasks/${task.taskId}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              sx={{ textTransform: "none" }}
+                            >
+                              Go To Task
+                            </Button>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              );
+            }
+          })()}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setUserTasksDialogOpen(false)} color="primary" variant="contained">
+            Close
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Container>
   );
 }
