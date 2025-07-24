@@ -776,6 +776,9 @@ conda activate agent-engine
 
 # Set display to VNC server (display :1)
 export DISPLAY=:1
+# If vpc not working, use xvfb
+Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
+export DISPLAY=:99
 
 # Start the agent engine
 python task_monitor.py
