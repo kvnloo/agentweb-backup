@@ -8,6 +8,14 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-07-24",
+    changes: [
+      "Enhanced Admin page to support showing tasks of a given user:",
+      "- Admins can now click on a user's task count in the Users tab to view all tasks for that user in a popup dialog.",
+      "- The task list includes Task ID, Name, truncated Prompt, and a 'View Details' link for each task (opens in a new tab).",
+    ],
+  },
+  {
     date: "2025-07-18",
     changes: [
       "Lifted file size limit from 1MB to 5MB for task attachments",
