@@ -11,6 +11,7 @@ interface PromptFormProps {
   setIsTemplateOpen: (isOpen: boolean) => void;
   placeholder?: string;
   buttonText?: string;
+  showTemplatesButton?: boolean;
 }
 
 export const PromptForm = ({
@@ -21,6 +22,7 @@ export const PromptForm = ({
   setIsTemplateOpen,
   placeholder,
   buttonText,
+  showTemplatesButton = true,
 }: PromptFormProps) => {
   return (
     <form onSubmit={onSubmit} className="p-4">
@@ -32,19 +34,25 @@ export const PromptForm = ({
           className="resize-none p-4 min-h-[180px] rounded-lg"
         />
       </div>
-      <div className="flex justify-between mt-4">
-        <Button
-          variant="outline"
-          className="text-gray-200 border-[#9b87f5] hover:bg-[#F3EFFD] h0"
-          onClick={() => setIsTemplateOpen(!isTemplateOpen)}
-        >
-          Templates{" "}
-          {isTemplateOpen ? (
-            <ChevronUp className="ml-1 h-4 w-4" />
-          ) : (
-            <ChevronDown className="ml-1 h-4 w-4" />
-          )}
-        </Button>
+      <div
+        className={`flex mt-4 ${
+          showTemplatesButton ? "justify-between" : "justify-end"
+        }`}
+      >
+        {showTemplatesButton && (
+          <Button
+            variant="outline"
+            className="text-gray-200 border-[#9b87f5] hover:bg-[#F3EFFD] h0"
+            onClick={() => setIsTemplateOpen(!isTemplateOpen)}
+          >
+            Templates{" "}
+            {isTemplateOpen ? (
+              <ChevronUp className="ml-1 h-4 w-4" />
+            ) : (
+              <ChevronDown className="ml-1 h-4 w-4" />
+            )}
+          </Button>
+        )}
         <Button
           type="submit"
           disabled={!prompt.trim()}

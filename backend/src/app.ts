@@ -12,6 +12,7 @@ import templateRoutes from "./routes/templates";
 import chatbotRoutes from "./routes/chatbot";
 import docsRoutes from "./routes/docs";
 import stripeRoutes from "./routes/stripe";
+import brandRoutes from "./routes/brand";
 
 // Import the new controller
 import { viewExternalFile } from "./controllers/filesController";
@@ -76,6 +77,7 @@ app.use("/api/chatbot", chatbotRoutes);
 app.use("/api/docs", docsRoutes);
 app.use("/api/files", fileRoutes);
 app.use("/api/stripe", stripeRoutes);
+app.use("/api/brand", brandRoutes);
 
 // Health check endpoint
 app.get("/", (req, res) => {

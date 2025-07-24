@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-07-24',
+    changes: [
+      'Major UI changes:',
+      '- Added Templates to the sidebar for easier access and task creation.',
+      '- Supported Brand Guidelines: customers can now maintain their brand guidelines in the portal.',
+      '- Task runs can leverage the guideline to maintain consistent branding for generated content.',
+    ],
+  },
+  {
     date: '2025-07-14',
     changes: [
       'Added perform_video_analysis function call which uses Gemini 2.5 Pro to understand video content',

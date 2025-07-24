@@ -57,6 +57,30 @@ export interface User {
   stripe_customer_id?: string;
   companyName?: string;
   useCaseCategories?: string[];
+  brandGuidelines?: {
+    brandData: {
+      brandName: string;
+      tagline: string;
+      primaryColor: string;
+      primaryColorEnd: string;
+      secondaryColor: string;
+      fontFamily: string;
+      toneOfVoice: string;
+      keyMessages: string[];
+      brandValues: string[];
+      targetAudience: string;
+      brandPersonality: string;
+      isGradient: boolean;
+    };
+    attachments: Array<{
+      type: string;
+      url: string;
+      key: string;
+      filename: string;
+    }>;
+    createdAt: string;
+    updatedAt: string;
+  };
 }
 
 interface UserInteraction {
@@ -474,15 +498,17 @@ export const taskDb = {
       let lastEvaluatedKey: any = undefined;
 
       do {
-        const result = await dynamodb.scan({
-          ...params,
-          ExclusiveStartKey: lastEvaluatedKey
-        }).promise();
-        
+        const result = await dynamodb
+          .scan({
+            ...params,
+            ExclusiveStartKey: lastEvaluatedKey,
+          })
+          .promise();
+
         if (result.Items) {
           allItems = allItems.concat(result.Items);
         }
-        
+
         lastEvaluatedKey = result.LastEvaluatedKey;
       } while (lastEvaluatedKey);
 
@@ -625,7 +651,7 @@ export const taskDb = {
       turnOffHeadless?: boolean;
       knowledgeBase?: string;
       knowledgeBaseSize?: number;
-      knowledgeBaseType?: 'public' | 'private';
+      knowledgeBaseType?: "public" | "private";
       useKnowledgeBase?: boolean;
       updateKnowledgeBase?: boolean;
       updateLeadList?: boolean;

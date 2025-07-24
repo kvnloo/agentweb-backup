@@ -12,7 +12,7 @@ import {
 } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Label } from "@/components/ui/label";
-import { PlusCircle, Trash2, Save, UserCircle } from "lucide-react";
+import { PlusCircle, Trash2, Save } from "lucide-react";
 import { toast } from "@/components/ui/use-toast";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 
