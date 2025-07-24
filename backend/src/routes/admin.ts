@@ -360,6 +360,18 @@ router.get("/tasks", async (req, res) => {
   }
 });
 
+// Get all tasks for a specific user
+router.get("/users/:userId/tasks", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const tasks = await taskDb.getTasksByUserId(userId);
+    res.json(tasks);
+  } catch (error) {
+    console.error("Error getting user tasks:", error);
+    res.status(500).json({ message: "Error fetching user tasks" });
+  }
+});
+
 // Get task analytics
 router.get("/analytics/tasks", async (req, res) => {
   try {
