@@ -12,6 +12,7 @@ import { Message } from "@/types/chat";
 import { MessageList } from "@/components/chat/MessageList";
 import { PromptForm } from "@/components/chat/PromptForm";
 import { TemplateGrid } from "@/components/templates/TemplateGrid";
+import { CategoryTaskHistory } from "@/components/tasks/CategoryTaskHistory";
 import { Separator } from "@/components/ui/separator";
 import axios from "axios";
 import { buildApiUrl } from "@/config";
@@ -254,57 +255,75 @@ const Dashboard = () => {
         </p>
       </div>
 
-      {/* Main Dashboard View - Only Prompt Form */}
+      {/* Main Dashboard View - Prompt Form and Other Category Tasks */}
       {isMainDashboard && (
-        <div className="flex flex-col flex-1 rounded-lg border overflow-hidden">
-          {/* Conditionally render the MessageList container only if there are messages */}
-          {messages.length > 0 && (
-            <div className="flex-1 overflow-hidden">
-              <MessageList messages={messages} />
-            </div>
-          )}
+        <div className="space-y-6">
+          <div className="flex flex-col flex-1 rounded-lg border overflow-hidden">
+            {/* Conditionally render the MessageList container only if there are messages */}
+            {messages.length > 0 && (
+              <div className="flex-1 overflow-hidden">
+                <MessageList messages={messages} />
+              </div>
+            )}
 
-          <div className="border-t">
-            <PromptForm
-              prompt={promptTextState}
-              setPrompt={setPromptTextState}
-              onSubmit={handleCreateTaskFromDashboardPrompt}
-              isTemplateOpen={false}
-              setIsTemplateOpen={() => {}} // Not used in main dashboard
-              placeholder="Enter your prompt to create a new task"
-              buttonText="Create Task"
-              showTemplatesButton={false}
-            />
+            <div className="border-t">
+              <PromptForm
+                prompt={promptTextState}
+                setPrompt={setPromptTextState}
+                onSubmit={handleCreateTaskFromDashboardPrompt}
+                isTemplateOpen={false}
+                setIsTemplateOpen={() => {}} // Not used in main dashboard
+                placeholder="Enter your prompt to create a new task"
+                buttonText="Create Task"
+                showTemplatesButton={false}
+              />
+            </div>
+          </div>
+
+          {/* General Tasks Section */}
+          <div className="space-y-4">
+            <CategoryTaskHistory category="General" limit={5} />
           </div>
         </div>
       )}
 
-      {/* Template Category View - Only Templates */}
+      {/* Template Category View - Templates and Task History */}
       {!isMainDashboard && (
-        <div className="space-y-4">
-          {isLoadingTemplates && <p>Loading templates...</p>}
-          {templateError && (
-            <p className="text-destructive">Error: {templateError}</p>
-          )}
-          {!isLoadingTemplates &&
-            !templateError &&
-            groupedTemplates[activeCategory] && (
-              <TemplateGrid
-                templates={groupedTemplates[activeCategory]}
-                categoryId={activeCategory}
-                onSelectTemplate={handleTemplateClick}
-              />
+        <div className="space-y-6">
+          {/* Templates Section */}
+          <div className="space-y-4">
+            <h2 className="text-xl font-semibold text-gray-700 dark:text-gray-300">
+              Available Templates
+            </h2>
+            {isLoadingTemplates && <p>Loading templates...</p>}
+            {templateError && (
+              <p className="text-destructive">Error: {templateError}</p>
             )}
-          {!isLoadingTemplates &&
-            !templateError &&
-            (!groupedTemplates[activeCategory] ||
-              groupedTemplates[activeCategory].length === 0) && (
-              <div className="text-center py-8">
-                <p className="text-gray-500 dark:text-gray-400">
-                  No templates available in this category.
-                </p>
-              </div>
-            )}
+            {!isLoadingTemplates &&
+              !templateError &&
+              groupedTemplates[activeCategory] && (
+                <TemplateGrid
+                  templates={groupedTemplates[activeCategory]}
+                  categoryId={activeCategory}
+                  onSelectTemplate={handleTemplateClick}
+                />
+              )}
+            {!isLoadingTemplates &&
+              !templateError &&
+              (!groupedTemplates[activeCategory] ||
+                groupedTemplates[activeCategory].length === 0) && (
+                <div className="text-center py-8">
+                  <p className="text-gray-500 dark:text-gray-400">
+                    No templates available in this category.
+                  </p>
+                </div>
+              )}
+          </div>
+
+          {/* Task History Section */}
+          <div className="space-y-4">
+            <CategoryTaskHistory category={activeCategory} limit={5} />
+          </div>
         </div>
       )}
 
