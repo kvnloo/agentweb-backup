@@ -785,6 +785,111 @@ class WebAgent:
                 logger.error(f"Error during API integration setup: {str(e)}")
                 return ActionResult(error=f"Error running integration: {str(e)}")
 
+        @self.controller.registry.action('Get brand guidelines')
+        def get_brand_guidelines() -> ActionResult:
+            """Get brand guidelines and assets for the current user.
+            
+            Returns comprehensive brand information including:
+            - Brand name, tagline, and values
+            - Colors (primary, secondary)
+            - Typography (font family)
+            - Tone of voice and messaging
+            - Target audience and brand personality
+            - Links to brand assets (logos, style guides)
+            
+            This information should be used to ensure all marketing materials,
+            content, and communications align with the brand identity.
+            """
+            if not self.user_id:
+                return ActionResult(error="User ID not provided")
+            
+            logger.info(f"Getting brand guidelines for user {self.user_id}")
+            
+            try:
+                # Get brand configuration from AW-Configs
+                table = dynamodb.Table(f'{TABLE_PREFIX}AW-Configs')
+                response = table.query(
+                    KeyConditionExpression='userId = :userId',
+                    FilterExpression='isBrandConfig = :isBrandConfig',
+                    ExpressionAttributeValues={
+                        ':userId': self.user_id,
+                        ':isBrandConfig': True
+                    }
+                )
+                
+                brand_configs = response.get('Items', [])
+                if not brand_configs:
+                    return ActionResult(error="No brand guidelines found for this account. Please set up brand guidelines in your account settings first.")
+                
+                brand_config = brand_configs[0]  # Get the first/primary brand config
+                brand_data = brand_config.get('brandData', {})
+                attachments = brand_config.get('attachments', [])
+                
+                # Format brand information for the agent
+                brand_info = []
+                brand_info.append("=== BRAND GUIDELINES ===")
+                
+                if brand_data.get('brandName'):
+                    brand_info.append(f"Brand Name: {brand_data['brandName']}")
+                
+                if brand_data.get('tagline'):
+                    brand_info.append(f"Tagline: {brand_data['tagline']}")
+                
+                # Colors
+                if brand_data.get('primaryColor') or brand_data.get('secondaryColor'):
+                    brand_info.append("\n--- COLORS ---")
+                    if brand_data.get('primaryColor'):
+                        brand_info.append(f"Primary Color: {brand_data['primaryColor']}")
+                    if brand_data.get('secondaryColor'):
+                        brand_info.append(f"Secondary Color: {brand_data['secondaryColor']}")
+                
+                # Typography
+                if brand_data.get('fontFamily'):
+                    brand_info.append(f"\n--- TYPOGRAPHY ---")
+                    brand_info.append(f"Font Family: {brand_data['fontFamily']}")
+                
+                # Voice and messaging
+                if brand_data.get('toneOfVoice'):
+                    brand_info.append(f"\n--- TONE OF VOICE ---")
+                    brand_info.append(f"Tone: {brand_data['toneOfVoice']}")
+                
+                if brand_data.get('keyMessages') and len(brand_data['keyMessages']) > 0:
+                    brand_info.append(f"\n--- KEY MESSAGES ---")
+                    for i, message in enumerate(brand_data['keyMessages'], 1):
+                        brand_info.append(f"{i}. {message}")
+                
+                if brand_data.get('brandValues') and len(brand_data['brandValues']) > 0:
+                    brand_info.append(f"\n--- BRAND VALUES ---")
+                    for i, value in enumerate(brand_data['brandValues'], 1):
+                        brand_info.append(f"{i}. {value}")
+                
+                # Audience and personality
+                if brand_data.get('targetAudience'):
+                    brand_info.append(f"\n--- TARGET AUDIENCE ---")
+                    brand_info.append(brand_data['targetAudience'])
+                
+                if brand_data.get('brandPersonality'):
+                    brand_info.append(f"\n--- BRAND PERSONALITY ---")
+                    brand_info.append(brand_data['brandPersonality'])
+                
+                # Assets
+                if attachments:
+                    brand_info.append(f"\n--- BRAND ASSETS ---")
+                    for attachment in attachments:
+                        asset_type = attachment.get('type', 'asset').title()
+                        filename = attachment.get('filename', 'Unknown')
+                        url = attachment.get('url', '')
+                        brand_info.append(f"{asset_type}: {filename} ({url})")
+                
+                brand_info.append("\n=== END BRAND GUIDELINES ===")
+                brand_info.append("\nIMPORTANT: Use these brand guidelines to ensure all content, designs, and communications align with the brand identity.")
+                
+                return ActionResult(extracted_content="\n".join(brand_info))
+                
+            except Exception as e:
+                logger.error(f"Error retrieving brand guidelines: {str(e)}")
+                return ActionResult(error=f"Error getting brand guidelines: {str(e)}")
+
         @self.controller.registry.action('Sleep')
         async def sleep(seconds: float) -> ActionResult:
             """Sleep for a specified number of seconds (max 5 minutes)"""
