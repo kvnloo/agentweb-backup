@@ -499,8 +499,8 @@ export default function AdminDashboard() {
       }
     };
 
-    // Only load tasks when Users tab (2) is selected and not already loaded
-    if (tabValue === 2 && tasks.length === 0) {
+    // Load tasks when either Users tab (2) or Tasks tab (4) is selected, and only if not already loaded
+    if ((tabValue === 2 || tabValue === 4) && tasks.length === 0) {
       loadTasks();
     }
   }, [tabValue, token, tasks.length]);
