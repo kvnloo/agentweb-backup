@@ -13,6 +13,9 @@ const s3 = new S3();
 // Get table prefix based on NODE_ENV
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
+console.log(`[BRAND DEBUG] Using table prefix: ${TABLE_PREFIX}`);
+console.log(`[BRAND DEBUG] Users table: ${TABLE_PREFIX}AW-Users`);
+
 // Configure multer for file uploads
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -27,6 +30,10 @@ async function uploadBrandFile(
   userId: string,
   fileType: string
 ): Promise<{ url: string; key: string }> {
+  console.log(
+    `[BRAND DEBUG] Uploading file: ${file.originalname} for user: ${userId}`
+  );
+
   const randomToken = Array.from(crypto.getRandomValues(new Uint8Array(16)))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
@@ -48,6 +55,7 @@ async function uploadBrandFile(
     process.env.AWS_S3_BUCKET || "agentweb-user-files"
   }.s3.${process.env.AWS_REGION || "us-west-2"}.amazonaws.com/${key}`;
 
+  console.log(`[BRAND DEBUG] File uploaded successfully: ${url}`);
   return { url, key };
 }
 
@@ -55,9 +63,16 @@ async function uploadBrandFile(
 router.get("/guidelines", authenticateToken, async (req, res) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
+    console.log(`[BRAND DEBUG] GET request for user: ${userId}`);
+
     if (!userId) {
+      console.log(`[BRAND DEBUG] No userId provided in request`);
       return res.status(401).json({ error: "User ID not provided" });
     }
+
+    console.log(
+      `[BRAND DEBUG] Querying table: ${TABLE_PREFIX}AW-Users with UserIdIndex`
+    );
 
     const result = await dynamodb
       .query({
@@ -70,21 +85,38 @@ router.get("/guidelines", authenticateToken, async (req, res) => {
       })
       .promise();
 
+    console.log(
+      `[BRAND DEBUG] Query result count: ${result.Items?.length || 0}`
+    );
+
     const users = result.Items || [];
 
     if (users.length === 0) {
+      console.log(`[BRAND DEBUG] User not found in database`);
       return res.status(404).json({ error: "User not found" });
     }
 
     const user = users[0];
+    console.log(`[BRAND DEBUG] Found user: ${user.email}`);
+    console.log(
+      `[BRAND DEBUG] User has brandGuidelines field: ${!!user.brandGuidelines}`
+    );
+
     const brandGuidelines = user.brandGuidelines;
 
     if (!brandGuidelines) {
+      console.log(`[BRAND DEBUG] No brand guidelines found for user`);
       return res.json({
         exists: false,
         message: "No brand guidelines found",
       });
     }
+
+    console.log(
+      `[BRAND DEBUG] Returning brand guidelines with ${
+        brandGuidelines.attachments?.length || 0
+      } attachments`
+    );
 
     res.json({
       exists: true,
@@ -94,7 +126,7 @@ router.get("/guidelines", authenticateToken, async (req, res) => {
       updatedAt: brandGuidelines.updatedAt,
     });
   } catch (error) {
-    console.error("Error fetching brand guidelines:", error);
+    console.error("[BRAND DEBUG] Error fetching brand guidelines:", error);
     res.status(500).json({ error: "Failed to fetch brand guidelines" });
   }
 });
@@ -112,7 +144,11 @@ router.post(
   async (req, res) => {
     try {
       const userId = (req as AuthenticatedRequest).user?.userId;
+      console.log(`[BRAND DEBUG] POST request for user: ${userId}`);
+      console.log(`[BRAND DEBUG] Request body:`, req.body);
+
       if (!userId) {
+        console.log(`[BRAND DEBUG] No userId provided in POST request`);
         return res.status(401).json({ error: "User ID not provided" });
       }
 
@@ -130,6 +166,7 @@ router.post(
       } = req.body;
 
       const files = req.files as { [fieldname: string]: Express.Multer.File[] };
+      console.log(`[BRAND DEBUG] Files received:`, Object.keys(files));
 
       // Upload files to S3
       const attachments = [];
@@ -188,7 +225,15 @@ router.post(
         }
       }
 
+      console.log(
+        `[BRAND DEBUG] Uploaded ${attachments.length} new attachments`
+      );
+
       // Get current user to access existing brand guidelines
+      console.log(
+        `[BRAND DEBUG] Fetching existing user data from: ${TABLE_PREFIX}AW-Users`
+      );
+
       const userResult = await dynamodb
         .query({
           TableName: `${TABLE_PREFIX}AW-Users`,
@@ -201,11 +246,20 @@ router.post(
         .promise();
 
       if (!userResult.Items || userResult.Items.length === 0) {
+        console.log(
+          `[BRAND DEBUG] User not found during brand guidelines save`
+        );
         return res.status(404).json({ error: "User not found" });
       }
 
       const user = userResult.Items[0];
+      console.log(`[BRAND DEBUG] Found user for update: ${user.email}`);
+      console.log(`[BRAND DEBUG] User primary key (email): ${user.email}`);
+
       const existingBrandGuidelines = user.brandGuidelines;
+      console.log(
+        `[BRAND DEBUG] Existing brand guidelines: ${!!existingBrandGuidelines}`
+      );
 
       // Parse keyMessages if it's a string
       let parsedKeyMessages = [];
@@ -257,27 +311,56 @@ router.post(
         updatedAt: new Date().toISOString(),
       };
 
+      console.log(
+        `[BRAND DEBUG] Prepared brand guidelines data:`,
+        JSON.stringify(brandGuidelinesData, null, 2)
+      );
+      console.log(
+        `[BRAND DEBUG] About to update user with email: ${user.email}`
+      );
+
       // Update user record with brand guidelines
-      await dynamodb
-        .update({
-          TableName: `${TABLE_PREFIX}AW-Users`,
-          Key: { email: user.email }, // Use email as primary key
-          UpdateExpression:
-            "SET brandGuidelines = :brandGuidelines, updatedAt = :updatedAt",
-          ExpressionAttributeValues: {
-            ":brandGuidelines": brandGuidelinesData,
-            ":updatedAt": new Date().toISOString(),
-          },
-        })
-        .promise();
+      const updateParams = {
+        TableName: `${TABLE_PREFIX}AW-Users`,
+        Key: { email: user.email }, // Use email as primary key
+        UpdateExpression:
+          "SET brandGuidelines = :brandGuidelines, updatedAt = :updatedAt",
+        ExpressionAttributeValues: {
+          ":brandGuidelines": brandGuidelinesData,
+          ":updatedAt": new Date().toISOString(),
+        },
+        ReturnValues: "ALL_NEW",
+      };
+
+      console.log(
+        `[BRAND DEBUG] Update parameters:`,
+        JSON.stringify(updateParams, null, 2)
+      );
+
+      const updateResult = await dynamodb.update(updateParams).promise();
+
+      console.log(
+        `[BRAND DEBUG] Update successful! Updated attributes:`,
+        updateResult.Attributes?.brandGuidelines
+          ? "brandGuidelines field exists"
+          : "brandGuidelines field missing"
+      );
 
       res.status(201).json({
         message: "Brand guidelines saved successfully",
         attachments: attachments.length,
+        debug: {
+          userEmail: user.email,
+          updateSuccess: true,
+          brandGuidelinesExists: !!updateResult.Attributes?.brandGuidelines,
+        },
       });
     } catch (error) {
-      console.error("Error saving brand guidelines:", error);
-      res.status(500).json({ error: "Failed to save brand guidelines" });
+      console.error("[BRAND DEBUG] Error saving brand guidelines:", error);
+      res.status(500).json({
+        error: "Failed to save brand guidelines",
+        debug: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 );
@@ -287,6 +370,10 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
     const { key } = req.params;
+
+    console.log(
+      `[BRAND DEBUG] DELETE asset request for user: ${userId}, key: ${key}`
+    );
 
     if (!userId) {
       return res.status(401).json({ error: "User ID not provided" });
@@ -305,6 +392,7 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       .promise();
 
     if (!result.Items || result.Items.length === 0) {
+      console.log(`[BRAND DEBUG] User not found for asset deletion`);
       return res.status(404).json({ error: "User not found" });
     }
 
@@ -312,12 +400,19 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
     const brandGuidelines = user.brandGuidelines;
 
     if (!brandGuidelines) {
+      console.log(`[BRAND DEBUG] No brand guidelines found for asset deletion`);
       return res.status(404).json({ error: "Brand guidelines not found" });
     }
 
     // Remove the asset from attachments
     const updatedAttachments = (brandGuidelines.attachments || []).filter(
       (attachment: any) => attachment.key !== key
+    );
+
+    console.log(
+      `[BRAND DEBUG] Removing asset, before: ${
+        brandGuidelines.attachments?.length || 0
+      }, after: ${updatedAttachments.length}`
     );
 
     // Delete from S3
@@ -328,8 +423,9 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
           Key: decodeURIComponent(key),
         })
         .promise();
+      console.log(`[BRAND DEBUG] Successfully deleted file from S3: ${key}`);
     } catch (s3Error) {
-      console.warn("Failed to delete from S3:", s3Error);
+      console.warn("[BRAND DEBUG] Failed to delete from S3:", s3Error);
       // Continue with database update even if S3 deletion fails
     }
 
@@ -353,9 +449,13 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       })
       .promise();
 
+    console.log(
+      `[BRAND DEBUG] Successfully updated user brand guidelines after asset deletion`
+    );
+
     res.json({ message: "Asset deleted successfully" });
   } catch (error) {
-    console.error("Error deleting brand asset:", error);
+    console.error("[BRAND DEBUG] Error deleting brand asset:", error);
     res.status(500).json({ error: "Failed to delete brand asset" });
   }
 });

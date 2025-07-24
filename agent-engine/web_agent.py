@@ -843,7 +843,11 @@ class WebAgent:
                 if brand_data.get('primaryColor') or brand_data.get('secondaryColor'):
                     brand_info.append("\n--- COLORS ---")
                     if brand_data.get('primaryColor'):
-                        brand_info.append(f"Primary Color: {brand_data['primaryColor']}")
+                        is_gradient = brand_data.get('isGradient', False)
+                        if is_gradient and brand_data.get('primaryColorEnd'):
+                            brand_info.append(f"Primary Color: Gradient from {brand_data['primaryColor']} to {brand_data['primaryColorEnd']}")
+                        else:
+                            brand_info.append(f"Primary Color: {brand_data['primaryColor']}")
                     if brand_data.get('secondaryColor'):
                         brand_info.append(f"Secondary Color: {brand_data['secondaryColor']}")
                 

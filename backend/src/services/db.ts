@@ -62,6 +62,7 @@ export interface User {
       brandName: string;
       tagline: string;
       primaryColor: string;
+      primaryColorEnd: string;
       secondaryColor: string;
       fontFamily: string;
       toneOfVoice: string;
@@ -69,6 +70,7 @@ export interface User {
       brandValues: string[];
       targetAudience: string;
       brandPersonality: string;
+      isGradient: boolean;
     };
     attachments: Array<{
       type: string;
