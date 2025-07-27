@@ -333,7 +333,9 @@ def get_llm(full_llm_name: str) -> Tuple[Any, str]:
                 "gemini-2.0-flash": get_gemini_llm,
                 "gemini-2.5-pro-preview-03-25": get_gemini_llm,
                 "gemini-2.5-pro-preview-05-06": get_gemini_llm,
-                "gemini-2.0-flash-exp": get_gemini_llm
+                "gemini-2.0-flash-exp": get_gemini_llm,
+                "gemini-2.5-flash": get_gemini_llm,
+                "gemini-2.5-flash-lite": get_gemini_llm
             }
         }
     }
