@@ -8,6 +8,16 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-07-28",
+    changes: [
+      "Added support for two new Gemini models: Gemini 2.5 Flash and Gemini 2.5 Flash Lite",
+      "- These models are cheaper and faster compared to Gemini 2.5 Pro",
+      "- Available for regular tasks with improved cost efficiency",
+      "Removed older Gemini models: Gemini 2.0 Flash and Gemini 2.5 Pro Preview 03-25",
+      "- These models are no longer useful and have been replaced by newer, more efficient alternatives",
+    ],
+  },
+  {
     date: "2025-07-24",
     changes: [
       "Enhanced Admin page to support showing tasks of a given user:",
