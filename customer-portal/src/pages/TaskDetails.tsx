@@ -2,7 +2,7 @@ import React, { useEffect, useState, useRef, useCallback } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
 import axios, { AxiosError } from "axios";
 import { useAuth } from "@/contexts/AuthContext";
-import { buildApiUrl } from "@/config";
+import { buildApiUrl, MAX_FILE_SIZE } from "@/config";
 import {
   Card,
   CardContent,
@@ -25,6 +25,8 @@ import {
   History,
   X,
   Folder,
+  Upload,
+  Trash2,
 } from "lucide-react";
 import { toast } from "@/components/ui/use-toast";
 import ReactMarkdown from "react-markdown";
@@ -197,6 +199,10 @@ const TaskDetailsPage: React.FC = () => {
     useState<Interaction | null>(null);
   const [interactionError, setInteractionError] = useState("");
   const [isInteracting, setIsInteracting] = useState(false);
+
+  // File upload state
+  const [uploadError, setUploadError] = useState<string>("");
+  const [isUploading, setIsUploading] = useState(false);
 
   const executionsRef = useRef<Execution[]>(executions);
   const taskRef = useRef<TaskDetail | null>(task);
@@ -379,6 +385,108 @@ const TaskDetailsPage: React.FC = () => {
       toast({
         title: "Error",
         description: "Failed to send response.",
+        variant: "destructive",
+      });
+    }
+  };
+
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || []);
+    if (files.length === 0) return;
+
+    // Check number of files
+    if (files.length > 5) {
+      setUploadError("You can only upload up to 5 files at once");
+      return;
+    }
+
+    // Check file sizes
+    const oversizedFiles = files.filter((file) => file.size > MAX_FILE_SIZE);
+    if (oversizedFiles.length > 0) {
+      setUploadError(
+        `Following files exceed ${MAX_FILE_SIZE / (1024 * 1024)}MB limit: ${oversizedFiles
+          .map((f) => f.name)
+          .join(", ")}`
+      );
+      return;
+    }
+
+    // Check total number of attachments
+    const currentAttachments = task?.attachments?.length || 0;
+    if (currentAttachments + files.length > 5) {
+      setUploadError(
+        `You can only have up to 5 attachments total. You currently have ${currentAttachments} attachments.`
+      );
+      return;
+    }
+
+    setIsUploading(true);
+    setUploadError("");
+
+    try {
+      // Upload files sequentially to avoid overwhelming the server
+      for (const file of files) {
+        const formData = new FormData();
+        formData.append("file", file);
+
+        await axios.post(
+          buildApiUrl(`/api/tasks/${taskId}/attachments`),
+          formData,
+          {
+            headers: {
+              "Content-Type": "multipart/form-data",
+              Authorization: `Bearer ${token}`,
+            },
+          }
+        );
+      }
+      await fetchTaskAndExecutions(); // Refresh task to get updated attachments
+      toast({
+        title: "Success",
+        description: "Files uploaded successfully.",
+      });
+    } catch (error: any) {
+      if (error.response?.status === 413) {
+        setUploadError(`File size too large. Maximum file size is ${MAX_FILE_SIZE / (1024 * 1024)}MB.`);
+      } else {
+        setUploadError(
+          error.response?.data?.error || "Failed to upload file(s)"
+        );
+      }
+      toast({
+        title: "Error",
+        description: "Failed to upload files.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsUploading(false);
+      // Clear the input value to allow uploading the same file again
+      if (event.target) {
+        event.target.value = "";
+      }
+    }
+  };
+
+  const handleDeleteAttachment = async (key: string) => {
+    try {
+      await axios.delete(
+        buildApiUrl(
+          `/api/tasks/${taskId}/attachments/${encodeURIComponent(key)}`
+        ),
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      await fetchTaskAndExecutions(); // Refresh task to get updated attachments
+      toast({
+        title: "Success",
+        description: "Attachment deleted successfully.",
+      });
+    } catch (error: any) {
+      console.error("Failed to delete attachment:", error);
+      toast({
+        title: "Error",
+        description: "Failed to delete attachment.",
         variant: "destructive",
       });
     }
@@ -586,26 +694,88 @@ const TaskDetailsPage: React.FC = () => {
           )}
         </CardHeader>
         <CardContent className="space-y-4">
-          {task.attachments && task.attachments.length > 0 && (
-            <div className="pb-4 border-b">
-              <h3 className="font-semibold mb-2 text-sm">Attachments:</h3>
-              <ul className="list-disc pl-5 space-y-1">
+          {/* Attachments Section */}
+          <div className="pb-4 border-b">
+            <h3 className="font-semibold mb-2 text-sm">Attachments</h3>
+            
+            {/* Upload Section */}
+            <div className="mb-4">
+              <input
+                accept="*/*"
+                style={{ display: "none" }}
+                id="file-upload"
+                type="file"
+                onChange={handleFileUpload}
+                multiple
+                disabled={isUploading || (task?.attachments?.length || 0) >= 5}
+              />
+              <label htmlFor="file-upload">
+                <Button
+                  variant="outline"
+                  disabled={
+                    isUploading || (task?.attachments?.length || 0) >= 5
+                  }
+                  className="cursor-pointer"
+                  asChild
+                >
+                  <span>
+                    {isUploading ? (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : (
+                      <Upload className="mr-2 h-4 w-4" />
+                    )}
+                    {isUploading ? "Uploading..." : "Upload Files"}
+                  </span>
+                </Button>
+              </label>
+              {(task?.attachments?.length || 0) >= 5 && (
+                <p className="text-xs text-muted-foreground mt-1">
+                  Maximum number of attachments (5) reached
+                </p>
+              )}
+              {uploadError && (
+                <Alert variant="destructive" className="mt-2">
+                  <AlertCircle className="h-4 w-4" />
+                  <AlertDescription>{uploadError}</AlertDescription>
+                </Alert>
+              )}
+            </div>
+
+            {/* Attachments List */}
+            {task.attachments && task.attachments.length > 0 ? (
+              <ul className="space-y-2">
                 {task.attachments.map((att) => (
-                  <li key={att.key} className="text-sm">
-                    <a
-                      href={att.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-blue-600 hover:underline"
+                  <li key={att.key} className="flex items-center justify-between p-2 bg-muted rounded">
+                    <div className="flex-1">
+                      <a
+                        href={att.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-blue-600 hover:underline text-sm"
+                      >
+                        {att.filename}
+                      </a>
+                      <p className="text-xs text-muted-foreground">
+                        Added on {new Date(att.uploadedAt).toLocaleDateString()}
+                      </p>
+                    </div>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => handleDeleteAttachment(att.key)}
+                      className="text-red-500 hover:text-red-600 ml-2"
                     >
-                      {att.filename} (added on{" "}
-                      {new Date(att.uploadedAt).toLocaleDateString()})
-                    </a>
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
                   </li>
                 ))}
               </ul>
-            </div>
-          )}
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                No attachments yet
+              </p>
+            )}
+          </div>
           {task.description && (
             <div className="pb-4 border-b">
               <h3 className="font-semibold mb-1 text-sm">Description:</h3>

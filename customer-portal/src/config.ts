@@ -4,6 +4,9 @@ const apiBaseUrl = import.meta.env.VITE_API_URL || "http://localhost:3001";
 // Discord Invite URL
 export const DISCORD_INVITE_URL = "https://discord.gg/kP2u6Wf9KQ";
 
+// File upload limits
+export const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB in bytes
+
 // Function to build API URLs
 export const buildApiUrl = (path: string): string => {
   // Ensure path starts with / for consistent concatenation
