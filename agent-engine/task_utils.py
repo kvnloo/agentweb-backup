@@ -297,15 +297,18 @@ def get_llm(full_llm_name: str) -> Tuple[Any, str]:
         Tuple containing the initialized LLM and the full LLM name
     """
     # Define valid platform-provider-model combinations with their initialization functions
+    # Each provider can have a default function that will be used for any model not explicitly listed
     VALID_CONFIGURATIONS = {
         "aws": {
             "anthropic": {
+                "__default__": get_aws_bedrock_llm,  # Default function for any AWS Anthropic model
                 "anthropic.claude-3-5-sonnet-20241022-v2:0": get_aws_bedrock_llm,
                 "us.anthropic.claude-3-7-sonnet-20250219-v1:0": get_aws_bedrock_llm
             }
         },
         "azure": {
             "openai": {
+                "__default__": get_azure_openai_llm,  # Default function for any Azure OpenAI model
                 "gpt-4o": get_azure_openai_llm,
                 "o1-mini": get_azure_openai_llm_o1,
                 "gpt-4.1": get_azure_openai_llm2
@@ -313,16 +316,19 @@ def get_llm(full_llm_name: str) -> Tuple[Any, str]:
         },
         "deepseek": {
             "deepseek": {
+                "__default__": get_deepseek_llm,  # Default function for any DeepSeek model
                 "deepseek-reasoner": get_deepseek_llm
             }
         },
         "pld": {
             "deepseek": {
+                "__default__": get_pld_deepseek_llm,  # Default function for any PLD DeepSeek model
                 "DeepSeek-R1": get_pld_deepseek_llm
             }
         },
         "openai": {
             "openai": {
+                "__default__": get_openai_llm,  # Default function for any OpenAI model
                 "gpt-4o": get_openai_llm,
                 "gpt-4o-mini": get_openai_llm,
                 "o3-mini": get_openai_llm_think
@@ -330,12 +336,12 @@ def get_llm(full_llm_name: str) -> Tuple[Any, str]:
         },
         "google": {
             "google": {
+                "__default__": get_gemini_llm,  # Default function for any Google Gemini model
                 "gemini-2.0-flash": get_gemini_llm,
                 "gemini-2.5-pro-preview-03-25": get_gemini_llm,
                 "gemini-2.5-pro-preview-05-06": get_gemini_llm,
                 "gemini-2.0-flash-exp": get_gemini_llm,
-                "gemini-2.5-flash": get_gemini_llm,
-                "gemini-2.5-flash-lite": get_gemini_llm
+                "gemini-2.5-flash": get_gemini_llm
             }
         }
     }
@@ -373,9 +379,15 @@ def get_llm(full_llm_name: str) -> Tuple[Any, str]:
     # Get the initialization function for the model
     init_func = provider_config.get(model_name)
     if not init_func:
-        logger.error(f"Invalid model '{model_name}' for provider '{provider}' on platform '{platform}'")
-        logger.error(f"Valid models are: {list(provider_config.keys())}")
-        sys.exit(1)
+        # Try to use the default function for this provider
+        default_func = provider_config.get("__default__")
+        if default_func:
+            logger.info(f"Model '{model_name}' not explicitly configured for provider '{provider}' on platform '{platform}', using default function")
+            init_func = default_func
+        else:
+            logger.error(f"Invalid model '{model_name}' for provider '{provider}' on platform '{platform}' and no default function available")
+            logger.error(f"Valid models are: {[k for k in provider_config.keys() if k != '__default__']}")
+            sys.exit(1)
 
     # Initialize the LLM using the mapped function
     return init_func(model_name), full_llm_name
