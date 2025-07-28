@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-07-28',
+    changes: [
+      'Added attachment support on Task Details page',
+      '- Users can now upload up to 5 files as attachments to their tasks',
+      '- Maximum file size is 5MB per file',
+      '- Files are securely stored and accessible during task execution'
+    ],
+  },
+  {
     date: '2025-07-24',
     changes: [
       'Major UI changes:',
