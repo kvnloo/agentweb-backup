@@ -10,6 +10,7 @@ import { emailService } from '../services/emailService';
 import { Storage, Bucket } from '@google-cloud/storage';
 import OpenAI from 'openai';
 import axios from 'axios';
+import AWS from 'aws-sdk';
 import { dynamodb } from '../config/aws';
 import { TABLE_PREFIX } from '../config/constants';
 
@@ -855,6 +856,76 @@ router.put("/:taskId/lead-list", authenticateToken, async (req: AuthRequest, res
   } catch (error) {
     console.error('Error in updateLeadList:', error);
     res.status(500).json({ message: 'Error updating lead list' });
+  }
+});
+
+// Get all executions with images for the current user
+router.get('/executions/with-images', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Get all task executions for the user
+    const allExecutions = await taskDb.getAllTaskExecutionsByUserId(userId) || [];
+    
+    // Filter executions that have result_files with image URLs
+    const executionsWithImages = allExecutions.filter((execution: any) => {
+      if (!execution.result_files || execution.result_files.length === 0) {
+        return false;
+      }
+      
+      // Check if any result file is an image
+      return execution.result_files.some((file: ResultFile) => {
+        const filename = file.filename.toLowerCase();
+        return filename.endsWith('.jpg') || 
+               filename.endsWith('.jpeg') || 
+               filename.endsWith('.png') || 
+               filename.endsWith('.gif') || 
+               filename.endsWith('.webp') || 
+               filename.endsWith('.svg');
+      });
+    });
+
+    // Get all tasks for the user to match with executions
+    const allTasks = await taskDb.getTasksByUserId(userId);
+    const taskMap = new Map(allTasks?.map((task: any) => [task.taskId, task]) || []);
+
+    // Group executions by taskId
+    const result: Record<string, any> = {};
+    
+    executionsWithImages.forEach((execution: any) => {
+      const task = taskMap.get(execution.taskId);
+      const taskId = execution.taskId;
+      
+      if (!result[taskId]) {
+        result[taskId] = {
+          taskId: taskId,
+          taskName: task?.name || 'Unknown Task',
+          executions: []
+        };
+      }
+      
+      result[taskId].executions.push({
+        executionId: execution.executionId,
+        result_files: execution.result_files?.filter((file: ResultFile) => {
+          const filename = file.filename.toLowerCase();
+          return filename.endsWith('.jpg') || 
+                 filename.endsWith('.jpeg') || 
+                 filename.endsWith('.png') || 
+                 filename.endsWith('.gif') || 
+                 filename.endsWith('.webp') || 
+                 filename.endsWith('.svg');
+        }) || []
+      });
+    });
+
+    res.json(result);
+  } catch (error) {
+    console.error('Error getting executions with images:', error);
+    res.status(500).json({ message: 'Internal server error' });
   }
 });
 

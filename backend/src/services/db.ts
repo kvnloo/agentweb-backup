@@ -872,6 +872,25 @@ export const taskDb = {
     }
   },
 
+  async getAllTaskExecutionsByUserId(userId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
+        IndexName: "UserIdIndex",
+        KeyConditionExpression: "userId = :userId",
+        ExpressionAttributeValues: {
+          ":userId": userId,
+        },
+        ScanIndexForward: false, // Get latest executions first
+      };
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, "getAllTaskExecutionsByUserId");
+    }
+  },
+
   async getTaskAnalytics(startDate: string, endDate: string) {
     try {
       // Get all tasks (no date filter)
