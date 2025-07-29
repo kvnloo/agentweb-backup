@@ -924,7 +924,7 @@ router.get('/executions/with-images', authenticateToken, async (req: Request, re
       });
     });
 
-    // Calculate latest execution time for each task
+    // Calculate latest execution time and find latest pending/running execution for each task
     Object.keys(result).forEach(taskId => {
       const task = result[taskId];
       const executionTimes = task.executions
@@ -935,6 +935,27 @@ router.get('/executions/with-images', authenticateToken, async (req: Request, re
         task.latestExecutionTime = executionTimes.sort().pop(); // Get the latest time
       } else {
         task.latestExecutionTime = null;
+      }
+
+      // Find the most recent pending or running execution for this task
+      const allTaskExecutions = allExecutions.filter((execution: any) => execution.taskId === taskId);
+      const pendingOrRunningExecutions = allTaskExecutions.filter((execution: any) => 
+        execution.status === 'pending' || execution.status === 'running'
+      );
+      
+      if (pendingOrRunningExecutions.length > 0) {
+        // Sort by startTime and get the most recent one
+        const latestPendingOrRunning = pendingOrRunningExecutions.sort((a: any, b: any) => 
+          new Date(b.startTime || 0).getTime() - new Date(a.startTime || 0).getTime()
+        )[0];
+        
+        task.latestPendingOrRunningExecution = {
+          executionId: latestPendingOrRunning.executionId,
+          status: latestPendingOrRunning.status,
+          startTime: latestPendingOrRunning.startTime || null
+        };
+      } else {
+        task.latestPendingOrRunningExecution = null;
       }
     });
 
