@@ -8,7 +8,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Alert, AlertDescription } from '@/components/ui/alert';
-import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink, Clock, ArrowUpRight, Play, Zap } from 'lucide-react';
+import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink, Clock, ArrowUpRight, Play, Zap, Download, Heart } from 'lucide-react';
 import { format } from 'date-fns';
 import { useNavigate } from 'react-router-dom';
 import { useToast } from '@/hooks/use-toast';
@@ -18,6 +18,7 @@ interface ResultFile {
   filename: string;
   token: string;
   is_html?: boolean;
+  is_favorited?: boolean;
 }
 
 interface ExecutionWithImages {
@@ -182,6 +183,64 @@ const ImagesPage: React.FC = () => {
         return 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-300';
       default:
         return 'bg-gray-100 text-gray-800 dark:bg-gray-900 dark:text-gray-300';
+    }
+  };
+
+  const handleViewImage = (imageUrl: string) => {
+    window.open(imageUrl, '_blank');
+  };
+
+  const handleFavoriteImage = async (executionId: string, imageUrl: string) => {
+    try {
+      const response = await axios.post(
+        buildApiUrl(`/api/tasks/executions/${executionId}/favorite-image`),
+        { imageUrl },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      if (response.data.success) {
+        // Update the specific image's favorite status in local state
+        setTasksWithExecutions(prev => {
+          const updated = { ...prev };
+          Object.keys(updated).forEach(taskId => {
+            const task = updated[taskId];
+            task.executions = task.executions.map(execution => {
+              if (execution.executionId === executionId) {
+                return {
+                  ...execution,
+                  result_files: execution.result_files.map(file => {
+                    if (file.url === imageUrl) {
+                      return {
+                        ...file,
+                        is_favorited: response.data.is_favorited
+                      };
+                    }
+                    return file;
+                  })
+                };
+              }
+              return execution;
+            });
+          });
+          return updated;
+        });
+        
+        toast({
+          title: response.data.is_favorited ? "Added to Favorites" : "Removed from Favorites",
+          description: response.data.is_favorited 
+            ? "Image has been added to your favorites." 
+            : "Image has been removed from your favorites.",
+        });
+      }
+    } catch (error: any) {
+      console.error('Error toggling favorite status:', error);
+      toast({
+        title: "Error",
+        description: error.response?.data?.message || "Failed to update favorite status.",
+        variant: "destructive",
+      });
     }
   };
 
@@ -412,15 +471,30 @@ const ImagesPage: React.FC = () => {
                             <p className="text-xs text-gray-500 dark:text-gray-400 truncate">
                               Started: {formatDate(execution.startTime)}
                             </p>
-                            <div className="flex items-center gap-2 mt-1">
+                            <div className="flex items-center gap-1 mt-2">
                               <Button
-                                variant="outline"
+                                variant="ghost"
                                 size="sm"
-                                className="h-6 px-2 text-xs"
-                                onClick={() => window.open(file.url, '_blank')}
+                                className="h-8 w-8 p-0 hover:bg-gray-100 dark:hover:bg-gray-800"
+                                onClick={() => handleViewImage(file.url)}
+                                title="View Image"
                               >
-                                <ExternalLink className="h-3 w-3 mr-1" />
-                                View Image
+                                <Download className="h-4 w-4" />
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-8 w-8 p-0 hover:bg-gray-100 dark:hover:bg-gray-800"
+                                onClick={() => handleFavoriteImage(execution.executionId, file.url)}
+                                title={file.is_favorited ? "Remove from Favorites" : "Add to Favorites"}
+                              >
+                                <Heart 
+                                  className={`h-4 w-4 ${
+                                    file.is_favorited 
+                                      ? 'fill-red-500 text-red-500' 
+                                      : 'text-gray-400 hover:text-red-500'
+                                  }`} 
+                                />
                               </Button>
                             </div>
                           </div>

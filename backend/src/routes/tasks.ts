@@ -59,6 +59,7 @@ interface ResultFile {
   filename: string;
   token: string;
   is_html?: boolean;
+  is_favorited?: boolean;
 }
 
 // Public routes (no authentication required)
@@ -962,6 +963,62 @@ router.get('/executions/with-images', authenticateToken, async (req: Request, re
     res.json(result);
   } catch (error) {
     console.error('Error getting executions with images:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Toggle favorite status for an image in a task execution
+router.post('/executions/:executionId/favorite-image', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { executionId } = req.params;
+    const { imageUrl } = req.body;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!executionId || !imageUrl) {
+      return res.status(400).json({ message: 'Execution ID and image URL are required' });
+    }
+
+    // Get the execution to verify ownership and get current result_files
+    const execution = await taskDb.getTaskExecutionById(executionId);
+    if (!execution) {
+      return res.status(404).json({ message: 'Execution not found' });
+    }
+
+    // Verify the user owns this execution
+    if (execution.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+      return res.status(403).json({ message: 'Not authorized to modify this execution' });
+    }
+
+    // Find the image in result_files and toggle its favorite status
+    const updatedResultFiles = execution.result_files?.map((file: ResultFile) => {
+      if (file.url === imageUrl) {
+        return {
+          ...file,
+          is_favorited: !file.is_favorited
+        };
+      }
+      return file;
+    }) || [];
+
+    // Update the execution with the modified result_files
+    await taskDb.updateTaskExecution(executionId, {
+      result_files: updatedResultFiles
+    });
+
+    // Find the updated file to return its new favorite status
+    const updatedFile = updatedResultFiles.find((file: ResultFile) => file.url === imageUrl);
+    
+    res.json({ 
+      success: true, 
+      is_favorited: updatedFile?.is_favorited || false 
+    });
+
+  } catch (error) {
+    console.error('Error toggling image favorite status:', error);
     res.status(500).json({ message: 'Internal server error' });
   }
 });

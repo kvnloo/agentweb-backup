@@ -794,6 +794,13 @@ export const taskDb = {
       userInteractions: UserInteraction[];
       shareToken: string;
       knowledge_base_updated_at: string;
+      result_files: Array<{
+        url: string;
+        filename: string;
+        token: string;
+        is_html?: boolean;
+        is_favorited?: boolean;
+      }>;
     }>
   ) {
     try {
