@@ -8,6 +8,9 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Textarea } from '@/components/ui/textarea';
+import { Label } from '@/components/ui/label';
 import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink, Clock, ArrowUpRight, Play, Zap, Download, Heart } from 'lucide-react';
 import { format } from 'date-fns';
 import { useNavigate } from 'react-router-dom';
@@ -52,6 +55,9 @@ const ImagesPage: React.FC = () => {
   const [searchTerm, setSearchTerm] = useState('');
   const [sortBy, setSortBy] = useState<string>('latestExecution');
   const [executingTasks, setExecutingTasks] = useState<Set<string>>(new Set());
+  const [feedbackDialogOpen, setFeedbackDialogOpen] = useState(false);
+  const [feedbackText, setFeedbackText] = useState('');
+  const [pendingTaskId, setPendingTaskId] = useState<string | null>(null);
   const refreshIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   const fetchExecutionsWithImages = async () => {
@@ -120,7 +126,14 @@ const ImagesPage: React.FC = () => {
   }, [tasksWithExecutions]);
 
   const handleGenerateMore = async (taskId: string) => {
-    if (!token) {
+    // Open feedback dialog first
+    setPendingTaskId(taskId);
+    setFeedbackText('');
+    setFeedbackDialogOpen(true);
+  };
+
+  const handleSubmitFeedback = async () => {
+    if (!pendingTaskId || !token) {
       toast({
         title: "Error",
         description: "Authentication token not found. Please log in.",
@@ -129,12 +142,15 @@ const ImagesPage: React.FC = () => {
       return;
     }
 
-    setExecutingTasks(prev => new Set(prev).add(taskId));
+    setExecutingTasks(prev => new Set(prev).add(pendingTaskId));
+    setFeedbackDialogOpen(false);
     
     try {
       await axios.post(
-        buildApiUrl(`/api/tasks/${taskId}/execute`),
-        {},
+        buildApiUrl(`/api/tasks/${pendingTaskId}/execute`),
+        { 
+          feedback: feedbackText.trim() || undefined 
+        },
         {
           headers: { Authorization: `Bearer ${token}` },
         }
@@ -142,7 +158,7 @@ const ImagesPage: React.FC = () => {
       
       toast({ 
         title: "Success", 
-        description: "Task execution started. New images will appear shortly." 
+        description: "Task execution started with your feedback. New images will appear shortly." 
       });
       
       // Refresh the data after a short delay to show the new execution
@@ -160,10 +176,18 @@ const ImagesPage: React.FC = () => {
     } finally {
       setExecutingTasks(prev => {
         const newSet = new Set(prev);
-        newSet.delete(taskId);
+        newSet.delete(pendingTaskId);
         return newSet;
       });
+      setPendingTaskId(null);
+      setFeedbackText('');
     }
+  };
+
+  const handleCancelFeedback = () => {
+    setFeedbackDialogOpen(false);
+    setPendingTaskId(null);
+    setFeedbackText('');
   };
 
   const formatDate = (dateString: string | undefined) => {
@@ -508,6 +532,38 @@ const ImagesPage: React.FC = () => {
           })}
         </div>
       )}
+
+      {/* Feedback Dialog */}
+      <Dialog open={feedbackDialogOpen} onOpenChange={setFeedbackDialogOpen}>
+        <DialogContent className="sm:max-w-[500px]">
+          <DialogHeader>
+            <DialogTitle>Provide Feedback for Better Images</DialogTitle>
+            <DialogDescription>
+              Share your thoughts on how to improve the generated images. Your feedback will be used to enhance the AI's understanding and generate better results.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="feedback">Feedback (Optional)</Label>
+              <Textarea
+                id="feedback"
+                placeholder="e.g., Make the images more vibrant, use different angles, add more details, change the style to be more realistic..."
+                value={feedbackText}
+                onChange={(e) => setFeedbackText(e.target.value)}
+                className="min-h-[120px]"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={handleCancelFeedback}>
+              Cancel
+            </Button>
+            <Button onClick={handleSubmitFeedback}>
+              Generate with Feedback
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 };

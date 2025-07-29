@@ -403,6 +403,7 @@ export const executeTask = async (req: AuthRequest, res: Response) => {
     }
 
     const taskId = req.params.id;
+    const { feedback } = req.body;
     const task = await taskDb.getTaskById(taskId);
 
     if (!task) {
@@ -427,7 +428,8 @@ export const executeTask = async (req: AuthRequest, res: Response) => {
       userId: task.userId, // Use the task owner's ID for execution
       run_user_id: userId !== task.userId ? userId : undefined, // Record who actually ran the task if different from owner
       status: 'pending',
-      startTime: new Date().toISOString()
+      startTime: new Date().toISOString(),
+      feedback: feedback || undefined // Store feedback if provided
     };
 
     await taskDb.createTaskExecution(execution);

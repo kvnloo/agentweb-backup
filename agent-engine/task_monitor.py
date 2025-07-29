@@ -788,6 +788,14 @@ async def execute_task(execution):
             # Prepare the prompt with previous feedback and user_id context
             base_prompt = execution.get('prompt') or task['prompt']
             
+            # Add user feedback if provided
+            user_feedback = execution.get('feedback')
+            if user_feedback:
+                base_prompt = f"{base_prompt}\n\nUser Feedback for Improvement: {user_feedback}"
+                logger.info(f"Added user feedback to task {task_id} execution {execution_id}: {user_feedback}")
+            else:
+                logger.info(f"No user feedback provided for task {task_id} execution {execution_id}")
+            
             if previous_feedback:
                 prompt = f"Task: {base_prompt}\n\nNote: Previous attempt {previous_feedback['time_ago']} was {previous_feedback['feedback']}. Previous result: {previous_feedback['result']}"
             else:
@@ -825,6 +833,14 @@ async def execute_task(execution):
             prompt = execution.get('prompt')
             if not prompt:
                 raise Exception(f"No prompt found for task {task_id}")
+            
+            # Add user feedback if provided for workflow tasks
+            user_feedback = execution.get('feedback')
+            if user_feedback:
+                prompt = f"{prompt}\n\nUser Feedback for Improvement: {user_feedback}"
+                logger.info(f"Added user feedback to workflow task {task_id} execution {execution_id}: {user_feedback}")
+            else:
+                logger.info(f"No user feedback provided for workflow task {task_id} execution {execution_id}")
             
             # Update execution status to running
             update_execution_status(execution_id, 'running')

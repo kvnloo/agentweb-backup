@@ -753,6 +753,7 @@ export const taskDb = {
     startTime: string;
     workflowExecutionId?: string;
     prompt?: string;
+    feedback?: string;
   }) {
     try {
       const params = {
