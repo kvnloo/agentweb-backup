@@ -19,6 +19,7 @@ import GuidePage from "@/pages/GuidePage.tsx";
 import ExecutionResultPage from "@/pages/ExecutionResultPage.tsx";
 import ChangelogPage from "@/pages/ChangelogPage.tsx";
 import BrandGuidelines from "@/pages/BrandGuidelines.tsx";
+import MarketStrategy from "@/pages/MarketStrategy.tsx";
 import ImagesPage from "@/pages/Images.tsx";
 
 const queryClient = new QueryClient();
@@ -64,6 +65,16 @@ const App = () => (
                   <ProtectedRoute>
                     <Layout>
                       <BrandGuidelines />
+                    </Layout>
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/market-strategy"
+                element={
+                  <ProtectedRoute>
+                    <Layout>
+                      <MarketStrategy />
                     </Layout>
                   </ProtectedRoute>
                 }

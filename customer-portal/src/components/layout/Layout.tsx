@@ -18,6 +18,7 @@ import {
   Lightbulb,
   Palette,
   Image,
+  TrendingUp,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -130,6 +131,12 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
           path: "/brand-guidelines",
           id: "brand-guidelines",
         },
+        {
+          icon: TrendingUp,
+          label: "Market Strategy",
+          path: "/market-strategy",
+          id: "market-strategy",
+        },
       ],
     },
     {
@@ -138,7 +145,7 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
       items: [
         {
           icon: Image,
-          label: "Images",
+          label: "Ad Images",
           path: "/images",
           id: "images",
         },
