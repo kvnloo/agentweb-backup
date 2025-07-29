@@ -19,6 +19,7 @@ import GuidePage from "@/pages/GuidePage.tsx";
 import ExecutionResultPage from "@/pages/ExecutionResultPage.tsx";
 import ChangelogPage from "@/pages/ChangelogPage.tsx";
 import BrandGuidelines from "@/pages/BrandGuidelines.tsx";
+import ImagesPage from "@/pages/Images.tsx";
 
 const queryClient = new QueryClient();
 
@@ -113,6 +114,16 @@ const App = () => (
                   <ProtectedRoute>
                     <Layout>
                       <ChangelogPage />
+                    </Layout>
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/images"
+                element={
+                  <ProtectedRoute>
+                    <Layout>
+                      <ImagesPage />
                     </Layout>
                   </ProtectedRoute>
                 }

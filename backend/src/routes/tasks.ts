@@ -10,6 +10,7 @@ import { emailService } from '../services/emailService';
 import { Storage, Bucket } from '@google-cloud/storage';
 import OpenAI from 'openai';
 import axios from 'axios';
+import AWS from 'aws-sdk';
 import { dynamodb } from '../config/aws';
 import { TABLE_PREFIX } from '../config/constants';
 
@@ -58,6 +59,7 @@ interface ResultFile {
   filename: string;
   token: string;
   is_html?: boolean;
+  is_favorited?: boolean;
 }
 
 // Public routes (no authentication required)
@@ -855,6 +857,169 @@ router.put("/:taskId/lead-list", authenticateToken, async (req: AuthRequest, res
   } catch (error) {
     console.error('Error in updateLeadList:', error);
     res.status(500).json({ message: 'Error updating lead list' });
+  }
+});
+
+// Get all executions with images for the current user
+router.get('/executions/with-images', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Get all task executions for the user
+    const allExecutions = await taskDb.getAllTaskExecutionsByUserId(userId) || [];
+    
+    // Filter executions that have result_files with image URLs
+    const executionsWithImages = allExecutions.filter((execution: any) => {
+      if (!execution.result_files || execution.result_files.length === 0) {
+        return false;
+      }
+      
+      // Check if any result file is an image
+      return execution.result_files.some((file: ResultFile) => {
+        const filename = file.filename.toLowerCase();
+        return filename.endsWith('.jpg') || 
+               filename.endsWith('.jpeg') || 
+               filename.endsWith('.png') || 
+               filename.endsWith('.gif') || 
+               filename.endsWith('.webp') || 
+               filename.endsWith('.svg');
+      });
+    });
+
+    // Get all tasks for the user to match with executions
+    const allTasks = await taskDb.getTasksByUserId(userId);
+    const taskMap = new Map(allTasks?.map((task: any) => [task.taskId, task]) || []);
+
+        // Group executions by taskId
+    const result: Record<string, any> = {};
+    
+    executionsWithImages.forEach((execution: any) => {
+      const task = taskMap.get(execution.taskId);
+      const taskId = execution.taskId;
+      
+      if (!result[taskId]) {
+        result[taskId] = {
+          taskId: taskId,
+          taskName: task?.name || 'Unknown Task',
+          createdAt: task?.createdAt || null,
+          executions: []
+        };
+      }
+      
+      result[taskId].executions.push({
+        executionId: execution.executionId,
+        startTime: execution.startTime || null,
+        result_files: execution.result_files?.filter((file: ResultFile) => {
+          const filename = file.filename.toLowerCase();
+          return filename.endsWith('.jpg') || 
+                 filename.endsWith('.jpeg') || 
+                 filename.endsWith('.png') || 
+                 filename.endsWith('.gif') || 
+                 filename.endsWith('.webp') || 
+                 filename.endsWith('.svg');
+        }) || []
+      });
+    });
+
+    // Calculate latest execution time and find latest pending/running execution for each task
+    Object.keys(result).forEach(taskId => {
+      const task = result[taskId];
+      const executionTimes = task.executions
+        .map((execution: any) => execution.startTime)
+        .filter((time: string) => time !== null);
+      
+      if (executionTimes.length > 0) {
+        task.latestExecutionTime = executionTimes.sort().pop(); // Get the latest time
+      } else {
+        task.latestExecutionTime = null;
+      }
+
+      // Find the most recent pending or running execution for this task
+      const allTaskExecutions = allExecutions.filter((execution: any) => execution.taskId === taskId);
+      const pendingOrRunningExecutions = allTaskExecutions.filter((execution: any) => 
+        execution.status === 'pending' || execution.status === 'running'
+      );
+      
+      if (pendingOrRunningExecutions.length > 0) {
+        // Sort by startTime and get the most recent one
+        const latestPendingOrRunning = pendingOrRunningExecutions.sort((a: any, b: any) => 
+          new Date(b.startTime || 0).getTime() - new Date(a.startTime || 0).getTime()
+        )[0];
+        
+        task.latestPendingOrRunningExecution = {
+          executionId: latestPendingOrRunning.executionId,
+          status: latestPendingOrRunning.status,
+          startTime: latestPendingOrRunning.startTime || null
+        };
+      } else {
+        task.latestPendingOrRunningExecution = null;
+      }
+    });
+
+    res.json(result);
+  } catch (error) {
+    console.error('Error getting executions with images:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Toggle favorite status for an image in a task execution
+router.post('/executions/:executionId/favorite-image', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { executionId } = req.params;
+    const { imageUrl } = req.body;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!executionId || !imageUrl) {
+      return res.status(400).json({ message: 'Execution ID and image URL are required' });
+    }
+
+    // Get the execution to verify ownership and get current result_files
+    const execution = await taskDb.getTaskExecutionById(executionId);
+    if (!execution) {
+      return res.status(404).json({ message: 'Execution not found' });
+    }
+
+    // Verify the user owns this execution
+    if (execution.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+      return res.status(403).json({ message: 'Not authorized to modify this execution' });
+    }
+
+    // Find the image in result_files and toggle its favorite status
+    const updatedResultFiles = execution.result_files?.map((file: ResultFile) => {
+      if (file.url === imageUrl) {
+        return {
+          ...file,
+          is_favorited: !file.is_favorited
+        };
+      }
+      return file;
+    }) || [];
+
+    // Update the execution with the modified result_files
+    await taskDb.updateTaskExecution(executionId, {
+      result_files: updatedResultFiles
+    });
+
+    // Find the updated file to return its new favorite status
+    const updatedFile = updatedResultFiles.find((file: ResultFile) => file.url === imageUrl);
+    
+    res.json({ 
+      success: true, 
+      is_favorited: updatedFile?.is_favorited || false 
+    });
+
+  } catch (error) {
+    console.error('Error toggling image favorite status:', error);
+    res.status(500).json({ message: 'Internal server error' });
   }
 });
 

@@ -753,6 +753,7 @@ export const taskDb = {
     startTime: string;
     workflowExecutionId?: string;
     prompt?: string;
+    feedback?: string;
   }) {
     try {
       const params = {
@@ -794,6 +795,13 @@ export const taskDb = {
       userInteractions: UserInteraction[];
       shareToken: string;
       knowledge_base_updated_at: string;
+      result_files: Array<{
+        url: string;
+        filename: string;
+        token: string;
+        is_html?: boolean;
+        is_favorited?: boolean;
+      }>;
     }>
   ) {
     try {
@@ -869,6 +877,25 @@ export const taskDb = {
       return result.Items || [];
     } catch (error) {
       handleDynamoDbError(error, "getTaskExecutions");
+    }
+  },
+
+  async getAllTaskExecutionsByUserId(userId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
+        IndexName: "UserIdIndex",
+        KeyConditionExpression: "userId = :userId",
+        ExpressionAttributeValues: {
+          ":userId": userId,
+        },
+        ScanIndexForward: false, // Get latest executions first
+      };
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, "getAllTaskExecutionsByUserId");
     }
   },
 

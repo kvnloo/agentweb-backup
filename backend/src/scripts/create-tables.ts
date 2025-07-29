@@ -123,6 +123,7 @@ const createTaskExecutionsTable = async () => {
     AttributeDefinitions: [
       { AttributeName: 'executionId', AttributeType: 'S' },
       { AttributeName: 'taskId', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' },
       { AttributeName: 'startTime', AttributeType: 'S' },
       { AttributeName: 'status', AttributeType: 'S' },
       { AttributeName: 'feedback', AttributeType: 'S' }
@@ -135,6 +136,16 @@ const createTaskExecutionsTable = async () => {
         IndexName: 'TaskIdIndex',
         KeySchema: [
           { AttributeName: 'taskId', KeyType: 'HASH' },
+          { AttributeName: 'startTime', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      },
+      {
+        IndexName: 'UserIdIndex',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' },
           { AttributeName: 'startTime', KeyType: 'RANGE' }
         ],
         Projection: {

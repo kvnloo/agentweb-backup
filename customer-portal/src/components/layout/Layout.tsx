@@ -17,6 +17,7 @@ import {
   Search,
   Lightbulb,
   Palette,
+  Image,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -64,6 +65,7 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
     overview: true,
     templates: true,
     brand: true,
+    creatives: true,
     activities: true,
     documents: true,
     account: true,
@@ -127,6 +129,18 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
           label: "Brand Guidelines",
           path: "/brand-guidelines",
           id: "brand-guidelines",
+        },
+      ],
+    },
+    {
+      key: "creatives",
+      title: "CREATIVES",
+      items: [
+        {
+          icon: Image,
+          label: "Images",
+          path: "/images",
+          id: "images",
         },
       ],
     },
