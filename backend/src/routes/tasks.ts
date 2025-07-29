@@ -893,7 +893,7 @@ router.get('/executions/with-images', authenticateToken, async (req: Request, re
     const allTasks = await taskDb.getTasksByUserId(userId);
     const taskMap = new Map(allTasks?.map((task: any) => [task.taskId, task]) || []);
 
-    // Group executions by taskId
+        // Group executions by taskId
     const result: Record<string, any> = {};
     
     executionsWithImages.forEach((execution: any) => {
@@ -901,12 +901,12 @@ router.get('/executions/with-images', authenticateToken, async (req: Request, re
       const taskId = execution.taskId;
       
       if (!result[taskId]) {
-              result[taskId] = {
-        taskId: taskId,
-        taskName: task?.name || 'Unknown Task',
-        createdAt: task?.createdAt || null,
-        executions: []
-      };
+        result[taskId] = {
+          taskId: taskId,
+          taskName: task?.name || 'Unknown Task',
+          createdAt: task?.createdAt || null,
+          executions: []
+        };
       }
       
       result[taskId].executions.push({
@@ -922,6 +922,20 @@ router.get('/executions/with-images', authenticateToken, async (req: Request, re
                  filename.endsWith('.svg');
         }) || []
       });
+    });
+
+    // Calculate latest execution time for each task
+    Object.keys(result).forEach(taskId => {
+      const task = result[taskId];
+      const executionTimes = task.executions
+        .map((execution: any) => execution.startTime)
+        .filter((time: string) => time !== null);
+      
+      if (executionTimes.length > 0) {
+        task.latestExecutionTime = executionTimes.sort().pop(); // Get the latest time
+      } else {
+        task.latestExecutionTime = null;
+      }
     });
 
     res.json(result);

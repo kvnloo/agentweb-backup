@@ -28,6 +28,7 @@ interface TaskWithExecutions {
   taskId: string;
   taskName: string;
   createdAt?: string;
+  latestExecutionTime?: string;
   executions: ExecutionWithImages[];
 }
 
@@ -37,7 +38,7 @@ const ImagesPage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
-  const [sortBy, setSortBy] = useState<string>('name');
+  const [sortBy, setSortBy] = useState<string>('latestExecution');
 
   useEffect(() => {
     fetchExecutionsWithImages();
@@ -88,6 +89,8 @@ const ImagesPage: React.FC = () => {
           return a.taskId.localeCompare(b.taskId);
         case 'createdAt':
           return (a.createdAt || '').localeCompare(b.createdAt || '');
+        case 'latestExecution':
+          return (b.latestExecutionTime || '').localeCompare(a.latestExecutionTime || ''); // Latest first
         default:
           return 0;
       }
@@ -154,6 +157,7 @@ const ImagesPage: React.FC = () => {
             <SelectValue placeholder="Sort by" />
           </SelectTrigger>
           <SelectContent>
+            <SelectItem value="latestExecution">Latest Execution</SelectItem>
             <SelectItem value="name">Task Name</SelectItem>
             <SelectItem value="taskId">Task ID</SelectItem>
             <SelectItem value="createdAt">Task Created</SelectItem>
@@ -196,6 +200,10 @@ const ImagesPage: React.FC = () => {
                     <div className="flex items-center gap-2 mt-2 text-sm text-gray-500 dark:text-gray-400">
                       <Clock className="h-4 w-4" />
                       <span>Task created: {formatDate(task.createdAt)}</span>
+                    </div>
+                    <div className="flex items-center gap-2 mt-1 text-sm text-gray-500 dark:text-gray-400">
+                      <Calendar className="h-4 w-4" />
+                      <span>Latest execution: {formatDate(task.latestExecutionTime)}</span>
                     </div>
                   </div>
                 </div>
