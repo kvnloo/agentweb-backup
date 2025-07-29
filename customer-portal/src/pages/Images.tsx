@@ -11,7 +11,8 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
-import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink, Clock, ArrowUpRight, Play, Zap, Download, Heart } from 'lucide-react';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink, Clock, ArrowUpRight, Play, Zap, Download, Heart, Plus } from 'lucide-react';
 import { format } from 'date-fns';
 import { useNavigate } from 'react-router-dom';
 import { useToast } from '@/hooks/use-toast';
@@ -45,6 +46,31 @@ interface TaskWithExecutions {
   executions: ExecutionWithImages[];
 }
 
+interface ICP {
+  id: string;
+  title: string;
+  description: string;
+  valueProposition: string;
+}
+
+interface MarketStrategyData {
+  businessOverview: string;
+  icp: ICP[];
+}
+
+interface BrandData {
+  brandName: string;
+  tagline: string;
+  primaryColor: string;
+  secondaryColor: string;
+  fontFamily: string;
+  toneOfVoice: string;
+  keyMessages: string[];
+  brandValues: string[];
+  targetAudience: string;
+  brandPersonality: string;
+}
+
 const ImagesPage: React.FC = () => {
   const { token } = useAuth();
   const navigate = useNavigate();
@@ -59,6 +85,18 @@ const ImagesPage: React.FC = () => {
   const [feedbackText, setFeedbackText] = useState('');
   const [pendingTaskId, setPendingTaskId] = useState<string | null>(null);
   const refreshIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Ad Image task creation state
+  const [createTaskDialogOpen, setCreateTaskDialogOpen] = useState(false);
+  const [isCreatingTask, setIsCreatingTask] = useState(false);
+  const [brandData, setBrandData] = useState<BrandData | null>(null);
+  const [marketStrategyData, setMarketStrategyData] = useState<MarketStrategyData | null>(null);
+  const [selectedOptions, setSelectedOptions] = useState({
+    brandGuidelines: true,
+    businessOverview: true,
+    icp: [] as string[]
+  });
+  const [additionalPrompt, setAdditionalPrompt] = useState('');
 
   const fetchExecutionsWithImages = async () => {
     try {
@@ -302,6 +340,159 @@ const ImagesPage: React.FC = () => {
 
   const hasActiveExecutionsInView = allTasks.some(task => task.latestPendingOrRunningExecution !== null);
 
+  // Load brand guidelines and market strategy data
+  const loadTaskCreationData = async () => {
+    try {
+      // Load brand guidelines
+      const brandResponse = await axios.get(buildApiUrl('/api/brand/guidelines'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      
+      if (brandResponse.data.exists) {
+        setBrandData(brandResponse.data.brandData);
+      }
+
+      // Load market strategy
+      const marketResponse = await axios.get(buildApiUrl('/api/market-strategy'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      
+      if (marketResponse.data.success) {
+        setMarketStrategyData(marketResponse.data.data);
+      }
+    } catch (error) {
+      console.error('Error loading task creation data:', error);
+    }
+  };
+
+  const handleCreateAdImageTask = async () => {
+    if (!token) {
+      toast({
+        title: "Error",
+        description: "Authentication token not found. Please log in.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    setIsCreatingTask(true);
+    
+    try {
+      // Build the prompt based on selected options
+      let prompt = "Create ad images for my business. ";
+      
+      if (selectedOptions.brandGuidelines && brandData) {
+        prompt += `\n\nBrand Guidelines:\n- Brand Name: ${brandData.brandName}\n- Tagline: ${brandData.tagline}\n- Primary Color: ${brandData.primaryColor}\n- Secondary Color: ${brandData.secondaryColor}\n- Font Family: ${brandData.fontFamily}\n- Tone of Voice: ${brandData.toneOfVoice}\n- Key Messages: ${brandData.keyMessages.join(', ')}\n- Brand Values: ${brandData.brandValues.join(', ')}\n- Target Audience: ${brandData.targetAudience}\n- Brand Personality: ${brandData.brandPersonality}`;
+      }
+      
+      if (selectedOptions.businessOverview && marketStrategyData?.businessOverview) {
+        prompt += `\n\nBusiness Overview:\n${marketStrategyData.businessOverview}`;
+      }
+      
+      // Handle ICP selection
+      if (selectedOptions.icp.length > 0 && marketStrategyData?.icp) {
+        const selectedICPs = marketStrategyData.icp.filter(icp => selectedOptions.icp.includes(icp.id));
+        if (selectedICPs.length > 0) {
+          prompt += `\n\nIdeal Customer Profiles:\n${selectedICPs.map(icp => `- ${icp.title}: ${icp.description} (Value Proposition: ${icp.valueProposition})`).join('\n')}`;
+        }
+      } else {
+        // General audience if no ICP selected
+        prompt += `\n\nTarget Audience: General audience`;
+      }
+      
+      prompt += `\n\nPlease create high-quality ad images that align with the above brand guidelines and target the specified audience. The images should be professional, engaging, and suitable for various marketing channels.`;
+      
+      // Add additional prompt if provided
+      if (additionalPrompt.trim()) {
+        prompt += `\n\nAdditional Instructions:\n${additionalPrompt.trim()}`;
+      }
+
+      // Create tasks based on ICP selection
+      const tasksToCreate = [];
+      
+      if (selectedOptions.icp.length > 0 && marketStrategyData?.icp) {
+        // Create a task for each selected ICP
+        const selectedICPs = marketStrategyData.icp.filter(icp => selectedOptions.icp.includes(icp.id));
+        for (const icp of selectedICPs) {
+          const icpPrompt = prompt.replace(
+            /Target Audience: General audience/,
+            `Target Audience: ${icp.title} - ${icp.description} (Value Proposition: ${icp.valueProposition})`
+          );
+          
+          tasksToCreate.push({
+            name: `Ad Images - ${icp.title}`,
+            prompt: icpPrompt,
+            category: 'Creatives',
+            description: `Ad image generation targeting ${icp.title} audience`
+          });
+        }
+      } else {
+        // Create a single task for general audience
+        tasksToCreate.push({
+          name: 'Ad Images - General Audience',
+          prompt: prompt,
+          category: 'Creatives',
+          description: 'Ad image generation for general audience'
+        });
+      }
+
+      // Create all tasks
+      const createdTasks = [];
+      for (const taskData of tasksToCreate) {
+        const response = await axios.post(
+          buildApiUrl('/api/tasks'),
+          taskData,
+          {
+            headers: { Authorization: `Bearer ${token}` },
+          }
+        );
+        createdTasks.push(response.data);
+      }
+
+      toast({
+        title: "Tasks Created Successfully",
+        description: `Created ${createdTasks.length} ad image generation task${createdTasks.length > 1 ? 's' : ''}. You will be redirected to the Tasks page.`,
+      });
+
+      setCreateTaskDialogOpen(false);
+      setSelectedOptions({
+        brandGuidelines: true,
+        businessOverview: true,
+        icp: []
+      });
+      setAdditionalPrompt('');
+      
+      // Navigate to tasks page
+      navigate('/tasks');
+      
+    } catch (err: any) {
+      console.error('Failed to create ad image tasks:', err);
+      toast({
+        title: "Error Creating Tasks",
+        description: err.response?.data?.message || "Could not create ad image tasks.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsCreatingTask(false);
+    }
+  };
+
+  const handleICPToggle = (icpId: string) => {
+    setSelectedOptions(prev => ({
+      ...prev,
+      icp: prev.icp.includes(icpId)
+        ? prev.icp.filter(id => id !== icpId)
+        : [...prev.icp, icpId]
+    }));
+  };
+
+  // Load data when create dialog opens
+  useEffect(() => {
+    if (createTaskDialogOpen && token) {
+      loadTaskCreationData();
+    }
+  }, [createTaskDialogOpen, token]);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
@@ -336,9 +527,9 @@ const ImagesPage: React.FC = () => {
             )}
           </p>
         </div>
-        <Button onClick={fetchExecutionsWithImages} variant="outline">
-          <ImageIcon className="h-4 w-4 mr-2" />
-          Refresh
+        <Button onClick={() => setCreateTaskDialogOpen(true)} className="bg-blue-600 hover:bg-blue-700 text-white font-medium px-6 py-2">
+          <Plus className="h-4 w-4 mr-2" />
+          Create Ad Images
         </Button>
       </div>
 
@@ -560,6 +751,135 @@ const ImagesPage: React.FC = () => {
             </Button>
             <Button onClick={handleSubmitFeedback}>
               Generate with Feedback
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Ad Image Task Creation Dialog */}
+      <Dialog open={createTaskDialogOpen} onOpenChange={setCreateTaskDialogOpen}>
+        <DialogContent className="sm:max-w-[600px] max-h-[80vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Create Ad Image Task</DialogTitle>
+            <DialogDescription>
+              Configure your ad image generation task by selecting the information to include in the prompt.
+            </DialogDescription>
+          </DialogHeader>
+          
+          <div className="space-y-6 py-4">
+            {/* Brand Guidelines */}
+            <div className="space-y-3">
+              <div className="flex items-center space-x-2">
+                <Checkbox
+                  id="brandGuidelines"
+                  checked={selectedOptions.brandGuidelines}
+                  onCheckedChange={(checked) => 
+                    setSelectedOptions(prev => ({ ...prev, brandGuidelines: checked as boolean }))
+                  }
+                />
+                <Label htmlFor="brandGuidelines" className="text-sm font-medium">
+                  Brand Guidelines
+                </Label>
+              </div>
+              {selectedOptions.brandGuidelines && brandData && (
+                <div className="ml-6 p-3 bg-gray-50 dark:bg-gray-800 rounded-md text-sm">
+                  <p><strong>Brand:</strong> {brandData.brandName}</p>
+                  <p><strong>Tagline:</strong> {brandData.tagline}</p>
+                  <p><strong>Colors:</strong> {brandData.primaryColor}, {brandData.secondaryColor}</p>
+                </div>
+              )}
+            </div>
+
+            {/* Market Strategy */}
+            <div className="space-y-3">
+              <h3 className="text-sm font-medium">Market Strategy</h3>
+              
+              {/* Business Overview */}
+              <div className="space-y-2">
+                <div className="flex items-center space-x-2">
+                  <Checkbox
+                    id="businessOverview"
+                    checked={selectedOptions.businessOverview}
+                    onCheckedChange={(checked) => 
+                      setSelectedOptions(prev => ({ ...prev, businessOverview: checked as boolean }))
+                    }
+                  />
+                  <Label htmlFor="businessOverview" className="text-sm">
+                    Business Overview
+                  </Label>
+                </div>
+                {selectedOptions.businessOverview && marketStrategyData?.businessOverview && (
+                  <div className="ml-6 p-3 bg-gray-50 dark:bg-gray-800 rounded-md text-sm">
+                    <p>{marketStrategyData.businessOverview.substring(0, 200)}...</p>
+                  </div>
+                )}
+              </div>
+
+              {/* ICP Selection */}
+              <div className="space-y-2">
+                <Label className="text-sm">Ideal Customer Profiles (ICP)</Label>
+                <p className="text-xs text-gray-500 dark:text-gray-400">
+                  Select specific ICPs to target, or leave unselected for general audience
+                </p>
+                {marketStrategyData?.icp && marketStrategyData.icp.length > 0 ? (
+                  <div className="ml-6 space-y-2">
+                    {marketStrategyData.icp.map((icp) => (
+                      <div key={icp.id} className="flex items-center space-x-2">
+                        <Checkbox
+                          id={`icp-${icp.id}`}
+                          checked={selectedOptions.icp.includes(icp.id)}
+                          onCheckedChange={() => handleICPToggle(icp.id)}
+                        />
+                        <Label htmlFor={`icp-${icp.id}`} className="text-sm">
+                          {icp.title}
+                        </Label>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="ml-6 p-3 bg-gray-50 dark:bg-gray-800 rounded-md text-sm">
+                    <p className="text-gray-500 dark:text-gray-400">
+                      No ICPs defined. Task will target general audience.
+                    </p>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Image Prompt */}
+            <div className="space-y-3">
+              <Label htmlFor="additionalPrompt" className="text-sm font-medium">
+                Image Prompt (Optional)
+              </Label>
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                Describe what images you want to generate. Include specific details about style, composition, or reference image URLs.
+              </p>
+              <Textarea
+                id="additionalPrompt"
+                placeholder="e.g., Create minimalist product shots with warm lighting, or include reference image: https://example.com/reference-image.jpg"
+                value={additionalPrompt}
+                onChange={(e) => setAdditionalPrompt(e.target.value)}
+                className="min-h-[100px]"
+              />
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setCreateTaskDialogOpen(false)}>
+              Cancel
+            </Button>
+            <Button 
+              onClick={handleCreateAdImageTask}
+              disabled={isCreatingTask}
+            >
+              {isCreatingTask ? (
+                <>
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Creating...
+                </>
+              ) : (
+                'Create Task'
+              )}
             </Button>
           </DialogFooter>
         </DialogContent>
