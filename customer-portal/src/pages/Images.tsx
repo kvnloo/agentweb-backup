@@ -71,6 +71,13 @@ interface BrandData {
   brandPersonality: string;
 }
 
+interface BrandAsset {
+  type: string;
+  url: string;
+  key: string;
+  filename: string;
+}
+
 const ImagesPage: React.FC = () => {
   const { token } = useAuth();
   const navigate = useNavigate();
@@ -90,6 +97,7 @@ const ImagesPage: React.FC = () => {
   const [createTaskDialogOpen, setCreateTaskDialogOpen] = useState(false);
   const [isCreatingTask, setIsCreatingTask] = useState(false);
   const [brandData, setBrandData] = useState<BrandData | null>(null);
+  const [brandAssets, setBrandAssets] = useState<BrandAsset[]>([]);
   const [marketStrategyData, setMarketStrategyData] = useState<MarketStrategyData | null>(null);
   const [selectedOptions, setSelectedOptions] = useState({
     brandGuidelines: true,
@@ -97,6 +105,7 @@ const ImagesPage: React.FC = () => {
     icp: [] as string[]
   });
   const [additionalPrompt, setAdditionalPrompt] = useState('');
+  const [taskName, setTaskName] = useState('');
 
   const fetchExecutionsWithImages = async () => {
     try {
@@ -350,6 +359,7 @@ const ImagesPage: React.FC = () => {
       
       if (brandResponse.data.exists) {
         setBrandData(brandResponse.data.brandData);
+        setBrandAssets(brandResponse.data.attachments || []);
       }
 
       // Load market strategy
@@ -375,37 +385,82 @@ const ImagesPage: React.FC = () => {
       return;
     }
 
+    // Validate required fields
+    if (!taskName.trim()) {
+      toast({
+        title: "Error",
+        description: "Task name is required.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    if (!additionalPrompt.trim()) {
+      toast({
+        title: "Error",
+        description: "Image Prompt is required. Please describe what images you want to generate.",
+        variant: "destructive",
+      });
+      return;
+    }
+
     setIsCreatingTask(true);
     
-    try {
-      // Build the prompt based on selected options
-      let prompt = "Create ad images for my business. ";
-      
-      if (selectedOptions.brandGuidelines && brandData) {
-        prompt += `\n\nBrand Guidelines:\n- Brand Name: ${brandData.brandName}\n- Tagline: ${brandData.tagline}\n- Primary Color: ${brandData.primaryColor}\n- Secondary Color: ${brandData.secondaryColor}\n- Font Family: ${brandData.fontFamily}\n- Tone of Voice: ${brandData.toneOfVoice}\n- Key Messages: ${brandData.keyMessages.join(', ')}\n- Brand Values: ${brandData.brandValues.join(', ')}\n- Target Audience: ${brandData.targetAudience}\n- Brand Personality: ${brandData.brandPersonality}`;
-      }
-      
-      if (selectedOptions.businessOverview && marketStrategyData?.businessOverview) {
-        prompt += `\n\nBusiness Overview:\n${marketStrategyData.businessOverview}`;
-      }
-      
-      // Handle ICP selection
-      if (selectedOptions.icp.length > 0 && marketStrategyData?.icp) {
-        const selectedICPs = marketStrategyData.icp.filter(icp => selectedOptions.icp.includes(icp.id));
-        if (selectedICPs.length > 0) {
-          prompt += `\n\nIdeal Customer Profiles:\n${selectedICPs.map(icp => `- ${icp.title}: ${icp.description} (Value Proposition: ${icp.valueProposition})`).join('\n')}`;
+          try {
+        // Build the prompt based on selected options
+        let prompt = "";
+        
+        // Add task description at the beginning
+        if (additionalPrompt.trim()) {
+          prompt += `Task:\n${additionalPrompt.trim()}\n\n`;
         }
-      } else {
-        // General audience if no ICP selected
-        prompt += `\n\nTarget Audience: General audience`;
-      }
-      
-      prompt += `\n\nPlease create high-quality ad images that align with the above brand guidelines and target the specified audience. The images should be professional, engaging, and suitable for various marketing channels.`;
-      
-      // Add additional prompt if provided
-      if (additionalPrompt.trim()) {
-        prompt += `\n\nAdditional Instructions:\n${additionalPrompt.trim()}`;
-      }
+        
+        prompt += "Use download_image to download reference images and generate_image to create the result images.\n\n";
+        
+        if (selectedOptions.brandGuidelines && brandData) {
+          const brandGuidelines = [];
+          
+          // Only include fields that have values
+          if (brandData.brandName?.trim()) brandGuidelines.push(`- Brand Name: ${brandData.brandName}`);
+          if (brandData.tagline?.trim()) brandGuidelines.push(`- Tagline: ${brandData.tagline}`);
+          if (brandData.primaryColor?.trim()) brandGuidelines.push(`- Primary Color: ${brandData.primaryColor}`);
+          if (brandData.secondaryColor?.trim()) brandGuidelines.push(`- Secondary Color: ${brandData.secondaryColor}`);
+          if (brandData.fontFamily?.trim()) brandGuidelines.push(`- Font Family: ${brandData.fontFamily}`);
+          if (brandData.toneOfVoice?.trim()) brandGuidelines.push(`- Tone of Voice: ${brandData.toneOfVoice}`);
+          if (brandData.keyMessages?.length > 0) brandGuidelines.push(`- Key Messages: ${brandData.keyMessages.join(', ')}`);
+          if (brandData.brandValues?.length > 0) brandGuidelines.push(`- Brand Values: ${brandData.brandValues.join(', ')}`);
+          if (brandData.targetAudience?.trim()) brandGuidelines.push(`- Target Audience: ${brandData.targetAudience}`);
+          if (brandData.brandPersonality?.trim()) brandGuidelines.push(`- Brand Personality: ${brandData.brandPersonality}`);
+          
+          // Add brand assets if available
+          if (brandAssets.length > 0) {
+            const logoAssets = brandAssets.filter(asset => asset.type === 'logo' || asset.type === 'secondaryLogo');
+            if (logoAssets.length > 0) {
+              brandGuidelines.push(`- Brand Logos: ${logoAssets.map(asset => asset.url).join(', ')}`);
+            }
+          }
+          
+          if (brandGuidelines.length > 0) {
+            prompt += `Brand Guidelines:\n${brandGuidelines.join('\n')}\n\n`;
+          }
+        }
+        
+        if (selectedOptions.businessOverview && marketStrategyData?.businessOverview) {
+          prompt += `Business Overview:\n${marketStrategyData.businessOverview}\n\n`;
+        }
+        
+        // Handle ICP selection
+        if (selectedOptions.icp.length > 0 && marketStrategyData?.icp) {
+          const selectedICPs = marketStrategyData.icp.filter(icp => selectedOptions.icp.includes(icp.id));
+          if (selectedICPs.length > 0) {
+            prompt += `Ideal Customer Profiles:\n${selectedICPs.map(icp => `- ${icp.title}: ${icp.description} (Value Proposition: ${icp.valueProposition})`).join('\n')}\n\n`;
+          }
+        } else {
+          // General audience if no ICP selected
+          prompt += `Target Audience: General audience\n\n`;
+        }
+        
+        prompt += `Please create high-quality ad images that align with the above brand guidelines and target the specified audience. The images should be professional, engaging, and suitable for various marketing channels.`;
 
       // Create tasks based on ICP selection
       const tasksToCreate = [];
@@ -420,7 +475,7 @@ const ImagesPage: React.FC = () => {
           );
           
           tasksToCreate.push({
-            name: `Ad Images - ${icp.title}`,
+            name: `${taskName.trim()} - ${icp.title}`,
             prompt: icpPrompt,
             category: 'Creatives',
             description: `Ad image generation targeting ${icp.title} audience`
@@ -429,7 +484,7 @@ const ImagesPage: React.FC = () => {
       } else {
         // Create a single task for general audience
         tasksToCreate.push({
-          name: 'Ad Images - General Audience',
+          name: taskName.trim(),
           prompt: prompt,
           category: 'Creatives',
           description: 'Ad image generation for general audience'
@@ -461,6 +516,7 @@ const ImagesPage: React.FC = () => {
         icp: []
       });
       setAdditionalPrompt('');
+      setTaskName('');
       
       // Navigate to tasks page
       navigate('/tasks');
@@ -767,6 +823,20 @@ const ImagesPage: React.FC = () => {
           </DialogHeader>
           
           <div className="space-y-6 py-4">
+            {/* Task Name */}
+            <div className="space-y-3">
+              <Label htmlFor="taskName" className="text-sm font-medium">
+                Task Name <span className="text-red-500">*</span>
+              </Label>
+              <Input
+                id="taskName"
+                placeholder="e.g., Product Launch Ad Images, Social Media Campaign"
+                value={taskName}
+                onChange={(e) => setTaskName(e.target.value)}
+                required
+              />
+            </div>
+
             {/* Brand Guidelines */}
             <div className="space-y-3">
               <div className="flex items-center space-x-2">
@@ -849,7 +919,7 @@ const ImagesPage: React.FC = () => {
             {/* Image Prompt */}
             <div className="space-y-3">
               <Label htmlFor="additionalPrompt" className="text-sm font-medium">
-                Image Prompt (Optional)
+                Image Prompt <span className="text-red-500">*</span>
               </Label>
               <p className="text-xs text-gray-500 dark:text-gray-400">
                 Describe what images you want to generate. Include specific details about style, composition, or reference image URLs.
@@ -860,6 +930,7 @@ const ImagesPage: React.FC = () => {
                 value={additionalPrompt}
                 onChange={(e) => setAdditionalPrompt(e.target.value)}
                 className="min-h-[100px]"
+                required
               />
             </div>
           </div>
