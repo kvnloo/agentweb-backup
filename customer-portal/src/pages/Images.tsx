@@ -449,11 +449,11 @@ const ImagesPage: React.FC = () => {
           prompt += `Business Overview:\n${marketStrategyData.businessOverview}\n\n`;
         }
         
-        // Handle ICP selection
+        // Handle Target Audience based on ICP selection
         if (selectedOptions.icp.length > 0 && marketStrategyData?.icp) {
           const selectedICPs = marketStrategyData.icp.filter(icp => selectedOptions.icp.includes(icp.id));
           if (selectedICPs.length > 0) {
-            prompt += `Ideal Customer Profiles:\n${selectedICPs.map(icp => `- ${icp.title}: ${icp.description} (Value Proposition: ${icp.valueProposition})`).join('\n')}\n\n`;
+            prompt += `Target Audience: ${selectedICPs.map(icp => icp.title).join(', ')}\n\n`;
           }
         } else {
           // General audience if no ICP selected
