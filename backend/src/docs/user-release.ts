@@ -19,6 +19,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Supports filtering by task name/ID and sorting by latest execution, name, or creation date',
       '- Users can favorite images and provide feedback for better generation results',
       '- "Generate More" button allows users to re-run tasks with specific feedback',
+      'Added Create Ad Image button to Images page',
+      '- Users can now create ad image generation tasks directly from the Images page',
+      '- Configurable options include Brand Guidelines, Market Strategy (Business Overview, ICP selection)',
+      '- Required fields: Task Name and Image Prompt for describing desired images',
+      '- Supports reference image URLs and custom styling instructions',
+      '- Creates targeted tasks based on selected ICPs or general audience',
     ],
   },
   {
