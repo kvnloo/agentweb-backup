@@ -8,8 +8,9 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Alert, AlertDescription } from '@/components/ui/alert';
-import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink, Clock } from 'lucide-react';
+import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink, Clock, ArrowUpRight } from 'lucide-react';
 import { format } from 'date-fns';
+import { useNavigate } from 'react-router-dom';
 
 interface ResultFile {
   url: string;
@@ -34,6 +35,7 @@ interface TaskWithExecutions {
 
 const ImagesPage: React.FC = () => {
   const { token } = useAuth();
+  const navigate = useNavigate();
   const [tasksWithExecutions, setTasksWithExecutions] = useState<Record<string, TaskWithExecutions>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -186,9 +188,18 @@ const ImagesPage: React.FC = () => {
               <CardHeader className="pb-3">
                 <div className="flex items-start justify-between">
                   <div className="flex-1">
-                    <CardTitle className="text-lg font-semibold text-gray-900 dark:text-white">
-                      {task.taskName}
-                    </CardTitle>
+                    <div className="flex items-center gap-2">
+                      <CardTitle className="text-lg font-semibold text-gray-900 dark:text-white">
+                        {task.taskName}
+                      </CardTitle>
+                      <button 
+                        onClick={() => window.location.href = `/tasks/${task.taskId}`}
+                        className="inline-flex items-center gap-1 text-sm text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300 transition-colors"
+                      >
+                        <ArrowUpRight className="h-3 w-3" />
+                        View Task
+                      </button>
+                    </div>
                     <div className="flex items-center gap-2 mt-1">
                       <Badge variant="outline" className="text-xs">
                         {task.taskId}
@@ -228,9 +239,18 @@ const ImagesPage: React.FC = () => {
                           <p className="text-sm font-medium text-gray-900 dark:text-white truncate">
                             {file.filename}
                           </p>
-                          <p className="text-xs text-gray-500 dark:text-gray-400 truncate">
-                            Execution: {execution.executionId}
-                          </p>
+                          <div className="flex items-center gap-1 mt-1">
+                            <p className="text-xs text-gray-500 dark:text-gray-400 truncate">
+                              Execution: {execution.executionId}
+                            </p>
+                            <button 
+                              onClick={() => window.location.href = `/tasks/${task.taskId}/executions/${execution.executionId}/result`}
+                              className="inline-flex items-center gap-1 text-xs text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300 transition-colors ml-1"
+                            >
+                              <ArrowUpRight className="h-3 w-3" />
+                              View
+                            </button>
+                          </div>
                           <p className="text-xs text-gray-500 dark:text-gray-400 truncate">
                             Started: {formatDate(execution.startTime)}
                           </p>
@@ -242,7 +262,7 @@ const ImagesPage: React.FC = () => {
                               onClick={() => window.open(file.url, '_blank')}
                             >
                               <ExternalLink className="h-3 w-3 mr-1" />
-                              View
+                              View Image
                             </Button>
                           </div>
                         </div>
