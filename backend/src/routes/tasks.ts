@@ -901,15 +901,17 @@ router.get('/executions/with-images', authenticateToken, async (req: Request, re
       const taskId = execution.taskId;
       
       if (!result[taskId]) {
-        result[taskId] = {
-          taskId: taskId,
-          taskName: task?.name || 'Unknown Task',
-          executions: []
-        };
+              result[taskId] = {
+        taskId: taskId,
+        taskName: task?.name || 'Unknown Task',
+        createdAt: task?.createdAt || null,
+        executions: []
+      };
       }
       
       result[taskId].executions.push({
         executionId: execution.executionId,
+        startTime: execution.startTime || null,
         result_files: execution.result_files?.filter((file: ResultFile) => {
           const filename = file.filename.toLowerCase();
           return filename.endsWith('.jpg') || 

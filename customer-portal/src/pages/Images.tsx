@@ -8,7 +8,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Alert, AlertDescription } from '@/components/ui/alert';
-import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink } from 'lucide-react';
+import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink, Clock } from 'lucide-react';
 import { format } from 'date-fns';
 
 interface ResultFile {
@@ -20,12 +20,14 @@ interface ResultFile {
 
 interface ExecutionWithImages {
   executionId: string;
+  startTime?: string;
   result_files: ResultFile[];
 }
 
 interface TaskWithExecutions {
   taskId: string;
   taskName: string;
+  createdAt?: string;
   executions: ExecutionWithImages[];
 }
 
@@ -62,6 +64,15 @@ const ImagesPage: React.FC = () => {
     }
   };
 
+  const formatDate = (dateString: string | undefined) => {
+    if (!dateString) return 'Unknown';
+    try {
+      return format(new Date(dateString), 'MMM dd, yyyy HH:mm');
+    } catch {
+      return 'Invalid date';
+    }
+  };
+
   // Convert to array of tasks and filter/sort
   const allTasks = Object.values(tasksWithExecutions)
     .filter(task => {
@@ -75,6 +86,8 @@ const ImagesPage: React.FC = () => {
           return a.taskName.localeCompare(b.taskName);
         case 'taskId':
           return a.taskId.localeCompare(b.taskId);
+        case 'createdAt':
+          return (a.createdAt || '').localeCompare(b.createdAt || '');
         default:
           return 0;
       }
@@ -143,6 +156,7 @@ const ImagesPage: React.FC = () => {
           <SelectContent>
             <SelectItem value="name">Task Name</SelectItem>
             <SelectItem value="taskId">Task ID</SelectItem>
+            <SelectItem value="createdAt">Task Created</SelectItem>
           </SelectContent>
         </Select>
       </div>
@@ -179,6 +193,10 @@ const ImagesPage: React.FC = () => {
                         {task.executions.length} execution{task.executions.length !== 1 ? 's' : ''}
                       </Badge>
                     </div>
+                    <div className="flex items-center gap-2 mt-2 text-sm text-gray-500 dark:text-gray-400">
+                      <Clock className="h-4 w-4" />
+                      <span>Task created: {formatDate(task.createdAt)}</span>
+                    </div>
                   </div>
                 </div>
               </CardHeader>
@@ -204,6 +222,9 @@ const ImagesPage: React.FC = () => {
                           </p>
                           <p className="text-xs text-gray-500 dark:text-gray-400 truncate">
                             Execution: {execution.executionId}
+                          </p>
+                          <p className="text-xs text-gray-500 dark:text-gray-400 truncate">
+                            Started: {formatDate(execution.startTime)}
                           </p>
                           <div className="flex items-center gap-2 mt-1">
                             <Button
