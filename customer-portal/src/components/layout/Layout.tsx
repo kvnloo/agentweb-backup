@@ -145,7 +145,7 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
       items: [
         {
           icon: Image,
-          label: "Images",
+          label: "Ad Images",
           path: "/images",
           id: "images",
         },
