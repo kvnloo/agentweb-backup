@@ -16,6 +16,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Users can now archive images they no longer want to see in the Ad Images page',
       '- Archive icon appears next to each image for easy access',
       '- Confirmation dialog warns users that archived images require support contact to restore',
+      'Added Upload directly button to Ad Images page',
+      '- Users can now upload ad images directly to S3 and add them to the latest execution',
+      '- Uploaded images appear alongside generated images in the task execution results',
     ],
   },
   {
