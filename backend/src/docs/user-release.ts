@@ -12,6 +12,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Reduced noisy images in Ad Images by moving download_image to attachment folder',
       '- Reference images downloaded via download_image are now saved in the task-specific attachments folder',
       '- This improves organization and reduces clutter in the downloads folder',
+      'Supported archive images in Ad Images',
+      '- Users can now archive images they no longer want to see in the Ad Images page',
+      '- Archive icon appears next to each image for easy access',
+      '- Confirmation dialog warns users that archived images require support contact to restore',
     ],
   },
   {
