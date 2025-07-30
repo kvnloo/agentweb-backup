@@ -60,6 +60,7 @@ interface ResultFile {
   token: string;
   is_html?: boolean;
   is_favorited?: boolean;
+  is_archived?: boolean;
 }
 
 // Public routes (no authentication required)
@@ -1019,6 +1020,59 @@ router.post('/executions/:executionId/favorite-image', authenticateToken, async 
 
   } catch (error) {
     console.error('Error toggling image favorite status:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Archive an image in a task execution
+router.post('/executions/:executionId/archive-image', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { executionId } = req.params;
+    const { imageUrl } = req.body;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!executionId || !imageUrl) {
+      return res.status(400).json({ message: 'Execution ID and image URL are required' });
+    }
+
+    // Get the execution to verify ownership and get current result_files
+    const execution = await taskDb.getTaskExecutionById(executionId);
+    if (!execution) {
+      return res.status(404).json({ message: 'Execution not found' });
+    }
+
+    // Verify the user owns this execution
+    if (execution.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+      return res.status(403).json({ message: 'Not authorized to modify this execution' });
+    }
+
+    // Find the image in result_files and mark it as archived
+    const updatedResultFiles = execution.result_files?.map((file: ResultFile) => {
+      if (file.url === imageUrl) {
+        return {
+          ...file,
+          is_archived: true
+        };
+      }
+      return file;
+    }) || [];
+
+    // Update the execution with the modified result_files
+    await taskDb.updateTaskExecution(executionId, {
+      result_files: updatedResultFiles
+    });
+
+    res.json({ 
+      success: true, 
+      message: 'Image archived successfully' 
+    });
+
+  } catch (error) {
+    console.error('Error archiving image:', error);
     res.status(500).json({ message: 'Internal server error' });
   }
 });

@@ -12,7 +12,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { Checkbox } from '@/components/ui/checkbox';
-import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink, Clock, ArrowUpRight, Play, Zap, Download, Heart, Plus } from 'lucide-react';
+import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink, Clock, ArrowUpRight, Play, Zap, Download, Heart, Plus, Archive } from 'lucide-react';
 import { format } from 'date-fns';
 import { useNavigate } from 'react-router-dom';
 import { useToast } from '@/hooks/use-toast';
@@ -23,6 +23,7 @@ interface ResultFile {
   token: string;
   is_html?: boolean;
   is_favorited?: boolean;
+  is_archived?: boolean;
 }
 
 interface ExecutionWithImages {
@@ -91,6 +92,8 @@ const ImagesPage: React.FC = () => {
   const [feedbackDialogOpen, setFeedbackDialogOpen] = useState(false);
   const [feedbackText, setFeedbackText] = useState('');
   const [pendingTaskId, setPendingTaskId] = useState<string | null>(null);
+  const [archiveDialogOpen, setArchiveDialogOpen] = useState(false);
+  const [pendingArchiveImage, setPendingArchiveImage] = useState<{ executionId: string; imageUrl: string } | null>(null);
   const refreshIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   // Ad Image task creation state
@@ -315,6 +318,76 @@ const ImagesPage: React.FC = () => {
     }
   };
 
+  const handleArchiveImage = async (executionId: string, imageUrl: string) => {
+    try {
+      const response = await axios.post(
+        buildApiUrl(`/api/tasks/executions/${executionId}/archive-image`),
+        { imageUrl },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      if (response.data.success) {
+        // Update the specific image's archived status in local state
+        setTasksWithExecutions(prev => {
+          const updated = { ...prev };
+          Object.keys(updated).forEach(taskId => {
+            const task = updated[taskId];
+            task.executions = task.executions.map(execution => {
+              if (execution.executionId === executionId) {
+                return {
+                  ...execution,
+                  result_files: execution.result_files.map(file => {
+                    if (file.url === imageUrl) {
+                      return {
+                        ...file,
+                        is_archived: true
+                      };
+                    }
+                    return file;
+                  })
+                };
+              }
+              return execution;
+            });
+          });
+          return updated;
+        });
+        
+        toast({
+          title: "Image Archived",
+          description: "Image has been archived and will no longer be visible. Contact AgentWeb support to restore it.",
+        });
+      }
+    } catch (error: any) {
+      console.error('Error archiving image:', error);
+      toast({
+        title: "Error",
+        description: error.response?.data?.message || "Failed to archive image.",
+        variant: "destructive",
+      });
+    }
+  };
+
+  const handleArchiveClick = (executionId: string, imageUrl: string) => {
+    setPendingArchiveImage({ executionId, imageUrl });
+    setArchiveDialogOpen(true);
+  };
+
+  const handleArchiveConfirm = async () => {
+    if (pendingArchiveImage) {
+      await handleArchiveImage(pendingArchiveImage.executionId, pendingArchiveImage.imageUrl);
+      setArchiveDialogOpen(false);
+      setPendingArchiveImage(null);
+    }
+  };
+
+  const handleArchiveCancel = () => {
+    setArchiveDialogOpen(false);
+    setPendingArchiveImage(null);
+  };
+
   // Convert to array of tasks and filter/sort
   const allTasks = Object.values(tasksWithExecutions)
     .filter(task => {
@@ -338,7 +411,8 @@ const ImagesPage: React.FC = () => {
     });
 
   const totalImages = allTasks.reduce(
-    (total, task) => total + task.executions.reduce((taskTotal, execution) => taskTotal + execution.result_files.length, 0),
+    (total, task) => total + task.executions.reduce((taskTotal, execution) => 
+      taskTotal + execution.result_files.filter(file => !file.is_archived).length, 0),
     0
   );
 
@@ -710,7 +784,7 @@ const ImagesPage: React.FC = () => {
                 <CardContent>
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
                     {task.executions.flatMap((execution, executionIndex) => 
-                      execution.result_files.map((file, fileIndex) => (
+                      execution.result_files.filter(file => !file.is_archived).map((file, fileIndex) => (
                         <div key={`${execution.executionId}-${fileIndex}`} className="group relative">
                           <div className="aspect-square overflow-hidden rounded-lg border border-gray-200 dark:border-gray-700">
                             <img
@@ -767,6 +841,15 @@ const ImagesPage: React.FC = () => {
                                   }`} 
                                 />
                               </Button>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-8 w-8 p-0 hover:bg-gray-100 dark:hover:bg-gray-800"
+                                onClick={() => handleArchiveClick(execution.executionId, file.url)}
+                                title="Archive Image"
+                              >
+                                <Archive className="h-4 w-4 text-gray-400 hover:text-orange-500" />
+                              </Button>
                             </div>
                           </div>
                         </div>
@@ -807,6 +890,26 @@ const ImagesPage: React.FC = () => {
             </Button>
             <Button onClick={handleSubmitFeedback}>
               Generate with Feedback
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Archive Confirmation Dialog */}
+      <Dialog open={archiveDialogOpen} onOpenChange={setArchiveDialogOpen}>
+        <DialogContent className="sm:max-w-[500px]">
+          <DialogHeader>
+            <DialogTitle>Archive Image</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to archive this image? Archived images will no longer be visible and you will need to contact AgentWeb support to restore them.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={handleArchiveCancel}>
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={handleArchiveConfirm}>
+              Archive Image
             </Button>
           </DialogFooter>
         </DialogContent>
