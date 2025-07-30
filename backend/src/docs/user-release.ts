@@ -23,6 +23,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Page no longer refreshes entire data every 5 seconds when tasks are in progress',
       '- Individual execution results are updated efficiently during task execution',
       '- Full page refresh only occurs when tasks start or complete for optimal performance',
+      'Improved image prompt to emphasize following brand guidelines',
+      '- When brand guidelines are selected, AI is now explicitly instructed to use brand data',
+      '- Instructions include using logo, typography, brand colors, and other brand elements',
+      '- Ensures generated images maintain consistency with brand identity',
     ],
   },
   {
