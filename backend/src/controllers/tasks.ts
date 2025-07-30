@@ -5,6 +5,9 @@ import { scheduleDb } from '../services/db';
 import AWS from 'aws-sdk';
 import { taskTemplateDb } from '../services/db';
 import crypto from 'crypto';
+import { S3 } from 'aws-sdk';
+
+const s3 = new S3();
 
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
@@ -1109,5 +1112,94 @@ export const sendExecutionEmail = async (req: AuthRequest, res: Response) => {
   } catch (error) {
     console.error('Error sending execution email:', error);
     res.status(500).json({ message: 'Error sending execution email' });
+  }
+}; 
+
+export const uploadImageToExecution = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const taskId = req.params.id;
+    const file = (req as any).file;
+
+    if (!file) {
+      return res.status(400).json({ message: 'No file uploaded' });
+    }
+
+    // Verify task exists and user has access
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Get user to check if admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    // Verify task belongs to user or user is admin
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Get the latest execution for this task
+    const executions = await taskDb.getTaskExecutions(taskId);
+    if (!executions || executions.length === 0) {
+      return res.status(404).json({ message: 'No executions found for this task' });
+    }
+
+    // Sort by startTime to get the latest execution
+    const latestExecution = executions.sort((a, b) => 
+      new Date(b.startTime).getTime() - new Date(a.startTime).getTime()
+    )[0];
+
+    // Upload file to S3
+    const randomToken = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+
+    const key = `tasks/${taskId}/executions/${latestExecution.executionId}/uploads/${Date.now()}-${randomToken}-${file.originalname}`;
+
+    await s3
+      .putObject({
+        Bucket: process.env.AWS_S3_BUCKET || "agentweb-user-files",
+        Key: key,
+        Body: file.buffer,
+        ContentType: file.mimetype,
+      })
+      .promise();
+
+    const url = `https://${
+      process.env.AWS_S3_BUCKET || "agentweb-user-files"
+    }.s3.${process.env.AWS_REGION || "us-west-2"}.amazonaws.com/${key}`;
+
+    // Create new result file entry
+    const newResultFile = {
+      url,
+      filename: file.originalname,
+      token: randomToken,
+      is_html: false
+    };
+
+    // Get current result_files and append the new file
+    const currentResultFiles = latestExecution.result_files || [];
+    const updatedResultFiles = [...currentResultFiles, newResultFile];
+
+    // Update the execution with the new result file
+    await taskDb.updateTaskExecution(latestExecution.executionId, {
+      result_files: updatedResultFiles
+    });
+
+    res.status(200).json({
+      message: 'Image uploaded successfully',
+      resultFile: newResultFile
+    });
+  } catch (error) {
+    console.error('Error in uploadImageToExecution:', error);
+    res.status(500).json({ message: 'Error uploading image' });
   }
 }; 

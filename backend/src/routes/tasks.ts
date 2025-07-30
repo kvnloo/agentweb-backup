@@ -1,5 +1,5 @@
 import express, { Request, RequestHandler, Response } from 'express';
-import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction, getTaskExecution, getExecutionLog, generateShareToken, getExecutionWithToken, sendExecutionEmail } from '../controllers/tasks';
+import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction, getTaskExecution, getExecutionLog, generateShareToken, getExecutionWithToken, sendExecutionEmail, uploadImageToExecution } from '../controllers/tasks';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { taskDb, subscriberDb } from '../services/db';
 import multer from 'multer';
@@ -82,6 +82,9 @@ router.delete('/:id', deleteTask);
 router.post('/:id/execute', executeTask);
 router.put('/:id/executions/:executionId', updateTaskExecution);
 router.put('/:id/executions/:executionId/interactions/:interactionId', respondToInteraction);
+
+// Upload image directly to latest execution
+router.post('/:id/upload-image', upload.single('file'), uploadImageToExecution);
 
 // Kill execution
 router.put('/:taskId/executions/:executionId/kill', authenticateToken, async (req: Request, res: Response) => {

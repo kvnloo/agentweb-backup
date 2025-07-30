@@ -7,12 +7,13 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { Checkbox } from '@/components/ui/checkbox';
-import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink, Clock, ArrowUpRight, Play, Zap, Download, Heart, Plus, Archive } from 'lucide-react';
+import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink, Clock, ArrowUpRight, Play, Zap, Download, Heart, Plus, Archive, Upload, ChevronDown } from 'lucide-react';
 import { format } from 'date-fns';
 import { useNavigate } from 'react-router-dom';
 import { useToast } from '@/hooks/use-toast';
@@ -94,6 +95,9 @@ const ImagesPage: React.FC = () => {
   const [pendingTaskId, setPendingTaskId] = useState<string | null>(null);
   const [archiveDialogOpen, setArchiveDialogOpen] = useState(false);
   const [pendingArchiveImage, setPendingArchiveImage] = useState<{ executionId: string; imageUrl: string } | null>(null);
+  const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
+  const [uploadingImage, setUploadingImage] = useState(false);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const refreshIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   // Ad Image task creation state
@@ -180,6 +184,12 @@ const ImagesPage: React.FC = () => {
     setPendingTaskId(taskId);
     setFeedbackText('');
     setFeedbackDialogOpen(true);
+  };
+
+  const handleUploadDirectly = (taskId: string) => {
+    setPendingTaskId(taskId);
+    setSelectedFile(null);
+    setUploadDialogOpen(true);
   };
 
   const handleSubmitFeedback = async () => {
@@ -386,6 +396,81 @@ const ImagesPage: React.FC = () => {
   const handleArchiveCancel = () => {
     setArchiveDialogOpen(false);
     setPendingArchiveImage(null);
+  };
+
+  const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file) {
+      // Check if file is an image
+      if (!file.type.startsWith('image/')) {
+        toast({
+          title: "Error",
+          description: "Please select an image file.",
+          variant: "destructive",
+        });
+        return;
+      }
+      setSelectedFile(file);
+    }
+  };
+
+  const handleUploadImage = async () => {
+    if (!pendingTaskId || !selectedFile || !token) {
+      toast({
+        title: "Error",
+        description: "Please select a file to upload.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    setUploadingImage(true);
+    
+    try {
+      const formData = new FormData();
+      formData.append('file', selectedFile);
+
+      await axios.post(
+        buildApiUrl(`/api/tasks/${pendingTaskId}/upload-image`),
+        formData,
+        {
+          headers: { 
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'multipart/form-data'
+          },
+        }
+      );
+      
+      toast({ 
+        title: "Success", 
+        description: "Image uploaded successfully and added to the latest execution." 
+      });
+      
+      setUploadDialogOpen(false);
+      setSelectedFile(null);
+      setPendingTaskId(null);
+      
+      // Refresh the data to show the new image
+      setTimeout(() => {
+        fetchExecutionsWithImages();
+      }, 1000);
+      
+    } catch (err: any) {
+      console.error('Failed to upload image:', err);
+      toast({
+        title: "Error Uploading Image",
+        description: err.response?.data?.message || "Could not upload image.",
+        variant: "destructive",
+      });
+    } finally {
+      setUploadingImage(false);
+    }
+  };
+
+  const handleUploadCancel = () => {
+    setUploadDialogOpen(false);
+    setSelectedFile(null);
+    setPendingTaskId(null);
   };
 
   // Convert to array of tasks and filter/sort
@@ -755,29 +840,43 @@ const ImagesPage: React.FC = () => {
                       )}
                     </div>
                     <div className="flex flex-col gap-2">
-                      <Button
-                        onClick={() => handleGenerateMore(task.taskId)}
-                        disabled={!canGenerateMore}
-                        size="sm"
-                        className="whitespace-nowrap"
-                      >
-                        {isCurrentlyExecuting ? (
-                          <>
-                            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                            Starting...
-                          </>
-                        ) : hasActiveExecution ? (
-                          <>
-                            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                            In Progress
-                          </>
-                        ) : (
-                          <>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            disabled={!canGenerateMore}
+                            size="sm"
+                            className="whitespace-nowrap"
+                          >
+                            {isCurrentlyExecuting ? (
+                              <>
+                                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                                Starting...
+                              </>
+                            ) : hasActiveExecution ? (
+                              <>
+                                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                                In Progress
+                              </>
+                            ) : (
+                              <>
+                                <Play className="h-4 w-4 mr-2" />
+                                Generate More
+                                <ChevronDown className="h-4 w-4 ml-1" />
+                              </>
+                            )}
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuItem onClick={() => handleGenerateMore(task.taskId)}>
                             <Play className="h-4 w-4 mr-2" />
-                            Generate More
-                          </>
-                        )}
-                      </Button>
+                            Generate with agent
+                          </DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => handleUploadDirectly(task.taskId)}>
+                            <Upload className="h-4 w-4 mr-2" />
+                            Upload directly
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
                     </div>
                   </div>
                 </CardHeader>
@@ -1053,6 +1152,63 @@ const ImagesPage: React.FC = () => {
                 </>
               ) : (
                 'Create Task'
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Upload Image Dialog */}
+      <Dialog open={uploadDialogOpen} onOpenChange={setUploadDialogOpen}>
+        <DialogContent className="sm:max-w-[500px]">
+          <DialogHeader>
+            <DialogTitle>Upload Image Directly</DialogTitle>
+            <DialogDescription>
+              Upload an image file to add it to the latest execution of this task. The image will be stored in S3 and appear alongside other generated images.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="imageFile">Select Image File</Label>
+              <Input
+                id="imageFile"
+                type="file"
+                accept="image/*"
+                onChange={handleFileSelect}
+                className="cursor-pointer"
+              />
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                Supported formats: JPG, PNG, GIF, WebP, SVG (max 5MB)
+              </p>
+            </div>
+            {selectedFile && (
+              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <p className="text-sm font-medium">Selected file:</p>
+                <p className="text-sm text-gray-600 dark:text-gray-400">{selectedFile.name}</p>
+                <p className="text-xs text-gray-500 dark:text-gray-400">
+                  Size: {(selectedFile.size / 1024 / 1024).toFixed(2)} MB
+                </p>
+              </div>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={handleUploadCancel}>
+              Cancel
+            </Button>
+            <Button 
+              onClick={handleUploadImage}
+              disabled={!selectedFile || uploadingImage}
+            >
+              {uploadingImage ? (
+                <>
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Uploading...
+                </>
+              ) : (
+                <>
+                  <Upload className="h-4 w-4 mr-2" />
+                  Upload Image
+                </>
               )}
             </Button>
           </DialogFooter>
