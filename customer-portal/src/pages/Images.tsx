@@ -216,14 +216,12 @@ const ImagesPage: React.FC = () => {
       activeExecutions.forEach(async ({ taskId, executionId }) => {
         const updatedExecution = await refreshExecutionResults(taskId, executionId);
         
-        // If execution is no longer pending/running, stop refreshing it
-        if (updatedExecution && !['pending', 'running'].includes(updatedExecution.status)) {
-          setRefreshingExecutions(prev => {
-            const newSet = new Set(prev);
-            newSet.delete(executionId);
-            return newSet;
-          });
-        }
+                 // If execution is no longer pending/running, refresh all data
+         if (updatedExecution && !['pending', 'running'].includes(updatedExecution.status)) {
+           setTimeout(() => {
+             fetchExecutionsWithImages();
+           }, 1000);
+         }
       });
     }, 5000); // Refresh every 5 seconds
   };
