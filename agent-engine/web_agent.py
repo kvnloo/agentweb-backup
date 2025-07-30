@@ -471,8 +471,18 @@ class WebAgent:
             logger.error(f"Failed to upload screenshot to S3: {e}")
             return None
 
+    def _get_attachment_dir(self) -> Optional[Path]:
+        """Get the attachment directory for the current task"""
+        if not self.current_task_id:
+            logger.error("No task ID available")
+            return None
+        
+        task_dir = self.attachments_dir / self.current_task_id
+        task_dir.mkdir(exist_ok=True)
+        return task_dir
+
     async def _get_attachment_path(self, file_name: str) -> Optional[str]:
-        """Get the local path for an attachment, downloading it from S3 if needed"""
+        """Get the local path for an attachment, downloading it from S3 if needed, or return if it exists locally."""
         try:
             if not self.current_task_id:
                 logger.error("No task ID available")
@@ -481,33 +491,36 @@ class WebAgent:
             # Get task details from DynamoDB
             tasks_table = dynamodb.Table(f'{TABLE_PREFIX}AW-Tasks')
             task = tasks_table.get_item(Key={'taskId': self.current_task_id}).get('Item')
-            if not task or 'attachments' not in task:
-                logger.error("No attachments found for this task")
-                return None
+            attachment = None
+            if task and 'attachments' in task:
+                # Find the attachment with matching filename
+                attachment = next((a for a in task['attachments'] if a['filename'] == file_name), None)
 
-            # Find the attachment with matching filename
-            attachment = next((a for a in task['attachments'] if a['filename'] == file_name), None)
-            if not attachment:
-                logger.error(f"No attachment found with filename: {file_name}")
+            # Use the helper method to get the task directory
+            task_dir = self._get_attachment_dir()
+            if not task_dir:
                 return None
-
-            # Create task-specific directory
-            task_dir = self.attachments_dir / self.current_task_id
-            task_dir.mkdir(exist_ok=True)
             local_path = task_dir / file_name
 
-            # Download if not already present
-            if not local_path.exists():
-                logger.info(f"Downloading attachment {file_name} from URL")
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(attachment['url']) as response:
-                        if response.status != 200:
-                            logger.error(f"Failed to download file: HTTP {response.status}")
-                            return None
-                        content = await response.read()
-                        local_path.write_bytes(content)
-
-            return str(local_path)
+            if attachment:
+                # Download if not already present
+                if not local_path.exists():
+                    logger.info(f"Downloading attachment {file_name} from URL")
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(attachment['url']) as response:
+                            if response.status != 200:
+                                logger.error(f"Failed to download file: HTTP {response.status}")
+                                return None
+                            content = await response.read()
+                            local_path.write_bytes(content)
+                return str(local_path)
+            else:
+                # Not in metadata, but check if file exists locally (e.g., from download_image)
+                if local_path.exists():
+                    logger.info(f"Found {file_name} in local attachments directory.")
+                    return str(local_path)
+                logger.error(f"No attachment found with filename: {file_name}")
+                return None
         except Exception as e:
             logger.error(f"Error getting attachment path: {e}")
             return None
@@ -1305,10 +1318,12 @@ class WebAgent:
 
         @self.controller.registry.action('Download image when you have the URL')
         async def download_image(url: str, browser: BrowserContext) -> ActionResult:
-            """Download an image from a URL and save it to the downloads folder."""
+            """Download an image from a URL and save it to the attachments folder."""
             try:
-                # Get user-specific downloads path
-                downloads_path = Path(self._get_downloads_path())
+                # Use the helper method to get the attachment directory
+                task_dir = self._get_attachment_dir()
+                if not task_dir:
+                    return ActionResult(error="No attachments folder available for saving the image")
                 
                 # Generate a random 8-character filename
                 random_name = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=8))
@@ -1317,7 +1332,7 @@ class WebAgent:
                 ext = url.split('.')[-1] if '.' in url.split('/')[-1] else 'jpg'
                 filename = f"{random_name}.{ext}"
                 
-                filepath = downloads_path / filename
+                filepath = task_dir / filename
                 
                 # Download the image
                 async with aiohttp.ClientSession() as session:
@@ -1329,7 +1344,7 @@ class WebAgent:
                         image_data = await response.read()
                         filepath.write_bytes(image_data)
                 
-                msg = f"Downloaded image to {filename}"
+                msg = f"Downloaded image to {filename} in attachments folder"
                 logger.info(msg)
                 return ActionResult(extracted_content=msg)
                 
