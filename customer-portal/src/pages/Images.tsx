@@ -966,9 +966,9 @@ const ImagesPage: React.FC = () => {
       <Dialog open={feedbackDialogOpen} onOpenChange={setFeedbackDialogOpen}>
         <DialogContent className="sm:max-w-[500px]">
           <DialogHeader>
-            <DialogTitle>Provide Feedback for Better Images</DialogTitle>
+            <DialogTitle>Provide Feedback for Agent</DialogTitle>
             <DialogDescription>
-              Share your thoughts on how to improve the generated images. Your feedback will be used to enhance the AI's understanding and generate better results.
+              Share your thoughts on how to improve the generated images. Your feedback will be used to enhance the AI agent's understanding and generate better results.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
