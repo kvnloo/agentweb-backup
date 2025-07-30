@@ -415,7 +415,7 @@ const ImagesPage: React.FC = () => {
           prompt += `Task:\n${additionalPrompt.trim()}\n\n`;
         }
         
-        prompt += "Use download_image to download reference images and generate_image to create the result images.\n\n";
+        prompt += "Use download_image to download reference images and generate_image to create the result images. Valid size values for generate_image include \"1024x1024\", \"1536x1024\", \"1024x1536\", \"auto\". Valid quality values for generate_image include \"low\", \"medium\", \"high\", \"auto\".\n\n";
         
         if (selectedOptions.brandGuidelines && brandData) {
           const brandGuidelines = [];
