@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-07-30',
+    changes: [
+      'Reduced noisy images in Ad Images by moving download_image to attachment folder',
+      '- Reference images downloaded via download_image are now saved in the task-specific attachments folder',
+      '- This improves organization and reduces clutter in the downloads folder',
+    ],
+  },
+  {
     date: '2025-07-29',
     changes: [
       'Added Market Strategy page to Customer Portal under Brand category',
