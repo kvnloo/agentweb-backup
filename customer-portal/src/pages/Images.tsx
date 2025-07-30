@@ -99,6 +99,7 @@ const ImagesPage: React.FC = () => {
   const [uploadingImage, setUploadingImage] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const refreshIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const [refreshingExecutions, setRefreshingExecutions] = useState<Set<string>>(new Set());
 
   // Ad Image task creation state
   const [createTaskDialogOpen, setCreateTaskDialogOpen] = useState(false);
@@ -135,6 +136,56 @@ const ImagesPage: React.FC = () => {
     }
   };
 
+  // Efficient refresh function that only updates specific execution results
+  // instead of refreshing the entire page data
+  const refreshExecutionResults = async (taskId: string, executionId: string) => {
+    try {
+      const response = await axios.get(
+        buildApiUrl(`/api/tasks/${taskId}/executions/${executionId}`),
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      
+      const updatedExecution = response.data;
+      
+      // Update the specific execution in the local state
+      setTasksWithExecutions(prev => {
+        const updated = { ...prev };
+        if (updated[taskId]) {
+          updated[taskId] = {
+            ...updated[taskId],
+            executions: updated[taskId].executions.map(execution => 
+              execution.executionId === executionId 
+                ? {
+                    ...execution,
+                    startTime: updatedExecution.startTime,
+                    result_files: updatedExecution.result_files || [],
+                    status: updatedExecution.status,
+                    completedAt: updatedExecution.completedAt
+                  }
+                : execution
+            )
+          };
+          
+          // Update latest execution time if this is the latest execution
+          const latestExecution = updated[taskId].executions
+            .sort((a, b) => new Date(b.startTime || '').getTime() - new Date(a.startTime || '').getTime())[0];
+          
+          if (latestExecution && latestExecution.executionId === executionId) {
+            updated[taskId].latestExecutionTime = latestExecution.startTime;
+          }
+        }
+        return updated;
+      });
+      
+      return updatedExecution;
+    } catch (err: any) {
+      console.error('Error refreshing execution results:', err);
+      return null;
+    }
+  };
+
   // Check if there are any pending or running executions
   const hasActiveExecutions = () => {
     return Object.values(tasksWithExecutions).some(
@@ -149,7 +200,29 @@ const ImagesPage: React.FC = () => {
     }
     
     refreshIntervalRef.current = setInterval(() => {
-      fetchExecutionsWithImages();
+      // Get all active executions that need refreshing
+      const activeExecutions: Array<{ taskId: string; executionId: string }> = [];
+      
+      Object.values(tasksWithExecutions).forEach(task => {
+        if (task.latestPendingOrRunningExecution) {
+          activeExecutions.push({
+            taskId: task.taskId,
+            executionId: task.latestPendingOrRunningExecution.executionId
+          });
+        }
+      });
+      
+      // Refresh each active execution individually
+      activeExecutions.forEach(async ({ taskId, executionId }) => {
+        const updatedExecution = await refreshExecutionResults(taskId, executionId);
+        
+                 // If execution is no longer pending/running, refresh all data
+         if (updatedExecution && !['pending', 'running'].includes(updatedExecution.status)) {
+           setTimeout(() => {
+             fetchExecutionsWithImages();
+           }, 1000);
+         }
+      });
     }, 5000); // Refresh every 5 seconds
   };
 
@@ -169,8 +242,18 @@ const ImagesPage: React.FC = () => {
   useEffect(() => {
     if (hasActiveExecutions()) {
       startAutoRefresh();
+      
+      // Track which executions are being refreshed
+      const activeExecutionIds = new Set<string>();
+      Object.values(tasksWithExecutions).forEach(task => {
+        if (task.latestPendingOrRunningExecution) {
+          activeExecutionIds.add(task.latestPendingOrRunningExecution.executionId);
+        }
+      });
+      setRefreshingExecutions(activeExecutionIds);
     } else {
       stopAutoRefresh();
+      setRefreshingExecutions(new Set());
     }
 
     // Cleanup on unmount
@@ -452,7 +535,14 @@ const ImagesPage: React.FC = () => {
       
       // Refresh the data to show the new image
       setTimeout(() => {
-        fetchExecutionsWithImages();
+        // Try to refresh just the latest execution first
+        const task = tasksWithExecutions[pendingTaskId];
+        if (task && task.latestPendingOrRunningExecution) {
+          refreshExecutionResults(pendingTaskId, task.latestPendingOrRunningExecution.executionId);
+        } else {
+          // Fallback to full refresh if no active execution
+          fetchExecutionsWithImages();
+        }
       }, 1000);
       
     } catch (err: any) {
@@ -577,6 +667,8 @@ const ImagesPage: React.FC = () => {
         prompt += "Use download_image to download reference images and generate_image to create the result images. Valid size values for generate_image include \"1024x1024\", \"1536x1024\", \"1024x1536\", \"auto\". Valid quality values for generate_image include \"low\", \"medium\", \"high\", \"auto\".\n\n";
         
         if (selectedOptions.brandGuidelines && brandData) {
+          prompt += `Brand Guidelines:\nIMPORTANT: Use the following brand data including logo, typography, brand colors, and other brand elements to maintain consistency in generated images. Ensure all images align with the brand identity.\n\n`;
+          
           const brandGuidelines = [];
           
           // Only include fields that have values
@@ -600,7 +692,7 @@ const ImagesPage: React.FC = () => {
           }
           
           if (brandGuidelines.length > 0) {
-            prompt += `Brand Guidelines:\n${brandGuidelines.join('\n')}\n\n`;
+            prompt += `${brandGuidelines.join('\n')}\n\n`;
           }
         }
         
@@ -737,7 +829,7 @@ const ImagesPage: React.FC = () => {
             All ad images generated by your tasks ({totalImages} images from {totalExecutions} executions across {allTasks.length} tasks)
             {hasActiveExecutionsInView && (
               <span className="ml-2 text-blue-600 dark:text-blue-400">
-                • Auto-refreshing every 5 seconds
+                • Auto-refreshing active executions
               </span>
             )}
           </p>
@@ -835,7 +927,12 @@ const ImagesPage: React.FC = () => {
                       {hasActiveExecution && (
                         <div className="flex items-center gap-2 mt-1 text-sm text-blue-600 dark:text-blue-400">
                           <Loader2 className="h-4 w-4 animate-spin" />
-                          <span>Generating images... Started: {formatDate(task.latestPendingOrRunningExecution!.startTime)}</span>
+                          <span>
+                            Generating images... Started: {formatDate(task.latestPendingOrRunningExecution!.startTime)}
+                            {refreshingExecutions.has(task.latestPendingOrRunningExecution!.executionId) && (
+                              <span className="ml-2 text-xs">• Auto-refreshing</span>
+                            )}
+                          </span>
                         </div>
                       )}
                     </div>
