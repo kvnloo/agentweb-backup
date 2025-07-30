@@ -19,6 +19,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Added Upload directly button to Ad Images page',
       '- Users can now upload ad images directly to S3 and add them to the latest execution',
       '- Uploaded images appear alongside generated images in the task execution results',
+      'Improved auto-refresh performance for Ad Images page',
+      '- Page no longer refreshes entire data every 5 seconds when tasks are in progress',
+      '- Individual execution results are updated efficiently during task execution',
+      '- Full page refresh only occurs when tasks start or complete for optimal performance',
     ],
   },
   {
