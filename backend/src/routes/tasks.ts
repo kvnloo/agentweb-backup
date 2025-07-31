@@ -86,6 +86,58 @@ router.put('/:id/executions/:executionId/interactions/:interactionId', respondTo
 // Upload image directly to latest execution
 router.post('/:id/upload-image', upload.single('file'), uploadImageToExecution);
 
+// Create revision execution
+router.post('/:id/executions/revision', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { id: taskId } = req.params;
+    const { revision_prompt, image_url, original_execution_id } = req.body;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!revision_prompt || !image_url || !original_execution_id) {
+      return res.status(400).json({ message: 'Missing required fields: revision_prompt, image_url, original_execution_id' });
+    }
+
+    // Get the task to verify ownership and get the original prompt
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Verify task belongs to user or user is admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Create a new task execution with revision prompt
+    const execution = {
+      executionId: Date.now().toString(),
+      taskId,
+      userId: task.userId, // Use the task owner's ID for execution
+      run_user_id: userId !== task.userId ? userId : undefined, // Record who actually ran the task if different from owner
+      status: 'pending',
+      startTime: new Date().toISOString(),
+      revision_prompt: revision_prompt,
+      original_image_url: image_url,
+      original_execution_id: original_execution_id
+    };
+
+    await taskDb.createTaskExecution(execution);
+    res.status(201).json({ success: true, execution });
+  } catch (error) {
+    console.error('Error creating revision execution:', error);
+    res.status(500).json({ message: 'Error creating revision execution' });
+  }
+});
+
 // Kill execution
 router.put('/:taskId/executions/:executionId/kill', authenticateToken, async (req: Request, res: Response) => {
   try {
