@@ -7,6 +7,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-07-31',
+    changes: [
+      'Supported image preview and revision',
+      '- Users can now click on any image in the Ad Images page to open a preview popup',
+      '- Preview popup displays the full image with download functionality',
+      '- Image Revision prompt allows users to describe how they want to modify the image',
+      '- Revision requests create new task executions with the original image as context',
+      '- Enables iterative improvement of generated images based on user feedback',
+    ],
+  },
+  {
     date: '2025-07-30',
     changes: [
       'Reduced noisy images in Ad Images by moving download_image to attachment folder',
