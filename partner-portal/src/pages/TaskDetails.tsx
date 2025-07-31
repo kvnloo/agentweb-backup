@@ -91,6 +91,7 @@ interface Task {
   updateKnowledgeBase?: boolean; // Flag for updating knowledge base
   updateLeadList?: boolean; // Flag for updating lead list
   leadListIdentifier?: string;
+  createVideo?: boolean; // Flag for creating video recording of task execution
   knowledgeBase?: string; // The content of the task's knowledge base
   knowledgeBaseSize?: number; // Size of the knowledge base in bytes
   knowledgeBaseType?: "public" | "private"; // Type of knowledge base
@@ -1609,6 +1610,24 @@ export default function TaskDetails() {
     }
   };
 
+  // Add the handler function for create video toggle
+  const handleCreateVideoToggle = async () => {
+    if (!task || !token) return;
+    const newCreateVideoValue = !(task?.createVideo || false);
+    try {
+      await axios.put(
+        buildApiUrl(`/api/tasks/${task.taskId}`),
+        { createVideo: newCreateVideoValue },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      await fetchTask(); // Re-fetch task data to update UI from source of truth
+      setError(""); // Clear previous errors
+    } catch (err) {
+      console.error("Failed to update create video setting:", err);
+      setError("Failed to update create video setting. Please try again.");
+    }
+  };
+
   if (loading) {
     return (
       <Box
@@ -2021,6 +2040,17 @@ export default function TaskDetails() {
                           )}
                         </Box>
                       }
+                    />
+                  </Tooltip>
+                  <Tooltip title="When enabled, the agent will create a video recording of the task execution for review and documentation">
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          checked={task?.createVideo || false}
+                          onChange={handleCreateVideoToggle}
+                        />
+                      }
+                      label="Create Video"
                     />
                   </Tooltip>
                 </Box>

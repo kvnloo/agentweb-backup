@@ -47,7 +47,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       turnOffHeadless,
       useKnowledgeBase,
       updateKnowledgeBase,
-      updateLeadList
+      updateLeadList,
+      createVideo
     } = req.body;
     
     // If templateId is provided, fetch the template and use its values
@@ -95,6 +96,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           useKnowledgeBase: useKnowledgeBase !== undefined ? Boolean(useKnowledgeBase) : template.useKnowledgeBase,
           updateKnowledgeBase: req.body.updateKnowledgeBase !== undefined ? Boolean(req.body.updateKnowledgeBase) : template.updateKnowledgeBase,
           updateLeadList: req.body.updateLeadList !== undefined ? Boolean(req.body.updateLeadList) : template.updateLeadList,
+          createVideo: req.body.createVideo !== undefined ? Boolean(req.body.createVideo) : template.createVideo,
           knowledgeBaseType: 'private', // Default to private for new tasks
           createdAt: new Date().toISOString(),
           llmName: req.body.llmName || null,
@@ -135,6 +137,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       useKnowledgeBase: Boolean(useKnowledgeBase),
       updateKnowledgeBase: Boolean(req.body.updateKnowledgeBase),
       updateLeadList: Boolean(req.body.updateLeadList),
+      createVideo: Boolean(req.body.createVideo),
       knowledgeBaseType: 'private', // Default to private for new tasks
       createdAt: new Date().toISOString(),
       llmName: req.body.llmName || null,
@@ -275,6 +278,10 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
 
     if (req.body.updateLeadList !== undefined) {
       updates.updateLeadList = Boolean(req.body.updateLeadList);
+    }
+
+    if (req.body.createVideo !== undefined) {
+      updates.createVideo = Boolean(req.body.createVideo);
     }
 
     if (req.body.leadListIdentifier !== undefined) {

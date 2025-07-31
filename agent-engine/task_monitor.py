@@ -477,7 +477,7 @@ async def update_workflow_execution(workflow_id: str, execution_id: str, updates
         logger.error(f"Error updating workflow execution: {e}")
         return False
 
-async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str, run_user_id: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False, use_knowledge_base: bool = False, update_knowledge_base: bool = False, update_lead_list: bool = False, lead_list_identifier: str = None, has_attachments: bool = False) -> Dict[str, Any]:
+async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str, run_user_id: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False, use_knowledge_base: bool = False, update_knowledge_base: bool = False, update_lead_list: bool = False, lead_list_identifier: str = None, has_attachments: bool = False, create_video: bool = False) -> Dict[str, Any]:
     global running_processes
     log_sync_manager = None
     process = None
@@ -547,6 +547,8 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
             cmd.extend(['--lead-list-identifier', lead_list_identifier])
         if has_attachments:
             cmd.append('--has-attachments')
+        if create_video:
+            cmd.append('--create-video')
         
         # Run command with output redirection
         logger.info(f"Running command: {' '.join(cmd)}")
@@ -1021,6 +1023,7 @@ async def execute_task(execution):
                         use_knowledge_base = bool(task.get('useKnowledgeBase', False)) if task else False
                         update_knowledge_base = bool(task.get('updateKnowledgeBase', False)) if task else False
                         update_lead_list = bool(task.get('updateLeadList', False)) if task else False
+                        create_video = bool(task.get('createVideo', False)) if task else False
                         
                         # Set filtered activity log path for later reference
                         filtered_activity_log = f'logs/execution_{execution_id}_browser_use.filtered.log'
@@ -1047,7 +1050,8 @@ async def execute_task(execution):
                             update_knowledge_base,
                             update_lead_list,
                             lead_list_identifier,
-                            has_attachments
+                            has_attachments,
+                            create_video
                         )
                     except Exception as e:
                         logger.error(f"Error running web agent: {str(e)}")

@@ -122,6 +122,7 @@ interface TaskTemplate {
   useKnowledgeBase?: boolean;
   updateKnowledgeBase?: boolean;
   updateLeadList?: boolean;
+  createVideo?: boolean;
 }
 
 interface UserWithCounts extends User {
@@ -456,6 +457,7 @@ export const taskDb = {
     selectedLLMs?: string[];
     useSharedBrowser?: boolean;
     turnOffHeadless?: boolean;
+    createVideo?: boolean;
   }) {
     try {
       const params = {
@@ -475,7 +477,7 @@ export const taskDb = {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Tasks`,
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, knowledgeBase, knowledgeBaseSize, knowledgeBaseType",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, createVideo, knowledgeBase, knowledgeBaseSize, knowledgeBaseType",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -546,7 +548,7 @@ export const taskDb = {
           ":userId": userId,
         },
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, knowledgeBaseSize",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, knowledgeBaseSize, createVideo",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -601,7 +603,7 @@ export const taskDb = {
           taskId,
         },
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, updateLeadList, leadListIdentifier, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, updateLeadList, createVideo, leadListIdentifier, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -655,6 +657,7 @@ export const taskDb = {
       useKnowledgeBase?: boolean;
       updateKnowledgeBase?: boolean;
       updateLeadList?: boolean;
+      createVideo?: boolean;
       leadListIdentifier?: string | null;
       knowledgeBaseUpdatedAt?: string;
     }>

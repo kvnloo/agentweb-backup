@@ -85,6 +85,13 @@ class VideoAnalysisParams(BaseModel):
     video_url: str
     prompt: str
 
+class GenerateVideoParams(BaseModel):
+    """Parameters for generating videos using Google VEO API."""
+    prompt: str
+    output_file_name: str
+    image_file_name: Optional[str] = None  # Optional input image for image-to-video generation
+    negative_prompt: Optional[str] = None  # Optional negative prompt to avoid certain elements
+
 class LogFilterThread(threading.Thread):
     """Thread that continuously filters the log file in real-time"""
     
@@ -285,7 +292,7 @@ class WebAgent:
         # Clear the reference to the log filter thread to help with garbage collection
         self.log_filter_thread = None
 
-    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False, use_knowledge_base: bool = False, update_knowledge_base: bool = False, update_lead_list: bool = False, lead_list_identifier: str = None, has_attachments: bool = False) -> Dict[str, Any]:
+    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False, use_knowledge_base: bool = False, update_knowledge_base: bool = False, update_lead_list: bool = False, lead_list_identifier: str = None, has_attachments: bool = False, create_video: bool = False) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
         log_file = None
         try:
@@ -303,6 +310,7 @@ class WebAgent:
             self.update_lead_list = update_lead_list
             self.lead_list_identifier = lead_list_identifier
             self.has_attachments = has_attachments
+            self.create_video = create_video
             # Set up logging
             log_file = self.setup_execution_logging(execution_id)
             
@@ -333,6 +341,10 @@ class WebAgent:
             # Add lead list instruction if enabled
             if self.update_lead_list:
                 prompt = f"{prompt}\n\nImportant: For this task, you MUST use the {'update_lead_list_json' if 'gemini' in self.llm_name.lower() else 'update_lead_list'} action to store your findings instead of reporting them in the final result. Each record should contain the identifier field {self.lead_list_identifier}. The action will handle both adding new records and updating existing ones. You can use the get_lead_list_identifiers action to get the list of existing identifiers."
+
+            # Add video generation instruction if enabled
+            if self.create_video:
+                prompt = f"{prompt}\n\nImportant: This task has video generation capabilities enabled. You can use the 'Generate short video' action to create videos based on text prompts. This is useful for creating promotional videos, tutorials, or any other video content needed for the task."
 
             # Create task
             self.task = prompt
@@ -1551,6 +1563,157 @@ class WebAgent:
                     )
                 except Exception as e:
                     return ActionResult(error=f"Failed to search knowledge base: {str(e)}")
+
+        # Add video generation action if create_video is enabled
+        if self.create_video:
+            @self.controller.registry.action('Generate short video', param_model=GenerateVideoParams)
+            async def generate_short_video(params: GenerateVideoParams) -> ActionResult:
+                """Generate videos using Google VEO API.
+                
+                This action uses Google VEO API to generate videos based on text prompts or input images.
+                The generated video is saved to the downloads folder.
+                
+                Parameters:
+                - params: GenerateVideoParams containing:
+                  - prompt: Description of the video to generate
+                  - output_file_name: Name of the output video file to save in downloads folder (must end with .mp4)
+                  - image_file_name: Optional input image file name for image-to-video generation. If provided, the file will be searched in task attachments first, then in downloads folder.
+                  - negative_prompt: Optional negative prompt to specify what to avoid in the generated video
+                
+                Note: VEO 3 generates 8-second videos in 16:9 aspect ratio only.
+                
+                Returns:
+                - ActionResult with the generation results or error message
+                """
+                try:
+                    # Import Google AI client
+                    try:
+                        from google import genai
+                        from google.genai import types
+                    except ImportError:
+                        return ActionResult(error="Google Generative AI package not installed. Install with: pip install google-genai")
+
+                    # Get API key
+                    api_key = os.getenv('GOOGLE_VEO_API_KEY')
+                    if not api_key:
+                        return ActionResult(error="GOOGLE_VEO_API_KEY environment variable is not set")
+
+                    # Initialize the client
+                    client = genai.Client(api_key=api_key)
+                    
+                    # Validate parameters
+                    # VEO 3 generates 8-second videos in 16:9 aspect ratio only
+                    # No validation needed for duration or aspect ratio as they are fixed
+                    
+                    # Validate output file extension (must end with .mp4)
+                    output_ext = Path(params.output_file_name).suffix.lower()
+                    if output_ext != ".mp4":
+                        return ActionResult(error=f"Output file extension '{output_ext}' must be '.mp4'. Please rename the file to end with .mp4")
+                    
+                    # Get downloads path for output
+                    downloads_path = self._get_downloads_path()
+                    output_path = Path(downloads_path) / params.output_file_name
+                    
+                    # Handle input image if provided
+                    image_object = None
+                    if params.image_file_name:
+                        # Try to get file path from attachments first, then downloads
+                        image_path = await self._get_attachment_path(params.image_file_name)
+                        
+                        if not image_path:
+                            # If not found in attachments, try downloads path
+                            image_path = Path(downloads_path) / params.image_file_name
+                            
+                            if not image_path.exists():
+                                return ActionResult(error=f"Input image file {params.image_file_name} not found in task attachments or downloads folder")
+                        
+                        # Check if file is an image
+                        image_ext = Path(params.image_file_name).suffix.lower()
+                        if image_ext not in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp']:
+                            return ActionResult(error=f"File {params.image_file_name} is not a supported image format. Supported formats: PNG, JPG, JPEG, GIF, BMP, WEBP")
+                        
+                        # Read the image file and create image object
+                        try:
+                            with open(image_path, "rb") as f:
+                                image_bytes = f.read()
+                            
+                            # Determine MIME type based on file extension
+                            mime_type_map = {
+                                '.png': 'image/png',
+                                '.jpg': 'image/jpeg',
+                                '.jpeg': 'image/jpeg',
+                                '.gif': 'image/gif',
+                                '.bmp': 'image/bmp',
+                                '.webp': 'image/webp'
+                            }
+                            mime_type = mime_type_map.get(image_ext, 'image/jpeg')
+                            
+                            image_object = types.Image(image_bytes=image_bytes, mime_type=mime_type)
+                            logger.info(f"Loaded input image: {params.image_file_name} (MIME: {mime_type})")
+                        except Exception as e:
+                            return ActionResult(error=f"Failed to read image file {params.image_file_name}: {str(e)}")
+                    
+                    logger.info(f"Generating video with prompt: {params.prompt}")
+                    logger.info("VEO 3: Generating 8-second video in 16:9 aspect ratio")
+                    
+                    # Generate video using VEO API
+                    if image_object:
+                        # Image-to-video generation
+                        logger.info("Generating video from input image")
+                        config_params = {
+                            "aspect_ratio": "16:9",  # 16:9 is the only supported value for Veo 3
+                            "number_of_videos": 1,  # 1 video generated per request
+                        }
+                        if params.negative_prompt:
+                            config_params["negative_prompt"] = params.negative_prompt
+                        
+                        operation = client.models.generate_videos(
+                            model="veo-3.0-generate-preview",
+                            prompt=params.prompt,
+                            image=image_object,
+                            config=types.GenerateVideosConfig(**config_params)
+                        )
+                    else:
+                        # Text-to-video generation
+                        logger.info("Generating video from text prompt")
+                        config_params = {
+                            "aspect_ratio": "16:9",  # 16:9 is the only supported value for Veo 3
+                            "number_of_videos": 1,  # 1 video generated per request
+                        }
+                        if params.negative_prompt:
+                            config_params["negative_prompt"] = params.negative_prompt
+                        
+                        operation = client.models.generate_videos(
+                            model="veo-3.0-generate-preview",
+                            prompt=params.prompt,
+                            config=types.GenerateVideosConfig(**config_params)
+                        )
+                    
+                    # Wait for the video to be generated
+                    logger.info("Waiting for video generation to complete...")
+                    while not operation.done:
+                        time.sleep(20)
+                        operation = client.operations.get(operation)
+                        logger.info(f"Video generation update: {operation}")
+                    
+                    result = operation.result
+                    
+                    # Check if video was generated successfully
+                    if result and result.generated_videos and len(result.generated_videos) > 0:
+                        # Download and save the video
+                        generated_video = result.generated_videos[0]
+                        client.files.download(file=generated_video.video)
+                        generated_video.video.save(output_path)
+                        
+                        logger.info(f"Generated video saved to: {output_path}")
+                        
+                        return ActionResult(extracted_content=f"✅ Video {params.output_file_name} generated successfully and saved to downloads folder!")
+                    else:
+                        return ActionResult(error="No video data received from Google VEO API")
+
+                except Exception as e:
+                    logger.error(f"Error generating video: {e}")
+                    return ActionResult(error=f"Failed to generate video: {str(e)}")
 
         # Add lead list actions if update_lead_list is enabled
         if self.update_lead_list:
@@ -2856,6 +3019,7 @@ async def main():
     parser.add_argument('--update-lead-list', action='store_true', help='Enable lead list updates during task execution')
     parser.add_argument('--lead-list-identifier', help='Identifier field name for lead list records')
     parser.add_argument('--has-attachments', action='store_true', help='Task has attachments')
+    parser.add_argument('--create-video', action='store_true', help='Create video recording of task execution')
     args = parser.parse_args()
 
     # Read prompt from file
@@ -2891,7 +3055,8 @@ async def main():
             update_knowledge_base=args.update_knowledge_base,
             update_lead_list=args.update_lead_list,
             lead_list_identifier=args.lead_list_identifier,
-            has_attachments=args.has_attachments
+            has_attachments=args.has_attachments,
+            create_video=args.create_video
         )
         print(json.dumps(result))
         sys.exit(0 if result["success"] else 1)
