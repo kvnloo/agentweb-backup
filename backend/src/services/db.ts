@@ -754,6 +754,9 @@ export const taskDb = {
     workflowExecutionId?: string;
     prompt?: string;
     feedback?: string;
+    revision_prompt?: string;
+    original_image_url?: string;
+    original_execution_id?: string;
   }) {
     try {
       const params = {

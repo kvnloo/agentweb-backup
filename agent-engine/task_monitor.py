@@ -788,18 +788,36 @@ async def execute_task(execution):
             # Prepare the prompt with previous feedback and user_id context
             base_prompt = execution.get('prompt') or task['prompt']
             
-            # Add user feedback if provided
-            user_feedback = execution.get('feedback')
-            if user_feedback:
-                base_prompt = f"{base_prompt}\n\nUser Feedback for Improvement: {user_feedback}"
-                logger.info(f"Added user feedback to task {task_id} execution {execution_id}: {user_feedback}")
-            else:
-                logger.info(f"No user feedback provided for task {task_id} execution {execution_id}")
+            # Check if this is a revision execution
+            revision_prompt = execution.get('revision_prompt')
+            original_image_url = execution.get('original_image_url')
+            original_execution_id = execution.get('original_execution_id')
             
-            if previous_feedback:
-                prompt = f"Task: {base_prompt}\n\nNote: Previous attempt {previous_feedback['time_ago']} was {previous_feedback['feedback']}. Previous result: {previous_feedback['result']}"
+            if revision_prompt and original_image_url:
+                # This is a revision execution - use the revision prompt as the main task
+                logger.info(f"Processing revision execution for task {task_id} execution {execution_id}")
+                logger.info(f"Original execution: {original_execution_id}")
+                logger.info(f"Original image: {original_image_url}")
+                logger.info(f"Revision prompt: {revision_prompt}")
+                
+                # The revision prompt becomes the main task, with the original prompt as context
+                prompt = f"""Task: Create a new image based on the revision prompt and the original image. Use original task as context.\n\n
+                Revision Prompt: {revision_prompt}\n    
+                Original Image URL: {original_image_url}\n\n
+                Context - Original Task: {base_prompt}\n\n"""
             else:
-                prompt = f"Task: {base_prompt}"
+                # Regular execution - add user feedback if provided
+                user_feedback = execution.get('feedback')
+                if user_feedback:
+                    base_prompt = f"{base_prompt}\n\nUser Feedback for Improvement: {user_feedback}"
+                    logger.info(f"Added user feedback to task {task_id} execution {execution_id}: {user_feedback}")
+                else:
+                    logger.info(f"No user feedback provided for task {task_id} execution {execution_id}")
+                
+                if previous_feedback:
+                    prompt = f"Task: {base_prompt}\n\nNote: Previous attempt {previous_feedback['time_ago']} was {previous_feedback['feedback']}. Previous result: {previous_feedback['result']}"
+                else:
+                    prompt = f"Task: {base_prompt}"
 
             # Add attachment information if present
             has_attachments = bool(task.get('attachments'))
