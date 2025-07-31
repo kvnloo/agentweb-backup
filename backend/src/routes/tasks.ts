@@ -894,39 +894,43 @@ router.get('/executions/with-images', authenticateToken, async (req: Request, re
       });
     });
 
-    // Get all tasks for the user to match with executions
+    // Get all non-archived tasks for the user to match with executions
     const allTasks = await taskDb.getTasksByUserId(userId);
-    const taskMap = new Map(allTasks?.map((task: any) => [task.taskId, task]) || []);
+    const nonArchivedTasks = allTasks?.filter((task: any) => task.status !== 'archived') || [];
+    const taskMap = new Map(nonArchivedTasks.map((task: any) => [task.taskId, task]));
 
-        // Group executions by taskId
+        // Group executions by taskId, but only for non-archived tasks
     const result: Record<string, any> = {};
     
     executionsWithImages.forEach((execution: any) => {
       const task = taskMap.get(execution.taskId);
       const taskId = execution.taskId;
       
-      if (!result[taskId]) {
-        result[taskId] = {
-          taskId: taskId,
-          taskName: task?.name || 'Unknown Task',
-          createdAt: task?.createdAt || null,
-          executions: []
-        };
+      // Only include executions from non-archived tasks
+      if (task) {
+        if (!result[taskId]) {
+          result[taskId] = {
+            taskId: taskId,
+            taskName: task.name,
+            createdAt: task.createdAt,
+            executions: []
+          };
+        }
+        
+        result[taskId].executions.push({
+          executionId: execution.executionId,
+          startTime: execution.startTime || null,
+          result_files: execution.result_files?.filter((file: ResultFile) => {
+            const filename = file.filename.toLowerCase();
+            return filename.endsWith('.jpg') || 
+                   filename.endsWith('.jpeg') || 
+                   filename.endsWith('.png') || 
+                   filename.endsWith('.gif') || 
+                   filename.endsWith('.webp') || 
+                   filename.endsWith('.svg');
+          }) || []
+        });
       }
-      
-      result[taskId].executions.push({
-        executionId: execution.executionId,
-        startTime: execution.startTime || null,
-        result_files: execution.result_files?.filter((file: ResultFile) => {
-          const filename = file.filename.toLowerCase();
-          return filename.endsWith('.jpg') || 
-                 filename.endsWith('.jpeg') || 
-                 filename.endsWith('.png') || 
-                 filename.endsWith('.gif') || 
-                 filename.endsWith('.webp') || 
-                 filename.endsWith('.svg');
-        }) || []
-      });
     });
 
     // Calculate latest execution time and find latest pending/running execution for each task
