@@ -1391,85 +1391,93 @@ const ImagesPage: React.FC = () => {
 
       {/* Image Preview Dialog */}
       <Dialog open={imagePreviewOpen} onOpenChange={setImagePreviewOpen}>
-        <DialogContent className="sm:max-w-[95vw] max-h-[90vh] p-0">
-          <div className="relative w-full h-full flex flex-col">
-            {previewImage && (
-              <>
-                {/* Header with filename and controls */}
-                <div className="bg-gray-900 border-b border-gray-600 p-4 pr-12 flex items-center justify-between">
-                  <div className="text-white text-sm font-medium">
-                    {previewImage.filename}
-                  </div>
-                  <div className="flex items-center gap-6">
+        <DialogContent className="max-w-[95vw] max-h-[95vh] p-0 overflow-auto">
+          {previewImage && (
+            <div className="bg-white">
+              {/* Header */}
+              <div className="sticky top-0 bg-gray-900 border-b border-gray-600 p-4 pr-4 flex items-center justify-between z-10">
+                <div className="text-white text-sm font-medium">
+                  {previewImage.filename}
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 w-8 p-0 bg-gray-800 text-white hover:bg-gray-700"
+                    onClick={() => window.open(previewImage.url, '_blank')}
+                    title="Download Image"
+                  >
+                    <Download className="h-4 w-4" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 w-8 p-0 bg-gray-800 text-white hover:bg-gray-700"
+                    onClick={() => {
+                      setImagePreviewOpen(false);
+                      setRevisionPrompt('');
+                    }}
+                    title="Close"
+                  >
+                    <X className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+
+              {/* Main content area - side by side */}
+              <div className="flex">
+                {/* Image - Left side */}
+                <div className="flex-1 bg-black p-4">
+                  <img
+                    src={previewImage.url}
+                    alt={previewImage.filename}
+                    className="w-full h-auto"
+                    onError={(e) => {
+                      const target = e.target as HTMLImageElement;
+                      target.src = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjAwIiBoZWlnaHQ9IjIwMCIgdmlld0JveD0iMCAwIDIwMCAyMDAiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CjxyZWN0IHdpZHRoPSIyMDAiIGhlaWdodD0iMjAwIiBmaWxsPSIjRjNGNEY2Ii8+CjxwYXRoIGQ9Ik02MCAxMDBDNjAgODguOTU0MyA2OC45NTQzIDgwIDgwIDgwQzkxLjA0NTcgODAgMTAwIDg4Ljk1NDMgMTAwIDEwMEMxMDAgMTExLjA0NiA5MS4wNDU3IDEyMCA4MCAxMjBDNjguOTU0MyAxMjAgNjAgMTExLjA0NiA2MCAxMDBaIiBmaWxsPSIjOUI5QkEwIi8+CjxwYXRoIGQ9Ik04MCAxNDBDNjguOTU0MyAxNDAgNjAgMTMxLjA0NiA2MCAxMjBMMTAwIDEyMEMxMDAgMTMxLjA0NiA5MS4wNDU3IDE0MCA4MCAxNDBaIiBmaWxsPSIjOUI5QkEwIi8+Cjwvc3ZnPgo=';
+                    }}
+                  />
+                </div>
+
+                {/* Revision Prompt Section - Right side */}
+                <div className="w-80 bg-gray-900 border-l border-gray-600 p-4 flex flex-col">
+                  <div className="flex-1">
+                    <Label htmlFor="revisionPrompt" className="text-white text-sm font-medium mb-3 block">
+                      Image Revision Prompt
+                    </Label>
+                    <Textarea
+                      id="revisionPrompt"
+                      placeholder="Describe how you'd like to revise this image (e.g., 'Make it more vibrant', 'Change the background to blue', 'Add more details')"
+                      value={revisionPrompt}
+                      onChange={(e) => setRevisionPrompt(e.target.value)}
+                      className="min-h-[120px] bg-gray-800 border-gray-600 text-white placeholder-gray-400 resize-none mb-4 w-full"
+                      onClick={(e) => e.stopPropagation()}
+                    />
                     <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-8 w-8 p-0 bg-gray-800 text-white hover:bg-gray-700"
-                      onClick={() => window.open(previewImage.url, '_blank')}
-                      title="Download Image"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleSubmitRevision();
+                      }}
+                      disabled={!revisionPrompt.trim() || isSubmittingRevision}
+                      className="w-full bg-blue-600 hover:bg-blue-700 text-white py-2"
                     >
-                      <Download className="h-4 w-4" />
+                      {isSubmittingRevision ? (
+                        <>
+                          <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                          Submitting...
+                        </>
+                      ) : (
+                        <>
+                          <Zap className="h-4 w-4 mr-2" />
+                          Submit Revision
+                        </>
+                      )}
                     </Button>
                   </div>
                 </div>
-
-                {/* Main content area */}
-                <div className="flex-1 flex">
-                  {/* Image display area - Left side */}
-                  <div className="flex-1 relative bg-black">
-                    <div className="w-full h-full flex items-center justify-center">
-                      <img
-                        src={previewImage.url}
-                        alt={previewImage.filename}
-                        className="max-w-full max-h-full object-contain"
-                        onError={(e) => {
-                          const target = e.target as HTMLImageElement;
-                          target.src = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjAwIiBoZWlnaHQ9IjIwMCIgdmlld0JveD0iMCAwIDIwMCAyMDAiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CjxyZWN0IHdpZHRoPSIyMDAiIGhlaWdodD0iMjAwIiBmaWxsPSIjRjNGNEY2Ii8+CjxwYXRoIGQ9Ik02MCAxMDBDNjAgODguOTU0MyA2OC45NTQzIDgwIDgwIDgwQzkxLjA0NTcgODAgMTAwIDg4Ljk1NDMgMTAwIDEwMEMxMDAgMTExLjA0NiA5MS4wNDU3IDEyMCA4MCAxMjBDNjguOTU0MyAxMjAgNjAgMTExLjA0NiA2MCAxMDBaIiBmaWxsPSIjOUI5QkEwIi8+CjxwYXRoIGQ9Ik04MCAxNDBDNjguOTU0MyAxNDAgNjAgMTMxLjA0NiA2MCAxMjBMMTAwIDEyMEMxMDAgMTMxLjA0NiA5MS4wNDU3IDE0MCA4MCAxNDBaIiBmaWxsPSIjOUI5QkEwIi8+Cjwvc3ZnPgo=';
-                        }}
-                      />
-                    </div>
-                  </div>
-
-                  {/* Revision Prompt Section - Right side */}
-                  <div className="w-80 bg-gray-900 border-l border-gray-600 p-4 flex flex-col">
-                    <div className="flex-1">
-                      <Label htmlFor="revisionPrompt" className="text-white text-sm font-medium mb-3 block">
-                        Image Revision Prompt
-                      </Label>
-                      <Textarea
-                        id="revisionPrompt"
-                        placeholder="Describe how you'd like to revise this image (e.g., 'Make it more vibrant', 'Change the background to blue', 'Add more details')"
-                        value={revisionPrompt}
-                        onChange={(e) => setRevisionPrompt(e.target.value)}
-                        className="min-h-[120px] bg-gray-800 border-gray-600 text-white placeholder-gray-400 resize-none mb-4"
-                        onClick={(e) => e.stopPropagation()}
-                      />
-                      <Button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleSubmitRevision();
-                        }}
-                        disabled={!revisionPrompt.trim() || isSubmittingRevision}
-                        className="w-full bg-blue-600 hover:bg-blue-700 text-white py-2"
-                      >
-                        {isSubmittingRevision ? (
-                          <>
-                            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                            Submitting...
-                          </>
-                        ) : (
-                          <>
-                            <Zap className="h-4 w-4 mr-2" />
-                            Submit Revision
-                          </>
-                        )}
-                      </Button>
-                    </div>
-                  </div>
-                </div>
-              </>
-            )}
-          </div>
+              </div>
+            </div>
+          )}
         </DialogContent>
       </Dialog>
     </div>
