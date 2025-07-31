@@ -90,6 +90,7 @@ class GenerateVideoParams(BaseModel):
     prompt: str
     output_file_name: str
     image_file_name: Optional[str] = None  # Optional input image for image-to-video generation
+    negative_prompt: Optional[str] = None  # Optional negative prompt to avoid certain elements
 
 class LogFilterThread(threading.Thread):
     """Thread that continuously filters the log file in real-time"""
@@ -1577,6 +1578,7 @@ class WebAgent:
                   - prompt: Description of the video to generate
                   - output_file_name: Name of the output video file to save in downloads folder (must end with .mp4)
                   - image_file_name: Optional input image file name for image-to-video generation. If provided, the file will be searched in task attachments first, then in downloads folder.
+                  - negative_prompt: Optional negative prompt to specify what to avoid in the generated video
                 
                 Note: VEO 3 generates 8-second videos in 16:9 aspect ratio only.
                 
@@ -1658,25 +1660,33 @@ class WebAgent:
                     if image_object:
                         # Image-to-video generation
                         logger.info("Generating video from input image")
+                        config_params = {
+                            "aspect_ratio": "16:9",  # 16:9 is the only supported value for Veo 3
+                            "number_of_videos": 1,  # 1 video generated per request
+                        }
+                        if params.negative_prompt:
+                            config_params["negative_prompt"] = params.negative_prompt
+                        
                         operation = client.models.generate_videos(
                             model="veo-3.0-generate-preview",
                             prompt=params.prompt,
                             image=image_object,
-                            config=types.GenerateVideosConfig(
-                                aspect_ratio="16:9",  # 16:9 is the only supported value for Veo 3
-                                number_of_videos=1,  # 1 video generated per request
-                            )
+                            config=types.GenerateVideosConfig(**config_params)
                         )
                     else:
                         # Text-to-video generation
                         logger.info("Generating video from text prompt")
+                        config_params = {
+                            "aspect_ratio": "16:9",  # 16:9 is the only supported value for Veo 3
+                            "number_of_videos": 1,  # 1 video generated per request
+                        }
+                        if params.negative_prompt:
+                            config_params["negative_prompt"] = params.negative_prompt
+                        
                         operation = client.models.generate_videos(
                             model="veo-3.0-generate-preview",
                             prompt=params.prompt,
-                            config=types.GenerateVideosConfig(
-                                aspect_ratio="16:9",  # 16:9 is the only supported value for Veo 3
-                                number_of_videos=1,  # 1 video generated per request
-                            )
+                            config=types.GenerateVideosConfig(**config_params)
                         )
                     
                     # Wait for the video to be generated
