@@ -13,7 +13,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { Checkbox } from '@/components/ui/checkbox';
-import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink, Clock, ArrowUpRight, Play, Zap, Download, Heart, Plus, Archive, Upload, ChevronDown } from 'lucide-react';
+import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink, Clock, ArrowUpRight, Play, Zap, Download, Heart, Plus, Archive, Upload, ChevronDown, X } from 'lucide-react';
 import { format } from 'date-fns';
 import { useNavigate } from 'react-router-dom';
 import { useToast } from '@/hooks/use-toast';
@@ -98,6 +98,22 @@ const ImagesPage: React.FC = () => {
   const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
   const [uploadingImage, setUploadingImage] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [imagePreviewOpen, setImagePreviewOpen] = useState(false);
+  const [previewImage, setPreviewImage] = useState<{ url: string; filename: string } | null>(null);
+
+  // Handle escape key to close image preview
+  useEffect(() => {
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && imagePreviewOpen) {
+        setImagePreviewOpen(false);
+      }
+    };
+
+    if (imagePreviewOpen) {
+      document.addEventListener('keydown', handleEscape);
+      return () => document.removeEventListener('keydown', handleEscape);
+    }
+  }, [imagePreviewOpen]);
   const refreshIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const [refreshingExecutions, setRefreshingExecutions] = useState<Set<string>>(new Set());
 
@@ -353,8 +369,9 @@ const ImagesPage: React.FC = () => {
     }
   };
 
-  const handleViewImage = (imageUrl: string) => {
-    window.open(imageUrl, '_blank');
+  const handleViewImage = (imageUrl: string, filename: string) => {
+    setPreviewImage({ url: imageUrl, filename });
+    setImagePreviewOpen(true);
   };
 
   const handleFavoriteImage = async (executionId: string, imageUrl: string) => {
@@ -982,7 +999,11 @@ const ImagesPage: React.FC = () => {
                     {task.executions.flatMap((execution, executionIndex) => 
                       execution.result_files.filter(file => !file.is_archived).map((file, fileIndex) => (
                         <div key={`${execution.executionId}-${fileIndex}`} className="group relative">
-                          <div className="aspect-square overflow-hidden rounded-lg border border-gray-200 dark:border-gray-700">
+                          <div 
+                            className="aspect-square overflow-hidden rounded-lg border border-gray-200 dark:border-gray-700 cursor-pointer"
+                            onClick={() => handleViewImage(file.url, file.filename)}
+                            title="Click to preview image"
+                          >
                             <img
                               src={file.url}
                               alt={file.filename}
@@ -1017,7 +1038,7 @@ const ImagesPage: React.FC = () => {
                                 variant="ghost"
                                 size="sm"
                                 className="h-8 w-8 p-0 hover:bg-gray-100 dark:hover:bg-gray-800"
-                                onClick={() => handleViewImage(file.url)}
+                                onClick={() => handleViewImage(file.url, file.filename)}
                                 title="View Image"
                               >
                                 <Download className="h-4 w-4" />
@@ -1309,6 +1330,56 @@ const ImagesPage: React.FC = () => {
               )}
             </Button>
           </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Image Preview Dialog */}
+      <Dialog open={imagePreviewOpen} onOpenChange={setImagePreviewOpen}>
+        <DialogContent className="sm:max-w-[90vw] max-h-[90vh] p-0 overflow-hidden">
+          <div className="relative w-full h-full">
+            {previewImage && (
+              <>
+                <div className="absolute top-4 left-4 z-10 bg-black/50 text-white px-3 py-1 rounded-md text-sm">
+                  {previewImage.filename}
+                </div>
+                <div className="absolute top-4 right-4 z-10 flex gap-2">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 w-8 p-0 bg-black/50 text-white hover:bg-black/70"
+                    onClick={() => window.open(previewImage.url, '_blank')}
+                    title="Download Image"
+                  >
+                    <Download className="h-4 w-4" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 w-8 p-0 bg-black/50 text-white hover:bg-black/70"
+                    onClick={() => setImagePreviewOpen(false)}
+                    title="Close Preview"
+                  >
+                    <X className="h-4 w-4" />
+                  </Button>
+                </div>
+                <div 
+                  className="w-full h-full flex items-center justify-center bg-black cursor-pointer"
+                  onClick={() => setImagePreviewOpen(false)}
+                >
+                  <img
+                    src={previewImage.url}
+                    alt={previewImage.filename}
+                    className="max-w-full max-h-full object-contain"
+                    onClick={(e) => e.stopPropagation()}
+                    onError={(e) => {
+                      const target = e.target as HTMLImageElement;
+                      target.src = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjAwIiBoZWlnaHQ9IjIwMCIgdmlld0JveD0iMCAwIDIwMCAyMDAiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CjxyZWN0IHdpZHRoPSIyMDAiIGhlaWdodD0iMjAwIiBmaWxsPSIjRjNGNEY2Ii8+CjxwYXRoIGQ9Ik02MCAxMDBDNjAgODguOTU0MyA2OC45NTQzIDgwIDgwIDgwQzkxLjA0NTcgODAgMTAwIDg4Ljk1NDMgMTAwIDEwMEMxMDAgMTExLjA0NiA5MS4wNDU3IDEyMCA4MCAxMjBDNjguOTU0MyAxMjAgNjAgMTExLjA0NiA2MCAxMDBaIiBmaWxsPSIjOUI5QkEwIi8+CjxwYXRoIGQ9Ik04MCAxNDBDNjguOTU0MyAxNDAgNjAgMTMxLjA0NiA2MCAxMjBMMTAwIDEyMEMxMDAgMTMxLjA0NiA5MS4wNDU3IDE0MCA4MCAxNDBaIiBmaWxsPSIjOUI5QkEwIi8+Cjwvc3ZnPgo=';
+                    }}
+                  />
+                </div>
+              </>
+            )}
+          </div>
         </DialogContent>
       </Dialog>
     </div>
