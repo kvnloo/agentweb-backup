@@ -26,6 +26,7 @@ export interface Task {
   knowledgeBaseSize?: number; // Size of the knowledge base in bytes
   knowledgeBaseType?: 'public' | 'private'; // Whether the knowledge base is stored in public or private bucket
   knowledgeBaseUpdatedAt?: string; // When the knowledge base was last updated
+  createVideo?: boolean; // Whether to create a video recording of the task execution
   description?: string; // Description of the task
   category?: string; // Category of the task
 }
@@ -56,4 +57,5 @@ export interface TaskUpdate {
   knowledgeBaseSize?: number; // Size of the knowledge base in bytes
   knowledgeBaseType?: 'public' | 'private'; // Whether the knowledge base is stored in public or private bucket
   knowledgeBaseUpdatedAt?: string; // When the knowledge base was last updated
+  createVideo?: boolean; // Whether to create a video recording of the task execution
 } 
