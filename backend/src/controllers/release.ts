@@ -8,6 +8,17 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-07-31",
+    changes: [
+      "Added Create Video toggle to Task Details",
+      "- Users can now enable video generation capabilities for tasks",
+      "- Supports both text-to-video and image-to-video generation using Google VEO API",
+      "- Generated videos are 8-second MP4 files in 16:9 aspect ratio",
+      "- Includes support for negative prompts to avoid unwanted elements",
+      "- Videos are automatically saved to downloads folder and can be referenced in task results",
+    ],
+  },
+  {
     date: "2025-07-28",
     changes: [
       "Added support for two new Gemini models: Gemini 2.5 Flash and Gemini 2.5 Flash Lite",
