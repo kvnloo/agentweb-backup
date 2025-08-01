@@ -6,6 +6,7 @@ import os
 import re
 import uuid
 import threading
+import base64
 from typing import Dict, Any, Optional, List, Union
 import browser_use
 from browser_use import Agent, Controller
@@ -292,7 +293,7 @@ class WebAgent:
         # Clear the reference to the log filter thread to help with garbage collection
         self.log_filter_thread = None
 
-    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False, use_knowledge_base: bool = False, update_knowledge_base: bool = False, update_lead_list: bool = False, lead_list_identifier: str = None, has_attachments: bool = False, create_video: bool = False) -> Dict[str, Any]:
+    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False, use_knowledge_base: bool = False, update_knowledge_base: bool = False, update_lead_list: bool = False, lead_list_identifier: str = None, has_attachments: bool = False, create_video: bool = False, video_model: str = None) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
         log_file = None
         try:
@@ -311,6 +312,7 @@ class WebAgent:
             self.lead_list_identifier = lead_list_identifier
             self.has_attachments = has_attachments
             self.create_video = create_video
+            self.video_model = video_model
             # Set up logging
             log_file = self.setup_execution_logging(execution_id)
             
@@ -1568,10 +1570,14 @@ class WebAgent:
         if self.create_video:
             @self.controller.registry.action('Generate short video', param_model=GenerateVideoParams)
             async def generate_short_video(params: GenerateVideoParams) -> ActionResult:
-                """Generate videos using Google VEO API.
+                """Generate videos using Google VEO API or Runway AI API.
                 
-                This action uses Google VEO API to generate videos based on text prompts or input images.
+                This action uses the selected video model to generate videos based on text prompts or input images.
                 The generated video is saved to the downloads folder.
+                
+                Supported models:
+                - veo-3.0-generate-preview (Google): 8-second videos with audio supported, 16:9 aspect ratio
+                - gen4_turbo (Runway AI): 5-second videos without audio, 1280:720 ratio
                 
                 Parameters:
                 - params: GenerateVideoParams containing:
@@ -1580,30 +1586,13 @@ class WebAgent:
                   - image_file_name: Optional input image file name for image-to-video generation. If provided, the file will be searched in task attachments first, then in downloads folder.
                   - negative_prompt: Optional negative prompt to specify what to avoid in the generated video
                 
-                Note: VEO 3 generates 8-second videos in 16:9 aspect ratio only.
-                
                 Returns:
                 - ActionResult with the generation results or error message
                 """
                 try:
-                    # Import Google AI client
-                    try:
-                        from google import genai
-                        from google.genai import types
-                    except ImportError:
-                        return ActionResult(error="Google Generative AI package not installed. Install with: pip install google-genai")
-
-                    # Get API key
-                    api_key = os.getenv('GOOGLE_VEO_API_KEY')
-                    if not api_key:
-                        return ActionResult(error="GOOGLE_VEO_API_KEY environment variable is not set")
-
-                    # Initialize the client
-                    client = genai.Client(api_key=api_key)
-                    
-                    # Validate parameters
-                    # VEO 3 generates 8-second videos in 16:9 aspect ratio only
-                    # No validation needed for duration or aspect ratio as they are fixed
+                    # Get the video model to use (default to Google VEO if not specified)
+                    video_model = self.video_model or "veo-3.0-generate-preview"
+                    logger.info(f"Using video model: {video_model}")
                     
                     # Validate output file extension (must end with .mp4)
                     output_ext = Path(params.output_file_name).suffix.lower()
@@ -1613,9 +1602,10 @@ class WebAgent:
                     # Get downloads path for output
                     downloads_path = self._get_downloads_path()
                     output_path = Path(downloads_path) / params.output_file_name
+
                     
                     # Handle input image if provided
-                    image_object = None
+                    image_path = None
                     if params.image_file_name:
                         # Try to get file path from attachments first, then downloads
                         image_path = await self._get_attachment_path(params.image_file_name)
@@ -1632,84 +1622,169 @@ class WebAgent:
                         if image_ext not in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp']:
                             return ActionResult(error=f"File {params.image_file_name} is not a supported image format. Supported formats: PNG, JPG, JPEG, GIF, BMP, WEBP")
                         
-                        # Read the image file and create image object
-                        try:
-                            with open(image_path, "rb") as f:
-                                image_bytes = f.read()
-                            
-                            # Determine MIME type based on file extension
-                            mime_type_map = {
-                                '.png': 'image/png',
-                                '.jpg': 'image/jpeg',
-                                '.jpeg': 'image/jpeg',
-                                '.gif': 'image/gif',
-                                '.bmp': 'image/bmp',
-                                '.webp': 'image/webp'
-                            }
-                            mime_type = mime_type_map.get(image_ext, 'image/jpeg')
-                            
-                            image_object = types.Image(image_bytes=image_bytes, mime_type=mime_type)
-                            logger.info(f"Loaded input image: {params.image_file_name} (MIME: {mime_type})")
-                        except Exception as e:
-                            return ActionResult(error=f"Failed to read image file {params.image_file_name}: {str(e)}")
+                        logger.info(f"Using input image: {params.image_file_name}")
                     
                     logger.info(f"Generating video with prompt: {params.prompt}")
-                    logger.info("VEO 3: Generating 8-second video in 16:9 aspect ratio")
                     
-                    # Generate video using VEO API
-                    if image_object:
-                        # Image-to-video generation
-                        logger.info("Generating video from input image")
-                        config_params = {
-                            "aspect_ratio": "16:9",  # 16:9 is the only supported value for Veo 3
-                            "number_of_videos": 1,  # 1 video generated per request
-                        }
-                        if params.negative_prompt:
-                            config_params["negative_prompt"] = params.negative_prompt
+                    # Generate video based on selected model
+                    if video_model == "gen4_turbo":
+                        # Use Runway AI
+                        try:
+                            from runwayml import RunwayML
+                        except ImportError:
+                            return ActionResult(error="Runway ML package not installed. Install with: pip install runwayml")
                         
-                        operation = client.models.generate_videos(
-                            model="veo-3.0-generate-preview",
-                            prompt=params.prompt,
-                            image=image_object,
-                            config=types.GenerateVideosConfig(**config_params)
-                        )
+                        # Get API key
+                        api_key = os.getenv('RUNWAY_API_KEY')
+                        if not api_key:
+                            return ActionResult(error="RUNWAY_API_KEY environment variable is not set")
+                        
+                        client = RunwayML(api_key=api_key)
+                        logger.info("Runway AI: Generating 5-second video without audio")
+                        
+                        if image_path:
+                            # Image-to-video generation
+                            logger.info("Generating video from input image using Runway AI")
+                            
+                            # Encode image to data URI
+                            with open(image_path, "rb") as f:
+                                base64_image = base64.b64encode(f.read()).decode("utf-8")
+                                # Get the image extension to determine MIME type
+                                image_ext = Path(params.image_file_name).suffix.lower()
+                                mime_map = {
+                                    '.png': 'image/png',
+                                    '.jpg': 'image/jpeg', 
+                                    '.jpeg': 'image/jpeg',
+                                    '.gif': 'image/gif',
+                                    '.bmp': 'image/bmp',
+                                    '.webp': 'image/webp'
+                                }
+                                mime_type = mime_map.get(image_ext, 'image/png')
+                                data_uri = f"data:{mime_type};base64,{base64_image}"
+                            
+                            try:
+                                task = client.image_to_video.create(
+                                    model='gen4_turbo',
+                                    prompt_image=data_uri,
+                                    prompt_text=params.prompt,
+                                    ratio='1280:720',
+                                    duration=5,
+                                ).wait_for_task_output()
+                                
+                                if task and hasattr(task, 'output') and task.output:
+                                    # Download the video
+                                    import requests
+                                    response = requests.get(task.output[0])
+                                    with open(output_path, 'wb') as f:
+                                        f.write(response.content)
+                                    
+                                    logger.info(f"Runway AI video saved to: {output_path}")
+                                    return ActionResult(extracted_content=f"✅ Video {params.output_file_name} generated successfully using Runway AI and saved to downloads folder!")
+                                else:
+                                    return ActionResult(error="No video data received from Runway AI")
+                                    
+                            except Exception as e:
+                                if 'TaskFailedError' in str(type(e)):
+                                    return ActionResult(error=f"Runway AI video generation failed: {str(e)}")
+                                else:
+                                    raise e
+                        else:
+                            # Text-to-video not supported by Runway AI gen4_turbo
+                            return ActionResult(error="Runway AI gen4_turbo only supports image-to-video generation. Please provide an input image.")
+                    
                     else:
-                        # Text-to-video generation
-                        logger.info("Generating video from text prompt")
-                        config_params = {
-                            "aspect_ratio": "16:9",  # 16:9 is the only supported value for Veo 3
-                            "number_of_videos": 1,  # 1 video generated per request
-                        }
-                        if params.negative_prompt:
-                            config_params["negative_prompt"] = params.negative_prompt
+                        # Use Google VEO (default)
+                        try:
+                            from google import genai
+                            from google.genai import types
+                        except ImportError:
+                            return ActionResult(error="Google Generative AI package not installed. Install with: pip install google-genai")
                         
-                        operation = client.models.generate_videos(
-                            model="veo-3.0-generate-preview",
-                            prompt=params.prompt,
-                            config=types.GenerateVideosConfig(**config_params)
-                        )
-                    
-                    # Wait for the video to be generated
-                    logger.info("Waiting for video generation to complete...")
-                    while not operation.done:
-                        time.sleep(20)
-                        operation = client.operations.get(operation)
-                        logger.info(f"Video generation update: {operation}")
-                    
-                    result = operation.result
-                    
-                    # Check if video was generated successfully
-                    if result and result.generated_videos and len(result.generated_videos) > 0:
-                        # Download and save the video
-                        generated_video = result.generated_videos[0]
-                        client.files.download(file=generated_video.video)
-                        generated_video.video.save(output_path)
+                        # Get API key
+                        api_key = os.getenv('GOOGLE_VEO_API_KEY')
+                        if not api_key:
+                            return ActionResult(error="GOOGLE_VEO_API_KEY environment variable is not set")
                         
-                        logger.info(f"Generated video saved to: {output_path}")
+                        client = genai.Client(api_key=api_key)
+                        logger.info("Google VEO: Generating 8-second video with audio support in 16:9 aspect ratio")
                         
-                        return ActionResult(extracted_content=f"✅ Video {params.output_file_name} generated successfully and saved to downloads folder!")
-                    else:
-                        return ActionResult(error="No video data received from Google VEO API")
+                        # Handle input image for Google VEO
+                        image_object = None
+                        if image_path:
+                            try:
+                                with open(image_path, "rb") as f:
+                                    image_bytes = f.read()
+                                
+                                # Determine MIME type based on file extension
+                                image_ext = Path(params.image_file_name).suffix.lower()
+                                mime_type_map = {
+                                    '.png': 'image/png',
+                                    '.jpg': 'image/jpeg',
+                                    '.jpeg': 'image/jpeg',
+                                    '.gif': 'image/gif',
+                                    '.bmp': 'image/bmp',
+                                    '.webp': 'image/webp'
+                                }
+                                mime_type = mime_type_map.get(image_ext, 'image/jpeg')
+                                
+                                image_object = types.Image(image_bytes=image_bytes, mime_type=mime_type)
+                                logger.info(f"Loaded input image for Google VEO: {params.image_file_name} (MIME: {mime_type})")
+                            except Exception as e:
+                                return ActionResult(error=f"Failed to read image file {params.image_file_name}: {str(e)}")
+                        
+                        # Generate video using VEO API
+                        if image_object:
+                            # Image-to-video generation
+                            logger.info("Generating video from input image using Google VEO")
+                            config_params = {
+                                "aspect_ratio": "16:9",  # 16:9 is the only supported value for Veo 3
+                                "number_of_videos": 1,  # 1 video generated per request
+                            }
+                            if params.negative_prompt:
+                                config_params["negative_prompt"] = params.negative_prompt
+                            
+                            operation = client.models.generate_videos(
+                                model="veo-3.0-generate-preview",
+                                prompt=params.prompt,
+                                image=image_object,
+                                config=types.GenerateVideosConfig(**config_params)
+                            )
+                        else:
+                            # Text-to-video generation
+                            logger.info("Generating video from text prompt using Google VEO")
+                            config_params = {
+                                "aspect_ratio": "16:9",  # 16:9 is the only supported value for Veo 3
+                                "number_of_videos": 1,  # 1 video generated per request
+                            }
+                            if params.negative_prompt:
+                                config_params["negative_prompt"] = params.negative_prompt
+                            
+                            operation = client.models.generate_videos(
+                                model="veo-3.0-generate-preview",
+                                prompt=params.prompt,
+                                config=types.GenerateVideosConfig(**config_params)
+                            )
+                        
+                        # Wait for the video to be generated
+                        logger.info("Waiting for Google VEO video generation to complete...")
+                        while not operation.done:
+                            time.sleep(20)
+                            operation = client.operations.get(operation)
+                            logger.info(f"Video generation update: {operation}")
+                        
+                        result = operation.result
+                        
+                        # Check if video was generated successfully
+                        if result and result.generated_videos and len(result.generated_videos) > 0:
+                            # Download and save the video
+                            generated_video = result.generated_videos[0]
+                            client.files.download(file=generated_video.video)
+                            generated_video.video.save(output_path)
+                            
+                            logger.info(f"Google VEO video saved to: {output_path}")
+                            return ActionResult(extracted_content=f"✅ Video {params.output_file_name} generated successfully using Google VEO and saved to downloads folder!")
+                        else:
+                            return ActionResult(error="No video data received from Google VEO API")
 
                 except Exception as e:
                     logger.error(f"Error generating video: {e}")
@@ -3020,6 +3095,7 @@ async def main():
     parser.add_argument('--lead-list-identifier', help='Identifier field name for lead list records')
     parser.add_argument('--has-attachments', action='store_true', help='Task has attachments')
     parser.add_argument('--create-video', action='store_true', help='Create video recording of task execution')
+    parser.add_argument('--video-model', help='Video model to use for video generation (veo-3.0-generate-preview or gen4_turbo)')
     args = parser.parse_args()
 
     # Read prompt from file
@@ -3056,7 +3132,8 @@ async def main():
             update_lead_list=args.update_lead_list,
             lead_list_identifier=args.lead_list_identifier,
             has_attachments=args.has_attachments,
-            create_video=args.create_video
+            create_video=args.create_video,
+            video_model=args.video_model
         )
         print(json.dumps(result))
         sys.exit(0 if result["success"] else 1)

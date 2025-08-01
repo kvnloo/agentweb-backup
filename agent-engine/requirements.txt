@@ -21,3 +21,4 @@ google-genai
 instaloader
 gdown
 yt-dlp
+runwayml
