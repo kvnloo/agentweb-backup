@@ -8,6 +8,14 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-08-01",
+    changes: [
+      "Added video model selection on Task Details page",
+      "- Users can now choose between VEO 3 from Google or Runway model",
+      "- Selected model is displayed as a chip next to the Create Video toggle",
+    ],
+  },
+  {
     date: "2025-07-31",
     changes: [
       "Added Create Video toggle to Task Details",
