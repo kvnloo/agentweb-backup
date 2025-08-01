@@ -951,20 +951,20 @@ const VideosPage: React.FC = () => {
       <Dialog open={feedbackDialogOpen} onOpenChange={setFeedbackDialogOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Generate More Videos</DialogTitle>
+            <DialogTitle>Provide Feedback for Agent</DialogTitle>
             <DialogDescription>
-              Provide feedback or instructions to generate more videos with improvements.
+              Share your thoughts on how to improve the generated videos. Your feedback will be used to enhance the AI agent's understanding and generate better results.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
-            <div>
-              <Label htmlFor="feedback">Instructions for video generation</Label>
+            <div className="space-y-2">
+              <Label htmlFor="feedback">Feedback (Optional)</Label>
               <Textarea
                 id="feedback"
-                placeholder="Describe improvements or changes you'd like in the new videos..."
+                placeholder="e.g., Make the videos more dynamic, use different camera angles, add more visual effects, change the style to be more cinematic..."
                 value={feedbackText}
                 onChange={(e) => setFeedbackText(e.target.value)}
-                rows={4}
+                className="min-h-[120px]"
               />
             </div>
           </div>
@@ -972,8 +972,8 @@ const VideosPage: React.FC = () => {
             <Button variant="outline" onClick={handleCancelFeedback}>
               Cancel
             </Button>
-            <Button onClick={handleSubmitFeedback} disabled={!feedbackText.trim()}>
-              Generate Videos
+            <Button onClick={handleSubmitFeedback}>
+              Generate with Feedback
             </Button>
           </DialogFooter>
         </DialogContent>
