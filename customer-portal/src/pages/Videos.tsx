@@ -304,6 +304,15 @@ const VideosPage: React.FC = () => {
     setFeedbackText('');
   };
 
+  const formatDate = (dateString: string | undefined) => {
+    if (!dateString) return 'Unknown';
+    try {
+      return format(new Date(dateString), 'MMM dd, yyyy HH:mm');
+    } catch {
+      return 'Invalid date';
+    }
+  };
+
   const handleToggleFavorite = async (executionId: string, videoUrl: string) => {
     if (!token) return;
 
@@ -841,120 +850,97 @@ const VideosPage: React.FC = () => {
                     </div>
                   </div>
                 </CardHeader>
-              <CardContent className="p-6">
-                {task.executions.length === 0 ? (
-                  <div className="text-center py-8 text-gray-500 dark:text-gray-400">
-                    No executions with videos yet
-                  </div>
-                ) : (
-                  <div className="space-y-6">
-                    {task.executions.map((execution) => {
-                      const videos = execution.result_files.filter(file => !file.is_archived);
-                      if (videos.length === 0) return null;
-
-                      return (
-                        <div key={execution.executionId} className="space-y-3">
-                          <div className="flex items-center justify-between">
-                            <div className="flex items-center gap-1 text-sm text-gray-600 dark:text-gray-400">
-                              <span className="font-medium">Execution:</span> {execution.executionId}
+                <CardContent>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                    {task.executions.flatMap((execution, executionIndex) => 
+                      execution.result_files.filter(file => !file.is_archived).map((file, fileIndex) => (
+                        <div key={`${execution.executionId}-${fileIndex}`} className="group relative">
+                          <div 
+                            className="aspect-video bg-gray-100 dark:bg-gray-800 rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700 cursor-pointer"
+                            onClick={() => {
+                              setPreviewVideo({
+                                url: file.url,
+                                filename: file.filename,
+                                taskId: task.taskId,
+                                executionId: execution.executionId
+                              });
+                              setVideoPreviewOpen(true);
+                            }}
+                            title="Click to preview video"
+                          >
+                            <video
+                              src={file.url}
+                              className="w-full h-full object-cover group-hover:opacity-75 transition-opacity"
+                              preload="metadata"
+                            />
+                            <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black bg-opacity-50 pointer-events-none">
+                              <Play className="h-12 w-12 text-white" />
+                            </div>
+                          </div>
+                          <div className="mt-2">
+                            <p className="text-sm font-medium text-gray-900 dark:text-white truncate">
+                              {file.filename}
+                            </p>
+                            <div className="flex items-center gap-1 mt-1">
+                              <p className="text-xs text-gray-500 dark:text-gray-400 truncate">
+                                Execution: {execution.executionId}
+                              </p>
                               <button 
-                                onClick={() => navigate(`/tasks/${task.taskId}/executions/${execution.executionId}/result`)}
+                                onClick={() => window.location.href = `/tasks/${task.taskId}/executions/${execution.executionId}/result`}
                                 className="inline-flex items-center gap-1 text-xs text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300 transition-colors ml-1"
                               >
                                 <ArrowUpRight className="h-3 w-3" />
                                 View
                               </button>
-                              {execution.startTime && (
-                                <span className="ml-2">• {format(new Date(execution.startTime), 'MMM d, h:mm a')}</span>
-                              )}
                             </div>
-                            <Badge variant="outline" className="text-xs">
-                              {videos.length} video{videos.length !== 1 ? 's' : ''}
-                            </Badge>
-                          </div>
-                          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-                            {videos.map((video, videoIndex) => (
-                              <div key={videoIndex} className="group relative">
-                                <div 
-                                  className="aspect-video bg-gray-100 dark:bg-gray-800 rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700 cursor-pointer"
-                                  onClick={() => {
-                                    setPreviewVideo({
-                                      url: video.url,
-                                      filename: video.filename,
-                                      taskId: task.taskId,
-                                      executionId: execution.executionId
-                                    });
-                                    setVideoPreviewOpen(true);
-                                  }}
-                                  title="Click to preview video"
-                                >
-                                  <video
-                                    src={video.url}
-                                    className="w-full h-full object-cover group-hover:opacity-75 transition-opacity"
-                                    preload="metadata"
-                                  />
-                                  <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black bg-opacity-50 pointer-events-none">
-                                    <Play className="h-12 w-12 text-white" />
-                                  </div>
-                                </div>
-                                <div className="mt-2 space-y-2">
-                                  <p className="text-sm font-medium text-gray-900 dark:text-white truncate" title={video.filename}>
-                                    {video.filename}
-                                  </p>
-                                  <div className="flex items-center justify-between">
-                                    <div className="flex items-center gap-1">
-                                      <Button
-                                        variant="ghost"
-                                        size="sm"
-                                        className="h-8 w-8 p-0"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          handleToggleFavorite(execution.executionId, video.url);
-                                        }}
-                                        title={video.is_favorited ? "Remove from favorites" : "Add to favorites"}
-                                      >
-                                        <Heart className={`h-4 w-4 ${video.is_favorited ? 'fill-red-500 text-red-500' : 'text-gray-400'}`} />
-                                      </Button>
-                                      <Button
-                                        variant="ghost"
-                                        size="sm"
-                                        className="h-8 w-8 p-0"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          window.open(video.url, '_blank');
-                                        }}
-                                        title="Download video"
-                                      >
-                                        <Download className="h-4 w-4 text-gray-400" />
-                                      </Button>
-                                      <Button
-                                        variant="ghost"
-                                        size="sm"
-                                        className="h-8 w-8 p-0"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          setPendingArchiveVideo({
-                                            executionId: execution.executionId,
-                                            videoUrl: video.url
-                                          });
-                                          setArchiveDialogOpen(true);
-                                        }}
-                                        title="Archive video"
-                                      >
-                                        <Archive className="h-4 w-4 text-gray-400" />
-                                      </Button>
-                                    </div>
-                                  </div>
-                                </div>
-                              </div>
-                            ))}
+                            <p className="text-xs text-gray-500 dark:text-gray-400 truncate">
+                              Started: {formatDate(execution.startTime)}
+                            </p>
+                            <div className="flex items-center gap-1 mt-2">
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-8 w-8 p-0 hover:bg-gray-100 dark:hover:bg-gray-800"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  window.open(file.url, '_blank');
+                                }}
+                                title="Download Video"
+                              >
+                                <Download className="h-4 w-4" />
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-8 w-8 p-0"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleToggleFavorite(execution.executionId, file.url);
+                                }}
+                                title={file.is_favorited ? "Remove from favorites" : "Add to favorites"}
+                              >
+                                <Heart className={`h-4 w-4 ${file.is_favorited ? 'fill-red-500 text-red-500' : 'text-gray-400'}`} />
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-8 w-8 p-0"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setPendingArchiveVideo({ executionId: execution.executionId, videoUrl: file.url });
+                                  setArchiveDialogOpen(true);
+                                }}
+                                title="Archive Video"
+                              >
+                                <Archive className="h-4 w-4" />
+                              </Button>
+                            </div>
                           </div>
                         </div>
-                      );
-                    })}
+                      ))
+                    )}
                   </div>
-                )}
-              </CardContent>
+                </CardContent>
             </Card>
             );
           })}
