@@ -1027,6 +1027,107 @@ router.get('/executions/with-images', authenticateToken, async (req: Request, re
   }
 });
 
+// Get all executions with videos for the current user
+router.get('/executions/with-videos', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Get all task executions for the user
+    const allExecutions = await taskDb.getAllTaskExecutionsByUserId(userId) || [];
+    
+    // Filter executions that have result_files with video URLs
+    const executionsWithVideos = allExecutions.filter((execution: any) => {
+      if (!execution.result_files || execution.result_files.length === 0) {
+        return false;
+      }
+      
+      // Check if any result file is a video (only .mp4 supported)
+      return execution.result_files.some((file: ResultFile) => {
+        const filename = file.filename.toLowerCase();
+        return filename.endsWith('.mp4');
+      });
+    });
+
+    // Get all non-archived tasks for the user to match with executions
+    const allTasks = await taskDb.getTasksByUserId(userId);
+    const nonArchivedTasks = allTasks?.filter((task: any) => task.status !== 'archived') || [];
+    const taskMap = new Map(nonArchivedTasks.map((task: any) => [task.taskId, task]));
+
+        // Group executions by taskId, but only for non-archived tasks
+    const result: Record<string, any> = {};
+    
+    executionsWithVideos.forEach((execution: any) => {
+      const task = taskMap.get(execution.taskId);
+      const taskId = execution.taskId;
+      
+      // Only include executions from non-archived tasks
+      if (task) {
+        if (!result[taskId]) {
+          result[taskId] = {
+            taskId: taskId,
+            taskName: task.name,
+            createdAt: task.createdAt,
+            executions: []
+          };
+        }
+        
+        result[taskId].executions.push({
+          executionId: execution.executionId,
+          startTime: execution.startTime || null,
+          result_files: execution.result_files?.filter((file: ResultFile) => {
+            const filename = file.filename.toLowerCase();
+            return filename.endsWith('.mp4');
+          }) || []
+        });
+      }
+    });
+
+    // Calculate latest execution time and find latest pending/running execution for each task
+    Object.keys(result).forEach(taskId => {
+      const task = result[taskId];
+      const executionTimes = task.executions
+        .map((execution: any) => execution.startTime)
+        .filter((time: string) => time !== null);
+      
+      if (executionTimes.length > 0) {
+        task.latestExecutionTime = executionTimes.sort().pop(); // Get the latest time
+      } else {
+        task.latestExecutionTime = null;
+      }
+
+      // Find the most recent pending or running execution for this task
+      const allTaskExecutions = allExecutions.filter((execution: any) => execution.taskId === taskId);
+      const pendingOrRunningExecutions = allTaskExecutions.filter((execution: any) => 
+        execution.status === 'pending' || execution.status === 'running'
+      );
+      
+      if (pendingOrRunningExecutions.length > 0) {
+        // Sort by startTime and get the most recent one
+        const latestPendingOrRunning = pendingOrRunningExecutions.sort((a: any, b: any) => 
+          new Date(b.startTime || 0).getTime() - new Date(a.startTime || 0).getTime()
+        )[0];
+        
+        task.latestPendingOrRunningExecution = {
+          executionId: latestPendingOrRunning.executionId,
+          status: latestPendingOrRunning.status,
+          startTime: latestPendingOrRunning.startTime || null
+        };
+      } else {
+        task.latestPendingOrRunningExecution = null;
+      }
+    });
+
+    res.json(result);
+  } catch (error) {
+    console.error('Error getting executions with videos:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
 // Toggle favorite status for an image in a task execution
 router.post('/executions/:executionId/favorite-image', authenticateToken, async (req: Request, res: Response) => {
   try {
