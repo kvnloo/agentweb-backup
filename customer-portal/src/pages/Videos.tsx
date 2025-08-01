@@ -93,15 +93,13 @@ const VideosPage: React.FC = () => {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [videoPreviewOpen, setVideoPreviewOpen] = useState(false);
   const [previewVideo, setPreviewVideo] = useState<{ url: string; filename: string; taskId: string; executionId: string } | null>(null);
-  const [revisionPrompt, setRevisionPrompt] = useState('');
-  const [isSubmittingRevision, setIsSubmittingRevision] = useState(false);
+
 
   // Handle escape key to close video preview
   useEffect(() => {
     const handleEscape = (event: KeyboardEvent) => {
       if (event.key === 'Escape' && videoPreviewOpen) {
         setVideoPreviewOpen(false);
-        setRevisionPrompt('');
       }
     };
 
@@ -111,12 +109,7 @@ const VideosPage: React.FC = () => {
     }
   }, [videoPreviewOpen]);
 
-  // Reset revision prompt when modal closes
-  useEffect(() => {
-    if (!videoPreviewOpen) {
-      setRevisionPrompt('');
-    }
-  }, [videoPreviewOpen]);
+
 
   // Create task functionality
   const [createTaskDialogOpen, setCreateTaskDialogOpen] = useState(false);
@@ -490,44 +483,7 @@ const VideosPage: React.FC = () => {
     }
   };
 
-  const handleCreateRevision = async () => {
-    if (!previewVideo || !revisionPrompt.trim()) return;
 
-    setIsSubmittingRevision(true);
-
-    try {
-      const response = await axios.post(
-        buildApiUrl(`/api/tasks/${previewVideo.taskId}/create-revision`),
-        { 
-          prompt: revisionPrompt,
-          originalExecutionId: previewVideo.executionId 
-        },
-        {
-          headers: { Authorization: `Bearer ${token}` }
-        }
-      );
-
-      toast({
-        title: "Revision Task Created",
-        description: "A new task has been created for your revision.",
-      });
-
-      setVideoPreviewOpen(false);
-      setRevisionPrompt('');
-      
-      // Refresh the data
-      fetchTasksWithExecutions();
-    } catch (err: any) {
-      console.error('Failed to create revision:', err);
-      toast({
-        title: "Error",
-        description: err.response?.data?.message || "Failed to create revision task.",
-        variant: "destructive",
-      });
-    } finally {
-      setIsSubmittingRevision(false);
-    }
-  };
 
   // Filter and sort tasks
   const filteredTasks = allTasks.filter(task =>
@@ -1261,10 +1217,7 @@ const VideosPage: React.FC = () => {
                     variant="ghost"
                     size="sm"
                     className="h-8 w-8 p-0 bg-gray-800 text-white hover:bg-gray-700"
-                    onClick={() => {
-                      setVideoPreviewOpen(false);
-                      setRevisionPrompt('');
-                    }}
+                    onClick={() => setVideoPreviewOpen(false)}
                     title="Close"
                   >
                     <X className="h-4 w-4" />
@@ -1272,57 +1225,14 @@ const VideosPage: React.FC = () => {
                 </div>
               </div>
 
-              {/* Main content area - side by side */}
-              <div className="flex">
-                {/* Video - Left side */}
-                <div className="flex-1 bg-black flex items-center justify-center min-h-[60vh]">
-                  <video
-                    src={previewVideo.url}
-                    controls
-                    className="max-w-full max-h-[80vh] object-contain"
-                    autoPlay
-                  />
-                </div>
-
-                {/* Revision Panel - Right side */}
-                <div className="w-80 bg-gray-50 border-l border-gray-200 p-6">
-                  <h3 className="text-lg font-semibold text-gray-900 mb-4">Create Revision</h3>
-                  <div className="space-y-4">
-                    <div>
-                      <Label htmlFor="revision-prompt" className="text-sm font-medium">
-                        Revision Instructions
-                      </Label>
-                      <Textarea
-                        id="revision-prompt"
-                        placeholder="Describe what changes you'd like to make to this video..."
-                        value={revisionPrompt}
-                        onChange={(e) => setRevisionPrompt(e.target.value)}
-                        rows={8}
-                        className="mt-2"
-                      />
-                    </div>
-                    <Button
-                      onClick={handleCreateRevision}
-                      disabled={!revisionPrompt.trim() || isSubmittingRevision}
-                      className="w-full"
-                    >
-                      {isSubmittingRevision ? (
-                        <>
-                          <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                          Creating Revision...
-                        </>
-                      ) : (
-                        <>
-                          <Plus className="h-4 w-4 mr-2" />
-                          Create Revision Task
-                        </>
-                      )}
-                    </Button>
-                    <p className="text-xs text-gray-600">
-                      This will create a new task to generate a revised version of this video based on your instructions.
-                    </p>
-                  </div>
-                </div>
+              {/* Main content area */}
+              <div className="bg-black flex items-center justify-center min-h-[60vh]">
+                <video
+                  src={previewVideo.url}
+                  controls
+                  className="max-w-full max-h-[80vh] object-contain"
+                  autoPlay
+                />
               </div>
             </div>
           )}
