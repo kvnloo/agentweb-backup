@@ -587,7 +587,7 @@ const ImagesPage: React.FC = () => {
       formData.append('file', selectedFile);
 
       await axios.post(
-        buildApiUrl(`/api/tasks/${pendingTaskId}/upload-image`),
+        buildApiUrl(`/api/tasks/${pendingTaskId}/upload-file`),
         formData,
         {
           headers: { 

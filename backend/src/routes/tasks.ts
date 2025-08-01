@@ -1,5 +1,5 @@
 import express, { Request, RequestHandler, Response } from 'express';
-import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction, getTaskExecution, getExecutionLog, generateShareToken, getExecutionWithToken, sendExecutionEmail, uploadImageToExecution } from '../controllers/tasks';
+import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction, getTaskExecution, getExecutionLog, generateShareToken, getExecutionWithToken, sendExecutionEmail, uploadFileToExecution } from '../controllers/tasks';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { taskDb, subscriberDb } from '../services/db';
 import multer from 'multer';
@@ -83,8 +83,8 @@ router.post('/:id/execute', executeTask);
 router.put('/:id/executions/:executionId', updateTaskExecution);
 router.put('/:id/executions/:executionId/interactions/:interactionId', respondToInteraction);
 
-// Upload image directly to latest execution
-router.post('/:id/upload-image', upload.single('file'), uploadImageToExecution);
+// Upload file directly to latest execution
+router.post('/:id/upload-file', upload.single('file'), uploadFileToExecution);
 
 // Create revision execution
 router.post('/:id/executions/revision', authenticateToken, async (req: Request, res: Response) => {

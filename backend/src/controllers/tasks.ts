@@ -1130,7 +1130,7 @@ export const sendExecutionEmail = async (req: AuthRequest, res: Response) => {
   }
 }; 
 
-export const uploadImageToExecution = async (req: AuthRequest, res: Response) => {
+export const uploadFileToExecution = async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.user?.userId;
     if (!userId) {
@@ -1210,11 +1210,11 @@ export const uploadImageToExecution = async (req: AuthRequest, res: Response) =>
     });
 
     res.status(200).json({
-      message: 'Image uploaded successfully',
+      message: 'File uploaded successfully',
       resultFile: newResultFile
     });
   } catch (error) {
-    console.error('Error in uploadImageToExecution:', error);
-    res.status(500).json({ message: 'Error uploading image' });
+    console.error('Error in uploadFileToExecution:', error);
+    res.status(500).json({ message: 'Error uploading file' });
   }
 }; 

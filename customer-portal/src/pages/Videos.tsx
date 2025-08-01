@@ -73,6 +73,38 @@ interface BrandAsset {
   filename: string;
 }
 
+interface ICP {
+  id: string;
+  title: string;
+  description: string;
+  valueProposition: string;
+}
+
+interface MarketStrategyData {
+  businessOverview: string;
+  icp: ICP[];
+}
+
+interface BrandData {
+  brandName: string;
+  tagline: string;
+  primaryColor: string;
+  secondaryColor: string;
+  fontFamily: string;
+  toneOfVoice: string;
+  keyMessages: string[];
+  brandValues: string[];
+  targetAudience: string;
+  brandPersonality: string;
+}
+
+interface BrandAsset {
+  type: string;
+  url: string;
+  key: string;
+  filename: string;
+}
+
 const VideosPage: React.FC = () => {
   const { token } = useAuth();
   const navigate = useNavigate();
@@ -94,7 +126,6 @@ const VideosPage: React.FC = () => {
   const [videoPreviewOpen, setVideoPreviewOpen] = useState(false);
   const [previewVideo, setPreviewVideo] = useState<{ url: string; filename: string; taskId: string; executionId: string } | null>(null);
 
-
   // Handle escape key to close video preview
   useEffect(() => {
     const handleEscape = (event: KeyboardEvent) => {
@@ -109,30 +140,23 @@ const VideosPage: React.FC = () => {
     }
   }, [videoPreviewOpen]);
 
+  const refreshIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const [refreshingExecutions, setRefreshingExecutions] = useState<Set<string>>(new Set());
 
-
-  // Create task functionality
+  // Ad Video task creation state
   const [createTaskDialogOpen, setCreateTaskDialogOpen] = useState(false);
   const [isCreatingTask, setIsCreatingTask] = useState(false);
-  const [availableBrandGuidelines, setAvailableBrandGuidelines] = useState<BrandGuideline[]>([]);
-  const [availableCompetitorBrandGuidelines, setAvailableCompetitorBrandGuidelines] = useState<BrandGuideline[]>([]);
-  const [availableICPs, setAvailableICPs] = useState<ICPProfile[]>([]);
-  const [availableBrandAssets, setAvailableBrandAssets] = useState<BrandAsset[]>([]);
-  const [selectedOptions, setSelectedOptions] = useState<{
-    brandGuidelines: string[];
-    competitorBrandGuidelines: string[];
-    icp: string[];
-    brandAssets: string[];
-    creativeTypes: string[];
-  }>({
-    brandGuidelines: [],
-    competitorBrandGuidelines: [],
-    icp: [],
-    brandAssets: [],
-    creativeTypes: []
+  const [brandData, setBrandData] = useState<BrandData | null>(null);
+  const [brandAssets, setBrandAssets] = useState<BrandAsset[]>([]);
+  const [marketStrategyData, setMarketStrategyData] = useState<MarketStrategyData | null>(null);
+  const [selectedOptions, setSelectedOptions] = useState({
+    brandGuidelines: true,
+    businessOverview: true,
+    icp: [] as string[]
   });
-  const [quantity, setQuantity] = useState(3);
-  const [additionalInstructions, setAdditionalInstructions] = useState('');
+  const [additionalPrompt, setAdditionalPrompt] = useState('');
+  const [taskName, setTaskName] = useState('');
+
 
   const allTasks = Object.values(tasksWithExecutions);
   const totalExecutions = allTasks.reduce((sum, task) => sum + task.executions.length, 0);
@@ -451,7 +475,7 @@ const VideosPage: React.FC = () => {
       }
 
       await axios.post(
-        buildApiUrl(`/api/tasks/${firstTaskId}/upload-image`),
+        buildApiUrl(`/api/tasks/${firstTaskId}/upload-file`),
         formData,
         {
           headers: { 
@@ -483,6 +507,11 @@ const VideosPage: React.FC = () => {
     }
   };
 
+  const handleUploadCancel = () => {
+    setUploadDialogOpen(false);
+    setSelectedFile(null);
+  };
+
 
 
   // Filter and sort tasks
@@ -509,35 +538,27 @@ const VideosPage: React.FC = () => {
   });
 
   const loadTaskCreationData = async () => {
-    if (!token) return;
-
     try {
-      const [brandGuidelinesRes, competitorBrandGuidelinesRes, icpRes, brandAssetsRes] = await Promise.all([
-        axios.get(buildApiUrl('/api/brand/guidelines'), {
-          headers: { Authorization: `Bearer ${token}` }
-        }),
-        axios.get(buildApiUrl('/api/brand/competitor-guidelines'), {
-          headers: { Authorization: `Bearer ${token}` }
-        }),
-        axios.get(buildApiUrl('/api/brand/icp'), {
-          headers: { Authorization: `Bearer ${token}` }
-        }),
-        axios.get(buildApiUrl('/api/brand/assets'), {
-          headers: { Authorization: `Bearer ${token}` }
-        })
-      ]);
-
-      setAvailableBrandGuidelines(brandGuidelinesRes.data);
-      setAvailableCompetitorBrandGuidelines(competitorBrandGuidelinesRes.data);
-      setAvailableICPs(icpRes.data);
-      setAvailableBrandAssets(brandAssetsRes.data);
-    } catch (err: any) {
-      console.error('Failed to load task creation data:', err);
-      toast({
-        title: "Error",
-        description: "Failed to load creation options.",
-        variant: "destructive",
+      // Load brand guidelines
+      const brandResponse = await axios.get(buildApiUrl('/api/brand/guidelines'), {
+        headers: { Authorization: `Bearer ${token}` },
       });
+      
+      if (brandResponse.data.exists) {
+        setBrandData(brandResponse.data.brandData);
+        setBrandAssets(brandResponse.data.attachments || []);
+      }
+
+      // Load market strategy
+      const marketResponse = await axios.get(buildApiUrl('/api/market-strategy'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      
+      if (marketResponse.data.success) {
+        setMarketStrategyData(marketResponse.data.data);
+      }
+    } catch (error) {
+      console.error('Error loading task creation data:', error);
     }
   };
 
@@ -545,71 +566,146 @@ const VideosPage: React.FC = () => {
     if (!token) {
       toast({
         title: "Error",
-        description: "You must be logged in to create tasks.",
+        description: "Authentication token not found. Please log in.",
         variant: "destructive",
       });
       return;
     }
 
-    if (selectedOptions.brandGuidelines.length === 0) {
+    // Validate required fields
+    if (!taskName.trim()) {
       toast({
         title: "Error",
-        description: "Please select at least one brand guideline.",
+        description: "Task name is required.",
         variant: "destructive",
       });
       return;
     }
 
-    if (selectedOptions.icp.length === 0) {
+    if (!additionalPrompt.trim()) {
       toast({
         title: "Error",
-        description: "Please select at least one ICP profile.",
+        description: "Video Prompt is required. Please describe what videos you want to generate.",
         variant: "destructive",
       });
       return;
     }
 
     setIsCreatingTask(true);
-
+    
     try {
-      const taskData: CreateTaskRequest = {
-        brandGuidelineIds: selectedOptions.brandGuidelines,
-        competitorBrandGuidelineIds: selectedOptions.competitorBrandGuidelines,
-        icpIds: selectedOptions.icp,
-        brandAssetIds: selectedOptions.brandAssets,
-        creativeTypes: ['Video'], // Default to video for this page
-        quantity,
-        additionalInstructions: additionalInstructions.trim() || undefined
-      };
-
-      const response = await axios.post(
-        buildApiUrl('/api/brand/create-ad-content-tasks'),
-        taskData,
-        {
-          headers: { Authorization: `Bearer ${token}` }
+      // Build the prompt based on selected options
+      let prompt = "Please create high-quality ad videos that align with the below brand guidelines and target the specified audience. The videos should be professional, engaging, and suitable for various marketing channels. Use download_video to download reference videos and generate_video to create the result videos. Valid duration values for generate_video include \"15s\", \"30s\", \"60s\", \"auto\". Valid quality values for generate_video include \"low\", \"medium\", \"high\", \"auto\". DO NOT browse the internet for other videos.\n\n";
+      
+      // Add task description
+      if (additionalPrompt.trim()) {
+        prompt += `Task:\n${additionalPrompt.trim()}\n\n`;
+      }
+      
+      if (selectedOptions.brandGuidelines && brandData) {
+        prompt += `Brand Guidelines:\nIMPORTANT: Use the following brand data including logo, typography, brand colors, and other brand elements to maintain consistency in generated videos. Ensure all videos align with the brand identity.\n\n`;
+        
+        const brandGuidelines = [];
+        
+        // Only include fields that have values
+        if (brandData.brandName?.trim()) brandGuidelines.push(`- Brand Name: ${brandData.brandName}`);
+        if (brandData.tagline?.trim()) brandGuidelines.push(`- Tagline: ${brandData.tagline}`);
+        if (brandData.primaryColor?.trim()) brandGuidelines.push(`- Primary Color: ${brandData.primaryColor}`);
+        if (brandData.secondaryColor?.trim()) brandGuidelines.push(`- Secondary Color: ${brandData.secondaryColor}`);
+        if (brandData.fontFamily?.trim()) brandGuidelines.push(`- Font Family: ${brandData.fontFamily}`);
+        if (brandData.toneOfVoice?.trim()) brandGuidelines.push(`- Tone of Voice: ${brandData.toneOfVoice}`);
+        if (brandData.keyMessages?.length > 0) brandGuidelines.push(`- Key Messages: ${brandData.keyMessages.join(', ')}`);
+        if (brandData.brandValues?.length > 0) brandGuidelines.push(`- Brand Values: ${brandData.brandValues.join(', ')}`);
+        if (brandData.targetAudience?.trim()) brandGuidelines.push(`- Target Audience: ${brandData.targetAudience}`);
+        if (brandData.brandPersonality?.trim()) brandGuidelines.push(`- Brand Personality: ${brandData.brandPersonality}`);
+        
+        // Add brand assets if available
+        if (brandAssets.length > 0) {
+          const logoAssets = brandAssets.filter(asset => asset.type === 'logo' || asset.type === 'secondaryLogo');
+          if (logoAssets.length > 0) {
+            brandGuidelines.push(`- Brand Logos: ${logoAssets.map(asset => asset.url).join(', ')}`);
+          }
         }
-      );
+        
+        if (brandGuidelines.length > 0) {
+          prompt += `${brandGuidelines.join('\n')}\n\n`;
+        }
+      }
+      
+      if (selectedOptions.businessOverview && marketStrategyData?.businessOverview) {
+        prompt += `Business Overview:\n${marketStrategyData.businessOverview}\n\n`;
+      }
+      
+      // Handle Target Audience based on ICP selection
+      if (selectedOptions.icp.length > 0 && marketStrategyData?.icp) {
+        const selectedICPs = marketStrategyData.icp.filter(icp => selectedOptions.icp.includes(icp.id));
+        if (selectedICPs.length > 0) {
+          prompt += `Target Audience: ${selectedICPs.map(icp => icp.title).join(', ')}\n\n`;
+        }
+      } else {
+        // General audience if no ICP selected
+        prompt += `Target Audience: General audience\n\n`;
+      }
+
+      // Create tasks based on ICP selection
+      const tasksToCreate = [];
+      
+      if (selectedOptions.icp.length > 0 && marketStrategyData?.icp) {
+        // Create a task for each selected ICP
+        const selectedICPs = marketStrategyData.icp.filter(icp => selectedOptions.icp.includes(icp.id));
+        for (const icp of selectedICPs) {
+          const icpPrompt = prompt.replace(
+            /Target Audience: General audience/,
+            `Target Audience: ${icp.title} - ${icp.description} (Value Proposition: ${icp.valueProposition})`
+          );
+          
+          tasksToCreate.push({
+            name: `${taskName.trim()} - ${icp.title}`,
+            prompt: icpPrompt,
+            category: 'Creatives',
+            description: `Ad video generation targeting ${icp.title} audience`
+          });
+        }
+      } else {
+        // Create a single task for general audience
+        tasksToCreate.push({
+          name: taskName.trim(),
+          prompt: prompt,
+          category: 'Creatives',
+          description: 'Ad video generation for general audience'
+        });
+      }
+
+      // Create all tasks
+      const createdTasks = [];
+      for (const taskData of tasksToCreate) {
+        const response = await axios.post(
+          buildApiUrl('/api/tasks'),
+          taskData,
+          {
+            headers: { Authorization: `Bearer ${token}` },
+          }
+        );
+        createdTasks.push(response.data);
+      }
 
       toast({
         title: "Tasks Created Successfully",
-        description: `Created ${response.data.tasksCreated} video generation tasks.`,
+        description: `Created ${createdTasks.length} ad video generation task${createdTasks.length > 1 ? 's' : ''}. You will be redirected to the Tasks page.`,
       });
 
       setCreateTaskDialogOpen(false);
-      
-      // Reset form
       setSelectedOptions({
-        brandGuidelines: [],
-        competitorBrandGuidelines: [],
-        icp: [],
-        brandAssets: [],
-        creativeTypes: []
+        brandGuidelines: true,
+        businessOverview: true,
+        icp: []
       });
-      setQuantity(3);
-      setAdditionalInstructions('');
+      setAdditionalPrompt('');
+      setTaskName('');
       
-      // Refresh the tasks list
-      fetchTasksWithExecutions();
+      // Navigate to tasks page
+      navigate('/tasks');
+      
     } catch (err: any) {
       console.error('Failed to create ad video tasks:', err);
       toast({
@@ -630,6 +726,13 @@ const VideosPage: React.FC = () => {
         : [...prev.icp, icpId]
     }));
   };
+
+  // Load data when create dialog opens
+  useEffect(() => {
+    if (createTaskDialogOpen && token) {
+      loadTaskCreationData();
+    }
+  }, [createTaskDialogOpen, token]);
 
   // Load data when create dialog opens
   useEffect(() => {
@@ -963,37 +1066,45 @@ const VideosPage: React.FC = () => {
         </DialogContent>
       </Dialog>
 
-      {/* Upload Dialog */}
+      {/* Upload Video Dialog */}
       <Dialog open={uploadDialogOpen} onOpenChange={setUploadDialogOpen}>
-        <DialogContent>
+        <DialogContent className="sm:max-w-[500px]">
           <DialogHeader>
-            <DialogTitle>Upload Video</DialogTitle>
+            <DialogTitle>Upload Video Directly</DialogTitle>
             <DialogDescription>
-              Upload an .mp4 video file to add to your collection.
+              Upload a video file to add it to the latest execution of this task. The video will be stored in S3 and appear alongside other generated videos.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
-            <div>
-              <Label htmlFor="video-upload">Select video file (.mp4 only)</Label>
+            <div className="space-y-2">
+              <Label htmlFor="videoFile">Select Video File</Label>
               <Input
-                id="video-upload"
+                id="videoFile"
                 type="file"
-                accept=".mp4"
+                accept="video/mp4"
                 onChange={(e) => setSelectedFile(e.target.files?.[0] || null)}
+                className="cursor-pointer"
               />
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                Supported formats: MP4 (max 50MB)
+              </p>
             </div>
             {selectedFile && (
-              <div className="text-sm text-gray-600 dark:text-gray-400">
-                Selected: {selectedFile.name} ({(selectedFile.size / 1024 / 1024).toFixed(2)} MB)
+              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <p className="text-sm font-medium">Selected file:</p>
+                <p className="text-sm text-gray-600 dark:text-gray-400">{selectedFile.name}</p>
+                <p className="text-xs text-gray-500 dark:text-gray-400">
+                  Size: {(selectedFile.size / 1024 / 1024).toFixed(2)} MB
+                </p>
               </div>
             )}
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setUploadDialogOpen(false)}>
+            <Button variant="outline" onClick={handleUploadCancel}>
               Cancel
             </Button>
             <Button 
-              onClick={handleVideoUpload} 
+              onClick={handleVideoUpload}
               disabled={!selectedFile || uploadingVideo}
             >
               {uploadingVideo ? (
@@ -1012,170 +1123,136 @@ const VideosPage: React.FC = () => {
         </DialogContent>
       </Dialog>
 
-      {/* Create Ad Videos Dialog */}
+      {/* Ad Video Task Creation Dialog */}
       <Dialog open={createTaskDialogOpen} onOpenChange={setCreateTaskDialogOpen}>
-        <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+        <DialogContent className="sm:max-w-[600px] max-h-[80vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>Create Ad Videos</DialogTitle>
+            <DialogTitle>Create Ad Video Task</DialogTitle>
             <DialogDescription>
-              Generate custom video advertisements using your brand guidelines and ICP profiles.
+              Configure your ad video generation task by selecting the information to include in the prompt.
             </DialogDescription>
           </DialogHeader>
-          <div className="space-y-6">
-            {/* Brand Guidelines */}
-            <div>
-              <Label className="text-base font-medium">Brand Guidelines *</Label>
-              <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">Select the brand guidelines to follow</p>
-              <div className="space-y-2 max-h-32 overflow-y-auto">
-                {availableBrandGuidelines.map((guideline) => (
-                  <div key={guideline.id} className="flex items-center space-x-2">
-                    <Checkbox
-                      id={`brand-${guideline.id}`}
-                      checked={selectedOptions.brandGuidelines.includes(guideline.id)}
-                      onCheckedChange={(checked) => {
-                        if (checked) {
-                          setSelectedOptions(prev => ({
-                            ...prev,
-                            brandGuidelines: [...prev.brandGuidelines, guideline.id]
-                          }));
-                        } else {
-                          setSelectedOptions(prev => ({
-                            ...prev,
-                            brandGuidelines: prev.brandGuidelines.filter(id => id !== guideline.id)
-                          }));
-                        }
-                      }}
-                    />
-                    <label htmlFor={`brand-${guideline.id}`} className="text-sm font-medium cursor-pointer">
-                      {guideline.name}
-                    </label>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {/* Competitor Brand Guidelines */}
-            {availableCompetitorBrandGuidelines.length > 0 && (
-              <div>
-                <Label className="text-base font-medium">Competitor Analysis (Optional)</Label>
-                <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">Include competitor guidelines for differentiation</p>
-                <div className="space-y-2 max-h-32 overflow-y-auto">
-                  {availableCompetitorBrandGuidelines.map((guideline) => (
-                    <div key={guideline.id} className="flex items-center space-x-2">
-                      <Checkbox
-                        id={`competitor-${guideline.id}`}
-                        checked={selectedOptions.competitorBrandGuidelines.includes(guideline.id)}
-                        onCheckedChange={(checked) => {
-                          if (checked) {
-                            setSelectedOptions(prev => ({
-                              ...prev,
-                              competitorBrandGuidelines: [...prev.competitorBrandGuidelines, guideline.id]
-                            }));
-                          } else {
-                            setSelectedOptions(prev => ({
-                              ...prev,
-                              competitorBrandGuidelines: prev.competitorBrandGuidelines.filter(id => id !== guideline.id)
-                            }));
-                          }
-                        }}
-                      />
-                      <label htmlFor={`competitor-${guideline.id}`} className="text-sm font-medium cursor-pointer">
-                        {guideline.name}
-                      </label>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* ICP Profiles */}
-            <div>
-              <Label className="text-base font-medium">Target Audience (ICP) *</Label>
-              <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">Select your ideal customer profiles to target</p>
-              <div className="space-y-2 max-h-32 overflow-y-auto">
-                {availableICPs.map((icp) => (
-                  <div key={icp.id} className="flex items-center space-x-2">
-                    <Checkbox
-                      id={`icp-${icp.id}`}
-                      checked={selectedOptions.icp.includes(icp.id)}
-                      onCheckedChange={() => handleICPToggle(icp.id)}
-                    />
-                    <label htmlFor={`icp-${icp.id}`} className="text-sm font-medium cursor-pointer">
-                      {icp.name}
-                    </label>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {/* Brand Assets */}
-            {availableBrandAssets.length > 0 && (
-              <div>
-                <Label className="text-base font-medium">Brand Assets (Optional)</Label>
-                <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">Include brand assets in the video</p>
-                <div className="space-y-2 max-h-32 overflow-y-auto">
-                  {availableBrandAssets.map((asset) => (
-                    <div key={asset.id} className="flex items-center space-x-2">
-                      <Checkbox
-                        id={`asset-${asset.id}`}
-                        checked={selectedOptions.brandAssets.includes(asset.id)}
-                        onCheckedChange={(checked) => {
-                          if (checked) {
-                            setSelectedOptions(prev => ({
-                              ...prev,
-                              brandAssets: [...prev.brandAssets, asset.id]
-                            }));
-                          } else {
-                            setSelectedOptions(prev => ({
-                              ...prev,
-                              brandAssets: prev.brandAssets.filter(id => id !== asset.id)
-                            }));
-                          }
-                        }}
-                      />
-                      <label htmlFor={`asset-${asset.id}`} className="text-sm font-medium cursor-pointer">
-                        {asset.name}
-                      </label>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Quantity */}
-            <div>
-              <Label htmlFor="quantity" className="text-base font-medium">Number of Videos</Label>
-              <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">How many videos to generate</p>
+          
+          <div className="space-y-6 py-4">
+            {/* Task Name */}
+            <div className="space-y-3">
+              <Label htmlFor="taskName" className="text-sm font-medium">
+                Task Name <span className="text-red-500">*</span>
+              </Label>
               <Input
-                id="quantity"
-                type="number"
-                min="1"
-                max="10"
-                value={quantity}
-                onChange={(e) => setQuantity(Math.max(1, Math.min(10, parseInt(e.target.value) || 1)))}
+                id="taskName"
+                placeholder="e.g., Product Launch Ad Videos, Social Media Campaign"
+                value={taskName}
+                onChange={(e) => setTaskName(e.target.value)}
+                required
               />
             </div>
 
-            {/* Additional Instructions */}
-            <div>
-              <Label htmlFor="additional-instructions" className="text-base font-medium">Additional Instructions (Optional)</Label>
-              <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">Any specific requirements or preferences</p>
+            {/* Brand Guidelines */}
+            <div className="space-y-3">
+              <div className="flex items-center space-x-2">
+                <Checkbox
+                  id="brandGuidelines"
+                  checked={selectedOptions.brandGuidelines}
+                  onCheckedChange={(checked) => 
+                    setSelectedOptions(prev => ({ ...prev, brandGuidelines: checked as boolean }))
+                  }
+                />
+                <Label htmlFor="brandGuidelines" className="text-sm font-medium">
+                  Brand Guidelines
+                </Label>
+              </div>
+              {selectedOptions.brandGuidelines && brandData && (
+                <div className="ml-6 p-3 bg-gray-50 dark:bg-gray-800 rounded-md text-sm">
+                  <p><strong>Brand:</strong> {brandData.brandName}</p>
+                  <p><strong>Tagline:</strong> {brandData.tagline}</p>
+                  <p><strong>Colors:</strong> {brandData.primaryColor}, {brandData.secondaryColor}</p>
+                </div>
+              )}
+            </div>
+
+            {/* Market Strategy */}
+            <div className="space-y-3">
+              <h3 className="text-sm font-medium">Market Strategy</h3>
+              
+              {/* Business Overview */}
+              <div className="space-y-2">
+                <div className="flex items-center space-x-2">
+                  <Checkbox
+                    id="businessOverview"
+                    checked={selectedOptions.businessOverview}
+                    onCheckedChange={(checked) => 
+                      setSelectedOptions(prev => ({ ...prev, businessOverview: checked as boolean }))
+                    }
+                  />
+                  <Label htmlFor="businessOverview" className="text-sm">
+                    Business Overview
+                  </Label>
+                </div>
+                {selectedOptions.businessOverview && marketStrategyData?.businessOverview && (
+                  <div className="ml-6 p-3 bg-gray-50 dark:bg-gray-800 rounded-md text-sm">
+                    <p>{marketStrategyData.businessOverview.substring(0, 200)}...</p>
+                  </div>
+                )}
+              </div>
+
+              {/* ICP Selection */}
+              <div className="space-y-2">
+                <Label className="text-sm">Ideal Customer Profiles (ICP)</Label>
+                <p className="text-xs text-gray-500 dark:text-gray-400">
+                  Select specific ICPs to target, or leave unselected for general audience
+                </p>
+                {marketStrategyData?.icp && marketStrategyData.icp.length > 0 ? (
+                  <div className="ml-6 space-y-2">
+                    {marketStrategyData.icp.map((icp) => (
+                      <div key={icp.id} className="flex items-center space-x-2">
+                        <Checkbox
+                          id={`icp-${icp.id}`}
+                          checked={selectedOptions.icp.includes(icp.id)}
+                          onCheckedChange={() => handleICPToggle(icp.id)}
+                        />
+                        <Label htmlFor={`icp-${icp.id}`} className="text-sm">
+                          {icp.title}
+                        </Label>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="ml-6 p-3 bg-gray-50 dark:bg-gray-800 rounded-md text-sm">
+                    <p className="text-gray-500 dark:text-gray-400">
+                      No ICPs defined. Task will target general audience.
+                    </p>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Video Prompt */}
+            <div className="space-y-3">
+              <Label htmlFor="additionalPrompt" className="text-sm font-medium">
+                Video Prompt <span className="text-red-500">*</span>
+              </Label>
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                Describe what videos you want to generate. Include specific details about style, composition, or reference video URLs.
+              </p>
               <Textarea
-                id="additional-instructions"
-                placeholder="e.g., Focus on product benefits, include testimonials, specific tone of voice..."
-                value={additionalInstructions}
-                onChange={(e) => setAdditionalInstructions(e.target.value)}
-                rows={3}
+                id="additionalPrompt"
+                placeholder="e.g., Create dynamic product videos with smooth transitions, or include reference video: https://example.com/reference-video.mp4"
+                value={additionalPrompt}
+                onChange={(e) => setAdditionalPrompt(e.target.value)}
+                className="min-h-[100px]"
+                required
               />
             </div>
           </div>
+
           <DialogFooter>
             <Button variant="outline" onClick={() => setCreateTaskDialogOpen(false)}>
               Cancel
             </Button>
             <Button 
-              onClick={handleCreateAdVideoTask} 
-              disabled={isCreatingTask || selectedOptions.brandGuidelines.length === 0 || selectedOptions.icp.length === 0}
+              onClick={handleCreateAdVideoTask}
+              disabled={isCreatingTask}
             >
               {isCreatingTask ? (
                 <>
@@ -1183,10 +1260,7 @@ const VideosPage: React.FC = () => {
                   Creating...
                 </>
               ) : (
-                <>
-                  <Plus className="h-4 w-4 mr-2" />
-                  Create {quantity} Video{quantity !== 1 ? 's' : ''}
-                </>
+                'Create Task'
               )}
             </Button>
           </DialogFooter>
