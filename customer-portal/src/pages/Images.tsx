@@ -730,14 +730,12 @@ const ImagesPage: React.FC = () => {
     
           try {
         // Build the prompt based on selected options
-        let prompt = "";
+        let prompt = "Please create high-quality ad images that align with the below brand guidelines and target the specified audience. The images should be professional, engaging, and suitable for various marketing channels. Use download_image to download reference images and generate_image to create the result images. Valid size values for generate_image include \"1024x1024\", \"1536x1024\", \"1024x1536\", \"auto\". Valid quality values for generate_image include \"low\", \"medium\", \"high\", \"auto\". DO NOT browse the internet for other images.\n\n";
         
-        // Add task description at the beginning
+        // Add task description
         if (additionalPrompt.trim()) {
           prompt += `Task:\n${additionalPrompt.trim()}\n\n`;
         }
-        
-        prompt += "Use download_image to download reference images and generate_image to create the result images. Valid size values for generate_image include \"1024x1024\", \"1536x1024\", \"1024x1536\", \"auto\". Valid quality values for generate_image include \"low\", \"medium\", \"high\", \"auto\".\n\n";
         
         if (selectedOptions.brandGuidelines && brandData) {
           prompt += `Brand Guidelines:\nIMPORTANT: Use the following brand data including logo, typography, brand colors, and other brand elements to maintain consistency in generated images. Ensure all images align with the brand identity.\n\n`;
@@ -784,7 +782,7 @@ const ImagesPage: React.FC = () => {
           prompt += `Target Audience: General audience\n\n`;
         }
         
-        prompt += `Please create high-quality ad images that align with the above brand guidelines and target the specified audience. The images should be professional, engaging, and suitable for various marketing channels.`;
+
 
       // Create tasks based on ICP selection
       const tasksToCreate = [];
