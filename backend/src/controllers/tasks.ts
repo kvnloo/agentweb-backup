@@ -282,6 +282,14 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
 
     if (req.body.createVideo !== undefined) {
       updates.createVideo = Boolean(req.body.createVideo);
+      // If disabling createVideo, also clear the videoModel
+      if (!updates.createVideo) {
+        updates.videoModel = null;
+      }
+    }
+
+    if (req.body.videoModel !== undefined) {
+      updates.videoModel = req.body.videoModel;
     }
 
     if (req.body.leadListIdentifier !== undefined) {

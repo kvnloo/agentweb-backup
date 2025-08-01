@@ -92,6 +92,7 @@ interface Task {
   updateLeadList?: boolean; // Flag for updating lead list
   leadListIdentifier?: string;
   createVideo?: boolean; // Flag for creating video recording of task execution
+  videoModel?: string; // The video model to use for video generation
   knowledgeBase?: string; // The content of the task's knowledge base
   knowledgeBaseSize?: number; // Size of the knowledge base in bytes
   knowledgeBaseType?: "public" | "private"; // Type of knowledge base
@@ -456,6 +457,8 @@ export default function TaskDetails() {
   const [isLeadListDialogOpen, setIsLeadListDialogOpen] = useState(false);
   const [leadListIdentifier, setLeadListIdentifier] = useState("");
   const [leadListIdentifierError, setLeadListIdentifierError] = useState("");
+  const [isVideoModelDialogOpen, setIsVideoModelDialogOpen] = useState(false);
+  const [selectedVideoModel, setSelectedVideoModel] = useState("");
 
   const isAdminRoute = location.pathname.startsWith("/admin/");
   const showActions =
@@ -1610,21 +1613,82 @@ export default function TaskDetails() {
     }
   };
 
-  // Add the handler function for create video toggle
-  const handleCreateVideoToggle = async () => {
-    if (!task || !token) return;
-    const newCreateVideoValue = !(task?.createVideo || false);
+  // Add video model dialog handlers
+  const handleVideoModelDialogClose = () => {
+    setIsVideoModelDialogOpen(false);
+    setSelectedVideoModel("");
+  };
+
+  const handleVideoModelDialogConfirm = async () => {
+    if (!selectedVideoModel.trim()) {
+      return;
+    }
+
     try {
       await axios.put(
-        buildApiUrl(`/api/tasks/${task.taskId}`),
-        { createVideo: newCreateVideoValue },
-        { headers: { Authorization: `Bearer ${token}` } }
+        buildApiUrl(`/api/tasks/${taskId}`),
+        {
+          createVideo: true,
+          videoModel: selectedVideoModel,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
       );
-      await fetchTask(); // Re-fetch task data to update UI from source of truth
-      setError(""); // Clear previous errors
-    } catch (err) {
-      console.error("Failed to update create video setting:", err);
-      setError("Failed to update create video setting. Please try again.");
+      await fetchTask();
+    } catch (error) {
+      console.error("Error updating video model settings:", error);
+      setError("Failed to update video model settings");
+    } finally {
+      // Always close the dialog regardless of success or failure
+      handleVideoModelDialogClose();
+    }
+  };
+
+  const handleCreateVideoToggle = async (
+    event: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    const newValue = event.target.checked;
+
+    if (newValue) {
+      // If enabling and no video model exists, open the dialog
+      if (!task?.videoModel) {
+        setIsVideoModelDialogOpen(true);
+      } else {
+        // If video model exists, just update the toggle
+        try {
+          await axios.put(
+            buildApiUrl(`/api/tasks/${taskId}`),
+            {
+              createVideo: true,
+            },
+            {
+              headers: { Authorization: `Bearer ${token}` },
+            }
+          );
+          await fetchTask();
+        } catch (error) {
+          console.error("Error updating create video settings:", error);
+          toast.error("Failed to update create video settings");
+        }
+      }
+    } else {
+      // If disabling, just update the toggle
+      try {
+        await axios.put(
+          buildApiUrl(`/api/tasks/${taskId}`),
+          {
+            createVideo: false,
+          },
+          {
+            headers: { Authorization: `Bearer ${token}` },
+          }
+        );
+        await fetchTask();
+      } catch (error) {
+        console.error("Error updating create video settings:", error);
+        toast.error("Failed to update create video settings");
+      }
     }
   };
 
@@ -2050,7 +2114,21 @@ export default function TaskDetails() {
                           onChange={handleCreateVideoToggle}
                         />
                       }
-                      label="Create Video"
+                      label={
+                        <Box
+                          sx={{ display: "flex", alignItems: "center", gap: 1 }}
+                        >
+                          <Typography>Create Video</Typography>
+                          {task?.createVideo && task?.videoModel && (
+                            <Chip
+                              label={`Model: ${task.videoModel}`}
+                              size="small"
+                              color="primary"
+                              variant="outlined"
+                            />
+                          )}
+                        </Box>
+                      }
                     />
                   </Tooltip>
                 </Box>
@@ -2851,6 +2929,48 @@ export default function TaskDetails() {
             onClick={handleLeadListDialogConfirm}
             variant="contained"
             color="primary"
+          >
+            Confirm
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Video Model Dialog */}
+      <Dialog
+        open={isVideoModelDialogOpen}
+        onClose={handleVideoModelDialogClose}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>Select Video Model</DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ mb: 2 }}>
+            Choose a video model for generating videos.
+          </DialogContentText>
+          <FormControl fullWidth>
+            <InputLabel id="video-model-select-label">Video Model</InputLabel>
+            <Select
+              labelId="video-model-select-label"
+              value={selectedVideoModel}
+              onChange={(e) => setSelectedVideoModel(e.target.value)}
+              label="Video Model"
+            >
+              <MenuItem value="veo-3.0-generate-preview">
+                veo-3.0-generate-preview (Google)
+              </MenuItem>
+              <MenuItem value="gen4_turbo">
+                gen4_turbo (Runway AI)
+              </MenuItem>
+            </Select>
+          </FormControl>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleVideoModelDialogClose}>Cancel</Button>
+          <Button
+            onClick={handleVideoModelDialogConfirm}
+            variant="contained"
+            color="primary"
+            disabled={!selectedVideoModel.trim()}
           >
             Confirm
           </Button>

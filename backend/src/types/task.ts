@@ -27,6 +27,7 @@ export interface Task {
   knowledgeBaseType?: 'public' | 'private'; // Whether the knowledge base is stored in public or private bucket
   knowledgeBaseUpdatedAt?: string; // When the knowledge base was last updated
   createVideo?: boolean; // Whether to create a video recording of the task execution
+  videoModel?: string; // The video model to use for video generation
   description?: string; // Description of the task
   category?: string; // Category of the task
 }
@@ -58,4 +59,5 @@ export interface TaskUpdate {
   knowledgeBaseType?: 'public' | 'private'; // Whether the knowledge base is stored in public or private bucket
   knowledgeBaseUpdatedAt?: string; // When the knowledge base was last updated
   createVideo?: boolean; // Whether to create a video recording of the task execution
+  videoModel?: string; // The video model to use for video generation
 } 
