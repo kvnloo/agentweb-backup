@@ -2956,10 +2956,20 @@ export default function TaskDetails() {
               label="Video Model"
             >
               <MenuItem value="veo-3.0-generate-preview">
-                veo-3.0-generate-preview (Google)
+                <Box>
+                  <Typography>veo-3.0-generate-preview (Google)</Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    8s video with audio supported
+                  </Typography>
+                </Box>
               </MenuItem>
               <MenuItem value="gen4_turbo">
-                gen4_turbo (Runway AI)
+                <Box>
+                  <Typography>gen4_turbo (Runway AI)</Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    5s video without audio
+                  </Typography>
+                </Box>
               </MenuItem>
             </Select>
           </FormControl>
