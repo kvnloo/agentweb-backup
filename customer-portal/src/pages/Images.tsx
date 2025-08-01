@@ -1094,8 +1094,11 @@ const ImagesPage: React.FC = () => {
                                 variant="ghost"
                                 size="sm"
                                 className="h-8 w-8 p-0 hover:bg-gray-100 dark:hover:bg-gray-800"
-                                onClick={() => handleViewImage(file.url, file.filename, task.taskId, execution.executionId)}
-                                title="View Image"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  window.open(file.url, '_blank');
+                                }}
+                                title="Download Image"
                               >
                                 <Download className="h-4 w-4" />
                               </Button>
