@@ -276,8 +276,16 @@ const VideosPage: React.FC = () => {
       });
       
       // Refresh the data after a short delay to show the new execution
-      setTimeout(() => {
-        fetchTasksWithExecutions();
+      setTimeout(async () => {
+        await fetchTasksWithExecutions();
+        // Clear the executing state after the data refresh
+        setExecutingTasks(prev => {
+          const newSet = new Set(prev);
+          newSet.delete(pendingTaskId);
+          return newSet;
+        });
+        setPendingTaskId(null);
+        setFeedbackText('');
       }, 2000);
       
     } catch (err: any) {
@@ -287,7 +295,7 @@ const VideosPage: React.FC = () => {
         description: err.response?.data?.message || "Could not start task execution.",
         variant: "destructive",
       });
-    } finally {
+      // Clear the executing state on error
       setExecutingTasks(prev => {
         const newSet = new Set(prev);
         newSet.delete(pendingTaskId);
