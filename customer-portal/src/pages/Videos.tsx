@@ -837,8 +837,8 @@ const VideosPage: React.FC = () => {
                               className="w-full h-full object-cover group-hover:opacity-75 transition-opacity"
                               preload="metadata"
                             />
-                            <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black bg-opacity-50 pointer-events-none">
-                              <Play className="h-12 w-12 text-white" />
+                            <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black bg-opacity-30 pointer-events-none">
+                              <Play className="h-8 w-8 text-white" />
                             </div>
                           </div>
                           <div className="mt-2">
