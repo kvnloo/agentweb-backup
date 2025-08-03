@@ -663,7 +663,9 @@ const VideosPage: React.FC = () => {
             name: `${taskName.trim()} - ${icp.title}`,
             prompt: icpPrompt,
             category: 'Creatives',
-            description: `Ad video generation targeting ${icp.title} audience`
+            description: `Ad video generation targeting ${icp.title} audience`,
+            createVideo: true,
+            videoModel: 'gen4_turbo'
           });
         }
       } else {
@@ -672,7 +674,9 @@ const VideosPage: React.FC = () => {
           name: taskName.trim(),
           prompt: prompt,
           category: 'Creatives',
-          description: 'Ad video generation for general audience'
+          description: 'Ad video generation for general audience',
+          createVideo: true,
+          videoModel: 'gen4_turbo'
         });
       }
 

@@ -48,7 +48,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       useKnowledgeBase,
       updateKnowledgeBase,
       updateLeadList,
-      createVideo
+      createVideo,
+      videoModel
     } = req.body;
     
     // If templateId is provided, fetch the template and use its values
@@ -97,6 +98,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           updateKnowledgeBase: req.body.updateKnowledgeBase !== undefined ? Boolean(req.body.updateKnowledgeBase) : template.updateKnowledgeBase,
           updateLeadList: req.body.updateLeadList !== undefined ? Boolean(req.body.updateLeadList) : template.updateLeadList,
           createVideo: req.body.createVideo !== undefined ? Boolean(req.body.createVideo) : template.createVideo,
+          videoModel: videoModel || null,
           knowledgeBaseType: 'private', // Default to private for new tasks
           createdAt: new Date().toISOString(),
           llmName: req.body.llmName || null,
@@ -138,6 +140,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       updateKnowledgeBase: Boolean(req.body.updateKnowledgeBase),
       updateLeadList: Boolean(req.body.updateLeadList),
       createVideo: Boolean(req.body.createVideo),
+      videoModel: videoModel || null,
       knowledgeBaseType: 'private', // Default to private for new tasks
       createdAt: new Date().toISOString(),
       llmName: req.body.llmName || null,
