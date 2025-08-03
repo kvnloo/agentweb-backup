@@ -192,15 +192,6 @@ const VideosPage: React.FC = () => {
       );
       setTasksWithExecutions(response.data);
       
-      // Update executingTasks state based on current executions
-      const currentlyExecuting = new Set<string>();
-      Object.values(response.data).forEach((task: TaskWithExecutions) => {
-        if (task.latestPendingOrRunningExecution) {
-          currentlyExecuting.add(task.taskId);
-        }
-      });
-      setExecutingTasks(currentlyExecuting);
-      
     } catch (err: any) {
       console.error('Failed to fetch tasks with executions:', err);
       setError('Failed to load video data');
