@@ -18,6 +18,7 @@ import {
   Lightbulb,
   Palette,
   Image,
+  Play,
   TrendingUp,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -148,6 +149,12 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
           label: "Ad Images",
           path: "/images",
           id: "images",
+        },
+        {
+          icon: Play,
+          label: "Ad Videos",
+          path: "/videos",
+          id: "videos",
         },
       ],
     },

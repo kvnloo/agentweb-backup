@@ -48,7 +48,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       useKnowledgeBase,
       updateKnowledgeBase,
       updateLeadList,
-      createVideo
+      createVideo,
+      videoModel
     } = req.body;
     
     // If templateId is provided, fetch the template and use its values
@@ -97,6 +98,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           updateKnowledgeBase: req.body.updateKnowledgeBase !== undefined ? Boolean(req.body.updateKnowledgeBase) : template.updateKnowledgeBase,
           updateLeadList: req.body.updateLeadList !== undefined ? Boolean(req.body.updateLeadList) : template.updateLeadList,
           createVideo: req.body.createVideo !== undefined ? Boolean(req.body.createVideo) : template.createVideo,
+          videoModel: videoModel || null,
           knowledgeBaseType: 'private', // Default to private for new tasks
           createdAt: new Date().toISOString(),
           llmName: req.body.llmName || null,
@@ -138,6 +140,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       updateKnowledgeBase: Boolean(req.body.updateKnowledgeBase),
       updateLeadList: Boolean(req.body.updateLeadList),
       createVideo: Boolean(req.body.createVideo),
+      videoModel: videoModel || null,
       knowledgeBaseType: 'private', // Default to private for new tasks
       createdAt: new Date().toISOString(),
       llmName: req.body.llmName || null,
@@ -1130,7 +1133,7 @@ export const sendExecutionEmail = async (req: AuthRequest, res: Response) => {
   }
 }; 
 
-export const uploadImageToExecution = async (req: AuthRequest, res: Response) => {
+export const uploadFileToExecution = async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.user?.userId;
     if (!userId) {
@@ -1210,11 +1213,11 @@ export const uploadImageToExecution = async (req: AuthRequest, res: Response) =>
     });
 
     res.status(200).json({
-      message: 'Image uploaded successfully',
+      message: 'File uploaded successfully',
       resultFile: newResultFile
     });
   } catch (error) {
-    console.error('Error in uploadImageToExecution:', error);
-    res.status(500).json({ message: 'Error uploading image' });
+    console.error('Error in uploadFileToExecution:', error);
+    res.status(500).json({ message: 'Error uploading file' });
   }
 }; 
