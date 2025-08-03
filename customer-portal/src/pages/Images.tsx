@@ -730,11 +730,11 @@ const ImagesPage: React.FC = () => {
     
           try {
         // Build the prompt based on selected options
-        let prompt = "Please create high-quality ad images that align with the below brand guidelines and target the specified audience. The images should be professional, engaging, and suitable for various marketing channels. Use download_image to download reference images and generate_image to create the result images. Valid size values for generate_image include \"1024x1024\", \"1536x1024\", \"1024x1536\", \"auto\". Valid quality values for generate_image include \"low\", \"medium\", \"high\", \"auto\". DO NOT browse the internet for other images.\n\n";
+        let prompt = "Please create high-quality ad images that align with the below context and target the specified audience. The images should be professional, engaging, and suitable for various marketing channels. Use download_image to download reference images and generate_image to create the result images. Valid size values for generate_image include \"1024x1024\", \"1536x1024\", \"1024x1536\", \"auto\". Valid quality values for generate_image include \"low\", \"medium\", \"high\", \"auto\". DO NOT browse the internet for other images.\n\n";
         
         // Add task description
         if (additionalPrompt.trim()) {
-          prompt += `Task:\n${additionalPrompt.trim()}\n\n`;
+          prompt += `Image Prompt:\n${additionalPrompt.trim()}\n\n`;
         }
         
         if (selectedOptions.brandGuidelines && brandData) {

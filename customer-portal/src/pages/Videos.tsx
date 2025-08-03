@@ -150,8 +150,8 @@ const VideosPage: React.FC = () => {
   const [brandAssets, setBrandAssets] = useState<BrandAsset[]>([]);
   const [marketStrategyData, setMarketStrategyData] = useState<MarketStrategyData | null>(null);
   const [selectedOptions, setSelectedOptions] = useState({
-    brandGuidelines: true,
-    businessOverview: true,
+    brandGuidelines: false,
+    businessOverview: false,
     icp: [] as string[]
   });
   const [additionalPrompt, setAdditionalPrompt] = useState('');
@@ -595,11 +595,11 @@ const VideosPage: React.FC = () => {
     
     try {
       // Build the prompt based on selected options
-      let prompt = "Please create high-quality ad videos that align with the below brand guidelines and target the specified audience. The videos should be professional, engaging, and suitable for various marketing channels. Use download_video to download reference videos and generate_video to create the result videos. Valid duration values for generate_video include \"15s\", \"30s\", \"60s\", \"auto\". Valid quality values for generate_video include \"low\", \"medium\", \"high\", \"auto\". DO NOT browse the internet for other videos.\n\n";
+      let prompt = "Please create a high-quality ad video that align with the below context and target the specified audience. The video should be professional, engaging, and suitable for various marketing channels. Use download_image to download reference images and generate_short_video to create the result video. DO NOT browse the internet for other videos.\n\n";
       
       // Add task description
       if (additionalPrompt.trim()) {
-        prompt += `Task:\n${additionalPrompt.trim()}\n\n`;
+        prompt += `Video Prompt:\n${additionalPrompt.trim()}\n\n`;
       }
       
       if (selectedOptions.brandGuidelines && brandData) {
@@ -696,8 +696,8 @@ const VideosPage: React.FC = () => {
 
       setCreateTaskDialogOpen(false);
       setSelectedOptions({
-        brandGuidelines: true,
-        businessOverview: true,
+        brandGuidelines: false,
+        businessOverview: false,
         icp: []
       });
       setAdditionalPrompt('');
