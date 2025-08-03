@@ -1045,10 +1045,10 @@ const VideosPage: React.FC = () => {
       <Dialog open={archiveDialogOpen} onOpenChange={setArchiveDialogOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Archive Video</DialogTitle>
-            <DialogDescription>
-              Are you sure you want to archive this video? Archived videos won't be shown in the main view but can still be accessed.
-            </DialogDescription>
+                    <DialogTitle>Archive Video</DialogTitle>
+        <DialogDescription>
+          Are you sure you want to archive this video? Archived videos will no longer be visible and you will need to contact AgentWeb support to restore them.
+        </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button variant="outline" onClick={() => setArchiveDialogOpen(false)}>
