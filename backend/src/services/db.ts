@@ -54,6 +54,7 @@ export interface User {
   isActive: boolean;
   createdAt: string;
   lastLoginTime?: string;
+  supportNote?: string;
   roles?: ("partner" | "customer")[];
   stripe_customer_id?: string;
   companyName?: string;

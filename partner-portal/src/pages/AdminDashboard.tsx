@@ -52,6 +52,7 @@ import {
   PersonOff as PersonOffIcon,
   Delete as DeleteIcon,
   PersonAdd as PersonAddIcon,
+  Check as CheckIcon,
 } from "@mui/icons-material";
 
 interface TabPanelProps {
@@ -122,6 +123,7 @@ interface User {
   isActive: boolean;
   createdAt: string;
   lastLoginTime?: string;
+  supportNote?: string;
   role?: "partner" | "customer"; // For single role from API
   roles?: ("partner" | "customer")[];
   taskCount?: number;
@@ -419,6 +421,9 @@ export default function AdminDashboard() {
   const [editingNoteEmail, setEditingNoteEmail] = useState<string | null>(null);
   const [currentNoteText, setCurrentNoteText] = useState("");
   const [noteEditLoading, setNoteEditLoading] = useState(false);
+  const [editingSupportNoteUserId, setEditingSupportNoteUserId] = useState<string | null>(null);
+  const [currentSupportNoteText, setCurrentSupportNoteText] = useState("");
+  const [supportNoteEditLoading, setSupportNoteEditLoading] = useState(false);
   const [emailToDelete, setEmailToDelete] = useState<string | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [userIdToDelete, setUserIdToDelete] = useState<string | null>(null);
@@ -900,6 +905,33 @@ export default function AdminDashboard() {
     }
   };
 
+  const handleSaveSupportNote = async (userId: string) => {
+    try {
+      setSupportNoteEditLoading(true);
+      
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/users/${userId}/support-note`),
+        { supportNote: currentSupportNoteText },
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+
+      if (response.status === 200) {
+        // Update the user in the context
+        await loadUsers();
+        setSuccess("Support note updated successfully!");
+        setEditingSupportNoteUserId(null);
+        setCurrentSupportNoteText("");
+      }
+    } catch (error: any) {
+      console.error("Error updating support note:", error);
+      setError(error.response?.data?.message || "Failed to update support note");
+    } finally {
+      setSupportNoteEditLoading(false);
+    }
+  };
+
   const useCaseOptions = [
     "Content Marketing",
     "SEO",
@@ -1268,6 +1300,7 @@ export default function AdminDashboard() {
                   <TableCell>Stripe Customer ID</TableCell>
                   <TableCell>Created</TableCell>
                   <TableCell>Last Login</TableCell>
+                  <TableCell>Support Note</TableCell>
                   <TableCell>Roles</TableCell>
                   <TableCell>Tasks</TableCell>
                   <TableCell>Workflows</TableCell>
@@ -1280,7 +1313,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={12} align="center">
+                    <TableCell colSpan={13} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -1307,6 +1340,56 @@ export default function AdminDashboard() {
                               new Date(user.lastLoginTime).toLocaleTimeString()
                             : "Never"
                           }
+                        </TableCell>
+                        <TableCell>
+                          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+                            {editingSupportNoteUserId === user.userId ? (
+                              <>
+                                <TextField
+                                  size="small"
+                                  value={currentSupportNoteText}
+                                  onChange={(e) => setCurrentSupportNoteText(e.target.value)}
+                                  placeholder="Add support note..."
+                                  sx={{ minWidth: 200 }}
+                                  disabled={supportNoteEditLoading}
+                                />
+                                <IconButton
+                                  size="small"
+                                  onClick={() => handleSaveSupportNote(user.userId)}
+                                  disabled={supportNoteEditLoading}
+                                  color="primary"
+                                >
+                                  <CheckIcon />
+                                </IconButton>
+                                <IconButton
+                                  size="small"
+                                  onClick={() => {
+                                    setEditingSupportNoteUserId(null);
+                                    setCurrentSupportNoteText("");
+                                  }}
+                                  disabled={supportNoteEditLoading}
+                                >
+                                  <CloseIcon />
+                                </IconButton>
+                              </>
+                            ) : (
+                              <>
+                                <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
+                                  {user.supportNote || "-"}
+                                </Typography>
+                                <IconButton
+                                  size="small"
+                                  onClick={() => {
+                                    setEditingSupportNoteUserId(user.userId);
+                                    setCurrentSupportNoteText(user.supportNote || "");
+                                  }}
+                                  disabled={supportNoteEditLoading}
+                                >
+                                  <EditIcon />
+                                </IconButton>
+                              </>
+                            )}
+                          </Box>
                         </TableCell>
                         <TableCell>
                           <Box

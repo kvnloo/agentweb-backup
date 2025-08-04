@@ -69,6 +69,27 @@ router.post("/users/:userId/deactivate", async (req, res) => {
   }
 });
 
+// Update user support note
+router.put("/users/:userId/support-note", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { supportNote } = req.body;
+
+    // Check if user exists
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Update the user's support note
+    const updatedUser = await userDb.updateUser(userId, { supportNote });
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error updating user support note:", error);
+    res.status(500).json({ message: "Error updating support note" });
+  }
+});
+
 // Get waitlist entries
 router.get("/waitlist", async (req, res) => {
   try {
