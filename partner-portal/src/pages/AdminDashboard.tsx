@@ -121,6 +121,7 @@ interface User {
   isAdmin: boolean;
   isActive: boolean;
   createdAt: string;
+  lastLoginTime?: string;
   role?: "partner" | "customer"; // For single role from API
   roles?: ("partner" | "customer")[];
   taskCount?: number;
@@ -1266,6 +1267,7 @@ export default function AdminDashboard() {
                   <TableCell>User ID</TableCell>
                   <TableCell>Stripe Customer ID</TableCell>
                   <TableCell>Created</TableCell>
+                  <TableCell>Last Login</TableCell>
                   <TableCell>Roles</TableCell>
                   <TableCell>Tasks</TableCell>
                   <TableCell>Workflows</TableCell>
@@ -1278,7 +1280,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={11} align="center">
+                    <TableCell colSpan={12} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -1298,6 +1300,13 @@ export default function AdminDashboard() {
                         <TableCell>{user.stripe_customer_id || "-"}</TableCell>
                         <TableCell>
                           {new Date(user.createdAt).toLocaleDateString()}
+                        </TableCell>
+                        <TableCell>
+                          {user.lastLoginTime 
+                            ? new Date(user.lastLoginTime).toLocaleDateString() + ' ' + 
+                              new Date(user.lastLoginTime).toLocaleTimeString()
+                            : "Never"
+                          }
                         </TableCell>
                         <TableCell>
                           <Box
