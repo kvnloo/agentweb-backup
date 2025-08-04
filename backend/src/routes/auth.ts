@@ -43,7 +43,17 @@ router.get('/me', authenticateToken, async (req, res) => {
     }
     // Don't send sensitive information
     const { password, ...userWithoutPassword } = user;
-    res.json(userWithoutPassword);
+    
+    // Add delegation information if this is a delegate session
+    const response: any = userWithoutPassword;
+    if (authenticatedReq.delegateInfo) {
+      response.delegateInfo = {
+        isDelegated: true,
+        adminEmail: authenticatedReq.delegateInfo.adminEmail
+      };
+    }
+    
+    res.json(response);
   } catch (error) {
     console.error('Error fetching current user:', error);
     res.status(500).json({ message: 'Server error' });

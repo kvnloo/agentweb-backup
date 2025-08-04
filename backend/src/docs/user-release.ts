@@ -12,6 +12,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fixed issue with Ad Images not seeing images for new owner after changing ownership',
       '- When task ownership is transferred to a new user, all associated execution images are now properly transferred',
       '- New task owners can immediately see all images from previous executions in their Ad Images page',
+      'Added support for Delegate access for admin to customer portal',
+      '- Admins can now access any customer\'s portal view by clicking "Access Customer Portal" button',
+      '- Delegate access creates secure 2-hour tokens that allow admins to view the portal as the user',
+      '- Clear visual indication shows when admin is viewing in delegate mode',
+      '- Added Support Note column with inline editing for admins to track user information',
+      '- Added Last Login Time column to track when users last accessed the platform',
     ],
   },
   {

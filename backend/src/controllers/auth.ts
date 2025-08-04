@@ -139,6 +139,16 @@ export const login = async (req: Request, res: Response) => {
       });
     }
 
+    // Update last login time
+    try {
+      await userDb.updateUser(user.userId, {
+        lastLoginTime: new Date().toISOString()
+      });
+    } catch (updateError) {
+      console.error("Error updating last login time:", updateError);
+      // Don't fail login if lastLoginTime update fails
+    }
+
     const jwtPayload = {
       userId: user.userId,
       email: user.email,
@@ -255,6 +265,16 @@ export const googleCallback = async (
         code: "invalid_role",
       };
       return done(errorObj, null);
+    }
+
+    // Update last login time for OAuth login
+    try {
+      await userDb.updateUser(user.userId, {
+        lastLoginTime: new Date().toISOString()
+      });
+    } catch (updateError) {
+      console.error("Error updating last login time for OAuth user:", updateError);
+      // Don't fail login if lastLoginTime update fails
     }
 
     const userRoles =

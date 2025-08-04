@@ -26,6 +26,10 @@ interface User {
   email: string;
   roles: UserRole[];
   isAdmin: boolean;
+  delegateInfo?: {
+    isDelegated: boolean;
+    adminEmail: string;
+  };
 }
 
 interface AuthContextType {

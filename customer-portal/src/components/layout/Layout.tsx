@@ -365,12 +365,18 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
         <header className="bg-white dark:bg-[#1B2549] h-14 px-4 flex items-center justify-between shrink-0">
           {/* Gradient bar */}
           <div className="absolute top-0 left-0 right-0 h-[2px] agent-gradient"></div>
-          <div className="flex items-center">
+          <div className="flex items-center gap-4">
             <h1 className="text-xl font-semibold text-gray-900 dark:text-[rgba(255,255,255,0.85)]">
               {categories
                 .flatMap((category) => category.items)
                 .find((item) => item.id === activeItem)?.label || "Dashboard"}
             </h1>
+            {user?.delegateInfo?.isDelegated && (
+              <div className="px-3 py-1 bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200 text-sm rounded-full flex items-center gap-1">
+                <Users size={14} />
+                <span>Admin View: {user.delegateInfo.adminEmail}</span>
+              </div>
+            )}
           </div>
           <div className="flex items-center gap-2">
             <Button
