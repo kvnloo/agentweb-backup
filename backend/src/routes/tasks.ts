@@ -305,8 +305,9 @@ router.put('/:id/owner', isAdmin, async (req: Request, res: Response) => {
       return res.status(404).json({ message: 'Admin user not found' });
     }
 
-    // Update task owner
+    // Update task owner and all associated executions
     await taskDb.updateTaskOwner(taskId, newOwner.userId);
+    await taskDb.updateTaskExecutionOwnership(taskId, newOwner.userId);
 
     // Send email notifications
     const siteDomain = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';

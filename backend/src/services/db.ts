@@ -1161,6 +1161,40 @@ export const taskDb = {
     return result.Attributes;
   },
 
+  async updateTaskExecutionOwnership(taskId: string, newOwnerId: string) {
+    try {
+      // Get all executions for this task
+      const executions = await this.getTaskExecutions(taskId);
+      
+      if (!executions || executions.length === 0) {
+        console.log(`No executions found for task ${taskId}`);
+        return;
+      }
+      
+      // Update each execution's userId
+      const updatePromises = executions.map(async (execution) => {
+        const params = {
+          TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
+          Key: {
+            executionId: execution.executionId,
+          },
+          UpdateExpression: "set userId = :userId",
+          ExpressionAttributeValues: {
+            ":userId": newOwnerId,
+          },
+        };
+
+        return dynamodb.update(params).promise();
+      });
+
+      await Promise.all(updatePromises);
+      console.log(`Updated ownership for ${executions.length} executions of task ${taskId}`);
+    } catch (error) {
+      console.error('Error updating task execution ownership:', error);
+      throw error;
+    }
+  },
+
   async archiveExecution(taskId: string, executionId: string) {
     const params = {
       TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
