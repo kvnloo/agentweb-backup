@@ -1,4 +1,5 @@
 import express from "express";
+import jwt from "jsonwebtoken";
 import { authenticateToken } from "../middleware/auth";
 import { isAdmin } from "../middleware/admin";
 import { userDb, taskDb, subscriberDb } from "../services/db";
@@ -87,6 +88,59 @@ router.put("/users/:userId/support-note", async (req, res) => {
   } catch (error) {
     console.error("Error updating user support note:", error);
     res.status(500).json({ message: "Error updating support note" });
+  }
+});
+
+// Create delegate access token for customer portal
+router.post("/users/:userId/delegate-access", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const adminReq = req as any; // Should have admin user from middleware
+    
+    // Check if user exists
+    const targetUser = await userDb.getUserById(userId);
+    if (!targetUser) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Ensure target user has customer role
+    if (!targetUser.roles || !targetUser.roles.includes("customer")) {
+      return res.status(400).json({ 
+        message: "User does not have customer portal access" 
+      });
+    }
+
+    // Create delegation token
+    const delegatePayload = {
+      userId: targetUser.userId, // This will be the active user in the token
+      email: targetUser.email,
+      roles: targetUser.roles,
+      isAdmin: false, // Target user permissions
+      delegateAccess: {
+        adminUserId: adminReq.user.userId,
+        adminEmail: adminReq.user.email,
+        targetUserId: targetUser.userId,
+        targetEmail: targetUser.email
+      }
+    };
+
+    const delegateToken = jwt.sign(
+      delegatePayload,
+      process.env.JWT_SECRET || "your-secret-key",
+      { expiresIn: "2h" } // Delegate tokens expire in 2 hours for security
+    );
+
+    // Return the delegate token and customer portal URL
+    const customerPortalUrl = process.env.CUSTOMER_FRONTEND_URL || "http://localhost:5174";
+    
+    res.json({ 
+      delegateToken,
+      customerPortalUrl: `${customerPortalUrl}/oauth-callback?token=${delegateToken}`,
+      expiresIn: "2h"
+    });
+  } catch (error) {
+    console.error("Error creating delegate access:", error);
+    res.status(500).json({ message: "Error creating delegate access" });
   }
 });
 

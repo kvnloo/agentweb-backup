@@ -53,6 +53,7 @@ import {
   Delete as DeleteIcon,
   PersonAdd as PersonAddIcon,
   Check as CheckIcon,
+  OpenInNew as OpenInNewIcon,
 } from "@mui/icons-material";
 
 interface TabPanelProps {
@@ -424,6 +425,7 @@ export default function AdminDashboard() {
   const [editingSupportNoteUserId, setEditingSupportNoteUserId] = useState<string | null>(null);
   const [currentSupportNoteText, setCurrentSupportNoteText] = useState("");
   const [supportNoteEditLoading, setSupportNoteEditLoading] = useState(false);
+  const [delegateAccessLoading, setDelegateAccessLoading] = useState<string | null>(null);
   const [emailToDelete, setEmailToDelete] = useState<string | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [userIdToDelete, setUserIdToDelete] = useState<string | null>(null);
@@ -929,6 +931,32 @@ export default function AdminDashboard() {
       setError(error.response?.data?.message || "Failed to update support note");
     } finally {
       setSupportNoteEditLoading(false);
+    }
+  };
+
+  const handleAccessCustomerPortal = async (userId: string) => {
+    try {
+      setDelegateAccessLoading(userId);
+      
+      const response = await axios.post(
+        buildApiUrl(`/api/admin/users/${userId}/delegate-access`),
+        {},
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+
+      if (response.status === 200) {
+        const { customerPortalUrl } = response.data;
+        // Open customer portal in new tab with delegate token
+        window.open(customerPortalUrl, '_blank');
+        setSuccess("Delegate access created successfully!");
+      }
+    } catch (error: any) {
+      console.error("Error creating delegate access:", error);
+      setError(error.response?.data?.message || "Failed to create delegate access");
+    } finally {
+      setDelegateAccessLoading(null);
     }
   };
 
@@ -1462,7 +1490,19 @@ export default function AdminDashboard() {
                           />
                         </TableCell>
                         <TableCell>
-                          <Box sx={{ display: "flex", gap: 1 }}>
+                          <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap" }}>
+                            {user.roles && user.roles.includes("customer") && (
+                              <Button
+                                variant="outlined"
+                                size="small"
+                                onClick={() => handleAccessCustomerPortal(user.userId)}
+                                startIcon={<OpenInNewIcon />}
+                                disabled={delegateAccessLoading === user.userId}
+                                color="primary"
+                              >
+                                {delegateAccessLoading === user.userId ? "Creating..." : "Access Customer Portal"}
+                              </Button>
+                            )}
                             <Button
                               variant="outlined"
                               size="small"
