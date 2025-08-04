@@ -974,6 +974,64 @@ const VideosPage: React.FC = () => {
                               <Button
                                 variant="ghost"
                                 size="sm"
+                                className="h-8 w-8 p-0 hover:bg-blue-50 dark:hover:bg-blue-900/20"
+                                onClick={async (e) => {
+                                  e.stopPropagation();
+                                  try {
+                                    // Call our backend API for Canva integration
+                                    const response = await axios.post(
+                                      buildApiUrl(`/api/tasks/${task.taskId}/canva-upload`),
+                                      {
+                                        videoUrl: file.url,
+                                        filename: file.filename
+                                      },
+                                      {
+                                        headers: { Authorization: `Bearer ${token}` }
+                                      }
+                                    );
+
+                                    if (response.data.success) {
+                                      // Copy video URL to clipboard
+                                      await navigator.clipboard.writeText(response.data.videoUrl);
+                                      
+                                      // Open Canva
+                                      window.open(response.data.canvaUrl, '_blank');
+                                      
+                                      // Show success toast with instructions
+                                      toast({
+                                        title: "✨ Ready for Canva!",
+                                        description: "Video URL copied! In Canva: Upload → From URL → Paste & Edit",
+                                        duration: 8000,
+                                      });
+                                    }
+                                  } catch (error) {
+                                    console.error('Canva integration error:', error);
+                                    // Fallback to original method
+                                    try {
+                                      await navigator.clipboard.writeText(file.url);
+                                      window.open('https://www.canva.com/create/videos/', '_blank');
+                                      toast({
+                                        title: "Canva Opened (Fallback)",
+                                        description: "Video URL copied! In Canva: Upload → From URL → Paste",
+                                        duration: 8000,
+                                      });
+                                    } catch (clipboardError) {
+                                      window.open('https://www.canva.com/create/videos/', '_blank');
+                                      toast({
+                                        title: "Canva Opened",
+                                        description: `Copy this URL: ${file.url}`,
+                                        duration: 10000,
+                                      });
+                                    }
+                                  }
+                                }}
+                                title="Edit with Canva"
+                              >
+                                <ExternalLink className="h-4 w-4 text-blue-600" />
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="sm"
                                 className="h-8 w-8 p-0"
                                 onClick={(e) => {
                                   e.stopPropagation();
@@ -1273,6 +1331,64 @@ const VideosPage: React.FC = () => {
                   {previewVideo.filename}
                 </div>
                 <div className="flex items-center gap-2">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 px-3 bg-blue-600 text-white hover:bg-blue-700"
+                    onClick={async () => {
+                      try {
+                        // Call our backend API for Canva integration
+                        const response = await axios.post(
+                          buildApiUrl(`/api/tasks/${previewVideo.taskId}/canva-upload`),
+                          {
+                            videoUrl: previewVideo.url,
+                            filename: previewVideo.filename
+                          },
+                          {
+                            headers: { Authorization: `Bearer ${token}` }
+                          }
+                        );
+
+                        if (response.data.success) {
+                          // Copy video URL to clipboard
+                          await navigator.clipboard.writeText(response.data.videoUrl);
+                          
+                          // Open Canva
+                          window.open(response.data.canvaUrl, '_blank');
+                          
+                          // Show success toast with instructions
+                          toast({
+                            title: "✨ Ready for Canva!",
+                            description: "Video URL copied! In Canva: Upload → From URL → Paste & Edit",
+                            duration: 8000,
+                          });
+                        }
+                      } catch (error) {
+                        console.error('Canva integration error:', error);
+                        // Fallback to original method
+                        try {
+                          await navigator.clipboard.writeText(previewVideo.url);
+                          window.open('https://www.canva.com/create/videos/', '_blank');
+                          toast({
+                            title: "Canva Opened (Fallback)",
+                            description: "Video URL copied! In Canva: Upload → From URL → Paste",
+                            duration: 8000,
+                          });
+                        } catch (clipboardError) {
+                          window.open('https://www.canva.com/create/videos/', '_blank');
+                          toast({
+                            title: "Canva Opened",
+                            description: `Copy this URL: ${previewVideo.url}`,
+                            duration: 10000,
+                          });
+                        }
+                      }
+                    }}
+                    title="Edit with Canva"
+                  >
+                    <ExternalLink className="h-4 w-4 mr-1" />
+                    Edit with Canva
+                  </Button>
                   <Button
                     variant="ghost"
                     size="sm"

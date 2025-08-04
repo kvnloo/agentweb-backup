@@ -1238,4 +1238,48 @@ router.post('/executions/:executionId/archive-image', authenticateToken, async (
   }
 });
 
+// Canva Integration Endpoint
+router.post('/:taskId/canva-upload', authenticateToken as ExpressRequestHandler, async (req: AuthRequest, res: Response) => {
+  try {
+    const { taskId } = req.params;
+    const { videoUrl, filename } = req.body;
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    if (!videoUrl || !filename) {
+      return res.status(400).json({ error: 'Video URL and filename are required' });
+    }
+
+    // Note: This is a placeholder for Canva Connect API integration
+    // In a real implementation, you would:
+    // 1. Get user's Canva access token from your database
+    // 2. Create asset upload job using Canva Connect API
+    // 3. Return job ID and status URL for polling
+
+    // For now, we'll return a success response with instructions
+    const response = {
+      success: true,
+      message: 'Video prepared for Canva upload',
+      canvaUrl: 'https://www.canva.com/create/videos/',
+      videoUrl: videoUrl,
+      filename: filename,
+      instructions: [
+        'Open the Canva link in a new tab',
+        'Click "Upload" in Canva',
+        'Select "From URL"',
+        'Paste the video URL provided',
+        'Start editing your video!'
+      ]
+    };
+
+    res.json(response);
+  } catch (error) {
+    console.error('Canva upload error:', error);
+    res.status(500).json({ error: 'Failed to prepare video for Canva upload' });
+  }
+});
+
 export default router; 
