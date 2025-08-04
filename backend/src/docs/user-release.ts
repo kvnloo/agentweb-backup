@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-08-04',
+    changes: [
+      'Fixed issue with Ad Images not seeing images for new owner after changing ownership',
+      '- When task ownership is transferred to a new user, all associated execution images are now properly transferred',
+      '- New task owners can immediately see all images from previous executions in their Ad Images page',
+    ],
+  },
+  {
     date: '2025-08-03',
     changes: [
       'Added Ad Videos page under Creatives category',
