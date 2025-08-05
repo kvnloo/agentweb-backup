@@ -18,6 +18,7 @@
     "@google-cloud/discoveryengine": "^2.1.0",
     "@google-cloud/storage": "^7.16.0",
     "@reactflow/core": "^11.11.4",
+    "@slack/web-api": "^7.9.3",
     "@types/aws-sdk": "^2.7.4",
     "@types/axios": "^0.9.36",
     "@types/bcryptjs": "^2.4.6",
@@ -52,7 +53,8 @@
     "reactflow": "^11.11.4",
     "socket.io": "^4.8.1",
     "stripe": "^18.2.1",
-    "typescript": "^5.3.3"
+    "typescript": "^5.3.3",
+    "uuid": "^11.1.0"
   },
   "devDependencies": {
     "@types/uuid": "^10.0.0",

@@ -13,7 +13,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { Checkbox } from '@/components/ui/checkbox';
-import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink, Clock, ArrowUpRight, Play, Zap, Download, Heart, Plus, Archive, Upload, ChevronDown, X } from 'lucide-react';
+import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink, Clock, ArrowUpRight, Play, Zap, Download, Heart, Plus, Archive, Upload, ChevronDown, X, CheckCircle, MessageSquare, AlertTriangle, RefreshCw } from 'lucide-react';
 import { format } from 'date-fns';
 import { useNavigate } from 'react-router-dom';
 import { useToast } from '@/hooks/use-toast';
@@ -25,7 +25,45 @@ interface ResultFile {
   is_html?: boolean;
   is_favorited?: boolean;
   is_archived?: boolean;
+  approval_status?: 'pending' | 'approved' | 'needs_changes' | null;
+  slack_message_ts?: string | null;
+  approval_channel?: string | null;
 }
+
+type AssetType = 'image' | 'video' | 'html' | 'text' | 'pdf' | 'other';
+
+// Utility function to determine asset type from filename
+const getAssetTypeFromFilename = (filename: string): AssetType => {
+  const extension = filename.toLowerCase().split('.').pop() || '';
+  
+  // Image formats
+  if (['jpg', 'jpeg', 'png', 'gif', 'svg', 'webp', 'bmp', 'ico'].includes(extension)) {
+    return 'image';
+  }
+  
+  // Video formats
+  if (['mp4', 'avi', 'mov', 'mkv', 'wmv', 'flv', 'webm', 'm4v', '3gp', 'mpg', 'mpeg', 'ogv'].includes(extension)) {
+    return 'video';
+  }
+  
+  // HTML formats
+  if (['html', 'htm'].includes(extension)) {
+    return 'html';
+  }
+  
+  // Text formats
+  if (['txt', 'json', 'csv', 'xml', 'md', 'js', 'css', 'log', 'yml', 'yaml'].includes(extension)) {
+    return 'text';
+  }
+  
+  // PDF format
+  if (extension === 'pdf') {
+    return 'pdf';
+  }
+  
+  // Default to other
+  return 'other';
+};
 
 interface ExecutionWithImages {
   executionId: string;
@@ -102,6 +140,15 @@ const ImagesPage: React.FC = () => {
   const [previewImage, setPreviewImage] = useState<{ url: string; filename: string; taskId: string; executionId: string } | null>(null);
   const [revisionPrompt, setRevisionPrompt] = useState('');
   const [isSubmittingRevision, setIsSubmittingRevision] = useState(false);
+  
+  // Approval-related state
+  const [channelSelectionOpen, setChannelSelectionOpen] = useState(false);
+  const [pendingApprovalImage, setPendingApprovalImage] = useState<{ executionId: string; imageUrl: string; filename: string } | null>(null);
+  const [slackChannels, setSlackChannels] = useState<Array<{ id: string; name: string; displayName: string }>>([]);
+  const [loadingChannels, setLoadingChannels] = useState(false);
+  const [sendingApproval, setSendingApproval] = useState(false);
+  const [approvalData, setApprovalData] = useState<{ assets?: Record<string, any> }>({});
+  const [refreshingApprovals, setRefreshingApprovals] = useState(false);
 
   // Handle escape key to close image preview
   useEffect(() => {
@@ -636,6 +683,181 @@ const ImagesPage: React.FC = () => {
     setPendingTaskId(null);
   };
 
+  // Load approval data for all assets
+  const loadApprovalData = async () => {
+    try {
+      const assetUrls = new Set<string>();
+      Object.values(tasksWithExecutions).forEach(task => {
+        task.executions.forEach(execution => {
+          execution.result_files.forEach(file => {
+            if (!file.is_archived) {
+              assetUrls.add(file.url);
+            }
+          });
+        });
+      });
+
+      if (assetUrls.size === 0) {
+        setApprovalData({});
+        return;
+      }
+
+      const response = await axios.post(buildApiUrl('/api/slack/approvals'), {
+        assetUrls: Array.from(assetUrls)
+      }, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      setApprovalData({ assets: response.data.approvals || {} });
+    } catch (error) {
+      console.error('Error loading approval data:', error);
+    }
+  };
+
+  // Load approval data when tasks change
+  useEffect(() => {
+    if (Object.keys(tasksWithExecutions).length > 0 && token) {
+      loadApprovalData();
+    }
+  }, [tasksWithExecutions, token]);
+
+  // Manual refresh function
+  const handleRefreshApprovals = async () => {
+    if (refreshingApprovals) return;
+    
+    setRefreshingApprovals(true);
+    try {
+      await axios.post(buildApiUrl('/api/slack/poll-updates'), {}, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      await loadApprovalData();
+      toast({
+        title: "Approvals Refreshed",
+        description: "Checked for the latest approval status updates.",
+      });
+    } catch (error) {
+      console.error('Error refreshing approvals:', error);
+      toast({
+        title: "Error Refreshing",
+        description: "Could not check for approval updates.",
+        variant: "destructive",
+      });
+    } finally {
+      setRefreshingApprovals(false);
+    }
+  };
+
+  // Polling for approval status updates
+  useEffect(() => {
+    if (!token) return;
+
+    const pollForUpdates = async () => {
+      if (refreshingApprovals) return; // Skip if manual refresh is running
+      
+      try {
+        await axios.post(buildApiUrl('/api/slack/poll-updates'), {}, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        // Reload approval data after polling
+        await loadApprovalData();
+      } catch (error) {
+        console.error('Error polling for approval updates:', error);
+      }
+    };
+
+    // Poll every 60 seconds for approval updates (less frequent than manual)
+    const pollInterval = setInterval(pollForUpdates, 60000);
+
+    return () => clearInterval(pollInterval);
+  }, [token, refreshingApprovals]);
+
+  // Approval handlers
+  const handleApprovalClick = async (executionId: string, assetUrl: string, filename: string) => {
+    setPendingApprovalImage({ executionId, imageUrl: assetUrl, filename });
+    setChannelSelectionOpen(true);
+    
+    // Load Slack channels
+    if (slackChannels.length === 0) {
+      await loadSlackChannels();
+    }
+  };
+
+  const loadSlackChannels = async () => {
+    setLoadingChannels(true);
+    try {
+      const response = await axios.get(buildApiUrl('/api/slack/channels'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setSlackChannels(response.data);
+    } catch (error: any) {
+      console.error('Error loading Slack channels:', error);
+      toast({
+        title: "Error Loading Channels",
+        description: "Could not load Slack channels. Please try again.",
+        variant: "destructive",
+      });
+    } finally {
+      setLoadingChannels(false);
+    }
+  };
+
+  const handleSendApprovalRequest = async (channelId: string) => {
+    if (!pendingApprovalImage || !token) return;
+
+    setSendingApproval(true);
+    try {
+      const assetType = getAssetTypeFromFilename(pendingApprovalImage.filename);
+      
+      const response = await axios.post(
+        buildApiUrl('/api/slack/send-approval'),
+        {
+          channel: channelId,
+          assetUrl: pendingApprovalImage.imageUrl,
+          filename: pendingApprovalImage.filename,
+          assetType,
+          executionId: pendingApprovalImage.executionId,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      if (response.data.success) {
+        toast({
+          title: "Approval Request Sent",
+          description: "The approval request has been sent to Slack successfully.",
+        });
+        
+        setChannelSelectionOpen(false);
+        setPendingApprovalImage(null);
+        
+        // Use timeout approach like emma-dashboard for immediate feedback
+        setTimeout(async () => {
+          await loadApprovalData();
+        }, 1000);
+      }
+    } catch (error: any) {
+      console.error('Error sending approval request:', error);
+      toast({
+        title: "Error Sending Approval",
+        description: error.response?.data?.message || "Failed to send approval request.",
+        variant: "destructive",
+      });
+    } finally {
+      setSendingApproval(false);
+    }
+  };
+
+  const handleCancelApproval = () => {
+    setChannelSelectionOpen(false);
+    setPendingApprovalImage(null);
+  };
+
+  // Get approval status for a specific asset
+  const getApprovalStatus = (assetUrl: string) => {
+    return approvalData.assets?.[assetUrl] || null;
+  };
+
   // Convert to array of tasks and filter/sort
   const allTasks = Object.values(tasksWithExecutions)
     .filter(task => {
@@ -903,12 +1125,26 @@ const ImagesPage: React.FC = () => {
                 • Auto-refreshing active executions
               </span>
             )}
+            <span className="ml-2 text-green-600 dark:text-green-400">
+              • Auto-checking for approval updates every minute
+            </span>
           </p>
         </div>
-        <Button onClick={() => setCreateTaskDialogOpen(true)} className="bg-blue-600 hover:bg-blue-700 text-white font-medium px-6 py-2">
-          <Plus className="h-4 w-4 mr-2" />
-          Create Ad Images
-        </Button>
+        <div className="flex gap-2">
+          <Button 
+            onClick={handleRefreshApprovals}
+            disabled={refreshingApprovals}
+            variant="outline" 
+            className="font-medium px-4 py-2"
+          >
+            <RefreshCw className={`h-4 w-4 mr-2 ${refreshingApprovals ? 'animate-spin' : ''}`} />
+            {refreshingApprovals ? 'Checking...' : 'Refresh Approvals'}
+          </Button>
+          <Button onClick={() => setCreateTaskDialogOpen(true)} className="bg-blue-600 hover:bg-blue-700 text-white font-medium px-6 py-2">
+            <Plus className="h-4 w-4 mr-2" />
+            Create Ad Images
+          </Button>
+        </div>
       </div>
 
       {/* Filters */}
@@ -1115,6 +1351,35 @@ const ImagesPage: React.FC = () => {
                                   }`} 
                                 />
                               </Button>
+                              {(() => {
+                                const approval = getApprovalStatus(file.url);
+                                const status = approval?.status;
+                                return (
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-8 w-8 p-0 hover:bg-gray-100 dark:hover:bg-gray-800"
+                                    onClick={() => handleApprovalClick(execution.executionId, file.url, file.filename)}
+                                    title={
+                                      status === 'approved' ? `Approved by ${approval.reviewedBy}` :
+                                      status === 'needs_changes' ? `Changes requested by ${approval.reviewedBy}` :
+                                      status === 'pending' ? 'Approval Pending' :
+                                      'Request Approval'
+                                    }
+                                    disabled={status === 'pending'}
+                                  >
+                                    {status === 'approved' ? (
+                                      <CheckCircle className="h-4 w-4 text-green-500" />
+                                    ) : status === 'needs_changes' ? (
+                                      <AlertTriangle className="h-4 w-4 text-orange-500" />
+                                    ) : status === 'pending' ? (
+                                      <MessageSquare className="h-4 w-4 text-blue-500" />
+                                    ) : (
+                                      <MessageSquare className="h-4 w-4 text-gray-400 hover:text-blue-500" />
+                                    )}
+                                  </Button>
+                                );
+                              })()}
                               <Button
                                 variant="ghost"
                                 size="sm"
@@ -1479,6 +1744,60 @@ const ImagesPage: React.FC = () => {
               </div>
             </div>
           )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Channel Selection Dialog */}
+      <Dialog open={channelSelectionOpen} onOpenChange={setChannelSelectionOpen}>
+        <DialogContent className="sm:max-w-[500px]">
+          <DialogHeader>
+            <DialogTitle>Select Slack Channel</DialogTitle>
+            <DialogDescription>
+              Choose which Slack channel to send the approval request for: {pendingApprovalImage?.filename}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            {loadingChannels ? (
+              <div className="flex items-center justify-center py-8">
+                <Loader2 className="h-6 w-6 animate-spin mr-2" />
+                <span>Loading channels...</span>
+              </div>
+            ) : slackChannels.length === 0 ? (
+              <div className="text-center py-8">
+                <p className="text-gray-500 dark:text-gray-400">
+                  No Slack channels available. Please check your Slack integration setup.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-2 max-h-60 overflow-y-auto">
+                {slackChannels.map((channel) => (
+                  <Button
+                    key={channel.id}
+                    variant="outline"
+                    className="w-full justify-start h-auto p-3"
+                    onClick={() => handleSendApprovalRequest(channel.id)}
+                    disabled={sendingApproval}
+                  >
+                    <div className="flex items-center">
+                      <MessageSquare className="h-4 w-4 mr-2" />
+                      <span>{channel.displayName}</span>
+                    </div>
+                  </Button>
+                ))}
+              </div>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={handleCancelApproval} disabled={sendingApproval}>
+              Cancel
+            </Button>
+            {sendingApproval && (
+              <Button disabled>
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                Sending...
+              </Button>
+            )}
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </div>
