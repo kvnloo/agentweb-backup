@@ -13,7 +13,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { Checkbox } from '@/components/ui/checkbox';
-import { Loader2, Search, Filter, Calendar, Play, ExternalLink, Clock, ArrowUpRight, Zap, Download, Heart, Plus, Archive, Upload, ChevronDown, X } from 'lucide-react';
+import { Loader2, Search, Filter, Calendar, Play, ExternalLink, Clock, ArrowUpRight, Zap, Download, Heart, Plus, Archive, Upload, ChevronDown, X, CheckCircle, MessageSquare, AlertTriangle, Send } from 'lucide-react';
 import { format } from 'date-fns';
 import { useNavigate } from 'react-router-dom';
 import { useToast } from '@/hooks/use-toast';
@@ -25,6 +25,9 @@ interface ResultFile {
   is_html?: boolean;
   is_favorited?: boolean;
   is_archived?: boolean;
+  approval_status?: string;
+  slack_message_ts?: string;
+  approval_channel?: string;
 }
 
 interface ExecutionWithVideos {
@@ -105,6 +108,34 @@ interface BrandAsset {
   filename: string;
 }
 
+// Define asset type for API calls
+type AssetType = 'image' | 'video' | 'document';
+
+// Utility function to determine asset type from filename
+const getAssetTypeFromFilename = (filename: string): AssetType => {
+  const extension = filename.toLowerCase().split('.').pop();
+  switch (extension) {
+    case 'mp4':
+    case 'avi':
+    case 'mov':
+    case 'wmv':
+    case 'flv':
+    case 'webm':
+    case 'mkv':
+      return 'video';
+    case 'jpg':
+    case 'jpeg':
+    case 'png':
+    case 'gif':
+    case 'bmp':
+    case 'svg':
+    case 'webp':
+      return 'image';
+    default:
+      return 'document';
+  }
+};
+
 const VideosPage: React.FC = () => {
   const { token } = useAuth();
   const navigate = useNavigate();
@@ -125,6 +156,20 @@ const VideosPage: React.FC = () => {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [videoPreviewOpen, setVideoPreviewOpen] = useState(false);
   const [previewVideo, setPreviewVideo] = useState<{ url: string; filename: string; taskId: string; executionId: string } | null>(null);
+  
+  // Approval-related state
+  const [channelSelectionOpen, setChannelSelectionOpen] = useState(false);
+  const [pendingApprovalVideo, setPendingApprovalVideo] = useState<{ executionId: string; videoUrl: string; filename: string } | null>(null);
+  const [slackChannels, setSlackChannels] = useState<Array<{ id: string; name: string; displayName: string }>>([]);
+  const [loadingChannels, setLoadingChannels] = useState(false);
+  const [sendingApproval, setSendingApproval] = useState(false);
+  const [approvalNote, setApprovalNote] = useState('');
+  const [approvalData, setApprovalData] = useState<{ assets?: Record<string, any> }>({});
+  const [revisionModalOpen, setRevisionModalOpen] = useState(false);
+  const [revisionVideo, setRevisionVideo] = useState<{ executionId: string; url: string; filename: string; feedback: string; taskId: string; note?: string } | null>(null);
+  const [selectedRevisionVideo, setSelectedRevisionVideo] = useState<string | null>(null);
+  const [submittingRevision, setSubmittingRevision] = useState(false);
+  const [revisionNote, setRevisionNote] = useState('');
 
   // Handle escape key to close video preview
   useEffect(() => {
@@ -736,6 +781,217 @@ const VideosPage: React.FC = () => {
     }
   }, [createTaskDialogOpen, token]);
 
+  // Approval-related functions
+  const loadApprovalData = async () => {
+    if (!token) return;
+    
+    try {
+      const allUrls = Object.values(tasksWithExecutions).flatMap(task => 
+        task.executions.flatMap(execution => 
+          execution.result_files.map(file => file.url)
+        )
+      );
+      
+      if (allUrls.length === 0) {
+        setApprovalData({});
+        return;
+      }
+
+      const response = await axios.post(
+        buildApiUrl('/api/slack/approvals'),
+        { assetUrls: allUrls },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      
+      setApprovalData({ assets: response.data.approvals || {} });
+    } catch (error: any) {
+      console.error('Error loading approval data:', error);
+    }
+  };
+
+  const loadSlackChannels = async () => {
+    if (!token) return;
+    
+    setLoadingChannels(true);
+    try {
+      const response = await axios.get(
+        buildApiUrl('/api/slack/channels'),
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setSlackChannels(response.data);
+    } catch (error: any) {
+      console.error('Error loading Slack channels:', error);
+      toast({
+        title: "Error Loading Channels",
+        description: "Failed to load Slack channels. Please check your integration setup.",
+        variant: "destructive",
+      });
+    } finally {
+      setLoadingChannels(false);
+    }
+  };
+
+  const handleApprovalClick = async (executionId: string, videoUrl: string, filename: string) => {
+    setPendingApprovalVideo({ executionId, videoUrl, filename });
+    if (slackChannels.length === 0) {
+      await loadSlackChannels();
+    }
+    setChannelSelectionOpen(true);
+  };
+
+  const handleSendApprovalRequest = async (channelId: string) => {
+    if (!pendingApprovalVideo || !token) return;
+
+    setSendingApproval(true);
+    try {
+      const assetType = getAssetTypeFromFilename(pendingApprovalVideo.filename);
+      
+      const selectedChannel = slackChannels.find(ch => ch.id === channelId);
+      const channelName = selectedChannel?.displayName || selectedChannel?.name || 'Unknown Channel';
+
+      const response = await axios.post(
+        buildApiUrl('/api/slack/send-approval'),
+        {
+          channel: channelId,
+          channelName,
+          assetUrl: pendingApprovalVideo.videoUrl,
+          filename: pendingApprovalVideo.filename,
+          assetType,
+          executionId: pendingApprovalVideo.executionId,
+          note: approvalNote,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      setChannelSelectionOpen(false);
+      setPendingApprovalVideo(null);
+      setApprovalNote('');
+      
+      toast({
+        title: "Approval Request Sent",
+        description: `Approval request sent to ${channelName}`,
+      });
+
+      await loadApprovalData();
+    } catch (error: any) {
+      console.error('Error sending approval request:', error);
+      toast({
+        title: "Error",
+        description: error.response?.data?.message || "Failed to send approval request.",
+        variant: "destructive",
+      });
+    } finally {
+      setSendingApproval(false);
+    }
+  };
+
+  const handleCancelApproval = () => {
+    setChannelSelectionOpen(false);
+    setPendingApprovalVideo(null);
+    setApprovalNote('');
+  };
+
+  const getApprovalStatus = (assetUrl: string) => {
+    return approvalData.assets?.[assetUrl] || null;
+  };
+
+  const handleRevisionClick = (executionId: string, assetUrl: string, filename: string, feedback: string, taskId: string, note?: string) => {
+    setRevisionVideo({ executionId, url: assetUrl, filename, feedback, taskId, note });
+    setSelectedRevisionVideo(null);
+    setRevisionNote(note || ''); // Copy the original note
+    setRevisionModalOpen(true);
+  };
+
+  // Get all unreviewed alternative videos from the task in a single flat array
+  const getUnreviewedAlternativeVideos = () => {
+    if (!revisionVideo?.taskId || !tasksWithExecutions[revisionVideo.taskId]) {
+      return [];
+    }
+    
+    const allFiles = [];
+    for (const execution of tasksWithExecutions[revisionVideo.taskId].executions) {
+      for (const file of execution.result_files) {
+        if (!file.is_archived && file.url !== revisionVideo.url) {
+          const approval = getApprovalStatus(file.url);
+          const isUnreviewed = !approval || (approval.status !== 'pending' && approval.status !== 'approved' && approval.status !== 'needs_changes' && approval.status !== 'revision_submitted');
+          
+          // Only include unreviewed videos
+          if (isUnreviewed) {
+            allFiles.push(file);
+          }
+        }
+      }
+    }
+    return allFiles;
+  };
+
+  const handleRevisionVideoSelect = (assetUrl: string) => {
+    setSelectedRevisionVideo(assetUrl);
+  };
+
+  const handleSubmitApprovalRevision = async () => {
+    if (!revisionVideo || !selectedRevisionVideo || !token) return;
+
+    setSubmittingRevision(true);
+    try {
+      const response = await axios.post(
+        buildApiUrl('/api/slack/submit-revision'),
+        {
+          executionId: revisionVideo.executionId,
+          originalAssetUrl: revisionVideo.url,
+          originalFilename: revisionVideo.filename,
+          selectedAssetUrl: selectedRevisionVideo,
+          note: revisionNote.trim() || undefined, // Include updated note
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      if (response.data.success) {
+        toast({
+          title: "Revision Submitted",
+          description: "Your revision has been submitted for review.",
+        });
+        
+        setRevisionModalOpen(false);
+        setRevisionVideo(null);
+        setSelectedRevisionVideo(null);
+        setRevisionNote(''); // Reset note after successful submission
+        
+        // Refresh approval data to show updated status
+        setTimeout(async () => {
+          await loadApprovalData();
+        }, 1000);
+      }
+    } catch (error: any) {
+      console.error('Error submitting revision:', error);
+      toast({
+        title: "Error Submitting Revision",
+        description: error.response?.data?.message || "Failed to submit revision.",
+        variant: "destructive",
+      });
+    } finally {
+      setSubmittingRevision(false);
+    }
+  };
+
+  const handleCancelRevision = () => {
+    setRevisionModalOpen(false);
+    setRevisionVideo(null);
+    setSelectedRevisionVideo(null);
+    setRevisionNote(''); // Reset note when canceling
+  };
+
+  // Load approval data when tasks data changes
+  useEffect(() => {
+    if (Object.keys(tasksWithExecutions).length > 0) {
+      loadApprovalData();
+    }
+  }, [tasksWithExecutions, token]);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
@@ -995,6 +1251,71 @@ const VideosPage: React.FC = () => {
                                 title="Archive Video"
                               >
                                 <Archive className="h-4 w-4" />
+                              </Button>
+                              
+                              {/* Approval Button */}
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-8 w-8 p-0 relative"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  const approval = getApprovalStatus(file.url);
+                                  if (approval?.status === 'pending' || approval?.status === 'approved' || approval?.status === 'revision_submitted') {
+                                    return; // Non-clickable for these statuses
+                                  }
+                                  
+                                  if (approval?.status === 'needs_changes') {
+                                    handleRevisionClick(execution.executionId, file.url, file.filename, approval?.feedback || '', task.taskId, approval?.note);
+                                  } else {
+                                    handleApprovalClick(execution.executionId, file.url, file.filename);
+                                  }
+                                }}
+                                title={(() => {
+                                  const approval = getApprovalStatus(file.url);
+                                  if (!approval) return "Send for approval";
+                                  
+                                  switch (approval.status) {
+                                    case 'pending':
+                                      return `Review request sent at ${new Date(approval.createdAt).toLocaleString()} to ${approval.slackChannelName || 'Slack channel'}`;
+                                    case 'approved':
+                                      return `Approved by ${approval.reviewedBy} at ${new Date(approval.updatedAt).toLocaleString()} in ${approval.slackChannelName || 'Slack channel'}`;
+                                    case 'needs_changes':
+                                      return `Changes requested by ${approval.reviewedBy} at ${new Date(approval.updatedAt).toLocaleString()} in ${approval.slackChannelName || 'Slack channel'}${approval.feedback ? `\nFeedback: ${approval.feedback}` : ''}`;
+                                    case 'revision_submitted':
+                                      return `Revision submitted at ${new Date(approval.updatedAt).toLocaleString()} in ${approval.slackChannelName || 'Slack channel'}`;
+                                    default:
+                                      return "Send for approval";
+                                  }
+                                })()}
+                              >
+                                {(() => {
+                                  const approval = getApprovalStatus(file.url);
+                                  if (!approval) {
+                                    return <MessageSquare className="h-4 w-4 text-gray-400 hover:text-blue-500" />;
+                                  }
+                                  
+                                  switch (approval.status) {
+                                    case 'pending':
+                                      return <MessageSquare className="h-4 w-4 text-blue-500" />;
+                                    case 'approved':
+                                      return <CheckCircle className="h-4 w-4 text-green-500" />;
+                                    case 'needs_changes':
+                                      return <AlertTriangle className="h-4 w-4 text-orange-500" />;
+                                    case 'revision_submitted':
+                                      return <Send className="h-4 w-4 text-gray-400" />;
+                                    default:
+                                      return <MessageSquare className="h-4 w-4 text-gray-400 hover:text-blue-500" />;
+                                  }
+                                })()}
+                                {(() => {
+                                  const approval = getApprovalStatus(file.url);
+                                  // Red dot only for needs_changes
+                                  if (approval?.feedback && approval.status === 'needs_changes') {
+                                    return <div className="absolute -top-1 -right-1 w-2 h-2 bg-red-500 rounded-full" title="Has feedback"></div>;
+                                  }
+                                  return null;
+                                })()}
                               </Button>
                             </div>
                           </div>
@@ -1305,6 +1626,181 @@ const VideosPage: React.FC = () => {
               </div>
             </div>
           )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Channel Selection Dialog */}
+      <Dialog open={channelSelectionOpen} onOpenChange={setChannelSelectionOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Send Approval Request</DialogTitle>
+            <DialogDescription>
+              Choose which Slack channel to send the approval request for: {pendingApprovalVideo?.filename}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="approval-note">Note (Optional)</Label>
+              <Textarea
+                id="approval-note"
+                placeholder="Add a note to provide context for the approval request..."
+                value={approvalNote}
+                onChange={(e) => setApprovalNote(e.target.value)}
+                className="min-h-[80px]"
+                disabled={sendingApproval}
+              />
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                This note will be shown to reviewers in Slack to provide context about the asset.
+              </p>
+            </div>
+            
+            <div className="space-y-2">
+              <Label>Select Channel</Label>
+              {loadingChannels ? (
+                <div className="flex items-center justify-center py-8">
+                  <Loader2 className="h-6 w-6 animate-spin mr-2" />
+                  <span>Loading channels...</span>
+                </div>
+              ) : slackChannels.length === 0 ? (
+                <div className="text-center py-8">
+                  <p className="text-gray-500 dark:text-gray-400">
+                    No Slack channels available. Please check your Slack integration setup.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-2 max-h-60 overflow-y-auto">
+                  {slackChannels.map((channel) => (
+                    <Button
+                      key={channel.id}
+                      variant="outline"
+                      className="w-full justify-start h-auto p-3"
+                      onClick={() => handleSendApprovalRequest(channel.id)}
+                      disabled={sendingApproval}
+                    >
+                      <div className="flex items-center space-x-2">
+                        <span className="font-medium">{channel.displayName}</span>
+                        {channel.isPrivate && (
+                          <Badge variant="secondary" className="text-xs">Private</Badge>
+                        )}
+                      </div>
+                    </Button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={handleCancelApproval}>
+              Cancel
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Revision Modal */}
+      <Dialog open={revisionModalOpen} onOpenChange={setRevisionModalOpen}>
+        <DialogContent className="sm:max-w-[90vw] max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Submit Revision</DialogTitle>
+            <DialogDescription>
+              Please select an existing video from this task to submit as a revision based on the feedback provided.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            {revisionVideo && (
+              <>
+                <div className="space-y-2">
+                  <Label>Original Video (Needs Changes)</Label>
+                  <div className="border rounded-lg p-4 bg-gray-50 dark:bg-gray-800">
+                    <video 
+                      src={revisionVideo.url} 
+                      className="max-w-full h-auto max-h-48 object-contain aspect-video"
+                      controls
+                    />
+                    <p className="text-sm text-gray-600 dark:text-gray-400 mt-2">
+                      {revisionVideo.filename}
+                    </p>
+                  </div>
+                </div>
+                
+                <div className="space-y-2">
+                  <Label>Feedback</Label>
+                  <div className="border rounded-lg p-4 bg-yellow-50 dark:bg-yellow-900/20 border-yellow-200 dark:border-yellow-800">
+                    <p className="text-sm text-yellow-800 dark:text-yellow-200">
+                      {revisionVideo.feedback || 'No specific feedback provided'}
+                    </p>
+                  </div>
+                </div>
+                
+                <div className="space-y-2">
+                  <Label htmlFor="revision-note">Note (Optional)</Label>
+                  <Textarea
+                    id="revision-note"
+                    placeholder="Add or update the note to provide context for the revision..."
+                    value={revisionNote}
+                    onChange={(e) => setRevisionNote(e.target.value)}
+                    className="min-h-[80px]"
+                    disabled={submittingRevision}
+                  />
+                  <p className="text-xs text-gray-500 dark:text-gray-400">
+                    This note will be shown to reviewers in Slack along with the revised asset.
+                  </p>
+                </div>
+                
+                <div className="space-y-2">
+                  <Label>Select Alternative Video</Label>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 max-h-80 overflow-y-auto">
+                    {getUnreviewedAlternativeVideos().map((file, fileIndex) => (
+                      <div 
+                        key={`revision-${fileIndex}`}
+                        className={`group relative aspect-video overflow-hidden rounded-lg border cursor-pointer transition-colors ${
+                          selectedRevisionVideo === file.url 
+                            ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20' 
+                            : 'border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600'
+                        }`}
+                        onClick={() => handleRevisionVideoSelect(file.url)}
+                      >
+                        <video 
+                          src={file.url} 
+                          className="h-full w-full object-cover"
+                          preload="metadata"
+                        />
+                        {selectedRevisionVideo === file.url && (
+                          <div className="absolute top-2 left-2 bg-blue-500 text-white text-xs px-2 py-1 rounded">
+                            Selected
+                          </div>
+                        )}
+                        <div className="absolute bottom-0 left-0 right-0 bg-black bg-opacity-50 text-white text-xs p-2">
+                          <p className="truncate">{file.filename}</p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <p className="text-xs text-gray-500 dark:text-gray-400">
+                    Select an unreviewed video from this task to submit as a revision.
+                  </p>
+                </div>
+              </>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={handleCancelRevision} disabled={submittingRevision}>
+              Cancel
+            </Button>
+            <Button 
+              onClick={handleSubmitApprovalRevision} 
+              disabled={!selectedRevisionVideo || submittingRevision}
+            >
+              {submittingRevision ? (
+                <>
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Submitting...
+                </>
+              ) : (
+                'Submit Revision'
+              )}
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </div>

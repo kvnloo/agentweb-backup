@@ -154,12 +154,18 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
       const { assetUrl, filename, executionId } = assetData;
 
       if (action.action_id === 'approve_asset') {
+        // Get asset type for proper display
+        const approval = await approvalDb.getApproval(assetUrl);
+        const assetType = approval?.assetType || 'asset';
+        
         // Handle approval directly
         await updateApprovalMessage(
           channel.id,
           message.ts,
           'approved',
-          user.username || user.id
+          user.username || user.id,
+          undefined,
+          assetType
         );
 
         await approvalDb.updateApprovalStatus(
@@ -225,7 +231,8 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
             originalApproval.slackMessageTs,
             'needs_changes',
             user.username || user.id,
-            feedbackValue
+            feedbackValue,
+            originalApproval.assetType || 'asset'
           );
         }
 
