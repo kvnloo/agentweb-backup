@@ -62,6 +62,7 @@ export interface AssetApproval {
   slackMessageTs: string | null;
   reviewedBy?: string;
   feedback?: string;
+  note?: string; // User-provided note for context
   createdAt: string;
   updatedAt: string;
 }
@@ -75,6 +76,7 @@ export interface CreateApprovalRequest {
   slackChannel: string; // Channel ID
   slackChannelName: string; // Channel name
   slackMessageTs: string | null;
+  note?: string; // User-provided note for context
 }
 
 export class ApprovalDB {
@@ -94,6 +96,7 @@ export class ApprovalDB {
       slackChannel: request.slackChannel,
       slackChannelName: request.slackChannelName,
       slackMessageTs: request.slackMessageTs,
+      note: request.note,
       createdAt: now,
       updatedAt: now,
     };

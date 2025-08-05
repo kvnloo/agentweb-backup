@@ -147,11 +147,13 @@ const ImagesPage: React.FC = () => {
   const [slackChannels, setSlackChannels] = useState<Array<{ id: string; name: string; displayName: string }>>([]);
   const [loadingChannels, setLoadingChannels] = useState(false);
   const [sendingApproval, setSendingApproval] = useState(false);
+  const [approvalNote, setApprovalNote] = useState('');
   const [approvalData, setApprovalData] = useState<{ assets?: Record<string, any> }>({});
   const [revisionModalOpen, setRevisionModalOpen] = useState(false);
-  const [revisionImage, setRevisionImage] = useState<{ executionId: string; assetUrl: string; filename: string; feedback: string; taskId: string } | null>(null);
+  const [revisionImage, setRevisionImage] = useState<{ executionId: string; assetUrl: string; filename: string; feedback: string; taskId: string; note?: string } | null>(null);
   const [selectedRevisionImage, setSelectedRevisionImage] = useState<string | null>(null);
   const [submittingRevision, setSubmittingRevision] = useState(false);
+  const [revisionNote, setRevisionNote] = useState('');
 
   // Handle escape key to close image preview
   useEffect(() => {
@@ -778,6 +780,7 @@ const ImagesPage: React.FC = () => {
           filename: pendingApprovalImage.filename,
           assetType,
           executionId: pendingApprovalImage.executionId,
+          note: approvalNote.trim() || undefined, // Include note if provided
         },
         {
           headers: { Authorization: `Bearer ${token}` },
@@ -792,6 +795,7 @@ const ImagesPage: React.FC = () => {
         
         setChannelSelectionOpen(false);
         setPendingApprovalImage(null);
+        setApprovalNote(''); // Reset note after successful send
         
         // Use timeout approach like emma-dashboard for immediate feedback
         setTimeout(async () => {
@@ -813,11 +817,13 @@ const ImagesPage: React.FC = () => {
   const handleCancelApproval = () => {
     setChannelSelectionOpen(false);
     setPendingApprovalImage(null);
+    setApprovalNote(''); // Reset note when canceling
   };
 
-  const handleRevisionClick = (executionId: string, assetUrl: string, filename: string, feedback: string, taskId: string) => {
-    setRevisionImage({ executionId, assetUrl, filename, feedback, taskId });
+  const handleRevisionClick = (executionId: string, assetUrl: string, filename: string, feedback: string, taskId: string, note?: string) => {
+    setRevisionImage({ executionId, assetUrl, filename, feedback, taskId, note });
     setSelectedRevisionImage(null);
+    setRevisionNote(note || ''); // Copy the original note
     setRevisionModalOpen(true);
   };
 
@@ -860,6 +866,7 @@ const ImagesPage: React.FC = () => {
           originalAssetUrl: revisionImage.assetUrl,
           originalFilename: revisionImage.filename,
           selectedAssetUrl: selectedRevisionImage,
+          note: revisionNote.trim() || undefined, // Include updated note
         },
         {
           headers: { Authorization: `Bearer ${token}` },
@@ -875,6 +882,7 @@ const ImagesPage: React.FC = () => {
         setRevisionModalOpen(false);
         setRevisionImage(null);
         setSelectedRevisionImage(null);
+        setRevisionNote(''); // Reset note after successful submission
         
         // Refresh approval data to show updated status
         setTimeout(async () => {
@@ -897,6 +905,7 @@ const ImagesPage: React.FC = () => {
     setRevisionModalOpen(false);
     setRevisionImage(null);
     setSelectedRevisionImage(null);
+    setRevisionNote(''); // Reset note when canceling
   };
 
   // Get approval status for a specific asset
@@ -1421,7 +1430,7 @@ const ImagesPage: React.FC = () => {
                                           status === 'pending' || status === 'approved' || status === 'revision_submitted'
                                             ? undefined 
                                             : status === 'needs_changes'
-                                              ? () => handleRevisionClick(execution.executionId, file.url, file.filename, approval?.feedback || '', task.taskId)
+                                              ? () => handleRevisionClick(execution.executionId, file.url, file.filename, approval?.feedback || '', task.taskId, approval?.note)
                                               : () => handleApprovalClick(execution.executionId, file.url, file.filename)
                                         }
                                         title={tooltip}
@@ -1821,6 +1830,20 @@ const ImagesPage: React.FC = () => {
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="approval-note">Note (Optional)</Label>
+              <Textarea
+                id="approval-note"
+                placeholder="Add a note to provide context for the approval request..."
+                value={approvalNote}
+                onChange={(e) => setApprovalNote(e.target.value)}
+                className="min-h-[80px]"
+                disabled={sendingApproval}
+              />
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                This note will be shown to reviewers in Slack to provide context about the asset.
+              </p>
+            </div>
             {loadingChannels ? (
               <div className="flex items-center justify-center py-8">
                 <Loader2 className="h-6 w-6 animate-spin mr-2" />
@@ -1898,6 +1921,21 @@ const ImagesPage: React.FC = () => {
                       {revisionImage.feedback || 'No specific feedback provided'}
                     </p>
                   </div>
+                </div>
+                
+                <div className="space-y-2">
+                  <Label htmlFor="revision-note">Note (Optional)</Label>
+                  <Textarea
+                    id="revision-note"
+                    placeholder="Add or update the note to provide context for the revision..."
+                    value={revisionNote}
+                    onChange={(e) => setRevisionNote(e.target.value)}
+                    className="min-h-[80px]"
+                    disabled={submittingRevision}
+                  />
+                  <p className="text-xs text-gray-500 dark:text-gray-400">
+                    This note will be shown to reviewers in Slack along with the revised asset.
+                  </p>
                 </div>
                 
                 <div className="space-y-2">
