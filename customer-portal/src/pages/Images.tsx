@@ -13,7 +13,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { Checkbox } from '@/components/ui/checkbox';
-import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink, Clock, ArrowUpRight, Play, Zap, Download, Heart, Plus, Archive, Upload, ChevronDown, X, CheckCircle, MessageSquare, AlertTriangle, RefreshCw } from 'lucide-react';
+import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink, Clock, ArrowUpRight, Play, Zap, Download, Heart, Plus, Archive, Upload, ChevronDown, X, CheckCircle, MessageSquare, AlertTriangle, RefreshCw, Send } from 'lucide-react';
 import { format } from 'date-fns';
 import { useNavigate } from 'react-router-dom';
 import { useToast } from '@/hooks/use-toast';
@@ -1418,7 +1418,7 @@ const ImagesPage: React.FC = () => {
                                         size="sm"
                                         className="h-8 w-8 p-0 hover:bg-gray-100 dark:hover:bg-gray-800"
                                         onClick={
-                                          status === 'pending' 
+                                          status === 'pending' || status === 'approved' || status === 'revision_submitted'
                                             ? undefined 
                                             : status === 'needs_changes'
                                               ? () => handleRevisionClick(execution.executionId, file.url, file.filename, approval?.feedback || '', task.taskId)
@@ -1433,11 +1433,11 @@ const ImagesPage: React.FC = () => {
                                     ) : status === 'pending' ? (
                                       <MessageSquare className="h-4 w-4 text-blue-500" />
                                     ) : status === 'revision_submitted' ? (
-                                      <RefreshCw className="h-4 w-4 text-purple-500" />
+                                      <Send className="h-4 w-4 text-gray-400" />
                                     ) : (
                                       <MessageSquare className="h-4 w-4 text-gray-400 hover:text-blue-500" />
                                     )}
-                                    {approval?.feedback && (
+                                    {approval?.feedback && status === 'needs_changes' && (
                                       <div className="absolute -top-1 -right-1 w-2 h-2 bg-red-500 rounded-full" title="Has feedback"></div>
                                     )}
                                       </Button>
