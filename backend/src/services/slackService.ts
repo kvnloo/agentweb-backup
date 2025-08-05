@@ -135,7 +135,7 @@ export async function sendApprovalRequest(
                 emoji: true,
               },
               style: "primary",
-              action_id: "approve_image",
+              action_id: "approve_asset",
               value: JSON.stringify({
                 assetUrl: request.imageUrl,
                 filename: request.filename,
@@ -150,7 +150,7 @@ export async function sendApprovalRequest(
                 emoji: true,
               },
               style: "danger",
-              action_id: "needs_changes_image",
+              action_id: "needs_changes_asset",
               value: JSON.stringify({
                 assetUrl: request.imageUrl,
                 filename: request.filename,
