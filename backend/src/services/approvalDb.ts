@@ -183,21 +183,38 @@ export class ApprovalDB {
   async getApprovalsByAssetUrls(assetUrls: string[]): Promise<AssetApproval[]> {
     if (assetUrls.length === 0) return [];
 
-    const params = {
-      RequestItems: {
-        [ASSET_APPROVALS_TABLE]: {
-          Keys: assetUrls.map(assetUrl => ({ assetUrl }))
-        }
-      }
-    };
+    // DynamoDB batchGet has a limit of 100 items per request, but let's use 25 to be safe
+    const BATCH_SIZE = 25;
+    const results: AssetApproval[] = [];
 
-    try {
-      const result = await dynamodb.batchGet(params).promise();
-      return (result.Responses?.[ASSET_APPROVALS_TABLE] as AssetApproval[]) || [];
-    } catch (error) {
-      console.error('❌ Error getting approvals by asset URLs:', error);
-      throw new Error('Failed to get approvals by asset URLs');
+    for (let i = 0; i < assetUrls.length; i += BATCH_SIZE) {
+      const batch = assetUrls.slice(i, i + BATCH_SIZE);
+      
+      const params = {
+        RequestItems: {
+          [ASSET_APPROVALS_TABLE]: {
+            Keys: batch.map(assetUrl => ({ assetUrl }))
+          }
+        }
+      };
+
+      try {
+        const result = await dynamodb.batchGet(params).promise();
+        const batchResults = (result.Responses?.[ASSET_APPROVALS_TABLE] as AssetApproval[]) || [];
+        results.push(...batchResults);
+      } catch (error) {
+        console.error('❌ Error getting approvals by asset URLs:', {
+          error: (error as any).message,
+          code: (error as any).code,
+          statusCode: (error as any).statusCode,
+          tableName: ASSET_APPROVALS_TABLE,
+          region: process.env.AWS_REGION
+        });
+        throw new Error(`Failed to get approvals by asset URLs: ${(error as any).message}`);
+      }
     }
+
+    return results;
   }
 
   /**
