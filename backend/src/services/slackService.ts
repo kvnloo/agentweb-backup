@@ -98,12 +98,12 @@ export async function sendApprovalRequest(
       text: `New ${request.assetType.charAt(0).toUpperCase() + request.assetType.slice(1)} Approval Request: ${request.filename}`,
              metadata: {
          event_type: "asset_approval_request",
-         event_payload: {
-           executionId: request.executionId,
-           assetUrl: request.imageUrl,
-           assetType: request.assetType,
-           userId: request.userId,
-         },
+                 event_payload: {
+          executionId: request.executionId || '',
+          assetUrl: request.imageUrl,
+          assetType: request.assetType,
+          userId: request.userId,
+        },
        },
       blocks: [
         {
@@ -231,7 +231,7 @@ export async function updateApprovalMessage(
       statusUpdateText += `\n*Feedback:* ${feedback}`;
     }
 
-    const newStatusBlock = {
+    const newStatusBlock: any = {
       type: "section",
       text: {
         type: "mrkdwn",
@@ -264,7 +264,7 @@ export async function updateApprovalMessage(
         channel,
         ts: messageTs,
         text: `${assetDisplayName} ${decision}: ${decision === "approved" ? "Approved" : "Needs Changes"}`,
-        blocks: finalBlocks,
+        blocks: finalBlocks as any,
       });
 
     console.log("✅ Approval message updated successfully");
@@ -346,21 +346,3 @@ export async function openFeedbackModal(
   }
 }
 
-/**
- * Verify Slack webhook signature for security
- */
-export function verifySlackSignature(
-  body: string,
-  signature: string,
-  timestamp: string
-): boolean {
-  if (!process.env.SLACK_SIGNING_SECRET) {
-    console.warn("⚠️ SLACK_SIGNING_SECRET not found. Skipping signature verification.");
-    return true; // Allow in development, but should be required in production
-  }
-
-  // In a real implementation, you would verify the signature using crypto
-  // For now, we'll do a basic check
-  const expectedSignature = `v0=${process.env.SLACK_SIGNING_SECRET}`;
-  return signature === expectedSignature;
-}
