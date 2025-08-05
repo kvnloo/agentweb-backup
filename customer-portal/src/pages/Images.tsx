@@ -148,7 +148,10 @@ const ImagesPage: React.FC = () => {
   const [loadingChannels, setLoadingChannels] = useState(false);
   const [sendingApproval, setSendingApproval] = useState(false);
   const [approvalData, setApprovalData] = useState<{ assets?: Record<string, any> }>({});
-  const [refreshingApprovals, setRefreshingApprovals] = useState(false);
+  const [revisionModalOpen, setRevisionModalOpen] = useState(false);
+  const [revisionImage, setRevisionImage] = useState<{ executionId: string; assetUrl: string; filename: string; feedback: string; taskId: string } | null>(null);
+  const [selectedRevisionImage, setSelectedRevisionImage] = useState<string | null>(null);
+  const [submittingRevision, setSubmittingRevision] = useState(false);
 
   // Handle escape key to close image preview
   useEffect(() => {
@@ -721,55 +724,9 @@ const ImagesPage: React.FC = () => {
     }
   }, [tasksWithExecutions, token]);
 
-  // Manual refresh function
-  const handleRefreshApprovals = async () => {
-    if (refreshingApprovals) return;
-    
-    setRefreshingApprovals(true);
-    try {
-      await axios.post(buildApiUrl('/api/slack/poll-updates'), {}, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      await loadApprovalData();
-      toast({
-        title: "Approvals Refreshed",
-        description: "Checked for the latest approval status updates.",
-      });
-    } catch (error) {
-      console.error('Error refreshing approvals:', error);
-      toast({
-        title: "Error Refreshing",
-        description: "Could not check for approval updates.",
-        variant: "destructive",
-      });
-    } finally {
-      setRefreshingApprovals(false);
-    }
-  };
+  // Manual refresh function removed - real-time webhook updates handle this automatically
 
-  // Polling for approval status updates
-  useEffect(() => {
-    if (!token) return;
-
-    const pollForUpdates = async () => {
-      if (refreshingApprovals) return; // Skip if manual refresh is running
-      
-      try {
-        await axios.post(buildApiUrl('/api/slack/poll-updates'), {}, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        // Reload approval data after polling
-        await loadApprovalData();
-      } catch (error) {
-        console.error('Error polling for approval updates:', error);
-      }
-    };
-
-    // Poll every 60 seconds for approval updates (less frequent than manual)
-    const pollInterval = setInterval(pollForUpdates, 60000);
-
-    return () => clearInterval(pollInterval);
-  }, [token, refreshingApprovals]);
+  // Real-time updates handled by Slack webhooks - no polling needed
 
   // Approval handlers
   const handleApprovalClick = async (executionId: string, assetUrl: string, filename: string) => {
@@ -808,10 +765,15 @@ const ImagesPage: React.FC = () => {
     try {
       const assetType = getAssetTypeFromFilename(pendingApprovalImage.filename);
       
+      // Find the channel name from the selected channel ID
+      const selectedChannel = slackChannels.find(ch => ch.id === channelId);
+      const channelName = selectedChannel?.name || channelId;
+      
       const response = await axios.post(
         buildApiUrl('/api/slack/send-approval'),
         {
           channel: channelId,
+          channelName: channelName,
           assetUrl: pendingApprovalImage.imageUrl,
           filename: pendingApprovalImage.filename,
           assetType,
@@ -851,6 +813,90 @@ const ImagesPage: React.FC = () => {
   const handleCancelApproval = () => {
     setChannelSelectionOpen(false);
     setPendingApprovalImage(null);
+  };
+
+  const handleRevisionClick = (executionId: string, assetUrl: string, filename: string, feedback: string, taskId: string) => {
+    setRevisionImage({ executionId, assetUrl, filename, feedback, taskId });
+    setSelectedRevisionImage(null);
+    setRevisionModalOpen(true);
+  };
+
+  // Get all unreviewed alternative images from the task in a single flat array
+  const getUnreviewedAlternativeImages = () => {
+    if (!revisionImage?.taskId || !tasksWithExecutions[revisionImage.taskId]) {
+      return [];
+    }
+    
+    const allFiles = [];
+    for (const execution of tasksWithExecutions[revisionImage.taskId].executions) {
+      for (const file of execution.result_files) {
+        if (!file.is_archived && file.url !== revisionImage.assetUrl) {
+          const approval = getApprovalStatus(file.url);
+          const isUnreviewed = !approval || (approval.status !== 'pending' && approval.status !== 'approved' && approval.status !== 'needs_changes' && approval.status !== 'revision_submitted');
+          
+          // Only include unreviewed images
+          if (isUnreviewed) {
+            allFiles.push(file);
+          }
+        }
+      }
+    }
+    return allFiles;
+  };
+
+  const handleRevisionImageSelect = (assetUrl: string) => {
+    setSelectedRevisionImage(assetUrl);
+  };
+
+  const handleSubmitApprovalRevision = async () => {
+    if (!revisionImage || !selectedRevisionImage || !token) return;
+
+    setSubmittingRevision(true);
+    try {
+      const response = await axios.post(
+        buildApiUrl('/api/slack/submit-revision'),
+        {
+          executionId: revisionImage.executionId,
+          originalAssetUrl: revisionImage.assetUrl,
+          originalFilename: revisionImage.filename,
+          selectedAssetUrl: selectedRevisionImage,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      if (response.data.success) {
+        toast({
+          title: "Revision Submitted",
+          description: "Your revision has been submitted for review.",
+        });
+        
+        setRevisionModalOpen(false);
+        setRevisionImage(null);
+        setSelectedRevisionImage(null);
+        
+        // Refresh approval data to show updated status
+        setTimeout(async () => {
+          await loadApprovalData();
+        }, 1000);
+      }
+    } catch (error: any) {
+      console.error('Error submitting revision:', error);
+      toast({
+        title: "Error Submitting Revision",
+        description: error.response?.data?.message || "Failed to submit revision.",
+        variant: "destructive",
+      });
+    } finally {
+      setSubmittingRevision(false);
+    }
+  };
+
+  const handleCancelRevision = () => {
+    setRevisionModalOpen(false);
+    setRevisionImage(null);
+    setSelectedRevisionImage(null);
   };
 
   // Get approval status for a specific asset
@@ -1125,21 +1171,10 @@ const ImagesPage: React.FC = () => {
                 • Auto-refreshing active executions
               </span>
             )}
-            <span className="ml-2 text-green-600 dark:text-green-400">
-              • Auto-checking for approval updates every minute
-            </span>
+            
           </p>
         </div>
         <div className="flex gap-2">
-          <Button 
-            onClick={handleRefreshApprovals}
-            disabled={refreshingApprovals}
-            variant="outline" 
-            className="font-medium px-4 py-2"
-          >
-            <RefreshCw className={`h-4 w-4 mr-2 ${refreshingApprovals ? 'animate-spin' : ''}`} />
-            {refreshingApprovals ? 'Checking...' : 'Refresh Approvals'}
-          </Button>
           <Button onClick={() => setCreateTaskDialogOpen(true)} className="bg-blue-600 hover:bg-blue-700 text-white font-medium px-6 py-2">
             <Plus className="h-4 w-4 mr-2" />
             Create Ad Images
@@ -1354,32 +1389,61 @@ const ImagesPage: React.FC = () => {
                               {(() => {
                                 const approval = getApprovalStatus(file.url);
                                 const status = approval?.status;
-                                return (
-                                  <Button
-                                    variant="ghost"
-                                    size="sm"
-                                    className="h-8 w-8 p-0 hover:bg-gray-100 dark:hover:bg-gray-800"
-                                    onClick={() => handleApprovalClick(execution.executionId, file.url, file.filename)}
-                                    title={
-                                      status === 'approved' ? `Approved by ${approval.reviewedBy}` :
-                                      status === 'needs_changes' ? `Changes requested by ${approval.reviewedBy}` :
-                                      status === 'pending' ? 'Approval Pending' :
-                                      'Request Approval'
-                                    }
-                                    disabled={status === 'pending'}
-                                  >
+                                
+                                // Create detailed tooltip based on status
+                                let tooltip = '';
+                                if (status === 'approved') {
+                                  const approvedTime = approval?.updatedAt ? new Date(approval.updatedAt).toLocaleString() : 'Unknown time';
+                                  const feedback = approval?.feedback ? `\nFeedback: ${approval.feedback}` : '';
+                                  tooltip = `Approved by ${approval?.reviewedBy || 'Unknown'} at ${approvedTime}${feedback}`;
+                                } else if (status === 'needs_changes') {
+                                  const changedTime = approval?.updatedAt ? new Date(approval.updatedAt).toLocaleString() : 'Unknown time';
+                                  const feedback = approval?.feedback ? `\nFeedback: ${approval.feedback}` : '';
+                                  tooltip = `Changes requested by ${approval?.reviewedBy || 'Unknown'} at ${changedTime}${feedback}`;
+                                } else if (status === 'pending') {
+                                  const sentTime = approval?.createdAt ? new Date(approval.createdAt).toLocaleString() : 'Unknown time';
+                                  const channel = approval?.slackChannelName ? `#${approval.slackChannelName}` : (approval?.slackChannel ? approval.slackChannel : 'Unknown channel');
+                                  tooltip = `Review request sent at ${sentTime} to channel ${channel}`;
+                                } else if (status === 'revision_submitted') {
+                                  const submittedTime = approval?.updatedAt ? new Date(approval.updatedAt).toLocaleString() : 'Unknown time';
+                                  tooltip = `Revision submitted at ${submittedTime}`;
+                                } else {
+                                  tooltip = 'Request Approval';
+                                }
+                                
+                                                                  return (
+                                    <div className="relative">
+                                      <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        className="h-8 w-8 p-0 hover:bg-gray-100 dark:hover:bg-gray-800"
+                                        onClick={
+                                          status === 'pending' 
+                                            ? undefined 
+                                            : status === 'needs_changes'
+                                              ? () => handleRevisionClick(execution.executionId, file.url, file.filename, approval?.feedback || '', task.taskId)
+                                              : () => handleApprovalClick(execution.executionId, file.url, file.filename)
+                                        }
+                                        title={tooltip}
+                                      >
                                     {status === 'approved' ? (
                                       <CheckCircle className="h-4 w-4 text-green-500" />
                                     ) : status === 'needs_changes' ? (
                                       <AlertTriangle className="h-4 w-4 text-orange-500" />
                                     ) : status === 'pending' ? (
                                       <MessageSquare className="h-4 w-4 text-blue-500" />
+                                    ) : status === 'revision_submitted' ? (
+                                      <RefreshCw className="h-4 w-4 text-purple-500" />
                                     ) : (
                                       <MessageSquare className="h-4 w-4 text-gray-400 hover:text-blue-500" />
                                     )}
-                                  </Button>
-                                );
-                              })()}
+                                    {approval?.feedback && (
+                                      <div className="absolute -top-1 -right-1 w-2 h-2 bg-red-500 rounded-full" title="Has feedback"></div>
+                                    )}
+                                      </Button>
+                                    </div>
+                                  );
+                                })()}
                               <Button
                                 variant="ghost"
                                 size="sm"
@@ -1797,6 +1861,106 @@ const ImagesPage: React.FC = () => {
                 Sending...
               </Button>
             )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Revision Modal */}
+      <Dialog open={revisionModalOpen} onOpenChange={setRevisionModalOpen}>
+        <DialogContent className="sm:max-w-[90vw] max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Submit Revision</DialogTitle>
+            <DialogDescription>
+              Please select an existing image from this task to submit as a revision based on the feedback provided.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            {revisionImage && (
+              <>
+                <div className="space-y-2">
+                  <Label>Original Image (Needs Changes)</Label>
+                  <div className="border rounded-lg p-4 bg-gray-50 dark:bg-gray-800">
+                    <img 
+                      src={revisionImage.assetUrl} 
+                      alt={revisionImage.filename}
+                      className="max-w-full h-auto max-h-48 object-contain"
+                    />
+                    <p className="text-sm text-gray-600 dark:text-gray-400 mt-2">
+                      {revisionImage.filename}
+                    </p>
+                  </div>
+                </div>
+                
+                <div className="space-y-2">
+                  <Label>Feedback</Label>
+                  <div className="border rounded-lg p-4 bg-yellow-50 dark:bg-yellow-900/20 border-yellow-200 dark:border-yellow-800">
+                    <p className="text-sm text-yellow-800 dark:text-yellow-200">
+                      {revisionImage.feedback || 'No specific feedback provided'}
+                    </p>
+                  </div>
+                </div>
+                
+                <div className="space-y-2">
+                  <Label>Select Alternative Image</Label>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 max-h-80 overflow-y-auto">
+                    {revisionImage.taskId && tasksWithExecutions[revisionImage.taskId]?.executions.flatMap((execution, executionIndex) => 
+                      execution.result_files
+                        .filter(file => {
+                          if (file.is_archived || file.url === revisionImage.assetUrl) return false;
+                          const approval = getApprovalStatus(file.url);
+                          return !approval || (approval.status !== 'pending' && approval.status !== 'approved' && approval.status !== 'needs_changes' && approval.status !== 'revision_submitted');
+                        })
+                        .map((file, fileIndex) => (
+                          <div 
+                            key={`${execution.executionId}-${fileIndex}`}
+                            className={`group relative aspect-square overflow-hidden rounded-lg border cursor-pointer transition-colors ${
+                              selectedRevisionImage === file.url 
+                                ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20' 
+                                : 'border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600'
+                            }`}
+                            onClick={() => handleRevisionImageSelect(file.url)}
+                          >
+                            <img 
+                              src={file.url} 
+                              alt={file.filename}
+                              className="h-full w-full object-cover transition-transform duration-200 group-hover:scale-105"
+                            />
+                            {selectedRevisionImage === file.url && (
+                              <div className="absolute top-2 left-2 bg-blue-500 text-white text-xs px-2 py-1 rounded">
+                                Selected
+                              </div>
+                            )}
+                            <div className="absolute bottom-0 left-0 right-0 bg-black bg-opacity-50 text-white text-xs p-2">
+                              <p className="truncate">{file.filename}</p>
+                            </div>
+                          </div>
+                        ))
+                    )}
+                  </div>
+                  <p className="text-xs text-gray-500 dark:text-gray-400">
+                    Select an unreviewed image from this task to submit as a revision.
+                  </p>
+                </div>
+              </>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={handleCancelRevision} disabled={submittingRevision}>
+              Cancel
+            </Button>
+            <Button 
+              onClick={handleSubmitApprovalRevision} 
+              disabled={!selectedRevisionImage || submittingRevision}
+            >
+              {submittingRevision ? (
+                <>
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Submitting...
+                </>
+              ) : (
+                'Submit Revision'
+              )}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

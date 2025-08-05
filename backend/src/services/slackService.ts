@@ -267,6 +267,78 @@ export async function updateApprovalMessage(
 }
 
 /**
+ * Open modal dialog for feedback input
+ */
+export async function openFeedbackModal(
+  triggerId: string,
+  assetUrl: string,
+  filename: string,
+  executionId?: string
+): Promise<void> {
+  if (!slackClient) {
+    throw new Error("Slack client not initialized. Check SLACK_BOT_TOKEN environment variable.");
+  }
+
+  try {
+    await slackClient.views.open({
+      trigger_id: triggerId,
+      view: {
+        type: "modal",
+        callback_id: "feedback_modal",
+        title: {
+          type: "plain_text",
+          text: "Provide Feedback",
+        },
+        submit: {
+          type: "plain_text",
+          text: "Submit Changes",
+        },
+        close: {
+          type: "plain_text",
+          text: "Cancel",
+        },
+        private_metadata: JSON.stringify({
+          assetUrl,
+          filename,
+          executionId,
+        }),
+        blocks: [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: `*Asset:* ${filename}\n*Action:* Request Changes`,
+            },
+          },
+          {
+            type: "input",
+            block_id: "feedback_input",
+            element: {
+              type: "plain_text_input",
+              action_id: "feedback_text",
+              multiline: true,
+              placeholder: {
+                type: "plain_text",
+                text: "Please provide specific feedback about what changes are needed...",
+              },
+            },
+            label: {
+              type: "plain_text",
+              text: "Feedback",
+            },
+          },
+        ],
+      },
+    });
+
+    console.log("✅ Feedback modal opened successfully");
+  } catch (error) {
+    console.error("❌ Error opening feedback modal:", error);
+    throw error;
+  }
+}
+
+/**
  * Verify Slack webhook signature for security
  */
 export function verifySlackSignature(
