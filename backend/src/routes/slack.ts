@@ -5,8 +5,7 @@ import {
   getSlackChannels, 
   sendApprovalRequest, 
   updateApprovalMessage,
-  openFeedbackModal,
-  verifySlackSignature 
+  openFeedbackModal
 } from "../services/slackService";
 import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
 
@@ -17,7 +16,8 @@ const router = express.Router();
  * @desc Get available Slack channels
  * @access Private (requires authentication)
  */
-router.get("/channels", authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
+router.get("/channels", authenticateToken, async (req: Request, res: Response) => {
+  const authReq = req as AuthenticatedRequest;
   try {
     console.log("📡 Fetching Slack channels...");
     
@@ -47,10 +47,11 @@ router.get("/channels", authenticateToken, async (req: AuthenticatedRequest, res
  * @desc Send approval request to Slack channel
  * @access Private (requires authentication)
  */
-router.post("/send-approval", authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
+router.post("/send-approval", authenticateToken, async (req: Request, res: Response) => {
+  const authReq = req as AuthenticatedRequest;
   try {
-    const { channel, channelName, assetUrl, filename, executionId, note } = req.body;
-    const userId = req.user?.userId;
+    const { channel, channelName, assetUrl, filename, executionId, note } = authReq.body;
+    const userId = authReq.user?.userId;
 
     if (!channel || !assetUrl || !filename) {
       return res.status(400).json({ 
@@ -86,7 +87,7 @@ router.post("/send-approval", authenticateToken, async (req: AuthenticatedReques
       executionId,
       userId,
       slackChannel: channel,
-      slackChannelName: req.body.channelName || channel, // Use channel name if provided, fallback to channel ID
+      slackChannelName: authReq.body.channelName || channel, // Use channel name if provided, fallback to channel ID
       slackMessageTs: result.messageTs,
       note: note, // Store the note in database
     });
@@ -122,8 +123,41 @@ router.post("/send-approval", authenticateToken, async (req: AuthenticatedReques
  */
 router.post("/interactions", express.urlencoded({ extended: true }), async (req: Request, res: Response) => {
   try {
-    // Parse the payload from Slack
+    // Parse the payload from Slack (Express has already parsed it)
+    if (!req.body.payload) {
+      console.error("❌ No payload found in request body");
+      return res.status(400).json({ error: "Missing payload" });
+    }
+
     const payload = JSON.parse(req.body.payload);
+    
+    // 🔒 SECURITY: Verify request is actually from Slack using verification token
+    if (!process.env.SLACK_VERIFICATION_TOKEN) {
+      console.error("❌ SLACK_VERIFICATION_TOKEN not configured");
+      return res.status(500).json({ error: "Server configuration error: Missing verification token" });
+    }
+
+    if (!payload.token || payload.token !== process.env.SLACK_VERIFICATION_TOKEN) {
+      console.error("❌ Invalid Slack verification token");
+      return res.status(401).json({ error: "Unauthorized: Invalid verification token" });
+    }
+    
+    console.log("✅ Slack verification token validated successfully");
+    
+    // 🔒 SECURITY: Validate Slack workspace/team
+    if (!payload.team || !payload.team.id) {
+      console.error("❌ Missing team information in Slack payload");
+      return res.status(401).json({ error: "Unauthorized: Invalid team" });
+    }
+
+    // Optional: Add team ID validation if you want to restrict to specific workspaces
+    // const allowedTeamIds = process.env.ALLOWED_SLACK_TEAM_IDS?.split(',') || [];
+    // if (allowedTeamIds.length > 0 && !allowedTeamIds.includes(payload.team.id)) {
+    //   console.error(`❌ Unauthorized Slack team: ${payload.team.id}`);
+    //   return res.status(401).json({ error: "Unauthorized: Team not allowed" });
+    // }
+
+    console.log(`✅ Validated request from Slack team: ${payload.team.domain} (${payload.team.id})`);
     
     // Handle button clicks
     if (payload.type === 'block_actions') {
@@ -258,9 +292,10 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
  * @desc Get approval status for multiple assets by URLs
  * @access Private (requires authentication)
  */
-router.post("/approvals", authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
+router.post("/approvals", authenticateToken, async (req: Request, res: Response) => {
+  const authReq = req as AuthenticatedRequest;
   try {
-    const { assetUrls } = req.body;
+    const { assetUrls } = authReq.body;
     
     if (!assetUrls || !Array.isArray(assetUrls)) {
       return res.status(400).json({ error: "Asset URLs array is required" });
@@ -308,7 +343,8 @@ router.post("/approvals", authenticateToken, async (req: AuthenticatedRequest, r
  * @desc Check Slack integration status
  * @access Private (requires authentication)
  */
-router.get("/status", authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
+router.get("/status", authenticateToken, async (req: Request, res: Response) => {
+  const authReq = req as AuthenticatedRequest;
   try {
     const hasToken = !!process.env.SLACK_BOT_TOKEN;
     const hasSigningSecret = !!process.env.SLACK_SIGNING_SECRET;
@@ -380,10 +416,11 @@ router.get("/test", (req: Request, res: Response) => {
  * @desc Submit a revision for an approved asset and send new approval request
  * @access Private (requires authentication)
  */
-router.post("/submit-revision", authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
+router.post("/submit-revision", authenticateToken, async (req: Request, res: Response) => {
+  const authReq = req as AuthenticatedRequest;
   try {
-    const { executionId, originalAssetUrl, originalFilename, selectedAssetUrl, note } = req.body;
-    const userId = req.user?.userId;
+    const { executionId, originalAssetUrl, originalFilename, selectedAssetUrl, note } = authReq.body;
+    const userId = authReq.user?.userId;
 
     if (!executionId || !originalAssetUrl || !originalFilename || !selectedAssetUrl) {
       return res.status(400).json({ 
