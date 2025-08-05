@@ -153,7 +153,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
 
       const { assetUrl, filename, executionId } = assetData;
 
-      if (action.action_id === 'approve_image') {
+      if (action.action_id === 'approve_asset') {
         // Handle approval directly
         await updateApprovalMessage(
           channel.id,
@@ -174,7 +174,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
           text: `✅ Approved by @${user.username}`
         });
 
-      } else if (action.action_id === 'needs_changes_image') {
+      } else if (action.action_id === 'needs_changes_asset') {
         // Open feedback modal instead of direct rejection
         await openFeedbackModal(
           payload.trigger_id,
