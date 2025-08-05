@@ -49,7 +49,7 @@ router.get("/channels", authenticateToken, async (req: AuthenticatedRequest, res
  */
 router.post("/send-approval", authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { channel, channelName, assetUrl, filename, executionId } = req.body;
+    const { channel, channelName, assetUrl, filename, executionId, note } = req.body;
     const userId = req.user?.userId;
 
     if (!channel || !assetUrl || !filename) {
@@ -74,7 +74,8 @@ router.post("/send-approval", authenticateToken, async (req: AuthenticatedReques
       filename,
       assetType,
       userId,
-      channel
+      channel,
+      note: note // Pass the note to Slack
     });
 
     // Store approval request in database for tracking
@@ -87,6 +88,7 @@ router.post("/send-approval", authenticateToken, async (req: AuthenticatedReques
       slackChannel: channel,
       slackChannelName: req.body.channelName || channel, // Use channel name if provided, fallback to channel ID
       slackMessageTs: result.messageTs,
+      note: note, // Store the note in database
     });
 
     console.log("✅ Approval request sent successfully to Slack and stored in database");
@@ -373,7 +375,7 @@ router.get("/test", (req: Request, res: Response) => {
  */
 router.post("/submit-revision", authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { executionId, originalAssetUrl, originalFilename, selectedAssetUrl } = req.body;
+    const { executionId, originalAssetUrl, originalFilename, selectedAssetUrl, note } = req.body;
     const userId = req.user?.userId;
 
     if (!executionId || !originalAssetUrl || !originalFilename || !selectedAssetUrl) {
@@ -412,6 +414,7 @@ router.post("/submit-revision", authenticateToken, async (req: AuthenticatedRequ
       assetType,
       userId,
       channel: originalApproval.slackChannel, // Send to same channel as original
+      note: note, // Include the updated note
     });
 
     // Create new approval record for the revision
@@ -424,6 +427,7 @@ router.post("/submit-revision", authenticateToken, async (req: AuthenticatedRequ
       slackChannel: originalApproval.slackChannel,
       slackChannelName: originalApproval.slackChannelName,
       slackMessageTs: result.messageTs,
+      note: note, // Store the updated note
     });
 
     console.log("✅ Revision submitted and new approval request sent:", {

@@ -25,6 +25,7 @@ export interface ApprovalRequest {
   assetType: string; // Asset type (image, video, etc.)
   userId: string;
   channel: string;
+  note?: string; // Optional note for context
 }
 
 /**
@@ -108,7 +109,7 @@ export async function sendApprovalRequest(
           type: "section",
           text: {
             type: "mrkdwn",
-            text: `*New ${request.assetType.charAt(0).toUpperCase() + request.assetType.slice(1)} Approval Request*\n\n*Filename:* ${request.filename}\n*Asset Type:* ${request.assetType.toUpperCase()}\n${request.executionId ? `*Execution ID:* ${request.executionId}\n` : ''}*Requested by:* User ${request.userId}`,
+            text: `*New ${request.assetType.charAt(0).toUpperCase() + request.assetType.slice(1)} Approval Request*\n\n*Filename:* ${request.filename}\n*Asset Type:* ${request.assetType.toUpperCase()}${request.note ? `\n*Note:* ${request.note}` : ''}`,
           },
         },
         {
