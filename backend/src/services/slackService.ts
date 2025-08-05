@@ -96,14 +96,15 @@ export async function sendApprovalRequest(
     const result = await slackClient.chat.postMessage({
       channel: request.channel,
       text: `New ${request.assetType.charAt(0).toUpperCase() + request.assetType.slice(1)} Approval Request: ${request.filename}`,
-      metadata: {
-        event_type: "image_approval_request",
-        event_payload: {
-          executionId: request.executionId,
-          imageUrl: request.imageUrl,
-          userId: request.userId,
-        },
-      },
+             metadata: {
+         event_type: "asset_approval_request",
+         event_payload: {
+           executionId: request.executionId,
+           assetUrl: request.imageUrl,
+           assetType: request.assetType,
+           userId: request.userId,
+         },
+       },
       blocks: [
         {
           type: "section",
@@ -112,18 +113,22 @@ export async function sendApprovalRequest(
             text: `*New ${request.assetType.charAt(0).toUpperCase() + request.assetType.slice(1)} Approval Request*\n\n*Filename:* ${request.filename}\n*Asset Type:* ${request.assetType.toUpperCase()}${request.note ? `\n*Note:* ${request.note}` : ''}`,
           },
         },
-        {
-          type: "section",
-          text: {
-            type: "mrkdwn",
-            text: `<${request.imageUrl}|View ${request.assetType.charAt(0).toUpperCase() + request.assetType.slice(1)}>`,
-          },
-          accessory: {
-            type: "image",
-            image_url: request.imageUrl,
-            alt_text: request.filename,
-          },
-        },
+                 {
+           type: "section",
+           text: {
+             type: "mrkdwn",
+             text: request.assetType === 'video' 
+               ? `📹 *Video File* (Click to download)\n<${request.imageUrl}|${request.filename}>`
+               : `<${request.imageUrl}|View ${request.assetType.charAt(0).toUpperCase() + request.assetType.slice(1)}>`,
+           },
+           ...(request.assetType !== 'video' && {
+             accessory: {
+               type: "image",
+               image_url: request.imageUrl,
+               alt_text: request.filename,
+             },
+           }),
+         },
         {
           type: "actions",
           elements: [
@@ -183,7 +188,8 @@ export async function updateApprovalMessage(
   messageTs: string,
   decision: "approved" | "needs_changes",
   reviewedBy: string,
-  feedback?: string
+  feedback?: string,
+  assetType?: string
 ): Promise<void> {
   if (!slackClient) {
     throw new Error("Slack client not initialized. Check SLACK_BOT_TOKEN environment variable.");
@@ -253,12 +259,13 @@ export async function updateApprovalMessage(
       (block: any) => block.type !== "actions"
     );
 
-    await slackClient.chat.update({
-      channel,
-      ts: messageTs,
-      text: `Image ${decision}: ${decision === "approved" ? "Approved" : "Needs Changes"}`,
-      blocks: finalBlocks,
-    });
+          const assetDisplayName = assetType ? assetType.charAt(0).toUpperCase() + assetType.slice(1) : 'Asset';
+      await slackClient.chat.update({
+        channel,
+        ts: messageTs,
+        text: `${assetDisplayName} ${decision}: ${decision === "approved" ? "Approved" : "Needs Changes"}`,
+        blocks: finalBlocks,
+      });
 
     console.log("✅ Approval message updated successfully");
   } catch (error) {
