@@ -211,6 +211,13 @@ npx ts-node src/scripts/create-tables.ts
 npm run dev
 ```
 
+5. (Optional) Expose backend for Slack integration:
+```bash
+# In a new terminal, expose the backend to the internet for Slack webhooks
+ngrok http 3001
+```
+This creates a public URL that Slack can use to send approval button interactions to your local backend.
+
 ### Frontend Setup for Development
 
 1. Install dependencies:

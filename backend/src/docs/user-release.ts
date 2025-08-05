@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-08-05',
+    changes: [
+      'Added review approval flow for image and video assets',
+      '- Users can now send images and videos for approval via Slack channels',
+      '- Approval button added to each asset with dynamic status indicators (pending, approved, needs changes, revision submitted)',
+      '- Detailed tooltips show approval status, reviewer, timestamps, feedback, and channel information',
+      '- "Needs changes" workflow allows users to select alternative assets from the same task for revision',
+    ],
+  },
+  {
     date: '2025-08-04',
     changes: [
       'Fixed issue with Ad Images not seeing images for new owner after changing ownership',
