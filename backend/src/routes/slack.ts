@@ -5,6 +5,7 @@ import {
   getSlackChannels, 
   sendApprovalRequest, 
   updateApprovalMessage,
+  openFeedbackModal,
   verifySlackSignature 
 } from "../services/slackService";
 import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
@@ -48,7 +49,7 @@ router.get("/channels", authenticateToken, async (req: AuthenticatedRequest, res
  */
 router.post("/send-approval", authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { channel, assetUrl, filename, executionId } = req.body;
+    const { channel, channelName, assetUrl, filename, executionId } = req.body;
     const userId = req.user?.userId;
 
     if (!channel || !assetUrl || !filename) {
@@ -84,6 +85,7 @@ router.post("/send-approval", authenticateToken, async (req: AuthenticatedReques
       executionId,
       userId,
       slackChannel: channel,
+      slackChannelName: req.body.channelName || channel, // Use channel name if provided, fallback to channel ID
       slackMessageTs: result.messageTs,
     });
 
@@ -113,7 +115,7 @@ router.post("/send-approval", authenticateToken, async (req: AuthenticatedReques
 
 /**
  * @route POST /api/slack/interactions
- * @desc Handle Slack button interactions (approve/reject)
+ * @desc Handle Slack button interactions and modal submissions
  * @access Public (Slack webhook)
  */
 router.post("/interactions", express.urlencoded({ extended: true }), async (req: Request, res: Response) => {
@@ -121,77 +123,120 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
     // Parse the payload from Slack
     const payload = JSON.parse(req.body.payload);
     
-    if (payload.type !== 'block_actions') {
+    // Handle button clicks
+    if (payload.type === 'block_actions') {
+      const action = payload.actions[0];
+      const user = payload.user;
+      const channel = payload.channel;
+      const message = payload.message;
+      
+      if (!action || !action.action_id) {
+        return res.status(200).json({ text: "Invalid action" });
+      }
+
+      console.log("🔘 Slack button interaction received:", {
+        action_id: action.action_id,
+        user: user.username,
+        channel: channel.id
+      });
+
+      // Parse the action data
+      let assetData;
+      try {
+        assetData = JSON.parse(action.value);
+      } catch (error) {
+        console.error("❌ Error parsing action value:", error);
+        return res.status(200).json({ text: "Invalid action data" });
+      }
+
+      const { assetUrl, filename, executionId } = assetData;
+
+      if (action.action_id === 'approve_image') {
+        // Handle approval directly
+        await updateApprovalMessage(
+          channel.id,
+          message.ts,
+          'approved',
+          user.username || user.id
+        );
+
+        await approvalDb.updateApprovalStatus(
+          assetUrl,
+          'approved',
+          user.username || user.id
+        );
+
+        console.log(`✅ Approved: ${assetUrl} by ${user.username}`);
+        res.status(200).json({
+          response_type: "in_channel",
+          text: `✅ Approved by @${user.username}`
+        });
+
+      } else if (action.action_id === 'needs_changes_image') {
+        // Open feedback modal instead of direct rejection
+        await openFeedbackModal(
+          payload.trigger_id,
+          assetUrl,
+          filename,
+          executionId
+        );
+
+        console.log(`📝 Opened feedback modal for: ${assetUrl}`);
+        res.status(200).json({}); // Empty response for modal trigger
+
+      } else {
+        return res.status(200).json({ text: "Unknown action" });
+      }
+    }
+    
+    // Handle modal submission
+    else if (payload.type === 'view_submission') {
+      const user = payload.user;
+      const view = payload.view;
+      
+      if (view.callback_id === 'feedback_modal') {
+        const metadata = JSON.parse(view.private_metadata);
+        const { assetUrl, filename, executionId } = metadata;
+        
+        // Get feedback from the modal
+        const feedbackValue = view.state.values.feedback_input.feedback_text.value;
+        
+        console.log("📝 Feedback submission received:", {
+          assetUrl,
+          feedback: feedbackValue,
+          user: user.username
+        });
+
+        // Update approval status with feedback
+        await approvalDb.updateApprovalStatus(
+          assetUrl,
+          'needs_changes',
+          user.username || user.id,
+          feedbackValue
+        );
+
+        // Update the original message to show the feedback
+        const originalApproval = await approvalDb.getApproval(assetUrl);
+        if (originalApproval && originalApproval.slackChannel && originalApproval.slackMessageTs) {
+          await updateApprovalMessage(
+            originalApproval.slackChannel,
+            originalApproval.slackMessageTs,
+            'needs_changes',
+            user.username || user.id,
+            feedbackValue
+          );
+        }
+
+        console.log(`🔶 Changes requested for: ${assetUrl} by ${user.username}`);
+        res.status(200).json({}); // Empty response for successful submission
+      } else {
+        return res.status(200).json({ text: "Unknown modal" });
+      }
+    }
+    
+    else {
       return res.status(200).json({ text: "Unknown interaction type" });
     }
-
-    const action = payload.actions[0];
-    const user = payload.user;
-    const channel = payload.channel;
-    const message = payload.message;
-    
-    if (!action || !action.action_id) {
-      return res.status(200).json({ text: "Invalid action" });
-    }
-
-    console.log("🔘 Slack interaction received:", {
-      action_id: action.action_id,
-      user: user.username,
-      channel: channel.id
-    });
-
-    // Parse the action data
-    let assetData;
-    try {
-      assetData = JSON.parse(action.value);
-    } catch (error) {
-      console.error("❌ Error parsing action value:", error);
-      return res.status(200).json({ text: "Invalid action data" });
-    }
-
-    const { assetUrl, filename } = assetData;
-    let status: 'approved' | 'needs_changes';
-    let statusText: string;
-    let statusEmoji: string;
-
-    if (action.action_id === 'approve_image') {
-      status = 'approved';
-      statusText = 'Approved';
-      statusEmoji = '✅';
-    } else if (action.action_id === 'needs_changes_image') {
-      status = 'needs_changes';
-      statusText = 'Needs Changes';
-      statusEmoji = '🔶';
-    } else {
-      return res.status(200).json({ text: "Unknown action" });
-    }
-
-    // Update the message in Slack to show the decision
-    await updateApprovalMessage(
-      channel.id,
-      message.ts,
-      status,
-      user.username || user.id
-    );
-
-    // Update the approval status in our database
-    try {
-      await approvalDb.updateApprovalStatus(
-        assetUrl,
-        status,
-        user.username || user.id
-      );
-      console.log(`✅ Updated approval status: ${assetUrl} -> ${status} by ${user.username}`);
-    } catch (error) {
-      console.error("❌ Error updating approval in database:", error);
-      // Still respond OK to Slack so the interaction doesn't fail
-    }
-
-    // Respond to Slack immediately to acknowledge the interaction
-    res.status(200).json({
-      response_type: "in_channel",
-      text: `${statusEmoji} ${statusText} by @${user.username}`
-    });
 
   } catch (error: any) {
     console.error("❌ Error handling Slack interaction:", error.message);
@@ -245,153 +290,9 @@ router.post("/approvals", authenticateToken, async (req: AuthenticatedRequest, r
   }
 });
 
-/**
- * @route POST /api/slack/poll-updates
- * @desc Poll Slack message history to check for approval status updates
- * @access Private (requires authentication)
- */
-router.post("/poll-updates", authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
-  try {
-    console.log("🔄 Polling Slack for approval status updates...");
+// Polling removed - real-time webhook interactions handle approval updates
 
-    // Get all pending approvals from database
-    const pendingApprovals = await approvalDb.getApprovalsByStatus('pending');
-    
-    if (pendingApprovals.length === 0) {
-      return res.json({ 
-        success: true, 
-        message: "No pending approvals to check",
-        updatedCount: 0
-      });
-    }
-
-    console.log(`📋 Found ${pendingApprovals.length} pending approvals to check`);
-    
-    let updatedCount = 0;
-    
-    // Group approvals by channel for efficient polling
-    const approvalsByChannel: Record<string, typeof pendingApprovals> = {};
-    pendingApprovals.forEach(approval => {
-      if (!approvalsByChannel[approval.slackChannel]) {
-        approvalsByChannel[approval.slackChannel] = [];
-      }
-      approvalsByChannel[approval.slackChannel].push(approval);
-    });
-
-    // Poll each channel for updates
-    for (const [channelId, channelApprovals] of Object.entries(approvalsByChannel)) {
-      try {
-        // Get slack client from the service
-        const { WebClient } = require('@slack/web-api');
-        const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-        
-        if (!process.env.SLACK_BOT_TOKEN) {
-          console.warn(`⚠️ Slack token not available, skipping channel ${channelId}`);
-          continue;
-        }
-
-        const historyResult = await slackClient.conversations.history({
-          channel: channelId,
-          limit: 50, // Check recent messages
-          include_all_metadata: true
-        });
-
-        if (!historyResult.ok) {
-          console.error(`❌ Failed to get history for channel ${channelId}:`, historyResult.error);
-          continue;
-        }
-
-        const messages = historyResult.messages || [];
-        
-        // Check each approval against the messages
-        for (const approval of channelApprovals) {
-          if (!approval.slackMessageTs) continue;
-          
-          // Find the specific message by timestamp
-          const message = messages.find((msg: any) => msg.ts === approval.slackMessageTs);
-          if (!message) continue;
-
-          // Parse the message to check for status updates
-          const statusUpdate = parseApprovalStatus(message);
-          if (statusUpdate && statusUpdate.status !== 'pending') {
-            // Update the approval in database using assetUrl
-            await approvalDb.updateApprovalStatus(
-              approval.assetUrl,
-              statusUpdate.status,
-              statusUpdate.reviewedBy || 'Unknown',
-              statusUpdate.feedback
-            );
-            
-            updatedCount++;
-            console.log(`✅ Updated approval ${approval.assetUrl}: ${statusUpdate.status}`);
-          }
-        }
-      } catch (error) {
-        console.error(`❌ Error polling channel ${channelId}:`, error);
-      }
-    }
-
-    console.log(`🔄 Polling complete: ${updatedCount} approvals updated`);
-    
-    res.json({ 
-      success: true, 
-      message: `Checked ${pendingApprovals.length} pending approvals`,
-      updatedCount
-    });
-  } catch (error: any) {
-    console.error("❌ Error polling Slack updates:", error.message);
-    res.status(500).json({ 
-      error: "Failed to poll Slack updates", 
-      details: error.message 
-    });
-  }
-});
-
-/**
- * Parse a Slack message to extract approval status
- */
-function parseApprovalStatus(message: any): { status: 'approved' | 'needs_changes' | 'pending', reviewedBy?: string, feedback?: string } | null {
-  try {
-    if (!message.blocks) {
-      return null;
-    }
-
-    // Look for status block (added when approval/rejection happens)
-    const statusBlock = message.blocks.find(
-      (block: any) => 
-        block.type === "section" && 
-        block.text && 
-        block.text.text.includes("*Status:*")
-    );
-
-    if (!statusBlock) {
-      return { status: 'pending' }; // No status block means still pending
-    }
-
-    const statusText = statusBlock.text.text;
-    
-    if (statusText.includes("✅ Approved")) {
-      const reviewedByMatch = statusText.match(/by @(\w+)/);
-      return {
-        status: 'approved',
-        reviewedBy: reviewedByMatch ? reviewedByMatch[1] : undefined
-      };
-    } else if (statusText.includes("🔶 Needs Changes")) {
-      const reviewedByMatch = statusText.match(/by @(\w+)/);
-      const feedbackMatch = statusText.match(/\*Feedback:\* (.*)/);
-      return {
-        status: 'needs_changes',
-        reviewedBy: reviewedByMatch ? reviewedByMatch[1] : undefined,
-        feedback: feedbackMatch ? feedbackMatch[1] : undefined
-      };
-    }
-
-    return { status: 'pending' };
-  } catch (error) {
-    console.error('Error parsing approval status:', error);
-    return null;
-  }
-}
+// parseApprovalStatus function removed - no longer needed with real-time webhook interactions
 
 /**
  * @route GET /api/slack/status
@@ -463,6 +364,87 @@ router.get("/test", (req: Request, res: Response) => {
       backendUrl: process.env.BACKEND_URL || 'http://localhost:3001'
     }
   });
+});
+
+/**
+ * @route POST /api/slack/submit-revision
+ * @desc Submit a revision for an approved asset and send new approval request
+ * @access Private (requires authentication)
+ */
+router.post("/submit-revision", authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { executionId, originalAssetUrl, originalFilename, selectedAssetUrl } = req.body;
+    const userId = req.user?.userId;
+
+    if (!executionId || !originalAssetUrl || !originalFilename || !selectedAssetUrl) {
+      return res.status(400).json({ 
+        error: "Missing required fields: executionId, originalAssetUrl, originalFilename, selectedAssetUrl" 
+      });
+    }
+
+    if (!userId) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    // Get the original approval to find the channel and asset info
+    const originalApproval = await approvalDb.getApproval(originalAssetUrl);
+    if (!originalApproval) {
+      return res.status(404).json({ error: "Original approval not found" });
+    }
+
+    // Update the original approval status to "revision_submitted"
+    await approvalDb.updateApprovalStatus(
+      originalAssetUrl, 
+      'revision_submitted' as any, 
+      userId,
+      `Revision submitted by user - selected image: ${selectedAssetUrl}`
+    );
+
+    // Extract filename from selectedAssetUrl
+    const selectedFilename = selectedAssetUrl.split('/').pop() || 'revised_asset';
+    const assetType = getAssetTypeFromFilename(selectedFilename);
+
+    // Send new approval request for the selected revision asset
+    const result = await sendApprovalRequest({
+      executionId,
+      imageUrl: selectedAssetUrl, // Using selectedAssetUrl as the new asset to review
+      filename: selectedFilename,
+      assetType,
+      userId,
+      channel: originalApproval.slackChannel, // Send to same channel as original
+    });
+
+    // Create new approval record for the revision
+    const newApproval = await approvalDb.createApproval({
+      assetUrl: selectedAssetUrl,
+      filename: selectedFilename,
+      assetType,
+      executionId,
+      userId,
+      slackChannel: originalApproval.slackChannel,
+      slackChannelName: originalApproval.slackChannelName,
+      slackMessageTs: result.messageTs,
+    });
+
+    console.log("✅ Revision submitted and new approval request sent:", {
+      originalAsset: originalAssetUrl,
+      revisionAsset: selectedAssetUrl,
+      channel: originalApproval.slackChannel
+    });
+    
+    res.json({ 
+      success: true, 
+      message: "Revision submitted and new approval request sent to Slack",
+      selectedAssetUrl,
+      newApprovalId: newApproval.assetUrl
+    });
+  } catch (error: any) {
+    console.error("❌ Error submitting revision:", error.message);
+    res.status(500).json({ 
+      error: "Failed to submit revision", 
+      details: error.message 
+    });
+  }
 });
 
 export default router;
