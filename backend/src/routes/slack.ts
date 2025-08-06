@@ -334,6 +334,47 @@ router.post("/approvals", authenticateToken, async (req: Request, res: Response)
   }
 });
 
+/**
+ * @route GET /api/slack/approvals
+ * @desc Get all approval status for the authenticated user
+ * @access Private (requires authentication)
+ */
+router.get("/approvals", authenticateToken, async (req: Request, res: Response) => {
+  const authReq = req as AuthenticatedRequest;
+  try {
+    console.log(`📋 Getting all approval status for user ${authReq.user.userId}`);
+
+    const approvals = await approvalDb.getApprovalsByUserId(authReq.user.userId);
+    
+    // Transform to a format that's easy for the frontend to use
+    const approvalMap: Record<string, any> = {};
+    approvals.forEach(approval => {
+      approvalMap[approval.assetUrl] = {
+        status: approval.status,
+        reviewedBy: approval.reviewedBy,
+        feedback: approval.feedback,
+        createdAt: approval.createdAt,
+        updatedAt: approval.updatedAt,
+        slackChannel: approval.slackChannel,
+        slackMessageTs: approval.slackMessageTs,
+      };
+    });
+
+    console.log(`✅ Found ${approvals.length} approval(s) for user`);
+    
+    res.json({ 
+      success: true, 
+      approvals: approvalMap
+    });
+  } catch (error: any) {
+    console.error("❌ Error getting approval status:", error.message);
+    res.status(500).json({ 
+      error: "Failed to get approval status", 
+      details: error.message 
+    });
+  }
+});
+
 // Polling removed - real-time webhook interactions handle approval updates
 
 // parseApprovalStatus function removed - no longer needed with real-time webhook interactions
