@@ -80,6 +80,57 @@ def get_downloads_path(user_id: Optional[str] = None, execution_id: Optional[str
     base_path.mkdir(parents=True, exist_ok=True)
     return str(base_path)
 
+async def download_file_from_url(url: str, save_dir: Path, file_type: str = "file") -> Tuple[str, str]:
+    """
+    Download a file from a URL and save it to the specified directory.
+    
+    This is a common utility function that can be used for downloading both images and files.
+    
+    Args:
+        url: The URL to download from
+        save_dir: The directory to save the file in
+        file_type: The type of file being downloaded (e.g., "image", "file", "report")
+        
+    Returns:
+        Tuple of (filename, success_message) or raises an exception on failure
+    """
+    try:
+        # Generate a random 8-character filename
+        random_name = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=8))
+        
+        # Get extension from URL or default based on file_type
+        if '.' in url.split('/')[-1]:
+            ext = url.split('.')[-1]
+        else:
+            # Default extensions based on file type
+            if file_type == "image":
+                ext = 'jpg'
+            elif file_type == "report":
+                ext = 'html'
+            else:
+                ext = 'txt'
+        
+        filename = f"{random_name}.{ext}"
+        filepath = save_dir / filename
+        
+        # Download the file
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    raise Exception(f"Failed to download {file_type}: HTTP {response.status}")
+                
+                # Read and save the file
+                file_data = await response.read()
+                filepath.write_bytes(file_data)
+        
+        msg = f"Downloaded {file_type} to {filename} in {save_dir.name} folder"
+        logger.info(msg)
+        return filename, msg
+        
+    except Exception as e:
+        logger.error(f'Error in download_file_from_url: {str(e)}')
+        raise Exception(f'Failed to download {file_type}: {str(e)}')
+
 def get_agent_code_base_path(user_id: str, task_id: Optional[str] = None) -> str:
     """
     Get the base path for agent code files in the GitHub repository.

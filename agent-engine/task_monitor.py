@@ -795,20 +795,35 @@ async def execute_task(execution):
             # Check if this is a revision execution
             revision_prompt = execution.get('revision_prompt')
             original_image_url = execution.get('original_image_url')
+            original_report_url = execution.get('original_report_url')
             original_execution_id = execution.get('original_execution_id')
             
-            if revision_prompt and original_image_url:
+            if revision_prompt and (original_image_url or original_report_url):
                 # This is a revision execution - use the revision prompt as the main task
                 logger.info(f"Processing revision execution for task {task_id} execution {execution_id}")
                 logger.info(f"Original execution: {original_execution_id}")
-                logger.info(f"Original image: {original_image_url}")
-                logger.info(f"Revision prompt: {revision_prompt}")
                 
-                # The revision prompt becomes the main task, with the original prompt as context
-                prompt = f"""Task: Create a new image based on the revision prompt and the original image. Use original task as context.\n\n
-                Revision Prompt: {revision_prompt}\n    
-                Original Image URL: {original_image_url}\n\n
-                Context - Original Task: {base_prompt}\n\n"""
+                if original_image_url:
+                    logger.info(f"Original image: {original_image_url}")
+                    # Image revision
+                    prompt = f"""Task: Create a new image based on the revision prompt and the original image. Use original task as context.\n\n
+                    Revision Prompt: {revision_prompt}\n    
+                    Original Image URL: {original_image_url}\n\n
+                    Context - Original Task: {base_prompt}\n\n"""
+                elif original_report_url:
+                    logger.info(f"Original report: {original_report_url}")
+                    # HTML report revision - use download_file and read_attached_file
+                    prompt = f"""Task: Create a new HTML report based on the revision prompt and the original report. Use original task as context.
+
+IMPORTANT: This is a revision of an HTML report. You must:
+1. Use the 'download_file' action to download the original report from: {original_report_url}
+2. Use the 'read_attached_file' action to read the raw HTML content of the downloaded file
+3. Analyze the current content and create a revised version based on the revision prompt
+4. Use the 'write_file' action to create the new HTML report with your improvements
+
+Revision Prompt: {revision_prompt}
+
+Context - Original Task: {base_prompt}"""
             else:
                 # Regular execution - add user feedback if provided
                 user_feedback = execution.get('feedback')
@@ -1027,6 +1042,11 @@ async def execute_task(execution):
                         update_lead_list = bool(task.get('updateLeadList', False)) if task else False
                         create_video = bool(task.get('createVideo', False)) if task else False
                         video_model = task.get('videoModel') if task else None
+                        
+                        # Override has_attachments for HTML report revisions to enable read_attached_file
+                        if original_report_url and revision_prompt:
+                            has_attachments = True
+                            logger.info(f"Enabled has_attachments for HTML report revision: {execution_id}")
                         
                         # Set filtered activity log path for later reference
                         filtered_activity_log = f'logs/execution_{execution_id}_browser_use.filtered.log'

@@ -90,15 +90,17 @@ router.post('/:id/upload-file', upload.single('file'), uploadFileToExecution);
 router.post('/:id/executions/revision', authenticateToken, async (req: Request, res: Response) => {
   try {
     const { id: taskId } = req.params;
-    const { revision_prompt, image_url, original_execution_id } = req.body;
+    const { revision_prompt, image_url, report_url, original_execution_id } = req.body;
     const userId = (req as AuthenticatedRequest).user?.userId;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    if (!revision_prompt || !image_url || !original_execution_id) {
-      return res.status(400).json({ message: 'Missing required fields: revision_prompt, image_url, original_execution_id' });
+    // Support both image_url (for images) and report_url (for HTML reports)
+    const assetUrl = image_url || report_url;
+    if (!revision_prompt || !assetUrl || !original_execution_id) {
+      return res.status(400).json({ message: 'Missing required fields: revision_prompt, asset_url (image_url or report_url), original_execution_id' });
     }
 
     // Get the task to verify ownership and get the original prompt
@@ -126,7 +128,8 @@ router.post('/:id/executions/revision', authenticateToken, async (req: Request, 
       status: 'pending',
       startTime: new Date().toISOString(),
       revision_prompt: revision_prompt,
-      original_image_url: image_url,
+      original_image_url: image_url || undefined,
+      original_report_url: report_url || undefined,
       original_execution_id: original_execution_id
     };
 
