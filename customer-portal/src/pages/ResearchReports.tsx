@@ -618,25 +618,7 @@ const ResearchReportsPage: React.FC = () => {
 
   const loadApprovalData = async () => {
     try {
-      const assetUrls = new Set<string>();
-      Object.values(tasksWithExecutions).forEach(task => {
-        task.executions.forEach(execution => {
-          execution.result_files.forEach(file => {
-            if (!file.is_archived) {
-              assetUrls.add(file.url);
-            }
-          });
-        });
-      });
-
-      if (assetUrls.size === 0) {
-        setApprovalData({});
-        return;
-      }
-
-      const response = await axios.post(buildApiUrl('/api/slack/approvals'), {
-        assetUrls: Array.from(assetUrls)
-      }, {
+      const response = await axios.get(buildApiUrl('/api/slack/approvals'), {
         headers: { Authorization: `Bearer ${token}` },
       });
 
