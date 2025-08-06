@@ -917,6 +917,124 @@ router.put("/:taskId/lead-list", authenticateToken, async (req: AuthRequest, res
   }
 });
 
+// Common function to get executions with specific asset types
+async function getExecutionsWithAssets(
+  userId: string, 
+  assetType: 'images' | 'videos' | 'html-reports',
+  errorMessage: string
+): Promise<Record<string, any>> {
+  // Get all task executions for the user
+  const allExecutions = await taskDb.getAllTaskExecutionsByUserId(userId) || [];
+  
+  // Define file filter functions for each asset type
+  const fileFilters = {
+    'images': (file: ResultFile) => {
+      const filename = file.filename.toLowerCase();
+      return filename.endsWith('.jpg') || 
+             filename.endsWith('.jpeg') || 
+             filename.endsWith('.png') || 
+             filename.endsWith('.gif') || 
+             filename.endsWith('.webp') || 
+             filename.endsWith('.svg');
+    },
+    'videos': (file: ResultFile) => {
+      const filename = file.filename.toLowerCase();
+      return filename.endsWith('.mp4');
+    },
+    'html-reports': (file: ResultFile) => {
+      const filename = file.filename.toLowerCase();
+      return filename.endsWith('.html') || 
+             filename.endsWith('.htm') ||
+             (file.is_html === true);
+    }
+  };
+  
+  const fileFilter = fileFilters[assetType];
+  
+  // Filter executions that have result_files with the specified asset type and are not archived
+  const executionsWithAssets = allExecutions.filter((execution: any) => {
+    if (!execution.result_files || execution.result_files.length === 0) {
+      return false;
+    }
+    
+    // Skip archived executions
+    if (execution.archived === true) {
+      return false;
+    }
+    
+    // Check if any result file matches the asset type
+    return execution.result_files.some(fileFilter);
+  });
+
+  // Get all non-archived tasks for the user to match with executions
+  const allTasks = await taskDb.getTasksByUserId(userId);
+  const nonArchivedTasks = allTasks?.filter((task: any) => task.status !== 'archived') || [];
+  const taskMap = new Map(nonArchivedTasks.map((task: any) => [task.taskId, task]));
+
+  // Group executions by taskId, but only for non-archived tasks
+  const result: Record<string, any> = {};
+  
+  executionsWithAssets.forEach((execution: any) => {
+    const task = taskMap.get(execution.taskId);
+    const taskId = execution.taskId;
+    
+    // Only include executions from non-archived tasks
+    if (task) {
+      if (!result[taskId]) {
+        result[taskId] = {
+          taskId: taskId,
+          taskName: task.name,
+          createdAt: task.createdAt,
+          executions: []
+        };
+      }
+      
+      result[taskId].executions.push({
+        executionId: execution.executionId,
+        startTime: execution.startTime || null,
+        result_files: execution.result_files?.filter(fileFilter) || []
+      });
+    }
+  });
+
+  // Calculate latest execution time and find latest pending/running execution for each task
+  Object.keys(result).forEach(taskId => {
+    const task = result[taskId];
+    const executionTimes = task.executions
+      .map((execution: any) => execution.startTime)
+      .filter((time: string) => time !== null);
+    
+    if (executionTimes.length > 0) {
+      task.latestExecutionTime = executionTimes.sort().pop(); // Get the latest time
+    } else {
+      task.latestExecutionTime = null;
+    }
+
+    // Find the most recent pending or running execution for this task
+    const allTaskExecutions = allExecutions.filter((execution: any) => execution.taskId === taskId);
+    const pendingOrRunningExecutions = allTaskExecutions.filter((execution: any) => 
+      (execution.status === 'pending' || execution.status === 'running') && execution.archived !== true
+    );
+    
+    if (pendingOrRunningExecutions.length > 0) {
+      // Sort by startTime and get the most recent one
+      const latestPendingOrRunning = pendingOrRunningExecutions.sort((a: any, b: any) => 
+        new Date(b.startTime || 0).getTime() - new Date(a.startTime || 0).getTime()
+      )[0];
+      
+      task.latestPendingOrRunningExecution = {
+        executionId: latestPendingOrRunning.executionId,
+        status: latestPendingOrRunning.status,
+        startTime: latestPendingOrRunning.startTime || null
+      };
+    } else {
+      task.latestPendingOrRunningExecution = null;
+    }
+  });
+
+  return result;
+}
+
 // Get all executions with images for the current user
 router.get('/executions/with-images', authenticateToken, async (req: Request, res: Response) => {
   try {
@@ -926,106 +1044,7 @@ router.get('/executions/with-images', authenticateToken, async (req: Request, re
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    // Get all task executions for the user
-    const allExecutions = await taskDb.getAllTaskExecutionsByUserId(userId) || [];
-    
-    // Filter executions that have result_files with image URLs and are not archived
-    const executionsWithImages = allExecutions.filter((execution: any) => {
-      if (!execution.result_files || execution.result_files.length === 0) {
-        return false;
-      }
-      
-      // Skip archived executions
-      if (execution.archived === true) {
-        return false;
-      }
-      
-      // Check if any result file is an image
-      return execution.result_files.some((file: ResultFile) => {
-        const filename = file.filename.toLowerCase();
-        return filename.endsWith('.jpg') || 
-               filename.endsWith('.jpeg') || 
-               filename.endsWith('.png') || 
-               filename.endsWith('.gif') || 
-               filename.endsWith('.webp') || 
-               filename.endsWith('.svg');
-      });
-    });
-
-    // Get all non-archived tasks for the user to match with executions
-    const allTasks = await taskDb.getTasksByUserId(userId);
-    const nonArchivedTasks = allTasks?.filter((task: any) => task.status !== 'archived') || [];
-    const taskMap = new Map(nonArchivedTasks.map((task: any) => [task.taskId, task]));
-
-        // Group executions by taskId, but only for non-archived tasks
-    const result: Record<string, any> = {};
-    
-    executionsWithImages.forEach((execution: any) => {
-      const task = taskMap.get(execution.taskId);
-      const taskId = execution.taskId;
-      
-      // Only include executions from non-archived tasks
-      if (task) {
-        if (!result[taskId]) {
-          result[taskId] = {
-            taskId: taskId,
-            taskName: task.name,
-            createdAt: task.createdAt,
-            executions: []
-          };
-        }
-        
-        result[taskId].executions.push({
-          executionId: execution.executionId,
-          startTime: execution.startTime || null,
-          result_files: execution.result_files?.filter((file: ResultFile) => {
-            const filename = file.filename.toLowerCase();
-            return filename.endsWith('.jpg') || 
-                   filename.endsWith('.jpeg') || 
-                   filename.endsWith('.png') || 
-                   filename.endsWith('.gif') || 
-                   filename.endsWith('.webp') || 
-                   filename.endsWith('.svg');
-          }) || []
-        });
-      }
-    });
-
-    // Calculate latest execution time and find latest pending/running execution for each task
-    Object.keys(result).forEach(taskId => {
-      const task = result[taskId];
-      const executionTimes = task.executions
-        .map((execution: any) => execution.startTime)
-        .filter((time: string) => time !== null);
-      
-      if (executionTimes.length > 0) {
-        task.latestExecutionTime = executionTimes.sort().pop(); // Get the latest time
-      } else {
-        task.latestExecutionTime = null;
-      }
-
-      // Find the most recent pending or running execution for this task
-      const allTaskExecutions = allExecutions.filter((execution: any) => execution.taskId === taskId);
-      const pendingOrRunningExecutions = allTaskExecutions.filter((execution: any) => 
-        (execution.status === 'pending' || execution.status === 'running') && execution.archived !== true
-      );
-      
-      if (pendingOrRunningExecutions.length > 0) {
-        // Sort by startTime and get the most recent one
-        const latestPendingOrRunning = pendingOrRunningExecutions.sort((a: any, b: any) => 
-          new Date(b.startTime || 0).getTime() - new Date(a.startTime || 0).getTime()
-        )[0];
-        
-        task.latestPendingOrRunningExecution = {
-          executionId: latestPendingOrRunning.executionId,
-          status: latestPendingOrRunning.status,
-          startTime: latestPendingOrRunning.startTime || null
-        };
-      } else {
-        task.latestPendingOrRunningExecution = null;
-      }
-    });
-
+    const result = await getExecutionsWithAssets(userId, 'images', 'Error getting executions with images');
     res.json(result);
   } catch (error) {
     console.error('Error getting executions with images:', error);
@@ -1042,96 +1061,7 @@ router.get('/executions/with-videos', authenticateToken, async (req: Request, re
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    // Get all task executions for the user
-    const allExecutions = await taskDb.getAllTaskExecutionsByUserId(userId) || [];
-    
-    // Filter executions that have result_files with video URLs and are not archived
-    const executionsWithVideos = allExecutions.filter((execution: any) => {
-      if (!execution.result_files || execution.result_files.length === 0) {
-        return false;
-      }
-      
-      // Skip archived executions
-      if (execution.archived === true) {
-        return false;
-      }
-      
-      // Check if any result file is a video (only .mp4 supported)
-      return execution.result_files.some((file: ResultFile) => {
-        const filename = file.filename.toLowerCase();
-        return filename.endsWith('.mp4');
-      });
-    });
-
-    // Get all non-archived tasks for the user to match with executions
-    const allTasks = await taskDb.getTasksByUserId(userId);
-    const nonArchivedTasks = allTasks?.filter((task: any) => task.status !== 'archived') || [];
-    const taskMap = new Map(nonArchivedTasks.map((task: any) => [task.taskId, task]));
-
-        // Group executions by taskId, but only for non-archived tasks
-    const result: Record<string, any> = {};
-    
-    executionsWithVideos.forEach((execution: any) => {
-      const task = taskMap.get(execution.taskId);
-      const taskId = execution.taskId;
-      
-      // Only include executions from non-archived tasks
-      if (task) {
-        if (!result[taskId]) {
-          result[taskId] = {
-            taskId: taskId,
-            taskName: task.name,
-            createdAt: task.createdAt,
-            executions: []
-          };
-        }
-        
-        result[taskId].executions.push({
-          executionId: execution.executionId,
-          startTime: execution.startTime || null,
-          result_files: execution.result_files?.filter((file: ResultFile) => {
-            const filename = file.filename.toLowerCase();
-            return filename.endsWith('.mp4');
-          }) || []
-        });
-      }
-    });
-
-    // Calculate latest execution time and find latest pending/running execution for each task
-    Object.keys(result).forEach(taskId => {
-      const task = result[taskId];
-      const executionTimes = task.executions
-        .map((execution: any) => execution.startTime)
-        .filter((time: string) => time !== null);
-      
-      if (executionTimes.length > 0) {
-        task.latestExecutionTime = executionTimes.sort().pop(); // Get the latest time
-      } else {
-        task.latestExecutionTime = null;
-      }
-
-      // Find the most recent pending or running execution for this task
-      const allTaskExecutions = allExecutions.filter((execution: any) => execution.taskId === taskId);
-      const pendingOrRunningExecutions = allTaskExecutions.filter((execution: any) => 
-        (execution.status === 'pending' || execution.status === 'running') && execution.archived !== true
-      );
-      
-      if (pendingOrRunningExecutions.length > 0) {
-        // Sort by startTime and get the most recent one
-        const latestPendingOrRunning = pendingOrRunningExecutions.sort((a: any, b: any) => 
-          new Date(b.startTime || 0).getTime() - new Date(a.startTime || 0).getTime()
-        )[0];
-        
-        task.latestPendingOrRunningExecution = {
-          executionId: latestPendingOrRunning.executionId,
-          status: latestPendingOrRunning.status,
-          startTime: latestPendingOrRunning.startTime || null
-        };
-      } else {
-        task.latestPendingOrRunningExecution = null;
-      }
-    });
-
+    const result = await getExecutionsWithAssets(userId, 'videos', 'Error getting executions with videos');
     res.json(result);
   } catch (error) {
     console.error('Error getting executions with videos:', error);
@@ -1148,100 +1078,7 @@ router.get('/executions/with-html-reports', authenticateToken, async (req: Reque
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    // Get all task executions for the user
-    const allExecutions = await taskDb.getAllTaskExecutionsByUserId(userId) || [];
-    
-    // Filter executions that have result_files with HTML URLs and are not archived
-    const executionsWithHtmlReports = allExecutions.filter((execution: any) => {
-      if (!execution.result_files || execution.result_files.length === 0) {
-        return false;
-      }
-      
-      // Skip archived executions
-      if (execution.archived === true) {
-        return false;
-      }
-      
-      // Check if any result file is an HTML report
-      return execution.result_files.some((file: ResultFile) => {
-        const filename = file.filename.toLowerCase();
-        return filename.endsWith('.html') || 
-               filename.endsWith('.htm') ||
-               (file.is_html === true);
-      });
-    });
-
-    // Get all non-archived tasks for the user to match with executions
-    const allTasks = await taskDb.getTasksByUserId(userId);
-    const nonArchivedTasks = allTasks?.filter((task: any) => task.status !== 'archived') || [];
-    const taskMap = new Map(nonArchivedTasks.map((task: any) => [task.taskId, task]));
-
-        // Group executions by taskId, but only for non-archived tasks
-    const result: Record<string, any> = {};
-    
-    executionsWithHtmlReports.forEach((execution: any) => {
-      const task = taskMap.get(execution.taskId);
-      const taskId = execution.taskId;
-      
-      // Only include executions from non-archived tasks
-      if (task) {
-        if (!result[taskId]) {
-          result[taskId] = {
-            taskId: taskId,
-            taskName: task.name,
-            createdAt: task.createdAt,
-            executions: []
-          };
-        }
-        
-        result[taskId].executions.push({
-          executionId: execution.executionId,
-          startTime: execution.startTime || null,
-          result_files: execution.result_files?.filter((file: ResultFile) => {
-            const filename = file.filename.toLowerCase();
-            return filename.endsWith('.html') || 
-                   filename.endsWith('.htm') ||
-                   (file.is_html === true);
-          }) || []
-        });
-      }
-    });
-
-    // Calculate latest execution time and find latest pending/running execution for each task
-    Object.keys(result).forEach(taskId => {
-      const task = result[taskId];
-      const executionTimes = task.executions
-        .map((execution: any) => execution.startTime)
-        .filter((time: string) => time !== null);
-      
-      if (executionTimes.length > 0) {
-        task.latestExecutionTime = executionTimes.sort().pop(); // Get the latest time
-      } else {
-        task.latestExecutionTime = null;
-      }
-
-      // Find the most recent pending or running execution for this task
-      const allTaskExecutions = allExecutions.filter((execution: any) => execution.taskId === taskId);
-      const pendingOrRunningExecutions = allTaskExecutions.filter((execution: any) => 
-        (execution.status === 'pending' || execution.status === 'running') && execution.archived !== true
-      );
-      
-      if (pendingOrRunningExecutions.length > 0) {
-        // Sort by startTime and get the most recent one
-        const latestPendingOrRunning = pendingOrRunningExecutions.sort((a: any, b: any) => 
-          new Date(b.startTime || 0).getTime() - new Date(a.startTime || 0).getTime()
-        )[0];
-        
-        task.latestPendingOrRunningExecution = {
-          executionId: latestPendingOrRunning.executionId,
-          status: latestPendingOrRunning.status,
-          startTime: latestPendingOrRunning.startTime || null
-        };
-      } else {
-        task.latestPendingOrRunningExecution = null;
-      }
-    });
-
+    const result = await getExecutionsWithAssets(userId, 'html-reports', 'Error getting executions with HTML reports');
     res.json(result);
   } catch (error) {
     console.error('Error getting executions with HTML reports:', error);
