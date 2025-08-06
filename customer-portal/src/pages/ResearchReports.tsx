@@ -13,7 +13,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { Checkbox } from '@/components/ui/checkbox';
-import { Loader2, Search, Filter, Calendar, FileText, ExternalLink, Clock, ArrowUpRight, Play, Zap, Download, Heart, Plus, Archive, Upload, ChevronDown, X, CheckCircle, MessageSquare, AlertTriangle, RefreshCw, Send } from 'lucide-react';
+import { Loader2, Search, Filter, Calendar, FileText, ExternalLink, Clock, ArrowUpRight, Play, Zap, Download, Heart, Plus, Archive, Upload, ChevronDown, X, CheckCircle, MessageSquare, AlertTriangle, RefreshCw, Send, Users } from 'lucide-react';
 import { format } from 'date-fns';
 import { useNavigate } from 'react-router-dom';
 import { useToast } from '@/hooks/use-toast';
@@ -50,22 +50,35 @@ interface TaskWithExecutions {
 }
 
 interface BrandData {
-  brandGuidelines: string;
-  businessOverview: string;
-  icp: Array<{ id: string; name: string; description: string }>;
+  brandName: string;
+  tagline: string;
+  primaryColor: string;
+  secondaryColor: string;
+  fontFamily: string;
+  toneOfVoice: string;
+  keyMessages: string[];
+  brandValues: string[];
+  targetAudience: string;
+  brandPersonality: string;
 }
 
 interface BrandAsset {
-  id: string;
-  name: string;
-  description: string;
   type: string;
+  url: string;
+  key: string;
+  filename: string;
+}
+
+interface ICP {
+  id: string;
+  title: string;
+  description: string;
+  valueProposition: string;
 }
 
 interface MarketStrategyData {
-  marketStrategy: string;
-  competitiveAnalysis: string;
-  targetAudience: string;
+  businessOverview: string;
+  icp: ICP[];
 }
 
 const ResearchReportsPage: React.FC = () => {
@@ -106,6 +119,20 @@ const ResearchReportsPage: React.FC = () => {
   const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
   const [uploadingReport, setUploadingReport] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+
+  // Create Research Reports functionality
+  const [createTaskDialogOpen, setCreateTaskDialogOpen] = useState(false);
+  const [isCreatingTask, setIsCreatingTask] = useState(false);
+  const [taskName, setTaskName] = useState('');
+  const [additionalPrompt, setAdditionalPrompt] = useState('');
+  const [brandData, setBrandData] = useState<BrandData | null>(null);
+  const [brandAssets, setBrandAssets] = useState<BrandAsset[]>([]);
+  const [marketStrategyData, setMarketStrategyData] = useState<MarketStrategyData | null>(null);
+  const [selectedOptions, setSelectedOptions] = useState({
+    brandGuidelines: true,
+    businessOverview: true,
+    icp: [] as string[]
+  });
 
   // Handle escape key to close report preview
   useEffect(() => {
@@ -830,6 +857,206 @@ const ResearchReportsPage: React.FC = () => {
     return !hasActiveExecution && !isExecuting;
   };
 
+  // Load brand guidelines and market strategy data
+  const loadTaskCreationData = async () => {
+    try {
+      // Load brand guidelines
+      const brandResponse = await axios.get(buildApiUrl('/api/brand/guidelines'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      
+      if (brandResponse.data.exists) {
+        setBrandData(brandResponse.data.brandData);
+        setBrandAssets(brandResponse.data.attachments || []);
+      }
+
+      // Load market strategy
+      const marketResponse = await axios.get(buildApiUrl('/api/market-strategy'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      
+      if (marketResponse.data.success) {
+        setMarketStrategyData(marketResponse.data.data);
+      }
+    } catch (error) {
+      console.error('Error loading task creation data:', error);
+    }
+  };
+
+  const handleCreateResearchReportTask = async () => {
+    if (!token) {
+      toast({
+        title: "Error",
+        description: "Authentication token not found. Please log in.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    // Validate required fields
+    if (!taskName.trim()) {
+      toast({
+        title: "Error",
+        description: "Task name is required.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    if (!additionalPrompt.trim()) {
+      toast({
+        title: "Error",
+        description: "Research Prompt is required. Please describe what research reports you want to generate.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    setIsCreatingTask(true);
+    
+    try {
+      // Build the prompt based on selected options
+      let prompt = "Please create a comprehensive HTML research report that aligns with the below context and target the specified audience. The report should be professional, well-structured, and suitable for business analysis. Use write_file to create the HTML report with proper formatting.\n\n";
+      
+      // Add task description
+      if (additionalPrompt.trim()) {
+        prompt += `Research Prompt:\n${additionalPrompt.trim()}\n\n`;
+      }
+      
+      if (selectedOptions.brandGuidelines && brandData) {
+        prompt += `Brand Guidelines:\nIMPORTANT: Use the following brand data including logo, typography, brand colors, and other brand elements to maintain consistency in generated reports. Ensure all reports align with the brand identity.\n\n`;
+        
+        const brandGuidelines = [];
+        
+        // Only include fields that have values
+        if (brandData.brandName?.trim()) brandGuidelines.push(`- Brand Name: ${brandData.brandName}`);
+        if (brandData.tagline?.trim()) brandGuidelines.push(`- Tagline: ${brandData.tagline}`);
+        if (brandData.primaryColor?.trim()) brandGuidelines.push(`- Primary Color: ${brandData.primaryColor}`);
+        if (brandData.secondaryColor?.trim()) brandGuidelines.push(`- Secondary Color: ${brandData.secondaryColor}`);
+        if (brandData.fontFamily?.trim()) brandGuidelines.push(`- Font Family: ${brandData.fontFamily}`);
+        if (brandData.toneOfVoice?.trim()) brandGuidelines.push(`- Tone of Voice: ${brandData.toneOfVoice}`);
+        if (brandData.keyMessages?.length > 0) brandGuidelines.push(`- Key Messages: ${brandData.keyMessages.join(', ')}`);
+        if (brandData.brandValues?.length > 0) brandGuidelines.push(`- Brand Values: ${brandData.brandValues.join(', ')}`);
+        if (brandData.targetAudience?.trim()) brandGuidelines.push(`- Target Audience: ${brandData.targetAudience}`);
+        if (brandData.brandPersonality?.trim()) brandGuidelines.push(`- Brand Personality: ${brandData.brandPersonality}`);
+        
+        // Add brand assets if available
+        if (brandAssets.length > 0) {
+          const logoAssets = brandAssets.filter(asset => asset.type === 'logo' || asset.type === 'secondaryLogo');
+          if (logoAssets.length > 0) {
+            brandGuidelines.push(`- Brand Logos: ${logoAssets.map(asset => asset.url).join(', ')}`);
+          }
+        }
+        
+        if (brandGuidelines.length > 0) {
+          prompt += `${brandGuidelines.join('\n')}\n\n`;
+        }
+      }
+      
+      if (selectedOptions.businessOverview && marketStrategyData?.businessOverview) {
+        prompt += `Business Overview:\n${marketStrategyData.businessOverview}\n\n`;
+      }
+      
+      // Handle Target Audience based on ICP selection
+      if (selectedOptions.icp.length > 0 && marketStrategyData?.icp) {
+        const selectedICPs = marketStrategyData.icp.filter(icp => selectedOptions.icp.includes(icp.id));
+        if (selectedICPs.length > 0) {
+          prompt += `Target Audience: ${selectedICPs.map(icp => icp.title).join(', ')}\n\n`;
+        }
+      } else {
+        // General audience if no ICP selected
+        prompt += `Target Audience: General audience\n\n`;
+      }
+      
+      // Create tasks based on ICP selection
+      const tasksToCreate = [];
+      
+      if (selectedOptions.icp.length > 0 && marketStrategyData?.icp) {
+        // Create a task for each selected ICP
+        const selectedICPs = marketStrategyData.icp.filter(icp => selectedOptions.icp.includes(icp.id));
+        for (const icp of selectedICPs) {
+          const icpPrompt = prompt.replace(
+            /Target Audience: General audience/,
+            `Target Audience: ${icp.title} - ${icp.description} (Value Proposition: ${icp.valueProposition})`
+          );
+          
+          tasksToCreate.push({
+            name: `${taskName.trim()} - ${icp.title}`,
+            prompt: icpPrompt,
+            category: 'Research',
+            description: `Research report generation targeting ${icp.title} audience`,
+            outputAsHtml: true
+          });
+        }
+      } else {
+        // Create a single task for general audience
+        tasksToCreate.push({
+          name: taskName.trim(),
+          prompt: prompt,
+          category: 'Research',
+          description: 'Research report generation for general audience',
+          outputAsHtml: true
+        });
+      }
+
+      // Create all tasks
+      const createdTasks = [];
+      for (const taskData of tasksToCreate) {
+        const response = await axios.post(
+          buildApiUrl('/api/tasks'),
+          taskData,
+          {
+            headers: { Authorization: `Bearer ${token}` },
+          }
+        );
+        createdTasks.push(response.data);
+      }
+
+      toast({
+        title: "Tasks Created Successfully",
+        description: `Created ${createdTasks.length} research report generation task${createdTasks.length > 1 ? 's' : ''}. You will be redirected to the Tasks page.`,
+      });
+
+      setCreateTaskDialogOpen(false);
+      setSelectedOptions({
+        brandGuidelines: true,
+        businessOverview: true,
+        icp: []
+      });
+      setAdditionalPrompt('');
+      setTaskName('');
+      
+      // Navigate to tasks page
+      navigate('/tasks');
+      
+    } catch (err: any) {
+      console.error('Failed to create research report tasks:', err);
+      toast({
+        title: "Error Creating Tasks",
+        description: err.response?.data?.message || "Could not create research report tasks.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsCreatingTask(false);
+    }
+  };
+
+  const handleICPToggle = (icpId: string) => {
+    setSelectedOptions(prev => ({
+      ...prev,
+      icp: prev.icp.includes(icpId)
+        ? prev.icp.filter(id => id !== icpId)
+        : [...prev.icp, icpId]
+    }));
+  };
+
+  // Load data when create dialog opens
+  useEffect(() => {
+    if (createTaskDialogOpen && token) {
+      loadTaskCreationData();
+    }
+  }, [createTaskDialogOpen, token]);
+
   // Convert to array of tasks and filter/sort
   const allTasks = Object.values(tasksWithExecutions)
     .filter(task => {
@@ -898,6 +1125,12 @@ const ResearchReportsPage: React.FC = () => {
               </span>
             )}
           </p>
+        </div>
+        <div className="flex gap-2">
+          <Button onClick={() => setCreateTaskDialogOpen(true)} className="bg-blue-600 hover:bg-blue-700 text-white font-medium px-6 py-2">
+            <Plus className="h-4 w-4 mr-2" />
+            Create Research Reports
+          </Button>
         </div>
       </div>
 
@@ -1514,6 +1747,150 @@ const ResearchReportsPage: React.FC = () => {
                 </>
               ) : (
                 'Upload Report'
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Create Research Reports Dialog */}
+      <Dialog open={createTaskDialogOpen} onOpenChange={setCreateTaskDialogOpen}>
+        <DialogContent className="sm:max-w-[600px] max-h-[80vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Create Research Report Task</DialogTitle>
+            <DialogDescription>
+              Configure your research report generation task by selecting the information to include in the prompt.
+            </DialogDescription>
+          </DialogHeader>
+          
+          <div className="space-y-6 py-4">
+            {/* Task Name */}
+            <div className="space-y-3">
+              <Label htmlFor="taskName" className="text-sm font-medium">
+                Task Name <span className="text-red-500">*</span>
+              </Label>
+              <Input
+                id="taskName"
+                placeholder="e.g., Market Research Report, Competitive Analysis, Industry Trends Report"
+                value={taskName}
+                onChange={(e) => setTaskName(e.target.value)}
+                required
+              />
+            </div>
+
+            {/* Brand Guidelines */}
+            <div className="space-y-3">
+              <div className="flex items-center space-x-2">
+                <Checkbox
+                  id="brandGuidelines"
+                  checked={selectedOptions.brandGuidelines}
+                  onCheckedChange={(checked) => 
+                    setSelectedOptions(prev => ({ ...prev, brandGuidelines: checked as boolean }))
+                  }
+                />
+                <Label htmlFor="brandGuidelines" className="text-sm font-medium">
+                  Brand Guidelines
+                </Label>
+              </div>
+              {selectedOptions.brandGuidelines && brandData && (
+                <div className="ml-6 p-3 bg-gray-50 dark:bg-gray-800 rounded-md text-sm">
+                  <p><strong>Brand:</strong> {brandData.brandName}</p>
+                  <p><strong>Tagline:</strong> {brandData.tagline}</p>
+                  <p><strong>Colors:</strong> {brandData.primaryColor}, {brandData.secondaryColor}</p>
+                </div>
+              )}
+            </div>
+
+            {/* Market Strategy */}
+            <div className="space-y-3">
+              <h3 className="text-sm font-medium">Market Strategy</h3>
+              
+              {/* Business Overview */}
+              <div className="space-y-2">
+                <div className="flex items-center space-x-2">
+                  <Checkbox
+                    id="businessOverview"
+                    checked={selectedOptions.businessOverview}
+                    onCheckedChange={(checked) => 
+                      setSelectedOptions(prev => ({ ...prev, businessOverview: checked as boolean }))
+                    }
+                  />
+                  <Label htmlFor="businessOverview" className="text-sm">
+                    Business Overview
+                  </Label>
+                </div>
+                {selectedOptions.businessOverview && marketStrategyData?.businessOverview && (
+                  <div className="ml-6 p-3 bg-gray-50 dark:bg-gray-800 rounded-md text-sm">
+                    <p>{marketStrategyData.businessOverview.substring(0, 200)}...</p>
+                  </div>
+                )}
+              </div>
+
+              {/* ICP Selection */}
+              <div className="space-y-2">
+                <Label className="text-sm">Ideal Customer Profiles (ICP)</Label>
+                <p className="text-xs text-gray-500 dark:text-gray-400">
+                  Select specific ICPs to target, or leave unselected for general audience
+                </p>
+                {marketStrategyData?.icp && marketStrategyData.icp.length > 0 ? (
+                  <div className="ml-6 space-y-2">
+                    {marketStrategyData.icp.map((icp) => (
+                      <div key={icp.id} className="flex items-center space-x-2">
+                        <Checkbox
+                          id={`icp-${icp.id}`}
+                          checked={selectedOptions.icp.includes(icp.id)}
+                          onCheckedChange={() => handleICPToggle(icp.id)}
+                        />
+                        <Label htmlFor={`icp-${icp.id}`} className="text-sm">
+                          {icp.title}
+                        </Label>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="ml-6 p-3 bg-gray-50 dark:bg-gray-800 rounded-md text-sm">
+                    <p className="text-gray-500 dark:text-gray-400">
+                      No ICPs defined. Task will target general audience.
+                    </p>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Research Prompt */}
+            <div className="space-y-3">
+              <Label htmlFor="additionalPrompt" className="text-sm font-medium">
+                Research Prompt <span className="text-red-500">*</span>
+              </Label>
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                Describe what research reports you want to generate. Include specific details about research type, data sources, analysis depth, or report structure.
+              </p>
+              <Textarea
+                id="additionalPrompt"
+                placeholder="e.g., Create comprehensive market analysis reports with industry trends, competitive landscape, and growth opportunities"
+                value={additionalPrompt}
+                onChange={(e) => setAdditionalPrompt(e.target.value)}
+                className="min-h-[100px]"
+                required
+              />
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setCreateTaskDialogOpen(false)}>
+              Cancel
+            </Button>
+            <Button 
+              onClick={handleCreateResearchReportTask}
+              disabled={!taskName.trim() || !additionalPrompt.trim() || isCreatingTask}
+            >
+              {isCreatingTask ? (
+                <>
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Creating...
+                </>
+              ) : (
+                'Create Task'
               )}
             </Button>
           </DialogFooter>
