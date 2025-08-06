@@ -543,6 +543,52 @@ const ResearchReportsPage: React.FC = () => {
     setRevisionNote(''); // Reset note when canceling
   };
 
+  const handleSubmitRevision = async () => {
+    if (!previewReport || !revisionPrompt.trim()) {
+      toast({
+        title: "Error",
+        description: "Please enter a revision prompt.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    setIsSubmittingRevision(true);
+    try {
+      const response = await axios.post(
+        buildApiUrl(`/api/tasks/${previewReport.taskId}/executions/revision`),
+        {
+          revision_prompt: revisionPrompt.trim(),
+          report_url: previewReport.url,
+          original_execution_id: previewReport.executionId
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      if (response.data.success) {
+        toast({
+          title: "Revision Submitted",
+          description: "Your report revision request has been submitted. The new execution will start shortly.",
+        });
+        setReportPreviewOpen(false);
+        setRevisionPrompt('');
+        // Refresh the executions to show the new pending execution
+        await fetchExecutionsWithHtmlReports();
+      }
+    } catch (error: any) {
+      console.error('Error submitting revision:', error);
+      toast({
+        title: "Error",
+        description: error.response?.data?.message || "Failed to submit revision request.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsSubmittingRevision(false);
+    }
+  };
+
   const loadApprovalData = async () => {
     try {
       const assetUrls = new Set<string>();
@@ -1197,13 +1243,53 @@ const ResearchReportsPage: React.FC = () => {
                 </div>
               </div>
 
-              {/* Main content area */}
-              <div className="bg-white p-4">
-                <iframe
-                  src={previewReport.url}
-                  className="w-full h-[80vh] border border-gray-200 rounded-lg"
-                  title={previewReport.filename}
-                />
+              {/* Main content area - side by side */}
+              <div className="flex">
+                {/* Report - Left side */}
+                <div className="flex-1 bg-white p-4">
+                  <iframe
+                    src={previewReport.url}
+                    className="w-full h-[80vh] border border-gray-200 rounded-lg"
+                    title={previewReport.filename}
+                  />
+                </div>
+
+                {/* Revision Prompt Section - Right side */}
+                <div className="w-80 bg-gray-900 border-l border-gray-600 p-4 flex flex-col">
+                  <div className="flex-1">
+                    <Label htmlFor="revisionPrompt" className="text-white text-sm font-medium mb-3 block">
+                      Report Revision Prompt
+                    </Label>
+                    <Textarea
+                      id="revisionPrompt"
+                      placeholder="Describe how you'd like to revise this report (e.g., 'Add more market analysis', 'Include competitor data', 'Make it more detailed')"
+                      value={revisionPrompt}
+                      onChange={(e) => setRevisionPrompt(e.target.value)}
+                      className="min-h-[120px] bg-gray-800 border-gray-600 text-white placeholder-gray-400 resize-none mb-4 w-full"
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                    <Button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleSubmitRevision();
+                      }}
+                      disabled={!revisionPrompt.trim() || isSubmittingRevision}
+                      className="w-full bg-blue-600 hover:bg-blue-700 text-white py-2"
+                    >
+                      {isSubmittingRevision ? (
+                        <>
+                          <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                          Submitting...
+                        </>
+                      ) : (
+                        <>
+                          <Zap className="h-4 w-4 mr-2" />
+                          Submit Revision
+                        </>
+                      )}
+                    </Button>
+                  </div>
+                </div>
               </div>
             </div>
           )}

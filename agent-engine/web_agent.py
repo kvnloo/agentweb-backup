@@ -1339,32 +1339,34 @@ class WebAgent:
                 if not task_dir:
                     return ActionResult(error="No attachments folder available for saving the image")
                 
-                # Generate a random 8-character filename
-                random_name = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=8))
+                # Use the common download function
+                from task_utils import download_file_from_url
+                filename, msg = await download_file_from_url(url, task_dir, "image")
                 
-                # Get extension from URL or default to jpg
-                ext = url.split('.')[-1] if '.' in url.split('/')[-1] else 'jpg'
-                filename = f"{random_name}.{ext}"
-                
-                filepath = task_dir / filename
-                
-                # Download the image
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url) as response:
-                        if response.status != 200:
-                            raise Exception(f"Failed to download image: HTTP {response.status}")
-                        
-                        # Read and save the image
-                        image_data = await response.read()
-                        filepath.write_bytes(image_data)
-                
-                msg = f"Downloaded image to {filename} in attachments folder"
-                logger.info(msg)
                 return ActionResult(extracted_content=msg)
                 
             except Exception as e:
                 logger.error(f'Error in download_image: {str(e)}')
                 return ActionResult(error=f'Failed to download image: {str(e)}')
+
+        @self.controller.registry.action('Download file when you have the URL')
+        async def download_file(url: str, browser: BrowserContext) -> ActionResult:
+            """Download a file from a URL and save it to the attachments folder."""
+            try:
+                # Use the helper method to get the attachment directory
+                task_dir = self._get_attachment_dir()
+                if not task_dir:
+                    return ActionResult(error="No attachments folder available for saving the file")
+                
+                # Use the common download function
+                from task_utils import download_file_from_url
+                filename, msg = await download_file_from_url(url, task_dir, "file")
+                
+                return ActionResult(extracted_content=msg)
+                
+            except Exception as e:
+                logger.error(f'Error in download_file: {str(e)}')
+                return ActionResult(error=f'Failed to download file: {str(e)}')
 
         @self.controller.registry.action('Write file')
         async def write_file(file_name: str, extension: str, content: str) -> ActionResult:
