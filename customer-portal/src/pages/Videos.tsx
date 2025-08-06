@@ -786,20 +786,8 @@ const VideosPage: React.FC = () => {
     if (!token) return;
     
     try {
-      const allUrls = Object.values(tasksWithExecutions).flatMap(task => 
-        task.executions.flatMap(execution => 
-          execution.result_files.map(file => file.url)
-        )
-      );
-      
-      if (allUrls.length === 0) {
-        setApprovalData({});
-        return;
-      }
-
-      const response = await axios.post(
+      const response = await axios.get(
         buildApiUrl('/api/slack/approvals'),
-        { assetUrls: allUrls },
         { headers: { Authorization: `Bearer ${token}` } }
       );
       

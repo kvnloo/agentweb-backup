@@ -22,6 +22,7 @@ import BrandGuidelines from "@/pages/BrandGuidelines.tsx";
 import MarketStrategy from "@/pages/MarketStrategy.tsx";
 import ImagesPage from "@/pages/Images.tsx";
 import VideosPage from "@/pages/Videos.tsx";
+import ResearchReportsPage from "@/pages/ResearchReports.tsx";
 
 const queryClient = new QueryClient();
 
@@ -76,6 +77,16 @@ const App = () => (
                   <ProtectedRoute>
                     <Layout>
                       <MarketStrategy />
+                    </Layout>
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/research-reports"
+                element={
+                  <ProtectedRoute>
+                    <Layout>
+                      <ResearchReportsPage />
                     </Layout>
                   </ProtectedRoute>
                 }
