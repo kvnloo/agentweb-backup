@@ -772,11 +772,8 @@ const ResearchReportsPage: React.FC = () => {
                             <div className="h-full w-full flex flex-col items-center justify-center p-4">
                               <FileText className="h-12 w-12 text-gray-400 mb-2" />
                               <div className="text-center">
-                                <div className="text-sm font-medium text-gray-900 dark:text-white truncate">
-                                  {file.filename}
-                                </div>
-                                <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                                  HTML Report
+                                <div className="text-xs text-gray-500 dark:text-gray-400">
+                                  Click to preview
                                 </div>
                               </div>
                             </div>
