@@ -101,6 +101,11 @@ const ResearchReportsPage: React.FC = () => {
   const [selectedRevisionReport, setSelectedRevisionReport] = useState<string | null>(null);
   const [submittingRevision, setSubmittingRevision] = useState(false);
   const [revisionNote, setRevisionNote] = useState('');
+  
+  // Upload functionality
+  const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
+  const [uploadingReport, setUploadingReport] = useState(false);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
 
   // Handle escape key to close report preview
   useEffect(() => {
@@ -609,6 +614,176 @@ const ResearchReportsPage: React.FC = () => {
     }
   };
 
+  // Generate More functionality
+  const handleGenerateMore = async (taskId: string) => {
+    // Open feedback dialog first
+    setPendingTaskId(taskId);
+    setFeedbackText('');
+    setFeedbackDialogOpen(true);
+  };
+
+  const handleUploadDirectly = (taskId: string) => {
+    setPendingTaskId(taskId);
+    setSelectedFile(null);
+    setUploadDialogOpen(true);
+  };
+
+  const handleSubmitFeedback = async () => {
+    if (!pendingTaskId || !token) {
+      toast({
+        title: "Error",
+        description: "Authentication token not found. Please log in.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    setExecutingTasks(prev => new Set(prev).add(pendingTaskId));
+    setFeedbackDialogOpen(false);
+    
+    try {
+      await axios.post(
+        buildApiUrl(`/api/tasks/${pendingTaskId}/execute`),
+        { 
+          feedback: feedbackText.trim() || undefined 
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      
+      toast({ 
+        title: "Success", 
+        description: "Task execution started with your feedback. New reports will appear shortly." 
+      });
+      
+      // Refresh the data after a short delay to show the new execution
+      setTimeout(() => {
+        fetchExecutionsWithHtmlReports();
+      }, 2000);
+      
+    } catch (err: any) {
+      console.error('Failed to execute task:', err);
+      toast({
+        title: "Error Executing Task",
+        description: err.response?.data?.message || "Could not start task execution.",
+        variant: "destructive",
+      });
+    } finally {
+      setExecutingTasks(prev => {
+        const newSet = new Set(prev);
+        newSet.delete(pendingTaskId);
+        return newSet;
+      });
+      setPendingTaskId(null);
+      setFeedbackText('');
+    }
+  };
+
+  const handleCancelFeedback = () => {
+    setFeedbackDialogOpen(false);
+    setPendingTaskId(null);
+    setFeedbackText('');
+  };
+
+  const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file) {
+      // Check if file is an HTML file
+      if (!file.name.toLowerCase().endsWith('.html') && !file.name.toLowerCase().endsWith('.htm')) {
+        toast({
+          title: "Error",
+          description: "Please select an HTML file.",
+          variant: "destructive",
+        });
+        return;
+      }
+      setSelectedFile(file);
+    }
+  };
+
+  const handleUploadReport = async () => {
+    if (!pendingTaskId || !selectedFile || !token) {
+      toast({
+        title: "Error",
+        description: "Please select a file to upload.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    setUploadingReport(true);
+    
+    try {
+      const formData = new FormData();
+      formData.append('file', selectedFile);
+
+      await axios.post(
+        buildApiUrl(`/api/tasks/${pendingTaskId}/upload-file`),
+        formData,
+        {
+          headers: { 
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'multipart/form-data'
+          },
+        }
+      );
+      
+      toast({ 
+        title: "Success", 
+        description: "Report uploaded successfully and added to the latest execution." 
+      });
+      
+      setUploadDialogOpen(false);
+      setSelectedFile(null);
+      setPendingTaskId(null);
+      
+      // Refresh the data to show the new report
+      setTimeout(() => {
+        // Try to refresh just the latest execution first
+        const task = tasksWithExecutions[pendingTaskId];
+        if (task && task.latestPendingOrRunningExecution) {
+          refreshExecutionResults(pendingTaskId, task.latestPendingOrRunningExecution.executionId);
+        } else {
+          // Fallback to full refresh if no active execution
+          fetchExecutionsWithHtmlReports();
+        }
+      }, 1000);
+      
+    } catch (err: any) {
+      console.error('Failed to upload report:', err);
+      toast({
+        title: "Error Uploading Report",
+        description: err.response?.data?.message || "Could not upload report.",
+        variant: "destructive",
+      });
+    } finally {
+      setUploadingReport(false);
+    }
+  };
+
+  const handleUploadCancel = () => {
+    setUploadDialogOpen(false);
+    setSelectedFile(null);
+    setPendingTaskId(null);
+  };
+
+  // Helper functions for dropdown functionality
+  const hasActiveExecutions = () => {
+    return Object.values(tasksWithExecutions).some(task => task.latestPendingOrRunningExecution !== null);
+  };
+
+  const isCurrentlyExecuting = (taskId: string) => {
+    return executingTasks.has(taskId);
+  };
+
+  const canGenerateMore = (taskId: string) => {
+    const task = tasksWithExecutions[taskId];
+    const hasActiveExecution = task?.latestPendingOrRunningExecution !== null;
+    const isExecuting = executingTasks.has(taskId);
+    return !hasActiveExecution && !isExecuting;
+  };
+
   // Convert to array of tasks and filter/sort
   const allTasks = Object.values(tasksWithExecutions)
     .filter(task => {
@@ -755,6 +930,64 @@ const ResearchReportsPage: React.FC = () => {
                           </Badge>
                         )}
                       </div>
+                      <div className="flex items-center gap-2 mt-2 text-sm text-gray-500 dark:text-gray-400">
+                        <Clock className="h-4 w-4" />
+                        <span>Task created: {formatDate(task.createdAt)}</span>
+                      </div>
+                      <div className="flex items-center gap-2 mt-1 text-sm text-gray-500 dark:text-gray-400">
+                        <Calendar className="h-4 w-4" />
+                        <span>Latest execution: {formatDate(task.latestExecutionTime)}</span>
+                      </div>
+                      {hasActiveExecution && (
+                        <div className="flex items-center gap-2 mt-1 text-sm text-blue-600 dark:text-blue-400">
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          <span>
+                            Generating reports... Started: {formatDate(task.latestPendingOrRunningExecution!.startTime)}
+                            {refreshingExecutions.has(task.latestPendingOrRunningExecution!.executionId) && (
+                              <span className="ml-2 text-xs">• Auto-refreshing</span>
+                            )}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                    <div className="flex flex-col gap-2">
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            disabled={!canGenerateMore(task.taskId)}
+                            size="sm"
+                            className="whitespace-nowrap"
+                          >
+                            {isCurrentlyExecuting(task.taskId) ? (
+                              <>
+                                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                                Starting...
+                              </>
+                            ) : hasActiveExecution ? (
+                              <>
+                                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                                In Progress
+                              </>
+                            ) : (
+                              <>
+                                <Play className="h-4 w-4 mr-2" />
+                                Generate More
+                                <ChevronDown className="h-4 w-4 ml-1" />
+                              </>
+                            )}
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuItem onClick={() => handleGenerateMore(task.taskId)}>
+                            <Play className="h-4 w-4 mr-2" />
+                            Generate with agent
+                          </DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => handleUploadDirectly(task.taskId)}>
+                            <Upload className="h-4 w-4 mr-2" />
+                            Upload directly
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
                     </div>
                   </div>
                 </CardHeader>
@@ -1118,6 +1351,83 @@ const ResearchReportsPage: React.FC = () => {
                 </>
               ) : (
                 'Submit Revision'
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Feedback Dialog */}
+      <Dialog open={feedbackDialogOpen} onOpenChange={setFeedbackDialogOpen}>
+        <DialogContent className="sm:max-w-[500px]">
+          <DialogHeader>
+            <DialogTitle>Provide Feedback for Agent</DialogTitle>
+            <DialogDescription>
+              Share your thoughts on how to improve the generated reports. Your feedback will be used to enhance the AI agent's understanding and generate better results.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="feedback">Feedback (Optional)</Label>
+              <Textarea
+                id="feedback"
+                placeholder="e.g., Make the reports more detailed, use different research sources, add more visualizations, change the style to be more comprehensive..."
+                value={feedbackText}
+                onChange={(e) => setFeedbackText(e.target.value)}
+                className="min-h-[120px]"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={handleCancelFeedback}>
+              Cancel
+            </Button>
+            <Button onClick={handleSubmitFeedback}>
+              Generate Report
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Upload Dialog */}
+      <Dialog open={uploadDialogOpen} onOpenChange={setUploadDialogOpen}>
+        <DialogContent className="sm:max-w-[500px]">
+          <DialogHeader>
+            <DialogTitle>Upload HTML Report</DialogTitle>
+            <DialogDescription>
+              Upload an HTML report file to add it to the latest execution of this task.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="file">Select HTML File</Label>
+              <Input
+                id="file"
+                type="file"
+                accept=".html,.htm"
+                onChange={handleFileSelect}
+                className="cursor-pointer"
+              />
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                Only HTML files (.html, .htm) are supported.
+              </p>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={handleUploadCancel}>
+              Cancel
+            </Button>
+            <Button 
+              onClick={handleUploadReport}
+              disabled={!selectedFile || uploadingReport}
+            >
+              {uploadingReport ? (
+                <>
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Uploading...
+                </>
+              ) : (
+                'Upload Report'
               )}
             </Button>
           </DialogFooter>
