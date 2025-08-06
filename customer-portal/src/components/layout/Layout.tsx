@@ -138,6 +138,12 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
           path: "/market-strategy",
           id: "market-strategy",
         },
+        {
+          icon: FileText,
+          label: "Research Reports",
+          path: "/research-reports",
+          id: "research-reports",
+        },
       ],
     },
     {

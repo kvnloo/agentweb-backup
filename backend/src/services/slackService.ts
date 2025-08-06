@@ -113,22 +113,24 @@ export async function sendApprovalRequest(
             text: `*New ${request.assetType.charAt(0).toUpperCase() + request.assetType.slice(1)} Approval Request*\n\n*Filename:* ${request.filename}\n*Asset Type:* ${request.assetType.toUpperCase()}${request.note ? `\n*Note:* ${request.note}` : ''}`,
           },
         },
-                 {
-           type: "section",
-           text: {
-             type: "mrkdwn",
-             text: request.assetType === 'video' 
-               ? `📹 *Video File* (Click to download)\n<${request.imageUrl}|${request.filename}>`
-               : `<${request.imageUrl}|View ${request.assetType.charAt(0).toUpperCase() + request.assetType.slice(1)}>`,
-           },
-           ...(request.assetType !== 'video' && {
-             accessory: {
-               type: "image",
-               image_url: request.imageUrl,
-               alt_text: request.filename,
-             },
-           }),
-         },
+                         {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: request.assetType === 'video' 
+              ? `📹 *Video File* (Click to download)\n<${request.imageUrl}|${request.filename}>`
+              : request.assetType === 'html'
+                ? `📄 *HTML Report* (Click to view)\n<${request.imageUrl}|${request.filename}>`
+                : `<${request.imageUrl}|View ${request.assetType.charAt(0).toUpperCase() + request.assetType.slice(1)}>`,
+          },
+          ...(request.assetType !== 'video' && request.assetType !== 'html' && {
+            accessory: {
+              type: "image",
+              image_url: request.imageUrl,
+              alt_text: request.filename,
+            },
+          }),
+        },
         {
           type: "actions",
           elements: [
