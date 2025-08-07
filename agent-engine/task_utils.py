@@ -272,8 +272,8 @@ def get_pld_deepseek_llm(model_name: str):
 
 def get_openai_llm(model_name: str):
     if model_name == "gpt-5":
-        # Use gpt-4.1 from Azure as a proxy for gpt-5
-        return get_azure_openai_llm2("gpt-4.1")
+        # Use Gemini 2.5 Flash as a proxy for gpt-5
+        return get_gemini_llm("gemini-2.5-flash")
     
     """Initialize OpenAI language model"""
     try:

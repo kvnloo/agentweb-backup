@@ -3276,11 +3276,11 @@ class WebAgent:
             "validate_output": validate_output
         }
 
-        # Conditionally add tool_calling_method for Azure OpenAI LLMs and GPT-5
+        # Conditionally add tool_calling_method for Azure OpenAI LLMs
         # self.llm_name is available from __init__ (e.g., "azure->openai->gpt-4o")
-        if self.llm_name and ("azure->openai" in self.llm_name.lower() or "gpt-5" in self.llm_name.lower()) and global_tool_calling_method_for_azure:
+        if self.llm_name and "azure->openai" in self.llm_name.lower() and global_tool_calling_method_for_azure:
             agent_kwargs["tool_calling_method"] = global_tool_calling_method_for_azure
-            logger.info(f"Using tool_calling_method '{global_tool_calling_method_for_azure}' for Azure OpenAI LLM or GPT-5.")
+            logger.info(f"Using tool_calling_method '{global_tool_calling_method_for_azure}' for Azure OpenAI LLM.")
         
         self.agent = Agent(**agent_kwargs)
         logger.info("Agent initialized successfully.")
