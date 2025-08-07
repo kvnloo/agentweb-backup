@@ -1580,6 +1580,7 @@ class WebAgent:
                 Supported models:
                 - veo-3.0-generate-preview (Google): 8-second videos with audio supported, 16:9 aspect ratio
                 - gen4_turbo (Runway AI): 5-second videos without audio, 1280:720 ratio
+                - kling-v2.1-std (ReelMind): 5-second image-to-video generation, 16:9 aspect ratio (Kling V1.6 Std used for text-to-video)
                 
                 Parameters:
                 - params: GenerateVideoParams containing:
@@ -1693,6 +1694,218 @@ class WebAgent:
                         else:
                             # Text-to-video not supported by Runway AI gen4_turbo
                             return ActionResult(error="Runway AI gen4_turbo only supports image-to-video generation. Please provide an input image.")
+                    
+                    elif video_model == "kling-v2.1-std":
+                        # Use ReelMind API for Kling V2.1 Std
+                        import requests
+                        import json
+                        import time
+                        
+                        # Get API key
+                        api_key = os.getenv('REELMIND_API_KEY')
+                        if not api_key:
+                            return ActionResult(error="REELMIND_API_KEY environment variable is not set (Do not retry - this is a permanent failure)")
+                        
+                        # Kling V2.1 Std supports both text-to-video and image-to-video generation
+                        # If no image is provided, we'll do text-to-video generation
+                        
+                        # Determine generation type and prepare request
+                        if image_path:
+                            logger.info("Kling V2.1 Std: Generating 5-10 second image-to-video")
+                            
+                            # Upload image to S3 to get a public URL
+                            from task_utils import get_s3_client
+                            
+                            s3_client = get_s3_client()
+                            s3_bucket = os.getenv('AWS_S3_BUCKET')
+                            
+                            if not s3_bucket:
+                                return ActionResult(error="AWS_S3_BUCKET environment variable is not set (Do not retry - this is a permanent failure)")
+                            
+                            # Generate unique S3 key for the image
+                            import uuid
+                            image_ext = Path(params.image_file_name).suffix.lower()
+                            unique_filename = f"kling_input_{uuid.uuid4()}{image_ext}"
+                            s3_key = f"video_inputs/{unique_filename}"
+                            
+                            # Upload image to S3
+                            try:
+                                # Determine content type
+                                mime_map = {
+                                    '.png': 'image/png',
+                                    '.jpg': 'image/jpeg', 
+                                    '.jpeg': 'image/jpeg',
+                                    '.gif': 'image/gif',
+                                    '.bmp': 'image/bmp',
+                                    '.webp': 'image/webp'
+                                }
+                                content_type = mime_map.get(image_ext, 'image/png')
+                                
+                                s3_client.upload_file(
+                                    image_path,
+                                    s3_bucket,
+                                    s3_key,
+                                    ExtraArgs={'ContentType': content_type}
+                                )
+                                
+                                # Generate public URL
+                                image_url = f"https://{s3_bucket}.s3.amazonaws.com/{s3_key}"
+                                logger.info(f"Uploaded input image to S3: {image_url}")
+                                
+                            except Exception as e:
+                                return ActionResult(error=f"Failed to upload image to S3: {str(e)} (Do not retry - this is a permanent failure)")
+                            
+                            # Prepare request data for image-to-video (Kling V2.1 Std)
+                            request_data = {
+                                "prompt": params.prompt,
+                                "model_id": "b36e980e-3e29-4e8f-8082-35408a2b57c7",  # Kling V2.1 Std
+                                "duration": "5",  # Default 5 seconds
+                                "aspect_ratio": "16:9",  # Default aspect ratio
+                                "image_url": image_url
+                            }
+                        else:
+                            logger.info("Kling V1.6 Std: Generating 5-second text-to-video")
+                            
+                            # Prepare request data for text-to-video (Kling V1.6 Std)
+                            request_data = {
+                                "prompt": params.prompt,
+                                "model_id": "5410929b-78d0-4c1f-ad7c-17913ad3e2b5",  # Kling V1.6 Std for text-to-video
+                                "duration": "5",  # Default 5 seconds
+                                "aspect_ratio": "16:9"  # Default aspect ratio
+                            }
+                        
+                        try:
+                            if params.negative_prompt:
+                                request_data["negative_prompt"] = params.negative_prompt
+                            else:
+                                request_data["negative_prompt"] = "blur, distort, and low quality"
+                            
+                            request_data["cfg_scale"] = 0.5  # Default CFG scale
+                            
+                            # Make request to ReelMind API
+                            headers = {
+                                "Authorization": api_key,
+                                "Content-Type": "application/json"
+                            }
+                            
+                            logger.info(f"Sending request to ReelMind API: {request_data}")
+                            response = requests.post(
+                                "https://nestapi.reelmind.ai/external-api/video/generate",
+                                headers=headers,
+                                json=request_data,
+                                timeout=30
+                            )
+
+                            if int(response.status_code) not in [200, 201]:
+                                error_msg = f"ReelMind API request failed with status {response.status_code}: {response.text}"
+                                logger.error(error_msg)
+                                return ActionResult(error=error_msg)
+                            
+                            task_data = response.json()
+                            task_id = task_data.get("data", {}).get("task_id")
+                            
+                            if not task_id:
+                                return ActionResult(error=f"No task_id received from ReelMind API: {task_data} (Do not retry - this is a permanent failure)")
+                            
+                            logger.info(f"ReelMind task created with ID: {task_id}")
+                            
+                            # Poll for completion (no webhook as requested)
+                            max_attempts = 120  # 10 minutes max (5 second intervals)
+                            attempt = 0
+                            
+                            while attempt < max_attempts:
+                                time.sleep(5)  # Wait 5 seconds between polls
+                                attempt += 1
+                                
+                                # Check task status (using task_id from response to get status)
+                                # Note: The exact status endpoint may need to be confirmed with ReelMind API docs
+                                status_response = requests.get(
+                                    f"https://nestapi.reelmind.ai/external-api/video/task/{task_id}",
+                                    headers=headers,
+                                    timeout=10
+                                )
+
+                                if int(status_response.status_code) not in [200, 201]:
+                                    logger.warning(f"Status check failed: {status_response.status_code} - {status_response.text}")
+                                    continue
+                                
+                                status_data = status_response.json()
+                                task_status = status_data.get("data", {}).get("status")
+                                
+                                logger.info(f"ReelMind task {task_id} status: {task_status} (attempt {attempt}/{max_attempts})")
+                                
+                                if task_status == "completed":
+                                    # Extract video URL from the nested data.output_result structure
+                                    output_result = status_data.get("data", {}).get("output_result", {})
+                                    video_url = output_result.get("video_url")
+                                    if video_url:
+                                        # Download the video
+                                        video_response = requests.get(video_url, timeout=60)
+                                        if video_response.status_code == 200:
+                                            with open(output_path, 'wb') as f:
+                                                f.write(video_response.content)
+                                            
+                                            # Clean up the uploaded input image from S3 (only if image was uploaded)
+                                            if image_path:
+                                                try:
+                                                    s3_client.delete_object(Bucket=s3_bucket, Key=s3_key)
+                                                    logger.info(f"Cleaned up input image from S3: {s3_key}")
+                                                except Exception as cleanup_error:
+                                                    logger.warning(f"Failed to clean up input image from S3: {cleanup_error}")
+                                            
+                                            logger.info(f"Kling video saved to: {output_path}")
+                                            return ActionResult(extracted_content=f"✅ Video {params.output_file_name} generated successfully using Kling V2.1 Std and saved to downloads folder!")
+                                        else:
+                                            return ActionResult(error=f"Failed to download video from URL: {video_url} (Do not retry - this is a permanent failure)")
+                                    else:
+                                        return ActionResult(error="Video completed but no video_url provided (Do not retry - this is a permanent failure)")
+                                
+                                elif task_status == "failed":
+                                    error_msg = status_data.get("error", "Video generation failed.")
+                                    # Clean up the uploaded input image from S3 (only if image was uploaded)
+                                    if image_path:
+                                        try:
+                                            s3_client.delete_object(Bucket=s3_bucket, Key=s3_key)
+                                            logger.info(f"Cleaned up input image from S3 after failure: {s3_key}")
+                                        except Exception as cleanup_error:
+                                            logger.warning(f"Failed to clean up input image from S3 after failure: {cleanup_error}")
+                                    return ActionResult(error=f"ReelMind video generation failed: {error_msg} (Do not retry - this is a permanent failure)")
+                                
+                                elif task_status in ["pending", "processing"]:
+                                    # Continue polling
+                                    continue
+                                else:
+                                    logger.warning(f"Unknown task status: {task_status}")
+                                    continue
+                            
+                            # If we get here, we've exceeded max attempts
+                            # Clean up the uploaded input image from S3 (only if image was uploaded)
+                            if image_path:
+                                try:
+                                    s3_client.delete_object(Bucket=s3_bucket, Key=s3_key)
+                                    logger.info(f"Cleaned up input image from S3 after timeout: {s3_key}")
+                                except Exception as cleanup_error:
+                                    logger.warning(f"Failed to clean up input image from S3 after timeout: {cleanup_error}")
+                            return ActionResult(error=f"ReelMind video generation timed out after {max_attempts * 5} seconds (Do not retry - this is a permanent failure)")
+                            
+                        except requests.exceptions.RequestException as e:
+                            # Clean up the uploaded input image from S3 if it exists
+                            if image_path and 's3_key' in locals():
+                                try:
+                                    s3_client.delete_object(Bucket=s3_bucket, Key=s3_key)
+                                    logger.info(f"Cleaned up input image from S3 after request error: {s3_key}")
+                                except Exception as cleanup_error:
+                                    logger.warning(f"Failed to clean up input image from S3 after request error: {cleanup_error}")
+                            return ActionResult(error=f"ReelMind API request error: {str(e)} (Do not retry - this is a permanent failure)")
+                        except Exception as e:
+                            # Clean up the uploaded input image from S3 if it exists
+                            if image_path and 's3_key' in locals():
+                                try:
+                                    s3_client.delete_object(Bucket=s3_bucket, Key=s3_key)
+                                    logger.info(f"Cleaned up input image from S3 after error: {s3_key}")
+                                except Exception as cleanup_error:
+                                    logger.warning(f"Failed to clean up input image from S3 after error: {cleanup_error}")
+                            return ActionResult(error=f"ReelMind video generation error: {str(e)} (Do not retry - this is a permanent failure)")
                     
                     else:
                         # Use Google VEO (default)
@@ -3097,7 +3310,7 @@ async def main():
     parser.add_argument('--lead-list-identifier', help='Identifier field name for lead list records')
     parser.add_argument('--has-attachments', action='store_true', help='Task has attachments')
     parser.add_argument('--create-video', action='store_true', help='Create video recording of task execution')
-    parser.add_argument('--video-model', help='Video model to use for video generation (veo-3.0-generate-preview or gen4_turbo)')
+    parser.add_argument('--video-model', help='Video model to use for video generation (veo-3.0-generate-preview, gen4_turbo, or kling-v2.1-std)')
     args = parser.parse_args()
 
     # Read prompt from file

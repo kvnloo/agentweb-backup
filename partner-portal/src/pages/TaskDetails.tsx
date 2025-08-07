@@ -2971,6 +2971,14 @@ export default function TaskDetails() {
                   </Typography>
                 </Box>
               </MenuItem>
+              <MenuItem value="kling-v2.1-std">
+                <Box>
+                  <Typography>kling-v2.1-std (ReelMind)</Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    5s video without audio
+                  </Typography>
+                </Box>
+              </MenuItem>
             </Select>
           </FormControl>
         </DialogContent>
