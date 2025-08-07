@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-08-07',
+    changes: [
+      'Added Kling V2.1 Std model for video generation',
+      '- Users can now generate videos using ReelMind\'s Kling V2.1 Std model',
+      '- Supports both text-to-video and image-to-video generation modes',
+      '- 5-second videos with 16:9 aspect ratio',
+      '- Available in the video model selector alongside VEO 3 and Runway models',
+    ],
+  },
+  {
     date: '2025-08-06',
     changes: [
       'Added Research Reports page under Brand category',
