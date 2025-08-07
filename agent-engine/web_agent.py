@@ -1825,12 +1825,14 @@ class WebAgent:
                                     continue
                                 
                                 status_data = status_response.json()
-                                task_status = status_data.get("status")
+                                task_status = status_data.get("data", {}).get("status")
                                 
                                 logger.info(f"ReelMind task {task_id} status: {task_status} (attempt {attempt}/{max_attempts})")
                                 
                                 if task_status == "completed":
-                                    video_url = status_data.get("video_url")
+                                    # Extract video URL from the nested data.output_result structure
+                                    output_result = status_data.get("data", {}).get("output_result", {})
+                                    video_url = output_result.get("video_url")
                                     if video_url:
                                         # Download the video
                                         video_response = requests.get(video_url, timeout=60)
