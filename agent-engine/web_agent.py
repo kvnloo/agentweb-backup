@@ -1785,16 +1785,12 @@ class WebAgent:
                                 timeout=30
                             )
 
-                            logger.info(f"ReelMind API response: {response.status_code} {response.text}")
-                            
                             if int(response.status_code) not in [200, 201]:
                                 error_msg = f"ReelMind API request failed with status {response.status_code}: {response.text}"
                                 logger.error(error_msg)
                                 return ActionResult(error=error_msg)
                             
-                            logger.info(f"Parsing response: {response.text}")
                             task_data = response.json()
-                            logger.info(f"Task data: {task_data}")
                             task_id = task_data.get("data", {}).get("task_id")
                             
                             if not task_id:
@@ -1818,8 +1814,6 @@ class WebAgent:
                                     timeout=10
                                 )
 
-                                logger.info(f"ReelMind status response: {status_response.status_code} {status_response.text}")
-                                
                                 if int(status_response.status_code) not in [200, 201]:
                                     logger.warning(f"Status check failed: {status_response.status_code} - {status_response.text}")
                                     continue
