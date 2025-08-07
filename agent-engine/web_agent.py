@@ -1580,7 +1580,7 @@ class WebAgent:
                 Supported models:
                 - veo-3.0-generate-preview (Google): 8-second videos with audio supported, 16:9 aspect ratio
                 - gen4_turbo (Runway AI): 5-second videos without audio, 1280:720 ratio
-                - kling-v2.1-std (ReelMind): 5-10 second text-to-video or image-to-video generation, 16:9 aspect ratio
+                - kling-v2.1-std (ReelMind): 5-second image-to-video generation, 16:9 aspect ratio (Kling V1.6 Std used for text-to-video)
                 
                 Parameters:
                 - params: GenerateVideoParams containing:
@@ -1755,21 +1755,21 @@ class WebAgent:
                             except Exception as e:
                                 return ActionResult(error=f"Failed to upload image to S3: {str(e)} (Do not retry - this is a permanent failure)")
                             
-                            # Prepare request data for image-to-video
+                            # Prepare request data for image-to-video (Kling V2.1 Std)
                             request_data = {
                                 "prompt": params.prompt,
-                                "model_id": "b36e980e-3e29-4e8f-8082-35408a2b57c7",
+                                "model_id": "b36e980e-3e29-4e8f-8082-35408a2b57c7",  # Kling V2.1 Std
                                 "duration": "5",  # Default 5 seconds
                                 "aspect_ratio": "16:9",  # Default aspect ratio
                                 "image_url": image_url
                             }
                         else:
-                            logger.info("Kling V2.1 Std: Generating 5-10 second text-to-video")
+                            logger.info("Kling V1.6 Std: Generating 5-second text-to-video")
                             
-                            # Prepare request data for text-to-video (no image_url)
+                            # Prepare request data for text-to-video (Kling V1.6 Std)
                             request_data = {
                                 "prompt": params.prompt,
-                                "model_id": "b36e980e-3e29-4e8f-8082-35408a2b57c7",
+                                "model_id": "5410929b-78d0-4c1f-ad7c-17913ad3e2b5",  # Kling V1.6 Std for text-to-video
                                 "duration": "5",  # Default 5 seconds
                                 "aspect_ratio": "16:9"  # Default aspect ratio
                             }
