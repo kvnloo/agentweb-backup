@@ -271,6 +271,10 @@ def get_pld_deepseek_llm(model_name: str):
         sys.exit(1)
 
 def get_openai_llm(model_name: str):
+    if model_name == "gpt-5":
+        # Use gpt-4.1 from Azure as a proxy for gpt-5
+        return get_azure_openai_llm2("gpt-4.1")
+    
     """Initialize OpenAI language model"""
     try:
         api_key = os.getenv('OPENAI_API_KEY')
@@ -382,7 +386,8 @@ def get_llm(full_llm_name: str) -> Tuple[Any, str]:
                 "__default__": get_openai_llm,  # Default function for any OpenAI model
                 "gpt-4o": get_openai_llm,
                 "gpt-4o-mini": get_openai_llm,
-                "o3-mini": get_openai_llm_think
+                "o3-mini": get_openai_llm_think,
+                "gpt-5": get_openai_llm,
             }
         },
         "google": {

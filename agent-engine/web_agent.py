@@ -348,6 +348,10 @@ class WebAgent:
             if self.create_video:
                 prompt = f"{prompt}\n\nImportant: This task has video generation capabilities enabled. You can use the 'Generate short video' action to create videos based on text prompts. This is useful for creating promotional videos, tutorials, or any other video content needed for the task."
 
+            # Add GPT-5 consultation instruction if using GPT-5 model
+            if "gpt-5" in self.llm_name.lower():
+                prompt = f"{prompt}\n\nImportant: You are using GPT-5, the most advanced AI model. For complex reasoning, strategic analysis, or when you need the most sophisticated AI capabilities, use the consult_agi action. This allows you to leverage GPT-5's full potential for deep thinking and problem-solving. When using consult_agi, make sure to include ALL relevant context in your question as GPT-5 cannot access external information or previous conversation history."
+
             # Create task
             self.task = prompt
 
@@ -811,6 +815,44 @@ class WebAgent:
             except Exception as e:
                 logger.error(f"Error during API integration setup: {str(e)}")
                 return ActionResult(error=f"Error running integration: {str(e)}")
+        if "gpt-5" in self.llm_name.lower():
+            @self.controller.registry.action('Consult AGI (GPT-5) for advanced reasoning and analysis')
+            def consult_agi(question_with_full_context: str) -> ActionResult:
+                """Consult GPT-5 for advanced reasoning and analysis. Use this when you need the most advanced AI capabilities for complex problem solving, strategic thinking, or deep analysis. IMPORTANT: Provide ALL relevant context in your question as GPT-5 cannot access external context or previous conversation history."""
+                try:
+                    # Import OpenAI client
+                    try:
+                        from openai import OpenAI
+                    except ImportError:
+                        return ActionResult(error="OpenAI package not installed. Install with: pip install openai")
+
+                    # Get API key
+                    api_key = os.getenv('OPENAI_API_KEY')
+                    if not api_key:
+                        return ActionResult(error="OPENAI_API_KEY environment variable is not set")
+
+                    # Initialize the client
+                    client = OpenAI(api_key=api_key)
+                    
+                    logger.info(f"Consulting GPT-5 with question: {question_with_full_context}")
+                    
+                    # Call GPT-5 without temperature parameter (uses default)
+                    response = client.chat.completions.create(
+                        model="gpt-5",
+                        messages=[
+                            {"role": "system", "content": "You are an advanced AI assistant. Provide thoughtful, comprehensive analysis and strategic insights."},
+                            {"role": "user", "content": question_with_full_context}
+                        ]
+                    )
+                    
+                    result = response.choices[0].message.content
+                    logger.info("GPT-5 consultation completed successfully")
+                    
+                    return ActionResult(extracted_content=result)
+                    
+                except Exception as e:
+                    logger.error(f"Error consulting GPT-5: {str(e)}")
+                    return ActionResult(error=f"Failed to consult GPT-5: {str(e)}")
 
         @self.controller.registry.action('Get brand guidelines')
         def get_brand_guidelines() -> ActionResult:
@@ -3234,11 +3276,11 @@ class WebAgent:
             "validate_output": validate_output
         }
 
-        # Conditionally add tool_calling_method for Azure OpenAI LLMs
+        # Conditionally add tool_calling_method for Azure OpenAI LLMs and GPT-5
         # self.llm_name is available from __init__ (e.g., "azure->openai->gpt-4o")
-        if self.llm_name and "azure->openai" in self.llm_name.lower() and global_tool_calling_method_for_azure:
+        if self.llm_name and ("azure->openai" in self.llm_name.lower() or "gpt-5" in self.llm_name.lower()) and global_tool_calling_method_for_azure:
             agent_kwargs["tool_calling_method"] = global_tool_calling_method_for_azure
-            logger.info(f"Using tool_calling_method '{global_tool_calling_method_for_azure}' for Azure OpenAI LLM.")
+            logger.info(f"Using tool_calling_method '{global_tool_calling_method_for_azure}' for Azure OpenAI LLM or GPT-5.")
         
         self.agent = Agent(**agent_kwargs)
         logger.info("Agent initialized successfully.")
