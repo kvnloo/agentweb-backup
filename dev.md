@@ -64,3 +64,6 @@ When deploying the Images feature, you may encounter an error: `ValidationExcept
 ### Prevention for Future Deployments
 
 The `create-tables.ts` script has been updated to include the `UserIdIndex` by default for new deployments. This ensures that future table creations will automatically include the required index.
+
+August 07, 2025
+testing with gpt-5 models: Azure does offer gpt-5-chat but has insufficient quota error; OpenAI offers all models but gpt-5 require removal of temperature but even after it is removed, it is not responding to extract-content call. gpt-5-chat-latest has error about tools not supported
