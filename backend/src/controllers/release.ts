@@ -8,6 +8,15 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-08-07",
+    changes: [
+      "Added support for GPT-5",
+      "- GPT-5 is now available as an advanced reasoning model",
+      "- Users can access GPT-5 by selecting openai->openai->gpt-5 model in preferred models",
+      "- GPT-5 provides the most advanced AI capabilities for strategic thinking and deep analysis",
+    ],
+  },
+  {
     date: "2025-08-01",
     changes: [
       "Added video model selection on Task Details page",
