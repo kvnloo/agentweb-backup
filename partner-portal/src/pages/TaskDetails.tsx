@@ -2975,7 +2975,7 @@ export default function TaskDetails() {
                 <Box>
                   <Typography>kling-v2.1-std (ReelMind)</Typography>
                   <Typography variant="caption" color="text.secondary">
-                    5-10s image-to-video generation
+                    5s video without audio
                   </Typography>
                 </Box>
               </MenuItem>
