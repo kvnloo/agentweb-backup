@@ -159,6 +159,8 @@ const ImagesPage: React.FC = () => {
   const [placidTemplates, setPlacidTemplates] = useState<PlacidTemplate[]>([]);
   const [selectedTemplateLayers, setSelectedTemplateLayers] = useState<{ text?: string; image?: string; logo?: string }>({});
   const [editorError, setEditorError] = useState<string | null>(null);
+  const [creatingImage, setCreatingImage] = useState(false);
+  const [generatedImageUrl, setGeneratedImageUrl] = useState<string | null>(null);
   const editorContainerRef = useRef<HTMLDivElement | null>(null);
   const editorInstanceRef = useRef<any>(null);
   // Dynamic layer values keyed by layer name -> { text?: string; image?: string }
@@ -2015,11 +2017,15 @@ const ImagesPage: React.FC = () => {
       {/* Placid Canvas Dialog */}
       <Dialog open={editorDialogOpen} onOpenChange={(open) => {
         setEditorDialogOpen(open);
-        if (!open && editorInstanceRef.current) {
-          try {
-            editorInstanceRef.current.destroy?.();
-          } catch {}
-          editorInstanceRef.current = null;
+        if (!open) {
+          // Reset generated image when dialog closes
+          setGeneratedImageUrl(null);
+          if (editorInstanceRef.current) {
+            try {
+              editorInstanceRef.current.destroy?.();
+            } catch {}
+            editorInstanceRef.current = null;
+          }
         }
       }}>
         <DialogContent className="sm:max-w-[90vw] max-h-[90vh] overflow-y-auto">
@@ -2044,6 +2050,8 @@ const ImagesPage: React.FC = () => {
                     <Label className="text-xs">Template</Label>
                     <Select value={placidTemplateUuid || ''} onValueChange={(val) => {
                       setPlacidTemplateUuid(val);
+                      // Reset generated image when template changes
+                      setGeneratedImageUrl(null);
                       const t = placidTemplates.find(pt => (pt.uuid || pt.id) === val);
                       const layers = t?.layers || [];
                       const textLayer = layers.find(l => l.type === 'text')?.name || layers.find(l => l.name === 'title')?.name;
@@ -2207,6 +2215,8 @@ const ImagesPage: React.FC = () => {
                         }
                         
                         try {
+                          setCreatingImage(true);
+                          
                           // Prepare the layers data for the backend
                           const tmpl = placidTemplates.find(pt => (pt.uuid || pt.id) === placidTemplateUuid);
                           const layers = tmpl?.layers || [];
@@ -2225,9 +2235,7 @@ const ImagesPage: React.FC = () => {
                             if (imgVal && imgVal.trim() !== '') layersData[imgLayer] = { image: imgVal };
                           }
                           
-
-                          
-                          await axios.post(
+                          const response = await axios.post(
                             buildApiUrl(`/api/tasks/${previewImage.taskId}/executions/${previewImage.executionId}/generate-from-template`),
                             { 
                               template_uuid: placidTemplateUuid,
@@ -2236,29 +2244,79 @@ const ImagesPage: React.FC = () => {
                             { headers: { Authorization: `Bearer ${token}` } }
                           );
                           
-                          toast({ title: 'Success', description: 'Generated image added to this execution.' });
-                          setEditorDialogOpen(false);
+                          // Get the generated image URL from the response
+                          const newImageUrl = response.data?.resultFile?.url;
+                          if (newImageUrl) {
+                            setGeneratedImageUrl(newImageUrl);
+                          }
                           
-                          // Refresh the execution results
+                          toast({ 
+                            title: 'Success', 
+                            description: 'Image generated successfully! You can create more images or find this one later on the Ad Images page.' 
+                          });
+                          
+                          // Refresh the execution results to get the new image
                           const task = tasksWithExecutions[previewImage.taskId];
                           if (task && task.latestPendingOrRunningExecution) {
                             await refreshExecutionResults(previewImage.taskId, task.latestPendingOrRunningExecution.executionId);
                           } else {
                             await fetchExecutionsWithImages();
                           }
+                          
                         } catch (e: any) {
                           console.error('Failed to generate from template', e);
                           toast({ title: 'Error', description: e?.response?.data?.message || 'Failed to generate image', variant: 'destructive' });
+                        } finally {
+                          setCreatingImage(false);
                         }
                       }}
-                      className="flex items-center gap-2 bg-green-600 hover:bg-green-700"
+                      disabled={creatingImage}
+                      className="flex items-center gap-2 bg-green-600 hover:bg-green-700 disabled:opacity-50"
                     >
-                      <Plus className="h-4 w-4" />
-                      Create
+                      {creatingImage ? (
+                        <>
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          Creating...
+                        </>
+                      ) : (
+                        <>
+                          <Plus className="h-4 w-4" />
+                          Create
+                        </>
+                      )}
                     </Button>
                   </div>
                 </div>
-                <div id="placid-canvas" ref={editorContainerRef} className="min-h-[70vh]" />
+                {generatedImageUrl ? (
+                  <div className="space-y-4">
+                    <div className="bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg p-4">
+                      <div className="flex items-center gap-2 mb-2">
+                        <CheckCircle className="h-5 w-5 text-green-600 dark:text-green-400" />
+                        <h3 className="font-medium text-green-800 dark:text-green-200">Image Generated Successfully!</h3>
+                      </div>
+                      <p className="text-sm text-green-700 dark:text-green-300">
+                        Your new image is ready! You can create more variations using the same template, or find this image later on the Ad Images page.
+                      </p>
+                    </div>
+                    <div className="border rounded-lg overflow-hidden bg-gray-50 dark:bg-gray-800">
+                      <img 
+                        src={generatedImageUrl} 
+                        alt="Generated image"
+                        className="w-full h-auto max-h-[60vh] object-contain"
+                        onError={() => {
+                          setGeneratedImageUrl(null);
+                          toast({ 
+                            title: 'Error', 
+                            description: 'Failed to load the generated image preview', 
+                            variant: 'destructive' 
+                          });
+                        }}
+                      />
+                    </div>
+                  </div>
+                ) : (
+                  <div id="placid-canvas" ref={editorContainerRef} className="min-h-[70vh]" />
+                )}
               </div>
             )}
           </div>
