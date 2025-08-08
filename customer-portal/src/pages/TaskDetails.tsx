@@ -107,6 +107,7 @@ interface Task {
   category?: string;
   description?: string;
   templateId?: string;
+  llmName?: string;
 }
 
 // Helper to get status badge variant (can be moved to utils)
@@ -683,6 +684,7 @@ const TaskDetailsPage: React.FC = () => {
           </div>
           <CardDescription className="text-xs text-muted-foreground">
             Task ID: {task.taskId} | Created: {formatDate(task.createdAt)}
+            {task.llmName && ` | Model: ${task.llmName}`}
           </CardDescription>
           {task.category && (
             <div className="mt-2">
@@ -907,6 +909,11 @@ const TaskDetailsPage: React.FC = () => {
                   )}
                   {exec.completedAt && (
                     <p>Completed: {formatDate(exec.completedAt)}</p>
+                  )}
+                  {exec.llmName && (
+                    <p className="text-xs mt-2">
+                      <span className="font-semibold">Model:</span> {exec.llmName}
+                    </p>
                   )}
                   {exec.status === "failed" && exec.error && (
                     <Alert variant="destructive" className="mt-2 p-2 text-xs">
