@@ -243,6 +243,7 @@ const ExecutionResultPage = () => {
               ? `Completed: ${formatDate(execution.completedAt)}`
               : `Status: ${execution?.status || "Unknown"}`}
             {executionId && ` (ID: ${executionId})`}
+            {execution?.llmName && ` | Model: ${execution.llmName}`}
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -266,11 +267,11 @@ const ExecutionResultPage = () => {
               <iframe
                 srcDoc={htmlContent}
                 title="Execution Result HTML"
-                style={{ 
-                  width: "100%", 
-                  height: "600px", 
+                style={{
+                  width: "100%",
+                  height: "600px",
                   border: "none",
-                  backgroundColor: "white"
+                  backgroundColor: "white",
                 }}
                 sandbox="allow-scripts"
               />
