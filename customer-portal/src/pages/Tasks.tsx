@@ -23,6 +23,7 @@ interface Task {
   prompt?: string;
   category?: string;
   description?: string;
+  llmName?: string;
 }
 
 const TasksPage: React.FC = () => {
