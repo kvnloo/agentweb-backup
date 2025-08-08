@@ -13,7 +13,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { Checkbox } from '@/components/ui/checkbox';
-import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink, Clock, ArrowUpRight, Play, Zap, Download, Heart, Plus, Archive, Upload, ChevronDown, X, CheckCircle, MessageSquare, AlertTriangle, RefreshCw, Send, Pencil } from 'lucide-react';
+import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink, Clock, ArrowUpRight, Play, Zap, Download, Heart, Plus, Archive, Upload, ChevronDown, X, CheckCircle, MessageSquare, AlertTriangle, RefreshCw, Send, Pencil, Eye } from 'lucide-react';
 import { format } from 'date-fns';
 import { useNavigate } from 'react-router-dom';
 import { useToast } from '@/hooks/use-toast';
@@ -146,7 +146,16 @@ const ImagesPage: React.FC = () => {
   const [placidToken, setPlacidToken] = useState<string | null>(null);
   const [placidTemplateUuid, setPlacidTemplateUuid] = useState<string | null>(null);
   interface PlacidTemplateLayer { name: string; type: string }
-  interface PlacidTemplate { uuid?: string; id?: string; name?: string; title?: string; layers?: PlacidTemplateLayer[] }
+  interface PlacidTemplate { 
+    uuid?: string; 
+    id?: string; 
+    name?: string; 
+    title?: string; 
+    layers?: PlacidTemplateLayer[];
+    thumbnail?: string;
+    width?: number;
+    height?: number;
+  }
   const [placidTemplates, setPlacidTemplates] = useState<PlacidTemplate[]>([]);
   const [selectedTemplateLayers, setSelectedTemplateLayers] = useState<{ text?: string; image?: string; logo?: string }>({});
   const [editorError, setEditorError] = useState<string | null>(null);
@@ -195,8 +204,18 @@ const ImagesPage: React.FC = () => {
   useEffect(() => {
     if (!editorDialogOpen) return;
     if (!placidToken || !placidTemplateUuid) return;
+    if (loadingEditor) return;
     const container = editorContainerRef.current;
-    if (!container) return;
+    if (!container) {
+      // Wait a bit for the DOM to be ready
+      setTimeout(() => {
+        const retryContainer = editorContainerRef.current;
+        if (retryContainer) {
+          initCanvas();
+        }
+      }, 100);
+      return;
+    }
     // Ensure SDK script exists
     const existing = document.querySelector('script[data-placid-sdk="editor"]') as HTMLScriptElement | null;
     const initCanvas = () => {
@@ -225,7 +244,9 @@ const ImagesPage: React.FC = () => {
         if (imgLayer && !prefill[imgLayer] && previewImage?.url) {
           prefill[imgLayer] = { image: previewImage.url };
         }
-        if (Object.keys(prefill).length > 0) instance.fillLayers(prefill);
+        if (Object.keys(prefill).length > 0) {
+          instance.fillLayers(prefill);
+        }
       } catch (e) {
         console.error('Failed to initialize Placid Canvas', e);
         setEditorError('Failed to initialize canvas');
@@ -244,7 +265,7 @@ const ImagesPage: React.FC = () => {
     } else {
       existing.addEventListener('load', initCanvas, { once: true });
     }
-  }, [editorDialogOpen, placidToken, placidTemplateUuid]);
+      }, [editorDialogOpen, placidToken, placidTemplateUuid, loadingEditor]);
   const refreshIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const [refreshingExecutions, setRefreshingExecutions] = useState<Set<string>>(new Set());
 
@@ -2033,6 +2054,30 @@ const ImagesPage: React.FC = () => {
                       </SelectContent>
                     </Select>
                   </div>
+                  {/* Template Thumbnail */}
+                  {placidTemplateUuid && (() => {
+                    const selectedTemplate = placidTemplates.find(pt => (pt.uuid || pt.id) === placidTemplateUuid);
+                    return selectedTemplate?.thumbnail ? (
+                      <div className="flex items-center space-x-2">
+                        <div className="w-64 h-64 border rounded overflow-hidden bg-gray-100 dark:bg-gray-800">
+                          <img 
+                            src={selectedTemplate.thumbnail} 
+                            alt={`${selectedTemplate.title || 'Template'} preview`}
+                            className="w-full h-full object-cover"
+                            onError={(e) => {
+                              const target = e.target as HTMLImageElement;
+                              target.style.display = 'none';
+                              target.parentElement!.innerHTML = '<div class="w-full h-full flex items-center justify-center text-xs text-gray-500">No preview</div>';
+                            }}
+                          />
+                        </div>
+                        <div className="text-xs text-gray-600 dark:text-gray-400">
+                          <div className="font-medium">{selectedTemplate.title || 'Template'}</div>
+                          <div>{selectedTemplate.width} × {selectedTemplate.height}</div>
+                        </div>
+                      </div>
+                    ) : null;
+                  })()}
                   {/* Dynamic inputs generated from template layers */}
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                     {(placidTemplates.find(pt => (pt.uuid || pt.id) === placidTemplateUuid)?.layers || []).map(layer => (
@@ -2062,27 +2107,111 @@ const ImagesPage: React.FC = () => {
                       </div>
                     ))}
                   </div>
-                  <div>
-                    <Button onClick={() => {
-                      try {
-                        if (!editorInstanceRef.current) return;
-                        const vals: Record<string, any> = {};
-                        Object.entries(layerValues).forEach(([name, v]) => {
-                          if (v.text && v.text.trim() !== '') vals[name] = { ...(vals[name] || {}), text: v.text };
-                          if (v.image && v.image.trim() !== '') vals[name] = { ...(vals[name] || {}), image: v.image };
-                        });
-                        // If no vals constructed, still try to prefill img with preview
-                        if (Object.keys(vals).length === 0) {
-                          const imgLayer = selectedTemplateLayers.image || 'img';
-                          if (previewImage?.url) vals[imgLayer] = { image: previewImage.url };
+                  <div className="flex gap-3">
+                    <Button 
+                      variant="outline"
+                      onClick={() => {
+                        try {
+                          if (!editorInstanceRef.current) {
+                            toast({ title: 'Error', description: 'No editor instance found', variant: 'destructive' });
+                            return;
+                          }
+                          
+                          const vals: Record<string, any> = {};
+                          // Prefer exact example mapping where possible
+                          const tmpl = placidTemplates.find(pt => (pt.uuid || pt.id) === placidTemplateUuid);
+                          const layers = tmpl?.layers || [];
+                          const imgLayer = layers.find(l => l.name === 'img')?.name || selectedTemplateLayers.image || layers.find(l => l.type === 'picture')?.name || 'img';
+                          const textLayer = layers.find(l => l.name === 'title')?.name || selectedTemplateLayers.text || layers.find(l => l.type === 'text')?.name || 'text';
+
+                          // Use user-entered values when present
+                          Object.entries(layerValues).forEach(([name, v]) => {
+                            if (v.text && v.text.trim() !== '') vals[name] = { ...(vals[name] || {}), text: v.text };
+                            if (v.image && v.image.trim() !== '') vals[name] = { ...(vals[name] || {}), image: v.image };
+                          });
+
+                          // Ensure img layer is set at minimum
+                          if (!vals[imgLayer]) {
+                            const imgVal = layerValues[imgLayer]?.image || previewImage?.url;
+                            if (imgVal && imgVal.trim() !== '') vals[imgLayer] = { image: imgVal };
+                          }
+                          // Ensure text layer is present (optional default text for quick sanity check)
+                          if (!vals[textLayer]) {
+                            const txtVal = layerValues[textLayer]?.text;
+                            if (txtVal && txtVal.trim() !== '') vals[textLayer] = { text: txtVal };
+                          }
+
+                          if (Object.keys(vals).length > 0) {
+                            editorInstanceRef.current.fillLayers(vals);
+                            toast({ title: 'Preview Updated', description: 'Template preview updated with current inputs.' });
+                          }
+                        } catch (err) {
+                          console.error('Error applying layer values:', err);
+                          toast({ title: 'Error', description: 'Failed to update preview', variant: 'destructive' });
                         }
-                        if (Object.keys(vals).length > 0) {
-                          editorInstanceRef.current.fillLayers(vals);
+                      }}
+                      className="flex items-center gap-2"
+                    >
+                      <Eye className="h-4 w-4" />
+                      Preview
+                    </Button>
+                    <Button 
+                      onClick={async () => {
+                        if (!token || !previewImage || !placidTemplateUuid) {
+                          toast({ title: 'Error', description: 'Missing required data', variant: 'destructive' });
+                          return;
                         }
-                      } catch (err) {
-                        console.error('Error applying layer values:', err);
-                      }
-                    }}>Apply</Button>
+                        
+                        try {
+                          // Prepare the layers data for the backend
+                          const tmpl = placidTemplates.find(pt => (pt.uuid || pt.id) === placidTemplateUuid);
+                          const layers = tmpl?.layers || [];
+                          const layersData: Record<string, any> = {};
+                          
+                          // Build layers object for backend
+                          Object.entries(layerValues).forEach(([name, v]) => {
+                            if (v.text && v.text.trim() !== '') layersData[name] = { text: v.text };
+                            if (v.image && v.image.trim() !== '') layersData[name] = { ...(layersData[name] || {}), image: v.image };
+                          });
+                          
+                          // Ensure img layer is set at minimum
+                          const imgLayer = layers.find(l => l.name === 'img')?.name || selectedTemplateLayers.image || layers.find(l => l.type === 'picture')?.name || 'img';
+                          if (!layersData[imgLayer]) {
+                            const imgVal = layerValues[imgLayer]?.image || previewImage?.url;
+                            if (imgVal && imgVal.trim() !== '') layersData[imgLayer] = { image: imgVal };
+                          }
+                          
+
+                          
+                          await axios.post(
+                            buildApiUrl(`/api/tasks/${previewImage.taskId}/executions/${previewImage.executionId}/generate-from-template`),
+                            { 
+                              template_uuid: placidTemplateUuid,
+                              layers: layersData
+                            },
+                            { headers: { Authorization: `Bearer ${token}` } }
+                          );
+                          
+                          toast({ title: 'Success', description: 'Generated image added to this execution.' });
+                          setEditorDialogOpen(false);
+                          
+                          // Refresh the execution results
+                          const task = tasksWithExecutions[previewImage.taskId];
+                          if (task && task.latestPendingOrRunningExecution) {
+                            await refreshExecutionResults(previewImage.taskId, task.latestPendingOrRunningExecution.executionId);
+                          } else {
+                            await fetchExecutionsWithImages();
+                          }
+                        } catch (e: any) {
+                          console.error('Failed to generate from template', e);
+                          toast({ title: 'Error', description: e?.response?.data?.message || 'Failed to generate image', variant: 'destructive' });
+                        }
+                      }}
+                      className="flex items-center gap-2 bg-green-600 hover:bg-green-700"
+                    >
+                      <Plus className="h-4 w-4" />
+                      Create
+                    </Button>
                   </div>
                 </div>
                 <div id="placid-canvas" ref={editorContainerRef} className="min-h-[70vh]" />
@@ -2091,30 +2220,6 @@ const ImagesPage: React.FC = () => {
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setEditorDialogOpen(false)}>Close</Button>
-            <Button onClick={async () => {
-              if (!token || !previewImage) return;
-              try {
-                setLoadingEditor(true);
-                await axios.post(
-                  buildApiUrl(`/api/tasks/${previewImage.taskId}/executions/${previewImage.executionId}/generate-from-template`),
-                  { template_uuid: placidTemplateUuid },
-                  { headers: { Authorization: `Bearer ${token}` } }
-                );
-                toast({ title: 'Success', description: 'Generated image added to this execution.' });
-                setEditorDialogOpen(false);
-                const task = tasksWithExecutions[previewImage.taskId];
-                if (task && task.latestPendingOrRunningExecution) {
-                  await refreshExecutionResults(previewImage.taskId, task.latestPendingOrRunningExecution.executionId);
-                } else {
-                  await fetchExecutionsWithImages();
-                }
-              } catch (e: any) {
-                console.error('Failed to generate from template', e);
-                toast({ title: 'Error', description: e?.response?.data?.message || 'Failed to generate image', variant: 'destructive' });
-              } finally {
-                setLoadingEditor(false);
-              }
-            }}>Generate & Add</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
