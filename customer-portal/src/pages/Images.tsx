@@ -2255,7 +2255,8 @@ const ImagesPage: React.FC = () => {
                             buildApiUrl(`/api/tasks/${previewImage.taskId}/executions/${previewImage.executionId}/generate-from-template`),
                             { 
                               template_uuid: placidTemplateUuid,
-                              layers: layersData
+                              layers: layersData,
+                              original_filename: previewImage.filename
                             },
                             { headers: { Authorization: `Bearer ${token}` } }
                           );

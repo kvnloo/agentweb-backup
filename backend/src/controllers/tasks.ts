@@ -1285,10 +1285,11 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
     const { id: taskId, executionId } = req.params;
-    const { template_uuid, layers, source_image_url } = req.body as {
+    const { template_uuid, layers, source_image_url, original_filename } = req.body as {
       template_uuid?: string;
       layers?: Record<string, Record<string, string>>;
       source_image_url?: string;
+      original_filename?: string;
     };
 
     const task = await taskDb.getTaskById(taskId);
@@ -1335,7 +1336,18 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
       .map((b) => b.toString(16).padStart(2, '0'))
       .join('');
 
-    const filenameBase = `placid-canvas-${Date.now()}`;
+    // Create filename based on original name and template ID
+    let baseNameWithoutExt = 'placid-generated';
+    if (original_filename) {
+      // Remove extension from original filename
+      const lastDotIndex = original_filename.lastIndexOf('.');
+      baseNameWithoutExt = lastDotIndex > 0 ? original_filename.substring(0, lastDotIndex) : original_filename;
+    }
+    
+    // Get short template ID (first 8 characters for readability)
+    const shortTemplateId = tplUuid ? tplUuid.substring(0, 8) : 'unknown';
+    
+    const filenameBase = `${baseNameWithoutExt}-placid-${shortTemplateId}`;
     const key = `tasks/${taskId}/executions/${executionId}/edits/${filenameBase}.${ext}`;
     const imageBuffer = Buffer.from(new Uint8Array(imgResp.data));
 
