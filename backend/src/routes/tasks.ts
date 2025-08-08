@@ -14,6 +14,13 @@ import AWS from 'aws-sdk';
 import { dynamodb } from '../config/aws';
 import { TABLE_PREFIX } from '../config/constants';
 
+// Initialize AWS S3
+const s3 = new AWS.S3({
+  region: process.env.AWS_REGION || 'us-west-2',
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+});
+
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
 }
@@ -1194,6 +1201,95 @@ router.post('/executions/:executionId/archive-image', authenticateToken, async (
 
   } catch (error) {
     console.error('Error archiving image:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Upload edited image
+router.post('/:taskId/upload-edited-image', authenticateToken, upload.single('file'), async (req: Request, res: Response) => {
+  try {
+    const { taskId } = req.params;
+    const { original_execution_id } = req.body;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ message: 'No file uploaded' });
+    }
+
+    // Verify task exists and user has access
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Get user to check if admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    // Verify task belongs to user or user is admin
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Get the execution
+    const execution = await taskDb.getTaskExecutionById(original_execution_id);
+    if (!execution) {
+      return res.status(404).json({ message: 'Execution not found' });
+    }
+
+    // Upload file to S3
+    const randomToken = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+
+    const key = `tasks/${taskId}/executions/${original_execution_id}/edited-images/${Date.now()}-${randomToken}-${req.file.originalname}`;
+
+    await s3
+      .putObject({
+        Bucket: process.env.AWS_S3_BUCKET || "agentweb-user-files",
+        Key: key,
+        Body: req.file.buffer,
+        ContentType: req.file.mimetype,
+      })
+      .promise();
+
+    const url = `https://${
+      process.env.AWS_S3_BUCKET || "agentweb-user-files"
+    }.s3.${process.env.AWS_REGION || "us-west-2"}.amazonaws.com/${key}`;
+
+    // Create new result file entry
+    const newResultFile = {
+      url,
+      filename: req.file.originalname,
+      token: randomToken,
+      is_html: false,
+      is_favorited: false,
+      is_archived: false
+    };
+
+    // Get current result_files and append the new file
+    const currentResultFiles = execution.result_files || [];
+    const updatedResultFiles = [...currentResultFiles, newResultFile];
+
+    // Update the execution with the new result file
+    await taskDb.updateTaskExecution(original_execution_id, {
+      result_files: updatedResultFiles
+    });
+
+    res.json({ 
+      success: true, 
+      message: 'Edited image uploaded successfully',
+      file: newResultFile
+    });
+
+  } catch (error) {
+    console.error('Error uploading edited image:', error);
     res.status(500).json({ message: 'Internal server error' });
   }
 });

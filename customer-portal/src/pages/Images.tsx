@@ -13,10 +13,11 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { Checkbox } from '@/components/ui/checkbox';
-import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink, Clock, ArrowUpRight, Play, Zap, Download, Heart, Plus, Archive, Upload, ChevronDown, X, CheckCircle, MessageSquare, AlertTriangle, RefreshCw, Send } from 'lucide-react';
+import { Loader2, Search, Filter, Calendar, Image as ImageIcon, ExternalLink, Clock, ArrowUpRight, Play, Zap, Download, Heart, Plus, Archive, Upload, ChevronDown, X, CheckCircle, MessageSquare, AlertTriangle, RefreshCw, Send, Edit, Type, Crop, Save } from 'lucide-react';
 import { format } from 'date-fns';
 import { useNavigate } from 'react-router-dom';
 import { useToast } from '@/hooks/use-toast';
+import ImageEditor from '@/components/ImageEditor';
 
 interface ResultFile {
   url: string;
@@ -155,6 +156,10 @@ const ImagesPage: React.FC = () => {
   const [submittingRevision, setSubmittingRevision] = useState(false);
   const [revisionNote, setRevisionNote] = useState('');
 
+  // Edit mode state
+  const [editMode, setEditMode] = useState(false);
+  const [brandData, setBrandData] = useState<BrandData | null>(null);
+
   // Handle escape key to close image preview
   useEffect(() => {
     const handleEscape = (event: KeyboardEvent) => {
@@ -182,7 +187,6 @@ const ImagesPage: React.FC = () => {
   // Ad Image task creation state
   const [createTaskDialogOpen, setCreateTaskDialogOpen] = useState(false);
   const [isCreatingTask, setIsCreatingTask] = useState(false);
-  const [brandData, setBrandData] = useState<BrandData | null>(null);
   const [brandAssets, setBrandAssets] = useState<BrandAsset[]>([]);
   const [marketStrategyData, setMarketStrategyData] = useState<MarketStrategyData | null>(null);
   const [selectedOptions, setSelectedOptions] = useState({
@@ -887,7 +891,52 @@ const ImagesPage: React.FC = () => {
     setRevisionModalOpen(false);
     setRevisionImage(null);
     setSelectedRevisionImage(null);
-    setRevisionNote(''); // Reset note when canceling
+    setRevisionNote('');
+  };
+
+  // Add this function to handle saving edited images
+  const handleSaveEditedImage = async (editedImageDataUrl: string) => {
+    if (!previewImage) return;
+
+    try {
+      // Convert data URL to blob
+      const response = await fetch(editedImageDataUrl);
+      const blob = await response.blob();
+      
+      // Create form data
+      const formData = new FormData();
+      formData.append('file', blob, `${previewImage.filename}_edited.png`);
+      formData.append('original_execution_id', previewImage.executionId);
+
+      // Upload edited image
+      const uploadResponse = await axios.post(
+        buildApiUrl(`/api/tasks/${previewImage.taskId}/upload-edited-image`),
+        formData,
+        {
+          headers: { 
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'multipart/form-data'
+          },
+        }
+      );
+
+      if (uploadResponse.data.success) {
+        toast({
+          title: "Success",
+          description: "Edited image saved successfully.",
+        });
+        setEditMode(false);
+        // Refresh the executions to show the new image
+        await fetchExecutionsWithImages();
+      }
+    } catch (error: any) {
+      console.error('Error saving edited image:', error);
+      toast({
+        title: "Error",
+        description: error.response?.data?.message || "Failed to save edited image.",
+        variant: "destructive",
+      });
+    }
   };
 
   // Get approval status for a specific asset
@@ -929,6 +978,28 @@ const ImagesPage: React.FC = () => {
   );
 
   const hasActiveExecutionsInView = allTasks.some(task => task.latestPendingOrRunningExecution !== null);
+
+  // Load brand data for editor
+  useEffect(() => {
+    const loadBrandData = async () => {
+      try {
+        const token = localStorage.getItem('token');
+        if (!token) return;
+
+        const response = await axios.get(buildApiUrl('/api/brand/guidelines'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        if (response.data.exists && response.data.brandData) {
+          setBrandData(response.data.brandData);
+        }
+      } catch (error) {
+        console.error('Error loading brand data:', error);
+      }
+    };
+
+    loadBrandData();
+  }, []);
 
   // Load brand guidelines and market strategy data
   const loadTaskCreationData = async () => {
@@ -1721,6 +1792,17 @@ const ImagesPage: React.FC = () => {
                   {previewImage.filename}
                 </div>
                 <div className="flex items-center gap-2">
+                  {/* Add Edit button */}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 px-3 bg-gray-800 text-white hover:bg-gray-700"
+                    onClick={() => setEditMode(true)}
+                    title="Edit Image"
+                  >
+                    <Edit className="h-4 w-4 mr-1" />
+                    Edit
+                  </Button>
                   <Button
                     variant="ghost"
                     size="sm"
@@ -1737,6 +1819,7 @@ const ImagesPage: React.FC = () => {
                     onClick={() => {
                       setImagePreviewOpen(false);
                       setRevisionPrompt('');
+                      setEditMode(false);
                     }}
                     title="Close"
                   >
@@ -1745,57 +1828,68 @@ const ImagesPage: React.FC = () => {
                 </div>
               </div>
 
-              {/* Main content area - side by side */}
+              {/* Main content area */}
               <div className="flex">
-                {/* Image - Left side */}
+                {/* Image/Editor - Left side */}
                 <div className="flex-1 bg-black p-4">
-                  <img
-                    src={previewImage.url}
-                    alt={previewImage.filename}
-                    className="w-full h-auto"
-                    onError={(e) => {
-                      const target = e.target as HTMLImageElement;
-                      target.src = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjAwIiBoZWlnaHQ9IjIwMCIgdmlld0JveD0iMCAwIDIwMCAyMDAiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CjxyZWN0IHdpZHRoPSIyMDAiIGhlaWdodD0iMjAwIiBmaWxsPSIjRjNGNEY2Ii8+CjxwYXRoIGQ9Ik02MCAxMDBDNjAgODguOTU0MyA2OC45NTQzIDgwIDgwIDgwQzkxLjA0NTcgODAgMTAwIDg4Ljk1NDMgMTAwIDEwMEMxMDAgMTExLjA0NiA5MS4wNDU3IDEyMCA4MCAxMjBDNjguOTU0MyAxMjAgNjAgMTExLjA0NiA2MCAxMDBaIiBmaWxsPSIjOUI5QkEwIi8+CjxwYXRoIGQ9Ik04MCAxNDBDNjguOTU0MyAxNDAgNjAgMTMxLjA0NiA2MCAxMjBMMTAwIDEyMEMxMDAgMTMxLjA0NiA5MS4wNDU3IDE0MCA4MCAxNDBaIiBmaWxsPSIjOUI5QkEwIi8+Cjwvc3ZnPgo=';
-                    }}
-                  />
+                  {editMode ? (
+                    <ImageEditor 
+                      imageUrl={previewImage.url}
+                      brandData={brandData}
+                      onSave={handleSaveEditedImage}
+                      onCancel={() => setEditMode(false)}
+                    />
+                  ) : (
+                    <img
+                      src={previewImage.url}
+                      alt={previewImage.filename}
+                      className="w-full h-auto"
+                      onError={(e) => {
+                        const target = e.target as HTMLImageElement;
+                        target.src = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjAwIiBoZWlnaHQ9IjIwMCIgdmlld0JveD0iMCAwIDIwMCAyMDAiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CjxyZWN0IHdpZHRoPSIyMDAiIGhlaWdodD0iMjAwIiBmaWxsPSIjRjNGNEY2Ii8+CjxwYXRoIGQ9Ik02MCAxMDBDNjAgODguOTU0MyA2OC45NTQzIDgwIDgwIDgwQzkxLjA0NTcgODAgMTAwIDg4Ljk1NDMgMTAwIDEwMEMxMDAgMTExLjA0NiA5MS4wNDU3IDEyMCA4MCAxMjBDNjguOTU0MyAxMjAgNjAgMTExLjA0NiA2MCAxMDBaIiBmaWxsPSIjOUI5QkEwIi8+CjxwYXRoIGQ9Ik04MCAxNDBDNjguOTU0MyAxNDAgNjAgMTMxLjA0NiA2MCAxMjBMMTAwIDEyMEMxMDAgMTMxLjA0NiA5MS4wNDU3IDE0MCA4MCAxNDBaIiBmaWxsPSIjOUI5QkEwIi8+Cjwvc3ZnPgo=';
+                      }}
+                    />
+                  )}
                 </div>
 
-                {/* Revision Prompt Section - Right side */}
-                <div className="w-80 bg-gray-900 border-l border-gray-600 p-4 flex flex-col">
-                  <div className="flex-1">
-                    <Label htmlFor="revisionPrompt" className="text-white text-sm font-medium mb-3 block">
-                      Image Revision Prompt
-                    </Label>
-                    <Textarea
-                      id="revisionPrompt"
-                      placeholder="Describe how you'd like to revise this image (e.g., 'Make it more vibrant', 'Change the background to blue', 'Add more details')"
-                      value={revisionPrompt}
-                      onChange={(e) => setRevisionPrompt(e.target.value)}
-                      className="min-h-[120px] bg-gray-800 border-gray-600 text-white placeholder-gray-400 resize-none mb-4 w-full"
-                      onClick={(e) => e.stopPropagation()}
-                    />
-                    <Button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleSubmitRevision();
-                      }}
-                      disabled={!revisionPrompt.trim() || isSubmittingRevision}
-                      className="w-full bg-blue-600 hover:bg-blue-700 text-white py-2"
-                    >
-                      {isSubmittingRevision ? (
-                        <>
-                          <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                          Submitting...
-                        </>
-                      ) : (
-                        <>
-                          <Zap className="h-4 w-4 mr-2" />
-                          Submit Revision
-                        </>
-                      )}
-                    </Button>
+                {/* Revision Prompt Section - Right side (only show when not in edit mode) */}
+                {!editMode && (
+                  <div className="w-80 bg-gray-900 border-l border-gray-600 p-4 flex flex-col">
+                    <div className="flex-1">
+                      <Label htmlFor="revisionPrompt" className="text-white text-sm font-medium mb-3 block">
+                        Image Revision Prompt
+                      </Label>
+                      <Textarea
+                        id="revisionPrompt"
+                        placeholder="Describe how you'd like to revise this image (e.g., 'Make it more vibrant', 'Change the background to blue', 'Add more details')"
+                        value={revisionPrompt}
+                        onChange={(e) => setRevisionPrompt(e.target.value)}
+                        className="min-h-[120px] bg-gray-800 border-gray-600 text-white placeholder-gray-400 resize-none mb-4 w-full"
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                      <Button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleSubmitRevision();
+                        }}
+                        disabled={!revisionPrompt.trim() || isSubmittingRevision}
+                        className="w-full bg-blue-600 hover:bg-blue-700 text-white py-2"
+                      >
+                        {isSubmittingRevision ? (
+                          <>
+                            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                            Submitting...
+                          </>
+                        ) : (
+                          <>
+                            <Zap className="h-4 w-4 mr-2" />
+                            Submit Revision
+                          </>
+                        )}
+                      </Button>
+                    </div>
                   </div>
-                </div>
+                )}
               </div>
             </div>
           )}
