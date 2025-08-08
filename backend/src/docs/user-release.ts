@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-08-08',
+    changes: [
+      'Display preferred LLM and LLM for the task and executions',
+      '- Task details now show the preferred LLM model in the task header',
+      '- Execution history displays the LLM model used for each execution',
+    ],
+  },
+  {
     date: '2025-08-07',
     changes: [
       'Added Kling models for video generation',

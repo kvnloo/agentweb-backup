@@ -397,7 +397,7 @@ VITE_DEBUG=false \
 npm run build && \
 VERSION="0.21" && \
 mkdir -p builds && \
-zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json
+zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json server.js
 ```
 
 2. Create a new application in Elastic Beanstalk:
