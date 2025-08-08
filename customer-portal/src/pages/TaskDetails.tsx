@@ -684,8 +684,14 @@ const TaskDetailsPage: React.FC = () => {
           </div>
           <CardDescription className="text-xs text-muted-foreground">
             Task ID: {task.taskId} | Created: {formatDate(task.createdAt)}
-            {task.llmName && ` | Model: ${task.llmName}`}
           </CardDescription>
+          {task.llmName && (
+            <div className="mt-2">
+              <Badge variant="outline" className="text-xs">
+                Preferred LLM: {task.llmName}
+              </Badge>
+            </div>
+          )}
           {task.category && (
             <div className="mt-2">
               <Badge variant="secondary">
@@ -912,7 +918,7 @@ const TaskDetailsPage: React.FC = () => {
                   )}
                   {exec.llmName && (
                     <p className="text-xs mt-2">
-                      <span className="font-semibold">Model:</span> {exec.llmName}
+                      <span className="font-semibold">LLM:</span> {exec.llmName}
                     </p>
                   )}
                   {exec.status === "failed" && exec.error && (
