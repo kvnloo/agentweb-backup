@@ -394,12 +394,10 @@ Note: Environment variables must be set during build time for the frontend, as V
 cd customer-portal && \
 VITE_API_URL=https://api.agentweb.pro \
 VITE_DEBUG=false \
-VITE_LIST_FULL_LLM_NAMES="azure->openai->gpt-4.1,google->google->gemini-2.5-pro-preview-05-06,azure->openai->gpt-4o,aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0,openai->openai->gpt-4o,aws->anthropic->us.anthropic.claude-3-7-sonnet-20250219-v1:0,google->google->gemini-2.5-flash,google->google->gemini-2.5-flash-lite,openai->openai->gpt-5" \
-VITE_DEEP_RESEARCH_LLM_NAMES="azure->openai->o1-mini,azure->openai->gpt-4o" \
 npm run build && \
 VERSION="0.21" && \
 mkdir -p builds && \
-zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json
+zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json server.js
 ```
 
 2. Create a new application in Elastic Beanstalk:
