@@ -1,5 +1,5 @@
 import express, { Request, RequestHandler, Response } from 'express';
-import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction, getTaskExecution, getExecutionLog, generateShareToken, getExecutionWithToken, sendExecutionEmail, uploadFileToExecution } from '../controllers/tasks';
+import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction, getTaskExecution, getExecutionLog, generateShareToken, getExecutionWithToken, sendExecutionEmail, uploadFileToExecution, getPlacidEditorToken, generateFromTemplateToExecution, listPlacidTemplates } from '../controllers/tasks';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { taskDb, subscriberDb } from '../services/db';
 import multer from 'multer';
@@ -140,6 +140,15 @@ router.post('/:id/executions/revision', authenticateToken, async (req: Request, 
     res.status(500).json({ message: 'Error creating revision execution' });
   }
 });
+
+// Placid Editor SDK token
+router.get('/:id/placid/editor-token', authenticateToken, getPlacidEditorToken);
+
+// Generate image from a template (after editor save/test), add to execution
+router.post('/:id/executions/:executionId/generate-from-template', authenticateToken, generateFromTemplateToExecution);
+
+// List Placid templates (for selection)
+router.get('/:id/placid/templates', authenticateToken, listPlacidTemplates);
 
 // Kill execution
 router.put('/:taskId/executions/:executionId/kill', authenticateToken, async (req: Request, res: Response) => {

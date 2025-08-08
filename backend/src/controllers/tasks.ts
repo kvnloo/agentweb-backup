@@ -6,6 +6,8 @@ import AWS from 'aws-sdk';
 import { taskTemplateDb } from '../services/db';
 import crypto from 'crypto';
 import { S3 } from 'aws-sdk';
+import axios from 'axios';
+import jwt from 'jsonwebtoken';
 
 const s3 = new S3();
 
@@ -1221,3 +1223,180 @@ export const uploadFileToExecution = async (req: AuthRequest, res: Response) => 
     res.status(500).json({ message: 'Error uploading file' });
   }
 }; 
+
+
+export const getPlacidEditorToken = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const privateToken = process.env.PLACID_PRIVATE_TOKEN;
+    const templateUuid = (req.query?.template_uuid as string) || (req.body as any)?.template_uuid || process.env.PLACID_TEMPLATE_UUID_AD_IMAGE;
+    if (!privateToken) {
+      return res.status(500).json({ message: 'PLACID_PRIVATE_TOKEN must be set' });
+    }
+
+    // Allow optional overrides via query/body if needed later
+    const expSeconds = Math.floor(Date.now() / 1000) + 5 * 60; // default 5 minutes
+    const defaultScopes: string[] = [];
+    if (templateUuid) {
+      // Canvas needs read access to the selected template
+      defaultScopes.push(`template:${templateUuid}:read`);
+    }
+    const payload = {
+      exp: expSeconds,
+      scopes: (req.body && Array.isArray((req.body as any).scopes)) ? (req.body as any).scopes : defaultScopes,
+      editor_options: (req.body && (req.body as any).editor_options) ? (req.body as any).editor_options : {
+        enableCanvasResizing: true,
+        enableCanvasTransparency: true,
+        enableTemplateRenaming: false,
+        enableButtonSave: false,
+        enableButtonSaveAndClose: false,
+        editorMode: 'inline',
+      },
+    } as any;
+
+    const resp = await axios.post<{ access_token?: string }>(
+      'https://api.placid.app/api/editor/accesstokens',
+      payload,
+      {
+        headers: {
+          Authorization: `Bearer ${privateToken}`,
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+
+    const accessToken = resp.data && (resp.data as any).access_token;
+    if (!accessToken) {
+      return res.status(502).json({ message: 'Failed to obtain Placid editor token' });
+    }
+
+    return res.json({ token: accessToken });
+  } catch (err: any) {
+    console.error('Error issuing Placid editor token:', err?.message || err);
+    return res.status(500).json({ message: 'Error issuing Placid editor token' });
+  }
+};
+
+export const generateFromTemplateToExecution = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { id: taskId, executionId } = req.params;
+    const { template_uuid, layers, source_image_url } = req.body as {
+      template_uuid?: string;
+      layers?: Record<string, Record<string, string>>;
+      source_image_url?: string;
+    };
+
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) return res.status(404).json({ message: 'Task not found' });
+    const user = await userDb.getUserById(userId);
+    if (!user) return res.status(401).json({ message: 'User not found' });
+    if (!user.isAdmin && task.userId !== userId) return res.status(403).json({ message: 'Access denied' });
+
+    const execution = await taskDb.getTaskExecutionById(executionId);
+    if (!execution || execution.taskId !== taskId) return res.status(404).json({ message: 'Execution not found' });
+
+    const tplUuid = template_uuid || process.env.PLACID_TEMPLATE_UUID_AD_IMAGE;
+    if (!tplUuid) return res.status(400).json({ message: 'template_uuid is required' });
+
+    const base = process.env.PLACID_URL_API_BASE || 'https://api.placid.app/u';
+    const params = new URLSearchParams();
+    // Map provided layers -> URL API notation
+    if (layers && typeof layers === 'object') {
+      for (const [layerName, props] of Object.entries(layers)) {
+        if (!props || typeof props !== 'object') continue;
+        for (const [propName, value] of Object.entries(props)) {
+          if (value === undefined || value === null) continue;
+          params.set(`${layerName}[${propName}]`, String(value));
+        }
+      }
+    }
+    // Optional convenience mapping for source image
+    if (source_image_url && !params.has('image[image]')) {
+      params.set('image[image]', source_image_url);
+    }
+    const placidImageUrl = `${base}/${tplUuid}${params.toString() ? `?${params.toString()}` : ''}`;
+
+    const imgResp = await axios.get<ArrayBuffer>(placidImageUrl, { responseType: 'arraybuffer' as const });
+    const contentType = (imgResp.headers['content-type'] as string) || 'image/png';
+    const ext = contentType.includes('jpeg')
+      ? 'jpg'
+      : contentType.includes('png')
+      ? 'png'
+      : contentType.includes('webp')
+      ? 'webp'
+      : 'png';
+
+    const randomToken = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+
+    const filenameBase = `placid-canvas-${Date.now()}`;
+    const key = `tasks/${taskId}/executions/${executionId}/edits/${filenameBase}.${ext}`;
+    const imageBuffer = Buffer.from(new Uint8Array(imgResp.data));
+
+    await s3
+      .putObject({
+        Bucket: process.env.AWS_S3_BUCKET || 'agentweb-user-files',
+        Key: key,
+        Body: imageBuffer,
+        ContentType: contentType,
+      })
+      .promise();
+
+    const url = `https://${
+      process.env.AWS_S3_BUCKET || 'agentweb-user-files'
+    }.s3.${process.env.AWS_REGION || 'us-west-2'}.amazonaws.com/${key}`;
+
+    const newResultFile = {
+      url,
+      filename: `${filenameBase}.${ext}`,
+      token: randomToken,
+      is_html: false,
+    };
+
+    const current = execution.result_files || [];
+    const updated = [...current, newResultFile];
+    await taskDb.updateTaskExecution(executionId, { result_files: updated });
+
+    return res.status(200).json({ message: 'Generated image from template', resultFile: newResultFile });
+  } catch (err: any) {
+    console.error('Error in generateFromTemplateToExecution:', err?.message || err);
+    return res.status(500).json({ message: 'Error generating image' });
+  }
+};
+
+export const listPlacidTemplates = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const privateToken = process.env.PLACID_PRIVATE_TOKEN;
+    if (!privateToken) return res.status(500).json({ message: 'PLACID_PRIVATE_TOKEN must be set' });
+
+    const { page, per_page, collection_id } = req.query as {
+      page?: string;
+      per_page?: string;
+      collection_id?: string;
+    };
+
+    const params: Record<string, string> = {};
+    if (page) params.page = page;
+    if (per_page) params.per_page = per_page;
+    if (collection_id) params.collection_id = collection_id;
+
+    const resp = await axios.get('https://api.placid.app/api/rest/templates', {
+      headers: { Authorization: `Bearer ${privateToken}` },
+      params,
+    });
+
+    return res.json(resp.data);
+  } catch (err: any) {
+    console.error('Error listing Placid templates:', err?.response?.data || err?.message || err);
+    return res.status(500).json({ message: 'Error listing templates' });
+  }
+};
