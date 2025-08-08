@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-08-09',
+    changes: [
+      'Added image editing feature with Placid integration',
+      '- Edit button added to image preview windows on Ad Images page',
+      '- Template-based image generation with live preview',
+      '- Automatic logo selection from brand guidelines',
+    ],
+  },
+  {
     date: '2025-08-08',
     changes: [
       'Display preferred LLM and LLM for the task and executions',
