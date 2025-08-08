@@ -16,6 +16,7 @@ export interface TaskExecution {
   prompt?: string;
   result?: string;
   details?: string;
+  llmName?: string;
 }
 
 interface ExecutionHistoryProps {
@@ -57,6 +58,7 @@ export const ExecutionHistory: React.FC<ExecutionHistoryProps> = ({
                   <TableHead>Status</TableHead>
                   <TableHead>Started</TableHead>
                   <TableHead>Completed</TableHead>
+                  <TableHead>LLM</TableHead>
                   <TableHead>Result</TableHead>
                 </TableRow>
               </TableHeader>
@@ -70,6 +72,11 @@ export const ExecutionHistory: React.FC<ExecutionHistoryProps> = ({
                     <TableCell>{getStatusBadge(execution.status)}</TableCell>
                     <TableCell>{formatDate(execution.startedAt)}</TableCell>
                     <TableCell>{formatDate(execution.completedAt)}</TableCell>
+                    <TableCell>
+                      <div className="text-xs">
+                        {execution.llmName || "N/A"}
+                      </div>
+                    </TableCell>
                     <TableCell>
                       <div className="max-w-xs truncate">
                         {execution.result || "No result data"}
@@ -94,6 +101,14 @@ export const ExecutionHistory: React.FC<ExecutionHistoryProps> = ({
                 </div>
                 
                 <div className="space-y-4">
+                  {selectedExecution.llmName && (
+                    <div>
+                      <Label className="block mb-1">LLM</Label>
+                      <div className="bg-muted p-3 rounded-md text-sm">
+                        {selectedExecution.llmName}
+                      </div>
+                    </div>
+                  )}
                   <div>
                     <Label className="block mb-1">Prompt</Label>
                     <div className="bg-muted p-3 rounded-md text-sm">

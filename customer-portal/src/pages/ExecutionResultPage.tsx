@@ -156,7 +156,7 @@ const ExecutionResultPage = () => {
               { responseType: "text" }
             );
             // Get the raw HTML content
-            let rawHtml = fileContentResponse.data;
+            const rawHtml = fileContentResponse.data;
 
             setHtmlContent(rawHtml);
 
