@@ -1853,11 +1853,27 @@ const ImagesPage: React.FC = () => {
                         const tpls = await axios.get(buildApiUrl(`/api/tasks/${previewImage.taskId}/placid/templates`), {
                           headers: { Authorization: `Bearer ${token}` },
                         });
-                        const items: PlacidTemplate[] = Array.isArray(tpls.data?.data) ? tpls.data.data : (tpls.data?.items || tpls.data?.data?.items || []);
-                        setPlacidTemplates(items);
+                        const allItems: PlacidTemplate[] = Array.isArray(tpls.data?.data) ? tpls.data.data : (tpls.data?.items || tpls.data?.data?.items || []);
+                        
+                        // Filter templates based on environment
+                        const isDev = import.meta.env.DEV || import.meta.env.VITE_API_URL?.includes('localhost');
+                        const envPrefix = isDev ? 'Dev -' : 'Prod -';
+                        const filteredItems = allItems
+                          .filter(item => {
+                            const title = item.title || item.name || '';
+                            return title.startsWith(envPrefix);
+                          })
+                          .map(item => ({
+                            ...item,
+                            // Strip the environment prefix for display
+                            title: item.title?.startsWith(envPrefix) ? item.title.substring(envPrefix.length).trim() : item.title,
+                            name: item.name?.startsWith(envPrefix) ? item.name.substring(envPrefix.length).trim() : item.name
+                          }));
+                        
+                        setPlacidTemplates(filteredItems);
                         // Preselect first if none selected yet and compute layer names
                         if (!placidTemplateUuid) {
-                          const first = items[0];
+                          const first = filteredItems[0];
                           const firstId = (first?.uuid || first?.id) as string | undefined;
                           if (firstId) {
                             setPlacidTemplateUuid(firstId);
@@ -1893,10 +1909,10 @@ const ImagesPage: React.FC = () => {
                               return next;
                             });
                           } else {
-                            setEditorError('No Placid templates found. Please configure a template.');
+                            setEditorError(`No Placid templates found for ${isDev ? 'development' : 'production'} environment. Please configure templates with "${envPrefix}" prefix.`);
                           }
                         } else {
-                          const current = items.find(t => (t.uuid || t.id) === placidTemplateUuid);
+                          const current = filteredItems.find(t => (t.uuid || t.id) === placidTemplateUuid);
                           const layers = current?.layers || [];
                           const textLayer = layers.find(l => l.type === 'text')?.name || layers.find(l => l.name === 'title')?.name;
                           const imageLayer = layers.find(l => l.name === 'img')?.name || layers.find(l => l.type === 'picture')?.name;
