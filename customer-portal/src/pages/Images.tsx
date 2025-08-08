@@ -1837,6 +1837,12 @@ const ImagesPage: React.FC = () => {
                       if (!token || !previewImage) return;
                       try {
                         setLoadingEditor(true);
+                        
+                        // Load brand data if not already loaded
+                        if (brandAssets.length === 0) {
+                          await loadTaskCreationData();
+                        }
+                        
                         const resp = await axios.get(buildApiUrl(`/api/tasks/${previewImage.taskId}/placid/editor-token`), {
                           headers: { Authorization: `Bearer ${token}` },
                         });
@@ -1871,6 +1877,12 @@ const ImagesPage: React.FC = () => {
                                   // Only prefill 'img' from preview image if not already set
                                   if (layer.name === 'img' && !next[layer.name].image && previewImage?.url) {
                                     next[layer.name].image = previewImage.url;
+                                  } else if (layer.name === 'logo' && !next[layer.name].image && brandAssets?.length > 0) {
+                                    // Auto-fill logo field with brand logo if available
+                                    const logoAssets = brandAssets.filter(asset => asset.type === 'logo' || asset.type === 'secondaryLogo');
+                                    if (logoAssets.length > 0) {
+                                      next[layer.name].image = logoAssets[0].url;
+                                    }
                                   } else if (next[layer.name].image === undefined) {
                                     next[layer.name].image = '';
                                   }
@@ -1900,6 +1912,12 @@ const ImagesPage: React.FC = () => {
                                 if (!next[layer.name]) next[layer.name] = {};
                                 if (layer.name === 'img' && !next[layer.name].image && previewImage?.url) {
                                   next[layer.name].image = previewImage.url;
+                                } else if (layer.name === 'logo' && !next[layer.name].image && brandAssets?.length > 0) {
+                                  // Auto-fill logo field with brand logo if available
+                                  const logoAssets = brandAssets.filter(asset => asset.type === 'logo' || asset.type === 'secondaryLogo');
+                                  if (logoAssets.length > 0) {
+                                    next[layer.name].image = logoAssets[0].url;
+                                  }
                                 } else if (next[layer.name].image === undefined) {
                                   next[layer.name].image = '';
                                 }
@@ -2007,7 +2025,7 @@ const ImagesPage: React.FC = () => {
         <DialogContent className="sm:max-w-[90vw] max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Template Preview</DialogTitle>
-            <DialogDescription>Live canvas preview with your values.</DialogDescription>
+            <DialogDescription>Select a template to create your ad image.</DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
             {editorError && (
@@ -2035,8 +2053,20 @@ const ImagesPage: React.FC = () => {
                       // Seed layerValues with keys for inputs below
                       const initial: Record<string, { text?: string; image?: string }> = {};
                       layers.forEach(layer => {
-                        if (layer.type === 'text') initial[layer.name] = { text: layerValues[layer.name]?.text || '' };
-                        if (layer.type === 'picture') initial[layer.name] = { image: layerValues[layer.name]?.image || '' };
+                        if (layer.type === 'text') {
+                          initial[layer.name] = { text: layerValues[layer.name]?.text || '' };
+                        }
+                        if (layer.type === 'picture') {
+                          let defaultImage = layerValues[layer.name]?.image || '';
+                          // Auto-fill logo field with brand logo if available
+                          if (layer.name === 'logo' && !defaultImage && brandAssets?.length > 0) {
+                            const logoAssets = brandAssets.filter(asset => asset.type === 'logo' || asset.type === 'secondaryLogo');
+                            if (logoAssets.length > 0) {
+                              defaultImage = logoAssets[0].url;
+                            }
+                          }
+                          initial[layer.name] = { image: defaultImage };
+                        }
                       });
                       setLayerValues(prev => ({ ...initial, ...prev }));
                     }}>
@@ -2093,14 +2123,75 @@ const ImagesPage: React.FC = () => {
                             }))}
                           />
                         ) : layer.type === 'picture' ? (
-                          <Input
-                            placeholder="https://..."
-                            value={layerValues[layer.name]?.image || (layer.name === 'img' ? (previewImage?.url || '') : '')}
-                            onChange={(e) => setLayerValues(prev => ({
-                              ...prev,
-                              [layer.name]: { ...(prev[layer.name] || {}), image: e.target.value }
-                            }))}
-                          />
+                          layer.name === 'logo' ? (
+                            // Logo selection with thumbnails
+                            (() => {
+                              const logoAssets = brandAssets?.filter(asset => asset.type === 'logo' || asset.type === 'secondaryLogo') || [];
+                              const selectedLogoUrl = layerValues[layer.name]?.image || '';
+                              const selectedLogo = logoAssets.find(asset => asset.url === selectedLogoUrl);
+                              
+                              if (logoAssets.length === 0) {
+                                return (
+                                  <div className="space-y-2">
+                                    <div className="text-xs text-orange-600 dark:text-orange-400 bg-orange-50 dark:bg-orange-900/20 p-2 rounded border">
+                                      No logos found. Please configure logos in Brand Guidelines page.
+                                    </div>
+                                  </div>
+                                );
+                              }
+                              
+                              return (
+                                <div className="space-y-2">
+                                  <Select 
+                                    value={selectedLogoUrl} 
+                                    onValueChange={(value) => setLayerValues(prev => ({
+                                      ...prev,
+                                      [layer.name]: { ...(prev[layer.name] || {}), image: value }
+                                    }))}
+                                  >
+                                    <SelectTrigger>
+                                      <SelectValue placeholder="Select a logo" />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                      {logoAssets.map((asset, idx) => (
+                                        <SelectItem key={asset.url || idx} value={asset.url}>
+                                          {asset.filename || asset.url.split('/').pop() || `Logo ${idx + 1}`}
+                                        </SelectItem>
+                                      ))}
+                                    </SelectContent>
+                                  </Select>
+                                  {selectedLogo && (
+                                    <div className="flex items-center space-x-2 p-2 bg-gray-50 dark:bg-gray-800 rounded border">
+                                      <div className="w-12 h-12 border rounded overflow-hidden bg-white">
+                                        <img 
+                                          src={selectedLogo.url} 
+                                          alt="Selected logo"
+                                          className="w-full h-full object-contain"
+                                          onError={(e) => {
+                                            const target = e.target as HTMLImageElement;
+                                            target.style.display = 'none';
+                                            target.parentElement!.innerHTML = '<div class="w-full h-full flex items-center justify-center text-xs text-gray-500">Error</div>';
+                                          }}
+                                        />
+                                      </div>
+                                      <div className="text-xs text-gray-600 dark:text-gray-400">
+                                        <div className="font-medium">{selectedLogo.filename || 'Selected Logo'}</div>
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })()
+                          ) : (
+                            <Input
+                              placeholder="https://..."
+                              value={layerValues[layer.name]?.image || (layer.name === 'img' ? (previewImage?.url || '') : '')}
+                              onChange={(e) => setLayerValues(prev => ({
+                                ...prev,
+                                [layer.name]: { ...(prev[layer.name] || {}), image: e.target.value }
+                              }))}
+                            />
+                          )
                         ) : (
                           <div className="text-xs text-gray-500">Unsupported layer type</div>
                         )}
@@ -2108,53 +2199,6 @@ const ImagesPage: React.FC = () => {
                     ))}
                   </div>
                   <div className="flex gap-3">
-                    <Button 
-                      variant="outline"
-                      onClick={() => {
-                        try {
-                          if (!editorInstanceRef.current) {
-                            toast({ title: 'Error', description: 'No editor instance found', variant: 'destructive' });
-                            return;
-                          }
-                          
-                          const vals: Record<string, any> = {};
-                          // Prefer exact example mapping where possible
-                          const tmpl = placidTemplates.find(pt => (pt.uuid || pt.id) === placidTemplateUuid);
-                          const layers = tmpl?.layers || [];
-                          const imgLayer = layers.find(l => l.name === 'img')?.name || selectedTemplateLayers.image || layers.find(l => l.type === 'picture')?.name || 'img';
-                          const textLayer = layers.find(l => l.name === 'title')?.name || selectedTemplateLayers.text || layers.find(l => l.type === 'text')?.name || 'text';
-
-                          // Use user-entered values when present
-                          Object.entries(layerValues).forEach(([name, v]) => {
-                            if (v.text && v.text.trim() !== '') vals[name] = { ...(vals[name] || {}), text: v.text };
-                            if (v.image && v.image.trim() !== '') vals[name] = { ...(vals[name] || {}), image: v.image };
-                          });
-
-                          // Ensure img layer is set at minimum
-                          if (!vals[imgLayer]) {
-                            const imgVal = layerValues[imgLayer]?.image || previewImage?.url;
-                            if (imgVal && imgVal.trim() !== '') vals[imgLayer] = { image: imgVal };
-                          }
-                          // Ensure text layer is present (optional default text for quick sanity check)
-                          if (!vals[textLayer]) {
-                            const txtVal = layerValues[textLayer]?.text;
-                            if (txtVal && txtVal.trim() !== '') vals[textLayer] = { text: txtVal };
-                          }
-
-                          if (Object.keys(vals).length > 0) {
-                            editorInstanceRef.current.fillLayers(vals);
-                            toast({ title: 'Preview Updated', description: 'Template preview updated with current inputs.' });
-                          }
-                        } catch (err) {
-                          console.error('Error applying layer values:', err);
-                          toast({ title: 'Error', description: 'Failed to update preview', variant: 'destructive' });
-                        }
-                      }}
-                      className="flex items-center gap-2"
-                    >
-                      <Eye className="h-4 w-4" />
-                      Preview
-                    </Button>
                     <Button 
                       onClick={async () => {
                         if (!token || !previewImage || !placidTemplateUuid) {
