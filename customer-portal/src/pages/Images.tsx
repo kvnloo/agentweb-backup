@@ -208,11 +208,28 @@ const ImagesPage: React.FC = () => {
 
   // Simple preview system - load SDK and create preview when template changes
   useEffect(() => {
-    if (!placidToken || !placidTemplateUuid || !previewContainerRef.current) return;
+    if (!placidToken || !placidTemplateUuid) return;
     
     const loadSDKAndCreatePreview = async () => {
       try {
         setPreviewLoading(true);
+        
+        // Wait for container to be ready in DOM
+        let container = previewContainerRef.current;
+        if (!container) {
+          // Wait a bit for the DOM to be ready
+          await new Promise<void>((resolve) => {
+            const checkContainer = () => {
+              container = previewContainerRef.current;
+              if (container) {
+                resolve();
+              } else {
+                setTimeout(checkContainer, 50);
+              }
+            };
+            checkContainer();
+          });
+        }
         
         // Load SDK if not already loaded
         if (!(window as any).EditorSDK) {
@@ -234,12 +251,12 @@ const ImagesPage: React.FC = () => {
         }
         
         // Clear container
-        if (previewContainerRef.current) {
-          previewContainerRef.current.innerHTML = '';
+        if (container) {
+          container.innerHTML = '';
         }
         
         // Create new preview
-        const instance = (window as any).EditorSDK.canvas.create(previewContainerRef.current, {
+        const instance = (window as any).EditorSDK.canvas.create(container, {
           access_token: placidToken,
           template_uuid: placidTemplateUuid,
         });
@@ -1864,6 +1881,10 @@ const ImagesPage: React.FC = () => {
                     onClick={async () => {
                       setEditorError(null);
                       setEditorDialogOpen(true);
+                      
+                      // Small delay to ensure dialog is fully rendered
+                      await new Promise(resolve => setTimeout(resolve, 100));
+                      
                       if (!token || !previewImage) return;
                       try {
                         setPreviewLoading(true);
