@@ -274,11 +274,14 @@ const ImagesPage: React.FC = () => {
   }, [placidToken, placidTemplateUuid]);
 
   // Function to update preview when layer values change
-  const updatePreview = () => {
+  const updatePreview = (newLayerValues?: Record<string, { text?: string; image?: string }>) => {
     if (!previewInstanceRef.current) return;
     
+    // Use the passed values or fall back to current state
+    const valuesToUse = newLayerValues || layerValues;
+    
     const prefill: Record<string, any> = {};
-    Object.entries(layerValues).forEach(([layerName, v]) => {
+    Object.entries(valuesToUse).forEach(([layerName, v]) => {
       if (v.text) prefill[layerName] = { text: v.text };
       if (v.image) prefill[layerName] = { image: v.image };
     });
@@ -2197,12 +2200,16 @@ const ImagesPage: React.FC = () => {
                             placeholder="Enter text"
                             value={layerValues[layer.name]?.text || ''}
                             onChange={(e) => {
-                              setLayerValues(prev => ({
-                                ...prev,
-                                [layer.name]: { ...(prev[layer.name] || {}), text: e.target.value }
-                              }));
-                              // Update preview with new values
-                              setTimeout(updatePreview, 100);
+                              const newValue = e.target.value;
+                              const newLayerValues = {
+                                ...layerValues,
+                                [layer.name]: { ...(layerValues[layer.name] || {}), text: newValue }
+                              };
+                              
+                              setLayerValues(newLayerValues);
+                              
+                              // Update preview immediately with new values
+                              updatePreview(newLayerValues);
                             }}
                           />
                         ) : layer.type === 'picture' ? (
@@ -2228,12 +2235,15 @@ const ImagesPage: React.FC = () => {
                                   <Select 
                                     value={selectedLogoUrl} 
                                     onValueChange={(value) => {
-                                      setLayerValues(prev => ({
-                                        ...prev,
-                                        [layer.name]: { ...(prev[layer.name] || {}), image: value }
-                                      }));
-                                      // Update preview with new values
-                                      setTimeout(updatePreview, 100);
+                                      const newLayerValues = {
+                                        ...layerValues,
+                                        [layer.name]: { ...(layerValues[layer.name] || {}), image: value }
+                                      };
+                                      
+                                      setLayerValues(newLayerValues);
+                                      
+                                      // Update preview immediately with new values
+                                      updatePreview(newLayerValues);
                                     }}
                                   >
                                     <SelectTrigger>
@@ -2274,12 +2284,16 @@ const ImagesPage: React.FC = () => {
                               placeholder="https://..."
                               value={layerValues[layer.name]?.image || (layer.name === 'img' ? (previewImage?.url || '') : '')}
                               onChange={(e) => {
-                                setLayerValues(prev => ({
-                                  ...prev,
-                                  [layer.name]: { ...(prev[layer.name] || {}), image: e.target.value }
-                                }));
-                                // Update preview with new values
-                                setTimeout(updatePreview, 100);
+                                const newValue = e.target.value;
+                                const newLayerValues = {
+                                  ...layerValues,
+                                  [layer.name]: { ...(layerValues[layer.name] || {}), image: newValue }
+                                };
+                                
+                                setLayerValues(newLayerValues);
+                                
+                                // Update preview immediately with new values
+                                updatePreview(newLayerValues);
                               }}
                             />
                           )
