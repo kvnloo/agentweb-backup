@@ -2182,10 +2182,9 @@ const ImagesPage: React.FC = () => {
                     const selectedTemplate = placidTemplates.find(pt => (pt.uuid || pt.id) === placidTemplateUuid);
                     return (
                       <div className="text-center text-sm text-gray-600 dark:text-gray-400">
-                        <div className="font-medium">{selectedTemplate?.title || 'Template'}</div>
                         <div>{selectedTemplate?.width} × {selectedTemplate?.height}</div>
                         {placidToken && (
-                          <div className="text-green-600 dark:text-green-400 mt-1">✓ Live Preview Active</div>
+                          <div className="text-green-600 dark:text-green-400 mt-1">✓ Live Preview of Your Final Image</div>
                         )}
                       </div>
                     );
