@@ -142,7 +142,7 @@ const ImagesPage: React.FC = () => {
   const [isSubmittingRevision, setIsSubmittingRevision] = useState(false);
   // Placid Canvas states
   const [editorDialogOpen, setEditorDialogOpen] = useState(false);
-  const [loadingEditor, setLoadingEditor] = useState(false);
+
   const [placidToken, setPlacidToken] = useState<string | null>(null);
   const [placidTemplateUuid, setPlacidTemplateUuid] = useState<string | null>(null);
   interface PlacidTemplateLayer { name: string; type: string }
@@ -161,10 +161,14 @@ const ImagesPage: React.FC = () => {
   const [editorError, setEditorError] = useState<string | null>(null);
   const [creatingImage, setCreatingImage] = useState(false);
   const [generatedImageUrl, setGeneratedImageUrl] = useState<string | null>(null);
-  const editorContainerRef = useRef<HTMLDivElement | null>(null);
-  const editorInstanceRef = useRef<any>(null);
+
   // Dynamic layer values keyed by layer name -> { text?: string; image?: string }
   const [layerValues, setLayerValues] = useState<Record<string, { text?: string; image?: string }>>({});
+  
+  // Simple preview system
+  const previewContainerRef = useRef<HTMLDivElement>(null);
+  const previewInstanceRef = useRef<any>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
   
   // Approval-related state
   const [channelSelectionOpen, setChannelSelectionOpen] = useState(false);
@@ -202,72 +206,93 @@ const ImagesPage: React.FC = () => {
     }
   }, [imagePreviewOpen]);
 
-  // Initialize Placid Canvas SDK when token & container available
+  // Simple preview system - load SDK and create preview when template changes
   useEffect(() => {
-    if (!editorDialogOpen) return;
-    if (!placidToken || !placidTemplateUuid) return;
-    if (loadingEditor) return;
-    const container = editorContainerRef.current;
-    if (!container) {
-      // Wait a bit for the DOM to be ready
-      setTimeout(() => {
-        const retryContainer = editorContainerRef.current;
-        if (retryContainer) {
-          initCanvas();
-        }
-      }, 100);
-      return;
-    }
-    // Ensure SDK script exists
-    const existing = document.querySelector('script[data-placid-sdk="editor"]') as HTMLScriptElement | null;
-    const initCanvas = () => {
+    if (!placidToken || !placidTemplateUuid || !previewContainerRef.current) return;
+    
+    const loadSDKAndCreatePreview = async () => {
       try {
-        // @ts-ignore
-        const SDK = (window as any).EditorSDK;
-        if (!SDK?.canvas?.create) return;
-        // Clean up any previous instance before creating a new one (e.g., when switching templates)
-        if (editorInstanceRef.current) {
-          try { editorInstanceRef.current.destroy?.(); } catch {}
-          editorInstanceRef.current = null;
+        setPreviewLoading(true);
+        
+        // Load SDK if not already loaded
+        if (!(window as any).EditorSDK) {
+          await new Promise<void>((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = 'https://sdk.placid.app/editor-sdk@latest/sdk.js';
+            script.onload = () => resolve();
+            script.onerror = () => reject(new Error('Failed to load Placid SDK'));
+            document.head.appendChild(script);
+          });
         }
-        const instance = SDK.canvas.create(container, {
+        
+        // Clean up previous preview
+        if (previewInstanceRef.current) {
+          try {
+            previewInstanceRef.current.destroy?.();
+          } catch {}
+          previewInstanceRef.current = null;
+        }
+        
+        // Clear container
+        if (previewContainerRef.current) {
+          previewContainerRef.current.innerHTML = '';
+        }
+        
+        // Create new preview
+        const instance = (window as any).EditorSDK.canvas.create(previewContainerRef.current, {
           access_token: placidToken,
           template_uuid: placidTemplateUuid,
         });
-        editorInstanceRef.current = instance;
+        
+        previewInstanceRef.current = instance;
+        
+        // Fill with current values
         const prefill: Record<string, any> = {};
-        // Start with any pre-populated values for detected layers
         Object.entries(layerValues).forEach(([layerName, v]) => {
-          if (v.text) prefill[layerName] = { ...(prefill[layerName] || {}), text: v.text };
-          if (v.image) prefill[layerName] = { ...(prefill[layerName] || {}), image: v.image };
+          if (v.text) prefill[layerName] = { text: v.text };
+          if (v.image) prefill[layerName] = { image: v.image };
         });
-        // If no value provided for an image layer, fallback to current preview image URL
-        const imgLayer = selectedTemplateLayers.image;
-        if (imgLayer && !prefill[imgLayer] && previewImage?.url) {
-          prefill[imgLayer] = { image: previewImage.url };
+        
+        // Auto-fill image layer with preview image if available
+        if (selectedTemplateLayers.image && !prefill[selectedTemplateLayers.image] && previewImage?.url) {
+          prefill[selectedTemplateLayers.image] = { image: previewImage.url };
         }
+        
         if (Object.keys(prefill).length > 0) {
           instance.fillLayers(prefill);
         }
-      } catch (e) {
-        console.error('Failed to initialize Placid Canvas', e);
-        setEditorError('Failed to initialize canvas');
+        
+        setPreviewLoading(false);
+      } catch (error) {
+        console.error('Failed to create preview:', error);
+        setPreviewLoading(false);
+        setEditorError('Failed to create preview');
       }
     };
+    
+    loadSDKAndCreatePreview();
+  }, [placidToken, placidTemplateUuid]);
 
-    if (!existing) {
-      const s = document.createElement('script');
-      s.src = 'https://sdk.placid.app/editor-sdk@latest/sdk.js';
-      s.async = true;
-      s.dataset.placidSdk = 'editor';
-      s.onload = initCanvas;
-      document.body.appendChild(s);
-    } else if ((window as any).EditorSDK) {
-      initCanvas();
-    } else {
-      existing.addEventListener('load', initCanvas, { once: true });
+  // Function to update preview when layer values change
+  const updatePreview = () => {
+    if (!previewInstanceRef.current) return;
+    
+    const prefill: Record<string, any> = {};
+    Object.entries(layerValues).forEach(([layerName, v]) => {
+      if (v.text) prefill[layerName] = { text: v.text };
+      if (v.image) prefill[layerName] = { image: v.image };
+    });
+    
+    // Auto-fill image layer with preview image if available
+    if (selectedTemplateLayers.image && !prefill[selectedTemplateLayers.image] && previewImage?.url) {
+      prefill[selectedTemplateLayers.image] = { image: previewImage.url };
     }
-      }, [editorDialogOpen, placidToken, placidTemplateUuid, loadingEditor]);
+    
+    if (Object.keys(prefill).length > 0) {
+      previewInstanceRef.current.fillLayers(prefill);
+    }
+  };
+
   const refreshIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const [refreshingExecutions, setRefreshingExecutions] = useState<Set<string>>(new Set());
 
@@ -1838,18 +1863,14 @@ const ImagesPage: React.FC = () => {
                       setEditorDialogOpen(true);
                       if (!token || !previewImage) return;
                       try {
-                        setLoadingEditor(true);
+                        setPreviewLoading(true);
                         
                         // Load brand data if not already loaded
                         if (brandAssets.length === 0) {
                           await loadTaskCreationData();
                         }
                         
-                        const resp = await axios.get(buildApiUrl(`/api/tasks/${previewImage.taskId}/placid/editor-token`), {
-                          headers: { Authorization: `Bearer ${token}` },
-                        });
-                        setPlacidToken(resp.data.token);
-                        // Always fetch templates so user can choose
+                        // First, fetch templates so user can choose
                         const tpls = await axios.get(buildApiUrl(`/api/tasks/${previewImage.taskId}/placid/templates`), {
                           headers: { Authorization: `Bearer ${token}` },
                         });
@@ -1871,7 +1892,14 @@ const ImagesPage: React.FC = () => {
                           }));
                         
                         setPlacidTemplates(filteredItems);
-                        // Preselect first if none selected yet and compute layer names
+                        
+                        if (filteredItems.length === 0) {
+                          setEditorError(`No Placid templates found for ${isDev ? 'development' : 'production'} environment. Please configure templates with "${envPrefix}" prefix.`);
+                          setPreviewLoading(false);
+                          return;
+                        }
+                        
+                        // Preselect first template if none selected yet
                         if (!placidTemplateUuid) {
                           const first = filteredItems[0];
                           const firstId = (first?.uuid || first?.id) as string | undefined;
@@ -1908,8 +1936,6 @@ const ImagesPage: React.FC = () => {
                               });
                               return next;
                             });
-                          } else {
-                            setEditorError(`No Placid templates found for ${isDev ? 'development' : 'production'} environment. Please configure templates with "${envPrefix}" prefix.`);
                           }
                         } else {
                           const current = filteredItems.find(t => (t.uuid || t.id) === placidTemplateUuid);
@@ -1944,11 +1970,20 @@ const ImagesPage: React.FC = () => {
                             return next;
                           });
                         }
+                        
+                        // Now get the token for the selected template
+                        const selectedTemplateId = placidTemplateUuid || filteredItems[0]?.uuid || filteredItems[0]?.id;
+                        if (selectedTemplateId) {
+                          const resp = await axios.get(buildApiUrl(`/api/tasks/${previewImage.taskId}/placid/editor-token?template_uuid=${selectedTemplateId}`), {
+                            headers: { Authorization: `Bearer ${token}` },
+                          });
+                          setPlacidToken(resp.data.token);
+                        }
                       } catch (e: any) {
                         console.error('Failed to init editor token', e);
                         setEditorError(e?.response?.data?.message || 'Failed to initialize editor');
                       } finally {
-                        setLoadingEditor(false);
+                        setPreviewLoading(false);
                       }
                     }}
                     title="Edit with Placid"
@@ -2036,11 +2071,12 @@ const ImagesPage: React.FC = () => {
         if (!open) {
           // Reset generated image when dialog closes
           setGeneratedImageUrl(null);
-          if (editorInstanceRef.current) {
+          // Clean up preview instance
+          if (previewInstanceRef.current) {
             try {
-              editorInstanceRef.current.destroy?.();
+              previewInstanceRef.current.destroy?.();
             } catch {}
-            editorInstanceRef.current = null;
+            previewInstanceRef.current = null;
           }
         }
       }}>
@@ -2055,16 +2091,16 @@ const ImagesPage: React.FC = () => {
                 <AlertDescription>{editorError}</AlertDescription>
               </Alert>
             )}
-            {loadingEditor ? (
-              <div className="flex items-center justify-center py-12 text-gray-500">
-                <Loader2 className="h-5 w-5 mr-2 animate-spin" /> Loading editor...
-              </div>
+            {previewLoading ? (
+                              <div className="flex items-center justify-center py-12 text-gray-500">
+                  <Loader2 className="h-5 w-5 mr-2 animate-spin" /> Loading preview...
+                </div>
             ) : (
               <div className="w-full border rounded-md">
                 <div className="p-3 flex flex-col gap-3 border-b bg-gray-50 dark:bg-gray-800">
                   <div className="w-full sm:w-auto">
                     <Label className="text-xs">Template</Label>
-                    <Select value={placidTemplateUuid || ''} onValueChange={(val) => {
+                    <Select value={placidTemplateUuid || ''} onValueChange={async (val) => {
                       setPlacidTemplateUuid(val);
                       // Reset generated image when template changes
                       setGeneratedImageUrl(null);
@@ -2093,6 +2129,17 @@ const ImagesPage: React.FC = () => {
                         }
                       });
                       setLayerValues(prev => ({ ...initial, ...prev }));
+                      
+                      // Get new token for selected template
+                      try {
+                        const resp = await axios.get(buildApiUrl(`/api/tasks/${previewImage.taskId}/placid/editor-token?template_uuid=${val}`), {
+                          headers: { Authorization: `Bearer ${token}` },
+                        });
+                        setPlacidToken(resp.data.token);
+                      } catch (error) {
+                        console.error('Failed to get token for selected template:', error);
+                        setEditorError('Failed to get access token for selected template');
+                      }
                     }}>
                       <SelectTrigger className="min-w-[220px]">
                         <SelectValue placeholder="Select a template" />
@@ -2108,29 +2155,37 @@ const ImagesPage: React.FC = () => {
                       </SelectContent>
                     </Select>
                   </div>
-                  {/* Template Thumbnail */}
+                  {/* Live Preview */}
+                  {placidTemplateUuid && (
+                    <div className="w-full max-w-sm mx-auto border rounded overflow-hidden bg-gray-100 dark:bg-gray-800 relative">
+                      <div 
+                        ref={previewContainerRef} 
+                        key={`preview-${placidTemplateUuid || 'empty'}`}
+                        className="w-full"
+                        style={{ minHeight: '192px' }}
+                      >
+                        {previewLoading ? (
+                          <div className="w-full h-48 flex items-center justify-center text-sm text-gray-500">
+                            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                            Loading preview...
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>
+                  )}
+                  
+                  {/* Template Info */}
                   {placidTemplateUuid && (() => {
                     const selectedTemplate = placidTemplates.find(pt => (pt.uuid || pt.id) === placidTemplateUuid);
-                    return selectedTemplate?.thumbnail ? (
-                      <div className="flex items-center space-x-2">
-                        <div className="w-64 h-64 border rounded overflow-hidden bg-gray-100 dark:bg-gray-800">
-                          <img 
-                            src={selectedTemplate.thumbnail} 
-                            alt={`${selectedTemplate.title || 'Template'} preview`}
-                            className="w-full h-full object-cover"
-                            onError={(e) => {
-                              const target = e.target as HTMLImageElement;
-                              target.style.display = 'none';
-                              target.parentElement!.innerHTML = '<div class="w-full h-full flex items-center justify-center text-xs text-gray-500">No preview</div>';
-                            }}
-                          />
-                        </div>
-                        <div className="text-xs text-gray-600 dark:text-gray-400">
-                          <div className="font-medium">{selectedTemplate.title || 'Template'}</div>
-                          <div>{selectedTemplate.width} × {selectedTemplate.height}</div>
-                        </div>
+                    return (
+                      <div className="text-center text-sm text-gray-600 dark:text-gray-400">
+                        <div className="font-medium">{selectedTemplate?.title || 'Template'}</div>
+                        <div>{selectedTemplate?.width} × {selectedTemplate?.height}</div>
+                        {placidToken && (
+                          <div className="text-green-600 dark:text-green-400 mt-1">✓ Live Preview Active</div>
+                        )}
                       </div>
-                    ) : null;
+                    );
                   })()}
                   {/* Dynamic inputs generated from template layers */}
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
@@ -2141,10 +2196,14 @@ const ImagesPage: React.FC = () => {
                           <Input
                             placeholder="Enter text"
                             value={layerValues[layer.name]?.text || ''}
-                            onChange={(e) => setLayerValues(prev => ({
-                              ...prev,
-                              [layer.name]: { ...(prev[layer.name] || {}), text: e.target.value }
-                            }))}
+                            onChange={(e) => {
+                              setLayerValues(prev => ({
+                                ...prev,
+                                [layer.name]: { ...(prev[layer.name] || {}), text: e.target.value }
+                              }));
+                              // Update preview with new values
+                              setTimeout(updatePreview, 100);
+                            }}
                           />
                         ) : layer.type === 'picture' ? (
                           layer.name === 'logo' ? (
@@ -2168,10 +2227,14 @@ const ImagesPage: React.FC = () => {
                                 <div className="space-y-2">
                                   <Select 
                                     value={selectedLogoUrl} 
-                                    onValueChange={(value) => setLayerValues(prev => ({
-                                      ...prev,
-                                      [layer.name]: { ...(prev[layer.name] || {}), image: value }
-                                    }))}
+                                    onValueChange={(value) => {
+                                      setLayerValues(prev => ({
+                                        ...prev,
+                                        [layer.name]: { ...(prev[layer.name] || {}), image: value }
+                                      }));
+                                      // Update preview with new values
+                                      setTimeout(updatePreview, 100);
+                                    }}
                                   >
                                     <SelectTrigger>
                                       <SelectValue placeholder="Select a logo" />
@@ -2210,10 +2273,14 @@ const ImagesPage: React.FC = () => {
                             <Input
                               placeholder="https://..."
                               value={layerValues[layer.name]?.image || (layer.name === 'img' ? (previewImage?.url || '') : '')}
-                              onChange={(e) => setLayerValues(prev => ({
-                                ...prev,
-                                [layer.name]: { ...(prev[layer.name] || {}), image: e.target.value }
-                              }))}
+                              onChange={(e) => {
+                                setLayerValues(prev => ({
+                                  ...prev,
+                                  [layer.name]: { ...(prev[layer.name] || {}), image: e.target.value }
+                                }));
+                                // Update preview with new values
+                                setTimeout(updatePreview, 100);
+                              }}
                             />
                           )
                         ) : (
@@ -2331,9 +2398,7 @@ const ImagesPage: React.FC = () => {
                       />
                     </div>
                   </div>
-                ) : (
-                  <div id="placid-canvas" ref={editorContainerRef} className="min-h-[70vh]" />
-                )}
+                ) : null}
               </div>
             )}
           </div>
