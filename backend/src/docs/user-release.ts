@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-08-11',
+    changes: [
+      'Added live preview with Placid templates',
+      '- Real-time preview of template customization as you type',
+      '- Instant updates when changing text, images, or logos',
+    ],
+  },
+  {
     date: '2025-08-09',
     changes: [
       'Added image editing feature with Placid integration',
