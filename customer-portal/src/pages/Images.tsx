@@ -270,10 +270,17 @@ const ImagesPage: React.FC = () => {
           if (v.image) prefill[layerName] = { image: v.image };
         });
         
-        // Auto-fill image layer with preview image if available
-        if (selectedTemplateLayers.image && !prefill[selectedTemplateLayers.image] && previewImage?.url) {
+        // ALWAYS use the current preview image for the main image layer
+        if (selectedTemplateLayers.image && previewImage?.url) {
           prefill[selectedTemplateLayers.image] = { image: previewImage.url };
         }
+        
+        // Also force any non-logo picture layer to use current preview image
+        Object.entries(layerValues).forEach(([layerName, v]) => {
+          if (v.image && layerName !== 'logo' && previewImage?.url) {
+            prefill[layerName] = { image: previewImage.url };
+          }
+        });
         
         if (Object.keys(prefill).length > 0) {
           instance.fillLayers(prefill);
@@ -288,7 +295,7 @@ const ImagesPage: React.FC = () => {
     };
     
     loadSDKAndCreatePreview();
-  }, [placidToken, placidTemplateUuid, layerValues, selectedTemplateLayers, previewImage]);
+  }, [placidToken, placidTemplateUuid, previewImage]);
 
   // Function to update preview when layer values change
   const updatePreview = (newLayerValues?: Record<string, { text?: string; image?: string }>) => {
@@ -303,10 +310,17 @@ const ImagesPage: React.FC = () => {
       if (v.image) prefill[layerName] = { image: v.image };
     });
     
-    // Auto-fill image layer with preview image if available
-    if (selectedTemplateLayers.image && !prefill[selectedTemplateLayers.image] && previewImage?.url) {
+    // ALWAYS use the current preview image for image layers
+    if (selectedTemplateLayers.image && previewImage?.url) {
       prefill[selectedTemplateLayers.image] = { image: previewImage.url };
     }
+    
+    // Force any non-logo picture layer to use current preview image
+    Object.entries(valuesToUse).forEach(([layerName, v]) => {
+      if (v.image && layerName !== 'logo' && previewImage?.url) {
+        prefill[layerName] = { image: previewImage.url };
+      }
+    });
     
     if (Object.keys(prefill).length > 0) {
       previewInstanceRef.current.fillLayers(prefill);
@@ -2105,11 +2119,8 @@ const ImagesPage: React.FC = () => {
             } catch {}
             previewInstanceRef.current = null;
           }
-          // Clear layer values so they get fresh data next time
-          setLayerValues({});
-          // Clear template selection
-          setPlacidTemplateUuid('');
-          setPlacidToken('');
+          // Only clear values when dialog is actually closed (not just switching states)
+          // Keep layer values and template selection for user convenience
         }
       }}>
         <DialogContent className="sm:max-w-[90vw] max-h-[90vh] overflow-y-auto">
