@@ -1231,7 +1231,10 @@ export const getPlacidEditorToken = async (req: AuthRequest, res: Response) => {
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
     const privateToken = process.env.PLACID_PRIVATE_TOKEN;
-    const templateUuid = (req.query?.template_uuid as string) || (req.body as any)?.template_uuid || process.env.PLACID_TEMPLATE_UUID_AD_IMAGE;
+    const templateUuid = (req.query?.template_uuid as string) || (req.body as any)?.template_uuid;
+    if (!templateUuid) {
+      return res.status(400).json({ message: 'template_uuid is required' });
+    }
     if (!privateToken) {
       return res.status(500).json({ message: 'PLACID_PRIVATE_TOKEN must be set' });
     }
@@ -1239,10 +1242,8 @@ export const getPlacidEditorToken = async (req: AuthRequest, res: Response) => {
     // Allow optional overrides via query/body if needed later
     const expSeconds = Math.floor(Date.now() / 1000) + 5 * 60; // default 5 minutes
     const defaultScopes: string[] = [];
-    if (templateUuid) {
-      // Canvas needs read access to the selected template
-      defaultScopes.push(`template:${templateUuid}:read`);
-    }
+    // Canvas needs read access to the selected template
+    defaultScopes.push(`template:${templateUuid}:read`);
     const payload = {
       exp: expSeconds,
       scopes: (req.body && Array.isArray((req.body as any).scopes)) ? (req.body as any).scopes : defaultScopes,
