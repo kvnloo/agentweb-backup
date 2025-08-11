@@ -288,7 +288,7 @@ const ImagesPage: React.FC = () => {
     };
     
     loadSDKAndCreatePreview();
-  }, [placidToken, placidTemplateUuid]);
+  }, [placidToken, placidTemplateUuid, layerValues, selectedTemplateLayers, previewImage]);
 
   // Function to update preview when layer values change
   const updatePreview = (newLayerValues?: Record<string, { text?: string; image?: string }>) => {
@@ -1944,15 +1944,16 @@ const ImagesPage: React.FC = () => {
                                 }
                                 if (layer.type === 'picture') {
                                   if (!next[layer.name]) next[layer.name] = {};
-                                  // Only prefill 'img' from preview image if not already set
-                                  if (layer.name === 'img' && !next[layer.name].image && previewImage?.url) {
-                                    next[layer.name].image = previewImage.url;
-                                  } else if (layer.name === 'logo' && !next[layer.name].image && brandAssets?.length > 0) {
+                                  // Always prefill main image layer with current preview image
+                                  if (layer.name === 'logo' && !next[layer.name].image && brandAssets?.length > 0) {
                                     // Auto-fill logo field with brand logo if available
                                     const logoAssets = brandAssets.filter(asset => asset.type === 'logo' || asset.type === 'secondaryLogo');
                                     if (logoAssets.length > 0) {
                                       next[layer.name].image = logoAssets[0].url;
                                     }
+                                  } else if (layer.name !== 'logo' && !next[layer.name].image && previewImage?.url) {
+                                    // For any non-logo picture layer, use the current preview image
+                                    next[layer.name].image = previewImage.url;
                                   } else if (next[layer.name].image === undefined) {
                                     next[layer.name].image = '';
                                   }
@@ -1978,14 +1979,16 @@ const ImagesPage: React.FC = () => {
                               }
                               if (layer.type === 'picture') {
                                 if (!next[layer.name]) next[layer.name] = {};
-                                if (layer.name === 'img' && !next[layer.name].image && previewImage?.url) {
-                                  next[layer.name].image = previewImage.url;
-                                } else if (layer.name === 'logo' && !next[layer.name].image && brandAssets?.length > 0) {
+                                // Always prefill main image layer with current preview image
+                                if (layer.name === 'logo' && !next[layer.name].image && brandAssets?.length > 0) {
                                   // Auto-fill logo field with brand logo if available
                                   const logoAssets = brandAssets.filter(asset => asset.type === 'logo' || asset.type === 'secondaryLogo');
                                   if (logoAssets.length > 0) {
                                     next[layer.name].image = logoAssets[0].url;
                                   }
+                                } else if (layer.name !== 'logo' && !next[layer.name].image && previewImage?.url) {
+                                  // For any non-logo picture layer, use the current preview image
+                                  next[layer.name].image = previewImage.url;
                                 } else if (next[layer.name].image === undefined) {
                                   next[layer.name].image = '';
                                 }
@@ -2102,6 +2105,11 @@ const ImagesPage: React.FC = () => {
             } catch {}
             previewInstanceRef.current = null;
           }
+          // Clear layer values so they get fresh data next time
+          setLayerValues({});
+          // Clear template selection
+          setPlacidTemplateUuid('');
+          setPlacidToken('');
         }
       }}>
         <DialogContent className="sm:max-w-[90vw] max-h-[90vh] overflow-y-auto">
