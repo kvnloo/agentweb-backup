@@ -270,10 +270,17 @@ const ImagesPage: React.FC = () => {
           if (v.image) prefill[layerName] = { image: v.image };
         });
         
-        // Auto-fill image layer with preview image if available
-        if (selectedTemplateLayers.image && !prefill[selectedTemplateLayers.image] && previewImage?.url) {
+        // ALWAYS use the current preview image for the main image layer
+        if (selectedTemplateLayers.image && previewImage?.url) {
           prefill[selectedTemplateLayers.image] = { image: previewImage.url };
         }
+        
+        // Also force any non-logo picture layer to use current preview image
+        Object.entries(layerValues).forEach(([layerName, v]) => {
+          if (v.image && layerName !== 'logo' && previewImage?.url) {
+            prefill[layerName] = { image: previewImage.url };
+          }
+        });
         
         if (Object.keys(prefill).length > 0) {
           instance.fillLayers(prefill);
@@ -288,7 +295,7 @@ const ImagesPage: React.FC = () => {
     };
     
     loadSDKAndCreatePreview();
-  }, [placidToken, placidTemplateUuid]);
+  }, [placidToken, placidTemplateUuid, previewImage]);
 
   // Function to update preview when layer values change
   const updatePreview = (newLayerValues?: Record<string, { text?: string; image?: string }>) => {
@@ -303,10 +310,17 @@ const ImagesPage: React.FC = () => {
       if (v.image) prefill[layerName] = { image: v.image };
     });
     
-    // Auto-fill image layer with preview image if available
-    if (selectedTemplateLayers.image && !prefill[selectedTemplateLayers.image] && previewImage?.url) {
+    // ALWAYS use the current preview image for image layers
+    if (selectedTemplateLayers.image && previewImage?.url) {
       prefill[selectedTemplateLayers.image] = { image: previewImage.url };
     }
+    
+    // Force any non-logo picture layer to use current preview image
+    Object.entries(valuesToUse).forEach(([layerName, v]) => {
+      if (v.image && layerName !== 'logo' && previewImage?.url) {
+        prefill[layerName] = { image: previewImage.url };
+      }
+    });
     
     if (Object.keys(prefill).length > 0) {
       previewInstanceRef.current.fillLayers(prefill);
@@ -1944,15 +1958,16 @@ const ImagesPage: React.FC = () => {
                                 }
                                 if (layer.type === 'picture') {
                                   if (!next[layer.name]) next[layer.name] = {};
-                                  // Only prefill 'img' from preview image if not already set
-                                  if (layer.name === 'img' && !next[layer.name].image && previewImage?.url) {
-                                    next[layer.name].image = previewImage.url;
-                                  } else if (layer.name === 'logo' && !next[layer.name].image && brandAssets?.length > 0) {
+                                  // Always prefill main image layer with current preview image
+                                  if (layer.name === 'logo' && !next[layer.name].image && brandAssets?.length > 0) {
                                     // Auto-fill logo field with brand logo if available
                                     const logoAssets = brandAssets.filter(asset => asset.type === 'logo' || asset.type === 'secondaryLogo');
                                     if (logoAssets.length > 0) {
                                       next[layer.name].image = logoAssets[0].url;
                                     }
+                                  } else if (layer.name !== 'logo' && !next[layer.name].image && previewImage?.url) {
+                                    // For any non-logo picture layer, use the current preview image
+                                    next[layer.name].image = previewImage.url;
                                   } else if (next[layer.name].image === undefined) {
                                     next[layer.name].image = '';
                                   }
@@ -1978,14 +1993,16 @@ const ImagesPage: React.FC = () => {
                               }
                               if (layer.type === 'picture') {
                                 if (!next[layer.name]) next[layer.name] = {};
-                                if (layer.name === 'img' && !next[layer.name].image && previewImage?.url) {
-                                  next[layer.name].image = previewImage.url;
-                                } else if (layer.name === 'logo' && !next[layer.name].image && brandAssets?.length > 0) {
+                                // Always prefill main image layer with current preview image
+                                if (layer.name === 'logo' && !next[layer.name].image && brandAssets?.length > 0) {
                                   // Auto-fill logo field with brand logo if available
                                   const logoAssets = brandAssets.filter(asset => asset.type === 'logo' || asset.type === 'secondaryLogo');
                                   if (logoAssets.length > 0) {
                                     next[layer.name].image = logoAssets[0].url;
                                   }
+                                } else if (layer.name !== 'logo' && !next[layer.name].image && previewImage?.url) {
+                                  // For any non-logo picture layer, use the current preview image
+                                  next[layer.name].image = previewImage.url;
                                 } else if (next[layer.name].image === undefined) {
                                   next[layer.name].image = '';
                                 }
@@ -2102,6 +2119,8 @@ const ImagesPage: React.FC = () => {
             } catch {}
             previewInstanceRef.current = null;
           }
+          // Only clear values when dialog is actually closed (not just switching states)
+          // Keep layer values and template selection for user convenience
         }
       }}>
         <DialogContent className="sm:max-w-[90vw] max-h-[90vh] overflow-y-auto">
