@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-08-12',
+    changes: [
+      'Provide direct links to partner portal for task and execution management',
+      '- Admin users with delegate access can now see manage icons on task details and execution records',
+      '- Settings icons provide direct links to partner portal for task and execution management',
+    ],
+  },
+  {
     date: '2025-08-11',
     changes: [
       'Added live preview with Placid templates',
