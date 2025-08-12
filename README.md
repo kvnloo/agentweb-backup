@@ -393,6 +393,7 @@ Note: Environment variables must be set during build time for the frontend, as V
 ```bash
 cd customer-portal && \
 VITE_API_URL=https://api.agentweb.pro \
+VITE_PARTNER_PORTAL_URL=https://partner.agentweb.pro \
 VITE_DEBUG=false \
 npm run build && \
 VERSION="0.21" && \

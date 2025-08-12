@@ -2,7 +2,7 @@ import React, { useEffect, useState, useRef, useCallback } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
 import axios, { AxiosError } from "axios";
 import { useAuth } from "@/contexts/AuthContext";
-import { buildApiUrl, MAX_FILE_SIZE } from "@/config";
+import { buildApiUrl, buildPartnerPortalUrl, MAX_FILE_SIZE } from "@/config";
 import {
   Card,
   CardContent,
@@ -27,6 +27,7 @@ import {
   Folder,
   Upload,
   Trash2,
+  Settings,
 } from "lucide-react";
 import { toast } from "@/components/ui/use-toast";
 import ReactMarkdown from "react-markdown";
@@ -187,8 +188,11 @@ const formatDate = (dateStr?: string) => {
 
 const TaskDetailsPage: React.FC = () => {
   const { taskId } = useParams<{ taskId: string }>();
-  const { token } = useAuth();
+  const { token, user } = useAuth();
   const navigate = useNavigate();
+  
+  // Check if user has delegate access
+  const hasDelegateAccess = user?.delegateInfo?.isDelegated;
   const [task, setTask] = useState<TaskDetail | null>(null);
   const [executions, setExecutions] = useState<Execution[]>([]);
   const [loading, setLoading] = useState(true);
@@ -679,7 +683,20 @@ const TaskDetailsPage: React.FC = () => {
       <Card>
         <CardHeader>
           <div className="flex justify-between items-start gap-2 mb-2">
-            <CardTitle className="text-2xl font-bold">{task.name}</CardTitle>
+            <div className="flex items-center gap-3">
+              <CardTitle className="text-2xl font-bold">{task.name}</CardTitle>
+              {hasDelegateAccess && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-muted-foreground hover:text-foreground"
+                  onClick={() => window.open(buildPartnerPortalUrl(`/tasks/${taskId}`), '_blank')}
+                  title="Manage Task in Partner Portal"
+                >
+                  <Settings className="h-4 w-4" />
+                </Button>
+              )}
+            </div>
             {getTaskStatusBadge(task.status)}
           </div>
           <CardDescription className="text-xs text-muted-foreground">
@@ -903,9 +920,25 @@ const TaskDetailsPage: React.FC = () => {
               >
                 <CardHeader className="pb-2">
                   <div className="flex justify-between items-center gap-2">
-                    <CardDescription>
-                      Execution ID: {exec.executionId}
-                    </CardDescription>
+                    <div className="flex items-center gap-2">
+                      <CardDescription>
+                        Execution ID: {exec.executionId}
+                      </CardDescription>
+                      {hasDelegateAccess && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="text-muted-foreground hover:text-foreground h-6 px-2"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            window.open(buildPartnerPortalUrl(`/tasks/${taskId}/executions/${exec.executionId}`), '_blank');
+                          }}
+                          title="Manage Execution in Partner Portal"
+                        >
+                          <Settings className="h-3 w-3" />
+                        </Button>
+                      )}
+                    </div>
                     {getExecutionStatusBadge(exec.status)}
                   </div>
                 </CardHeader>
