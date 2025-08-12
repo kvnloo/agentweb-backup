@@ -2746,8 +2746,12 @@ const ImagesPage: React.FC = () => {
                           const layers = tmpl?.layers || [];
                           const layersData: Record<string, any> = {};
                           
-                          // Build layers object for backend
+                          // Build layers object for backend - only include layers from current template
                           Object.entries(layerValues).forEach(([name, v]) => {
+                            // Only process layers that exist in the current template
+                            const layerExists = layers.some(layer => layer.name === name);
+                            if (!layerExists) return;
+                            
                             // Start with empty object
                             layersData[name] = {};
                             
