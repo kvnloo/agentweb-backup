@@ -1288,7 +1288,7 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
     const { id: taskId, executionId } = req.params;
     const { template_uuid, layers, source_image_url, original_filename } = req.body as {
       template_uuid?: string;
-      layers?: Record<string, Record<string, string>>;
+      layers?: Record<string, Record<string, string | boolean>>;
       source_image_url?: string;
       original_filename?: string;
     };
@@ -1308,6 +1308,8 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
     const base = process.env.PLACID_URL_API_BASE || 'https://api.placid.app/u';
     const params = new URLSearchParams();
     // Map provided layers -> URL API notation
+    // Note: The 'hide' property (boolean) will be sent to Placid API as a string parameter
+    // Placid will handle hiding layers based on this property
     if (layers && typeof layers === 'object') {
       for (const [layerName, props] of Object.entries(layers)) {
         if (!props || typeof props !== 'object') continue;

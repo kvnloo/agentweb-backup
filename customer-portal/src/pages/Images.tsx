@@ -162,8 +162,8 @@ const ImagesPage: React.FC = () => {
   const [creatingImage, setCreatingImage] = useState(false);
   const [generatedImageUrl, setGeneratedImageUrl] = useState<string | null>(null);
 
-  // Dynamic layer values keyed by layer name -> { text?: string; image?: string }
-  const [layerValues, setLayerValues] = useState<Record<string, { text?: string; image?: string }>>({});
+  // Dynamic layer values keyed by layer name -> { text?: string; image?: string; hide?: boolean }
+  const [layerValues, setLayerValues] = useState<Record<string, { text?: string; image?: string; hide?: boolean }>>({});
   
   // Simple preview system
   const previewContainerRef = useRef<HTMLDivElement>(null);
@@ -266,19 +266,31 @@ const ImagesPage: React.FC = () => {
         // Fill with current values
         const prefill: Record<string, any> = {};
         Object.entries(layerValues).forEach(([layerName, v]) => {
-          if (v.text) prefill[layerName] = { text: v.text };
-          if (v.image) prefill[layerName] = { image: v.image };
+          // Include hide property for all layers
+          prefill[layerName] = { hide: v.hide || false };
+          
+          // Add text and image properties if not hidden
+          if (!v.hide) {
+            if (v.text) prefill[layerName].text = v.text;
+            if (v.image) prefill[layerName].image = v.image;
+          }
         });
         
         // ALWAYS use the current preview image for the main image layer
         if (selectedTemplateLayers.image && previewImage?.url) {
-          prefill[selectedTemplateLayers.image] = { image: previewImage.url };
+          prefill[selectedTemplateLayers.image] = { 
+            ...prefill[selectedTemplateLayers.image],
+            image: previewImage.url 
+          };
         }
         
         // Also force any non-logo picture layer to use current preview image
         Object.entries(layerValues).forEach(([layerName, v]) => {
           if (v.image && layerName !== 'logo' && previewImage?.url) {
-            prefill[layerName] = { image: previewImage.url };
+            prefill[layerName] = { 
+              ...prefill[layerName],
+              image: previewImage.url 
+            };
           }
         });
         
@@ -298,7 +310,7 @@ const ImagesPage: React.FC = () => {
   }, [placidToken, placidTemplateUuid, previewImage]);
 
   // Function to update preview when layer values change
-  const updatePreview = (newLayerValues?: Record<string, { text?: string; image?: string }>) => {
+  const updatePreview = (newLayerValues?: Record<string, { text?: string; image?: string; hide?: boolean }>) => {
     if (!previewInstanceRef.current) return;
     
     // Use the passed values or fall back to current state
@@ -306,19 +318,31 @@ const ImagesPage: React.FC = () => {
     
     const prefill: Record<string, any> = {};
     Object.entries(valuesToUse).forEach(([layerName, v]) => {
-      if (v.text) prefill[layerName] = { text: v.text };
-      if (v.image) prefill[layerName] = { image: v.image };
+      // Include hide property for all layers
+      prefill[layerName] = { hide: v.hide || false };
+      
+      // Add text and image properties if not hidden
+      if (!v.hide) {
+        if (v.text) prefill[layerName].text = v.text;
+        if (v.image) prefill[layerName].image = v.image;
+      }
     });
     
     // ALWAYS use the current preview image for image layers
     if (selectedTemplateLayers.image && previewImage?.url) {
-      prefill[selectedTemplateLayers.image] = { image: previewImage.url };
+      prefill[selectedTemplateLayers.image] = { 
+        ...prefill[selectedTemplateLayers.image],
+        image: previewImage.url 
+      };
     }
     
     // Force any non-logo picture layer to use current preview image
     Object.entries(valuesToUse).forEach(([layerName, v]) => {
       if (v.image && layerName !== 'logo' && previewImage?.url) {
-        prefill[layerName] = { image: previewImage.url };
+        prefill[layerName] = { 
+          ...prefill[layerName],
+          image: previewImage.url 
+        };
       }
     });
     
@@ -1950,7 +1974,7 @@ const ImagesPage: React.FC = () => {
                             setSelectedTemplateLayers({ text: textLayer, image: imageLayer, logo: logoLayer });
                             // Prefill layerValues for inputs, preserving any existing values
                             setLayerValues(prev => {
-                              const next = { ...prev } as Record<string, { text?: string; image?: string }>;
+                              const next = { ...prev } as Record<string, { text?: string; image?: string; hide?: boolean }>;
                               layers.forEach(layer => {
                                 if (layer.type === 'text') {
                                   if (!next[layer.name]) next[layer.name] = {};
@@ -1985,7 +2009,7 @@ const ImagesPage: React.FC = () => {
                           setSelectedTemplateLayers({ text: textLayer, image: imageLayer, logo: logoLayer });
                           // Update layerValues with defaults if missing
                           setLayerValues(prev => {
-                            const next = { ...prev } as Record<string, { text?: string; image?: string }>;
+                            const next = { ...prev } as Record<string, { text?: string; image?: string; hide?: boolean }>;
                             layers.forEach(layer => {
                               if (layer.type === 'text') {
                                 if (!next[layer.name]) next[layer.name] = {};
@@ -2154,10 +2178,13 @@ const ImagesPage: React.FC = () => {
                       const logoLayer = layers.find(l => l.name === 'logo')?.name;
                       setSelectedTemplateLayers({ text: textLayer, image: imageLayer, logo: logoLayer });
                       // Seed layerValues with keys for inputs below
-                      const initial: Record<string, { text?: string; image?: string }> = {};
+                      const initial: Record<string, { text?: string; image?: string; hide?: boolean }> = {};
                       layers.forEach(layer => {
                         if (layer.type === 'text') {
-                          initial[layer.name] = { text: layerValues[layer.name]?.text || '' };
+                          initial[layer.name] = { 
+                            text: layerValues[layer.name]?.text || '',
+                            hide: layerValues[layer.name]?.hide || false
+                          };
                         }
                         if (layer.type === 'picture') {
                           let defaultImage = layerValues[layer.name]?.image || '';
@@ -2168,7 +2195,10 @@ const ImagesPage: React.FC = () => {
                               defaultImage = logoAssets[0].url;
                             }
                           }
-                          initial[layer.name] = { image: defaultImage };
+                          initial[layer.name] = { 
+                            image: defaultImage,
+                            hide: layerValues[layer.name]?.hide || false
+                          };
                         }
                       });
                       setLayerValues(prev => ({ ...initial, ...prev }));
@@ -2229,104 +2259,32 @@ const ImagesPage: React.FC = () => {
                       </div>
                     );
                   })()}
+                  
+                  {/* Layer Controls Explanation */}
+                  {placidTemplateUuid && (
+                    <div className="text-center text-xs text-gray-500 dark:text-gray-400 bg-gray-50 dark:bg-gray-800 p-2 rounded border">
+                      💡 Use the "Hide" toggle to control which layers appear in your final image. Hidden layers will not be processed.
+                    </div>
+                  )}
+                  
                   {/* Dynamic inputs generated from template layers */}
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                     {(placidTemplates.find(pt => (pt.uuid || pt.id) === placidTemplateUuid)?.layers || []).map(layer => (
-                      <div key={layer.name} className="space-y-1">
-                        <Label className="text-xs">{layer.name} ({layer.type})</Label>
-                        {layer.type === 'text' ? (
-                          <Input
-                            placeholder="Enter text"
-                            value={layerValues[layer.name]?.text || ''}
-                            onChange={(e) => {
-                              const newValue = e.target.value;
-                              const newLayerValues = {
-                                ...layerValues,
-                                [layer.name]: { ...(layerValues[layer.name] || {}), text: newValue }
-                              };
-                              
-                              setLayerValues(newLayerValues);
-                              
-                              // Update preview immediately with new values
-                              updatePreview(newLayerValues);
-                            }}
-                          />
-                        ) : layer.type === 'picture' ? (
-                          layer.name === 'logo' ? (
-                            // Logo selection with thumbnails
-                            (() => {
-                              const logoAssets = brandAssets?.filter(asset => asset.type === 'logo' || asset.type === 'secondaryLogo') || [];
-                              const selectedLogoUrl = layerValues[layer.name]?.image || '';
-                              const selectedLogo = logoAssets.find(asset => asset.url === selectedLogoUrl);
-                              
-                              if (logoAssets.length === 0) {
-                                return (
-                                  <div className="space-y-2">
-                                    <div className="text-xs text-orange-600 dark:text-orange-400 bg-orange-50 dark:bg-orange-900/20 p-2 rounded border">
-                                      No logos found. Please configure logos in Brand Guidelines page.
-                                    </div>
-                                  </div>
-                                );
-                              }
-                              
-                              return (
-                                <div className="space-y-2">
-                                  <Select 
-                                    value={selectedLogoUrl} 
-                                    onValueChange={(value) => {
-                                      const newLayerValues = {
-                                        ...layerValues,
-                                        [layer.name]: { ...(layerValues[layer.name] || {}), image: value }
-                                      };
-                                      
-                                      setLayerValues(newLayerValues);
-                                      
-                                      // Update preview immediately with new values
-                                      updatePreview(newLayerValues);
-                                    }}
-                                  >
-                                    <SelectTrigger>
-                                      <SelectValue placeholder="Select a logo" />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                      {logoAssets.map((asset, idx) => (
-                                        <SelectItem key={asset.url || idx} value={asset.url}>
-                                          {asset.filename || asset.url.split('/').pop() || `Logo ${idx + 1}`}
-                                        </SelectItem>
-                                      ))}
-                                    </SelectContent>
-                                  </Select>
-                                  {selectedLogo && (
-                                    <div className="flex items-center space-x-2 p-2 bg-gray-50 dark:bg-gray-800 rounded border">
-                                      <div className="w-12 h-12 border rounded overflow-hidden bg-white">
-                                        <img 
-                                          src={selectedLogo.url} 
-                                          alt="Selected logo"
-                                          className="w-full h-full object-contain"
-                                          onError={(e) => {
-                                            const target = e.target as HTMLImageElement;
-                                            target.style.display = 'none';
-                                            target.parentElement!.innerHTML = '<div class="w-full h-full flex items-center justify-center text-xs text-gray-500">Error</div>';
-                                          }}
-                                        />
-                                      </div>
-                                      <div className="text-xs text-gray-600 dark:text-gray-400">
-                                        <div className="font-medium">{selectedLogo.filename || 'Selected Logo'}</div>
-                                      </div>
-                                    </div>
-                                  )}
-                                </div>
-                              );
-                            })()
-                          ) : (
-                            <Input
-                              placeholder="https://..."
-                              value={layerValues[layer.name]?.image || (layer.name === 'img' ? (previewImage?.url || '') : '')}
+                      <div key={layer.name} className={`space-y-1 ${layerValues[layer.name]?.hide ? 'opacity-50' : ''}`}>
+                        <div className="flex items-center justify-between">
+                          <Label className={`text-xs ${layerValues[layer.name]?.hide ? 'line-through text-gray-400' : ''}`}>
+                            {layer.name} ({layer.type})
+                          </Label>
+                          <div className="flex items-center space-x-2">
+                            <Label htmlFor={`hide-${layer.name}`} className="text-xs text-gray-500">Hide</Label>
+                            <input
+                              id={`hide-${layer.name}`}
+                              type="checkbox"
+                              checked={layerValues[layer.name]?.hide || false}
                               onChange={(e) => {
-                                const newValue = e.target.value;
                                 const newLayerValues = {
                                   ...layerValues,
-                                  [layer.name]: { ...(layerValues[layer.name] || {}), image: newValue }
+                                  [layer.name]: { ...(layerValues[layer.name] || {}), hide: e.target.checked }
                                 };
                                 
                                 setLayerValues(newLayerValues);
@@ -2334,14 +2292,138 @@ const ImagesPage: React.FC = () => {
                                 // Update preview immediately with new values
                                 updatePreview(newLayerValues);
                               }}
+                              className="h-3 w-3 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
                             />
-                          )
-                        ) : (
-                          <div className="text-xs text-gray-500">Unsupported layer type</div>
-                        )}
+                          </div>
+                        </div>
+                        {!layerValues[layer.name]?.hide ? (
+                          <>
+                            {layer.type === 'text' ? (
+                              <Input
+                                placeholder="Enter text"
+                                value={layerValues[layer.name]?.text || ''}
+                                onChange={(e) => {
+                                  const newValue = e.target.value;
+                                  const newLayerValues = {
+                                    ...layerValues,
+                                    [layer.name]: { ...(layerValues[layer.name] || {}), text: newValue }
+                                  };
+                                  
+                                  setLayerValues(newLayerValues);
+                                  
+                                  // Update preview immediately with new values
+                                  updatePreview(newLayerValues);
+                                }}
+                              />
+                            ) : layer.type === 'picture' ? (
+                              layer.name === 'logo' ? (
+                                // Logo selection with thumbnails
+                                (() => {
+                                  const logoAssets = brandAssets?.filter(asset => asset.type === 'logo' || asset.type === 'secondaryLogo') || [];
+                                  const selectedLogoUrl = layerValues[layer.name]?.image || '';
+                                  const selectedLogo = logoAssets.find(asset => asset.url === selectedLogoUrl);
+                                  
+                                  if (logoAssets.length === 0) {
+                                    return (
+                                      <div className="space-y-2">
+                                        <div className="text-xs text-orange-600 dark:text-orange-400 bg-orange-50 dark:bg-orange-900/20 p-2 rounded border">
+                                          No logos found. Please configure logos in Brand Guidelines page.
+                                        </div>
+                                      </div>
+                                    );
+                                  }
+                                  
+                                  return (
+                                    <div className="space-y-2">
+                                      <Select 
+                                        value={selectedLogoUrl} 
+                                        onValueChange={(value) => {
+                                          const newLayerValues = {
+                                            ...layerValues,
+                                            [layer.name]: { ...(layerValues[layer.name] || {}), image: value }
+                                          };
+                                          
+                                          setLayerValues(newLayerValues);
+                                          
+                                          // Update preview immediately with new values
+                                          updatePreview(newLayerValues);
+                                        }}
+                                      >
+                                        <SelectTrigger>
+                                          <SelectValue placeholder="Select a logo" />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                          {logoAssets.map((asset, idx) => (
+                                            <SelectItem key={asset.url || idx} value={asset.url}>
+                                              {asset.filename || asset.url.split('/').pop() || `Logo ${idx + 1}`}
+                                            </SelectItem>
+                                          ))}
+                                        </SelectContent>
+                                      </Select>
+                                      {selectedLogo && (
+                                        <div className="flex items-center space-x-2 p-2 bg-gray-50 dark:bg-gray-800 rounded border">
+                                          <div className="w-12 h-12 border rounded overflow-hidden bg-white">
+                                            <img 
+                                              src={selectedLogo.url} 
+                                              alt="Selected logo"
+                                              className="w-full h-full object-contain"
+                                              onError={(e) => {
+                                                const target = e.target as HTMLImageElement;
+                                                target.style.display = 'none';
+                                                target.parentElement!.innerHTML = '<div class="w-full h-full flex items-center justify-center text-xs text-gray-500">Error</div>';
+                                              }}
+                                            />
+                                          </div>
+                                          <div className="text-xs text-gray-600 dark:text-gray-400">
+                                            <div className="font-medium">{selectedLogo.filename || 'Selected Logo'}</div>
+                                          </div>
+                                        </div>
+                                      )}
+                                    </div>
+                                  );
+                                })()
+                              ) : (
+                                <Input
+                                  placeholder="https://..."
+                                  value={layerValues[layer.name]?.image || (layer.name === 'img' ? (previewImage?.url || '') : '')}
+                                  onChange={(e) => {
+                                    const newValue = e.target.value;
+                                    const newLayerValues = {
+                                      ...layerValues,
+                                      [layer.name]: { ...(layerValues[layer.name] || {}), image: newValue }
+                                    };
+                                    
+                                    setLayerValues(newLayerValues);
+                                    
+                                    // Update preview immediately with new values
+                                    updatePreview(newLayerValues);
+                                  }}
+                                />
+                              )
+                            ) : (
+                              <div className="text-xs text-gray-500">Unsupported layer type</div>
+                            )}
+                          </>
+                        ) : null}
                       </div>
                     ))}
                   </div>
+                  
+                  {/* Show message when all layers are hidden */}
+                  {placidTemplateUuid && (() => {
+                    const selectedTemplate = placidTemplates.find(pt => (pt.uuid || pt.id) === placidTemplateUuid);
+                    const layers = selectedTemplate?.layers || [];
+                    const allLayersHidden = layers.length > 0 && layers.every(layer => layerValues[layer.name]?.hide);
+                    
+                    if (allLayersHidden) {
+                      return (
+                        <div className="text-center text-sm text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-900/20 p-3 rounded border">
+                          ⚠️ All layers are currently hidden. The generated image will use only the template's default content.
+                        </div>
+                      );
+                    }
+                    return null;
+                  })()}
                   <div className="flex gap-3">
                     <Button 
                       onClick={async () => {
@@ -2360,15 +2442,26 @@ const ImagesPage: React.FC = () => {
                           
                           // Build layers object for backend
                           Object.entries(layerValues).forEach(([name, v]) => {
-                            if (v.text && v.text.trim() !== '') layersData[name] = { text: v.text };
-                            if (v.image && v.image.trim() !== '') layersData[name] = { ...(layersData[name] || {}), image: v.image };
+                            // Include hide property for all layers
+                            layersData[name] = { hide: v.hide || false };
+                            
+                            // Add text and image properties if not hidden
+                            if (!v.hide) {
+                              if (v.text && v.text.trim() !== '') layersData[name].text = v.text;
+                              if (v.image && v.image.trim() !== '') layersData[name].image = v.image;
+                            }
                           });
                           
                           // Ensure img layer is set at minimum
                           const imgLayer = layers.find(l => l.name === 'img')?.name || selectedTemplateLayers.image || layers.find(l => l.type === 'picture')?.name || 'img';
                           if (!layersData[imgLayer]) {
                             const imgVal = layerValues[imgLayer]?.image || previewImage?.url;
-                            if (imgVal && imgVal.trim() !== '') layersData[imgLayer] = { image: imgVal };
+                            if (imgVal && imgVal.trim() !== '') {
+                              layersData[imgLayer] = { 
+                                image: imgVal,
+                                hide: layerValues[imgLayer]?.hide || false
+                              };
+                            }
                           }
                           
                           const response = await axios.post(
