@@ -8,6 +8,14 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-08-12",
+    changes: [
+      "Added OpenAI GPT-5 mode via Azure",
+      "- Users can now access GPT-5 through Azure integration for enhanced AI capabilities",
+      "- This model replaces the openai->openai->gpt-5 model for better performance and cost efficiency",
+    ],
+  },
+  {
     date: "2025-08-07",
     changes: [
       "Added support for GPT-5",
