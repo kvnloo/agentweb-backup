@@ -1288,7 +1288,7 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
     const { id: taskId, executionId } = req.params;
     const { template_uuid, layers, source_image_url, original_filename } = req.body as {
       template_uuid?: string;
-      layers?: Record<string, Record<string, string>>;
+      layers?: Record<string, Record<string, string | boolean | number>>;
       source_image_url?: string;
       original_filename?: string;
     };
@@ -1308,6 +1308,17 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
     const base = process.env.PLACID_URL_API_BASE || 'https://api.placid.app/u';
     const params = new URLSearchParams();
     // Map provided layers -> URL API notation
+    // Note: The following properties will be sent to Placid API:
+    // - 'hide' (boolean): Set true to hide this layer; defaults to false
+    // - 'opacity' (number): Adjust layer opacity from 0 to 100
+    // - 'rotation' (number): Set layer rotation from 0 to 359 degrees
+    // - 'position_x_absolute' (string): Set absolute X position (e.g., "10px")
+    // - 'position_y_absolute' (string): Set absolute Y position (e.g., "10px")
+    // - 'position_x_relative' (string): Set relative X position (e.g., "+10px", "-10px")
+    // - 'position_y_relative' (string): Set relative Y position (e.g., "+10px", "-10px")
+    // - 'width' (string): Set width (e.g., "50%", "+10px", "100px")
+    // - 'height' (string): Set height (e.g., "50%", "+10px", "100px")
+    // Placid will handle all these properties to control layer appearance and positioning
     if (layers && typeof layers === 'object') {
       for (const [layerName, props] of Object.entries(layers)) {
         if (!props || typeof props !== 'object') continue;
@@ -1349,7 +1360,7 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
     const shortTemplateId = tplUuid ? tplUuid.substring(0, 8) : 'unknown';
     
     const filenameBase = `${baseNameWithoutExt}-placid-${shortTemplateId}`;
-    const key = `tasks/${taskId}/executions/${executionId}/edits/${filenameBase}.${ext}`;
+    const key = `tasks/${taskId}/executions/${executionId}/edits/${randomToken}/${filenameBase}.${ext}`;
     const imageBuffer = Buffer.from(new Uint8Array(imgResp.data));
 
     await s3

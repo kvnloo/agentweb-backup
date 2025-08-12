@@ -162,8 +162,21 @@ const ImagesPage: React.FC = () => {
   const [creatingImage, setCreatingImage] = useState(false);
   const [generatedImageUrl, setGeneratedImageUrl] = useState<string | null>(null);
 
-  // Dynamic layer values keyed by layer name -> { text?: string; image?: string }
-  const [layerValues, setLayerValues] = useState<Record<string, { text?: string; image?: string }>>({});
+  // Dynamic layer values keyed by layer name -> { text?: string; image?: string; hide?: boolean; opacity?: number; rotation?: number; position_x_absolute?: string; position_y_absolute?: string; position_x_relative?: string; position_y_relative?: string; width?: string; height?: string; _expanded?: boolean }
+  const [layerValues, setLayerValues] = useState<Record<string, { 
+    text?: string; 
+    image?: string; 
+    hide?: boolean; 
+    opacity?: number; 
+    rotation?: number; 
+    position_x_absolute?: string; 
+    position_y_absolute?: string; 
+    position_x_relative?: string; 
+    position_y_relative?: string; 
+    width?: string; 
+    height?: string; 
+    _expanded?: boolean;
+  }>>({});
   
   // Simple preview system
   const previewContainerRef = useRef<HTMLDivElement>(null);
@@ -266,19 +279,45 @@ const ImagesPage: React.FC = () => {
         // Fill with current values
         const prefill: Record<string, any> = {};
         Object.entries(layerValues).forEach(([layerName, v]) => {
-          if (v.text) prefill[layerName] = { text: v.text };
-          if (v.image) prefill[layerName] = { image: v.image };
+          // Include all properties for all layers
+          prefill[layerName] = { 
+            hide: v.hide || false,
+            opacity: v.opacity ?? 100,
+            rotation: v.rotation ?? 0
+          };
+          
+          // Add position properties if they exist
+          if (v.position_x_absolute) prefill[layerName].position_x_absolute = v.position_x_absolute;
+          if (v.position_y_absolute) prefill[layerName].position_y_absolute = v.position_y_absolute;
+          if (v.position_x_relative) prefill[layerName].position_x_relative = v.position_x_relative;
+          if (v.position_y_relative) prefill[layerName].position_y_relative = v.position_y_relative;
+          
+          // Add size properties if they exist
+          if (v.width) prefill[layerName].width = v.width;
+          if (v.height) prefill[layerName].height = v.height;
+          
+          // Add text and image properties if not hidden
+          if (!v.hide) {
+            if (v.text) prefill[layerName].text = v.text;
+            if (v.image) prefill[layerName].image = v.image;
+          }
         });
         
         // ALWAYS use the current preview image for the main image layer
         if (selectedTemplateLayers.image && previewImage?.url) {
-          prefill[selectedTemplateLayers.image] = { image: previewImage.url };
+          prefill[selectedTemplateLayers.image] = { 
+            ...prefill[selectedTemplateLayers.image],
+            image: previewImage.url 
+          };
         }
         
         // Also force any non-logo picture layer to use current preview image
         Object.entries(layerValues).forEach(([layerName, v]) => {
           if (v.image && layerName !== 'logo' && previewImage?.url) {
-            prefill[layerName] = { image: previewImage.url };
+            prefill[layerName] = { 
+              ...prefill[layerName],
+              image: previewImage.url 
+            };
           }
         });
         
@@ -298,7 +337,20 @@ const ImagesPage: React.FC = () => {
   }, [placidToken, placidTemplateUuid, previewImage]);
 
   // Function to update preview when layer values change
-  const updatePreview = (newLayerValues?: Record<string, { text?: string; image?: string }>) => {
+  const updatePreview = (newLayerValues?: Record<string, { 
+    text?: string; 
+    image?: string; 
+    hide?: boolean; 
+    opacity?: number; 
+    rotation?: number; 
+    position_x_absolute?: string; 
+    position_y_absolute?: string; 
+    position_x_relative?: string; 
+    position_y_relative?: string; 
+    width?: string; 
+    height?: string; 
+    _expanded?: boolean;
+  }>) => {
     if (!previewInstanceRef.current) return;
     
     // Use the passed values or fall back to current state
@@ -306,19 +358,45 @@ const ImagesPage: React.FC = () => {
     
     const prefill: Record<string, any> = {};
     Object.entries(valuesToUse).forEach(([layerName, v]) => {
-      if (v.text) prefill[layerName] = { text: v.text };
-      if (v.image) prefill[layerName] = { image: v.image };
+      // Include all properties for all layers
+      prefill[layerName] = { 
+        hide: v.hide || false,
+        opacity: v.opacity ?? 100,
+        rotation: v.rotation ?? 0
+      };
+      
+      // Add position properties if they exist
+      if (v.position_x_absolute) prefill[layerName].position_x_absolute = v.position_x_absolute;
+      if (v.position_y_absolute) prefill[layerName].position_y_absolute = v.position_y_absolute;
+      if (v.position_x_relative) prefill[layerName].position_x_relative = v.position_x_relative;
+      if (v.position_y_relative) prefill[layerName].position_y_relative = v.position_y_relative;
+      
+      // Add size properties if they exist
+      if (v.width) prefill[layerName].width = v.width;
+      if (v.height) prefill[layerName].height = v.height;
+      
+      // Add text and image properties if not hidden
+      if (!v.hide) {
+        if (v.text) prefill[layerName].text = v.text;
+        if (v.image) prefill[layerName].image = v.image;
+      }
     });
     
     // ALWAYS use the current preview image for image layers
     if (selectedTemplateLayers.image && previewImage?.url) {
-      prefill[selectedTemplateLayers.image] = { image: previewImage.url };
+      prefill[selectedTemplateLayers.image] = { 
+        ...prefill[selectedTemplateLayers.image],
+        image: previewImage.url 
+      };
     }
     
     // Force any non-logo picture layer to use current preview image
     Object.entries(valuesToUse).forEach(([layerName, v]) => {
       if (v.image && layerName !== 'logo' && previewImage?.url) {
-        prefill[layerName] = { image: previewImage.url };
+        prefill[layerName] = { 
+          ...prefill[layerName],
+          image: previewImage.url 
+        };
       }
     });
     
@@ -1950,7 +2028,7 @@ const ImagesPage: React.FC = () => {
                             setSelectedTemplateLayers({ text: textLayer, image: imageLayer, logo: logoLayer });
                             // Prefill layerValues for inputs, preserving any existing values
                             setLayerValues(prev => {
-                              const next = { ...prev } as Record<string, { text?: string; image?: string }>;
+                              const next = { ...prev } as Record<string, { text?: string; image?: string; hide?: boolean }>;
                               layers.forEach(layer => {
                                 if (layer.type === 'text') {
                                   if (!next[layer.name]) next[layer.name] = {};
@@ -1985,7 +2063,7 @@ const ImagesPage: React.FC = () => {
                           setSelectedTemplateLayers({ text: textLayer, image: imageLayer, logo: logoLayer });
                           // Update layerValues with defaults if missing
                           setLayerValues(prev => {
-                            const next = { ...prev } as Record<string, { text?: string; image?: string }>;
+                            const next = { ...prev } as Record<string, { text?: string; image?: string; hide?: boolean }>;
                             layers.forEach(layer => {
                               if (layer.type === 'text') {
                                 if (!next[layer.name]) next[layer.name] = {};
@@ -2154,10 +2232,35 @@ const ImagesPage: React.FC = () => {
                       const logoLayer = layers.find(l => l.name === 'logo')?.name;
                       setSelectedTemplateLayers({ text: textLayer, image: imageLayer, logo: logoLayer });
                       // Seed layerValues with keys for inputs below
-                      const initial: Record<string, { text?: string; image?: string }> = {};
+                      const initial: Record<string, { 
+                        text?: string; 
+                        image?: string; 
+                        hide?: boolean; 
+                        opacity?: number; 
+                        rotation?: number; 
+                        position_x_absolute?: string; 
+                        position_y_absolute?: string; 
+                        position_x_relative?: string; 
+                        position_y_relative?: string; 
+                        width?: string; 
+                        height?: string; 
+                        _expanded?: boolean;
+                      }> = {};
                       layers.forEach(layer => {
                         if (layer.type === 'text') {
-                          initial[layer.name] = { text: layerValues[layer.name]?.text || '' };
+                          initial[layer.name] = { 
+                            text: layerValues[layer.name]?.text || '',
+                            hide: layerValues[layer.name]?.hide || false,
+                            opacity: layerValues[layer.name]?.opacity ?? 100,
+                            rotation: layerValues[layer.name]?.rotation ?? 0,
+                            position_x_absolute: layerValues[layer.name]?.position_x_absolute || '',
+                            position_y_absolute: layerValues[layer.name]?.position_y_absolute || '',
+                            position_x_relative: layerValues[layer.name]?.position_x_relative || '',
+                            position_y_relative: layerValues[layer.name]?.position_y_relative || '',
+                            width: layerValues[layer.name]?.width || '',
+                            height: layerValues[layer.name]?.height || '',
+                            _expanded: layerValues[layer.name]?._expanded || false
+                          };
                         }
                         if (layer.type === 'picture') {
                           let defaultImage = layerValues[layer.name]?.image || '';
@@ -2168,7 +2271,19 @@ const ImagesPage: React.FC = () => {
                               defaultImage = logoAssets[0].url;
                             }
                           }
-                          initial[layer.name] = { image: defaultImage };
+                          initial[layer.name] = { 
+                            image: defaultImage,
+                            hide: layerValues[layer.name]?.hide || false,
+                            opacity: layerValues[layer.name]?.opacity ?? 100,
+                            rotation: layerValues[layer.name]?.rotation ?? 0,
+                            position_x_absolute: layerValues[layer.name]?.position_x_absolute || '',
+                            position_y_absolute: layerValues[layer.name]?.position_y_absolute || '',
+                            position_x_relative: layerValues[layer.name]?.position_x_relative || '',
+                            position_y_relative: layerValues[layer.name]?.position_y_relative || '',
+                            width: layerValues[layer.name]?.width || '',
+                            height: layerValues[layer.name]?.height || '',
+                            _expanded: layerValues[layer.name]?._expanded || false
+                          };
                         }
                       });
                       setLayerValues(prev => ({ ...initial, ...prev }));
@@ -2229,119 +2344,392 @@ const ImagesPage: React.FC = () => {
                       </div>
                     );
                   })()}
+                  
+                  {/* Layer Controls Explanation */}
+                  {placidTemplateUuid && (
+                    <div className="text-center text-xs text-gray-500 dark:text-gray-400 bg-gray-50 dark:bg-gray-800 p-3 rounded border">
+                      💡 <strong>Layer Controls:</strong> Content inputs are always visible for easy editing. Click "Advanced Visual Properties" to access positioning, sizing, opacity, and rotation controls.
+                    </div>
+                  )}
+                  
                   {/* Dynamic inputs generated from template layers */}
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                     {(placidTemplates.find(pt => (pt.uuid || pt.id) === placidTemplateUuid)?.layers || []).map(layer => (
-                      <div key={layer.name} className="space-y-1">
-                        <Label className="text-xs">{layer.name} ({layer.type})</Label>
-                        {layer.type === 'text' ? (
-                          <Input
-                            placeholder="Enter text"
-                            value={layerValues[layer.name]?.text || ''}
-                            onChange={(e) => {
-                              const newValue = e.target.value;
-                              const newLayerValues = {
-                                ...layerValues,
-                                [layer.name]: { ...(layerValues[layer.name] || {}), text: newValue }
-                              };
-                              
-                              setLayerValues(newLayerValues);
-                              
-                              // Update preview immediately with new values
-                              updatePreview(newLayerValues);
-                            }}
-                          />
-                        ) : layer.type === 'picture' ? (
-                          layer.name === 'logo' ? (
-                            // Logo selection with thumbnails
-                            (() => {
-                              const logoAssets = brandAssets?.filter(asset => asset.type === 'logo' || asset.type === 'secondaryLogo') || [];
-                              const selectedLogoUrl = layerValues[layer.name]?.image || '';
-                              const selectedLogo = logoAssets.find(asset => asset.url === selectedLogoUrl);
-                              
-                              if (logoAssets.length === 0) {
-                                return (
-                                  <div className="space-y-2">
-                                    <div className="text-xs text-orange-600 dark:text-orange-400 bg-orange-50 dark:bg-orange-900/20 p-2 rounded border">
-                                      No logos found. Please configure logos in Brand Guidelines page.
-                                    </div>
-                                  </div>
-                                );
-                              }
-                              
-                              return (
+                      <div key={layer.name} className={`border rounded-lg p-4 ${layerValues[layer.name]?.hide ? 'opacity-50 bg-gray-50 dark:bg-gray-800' : 'bg-white dark:bg-gray-900'}`}>
+                        {/* Layer Header */}
+                        <div className="flex items-center justify-between mb-4">
+                          <div className="flex items-center space-x-3">
+                            <Label className={`text-sm font-medium ${layerValues[layer.name]?.hide ? 'line-through text-gray-400' : ''}`}>
+                              {layer.name} ({layer.type})
+                            </Label>
+                            <div className="flex items-center space-x-2">
+                              <Label htmlFor={`hide-${layer.name}`} className="text-xs text-gray-500">Hide</Label>
+                              <input
+                                id={`hide-${layer.name}`}
+                                type="checkbox"
+                                checked={layerValues[layer.name]?.hide || false}
+                                onChange={(e) => {
+                                  const newLayerValues = {
+                                    ...layerValues,
+                                    [layer.name]: { ...(layerValues[layer.name] || {}), hide: e.target.checked }
+                                  };
+                                  
+                                  setLayerValues(newLayerValues);
+                                  updatePreview(newLayerValues);
+                                }}
+                                className="h-3 w-3 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                              />
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Layer Content - Only show if not hidden */}
+                        {!layerValues[layer.name]?.hide ? (
+                          <div className="space-y-4">
+                            {/* Basic Content Inputs - Always Visible */}
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                              {layer.type === 'text' && (
                                 <div className="space-y-2">
-                                  <Select 
-                                    value={selectedLogoUrl} 
-                                    onValueChange={(value) => {
+                                  <Label className="text-xs font-medium">Text Content</Label>
+                                  <Input
+                                    placeholder="Enter text"
+                                    value={layerValues[layer.name]?.text || ''}
+                                    onChange={(e) => {
+                                      const newValue = e.target.value;
                                       const newLayerValues = {
                                         ...layerValues,
-                                        [layer.name]: { ...(layerValues[layer.name] || {}), image: value }
+                                        [layer.name]: { ...(layerValues[layer.name] || {}), text: newValue }
                                       };
                                       
                                       setLayerValues(newLayerValues);
-                                      
-                                      // Update preview immediately with new values
                                       updatePreview(newLayerValues);
                                     }}
-                                  >
-                                    <SelectTrigger>
-                                      <SelectValue placeholder="Select a logo" />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                      {logoAssets.map((asset, idx) => (
-                                        <SelectItem key={asset.url || idx} value={asset.url}>
-                                          {asset.filename || asset.url.split('/').pop() || `Logo ${idx + 1}`}
-                                        </SelectItem>
-                                      ))}
-                                    </SelectContent>
-                                  </Select>
-                                  {selectedLogo && (
-                                    <div className="flex items-center space-x-2 p-2 bg-gray-50 dark:bg-gray-800 rounded border">
-                                      <div className="w-12 h-12 border rounded overflow-hidden bg-white">
-                                        <img 
-                                          src={selectedLogo.url} 
-                                          alt="Selected logo"
-                                          className="w-full h-full object-contain"
-                                          onError={(e) => {
-                                            const target = e.target as HTMLImageElement;
-                                            target.style.display = 'none';
-                                            target.parentElement!.innerHTML = '<div class="w-full h-full flex items-center justify-center text-xs text-gray-500">Error</div>';
-                                          }}
-                                        />
-                                      </div>
-                                      <div className="text-xs text-gray-600 dark:text-gray-400">
-                                        <div className="font-medium">{selectedLogo.filename || 'Selected Logo'}</div>
-                                      </div>
-                                    </div>
+                                  />
+                                </div>
+                              )}
+                              
+                              {layer.type === 'picture' && (
+                                <div className="space-y-2">
+                                  <Label className="text-xs font-medium">Image Source</Label>
+                                  {layer.name === 'logo' ? (
+                                    // Logo selection with thumbnails
+                                    (() => {
+                                      const logoAssets = brandAssets?.filter(asset => asset.type === 'logo' || asset.type === 'secondaryLogo') || [];
+                                      const selectedLogoUrl = layerValues[layer.name]?.image || '';
+                                      const selectedLogo = logoAssets.find(asset => asset.url === selectedLogoUrl);
+                                      
+                                      if (logoAssets.length === 0) {
+                                        return (
+                                          <div className="text-xs text-orange-600 dark:text-orange-400 bg-orange-50 dark:bg-orange-900/20 p-2 rounded border">
+                                            No logos found. Please configure logos in Brand Guidelines page.
+                                          </div>
+                                        );
+                                      }
+                                      
+                                      return (
+                                        <div className="space-y-2">
+                                          <Select 
+                                            value={selectedLogoUrl} 
+                                            onValueChange={(value) => {
+                                              const newLayerValues = {
+                                                ...layerValues,
+                                                [layer.name]: { ...(layerValues[layer.name] || {}), image: value }
+                                              };
+                                              
+                                              setLayerValues(newLayerValues);
+                                              updatePreview(newLayerValues);
+                                            }}
+                                          >
+                                            <SelectTrigger>
+                                              <SelectValue placeholder="Select a logo" />
+                                            </SelectTrigger>
+                                            <SelectContent>
+                                              {logoAssets.map((asset, idx) => (
+                                                <SelectItem key={asset.url || idx} value={asset.url}>
+                                                  {asset.filename || asset.url.split('/').pop() || `Logo ${idx + 1}`}
+                                                </SelectItem>
+                                              ))}
+                                            </SelectContent>
+                                          </Select>
+                                          {selectedLogo && (
+                                            <div className="flex items-center space-x-2 p-2 bg-gray-50 dark:bg-gray-800 rounded border">
+                                              <div className="w-12 h-12 border rounded overflow-hidden bg-white">
+                                                <img 
+                                                  src={selectedLogo.url} 
+                                                  alt="Selected logo"
+                                                  className="w-full h-full object-contain"
+                                                  onError={(e) => {
+                                                    const target = e.target as HTMLImageElement;
+                                                    target.style.display = 'none';
+                                                    target.parentElement!.innerHTML = '<div class="w-full h-full flex items-center justify-center text-xs text-gray-500">Error</div>';
+                                                  }}
+                                                />
+                                              </div>
+                                              <div className="text-xs text-gray-600 dark:text-gray-400">
+                                                <div className="font-medium">{selectedLogo.filename || 'Selected Logo'}</div>
+                                              </div>
+                                            </div>
+                                          )}
+                                        </div>
+                                      );
+                                    })()
+                                  ) : (
+                                    <Input
+                                      placeholder="https://..."
+                                      value={layerValues[layer.name]?.image || (layer.name === 'img' ? (previewImage?.url || '') : '')}
+                                      onChange={(e) => {
+                                        const newValue = e.target.value;
+                                        const newLayerValues = {
+                                          ...layerValues,
+                                          [layer.name]: { ...(layerValues[layer.name] || {}), image: newValue }
+                                        };
+                                        
+                                        setLayerValues(newLayerValues);
+                                        updatePreview(newLayerValues);
+                                      }}
+                                    />
                                   )}
                                 </div>
-                              );
-                            })()
-                          ) : (
-                            <Input
-                              placeholder="https://..."
-                              value={layerValues[layer.name]?.image || (layer.name === 'img' ? (previewImage?.url || '') : '')}
-                              onChange={(e) => {
-                                const newValue = e.target.value;
-                                const newLayerValues = {
-                                  ...layerValues,
-                                  [layer.name]: { ...(layerValues[layer.name] || {}), image: newValue }
-                                };
-                                
-                                setLayerValues(newLayerValues);
-                                
-                                // Update preview immediately with new values
-                                updatePreview(newLayerValues);
-                              }}
-                            />
-                          )
+                              )}
+                            </div>
+
+                            {/* Visual Properties - Collapsible */}
+                            <div className="border-t pt-4">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const newLayerValues = {
+                                    ...layerValues,
+                                    [layer.name]: { 
+                                      ...(layerValues[layer.name] || {}), 
+                                      _expanded: !layerValues[layer.name]?._expanded 
+                                    }
+                                  };
+                                  setLayerValues(newLayerValues);
+                                }}
+                                className="flex items-center justify-between w-full text-left text-xs font-medium text-gray-700 dark:text-gray-300 hover:text-gray-900 dark:hover:text-gray-100 transition-colors"
+                              >
+                                <span>Advanced Visual Properties</span>
+                                <span className="text-gray-400">
+                                  {layerValues[layer.name]?._expanded ? '▼' : '▶'}
+                                </span>
+                              </button>
+                              
+                              {layerValues[layer.name]?._expanded && (
+                                <div className="mt-3 space-y-4">
+                                  {/* Opacity and Rotation */}
+                                  <div className="grid grid-cols-2 gap-4 mb-4">
+                                    <div className="space-y-2">
+                                      <Label className="text-xs">Opacity</Label>
+                                      <div className="flex items-center space-x-2">
+                                        <input
+                                          type="range"
+                                          min="0"
+                                          max="100"
+                                          value={layerValues[layer.name]?.opacity ?? 100}
+                                          onChange={(e) => {
+                                            const newValue = parseInt(e.target.value);
+                                            const newLayerValues = {
+                                              ...layerValues,
+                                              [layer.name]: { ...(layerValues[layer.name] || {}), opacity: newValue }
+                                            };
+                                            
+                                            setLayerValues(newLayerValues);
+                                            updatePreview(newLayerValues);
+                                          }}
+                                          className="flex-1 h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+                                        />
+                                        <span className="text-xs text-gray-500 w-12 text-right">
+                                          {layerValues[layer.name]?.opacity ?? 100}%
+                                        </span>
+                                      </div>
+                                    </div>
+                                    
+                                    <div className="space-y-2">
+                                      <Label className="text-xs">Rotation</Label>
+                                      <div className="flex items-center space-x-2">
+                                        <input
+                                          type="range"
+                                          min="0"
+                                          max="359"
+                                          value={layerValues[layer.name]?.rotation ?? 0}
+                                          onChange={(e) => {
+                                            const newValue = parseInt(e.target.value);
+                                            const newLayerValues = {
+                                              ...layerValues,
+                                              [layer.name]: { ...(layerValues[layer.name] || {}), rotation: newValue }
+                                            };
+                                            
+                                            setLayerValues(newLayerValues);
+                                            updatePreview(newLayerValues);
+                                          }}
+                                          className="flex-1 h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+                                        />
+                                        <span className="text-xs text-gray-500 w-12 text-right">
+                                          {layerValues[layer.name]?.rotation ?? 0}°
+                                        </span>
+                                      </div>
+                                    </div>
+                                  </div>
+
+                                  {/* Position Controls - Two per row */}
+                                  <div className="space-y-3 mb-4">
+                                    <Label className="text-xs font-medium">Position</Label>
+                                    
+                                    <div className="grid grid-cols-2 gap-4">
+                                      <div className="space-y-2">
+                                        <Label className="text-xs text-gray-600">X Position</Label>
+                                        <Input
+                                          placeholder="10px or +10px"
+                                          value={layerValues[layer.name]?.position_x_absolute || ''}
+                                          onChange={(e) => {
+                                            const newValue = e.target.value;
+                                            const newLayerValues = {
+                                              ...layerValues,
+                                              [layer.name]: { ...(layerValues[layer.name] || {}), position_x_absolute: newValue }
+                                            };
+                                            
+                                            setLayerValues(newLayerValues);
+                                            updatePreview(newLayerValues);
+                                          }}
+                                          className="text-xs"
+                                        />
+                                      </div>
+                                      
+                                      <div className="space-y-2">
+                                        <Label className="text-xs text-gray-600">Y Position</Label>
+                                        <Input
+                                          placeholder="10px or +10px"
+                                          value={layerValues[layer.name]?.position_y_absolute || ''}
+                                          onChange={(e) => {
+                                            const newValue = e.target.value;
+                                            const newLayerValues = {
+                                              ...layerValues,
+                                              [layer.name]: { ...(layerValues[layer.name] || {}), position_y_absolute: newValue }
+                                            };
+                                            
+                                            setLayerValues(newLayerValues);
+                                            updatePreview(newLayerValues);
+                                          }}
+                                          className="text-xs"
+                                        />
+                                      </div>
+                                    </div>
+                                    
+                                    <div className="grid grid-cols-2 gap-4">
+                                      <div className="space-y-2">
+                                        <Label className="text-xs text-gray-600">X Relative</Label>
+                                        <Input
+                                          placeholder="+10px or -10px"
+                                          value={layerValues[layer.name]?.position_x_relative || ''}
+                                          onChange={(e) => {
+                                            const newValue = e.target.value;
+                                            const newLayerValues = {
+                                              ...layerValues,
+                                              [layer.name]: { ...(layerValues[layer.name] || {}), position_x_relative: newValue }
+                                            };
+                                            
+                                            setLayerValues(newLayerValues);
+                                            updatePreview(newLayerValues);
+                                          }}
+                                          className="text-xs"
+                                        />
+                                      </div>
+                                      
+                                      <div className="space-y-2">
+                                        <Label className="text-xs text-gray-600">Y Relative</Label>
+                                        <Input
+                                          placeholder="+10px or -10px"
+                                          value={layerValues[layer.name]?.position_y_relative || ''}
+                                          onChange={(e) => {
+                                            const newValue = e.target.value;
+                                            const newLayerValues = {
+                                              ...layerValues,
+                                              [layer.name]: { ...(layerValues[layer.name] || {}), position_y_relative: newValue }
+                                            };
+                                            
+                                            setLayerValues(newLayerValues);
+                                            updatePreview(newLayerValues);
+                                          }}
+                                          className="text-xs"
+                                        />
+                                      </div>
+                                    </div>
+                                  </div>
+
+                                  {/* Size Controls - Two per row */}
+                                  <div className="space-y-3">
+                                    <Label className="text-xs font-medium">Size</Label>
+                                    
+                                    <div className="grid grid-cols-2 gap-4">
+                                      <div className="space-y-2">
+                                        <Label className="text-xs text-gray-600">Width</Label>
+                                        <Input
+                                          placeholder="50% or +10px or 100px"
+                                          value={layerValues[layer.name]?.width || ''}
+                                          onChange={(e) => {
+                                            const newValue = e.target.value;
+                                            const newLayerValues = {
+                                              ...layerValues,
+                                              [layer.name]: { ...(layerValues[layer.name] || {}), width: newValue }
+                                            };
+                                            
+                                            setLayerValues(newLayerValues);
+                                            updatePreview(newLayerValues);
+                                          }}
+                                          className="text-xs"
+                                        />
+                                      </div>
+                                      
+                                      <div className="space-y-2">
+                                        <Label className="text-xs text-gray-600">Height</Label>
+                                        <Input
+                                          placeholder="50% or +10px or 100px"
+                                          value={layerValues[layer.name]?.height || ''}
+                                          onChange={(e) => {
+                                            const newValue = e.target.value;
+                                            const newLayerValues = {
+                                              ...layerValues,
+                                              [layer.name]: { ...(layerValues[layer.name] || {}), height: newValue }
+                                            };
+                                            
+                                            setLayerValues(newLayerValues);
+                                            updatePreview(newLayerValues);
+                                          }}
+                                          className="text-xs"
+                                        />
+                                      </div>
+                                    </div>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          </div>
                         ) : (
-                          <div className="text-xs text-gray-500">Unsupported layer type</div>
+                          <div className="text-center text-sm text-gray-500 py-4">
+                            Layer is hidden
+                          </div>
                         )}
                       </div>
                     ))}
                   </div>
+                  
+                  {/* Show message when all layers are hidden */}
+                  {placidTemplateUuid && (() => {
+                    const selectedTemplate = placidTemplates.find(pt => (pt.uuid || pt.id) === placidTemplateUuid);
+                    const layers = selectedTemplate?.layers || [];
+                    const allLayersHidden = layers.length > 0 && layers.every(layer => layerValues[layer.name]?.hide);
+                    
+                    if (allLayersHidden) {
+                      return (
+                        <div className="text-center text-sm text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-900/20 p-3 rounded border">
+                          ⚠️ All layers are currently hidden. The generated image will use only the template's default content.
+                        </div>
+                      );
+                    }
+                    return null;
+                  })()}
+                  
                   <div className="flex gap-3">
                     <Button 
                       onClick={async () => {
@@ -2358,17 +2746,99 @@ const ImagesPage: React.FC = () => {
                           const layers = tmpl?.layers || [];
                           const layersData: Record<string, any> = {};
                           
-                          // Build layers object for backend
+                          // Build layers object for backend - only include layers from current template
                           Object.entries(layerValues).forEach(([name, v]) => {
-                            if (v.text && v.text.trim() !== '') layersData[name] = { text: v.text };
-                            if (v.image && v.image.trim() !== '') layersData[name] = { ...(layersData[name] || {}), image: v.image };
+                            // Only process layers that exist in the current template
+                            const layerExists = layers.some(layer => layer.name === name);
+                            if (!layerExists) return;
+                            
+                            // Start with empty object
+                            layersData[name] = {};
+                            
+                            // Only add hide if it's true (not default false)
+                            if (v.hide === true) {
+                              layersData[name].hide = true;
+                            }
+                            
+                            // Only add opacity if it's not the default (100)
+                            if (v.opacity !== undefined && v.opacity !== 100) {
+                              layersData[name].opacity = v.opacity;
+                            }
+                            
+                            // Only add rotation if it's not the default (0)
+                            if (v.rotation !== undefined && v.rotation !== 0) {
+                              layersData[name].rotation = v.rotation;
+                            }
+                            
+                            // Only add position properties if they have values
+                            if (v.position_x_absolute && v.position_x_absolute.trim() !== '') {
+                              layersData[name].position_x_absolute = v.position_x_absolute;
+                            }
+                            if (v.position_y_absolute && v.position_y_absolute.trim() !== '') {
+                              layersData[name].position_y_absolute = v.position_y_absolute;
+                            }
+                            if (v.position_x_relative && v.position_x_relative.trim() !== '') {
+                              layersData[name].position_x_relative = v.position_x_relative;
+                            }
+                            if (v.position_y_relative && v.position_y_relative.trim() !== '') {
+                              layersData[name].position_y_relative = v.position_y_relative;
+                            }
+                            
+                            // Only add size properties if they have values
+                            if (v.width && v.width.trim() !== '') {
+                              layersData[name].width = v.width;
+                            }
+                            if (v.height && v.height.trim() !== '') {
+                              layersData[name].height = v.height;
+                            }
+                            
+                            // Add text and image properties if not hidden
+                            if (!v.hide) {
+                              if (v.text && v.text.trim() !== '') layersData[name].text = v.text;
+                              if (v.image && v.image.trim() !== '') layersData[name].image = v.image;
+                            }
                           });
                           
                           // Ensure img layer is set at minimum
                           const imgLayer = layers.find(l => l.name === 'img')?.name || selectedTemplateLayers.image || layers.find(l => l.type === 'picture')?.name || 'img';
                           if (!layersData[imgLayer]) {
                             const imgVal = layerValues[imgLayer]?.image || previewImage?.url;
-                            if (imgVal && imgVal.trim() !== '') layersData[imgLayer] = { image: imgVal };
+                            if (imgVal && imgVal.trim() !== '') {
+                              layersData[imgLayer] = { 
+                                image: imgVal
+                              };
+                              
+                              // Only add hide if it's true (not default false)
+                              if (layerValues[imgLayer]?.hide === true) {
+                                layersData[imgLayer].hide = true;
+                              }
+                              
+                              // Only add non-default control values
+                              if (layerValues[imgLayer]?.opacity !== undefined && layerValues[imgLayer]?.opacity !== 100) {
+                                layersData[imgLayer].opacity = layerValues[imgLayer]?.opacity;
+                              }
+                              if (layerValues[imgLayer]?.rotation !== undefined && layerValues[imgLayer]?.rotation !== 0) {
+                                layersData[imgLayer].rotation = layerValues[imgLayer]?.rotation;
+                              }
+                              if (layerValues[imgLayer]?.position_x_absolute && layerValues[imgLayer]?.position_x_absolute.trim() !== '') {
+                                layersData[imgLayer].position_x_absolute = layerValues[imgLayer]?.position_x_absolute;
+                              }
+                              if (layerValues[imgLayer]?.position_y_absolute && layerValues[imgLayer]?.position_y_absolute.trim() !== '') {
+                                layersData[imgLayer].position_y_absolute = layerValues[imgLayer]?.position_y_absolute;
+                              }
+                              if (layerValues[imgLayer]?.position_x_relative && layerValues[imgLayer]?.position_x_relative.trim() !== '') {
+                                layersData[imgLayer].position_x_relative = layerValues[imgLayer]?.position_x_relative;
+                              }
+                              if (layerValues[imgLayer]?.position_y_relative && layerValues[imgLayer]?.position_y_relative.trim() !== '') {
+                                layersData[imgLayer].position_y_relative = layerValues[imgLayer]?.position_y_relative;
+                              }
+                              if (layerValues[imgLayer]?.width && layerValues[imgLayer]?.width.trim() !== '') {
+                                layersData[imgLayer].width = layerValues[imgLayer]?.width;
+                              }
+                              if (layerValues[imgLayer]?.height && layerValues[imgLayer]?.height.trim() !== '') {
+                                layersData[imgLayer].height = layerValues[imgLayer]?.height;
+                              }
+                            }
                           }
                           
                           const response = await axios.post(

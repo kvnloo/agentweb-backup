@@ -9,6 +9,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2025-08-12',
     changes: [
+      'Added comprehensive layer field controls for Placid image editing',
+      '- Complete control over layer properties including opacity, rotation, positioning, sizing, and visibility',
+      '- Folded interface design with content inputs always visible and advanced controls expandable on demand',
+      '- Real-time preview updates for all layer property changes',
       'Provide direct links to partner portal for task and execution management',
       '- Admin users with delegate access can now see manage icons on task details and execution records',
       '- Settings icons provide direct links to partner portal for task and execution management',
