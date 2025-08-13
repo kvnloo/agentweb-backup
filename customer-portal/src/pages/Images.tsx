@@ -311,25 +311,35 @@ const ImagesPage: React.FC = () => {
           }
         });
         
-        // ALWAYS use the current preview image for the main image layer
-        if (selectedTemplateLayers.image && previewImage?.url) {
-          prefill[selectedTemplateLayers.image] = { 
-            ...prefill[selectedTemplateLayers.image],
-            image: previewImage.url 
-          };
-        }
+        // For recreation mode, respect the stored image URLs
+        // For new creation mode, use the current preview image as fallback
+        const isRecreationMode = Object.keys(layerValues).length > 0 && 
+                                 Object.values(layerValues).some(v => v.image && v.image.trim() !== '');
         
-        // Also force any non-logo picture layer to use current preview image
-        Object.entries(layerValues).forEach(([layerName, v]) => {
-          if (v.image && layerName !== 'logo' && previewImage?.url) {
-            prefill[layerName] = { 
-              ...prefill[layerName],
+        if (!isRecreationMode) {
+          // Only override with current preview image for new creation mode
+          if (selectedTemplateLayers.image && previewImage?.url) {
+            prefill[selectedTemplateLayers.image] = { 
+              ...prefill[selectedTemplateLayers.image],
               image: previewImage.url 
             };
           }
-        });
+          
+          // Also force any non-logo picture layer to use current preview image for new creation
+          Object.entries(layerValues).forEach(([layerName, v]) => {
+            if (v.image && layerName !== 'logo' && previewImage?.url) {
+              prefill[layerName] = { 
+                ...prefill[layerName],
+                image: previewImage.url 
+              };
+            }
+          });
+        }
         
         if (Object.keys(prefill).length > 0) {
+          console.log('Preview prefill data:', prefill);
+          console.log('Is recreation mode:', isRecreationMode);
+          console.log('Layer values:', layerValues);
           instance.fillLayers(prefill);
         }
         
@@ -390,25 +400,35 @@ const ImagesPage: React.FC = () => {
       }
     });
     
-    // ALWAYS use the current preview image for image layers
-    if (selectedTemplateLayers.image && previewImage?.url) {
-      prefill[selectedTemplateLayers.image] = { 
-        ...prefill[selectedTemplateLayers.image],
-        image: previewImage.url 
-      };
-    }
+    // For recreation mode, respect the stored image URLs
+    // For new creation mode, use the current preview image as fallback
+    const isRecreationMode = Object.keys(valuesToUse).length > 0 && 
+                             Object.values(valuesToUse).some(v => v.image && v.image.trim() !== '');
     
-    // Force any non-logo picture layer to use current preview image
-    Object.entries(valuesToUse).forEach(([layerName, v]) => {
-      if (v.image && layerName !== 'logo' && previewImage?.url) {
-        prefill[layerName] = { 
-          ...prefill[layerName],
+    if (!isRecreationMode) {
+      // Only override with current preview image for new creation mode
+      if (selectedTemplateLayers.image && previewImage?.url) {
+        prefill[selectedTemplateLayers.image] = { 
+          ...prefill[selectedTemplateLayers.image],
           image: previewImage.url 
         };
       }
-    });
+      
+      // Force any non-logo picture layer to use current preview image for new creation
+      Object.entries(valuesToUse).forEach(([layerName, v]) => {
+        if (v.image && layerName !== 'logo' && previewImage?.url) {
+          prefill[layerName] = { 
+            ...prefill[layerName],
+            image: previewImage.url 
+          };
+        }
+      });
+    }
     
     if (Object.keys(prefill).length > 0) {
+      console.log('UpdatePreview prefill data:', prefill);
+      console.log('Is recreation mode:', isRecreationMode);
+      console.log('Values to use:', valuesToUse);
       previewInstanceRef.current.fillLayers(prefill);
     }
   };
