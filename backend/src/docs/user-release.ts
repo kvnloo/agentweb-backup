@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-08-13',
+    changes: [
+      'Added Create Variation with Placid feature',
+      '- Users can now create variations of images using the same Placid template and configuration',
+      '- Create Variation icon (refresh icon) appears next to Archive icon for images created with Placid',
+      '- Clicking create variation opens the Placid editor with all previous settings pre-populated',
+      '- Users can modify the configuration to create variations or recreate the exact same image',
+    ],
+  },
+  {
     date: '2025-08-12',
     changes: [
       'Added comprehensive layer field controls for Placid image editing',

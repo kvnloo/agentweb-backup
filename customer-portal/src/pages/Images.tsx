@@ -28,6 +28,12 @@ interface ResultFile {
   approval_status?: 'pending' | 'approved' | 'needs_changes' | null;
   slack_message_ts?: string | null;
   approval_channel?: string | null;
+  placid_config?: {
+    template_uuid: string;
+    layers: Record<string, Record<string, string | boolean | number>>;
+    source_image_url?: string;
+    original_filename?: string;
+  };
 }
 
 type AssetType = 'image' | 'video' | 'html' | 'text' | 'pdf' | 'other';
@@ -142,6 +148,7 @@ const ImagesPage: React.FC = () => {
   const [isSubmittingRevision, setIsSubmittingRevision] = useState(false);
   // Placid Canvas states
   const [editorDialogOpen, setEditorDialogOpen] = useState(false);
+  const [isRecreationMode, setIsRecreationMode] = useState(false);
 
   const [placidToken, setPlacidToken] = useState<string | null>(null);
   const [placidTemplateUuid, setPlacidTemplateUuid] = useState<string | null>(null);
@@ -218,6 +225,8 @@ const ImagesPage: React.FC = () => {
       setRevisionPrompt('');
     }
   }, [imagePreviewOpen]);
+
+
 
   // Simple preview system - load SDK and create preview when template changes
   useEffect(() => {
@@ -303,23 +312,26 @@ const ImagesPage: React.FC = () => {
           }
         });
         
-        // ALWAYS use the current preview image for the main image layer
-        if (selectedTemplateLayers.image && previewImage?.url) {
-          prefill[selectedTemplateLayers.image] = { 
-            ...prefill[selectedTemplateLayers.image],
-            image: previewImage.url 
-          };
-        }
-        
-        // Also force any non-logo picture layer to use current preview image
-        Object.entries(layerValues).forEach(([layerName, v]) => {
-          if (v.image && layerName !== 'logo' && previewImage?.url) {
-            prefill[layerName] = { 
-              ...prefill[layerName],
+        // Use the simple flag to determine mode
+        if (!isRecreationMode) {
+          // Only override with current preview image for new creation mode
+          if (selectedTemplateLayers.image && previewImage?.url) {
+            prefill[selectedTemplateLayers.image] = { 
+              ...prefill[selectedTemplateLayers.image],
               image: previewImage.url 
             };
           }
-        });
+          
+          // Also force any non-logo picture layer to use current preview image for new creation
+          Object.entries(layerValues).forEach(([layerName, v]) => {
+            if (v.image && layerName !== 'logo' && previewImage?.url) {
+              prefill[layerName] = { 
+                ...prefill[layerName],
+                image: previewImage.url 
+              };
+            }
+          });
+        }
         
         if (Object.keys(prefill).length > 0) {
           instance.fillLayers(prefill);
@@ -382,23 +394,26 @@ const ImagesPage: React.FC = () => {
       }
     });
     
-    // ALWAYS use the current preview image for image layers
-    if (selectedTemplateLayers.image && previewImage?.url) {
-      prefill[selectedTemplateLayers.image] = { 
-        ...prefill[selectedTemplateLayers.image],
-        image: previewImage.url 
-      };
-    }
-    
-    // Force any non-logo picture layer to use current preview image
-    Object.entries(valuesToUse).forEach(([layerName, v]) => {
-      if (v.image && layerName !== 'logo' && previewImage?.url) {
-        prefill[layerName] = { 
-          ...prefill[layerName],
+    // Use the simple flag to determine mode
+    if (!isRecreationMode) {
+      // Only override with current preview image for new creation mode
+      if (selectedTemplateLayers.image && previewImage?.url) {
+        prefill[selectedTemplateLayers.image] = { 
+          ...prefill[selectedTemplateLayers.image],
           image: previewImage.url 
         };
       }
-    });
+      
+      // Force any non-logo picture layer to use current preview image for new creation
+      Object.entries(valuesToUse).forEach(([layerName, v]) => {
+        if (v.image && layerName !== 'logo' && previewImage?.url) {
+          prefill[layerName] = { 
+            ...prefill[layerName],
+            image: previewImage.url 
+          };
+        }
+      });
+    }
     
     if (Object.keys(prefill).length > 0) {
       previewInstanceRef.current.fillLayers(prefill);
@@ -833,6 +848,131 @@ const ImagesPage: React.FC = () => {
   const handleArchiveCancel = () => {
     setArchiveDialogOpen(false);
     setPendingArchiveImage(null);
+  };
+
+  const loadPlacidTemplates = async (taskId: string) => {
+    try {
+      setPreviewLoading(true);
+      setEditorError(null);
+      
+      // Load brand data if not already loaded
+      if (brandAssets.length === 0) {
+        await loadTaskCreationData();
+      }
+      
+      // First, fetch templates so user can choose
+      const tpls = await axios.get(buildApiUrl(`/api/tasks/${taskId}/placid/templates`), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const allItems: PlacidTemplate[] = Array.isArray(tpls.data?.data) ? tpls.data.data : (tpls.data?.items || tpls.data?.data?.items || []);
+      
+      // Filter templates based on environment
+      const isDev = import.meta.env.DEV || import.meta.env.VITE_API_URL?.includes('localhost');
+      const envPrefix = isDev ? 'Dev -' : 'Prod -';
+      const filteredItems = allItems
+        .filter(item => {
+          const title = item.title || item.name || '';
+          return title.startsWith(envPrefix);
+        })
+        .map(item => ({
+          ...item,
+          // Strip the environment prefix for display
+          title: item.title?.startsWith(envPrefix) ? item.title.substring(envPrefix.length).trim() : item.title,
+          name: item.name?.startsWith(envPrefix) ? item.name.substring(envPrefix.length).trim() : item.name
+        }));
+      
+      setPlacidTemplates(filteredItems);
+      
+      if (filteredItems.length === 0) {
+        setEditorError(`No Placid templates found for ${isDev ? 'development' : 'production'} environment. Please configure templates with "${envPrefix}" prefix.`);
+        setPreviewLoading(false);
+        return false;
+      }
+      
+      // If we have a pre-selected template, set it up
+      if (placidTemplateUuid) {
+        const current = filteredItems.find(t => (t.uuid || t.id) === placidTemplateUuid);
+        if (current) {
+          const layers = current?.layers || [];
+          const textLayer = layers.find(l => l.type === 'text')?.name || layers.find(l => l.name === 'title')?.name;
+          const imageLayer = layers.find(l => l.name === 'img')?.name || layers.find(l => l.type === 'picture')?.name;
+          const logoLayer = layers.find(l => l.name === 'logo')?.name;
+          setSelectedTemplateLayers({ text: textLayer, image: imageLayer, logo: logoLayer });
+          
+          // Get editor token for the selected template
+          const resp = await axios.get(buildApiUrl(`/api/tasks/${taskId}/placid/editor-token?template_uuid=${placidTemplateUuid}`), {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          setPlacidToken(resp.data.token);
+        }
+      }
+      
+      return true;
+    } catch (e: any) {
+      console.error('Failed to init editor token', e);
+      setEditorError(e?.response?.data?.message || 'Failed to initialize editor');
+      return false;
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
+  const handleCreateVariation = (file: ResultFile, taskId: string, executionId: string) => {
+    if (!file.placid_config) return;
+    
+    // Set the preview image to the current file
+    setPreviewImage({
+      url: file.url,
+      filename: file.filename,
+      taskId: taskId,
+      executionId: executionId
+    });
+    
+    // Pre-populate the Placid configs
+    setPlacidTemplateUuid(file.placid_config.template_uuid);
+    
+    // Transform the stored config to match the expected layerValues format
+    const formattedLayerValues: Record<string, { 
+      text?: string; 
+      image?: string; 
+      hide?: boolean; 
+      opacity?: number; 
+      rotation?: number; 
+      position_x_absolute?: string; 
+      position_y_absolute?: string; 
+      position_x_relative?: string; 
+      position_y_relative?: string; 
+      width?: string; 
+      height?: string; 
+      _expanded?: boolean;
+    }> = {};
+    
+    Object.entries(file.placid_config.layers).forEach(([layerName, layerProps]) => {
+      formattedLayerValues[layerName] = {
+        text: typeof layerProps === 'object' && 'text' in layerProps ? String(layerProps.text) : undefined,
+        image: typeof layerProps === 'object' && 'image' in layerProps ? String(layerProps.image) : undefined,
+        hide: typeof layerProps === 'object' && 'hide' in layerProps ? Boolean(layerProps.hide) : false,
+        opacity: typeof layerProps === 'object' && 'opacity' in layerProps ? Number(layerProps.opacity) : 100,
+        rotation: typeof layerProps === 'object' && 'rotation' in layerProps ? Number(layerProps.rotation) : 0,
+        position_x_absolute: typeof layerProps === 'object' && 'position_x_absolute' in layerProps ? String(layerProps.position_x_absolute) : '',
+        position_y_absolute: typeof layerProps === 'object' && 'position_y_absolute' in layerProps ? String(layerProps.position_y_absolute) : '',
+        position_x_relative: typeof layerProps === 'object' && 'position_x_relative' in layerProps ? String(layerProps.position_x_relative) : '',
+        position_y_relative: typeof layerProps === 'object' && 'position_y_relative' in layerProps ? String(layerProps.position_y_relative) : '',
+        width: typeof layerProps === 'object' && 'width' in layerProps ? String(layerProps.width) : '',
+        height: typeof layerProps === 'object' && 'height' in layerProps ? String(layerProps.height) : '',
+        _expanded: false
+      };
+    });
+    
+    setLayerValues(formattedLayerValues);
+    
+    // Open the editor dialog and load templates
+    setIsRecreationMode(true); // This is variation mode
+    setEditorDialogOpen(true);
+    // Small delay to ensure dialog is fully rendered, then load templates
+    setTimeout(() => {
+      loadPlacidTemplates(taskId);
+    }, 100);
   };
 
   const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -1666,6 +1806,18 @@ const ImagesPage: React.FC = () => {
                                     </div>
                                   );
                                 })()}
+                              {/* Recreate Icon - Only show for images with Placid configs */}
+                              {file.placid_config && (
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-8 w-8 p-0 hover:bg-gray-100 dark:hover:bg-gray-800"
+                                                          onClick={() => handleCreateVariation(file, task.taskId, execution.executionId)}
+                        title="Create Variation with Placid"
+                                >
+                                  <RefreshCw className="h-4 w-4 text-gray-400 hover:text-blue-500" />
+                                </Button>
+                              )}
                               <Button
                                 variant="ghost"
                                 size="sm"
@@ -1972,96 +2124,30 @@ const ImagesPage: React.FC = () => {
                     className="h-8 px-2 bg-gray-800 text-white hover:bg-gray-700"
                     onClick={async () => {
                       setEditorError(null);
+                      setIsRecreationMode(false); // This is new creation, not recreation
                       setEditorDialogOpen(true);
                       
                       // Small delay to ensure dialog is fully rendered
                       await new Promise(resolve => setTimeout(resolve, 100));
                       
                       if (!token || !previewImage) return;
-                      try {
-                        setPreviewLoading(true);
-                        
-                        // Load brand data if not already loaded
-                        if (brandAssets.length === 0) {
-                          await loadTaskCreationData();
-                        }
-                        
-                        // First, fetch templates so user can choose
-                        const tpls = await axios.get(buildApiUrl(`/api/tasks/${previewImage.taskId}/placid/templates`), {
-                          headers: { Authorization: `Bearer ${token}` },
-                        });
-                        const allItems: PlacidTemplate[] = Array.isArray(tpls.data?.data) ? tpls.data.data : (tpls.data?.items || tpls.data?.data?.items || []);
-                        
-                        // Filter templates based on environment
-                        const isDev = import.meta.env.DEV || import.meta.env.VITE_API_URL?.includes('localhost');
-                        const envPrefix = isDev ? 'Dev -' : 'Prod -';
-                        const filteredItems = allItems
-                          .filter(item => {
-                            const title = item.title || item.name || '';
-                            return title.startsWith(envPrefix);
-                          })
-                          .map(item => ({
-                            ...item,
-                            // Strip the environment prefix for display
-                            title: item.title?.startsWith(envPrefix) ? item.title.substring(envPrefix.length).trim() : item.title,
-                            name: item.name?.startsWith(envPrefix) ? item.name.substring(envPrefix.length).trim() : item.name
-                          }));
-                        
-                        setPlacidTemplates(filteredItems);
-                        
-                        if (filteredItems.length === 0) {
-                          setEditorError(`No Placid templates found for ${isDev ? 'development' : 'production'} environment. Please configure templates with "${envPrefix}" prefix.`);
-                          setPreviewLoading(false);
-                          return;
-                        }
-                        
-                        // Preselect first template if none selected yet
-                        if (!placidTemplateUuid) {
-                          const first = filteredItems[0];
-                          const firstId = (first?.uuid || first?.id) as string | undefined;
-                          if (firstId) {
-                            setPlacidTemplateUuid(firstId);
-                            const layers = first?.layers || [];
-                            const textLayer = layers.find(l => l.type === 'text')?.name || layers.find(l => l.name === 'title')?.name;
-                            const imageLayer = layers.find(l => l.name === 'img')?.name || layers.find(l => l.type === 'picture')?.name;
-                            const logoLayer = layers.find(l => l.name === 'logo')?.name;
-                            setSelectedTemplateLayers({ text: textLayer, image: imageLayer, logo: logoLayer });
-                            // Prefill layerValues for inputs, preserving any existing values
-                            setLayerValues(prev => {
-                              const next = { ...prev } as Record<string, { text?: string; image?: string; hide?: boolean }>;
-                              layers.forEach(layer => {
-                                if (layer.type === 'text') {
-                                  if (!next[layer.name]) next[layer.name] = {};
-                                  if (next[layer.name].text === undefined) next[layer.name].text = '';
-                                }
-                                if (layer.type === 'picture') {
-                                  if (!next[layer.name]) next[layer.name] = {};
-                                  // Always prefill main image layer with current preview image
-                                  if (layer.name === 'logo' && !next[layer.name].image && brandAssets?.length > 0) {
-                                    // Auto-fill logo field with brand logo if available
-                                    const logoAssets = brandAssets.filter(asset => asset.type === 'logo' || asset.type === 'secondaryLogo');
-                                    if (logoAssets.length > 0) {
-                                      next[layer.name].image = logoAssets[0].url;
-                                    }
-                                  } else if (layer.name !== 'logo' && !next[layer.name].image && previewImage?.url) {
-                                    // For any non-logo picture layer, use the current preview image
-                                    next[layer.name].image = previewImage.url;
-                                  } else if (next[layer.name].image === undefined) {
-                                    next[layer.name].image = '';
-                                  }
-                                }
-                              });
-                              return next;
-                            });
-                          }
-                        } else {
-                          const current = filteredItems.find(t => (t.uuid || t.id) === placidTemplateUuid);
-                          const layers = current?.layers || [];
+                      
+                      // Use the shared function to load templates
+                      await loadPlacidTemplates(previewImage.taskId);
+                      
+                      // If no template is selected yet, preselect the first one
+                      if (!placidTemplateUuid && placidTemplates.length > 0) {
+                        const first = placidTemplates[0];
+                        const firstId = (first?.uuid || first?.id) as string | undefined;
+                        if (firstId) {
+                          setPlacidTemplateUuid(firstId);
+                          const layers = first?.layers || [];
                           const textLayer = layers.find(l => l.type === 'text')?.name || layers.find(l => l.name === 'title')?.name;
                           const imageLayer = layers.find(l => l.name === 'img')?.name || layers.find(l => l.type === 'picture')?.name;
                           const logoLayer = layers.find(l => l.name === 'logo')?.name;
                           setSelectedTemplateLayers({ text: textLayer, image: imageLayer, logo: logoLayer });
-                          // Update layerValues with defaults if missing
+                          
+                          // Prefill layerValues for inputs, preserving any existing values
                           setLayerValues(prev => {
                             const next = { ...prev } as Record<string, { text?: string; image?: string; hide?: boolean }>;
                             layers.forEach(layer => {
@@ -2089,20 +2175,6 @@ const ImagesPage: React.FC = () => {
                             return next;
                           });
                         }
-                        
-                        // Now get the token for the selected template
-                        const selectedTemplateId = placidTemplateUuid || filteredItems[0]?.uuid || filteredItems[0]?.id;
-                        if (selectedTemplateId) {
-                          const resp = await axios.get(buildApiUrl(`/api/tasks/${previewImage.taskId}/placid/editor-token?template_uuid=${selectedTemplateId}`), {
-                            headers: { Authorization: `Bearer ${token}` },
-                          });
-                          setPlacidToken(resp.data.token);
-                        }
-                      } catch (e: any) {
-                        console.error('Failed to init editor token', e);
-                        setEditorError(e?.response?.data?.message || 'Failed to initialize editor');
-                      } finally {
-                        setPreviewLoading(false);
                       }
                     }}
                     title="Edit with Placid"
@@ -2203,8 +2275,14 @@ const ImagesPage: React.FC = () => {
       }}>
         <DialogContent className="sm:max-w-[90vw] max-h-[90vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>Template Preview</DialogTitle>
-            <DialogDescription>Select a template to create your ad image.</DialogDescription>
+            <DialogTitle>
+              {previewImage && Object.keys(layerValues).length > 0 ? 'Edit with Placid' : 'Template Preview'}
+            </DialogTitle>
+            <DialogDescription>
+              {previewImage && Object.keys(layerValues).length > 0 
+                ? 'Edit your image using the Placid template editor. You can modify text, images, and visual properties.' 
+                : 'Select a template to create your ad image.'}
+            </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
             {editorError && (
@@ -2801,12 +2879,18 @@ const ImagesPage: React.FC = () => {
                           
                           // Ensure img layer is set at minimum
                           const imgLayer = layers.find(l => l.name === 'img')?.name || selectedTemplateLayers.image || layers.find(l => l.type === 'picture')?.name || 'img';
-                          if (!layersData[imgLayer]) {
+                          
+                          // Always ensure the img layer has the image property
+                          if (imgLayer) {
                             const imgVal = layerValues[imgLayer]?.image || previewImage?.url;
                             if (imgVal && imgVal.trim() !== '') {
-                              layersData[imgLayer] = { 
-                                image: imgVal
-                              };
+                              // Initialize if doesn't exist
+                              if (!layersData[imgLayer]) {
+                                layersData[imgLayer] = {};
+                              }
+                              
+                              // Always set the image property
+                              layersData[imgLayer].image = imgVal;
                               
                               // Only add hide if it's true (not default false)
                               if (layerValues[imgLayer]?.hide === true) {
@@ -2846,6 +2930,7 @@ const ImagesPage: React.FC = () => {
                             { 
                               template_uuid: placidTemplateUuid,
                               layers: layersData,
+                              source_image_url: previewImage.url,
                               original_filename: previewImage.filename
                             },
                             { headers: { Authorization: `Bearer ${token}` } }

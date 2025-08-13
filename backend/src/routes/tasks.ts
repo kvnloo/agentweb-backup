@@ -61,6 +61,12 @@ interface ResultFile {
   is_html?: boolean;
   is_favorited?: boolean;
   is_archived?: boolean;
+  placid_config?: {
+    template_uuid: string;
+    layers: Record<string, Record<string, string | boolean | number>>;
+    source_image_url?: string;
+    original_filename?: string;
+  };
 }
 
 // Public routes (no authentication required)

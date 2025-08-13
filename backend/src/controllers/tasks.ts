@@ -1381,6 +1381,12 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
       filename: `${filenameBase}.${ext}`,
       token: randomToken,
       is_html: false,
+      placid_config: {
+        template_uuid: tplUuid,
+        layers: layers || {},
+        source_image_url: source_image_url,
+        original_filename: original_filename
+      }
     };
 
     const current = execution.result_files || [];
