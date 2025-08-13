@@ -917,7 +917,7 @@ const ImagesPage: React.FC = () => {
     }
   };
 
-  const handleRecreateImage = (file: ResultFile, taskId: string, executionId: string) => {
+  const handleCreateVariation = (file: ResultFile, taskId: string, executionId: string) => {
     if (!file.placid_config) return;
     
     // Set the preview image to the current file
@@ -967,7 +967,7 @@ const ImagesPage: React.FC = () => {
     setLayerValues(formattedLayerValues);
     
     // Open the editor dialog and load templates
-    setIsRecreationMode(true); // This is recreation mode
+    setIsRecreationMode(true); // This is variation mode
     setEditorDialogOpen(true);
     // Small delay to ensure dialog is fully rendered, then load templates
     setTimeout(() => {
@@ -1812,8 +1812,8 @@ const ImagesPage: React.FC = () => {
                                   variant="ghost"
                                   size="sm"
                                   className="h-8 w-8 p-0 hover:bg-gray-100 dark:hover:bg-gray-800"
-                                  onClick={() => handleRecreateImage(file, task.taskId, execution.executionId)}
-                                  title="Recreate with Placid"
+                                                          onClick={() => handleCreateVariation(file, task.taskId, execution.executionId)}
+                        title="Create Variation with Placid"
                                 >
                                   <RefreshCw className="h-4 w-4 text-gray-400 hover:text-blue-500" />
                                 </Button>
