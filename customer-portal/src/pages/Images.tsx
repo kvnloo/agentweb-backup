@@ -148,6 +148,7 @@ const ImagesPage: React.FC = () => {
   const [isSubmittingRevision, setIsSubmittingRevision] = useState(false);
   // Placid Canvas states
   const [editorDialogOpen, setEditorDialogOpen] = useState(false);
+  const [isRecreationMode, setIsRecreationMode] = useState(false);
 
   const [placidToken, setPlacidToken] = useState<string | null>(null);
   const [placidTemplateUuid, setPlacidTemplateUuid] = useState<string | null>(null);
@@ -311,11 +312,7 @@ const ImagesPage: React.FC = () => {
           }
         });
         
-        // For recreation mode, respect the stored image URLs
-        // For new creation mode, use the current preview image as fallback
-        const isRecreationMode = Object.keys(layerValues).length > 0 && 
-                                 Object.values(layerValues).some(v => v.image && v.image.trim() !== '');
-        
+        // Use the simple flag to determine mode
         if (!isRecreationMode) {
           // Only override with current preview image for new creation mode
           if (selectedTemplateLayers.image && previewImage?.url) {
@@ -397,11 +394,7 @@ const ImagesPage: React.FC = () => {
       }
     });
     
-    // For recreation mode, respect the stored image URLs
-    // For new creation mode, use the current preview image as fallback
-    const isRecreationMode = Object.keys(valuesToUse).length > 0 && 
-                             Object.values(valuesToUse).some(v => v.image && v.image.trim() !== '');
-    
+    // Use the simple flag to determine mode
     if (!isRecreationMode) {
       // Only override with current preview image for new creation mode
       if (selectedTemplateLayers.image && previewImage?.url) {
@@ -974,6 +967,7 @@ const ImagesPage: React.FC = () => {
     setLayerValues(formattedLayerValues);
     
     // Open the editor dialog and load templates
+    setIsRecreationMode(true); // This is recreation mode
     setEditorDialogOpen(true);
     // Small delay to ensure dialog is fully rendered, then load templates
     setTimeout(() => {
@@ -2130,6 +2124,7 @@ const ImagesPage: React.FC = () => {
                     className="h-8 px-2 bg-gray-800 text-white hover:bg-gray-700"
                     onClick={async () => {
                       setEditorError(null);
+                      setIsRecreationMode(false); // This is new creation, not recreation
                       setEditorDialogOpen(true);
                       
                       // Small delay to ensure dialog is fully rendered
