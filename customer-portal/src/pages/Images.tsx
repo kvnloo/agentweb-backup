@@ -337,9 +337,6 @@ const ImagesPage: React.FC = () => {
         }
         
         if (Object.keys(prefill).length > 0) {
-          console.log('Preview prefill data:', prefill);
-          console.log('Is recreation mode:', isRecreationMode);
-          console.log('Layer values:', layerValues);
           instance.fillLayers(prefill);
         }
         
@@ -426,9 +423,6 @@ const ImagesPage: React.FC = () => {
     }
     
     if (Object.keys(prefill).length > 0) {
-      console.log('UpdatePreview prefill data:', prefill);
-      console.log('Is recreation mode:', isRecreationMode);
-      console.log('Values to use:', valuesToUse);
       previewInstanceRef.current.fillLayers(prefill);
     }
   };
