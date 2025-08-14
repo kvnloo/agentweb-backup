@@ -11,6 +11,10 @@ AgentWeb is a powerful web automation platform that allows users to create and m
 - 📊 Real-time task monitoring and alerts
 - 🔐 MFA for AgentWeb account security
 - 🔌 API Integration support - connect with external APIs
+- 🎨 AI Image Generation support
+  - OpenAI GPT Image for general image generation and editing
+  - FLUX Kontext Max via ReelMind API for high-quality image generation
+  - Support for both text-to-image and image-to-image generation
 - 👥 Admin dashboard for user management and analytics
   - User overview and management
   - Waitlist management with email invitations
@@ -103,6 +107,64 @@ Example task prompt that uses an API integration:
 ```
 Get my latest GitHub repositories and create a report. Use my GitHub API integration to access the data.
 ```
+
+### AI Image Generation
+
+AgentWeb supports multiple AI image generation models:
+
+#### OpenAI GPT Image
+- **Action**: `Generate image with input images using OpenAI GPT Image`
+- **Capabilities**: Text-to-image, image editing, multi-image combination
+- **Supported formats**: PNG, JPG, JPEG, GIF, BMP, WEBP
+- **Sizes**: 1024x1024, 1536x1024, 1024x1536, auto
+- **Quality**: low, medium, high, auto
+
+#### FLUX Kontext Max (ReelMind)
+- **Action**: `Generate image using FLUX Kontext Max`
+- **Capabilities**: High-quality text-to-image and image-to-image generation
+- **Supported formats**: PNG, JPG, JPEG, GIF, BMP, WEBP (for input images)
+- **Aspect ratios**: 16:9, 9:16, 1:1, 4:3, 3:2, 2:3, custom
+- **Features**: Advanced guidance scale control, negative prompts, seed control
+- **API Pattern**: Task-based generation with status polling for completion
+
+Example task prompts for image generation:
+
+```
+Generate a professional logo for my tech startup using FLUX Kontext Max. The logo should be modern, minimalist, and use blue and white colors.
+```
+
+```
+Transform this product photo into a futuristic style with neon lighting effects using FLUX Kontext Max.
+```
+
+**Note**: FLUX Kontext Max requires a `REELMIND_API_KEY` environment variable to be set in the agent-engine.
+
+## Technical Implementation Details
+
+### API Request Structure
+```json
+{
+  "prompt": "Image description",
+  "model_id": "FLUX Kontext Max",
+  "aspect_ratio": "16:9",
+  "guidance_scale": 3.5,
+  "negative_prompt": "Optional negative prompt",
+  "seed": 12345,
+  "image_url": "Optional input image URL for image-to-image"
+}
+```
+
+### Response Handling
+- **Task-Based API**: API always returns a task ID for status tracking
+- **Status Polling**: Poll task status endpoint until completion
+- **Result Download**: Download generated image once task is completed
+- **Error Handling**: Comprehensive error handling with S3 cleanup
+
+### S3 Integration
+- Input images uploaded to `image_inputs/` folder
+- Unique filenames generated using UUID
+- Automatic cleanup after processing (success or failure)
+- Support for multiple image formats (PNG, JPG, JPEG, GIF, BMP, WEBP)
 
 For detailed documentation, please refer to our [Design Document](./design.md).
 
@@ -245,6 +307,12 @@ This creates a public URL that Slack can use to send approval button interaction
 cd partner-portal
 npm install
 ```
+
+2. **Image Generation Model Selection**: The partner-portal now includes support for selecting image generation models when creating tasks:
+   - **OpenAI GPT Image**: Default model for general image generation and editing
+   - **FLUX Kontext Max**: High-quality image generation via ReelMind API
+   - Model selection is available in both task creation and template management
+   - Templates can specify preferred image generation models for consistent results
 
 2. Configure environment variables:
 

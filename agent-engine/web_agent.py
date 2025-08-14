@@ -3177,6 +3177,291 @@ class WebAgent:
                 logger.error(f"Error generating image: {e}")
                 return ActionResult(error=f"Failed to generate image: {str(e)}")
 
+        @self.controller.registry.action('Generate image using FLUX Kontext Max', param_model=GenerateImageParams)
+        async def generate_image_flux(params: GenerateImageParams) -> ActionResult:
+            """Generate images using FLUX Kontext Max via ReelMind API.
+            
+            This action uses FLUX Kontext Max to generate high-quality images based on text prompts.
+            The generated image is saved to the downloads folder.
+            
+            Parameters:
+            - params: GenerateImageParams containing:
+              - input_file_names: List of input image file names for image-to-image generation (optional)
+              - prompt: Description of what image to generate
+              - output_file_name: Name of the output image file to save in downloads folder
+              - size: Image size (will be converted to aspect ratio)
+              - quality: Image quality (not used by FLUX, kept for compatibility)
+            
+            Returns:
+            - ActionResult with the generation results or error message
+            """
+            try:
+                import requests
+                import json
+                
+                # Get API key
+                api_key = os.getenv('REELMIND_API_KEY')
+                if not api_key:
+                    return ActionResult(error="REELMIND_API_KEY environment variable is not set (Do not retry - this is a permanent failure)")
+                
+                # Validate output file extension (must end with .png)
+                output_ext = Path(params.output_file_name).suffix.lower()
+                if output_ext != ".png":
+                    return ActionResult(error=f"Output file extension '{output_ext}' must be '.png'. Please rename the file to end with .png")
+                
+                # Get downloads path for output
+                downloads_path = self._get_downloads_path()
+                output_path = Path(downloads_path) / params.output_file_name
+                
+                # Prepare request data
+                request_data = {
+                    "prompt": params.prompt,
+                    "model_id": "FLUX Kontext Max",  # FLUX Kontext Max model
+                    "guidance_scale": 3.5  # Default guidance scale
+                }
+                
+                # Convert size to aspect ratio if provided
+                if params.size and params.size != "auto":
+                    size_mapping = {
+                        "1024x1024": "1:1",
+                        "1536x1024": "3:2", 
+                        "1024x1536": "2:3",
+                        "16:9": "16:9",
+                        "9:16": "9:16",
+                        "4:3": "4:3",
+                        "3:4": "3:4"
+                    }
+                    if params.size in size_mapping:
+                        request_data["aspect_ratio"] = size_mapping[params.size]
+                    else:
+                        # Try to parse custom dimensions
+                        try:
+                            width, height = map(int, params.size.split('x'))
+                            if width > height:
+                                request_data["aspect_ratio"] = f"{width}:{height}"
+                            else:
+                                request_data["aspect_ratio"] = f"{height}:{width}"
+                        except:
+                            # Default to 1:1 if parsing fails
+                            request_data["aspect_ratio"] = "1:1"
+                else:
+                    # Default aspect ratio
+                    request_data["aspect_ratio"] = "1:1"
+                
+                # Handle image-to-image generation if input images are provided
+                if params.input_file_names and len(params.input_file_names) > 0:
+                    # For now, we'll use the first input image for image-to-image generation
+                    # FLUX Kontext Max supports image-to-image generation
+                    input_file_name = params.input_file_names[0]
+                    
+                    # Try to get file path from attachments first, then downloads
+                    input_file_path = await self._get_attachment_path(input_file_name)
+                    
+                    if not input_file_path:
+                        # If not found in attachments, try downloads path
+                        input_file_path = Path(downloads_path) / input_file_name
+                        
+                        if not input_file_path.exists():
+                            return ActionResult(error=f"Input image file {input_file_name} not found in task attachments or downloads folder")
+                    
+                    # Check if file is an image
+                    file_ext = Path(input_file_name).suffix.lower()
+                    if file_ext not in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp']:
+                        return ActionResult(error=f"File {input_file_name} is not a supported image format. Supported formats: PNG, JPG, JPEG, GIF, BMP, WEBP")
+                    
+                    # Upload image to S3 to get a public URL for the API
+                    from task_utils import get_s3_client
+                    
+                    s3_client = get_s3_client()
+                    s3_bucket = os.getenv('AWS_S3_BUCKET')
+                    
+                    if not s3_bucket:
+                        return ActionResult(error="AWS_S3_BUCKET environment variable is not set (Do not retry - this is a permanent failure)")
+                    
+                    # Generate unique S3 key for the image
+                    import uuid
+                    unique_filename = f"flux_input_{uuid.uuid4()}{file_ext}"
+                    s3_key = f"image_inputs/{unique_filename}"
+                    
+                    # Upload image to S3
+                    try:
+                        # Determine content type
+                        mime_map = {
+                            '.png': 'image/png',
+                            '.jpg': 'image/jpeg', 
+                            '.jpeg': 'image/jpeg',
+                            '.gif': 'image/gif',
+                            '.bmp': 'image/bmp',
+                            '.webp': 'image/webp'
+                        }
+                        content_type = mime_map.get(file_ext, 'image/png')
+                        
+                        s3_client.upload_file(
+                            input_file_path,
+                            s3_bucket,
+                            s3_key,
+                            ExtraArgs={'ContentType': content_type}
+                        )
+                        
+                        # Generate public URL
+                        image_url = f"https://{s3_bucket}.s3.amazonaws.com/{s3_key}"
+                        logger.info(f"Uploaded input image to S3: {image_url}")
+                        
+                        # Add image URL to request data for image-to-image generation
+                        request_data["image_url"] = image_url
+                        
+                    except Exception as e:
+                        return ActionResult(error=f"Failed to upload image to S3: {str(e)} (Do not retry - this is a permanent failure)")
+                
+                # Make request to ReelMind API
+                headers = {
+                    "Authorization": api_key,
+                    "Content-Type": "application/json"
+                }
+                
+                logger.info(f"Sending request to ReelMind API for FLUX Kontext Max: {request_data}")
+                response = requests.post(
+                    "https://nestapi.reelmind.ai/external-api/image/generate",
+                    headers=headers,
+                    json=request_data,
+                    timeout=60
+                )
+                
+                if int(response.status_code) not in [200, 201]:
+                    error_msg = f"ReelMind API request failed with status {response.status_code}: {response.text}"
+                    logger.error(error_msg)
+                    return ActionResult(error=error_msg)
+                
+                response_data = response.json()
+                
+                # The ReelMind API always returns a task ID that needs to be queried for results
+                if "data" in response_data and "task_id" in response_data["data"]:
+                    # Task-based response - poll for completion
+                    task_id = response_data["data"]["task_id"]
+                    logger.info(f"FLUX Kontext Max task created with ID: {task_id}")
+                    
+                    # Poll for completion
+                    max_attempts = 60  # 5 minutes max (5 second intervals)
+                    attempt = 0
+                    
+                    while attempt < max_attempts:
+                        time.sleep(5)  # Wait 5 seconds between polls
+                        attempt += 1
+                        
+                        # Check task status
+                        status_response = requests.get(
+                            f"https://nestapi.reelmind.ai/external-api/image/task/{task_id}",
+                            headers=headers,
+                            timeout=10
+                        )
+                        
+                        if int(status_response.status_code) not in [200, 201]:
+                            logger.warning(f"Status check failed: {status_response.status_code} - {status_response.text}")
+                            continue
+                        
+                        status_data = status_response.json()
+                        task_status = status_data.get("data", {}).get("status")
+                        
+                        logger.info(f"FLUX Kontext Max task {task_id} status: {task_status} (attempt {attempt}/{max_attempts})")
+                        
+                        if task_status == "completed":
+                            # Extract image URL from the response
+                            output_result = status_data.get("data", {}).get("output_result", {})
+                            image_url = output_result.get("image_url")
+                            if image_url:
+                                # Download the image
+                                image_response = requests.get(image_url, timeout=60)
+                                if image_response.status_code == 200:
+                                    with open(output_path, 'wb') as f:
+                                        f.write(image_response.content)
+                                    
+                                    # Clean up the uploaded input image from S3 if it exists
+                                    if 's3_key' in locals():
+                                        try:
+                                            s3_client.delete_object(Bucket=s3_bucket, Key=s3_key)
+                                            logger.info(f"Cleaned up input image from S3: {s3_key}")
+                                        except Exception as cleanup_error:
+                                            logger.warning(f"Failed to clean up input image from S3: {cleanup_error}")
+                                    
+                                    logger.info(f"FLUX Kontext Max image saved to: {output_path}")
+                                    
+                                    # Upload the generated image to S3 and get the URL
+                                    result_files = []
+                                    if self.current_execution_id:
+                                        result_files = upload_task_result_files(downloads_path, self.current_execution_id)
+                                    
+                                    # Find the uploaded file info for our generated image
+                                    uploaded_file_info = None
+                                    for file_info in result_files:
+                                        if file_info.get('filename') == params.output_file_name:
+                                            uploaded_file_info = file_info
+                                            break
+                                    
+                                    # Create success message
+                                    if uploaded_file_info and uploaded_file_info.get('url'):
+                                        success_msg = f"✅ Image {params.output_file_name} generated successfully using FLUX Kontext Max! It has been uploaded and available at {uploaded_file_info['url']}. You MUST use the URL to refer this image in any HTML or Markdown content."
+                                        logger.info(f"Generated image uploaded to S3: {uploaded_file_info['url']}")
+                                    else:
+                                        success_msg = f"✅ Image {params.output_file_name} generated successfully using FLUX Kontext Max and saved to downloads folder!"
+                                        logger.warning("Could not retrieve S3 URL for generated image")
+                                    
+                                    return ActionResult(extracted_content=success_msg)
+                                else:
+                                    return ActionResult(error=f"Failed to download image from URL: {image_url} (Do not retry - this is a permanent failure)")
+                            else:
+                                return ActionResult(error="Image completed but no image_url provided (Do not retry - this is a permanent failure)")
+                        
+                        elif task_status == "failed":
+                            error_msg = status_data.get("error", "Image generation failed.")
+                            # Clean up the uploaded input image from S3 if it exists
+                            if 's3_key' in locals():
+                                try:
+                                    s3_client.delete_object(Bucket=s3_bucket, Key=s3_key)
+                                    logger.info(f"Cleaned up input image from S3 after failure: {s3_key}")
+                                except Exception as cleanup_error:
+                                    logger.warning(f"Failed to clean up input image from S3 after failure: {cleanup_error}")
+                            return ActionResult(error=f"FLUX Kontext Max image generation failed: {error_msg} (Do not retry - this is a permanent failure)")
+                        
+                        elif task_status in ["pending", "processing"]:
+                            # Continue polling
+                            continue
+                        else:
+                            logger.warning(f"Unknown task status: {task_status}")
+                            continue
+                    
+                    # If we get here, we've exceeded max attempts
+                    # Clean up the uploaded input image from S3 if it exists
+                    if 's3_key' in locals():
+                        try:
+                            s3_client.delete_object(Bucket=s3_bucket, Key=s3_key)
+                            logger.info(f"Cleaned up input image from S3 after timeout: {s3_key}")
+                        except Exception as cleanup_error:
+                            logger.warning(f"Failed to clean up input image from S3 after timeout: {cleanup_error}")
+                    return ActionResult(error=f"FLUX Kontext Max image generation timed out after {max_attempts * 5} seconds (Do not retry - this is a permanent failure)")
+                
+                else:
+                    # Unexpected response format
+                    return ActionResult(error=f"Unexpected response format from ReelMind API: {response_data} (Do not retry - this is a permanent failure)")
+                
+            except requests.exceptions.RequestException as e:
+                # Clean up the uploaded input image from S3 if it exists
+                if 's3_key' in locals():
+                    try:
+                        s3_client.delete_object(Bucket=s3_bucket, Key=s3_key)
+                        logger.info(f"Cleaned up input image from S3 after request error: {s3_key}")
+                    except Exception as cleanup_error:
+                        logger.warning(f"Failed to clean up input image from S3 after request error: {cleanup_error}")
+                return ActionResult(error=f"ReelMind API request error: {str(e)} (Do not retry - this is a permanent failure)")
+            except Exception as e:
+                # Clean up the uploaded input image from S3 if it exists
+                if 's3_key' in locals():
+                    try:
+                        s3_client.delete_object(Bucket=s3_bucket, Key=s3_key)
+                        logger.info(f"Cleaned up input image from S3 after error: {s3_key}")
+                    except Exception as cleanup_error:
+                        logger.warning(f"Failed to clean up input image from S3 after error: {cleanup_error}")
+                return ActionResult(error=f"FLUX Kontext Max image generation error: {str(e)} (Do not retry - this is a permanent failure)")
+
     def _get_cookies_path(self):
         """Get the path to the user's cookies file"""
         if not self.user_id:

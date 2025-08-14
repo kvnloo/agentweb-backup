@@ -125,6 +125,7 @@ interface TaskTemplate {
   updateKnowledgeBase?: boolean;
   updateLeadList?: boolean;
   createVideo?: boolean;
+  imageGenerationModel?: string;
 }
 
 interface UserWithCounts extends User {
