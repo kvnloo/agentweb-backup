@@ -59,6 +59,7 @@ const MetaCampaigns = () => {
   const [isLoading, setIsLoading] = useState(true);
   const [hasAdAccount, setHasAdAccount] = useState(false);
   const [adPerformance, setAdPerformance] = useState<AdPerformance[]>([]);
+  const [adSetsData, setAdSetsData] = useState<any[]>([]);
   const [campaignSummary, setCampaignSummary] = useState<CampaignSummary | null>(null);
   const [selectedTimeframe, setSelectedTimeframe] = useState("7d");
 
@@ -120,6 +121,7 @@ const MetaCampaigns = () => {
         headers: { Authorization: `Bearer ${token}` }
       });
       setAdPerformance(response.data.adPerformance);
+      setAdSetsData(response.data.adSetsData || []);
       setCampaignSummary(response.data.campaignSummary);
     } catch (error: any) {
       console.error("Error fetching ad performance", error);
@@ -423,6 +425,86 @@ const MetaCampaigns = () => {
                       </td>
                       <td className="py-3 px-4 text-right">
                         {ad.frequency.toFixed(2)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Ad Sets Performance Table */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center space-x-2">
+            <Zap className="h-5 w-5" />
+            <span>Ad Sets Performance</span>
+          </CardTitle>
+          <CardDescription>
+            Ad set-level performance metrics and targeting information
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {adSetsData.length === 0 ? (
+            <div className="text-center py-8 text-gray-500">
+              <BarChart3 className="h-12 w-12 mx-auto mb-4 text-gray-300" />
+              <p>No ad sets data available for the selected timeframe.</p>
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full border border-gray-200 rounded-lg">
+                <thead>
+                  <tr className="border-b bg-gray-100">
+                    <th className="text-left py-3 px-4 font-medium text-gray-700">Ad Set Name</th>
+                    <th className="text-left py-3 px-4 font-medium text-gray-700">Campaign</th>
+                    <th className="text-left py-3 px-4 font-medium text-gray-700">Status</th>
+                    <th className="text-right py-3 px-4 font-medium text-gray-700">Impressions</th>
+                    <th className="text-right py-3 px-4 font-medium text-gray-700">Clicks</th>
+                    <th className="text-right py-3 px-4 font-medium text-gray-700">CTR</th>
+                    <th className="text-right py-3 px-4 font-medium text-gray-700">Spend</th>
+                    <th className="text-right py-3 px-4 font-medium text-gray-700">CPC</th>
+                    <th className="text-right py-3 px-4 font-medium text-gray-700">Reach</th>
+                    <th className="text-right py-3 px-4 font-medium text-gray-700">Frequency</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {adSetsData.map((adSet) => (
+                    <tr key={adSet.id} className="border-b hover:bg-blue-50 hover:text-gray-900 transition-colors duration-150">
+                      <td className="py-3 px-4">
+                        <div className="font-medium">{adSet.name}</div>
+                      </td>
+                      <td className="py-3 px-4">
+                        <div className="font-medium">{adSet.campaignName}</div>
+                      </td>
+                      <td className="py-3 px-4">
+                        <Badge
+                          variant={adSet.status === "ACTIVE" ? "default" : "secondary"}
+                        >
+                          {adSet.status}
+                        </Badge>
+                      </td>
+                      <td className="py-3 px-4 text-right">
+                        {formatNumber(adSet.impressions)}
+                      </td>
+                      <td className="py-3 px-4 text-right">
+                        {formatNumber(adSet.clicks)}
+                      </td>
+                      <td className="py-3 px-4 text-right">
+                        {formatPercentage(adSet.ctr)}
+                      </td>
+                      <td className="py-3 px-4 text-right">
+                        {formatCurrency(adSet.spend)}
+                      </td>
+                      <td className="py-3 px-4 text-right">
+                        {formatCurrency(adSet.cpc)}
+                      </td>
+                      <td className="py-3 px-4 text-right">
+                        {formatNumber(adSet.reach)}
+                      </td>
+                      <td className="py-3 px-4 text-right">
+                        {adSet.frequency.toFixed(2)}
                       </td>
                     </tr>
                   ))}
