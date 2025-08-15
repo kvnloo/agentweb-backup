@@ -41,7 +41,7 @@ def send_task_approval_request(task_id, task_name, execution_id, html_report_url
             'filename': filename,
             'assetType': 'html',
             'executionId': execution_id,
-            'note': f'A report has been generated. Please review and approve.'
+            'note': f'A report has been generated. Please review and approve. Once approved, results will be automatically sent to all task subscribers. You can manage subscribers at: {os.getenv("CUSTOMER_FRONTEND_URL", "http://localhost:5174")}/tasks/{task_id}#subscribers'
         }
         
         # Send the approval request to the backend using JWT authentication
