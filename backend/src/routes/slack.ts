@@ -8,6 +8,8 @@ import {
   openFeedbackModal
 } from "../services/slackService";
 import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
+import { taskDb, subscriberDb } from "../services/db";
+import { emailService } from "../services/emailService";
 
 const router = express.Router();
 
@@ -207,6 +209,58 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
           'approved',
           user.username || user.id
         );
+
+        // Send email notifications to subscribers after approval
+        try {
+          if (approval && approval.executionId) {
+            console.log(`🔍 Looking up execution details for executionId: ${approval.executionId}`);
+            
+            // Get task information from the execution
+            const execution = await taskDb.getTaskExecutionById(approval.executionId);
+            if (execution) {
+              console.log(`✅ Found execution for taskId: ${execution.taskId}`);
+              
+              // Get task details
+              const task = await taskDb.getTaskById(execution.taskId);
+              if (task) {
+                console.log(`✅ Found task: ${task.name}`);
+                
+                // Get task subscribers
+                const subscribers = await subscriberDb.getTaskSubscribers(execution.taskId);
+                const subscriberEmails = subscribers ? subscribers.map(sub => sub.email) : [];
+                console.log(`📧 Found ${subscriberEmails.length} subscribers for task: ${execution.taskId}`);
+                
+                if (subscriberEmails.length > 0) {
+                  // Send task results to subscribers using common function
+                  for (const email of subscriberEmails) {
+                    try {
+                      await emailService.sendTaskExecutionEmail(
+                        email,
+                        approval.executionId
+                      );
+                      console.log(`📧 Task results sent to subscriber: ${email}`);
+                    } catch (error) {
+                      console.error(`Failed to send task results to ${email}:`, error);
+                      // Continue with other subscribers even if one fails
+                    }
+                  }
+                  console.log(`📧 Task results sent to ${subscriberEmails.length} subscribers for task: ${execution.taskId}`);
+                } else {
+                  console.log(`No subscribers to notify for task: ${execution.taskId}`);
+                }
+              } else {
+                console.log(`❌ Task not found for taskId: ${execution.taskId}`);
+              }
+            } else {
+              console.log(`❌ Execution not found for executionId: ${approval.executionId}`);
+            }
+          } else {
+            console.log(`❌ No executionId found in approval:`, approval);
+          }
+        } catch (error) {
+          console.error('Error sending approval notifications to subscribers:', error);
+          // Don't fail the approval if email notifications fail
+        }
 
         console.log(`✅ Approved: ${assetUrl} by ${user.username}`);
         res.status(200).json({

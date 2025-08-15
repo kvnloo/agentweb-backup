@@ -386,22 +386,6 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                                 logger.warning(f"No HTML report found for task {execution['taskId']} that requires approval")
                         except Exception as e:
                             logger.error(f"Failed to send Slack approval request for task {execution['taskId']}: {e}")
-                            # Fall back to email notifications if Slack fails
-                            if has_subscribers:
-                                from email_utils import notify_task_subscribers
-                                notify_task_subscribers(
-                                    task_id=execution['taskId'],
-                                    task_name=task['name'],
-                                    execution_status=status,
-                                    execution_id=execution_id,
-                                    result=result,
-                                    error=error,
-                                    start_time=start_time,
-                                    end_time=end_time,
-                                    new_info_summary=new_info_summary,
-                                    result_files=execution.get('result_files', []),
-                                    llm_name=llm_name
-                                )
                     
                     # Send detailed results to all subscribers (if any and not requiring approval)
                     if has_subscribers and not (task.get('requireApproval') and task.get('slackChannel')):
