@@ -12,6 +12,18 @@ const transporter = nodemailer.createTransport({
 });
 
 export const emailService = {
+  // Escape HTML content to make it safe for emails
+  escapeHtml(html: string): string {
+    if (!html) return '';
+    
+    return html
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  },
+
   async sendEmail(to: string, subject: string, text: string, html: string, cc?: string) {
     const mailOptions = {
       from: process.env.FROM_EMAIL,
@@ -122,5 +134,163 @@ export const emailService = {
     `;
 
     await this.sendEmail(recipientEmail, subject, text, html, cc);
+  },
+
+  async sendTaskExecutionEmail(
+    toEmail: string,
+    executionId: string
+  ) {
+    try {
+      // Import required services
+      const { taskDb } = require('../services/db');
+      
+      // Get environment variables
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      
+      // Fetch execution data
+      const execution = await taskDb.getTaskExecutionById(executionId);
+      if (!execution) {
+        throw new Error(`Execution not found: ${executionId}`);
+      }
+      
+      // Fetch task data
+      const task = await taskDb.getTaskById(execution.taskId);
+      if (!task) {
+        throw new Error(`Task not found: ${execution.taskId}`);
+      }
+      
+      // Create execution start/end time strings
+      const startTime = execution.startTime ? new Date(execution.startTime).toLocaleString() : 'Not available';
+      const completedTime = execution.completedAt ? new Date(execution.completedAt).toLocaleString() : 'Not available';
+    
+    // Calculate execution duration if both start and end times are available
+    let durationStr = '';
+    if (execution.startTime && execution.completedAt) {
+      const start = new Date(execution.startTime).getTime();
+      const end = new Date(execution.completedAt).getTime();
+      const durationMs = end - start;
+      const durationMinutes = Math.floor(durationMs / 60000);
+      const durationSeconds = Math.floor((durationMs % 60000) / 1000);
+      
+      if (durationMinutes > 0) {
+        durationStr = `<p><strong>Duration:</strong> ${durationMinutes} minutes ${durationSeconds} seconds</p>`;
+      } else {
+        durationStr = `<p><strong>Duration:</strong> ${durationSeconds} seconds</p>`;
+      }
+    }
+    
+    // Fetch HTML content from result_files
+    let htmlContentFromFile = '';
+    if (execution.result_files && execution.result_files.length > 0) {
+      for (const file of execution.result_files) {
+        if ((file.is_html || file.view_type === 'html') && file.url) {
+          try {
+            // Import fetch
+            const fetch = require('node-fetch');
+            const response = await fetch(file.url);
+            
+            if (response.ok) {
+              const fetchedHtmlContent = await response.text();
+              htmlContentFromFile = `
+                <div class="html-result">
+                  <h3>HTML Result File:</h3>
+                  ${fetchedHtmlContent}
+                </div>
+              `;
+              console.log(`Successfully fetched HTML content from ${file.url}`);
+              break; // Use the first HTML file found
+            } else {
+              console.error(`Failed to fetch HTML content from ${file.url}: ${response.statusText}`);
+              htmlContentFromFile = `
+                <div class="html-result">
+                  <h3>HTML Result File:</h3>
+                  <p><i>Error fetching HTML content: ${response.statusText}</i></p>
+                </div>
+              `;
+            }
+          } catch (error) {
+            console.error(`Error fetching HTML content from ${file.url}:`, error);
+            htmlContentFromFile = `
+              <div class="html-result">
+                <h3>HTML Result File:</h3>
+                <p><i>Error fetching HTML content</i></p>
+              </div>
+            `;
+          }
+          break; // Process only the first HTML file found, even if error
+        }
+      }
+    }
+    
+
+    
+        // Create HTML content for the email - matching agent-engine send_task_results style
+    const html = `
+      <html>
+      <head>
+        <style>
+          body { font-family: sans-serif; margin: 0; padding: 0; color: #333; background-color: #fff; }
+          .container { padding: 20px; background-color: #fdfdfd; }
+          .header { font-size: 1.5em; font-weight: bold; margin-bottom: 15px; color: #2c3e50; }
+          .details { margin-bottom: 20px; padding: 15px; border: 1px solid #eee; background-color: #f9f9f9; border-radius: 5px; }
+          .details p { margin: 5px 0; }
+          .section { margin-top: 20px; }
+          .section h3 { font-size: 1.2em; margin-top: 0; border-bottom: 2px solid #ecf0f1; padding-bottom: 8px; color: #34495e; }
+          pre { white-space: pre-wrap; word-wrap: break-word; background: #ecf0f1; padding: 15px; border-radius: 5px; font-size: 0.9em; color: #555; }
+          .html-result { border: 1px solid #ddd; padding: 10px; margin-top: 15px; border-radius: 5px; }
+          .html-result h3 { margin-top:0; }
+          .footer { margin-top: 25px; font-size: 0.9em; color: #7f8c8d; }
+          a { color: #3498db; text-decoration: none; }
+          a:hover { text-decoration: underline; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">Task Run Results for "${task.name}"</div>
+          <div class="details">
+            <p><strong>Status:</strong> ${execution.status.toUpperCase()}</p>
+            <p><strong>Started:</strong> ${startTime}</p>
+            <p><strong>Completed:</strong> ${completedTime}</p>
+            ${execution.llmName ? `<p><strong>LLM Used:</strong> ${execution.llmName}</p>` : ''}
+            ${durationStr ? `<p><strong>Duration:</strong> ${durationStr.replace(/<\/?p>|<\/?strong>/g, '')}</p>` : ''}
+          </div>
+          
+          ${execution.result ? `
+          <div class="section">
+            <h3>Results Summary:</h3>
+            <pre>${emailService.escapeHtml(execution.result)}</pre>
+          </div>
+          ` : ''}
+          
+          ${execution.error ? `
+          <div class="section">
+            <h3>Error Details:</h3>
+            <pre>${emailService.escapeHtml(execution.error)}</pre>
+          </div>
+          ` : ''}
+          
+          ${htmlContentFromFile ? `
+          <div class="section">
+            ${htmlContentFromFile}
+          </div>
+          ` : ''}
+          
+          <div class="footer">
+            <p>Manage task and history at: <a href="${customerFrontendUrl}/tasks/${task.taskId}">${customerFrontendUrl}/tasks/${task.taskId}</a></p>
+            <hr>
+            <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>
+          </div>
+        </div>
+      </body></html>
+    `;
+
+    const subject = `AgentWeb - Task Run Results: ${task.name}`;
+    const text = `Task: ${task.name}\nStatus: ${execution.status.toUpperCase()}\nManage task and history at: ${customerFrontendUrl}/tasks/${task.taskId}`;
+    
+    await this.sendEmail(toEmail, subject, text, html);
+    } catch (error) {
+      console.error(`Error sending task execution email to ${toEmail}:`, error);
+      throw error;
+    }
   }
 }; 

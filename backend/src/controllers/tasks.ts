@@ -51,7 +51,9 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       updateKnowledgeBase,
       updateLeadList,
       createVideo,
-      videoModel
+      videoModel,
+      requireApproval,
+      slackChannel
     } = req.body;
     
     // If templateId is provided, fetch the template and use its values
@@ -101,7 +103,9 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           updateLeadList: req.body.updateLeadList !== undefined ? Boolean(req.body.updateLeadList) : template.updateLeadList,
           createVideo: req.body.createVideo !== undefined ? Boolean(req.body.createVideo) : template.createVideo,
           videoModel: videoModel || null,
-          knowledgeBaseType: 'private', // Default to private for new tasks
+          knowledgeBaseType: 'private',
+          requireApproval: req.body.requireApproval !== undefined ? Boolean(req.body.requireApproval) : template.requireApproval || false,
+          slackChannel: req.body.slackChannel || template.slackChannel || null,
           createdAt: new Date().toISOString(),
           llmName: req.body.llmName || null,
           category: category || template.category,
@@ -148,7 +152,9 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       llmName: req.body.llmName || null,
       category: category,
       description: description,
-      selectedLLMs: selectedLLMs || null
+      selectedLLMs: selectedLLMs || null,
+      requireApproval: Boolean(requireApproval),
+      slackChannel: slackChannel || null
     };
 
     const createdTask = await taskDb.createTask(task);
@@ -332,6 +338,14 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
 
     if (req.body.isAgenticDevMode !== undefined) {
       updates.isAgenticDevMode = Boolean(req.body.isAgenticDevMode);
+    }
+    
+    if (req.body.requireApproval !== undefined) {
+      updates.requireApproval = Boolean(req.body.requireApproval);
+    }
+    
+    if (req.body.slackChannel !== undefined) {
+      updates.slackChannel = req.body.slackChannel || null;
     }
     
     // Check if we're unarchiving a task (changing status from 'archived' to 'active')
@@ -843,289 +857,19 @@ export const sendExecutionEmail = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ message: 'Execution not found for this task' });
     }
 
-    // Prepare email content
-    const siteDomain = process.env.FRONTEND_URL || 'http://localhost:5173';
-    const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
-    const landingSiteUrl = process.env.LANDING_SITE_URL || 'https://agentweb.pro';
-    const taskUrl = `${siteDomain}/tasks/${taskId}`;
-    const executionUrl = `${customerFrontendUrl}/tasks/${taskId}/executions/${executionId}/result`;
 
-    // Create execution start/end time strings
-    const startTime = execution.startTime ? new Date(execution.startTime).toLocaleString() : 'Not available';
-    const completedTime = execution.completedAt ? new Date(execution.completedAt).toLocaleString() : 'Not available';
     
-    // Calculate execution duration if both start and end times are available
-    let durationStr = '';
-    if (execution.startTime && execution.completedAt) {
-      const start = new Date(execution.startTime).getTime();
-      const end = new Date(execution.completedAt).getTime();
-      const durationMs = end - start;
-      const durationMinutes = Math.floor(durationMs / 60000);
-      const durationSeconds = Math.floor((durationMs % 60000) / 1000);
-      
-      if (durationMinutes > 0) {
-        durationStr = `<p><strong>Duration:</strong> ${durationMinutes} minutes ${durationSeconds} seconds</p>`;
-      } else {
-        durationStr = `<p><strong>Duration:</strong> ${durationSeconds} seconds</p>`;
-      }
-    }
+
     
-    // Fetch HTML content from result_files
-    let htmlContentFromFile = '';
-    if (execution.result_files && execution.result_files.length > 0) {
-      for (const file of execution.result_files) {
-        if ((file.is_html || file.view_type === 'html') && file.url) {
-          try {
-            // Import fetch
-            const fetch = require('node-fetch');
-            const response = await fetch(file.url);
-            
-            if (response.ok) {
-              const fetchedHtmlContent = await response.text();
-              htmlContentFromFile = `
-                <div class="html-result">
-                  <h3>HTML Result File:</h3>
-                  ${fetchedHtmlContent}
-                </div>
-              `;
-              console.log(`Successfully fetched HTML content from ${file.url}`);
-              break; // Use the first HTML file found
-            } else {
-              console.error(`Failed to fetch HTML content from ${file.url}: ${response.statusText}`);
-              htmlContentFromFile = `
-                <div class="html-result">
-                  <h3>HTML Result File:</h3>
-                  <p><i>Error fetching HTML content: ${response.statusText}</i></p>
-                </div>
-              `;
-            }
-          } catch (error) {
-            console.error(`Error fetching HTML content from ${file.url}:`, error);
-            htmlContentFromFile = `
-              <div class="html-result">
-                <h3>HTML Result File:</h3>
-                <p><i>Error fetching HTML content</i></p>
-              </div>
-            `;
-          }
-          break; // Process only the first HTML file found, even if error
-        }
-      }
-    }
-    
-    // Create HTML content for the email
-    const html = `
-      <!DOCTYPE html>
-      <html>
-        <head>
-          <meta charset="utf-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <style>
-            body {
-              font-family: Arial, sans-serif;
-              line-height: 1.6;
-              color: #333;
-              margin: 0;
-              padding: 0;
-              background-color: #fff;
-            }
-            .container {
-              padding: 20px;
-              background-color: #fdfdfd;
-            }
-            .header {
-              background-color: #1976d2;
-              color: white;
-              padding: 20px;
-              text-align: center;
-              border-radius: 4px 4px 0 0;
-            }
-            .content {
-              padding: 20px;
-              background: #fff;
-              border: 1px solid #ddd;
-              border-radius: 0 0 4px 4px;
-            }
-            .section {
-              margin-bottom: 20px;
-              padding-bottom: 20px;
-              border-bottom: 1px solid #eee;
-            }
-            .section:last-child {
-              border-bottom: none;
-            }
-            .section h3 {
-              margin-top: 0;
-              color: #1976d2;
-              border-bottom: 2px solid #ecf0f1;
-              padding-bottom: 8px;
-            }
-            .details-table {
-              width: 100%;
-              border-collapse: collapse;
-              margin-bottom: 20px;
-            }
-            .details-table th, .details-table td {
-              padding: 8px;
-              text-align: left;
-              border-bottom: 1px solid #ddd;
-            }
-            .details-table th {
-              background-color: #f5f5f5;
-            }
-            .status {
-              padding: 4px 8px;
-              border-radius: 4px;
-              font-weight: bold;
-              display: inline-block;
-            }
-            .status-completed {
-              background-color: #e8f5e9;
-              color: #2e7d32;
-            }
-            .status-failed {
-              background-color: #ffebee;
-              color: #c62828;
-            }
-            .status-running {
-              background-color: #e3f2fd;
-              color: #1565c0;
-            }
-            .status-pending {
-              background-color: #fff8e1;
-              color: #f57f17;
-            }
-            .pre-content {
-              background-color: #f5f5f5;
-              padding: 15px;
-              border-radius: 4px;
-              overflow-x: auto;
-              white-space: pre-wrap;
-              word-break: break-word;
-              font-family: monospace;
-              font-size: 0.9em;
-            }
-            .html-result {
-              border: 1px solid #ddd;
-              padding: 10px;
-              margin-top: 15px;
-              border-radius: 5px;
-              overflow: auto;
-            }
-            .html-result h3 {
-              margin-top: 0;
-              font-size: 1.2em;
-              border-bottom: 2px solid #ecf0f1;
-              padding-bottom: 8px;
-              color: #34495e;
-            }
-            .footer {
-              text-align: center;
-              margin-top: 20px;
-              color: #666;
-              font-size: 0.9em;
-            }
-            .button {
-              display: inline-block;
-              padding: 10px 20px;
-              background-color: #1976d2;
-              color: white;
-              text-decoration: none;
-              border-radius: 4px;
-              font-weight: bold;
-            }
-          </style>
-        </head>
-        <body>
-          <div class="container">
-            <div class="header">
-              <h2 style="margin:0;padding:0;font-size:24px;">Task Run Results: ${task.name}</h2>
-            </div>
-            <div class="content">
-              <div class="section">
-                <h3>Task Information</h3>
-                <table class="details-table">
-                  <tr>
-                    <th>Task Name</th>
-                    <td>${task.name}</td>
-                  </tr>
-                  <tr>
-                    <th>Task ID</th>
-                    <td>${taskId}</td>
-                  </tr>
-                  <tr>
-                    <th>Execution ID</th>
-                    <td>${executionId}</td>
-                  </tr>
-                  <tr>
-                    <th>Status</th>
-                    <td>
-                      <span class="status status-${execution.status.toLowerCase()}">${execution.status.toUpperCase()}</span>
-                    </td>
-                  </tr>
-                  <tr>
-                    <th>Started</th>
-                    <td>${startTime}</td>
-                  </tr>
-                  <tr>
-                    <th>Completed</th>
-                    <td>${completedTime}</td>
-                  </tr>
-                  ${execution.llmName ? `
-                  <tr>
-                    <th>LLM Used</th>
-                    <td>${execution.llmName}</td>
-                  </tr>` : ''}
-                  ${durationStr ? `
-                  <tr>
-                    <th>Duration</th>
-                    <td>${durationStr.replace(/<\/?p>|<\/?strong>/g, '')}</td>
-                  </tr>` : ''}
-                </table>
-              </div>
-              
-              ${execution.result ? `
-              <div class="section">
-                <h3>Results Summary</h3>
-                <div class="pre-content">${execution.result}</div>
-              </div>
-              ` : ''}
-              
-              ${execution.error ? `
-              <div class="section">
-                <h3>Error Details</h3>
-                <div class="pre-content" style="color:#c62828">${execution.error}</div>
-              </div>
-              ` : ''}
-              
-              ${htmlContentFromFile ? `
-              <div class="section">
-                ${htmlContentFromFile}
-              </div>
-              ` : ''}
-              
-              <div class="section" style="text-align: center;">
-                <a href="${executionUrl}" class="button">View Full Details</a>
-              </div>
-            </div>
-            <div class="footer">
-              <p>This email was sent from AgentWeb. You can reply directly to this email if you have any questions.</p>
-              <p>View <a href="${customerFrontendUrl}/tasks/${taskId}">task details</a> or go to <a href="${landingSiteUrl}">AgentWeb</a>.</p>
-            </div>
-          </div>
-        </body>
-      </html>
-    `;
+
 
     // Import emailService
     const { emailService } = require('../services/emailService');
     
-    // Send the email
-    await emailService.sendEmail(
+    // Send the email using common function
+    await emailService.sendTaskExecutionEmail(
       email,
-      `AgentWeb - Task Run Results: ${task.name}`,
-      `Task: ${task.name}\nStatus: ${execution.status.toUpperCase()}\nView details: ${executionUrl}`,
-      html
+      executionId
     );
     
     res.json({ message: `Execution details sent to ${email}` });

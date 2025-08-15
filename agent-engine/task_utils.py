@@ -39,6 +39,40 @@ global_use_vision = True
 # Initialize DynamoDB client
 dynamodb = get_dynamodb_resource()
 
+def create_jwt_token(user_id: str) -> str:
+    """
+    Create a JWT token for the given user_id using JWT_SECRET.
+    
+    Args:
+        user_id: The user ID to create the token for
+        
+    Returns:
+        JWT token string or None if creation fails
+    """
+    try:
+        import jwt
+        from datetime import datetime, timedelta
+        
+        jwt_secret = os.getenv('JWT_SECRET')
+        if not jwt_secret:
+            logger.error("JWT_SECRET environment variable not set")
+            return None
+            
+        # Create payload with user_id and expiration
+        payload = {
+            'userId': user_id,
+            'exp': datetime.utcnow() + timedelta(hours=1),  # Token expires in 1 hour
+            'iat': datetime.utcnow()
+        }
+        
+        # Create JWT token
+        token = jwt.encode(payload, jwt_secret, algorithm='HS256')
+        return token
+        
+    except Exception as e:
+        logger.error(f"Error creating JWT token: {e}")
+        return None
+
 def generate_content_hash(content: Any) -> str:
     """Generate a hash of the content to use as a filename.
     
