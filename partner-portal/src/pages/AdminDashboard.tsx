@@ -131,6 +131,7 @@ interface User {
   workflowCount?: number;
   isOAuthUser?: boolean; // Ensured from API structure
   stripe_customer_id?: string; // Added stripe_customer_id
+  adAccount?: string; // Meta ad account ID
 }
 
 // Define an interface for the task data shown in the admin tasks tab
@@ -425,6 +426,9 @@ export default function AdminDashboard() {
   const [editingSupportNoteUserId, setEditingSupportNoteUserId] = useState<string | null>(null);
   const [currentSupportNoteText, setCurrentSupportNoteText] = useState("");
   const [supportNoteEditLoading, setSupportNoteEditLoading] = useState(false);
+  const [editingAdAccountUserId, setEditingAdAccountUserId] = useState<string | null>(null);
+  const [currentAdAccountText, setCurrentAdAccountText] = useState("");
+  const [adAccountEditLoading, setAdAccountEditLoading] = useState(false);
   const [delegateAccessLoading, setDelegateAccessLoading] = useState<string | null>(null);
   const [emailToDelete, setEmailToDelete] = useState<string | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -934,6 +938,40 @@ export default function AdminDashboard() {
     }
   };
 
+  const handleSaveAdAccount = async (userId: string) => {
+    try {
+      setAdAccountEditLoading(true);
+      
+      // Validate Meta Ad Account ID format (should be a numeric string)
+      const adAccountId = currentAdAccountText.trim();
+      if (adAccountId && !/^\d+$/.test(adAccountId)) {
+        setError("Meta Ad Account ID must be a numeric value (e.g., 123456789012345)");
+        return;
+      }
+      
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/users/${userId}/ad-account`),
+        { adAccount: adAccountId },
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+
+      if (response.status === 200) {
+        // Update the user in the context
+        await loadUsers();
+        setSuccess("Ad account updated successfully!");
+        setEditingAdAccountUserId(null);
+        setCurrentAdAccountText("");
+      }
+    } catch (error: any) {
+      console.error("Error updating ad account:", error);
+      setError(error.response?.data?.message || "Failed to update ad account");
+    } finally {
+      setAdAccountEditLoading(false);
+    }
+  };
+
   const handleAccessCustomerPortal = async (userId: string) => {
     try {
       setDelegateAccessLoading(userId);
@@ -1326,6 +1364,7 @@ export default function AdminDashboard() {
                   <TableCell>Email</TableCell>
                   <TableCell>User ID</TableCell>
                   <TableCell>Stripe Customer ID</TableCell>
+                  <TableCell>Ad Account</TableCell>
                   <TableCell>Created</TableCell>
                   <TableCell>Last Login</TableCell>
                   <TableCell>Support Note</TableCell>
@@ -1341,7 +1380,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={13} align="center">
+                    <TableCell colSpan={14} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -1359,6 +1398,55 @@ export default function AdminDashboard() {
                         <TableCell>{user.email}</TableCell>
                         <TableCell>{user.userId}</TableCell>
                         <TableCell>{user.stripe_customer_id || "-"}</TableCell>
+                        <TableCell>
+                          {editingAdAccountUserId === user.userId ? (
+                            <>
+                                                              <TextField
+                                  size="small"
+                                  value={currentAdAccountText}
+                                  onChange={(e) => setCurrentAdAccountText(e.target.value)}
+                                  placeholder="Enter Meta Ad Account ID (e.g., 123456789012345)..."
+                                  sx={{ minWidth: 250 }}
+                                  disabled={adAccountEditLoading}
+                                  helperText="Meta Ad Account ID from business.facebook.com"
+                                />
+                              <IconButton
+                                size="small"
+                                onClick={() => handleSaveAdAccount(user.userId)}
+                                disabled={adAccountEditLoading}
+                                color="primary"
+                              >
+                                <CheckIcon />
+                              </IconButton>
+                              <IconButton
+                                size="small"
+                                onClick={() => {
+                                  setEditingAdAccountUserId(null);
+                                  setCurrentAdAccountText("");
+                                }}
+                                disabled={adAccountEditLoading}
+                              >
+                                <CloseIcon />
+                              </IconButton>
+                            </>
+                          ) : (
+                            <>
+                              <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
+                                {user.adAccount || "-"}
+                              </Typography>
+                              <IconButton
+                                size="small"
+                                onClick={() => {
+                                  setEditingAdAccountUserId(user.userId);
+                                  setCurrentAdAccountText(user.adAccount || "");
+                                }}
+                                disabled={adAccountEditLoading}
+                              >
+                                <EditIcon />
+                              </IconButton>
+                            </>
+                          )}
+                        </TableCell>
                         <TableCell>
                           {new Date(user.createdAt).toLocaleDateString()}
                         </TableCell>

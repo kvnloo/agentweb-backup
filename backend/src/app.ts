@@ -15,6 +15,7 @@ import stripeRoutes from "./routes/stripe";
 import brandRoutes from "./routes/brand";
 import marketStrategyRoutes from "./routes/marketStrategy";
 import slackRoutes from "./routes/slack";
+import metaRoutes from "./routes/meta";
 
 // Import the new controller
 import { viewExternalFile } from "./controllers/filesController";
@@ -82,6 +83,7 @@ app.use("/api/stripe", stripeRoutes);
 app.use("/api/brand", brandRoutes);
 app.use("/api/market-strategy", marketStrategyRoutes);
 app.use("/api/slack", slackRoutes);
+app.use("/api/meta", metaRoutes);
 
 // Health check endpoint
 app.get("/", (req, res) => {
