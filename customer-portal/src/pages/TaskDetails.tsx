@@ -29,6 +29,7 @@ import {
   Trash2,
   Settings,
   Edit,
+  Users,
 } from "lucide-react";
 import { toast } from "@/components/ui/use-toast";
 import ReactMarkdown from "react-markdown";
@@ -943,9 +944,10 @@ const TaskDetailsPage: React.FC = () => {
           <div className="mt-2">
             <a
               href="#subscribers"
-              className="text-sm text-blue-600 hover:text-blue-800 hover:underline"
+              className="text-sm text-blue-600 hover:text-blue-800 hover:underline flex items-center gap-1"
             >
-              📧 Manage Subscribers
+              <Users className="h-3.5 w-3.5" />
+              Manage Subscribers
             </a>
           </div>
         </CardHeader>
