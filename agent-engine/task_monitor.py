@@ -288,7 +288,7 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                 # Get task details
                 task = tasks_table.get_item(
                     Key={'taskId': execution['taskId']},
-                    ProjectionExpression='userId, #n, emailNotification',
+                    ProjectionExpression='userId, #n, emailNotification, requireApproval, slackChannel',
                     ExpressionAttributeNames={'#n': 'name'}
                 ).get('Item')
                 
@@ -354,8 +354,58 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                         else:
                             logger.error(f"User email not found for userId: {task['userId']}")
                     
-                    # Send detailed results to all subscribers
-                    if has_subscribers:
+                    # Check if task requires approval (regardless of subscribers)
+                    # This ensures approval requests are sent even for tasks with no subscribers
+                    if task.get('requireApproval') and task.get('slackChannel'):
+                        # Send Slack approval request instead of emails
+                        logger.info(f"Task {execution['taskId']} requires approval. Sending Slack approval request.")
+                        try:
+                            # Find the first HTML report in result_files
+                            html_report = None
+                            if execution.get('result_files'):
+                                for file_info in execution['result_files']:
+                                    # Check if file is HTML using view_type
+                                    if file_info.get('view_type') == 'html':
+                                        html_report = file_info
+                                        break
+                            
+                            if html_report:
+                                # Send Slack approval request
+                                from slack_utils import send_task_approval_request
+                                send_task_approval_request(
+                                    task_id=execution['taskId'],
+                                    task_name=task['name'],
+                                    execution_id=execution_id,
+                                    html_report_url=html_report['url'],
+                                    filename=html_report['filename'],
+                                    slack_channel=task['slackChannel'],
+                                    user_id=task['userId']
+                                )
+                                logger.info(f"Slack approval request sent for task {execution['taskId']}")
+                            else:
+                                logger.warning(f"No HTML report found for task {execution['taskId']} that requires approval")
+                        except Exception as e:
+                            logger.error(f"Failed to send Slack approval request for task {execution['taskId']}: {e}")
+                            # Fall back to email notifications if Slack fails
+                            if has_subscribers:
+                                from email_utils import notify_task_subscribers
+                                notify_task_subscribers(
+                                    task_id=execution['taskId'],
+                                    task_name=task['name'],
+                                    execution_status=status,
+                                    execution_id=execution_id,
+                                    result=result,
+                                    error=error,
+                                    start_time=start_time,
+                                    end_time=end_time,
+                                    new_info_summary=new_info_summary,
+                                    result_files=execution.get('result_files', []),
+                                    llm_name=llm_name
+                                )
+                    
+                    # Send detailed results to all subscribers (if any and not requiring approval)
+                    if has_subscribers and not (task.get('requireApproval') and task.get('slackChannel')):
+                        # Send regular email notifications
                         from email_utils import notify_task_subscribers
                         notify_task_subscribers(
                             task_id=execution['taskId'],
