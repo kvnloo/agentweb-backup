@@ -51,7 +51,9 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       updateKnowledgeBase,
       updateLeadList,
       createVideo,
-      videoModel
+      videoModel,
+      requireApproval,
+      slackChannel
     } = req.body;
     
     // If templateId is provided, fetch the template and use its values
@@ -101,7 +103,9 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           updateLeadList: req.body.updateLeadList !== undefined ? Boolean(req.body.updateLeadList) : template.updateLeadList,
           createVideo: req.body.createVideo !== undefined ? Boolean(req.body.createVideo) : template.createVideo,
           videoModel: videoModel || null,
-          knowledgeBaseType: 'private', // Default to private for new tasks
+          knowledgeBaseType: 'private',
+          requireApproval: req.body.requireApproval !== undefined ? Boolean(req.body.requireApproval) : template.requireApproval || false,
+          slackChannel: req.body.slackChannel || template.slackChannel || null,
           createdAt: new Date().toISOString(),
           llmName: req.body.llmName || null,
           category: category || template.category,
@@ -148,7 +152,9 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       llmName: req.body.llmName || null,
       category: category,
       description: description,
-      selectedLLMs: selectedLLMs || null
+      selectedLLMs: selectedLLMs || null,
+      requireApproval: Boolean(requireApproval),
+      slackChannel: slackChannel || null
     };
 
     const createdTask = await taskDb.createTask(task);
@@ -332,6 +338,14 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
 
     if (req.body.isAgenticDevMode !== undefined) {
       updates.isAgenticDevMode = Boolean(req.body.isAgenticDevMode);
+    }
+    
+    if (req.body.requireApproval !== undefined) {
+      updates.requireApproval = Boolean(req.body.requireApproval);
+    }
+    
+    if (req.body.slackChannel !== undefined) {
+      updates.slackChannel = req.body.slackChannel || null;
     }
     
     // Check if we're unarchiving a task (changing status from 'archived' to 'active')

@@ -28,6 +28,7 @@ import {
   Upload,
   Trash2,
   Settings,
+  Edit,
 } from "lucide-react";
 import { toast } from "@/components/ui/use-toast";
 import ReactMarkdown from "react-markdown";
@@ -36,6 +37,7 @@ import { Separator } from "@/components/ui/separator";
 import { TaskScheduler } from "@/components/tasks/TaskScheduler";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 
 // Define Execution Status type
 type ExecutionStatus =
@@ -109,6 +111,8 @@ interface Task {
   description?: string;
   templateId?: string;
   llmName?: string;
+  requireApproval?: boolean;
+  slackChannel?: string;
 }
 
 // Helper to get status badge variant (can be moved to utils)
@@ -200,6 +204,12 @@ const TaskDetailsPage: React.FC = () => {
   const [isRunning, setIsRunning] = useState(false);
   const [isUpdatingInteractive, setIsUpdatingInteractive] = useState(false);
 
+  // Require Approval state
+  const [isUpdatingApproval, setIsUpdatingApproval] = useState(false);
+  const [slackChannels, setSlackChannels] = useState<Array<{ id: string; name: string; displayName: string; isPrivate: boolean }>>([]);
+  const [loadingChannels, setLoadingChannels] = useState(false);
+  const [channelSelectionOpen, setChannelSelectionOpen] = useState(false);
+
   const [selectedInteraction, setSelectedInteraction] =
     useState<Interaction | null>(null);
   const [interactionError, setInteractionError] = useState("");
@@ -289,6 +299,13 @@ const TaskDetailsPage: React.FC = () => {
     return () => clearInterval(intervalId);
   }, [taskId, token, isInteracting]);
 
+  // Load Slack channels when component mounts
+  useEffect(() => {
+    if (token) {
+      loadSlackChannels();
+    }
+  }, [token]);
+
   const handleRunTask = async () => {
     if (!token || !taskId) {
       toast({
@@ -359,6 +376,102 @@ const TaskDetailsPage: React.FC = () => {
       });
     } finally {
       setIsUpdatingInteractive(false);
+    }
+  };
+
+  const loadSlackChannels = async () => {
+    setLoadingChannels(true);
+    try {
+      const response = await axios.get(buildApiUrl('/api/slack/channels'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setSlackChannels(response.data);
+    } catch (error: any) {
+      console.error('Error loading Slack channels:', error);
+      toast({
+        title: "Error Loading Channels",
+        description: "Could not load Slack channels. Please try again.",
+        variant: "destructive",
+      });
+    } finally {
+      setLoadingChannels(false);
+    }
+  };
+
+  const handleApprovalToggle = async () => {
+    if (!task) return;
+    setIsUpdatingApproval(true);
+    try {
+      const newValue = !task.requireApproval;
+      const updates: any = { requireApproval: newValue };
+      
+      // If enabling approval, open channel selection
+      if (newValue) {
+        // Load channels if not already loaded
+        if (slackChannels.length === 0) {
+          await loadSlackChannels();
+        }
+        // Open channel selection dialog
+        setChannelSelectionOpen(true);
+      } else {
+        // If disabling approval, clear the Slack channel
+        updates.slackChannel = null;
+        await axios.put(
+          buildApiUrl(`/api/tasks/${task.taskId}`),
+          updates,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        // Refresh task data from server to ensure consistency
+        await fetchTaskAndExecutions();
+        toast({ title: "Success", description: "Require Approval setting updated." });
+      }
+    } catch (err) {
+      toast({
+        title: "Error",
+        description: "Failed to update Require Approval setting.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsUpdatingApproval(false);
+    }
+  };
+
+  const handleSlackChannelSelect = async (channelId: string) => {
+    if (!task) return;
+    setIsUpdatingApproval(true);
+    try {
+      const selectedChannel = slackChannels.find(ch => ch.id === channelId);
+      const channelName = selectedChannel?.name || channelId;
+      
+      // Update both requireApproval and slackChannel
+      await axios.put(
+        buildApiUrl(`/api/tasks/${task.taskId}`),
+        { 
+          requireApproval: true,
+          slackChannel: channelId 
+        },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      // Refresh task data from server to ensure consistency
+      await fetchTaskAndExecutions();
+      setChannelSelectionOpen(false);
+      toast({ title: "Success", description: `Require Approval enabled and Slack channel set to ${channelName}` });
+    } catch (err) {
+      toast({
+        title: "Error",
+        description: "Failed to update Slack channel.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsUpdatingApproval(false);
+    }
+  };
+
+  const handleCancelApproval = () => {
+    setChannelSelectionOpen(false);
+    // If the user cancels after enabling approval, revert the setting
+    if (task && task.requireApproval && !task.slackChannel) {
+      setTask({ ...task, requireApproval: false });
     }
   };
 
@@ -864,6 +977,62 @@ const TaskDetailsPage: React.FC = () => {
               </span>
             )}
           </div>
+          
+          {/* Require Approval Section */}
+          <div className="flex items-center gap-2 mb-2">
+            <Switch
+              id="require-approval"
+              checked={!!task.requireApproval}
+              onCheckedChange={handleApprovalToggle}
+              disabled={isUpdatingApproval}
+            />
+            <Label htmlFor="require-approval">Require Approval</Label>
+            {isUpdatingApproval && (
+              <span className="text-xs text-muted-foreground ml-2">
+                Updating...
+              </span>
+            )}
+          </div>
+          
+          {/* Slack Channel Selection */}
+          {task.requireApproval && (
+            <div className="mb-4">
+              <Label className="text-sm font-medium">Slack Channel for Approval</Label>
+              <div className="flex items-center gap-2 mt-1">
+                {task.slackChannel ? (
+                  <>
+                    <span className="text-sm text-muted-foreground">
+                      {slackChannels.find(ch => ch.id === task.slackChannel)?.name || task.slackChannel}
+                    </span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setChannelSelectionOpen(true)}
+                      disabled={isUpdatingApproval}
+                    >
+                      <Edit className="h-4 w-4" />
+                    </Button>
+                  </>
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm text-orange-600">No channel selected</span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setChannelSelectionOpen(true)}
+                      disabled={isUpdatingApproval}
+                    >
+                      Select Channel
+                    </Button>
+                  </div>
+                )}
+              </div>
+              <p className="text-xs text-muted-foreground mt-1">
+                When enabled, task results will be sent to Slack for approval instead of directly to subscribers.
+              </p>
+            </div>
+          )}
+          
           {latestExecution &&
             latestExecution.status === "running" &&
             latestExecution.userInteractions?.some(
@@ -997,6 +1166,60 @@ const TaskDetailsPage: React.FC = () => {
           </p>
         )}
       </div>
+      
+      {/* Slack Channel Selection Dialog */}
+      <Dialog open={channelSelectionOpen} onOpenChange={setChannelSelectionOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Select Slack Channel</DialogTitle>
+            <DialogDescription>
+              {task?.slackChannel 
+                ? "Choose a different Slack channel to send approval requests to when this task completes."
+                : "Choose a Slack channel to send approval requests to when this task completes. This will enable Require Approval for this task."
+              }
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            {loadingChannels ? (
+              <div className="flex justify-center py-4">
+                <Loader2 className="h-6 w-6 animate-spin" />
+              </div>
+            ) : slackChannels.length > 0 ? (
+              <div className="space-y-2">
+                {slackChannels.map((channel) => (
+                  <Button
+                    key={channel.id}
+                    variant="outline"
+                    className="w-full justify-start"
+                    onClick={() => handleSlackChannelSelect(channel.id)}
+                    disabled={isUpdatingApproval}
+                  >
+                    <span className="font-medium">{channel.displayName || channel.name}</span>
+                    {channel.isPrivate && (
+                      <Badge variant="secondary" className="ml-2">
+                        Private
+                      </Badge>
+                    )}
+                  </Button>
+                ))}
+              </div>
+            ) : (
+              <div className="text-center py-4 text-muted-foreground">
+                No Slack channels available. Please check your Slack integration.
+              </div>
+            )}
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={handleCancelApproval}
+              disabled={isUpdatingApproval}
+            >
+              Cancel
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 };
