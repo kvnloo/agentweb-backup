@@ -14,6 +14,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- When enabled, users select a Slack channel for approval requests',
       '- Task results are sent to Slack instead of directly to subscribers',
       '- Once approved via Slack, results are automatically sent to all task subscribers',
+      'Added Meta Campaigns page under Brand category',
+      '- Users can now view Meta ad performance data including campaigns and ad sets',
+      '- Timeframe selection (7 days, 30 days, 90 days) for performance analysis',
+      '- Admin-configurable Meta Ad Account IDs via partner portal admin page',
     ],
   },
   {

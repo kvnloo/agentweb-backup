@@ -91,6 +91,27 @@ router.put("/users/:userId/support-note", async (req, res) => {
   }
 });
 
+// Update user ad account
+router.put("/users/:userId/ad-account", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { adAccount } = req.body;
+
+    // Check if user exists
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Update the user's ad account
+    const updatedUser = await userDb.updateUser(userId, { adAccount });
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error updating user ad account:", error);
+    res.status(500).json({ message: "Error updating ad account" });
+  }
+});
+
 // Create delegate access token for customer portal
 router.post("/users/:userId/delegate-access", async (req, res) => {
   try {

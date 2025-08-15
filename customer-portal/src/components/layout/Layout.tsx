@@ -20,6 +20,7 @@ import {
   Image,
   Play,
   TrendingUp,
+  BarChart3,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -137,6 +138,12 @@ const Layout = ({ children }: { children: React.ReactNode }) => {
           label: "Market Strategy",
           path: "/market-strategy",
           id: "market-strategy",
+        },
+        {
+          icon: BarChart3,
+          label: "Meta Campaigns",
+          path: "/meta-campaigns",
+          id: "meta-campaigns",
         },
         {
           icon: FileText,

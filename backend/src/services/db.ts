@@ -57,6 +57,7 @@ export interface User {
   supportNote?: string;
   roles?: ("partner" | "customer")[];
   stripe_customer_id?: string;
+  adAccount?: string; // Meta ad account ID
   companyName?: string;
   useCaseCategories?: string[];
   brandGuidelines?: {

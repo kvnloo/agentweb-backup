@@ -20,6 +20,7 @@ import ExecutionResultPage from "@/pages/ExecutionResultPage.tsx";
 import ChangelogPage from "@/pages/ChangelogPage.tsx";
 import BrandGuidelines from "@/pages/BrandGuidelines.tsx";
 import MarketStrategy from "@/pages/MarketStrategy.tsx";
+import MetaCampaigns from "@/pages/MetaCampaigns.tsx";
 import ImagesPage from "@/pages/Images.tsx";
 import VideosPage from "@/pages/Videos.tsx";
 import ResearchReportsPage from "@/pages/ResearchReports.tsx";
@@ -77,6 +78,16 @@ const App = () => (
                   <ProtectedRoute>
                     <Layout>
                       <MarketStrategy />
+                    </Layout>
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/meta-campaigns"
+                element={
+                  <ProtectedRoute>
+                    <Layout>
+                      <MetaCampaigns />
                     </Layout>
                   </ProtectedRoute>
                 }

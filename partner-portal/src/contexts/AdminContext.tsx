@@ -31,6 +31,7 @@ interface User {
   workflowCount?: number;
   isOAuthUser?: boolean;
   stripe_customer_id?: string;
+  adAccount?: string; // Meta ad account ID
 }
 
 interface AdminContextType {
