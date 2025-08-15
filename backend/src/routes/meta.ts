@@ -1,6 +1,7 @@
 import express from "express";
 import { authenticateToken } from "../middleware/auth";
 import { userDb } from "../services/db";
+import { getMetaAccessToken } from "../utils/secretsManager";
 
 const router = express.Router();
 
@@ -45,19 +46,18 @@ router.get("/ad-performance", async (req, res) => {
       return res.status(400).json({ message: "Ad account not configured" });
     }
 
-    // Initialize Facebook Ads API with access token
-    console.log("Environment variables:", {
-      NODE_ENV: process.env.NODE_ENV,
-      META_ACCESS_TOKEN: process.env.META_ACCESS_TOKEN ? "EXISTS" : "MISSING",
-      META_APP_ID: process.env.META_APP_ID ? "EXISTS" : "MISSING",
-      META_APP_SECRET: process.env.META_APP_SECRET ? "EXISTS" : "MISSING"
-    });
+    // Get Meta API access token from Secrets Manager
+    console.log("Fetching Meta access token from Secrets Manager...");
     
-    const accessToken = process.env.META_ACCESS_TOKEN;
-    if (!accessToken) {
+    let accessToken: string;
+    try {
+      accessToken = await getMetaAccessToken();
+      console.log("Meta access token retrieved successfully from Secrets Manager");
+    } catch (error: any) {
+      console.error("Error fetching Meta access token:", error);
       return res.status(500).json({ 
         message: "Meta access token not configured",
-        error: "META_ACCESS_TOKEN environment variable is missing"
+        error: error.message || "Failed to fetch access token from Secrets Manager"
       });
     }
 
