@@ -12,6 +12,18 @@ const transporter = nodemailer.createTransport({
 });
 
 export const emailService = {
+  // Escape HTML content to make it safe for emails
+  escapeHtml(html: string): string {
+    if (!html) return '';
+    
+    return html
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  },
+
   async sendEmail(to: string, subject: string, text: string, html: string, cc?: string) {
     const mailOptions = {
       from: process.env.FROM_EMAIL,
@@ -133,9 +145,7 @@ export const emailService = {
       const { taskDb } = require('../services/db');
       
       // Get environment variables
-      const siteDomain = process.env.FRONTEND_URL || 'https://agentweb.pro';
-      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'https://agentweb.pro';
-      const landingSiteUrl = process.env.LANDING_SITE_URL || 'https://agentweb.pro';
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
       
       // Fetch execution data
       const execution = await taskDb.getTaskExecutionById(executionId);
@@ -212,215 +222,70 @@ export const emailService = {
       }
     }
     
-    const taskUrl = `${siteDomain}/tasks/${task.taskId}`;
-    const executionUrl = `${customerFrontendUrl}/tasks/${task.taskId}/executions/${execution.executionId}/result`;
+
     
-    // Create HTML content for the email
+        // Create HTML content for the email - matching agent-engine send_task_results style
     const html = `
-      <!DOCTYPE html>
       <html>
-        <head>
-          <meta charset="utf-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <style>
-            body {
-              font-family: Arial, sans-serif;
-              line-height: 1.6;
-              color: #333;
-              margin: 0;
-              padding: 0;
-              background-color: #fff;
-            }
-            .container {
-              padding: 20px;
-              background-color: #fdfdfd;
-            }
-            .header {
-              background-color: #1976d2;
-              color: white;
-              padding: 20px;
-              text-align: center;
-              border-radius: 4px 4px 0 0;
-            }
-            .content {
-              padding: 20px;
-              background: #fff;
-              border: 1px solid #ddd;
-              border-radius: 0 0 4px 4px;
-            }
-            .section {
-              margin-bottom: 20px;
-              padding-bottom: 20px;
-              border-bottom: 1px solid #eee;
-            }
-            .section:last-child {
-              border-bottom: none;
-            }
-            .section h3 {
-              margin-top: 0;
-              color: #1976d2;
-              border-bottom: 2px solid #ecf0f1;
-              padding-bottom: 8px;
-            }
-            .details-table {
-              width: 100%;
-              border-collapse: collapse;
-              margin-bottom: 20px;
-            }
-            .details-table th, .details-table td {
-              padding: 8px;
-              text-align: left;
-              border-bottom: 1px solid #ddd;
-            }
-            .details-table th {
-              background-color: #f5f5f5;
-            }
-            .status {
-              padding: 4px 8px;
-              border-radius: 4px;
-              font-weight: bold;
-              display: inline-block;
-            }
-            .status-completed {
-              background-color: #e8f5e9;
-              color: #2e7d32;
-            }
-            .status-failed {
-              background-color: #ffebee;
-              color: #c62828;
-            }
-            .status-running {
-              background-color: #e3f2fd;
-              color: #1565c0;
-            }
-            .status-pending {
-              background-color: #fff8e1;
-              color: #f57f17;
-            }
-            .pre-content {
-              background-color: #f5f5f5;
-              padding: 15px;
-              border-radius: 4px;
-              overflow-x: auto;
-              white-space: pre-wrap;
-              word-break: break-word;
-              font-family: monospace;
-              font-size: 0.9em;
-            }
-            .html-result {
-              border: 1px solid #ddd;
-              padding: 10px;
-              margin-top: 15px;
-              border-radius: 5px;
-              overflow: auto;
-            }
-            .html-result h3 {
-              margin-top: 0;
-              font-size: 1.2em;
-              border-bottom: 2px solid #ecf0f1;
-              padding-bottom: 8px;
-              color: #34495e;
-            }
-            .footer {
-              text-align: center;
-              margin-top: 20px;
-              color: #666;
-              font-size: 0.9em;
-            }
-            .button {
-              display: inline-block;
-              padding: 10px 20px;
-              background-color: #1976d2;
-              color: white;
-              text-decoration: none;
-              border-radius: 4px;
-              font-weight: bold;
-            }
-          </style>
-        </head>
-        <body>
-          <div class="container">
-            <div class="header">
-              <h2 style="margin:0;padding:0;font-size:24px;">Task Run Results: ${task.name}</h2>
-            </div>
-            <div class="content">
-              <div class="section">
-                <h3>Task Information</h3>
-                <table class="details-table">
-                  <tr>
-                    <th>Task Name</th>
-                    <td>${task.name}</td>
-                  </tr>
-                  <tr>
-                    <th>Task ID</th>
-                    <td>${task.taskId}</td>
-                  </tr>
-                  <tr>
-                    <th>Execution ID</th>
-                    <td>${execution.executionId}</td>
-                  </tr>
-                  <tr>
-                    <th>Status</th>
-                    <td>
-                      <span class="status status-${execution.status.toLowerCase()}">${execution.status.toUpperCase()}</span>
-                    </td>
-                  </tr>
-                  <tr>
-                    <th>Started</th>
-                    <td>${startTime}</td>
-                  </tr>
-                  <tr>
-                    <th>Completed</th>
-                    <td>${completedTime}</td>
-                  </tr>
-                  ${execution.llmName ? `
-                  <tr>
-                    <th>LLM Used</th>
-                    <td>${execution.llmName}</td>
-                  </tr>` : ''}
-                  ${durationStr ? `
-                  <tr>
-                    <th>Duration</th>
-                    <td>${durationStr.replace(/<\/?p>|<\/?strong>/g, '')}</td>
-                  </tr>` : ''}
-                </table>
-              </div>
-              
-              ${execution.result ? `
-              <div class="section">
-                <h3>Results Summary</h3>
-                <div class="pre-content">${execution.result}</div>
-              </div>
-              ` : ''}
-              
-              ${execution.error ? `
-              <div class="section">
-                <h3>Error Details</h3>
-                <div class="pre-content" style="color:#c62828">${execution.error}</div>
-              </div>
-              ` : ''}
-              
-              ${htmlContentFromFile ? `
-              <div class="section">
-                ${htmlContentFromFile}
-              </div>
-              ` : ''}
-              
-              <div class="section" style="text-align: center;">
-                <a href="${executionUrl}" class="button">View Full Details</a>
-              </div>
-            </div>
-            <div class="footer">
-              <p>This email was sent from AgentWeb. You can reply directly to this email if you have any questions.</p>
-              <p>View <a href="${customerFrontendUrl}/tasks/${task.taskId}">task details</a> or go to <a href="${landingSiteUrl}">AgentWeb</a>.</p>
-            </div>
+      <head>
+        <style>
+          body { font-family: sans-serif; margin: 0; padding: 0; color: #333; background-color: #fff; }
+          .container { padding: 20px; background-color: #fdfdfd; }
+          .header { font-size: 1.5em; font-weight: bold; margin-bottom: 15px; color: #2c3e50; }
+          .details { margin-bottom: 20px; padding: 15px; border: 1px solid #eee; background-color: #f9f9f9; border-radius: 5px; }
+          .details p { margin: 5px 0; }
+          .section { margin-top: 20px; }
+          .section h3 { font-size: 1.2em; margin-top: 0; border-bottom: 2px solid #ecf0f1; padding-bottom: 8px; color: #34495e; }
+          pre { white-space: pre-wrap; word-wrap: break-word; background: #ecf0f1; padding: 15px; border-radius: 5px; font-size: 0.9em; color: #555; }
+          .html-result { border: 1px solid #ddd; padding: 10px; margin-top: 15px; border-radius: 5px; }
+          .html-result h3 { margin-top:0; }
+          .footer { margin-top: 25px; font-size: 0.9em; color: #7f8c8d; }
+          a { color: #3498db; text-decoration: none; }
+          a:hover { text-decoration: underline; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">Task Run Results for "${task.name}"</div>
+          <div class="details">
+            <p><strong>Status:</strong> ${execution.status.toUpperCase()}</p>
+            <p><strong>Started:</strong> ${startTime}</p>
+            <p><strong>Completed:</strong> ${completedTime}</p>
+            ${execution.llmName ? `<p><strong>LLM Used:</strong> ${execution.llmName}</p>` : ''}
+            ${durationStr ? `<p><strong>Duration:</strong> ${durationStr.replace(/<\/?p>|<\/?strong>/g, '')}</p>` : ''}
           </div>
-        </body>
-      </html>
+          
+          ${execution.result ? `
+          <div class="section">
+            <h3>Results Summary:</h3>
+            <pre>${emailService.escapeHtml(execution.result)}</pre>
+          </div>
+          ` : ''}
+          
+          ${execution.error ? `
+          <div class="section">
+            <h3>Error Details:</h3>
+            <pre>${emailService.escapeHtml(execution.error)}</pre>
+          </div>
+          ` : ''}
+          
+          ${htmlContentFromFile ? `
+          <div class="section">
+            ${htmlContentFromFile}
+          </div>
+          ` : ''}
+          
+          <div class="footer">
+            <p>Manage task and history at: <a href="${customerFrontendUrl}/tasks/${task.taskId}">${customerFrontendUrl}/tasks/${task.taskId}</a></p>
+            <hr>
+            <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>
+          </div>
+        </div>
+      </body></html>
     `;
 
     const subject = `AgentWeb - Task Run Results: ${task.name}`;
-    const text = `Task: ${task.name}\nStatus: ${execution.status.toUpperCase()}\nView details: ${executionUrl}`;
+    const text = `Task: ${task.name}\nStatus: ${execution.status.toUpperCase()}\nManage task and history at: ${customerFrontendUrl}/tasks/${task.taskId}`;
     
     await this.sendEmail(toEmail, subject, text, html);
     } catch (error) {
