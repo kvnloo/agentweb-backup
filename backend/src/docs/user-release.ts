@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-08-15',
+    changes: [
+      'Added Require Approval control for task execution',
+      '- Users can now enable "Require Approval" toggle on tasks to send results to Slack for review',
+      '- When enabled, users select a Slack channel for approval requests',
+      '- Task results are sent to Slack instead of directly to subscribers',
+      '- Once approved via Slack, results are automatically sent to all task subscribers',
+    ],
+  },
+  {
     date: '2025-08-13',
     changes: [
       'Added Create Variation with Placid feature',
