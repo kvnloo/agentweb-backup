@@ -41,7 +41,7 @@ def send_task_approval_request(task_id, task_name, execution_id, html_report_url
             'filename': filename,
             'assetType': 'html',
             'executionId': execution_id,
-            'note': f'Task "{task_name}" has completed and requires approval. This is an automated request from AgentWeb.'
+            'note': f'A report has been generated and ready for review. Please review and approve.'
         }
         
         # Send the approval request to the backend using JWT authentication
