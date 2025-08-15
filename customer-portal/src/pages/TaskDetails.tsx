@@ -329,12 +329,17 @@ const TaskDetailsPage: React.FC = () => {
   // Handle hash navigation
   useEffect(() => {
     if (window.location.hash === '#subscribers') {
-      const subscribersElement = document.getElementById('subscribers');
-      if (subscribersElement) {
-        subscribersElement.scrollIntoView({ behavior: 'smooth' });
-      }
+      // Wait a bit for the component to fully render
+      const timer = setTimeout(() => {
+        const subscribersElement = document.getElementById('subscribers');
+        if (subscribersElement) {
+          subscribersElement.scrollIntoView({ behavior: 'smooth' });
+        }
+      }, 100);
+      
+      return () => clearTimeout(timer);
     }
-  }, []);
+  }, [loading, subscribers.length]); // Run when loading completes and subscribers are loaded
 
   const handleRunTask = async () => {
     if (!token || !taskId) {
@@ -1361,19 +1366,7 @@ const TaskDetailsPage: React.FC = () => {
               )}
             </div>
             
-            {/* Back to Top Link */}
-            <div className="pt-2 border-t">
-              <a
-                href="#"
-                className="text-sm text-muted-foreground hover:text-foreground hover:underline"
-                onClick={(e) => {
-                  e.preventDefault();
-                  window.scrollTo({ top: 0, behavior: 'smooth' });
-                }}
-              >
-                ↑ Back to Top
-              </a>
-            </div>
+
           </CardContent>
         </Card>
       </div>
