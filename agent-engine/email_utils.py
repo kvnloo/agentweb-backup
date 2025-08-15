@@ -204,7 +204,7 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
 
         html_body_content += f"""
     <div class="footer">
-      <p>View complete task details and history: <a href="{site_domain}/tasks/{task_id}">{site_domain}/tasks/{task_id}</a></p>
+      <p>Manage task and history at: <a href="{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/tasks/{task_id}">{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/tasks/{task_id}</a></p>
       <hr>
       <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>
     </div>
