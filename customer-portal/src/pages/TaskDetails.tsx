@@ -88,6 +88,12 @@ interface TaskAttachment {
   uploadedAt: string;
 }
 
+// Define Subscriber interface
+interface Subscriber {
+  email: string;
+  subscribedAt: string;
+}
+
 // Update TaskDetail interface
 interface TaskDetail extends Task {
   parameterValues?: Record<string, string>;
@@ -218,6 +224,12 @@ const TaskDetailsPage: React.FC = () => {
   // File upload state
   const [uploadError, setUploadError] = useState<string>("");
   const [isUploading, setIsUploading] = useState(false);
+  
+  // Subscriber management state
+  const [subscribers, setSubscribers] = useState<Subscriber[]>([]);
+  const [newSubscriberEmail, setNewSubscriberEmail] = useState("");
+  const [subscriberError, setSubscriberError] = useState("");
+  const [loadingSubscribers, setLoadingSubscribers] = useState(false);
 
   const executionsRef = useRef<Execution[]>(executions);
   const taskRef = useRef<TaskDetail | null>(task);
@@ -305,6 +317,23 @@ const TaskDetailsPage: React.FC = () => {
       loadSlackChannels();
     }
   }, [token]);
+
+  // Load subscribers when component mounts
+  useEffect(() => {
+    if (token && taskId) {
+      fetchSubscribers();
+    }
+  }, [token, taskId]);
+
+  // Handle hash navigation
+  useEffect(() => {
+    if (window.location.hash === '#subscribers') {
+      const subscribersElement = document.getElementById('subscribers');
+      if (subscribersElement) {
+        subscribersElement.scrollIntoView({ behavior: 'smooth' });
+      }
+    }
+  }, []);
 
   const handleRunTask = async () => {
     if (!token || !taskId) {
@@ -610,6 +639,87 @@ const TaskDetailsPage: React.FC = () => {
     }
   };
 
+  // Subscriber management functions
+  const fetchSubscribers = async () => {
+    if (!taskId || !token) return;
+    setLoadingSubscribers(true);
+    try {
+      const response = await axios.get(
+        buildApiUrl(`/api/tasks/${taskId}/subscribers`),
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      setSubscribers(response.data);
+      setSubscriberError("");
+    } catch (error: any) {
+      console.error("Error fetching subscribers:", error);
+      setSubscriberError(
+        error.response?.data?.message || "Failed to fetch subscribers"
+      );
+    } finally {
+      setLoadingSubscribers(false);
+    }
+  };
+
+  const handleAddSubscriber = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newSubscriberEmail.trim() || !taskId || !token) return;
+
+    try {
+      const response = await axios.post(
+        buildApiUrl(`/api/tasks/${taskId}/subscribers`),
+        { email: newSubscriberEmail },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      const newSubscriber: Subscriber = {
+        email: response.data.email,
+        subscribedAt: response.data.subscribedAt || new Date().toISOString(),
+      };
+
+      setSubscribers([...subscribers, newSubscriber]);
+      setNewSubscriberEmail("");
+      setSubscriberError("");
+      toast({
+        title: "Success",
+        description: "Subscriber added successfully.",
+      });
+    } catch (error: any) {
+      console.error("Error adding subscriber:", error);
+      const errorMessage =
+        error.response?.data?.message ||
+        (error.response?.status === 400
+          ? "Invalid email address"
+          : "Failed to add subscriber");
+      setSubscriberError(errorMessage);
+    }
+  };
+
+  const handleRemoveSubscriber = async (email: string) => {
+    if (!taskId || !token) return;
+    
+    try {
+      await axios.delete(
+        buildApiUrl(
+          `/api/tasks/${taskId}/subscribers/${encodeURIComponent(email)}`
+        ),
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setSubscribers(subscribers.filter((s) => s.email !== email));
+      setSubscriberError("");
+      toast({
+        title: "Success",
+        description: "Subscriber removed successfully.",
+      });
+    } catch (error: any) {
+      console.error("Error removing subscriber:", error);
+      setSubscriberError(
+        error.response?.data?.message || "Failed to remove subscriber"
+      );
+    }
+  };
+
   interface UserInteractionDialogProps {
     execution: Execution;
     onRespond: (
@@ -830,6 +940,14 @@ const TaskDetailsPage: React.FC = () => {
               </Badge>
             </div>
           )}
+          <div className="mt-2">
+            <a
+              href="#subscribers"
+              className="text-sm text-blue-600 hover:text-blue-800 hover:underline"
+            >
+              📧 Manage Subscribers
+            </a>
+          </div>
         </CardHeader>
         <CardContent className="space-y-4">
           {/* Attachments Section */}
@@ -1165,6 +1283,97 @@ const TaskDetailsPage: React.FC = () => {
             No executions found for this task.
           </p>
         )}
+      </div>
+      
+      {/* Subscriber Management Section */}
+      <div className="space-y-4" id="subscribers">
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-lg font-semibold">Subscribers</CardTitle>
+            <CardDescription>
+              Manage who receives email notifications when this task completes.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {/* Add Subscriber Form */}
+            <form onSubmit={handleAddSubscriber} className="flex gap-2">
+              <input
+                type="email"
+                value={newSubscriberEmail}
+                onChange={(e) => setNewSubscriberEmail(e.target.value)}
+                placeholder="Enter email address"
+                className="flex-1 px-3 py-2 border border-input rounded-md bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+                disabled={loadingSubscribers}
+              />
+              <Button
+                type="submit"
+                variant="default"
+                disabled={!newSubscriberEmail.trim() || loadingSubscribers}
+                className="px-4 py-2"
+              >
+                {loadingSubscribers ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  "Add Subscriber"
+                )}
+              </Button>
+            </form>
+
+            {/* Error Display */}
+            {subscriberError && (
+              <Alert variant="destructive">
+                <AlertCircle className="h-4 w-4" />
+                <AlertDescription>{subscriberError}</AlertDescription>
+              </Alert>
+            )}
+
+            {/* Subscribers List */}
+            <div className="space-y-2">
+              {subscribers.map((subscriber) => (
+                <div
+                  key={subscriber.email}
+                  className="flex items-center justify-between p-3 bg-muted rounded-md"
+                >
+                  <div>
+                    <p className="font-medium">{subscriber.email}</p>
+                    <p className="text-sm text-muted-foreground">
+                      Subscribed on {new Date(subscriber.subscribedAt).toLocaleDateString()}
+                    </p>
+                  </div>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => handleRemoveSubscriber(subscriber.email)}
+                    disabled={loadingSubscribers}
+                    className="text-destructive hover:text-destructive hover:bg-destructive/10"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </div>
+              ))}
+              
+              {subscribers.length === 0 && (
+                <p className="text-center text-muted-foreground py-4">
+                  No subscribers yet
+                </p>
+              )}
+            </div>
+            
+            {/* Back to Top Link */}
+            <div className="pt-2 border-t">
+              <a
+                href="#"
+                className="text-sm text-muted-foreground hover:text-foreground hover:underline"
+                onClick={(e) => {
+                  e.preventDefault();
+                  window.scrollTo({ top: 0, behavior: 'smooth' });
+                }}
+              >
+                ↑ Back to Top
+              </a>
+            </div>
+          </CardContent>
+        </Card>
       </div>
       
       {/* Slack Channel Selection Dialog */}
