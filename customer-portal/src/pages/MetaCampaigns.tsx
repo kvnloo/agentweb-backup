@@ -166,6 +166,10 @@ const MetaCampaigns = () => {
     return `${(num * 100).toFixed(2)}%`;
   };
 
+  const formatCtr = (ctr: number) => {
+    return `${ctr.toFixed(2)}%`;
+  };
+
   if (isLoading) {
     return (
       <div className="container mx-auto p-6 space-y-6">
@@ -354,22 +358,22 @@ const MetaCampaigns = () => {
         </div>
       )}
 
-      {/* Ad Performance Table */}
+      {/* Campaigns Table */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center space-x-2">
             <BarChart3 className="h-5 w-5" />
-            <span>Ad Performance</span>
+            <span>Campaigns</span>
           </CardTitle>
           <CardDescription>
-            Detailed performance metrics for your Meta ads
+            Detailed performance metrics for your Meta campaigns
           </CardDescription>
         </CardHeader>
         <CardContent>
           {adPerformance.length === 0 ? (
             <div className="text-center py-8 text-gray-500">
               <Zap className="h-12 w-12 mx-auto mb-4 text-gray-300" />
-              <p>No ad performance data available for the selected timeframe.</p>
+              <p>No campaign performance data available for the selected timeframe.</p>
             </div>
           ) : (
             <div className="overflow-x-auto">
@@ -412,7 +416,7 @@ const MetaCampaigns = () => {
                         {formatNumber(ad.clicks)}
                       </td>
                       <td className="py-3 px-4 text-right">
-                        {formatPercentage(ad.ctr)}
+                        {formatCtr(ad.ctr)}
                       </td>
                       <td className="py-3 px-4 text-right">
                         {formatCurrency(ad.spend)}
@@ -435,12 +439,12 @@ const MetaCampaigns = () => {
         </CardContent>
       </Card>
 
-      {/* Ad Sets Performance Table */}
+      {/* Ad Sets Table */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center space-x-2">
             <Zap className="h-5 w-5" />
-            <span>Ad Sets Performance</span>
+            <span>Ad Sets</span>
           </CardTitle>
           <CardDescription>
             Ad set-level performance metrics and targeting information
@@ -492,7 +496,7 @@ const MetaCampaigns = () => {
                         {formatNumber(adSet.clicks)}
                       </td>
                       <td className="py-3 px-4 text-right">
-                        {formatPercentage(adSet.ctr)}
+                        {formatCtr(adSet.ctr)}
                       </td>
                       <td className="py-3 px-4 text-right">
                         {formatCurrency(adSet.spend)}
