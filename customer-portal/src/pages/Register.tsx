@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import { useNavigate, useSearchParams, Link } from "react-router-dom";
 import { useAuth, AuthErrorCode } from "../contexts/AuthContext";
 import { Button } from "@/components/ui/button";
@@ -28,8 +28,6 @@ const Register = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [formError, setFormError] = useState("");
   const [isEmailFromStripe, setIsEmailFromStripe] = useState(false);
-  const [stripeSessionData, setStripeSessionData] = useState<any>(null);
-  const hasTrackedPurchaseRef = useRef(false);
   const { error, register, errorCode, landingSiteUrl } = useAuth();
   const navigate = useNavigate();
 
@@ -44,9 +42,6 @@ const Register = () => {
         .get(buildApiUrl(`/api/stripe/session/${sessionId}`))
         .then((response) => {
           if (response.data && response.data.email) {
-            // Store stripe session data for later use in Purchase tracking
-            setStripeSessionData(response.data);
-
             if (response.data.existingUser === true) {
               // User already exists, redirect to login
               console.log(
@@ -96,56 +91,11 @@ const Register = () => {
 
     try {
       await register(email, password);
-
-      // Track Facebook Pixel Purchase event if user came from Stripe
-      if (
-        isEmailFromStripe &&
-        stripeSessionData &&
-        !hasTrackedPurchaseRef.current
-      ) {
-        trackPurchaseEvent();
-        hasTrackedPurchaseRef.current = true;
-      }
-
       navigate("/");
     } catch (err) {
       // Error is already handled in the auth context
     } finally {
       setIsLoading(false);
-    }
-  };
-
-  // Track Facebook Pixel Purchase event
-  const trackPurchaseEvent = () => {
-    // Check if Facebook Pixel is available
-    if (typeof window !== "undefined" && window.fbq) {
-      const fbq = window.fbq;
-
-      try {
-        // Track Purchase event with Stripe session data
-        fbq("track", "Purchase", {
-          value: stripeSessionData?.amount_total
-            ? stripeSessionData.amount_total / 100
-            : undefined, // Convert from cents to dollars
-          currency: stripeSessionData?.currency || "USD",
-          content_name: "AgentWeb Subscription",
-          content_category: "Software Subscription",
-          num_items: 1,
-          customer_email: email,
-          stripe_session_id:
-            stripeSessionData?.stripe_session_id ||
-            searchParams.get("session_id"),
-          source: "stripe_checkout",
-        });
-
-        console.log(
-          "Facebook Pixel Purchase event tracked for Stripe conversion"
-        );
-      } catch (error) {
-        console.error("Failed to track Facebook Pixel Purchase event:", error);
-      }
-    } else {
-      console.warn("Facebook Pixel not available for Purchase tracking");
     }
   };
 
