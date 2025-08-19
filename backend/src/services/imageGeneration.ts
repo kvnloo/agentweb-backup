@@ -85,12 +85,23 @@ export class OpenAIImageService {
               filename: params.filename,
             };
           } else {
+            console.error("❌ No URL or base64 data in image response:", imageData);
             throw new Error(`No image data in response. Image data keys: ${Object.keys(imageData)}`);
           }
         } else {
+          console.error("❌ No data in OpenAI response:", result);
           throw new Error(`No data in OpenAI response: ${JSON.stringify(result)}`);
         }
       } catch (apiError: any) {
+        console.error("💥 OpenAI API error details:", {
+          status: apiError.status,
+          message: apiError.message,
+          error: apiError.error,
+          type: apiError.type,
+          code: apiError.code,
+          fullError: apiError
+        });
+        
         // Re-throw the error with more context
         throw new Error(`OpenAI API failed: ${apiError.message || apiError.error || 'Unknown error'}`);
       }
