@@ -21,6 +21,7 @@ import {
   Play,
   TrendingUp,
   BarChart3,
+  Edit3,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";

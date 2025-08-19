@@ -16,9 +16,13 @@ import brandRoutes from "./routes/brand";
 import marketStrategyRoutes from "./routes/marketStrategy";
 import slackRoutes from "./routes/slack";
 import metaRoutes from "./routes/meta";
+import blogRoutes from "./routes/blog";
 
 // Import the new controller
-import { viewExternalFile } from "./controllers/filesController";
+import {
+  viewExternalFile,
+  getFileContent,
+} from "./controllers/filesController";
 
 const app = express();
 
@@ -66,6 +70,7 @@ app.use(passport.initialize());
 // Create a new router for file-related routes
 const fileRoutes = express.Router();
 fileRoutes.get("/view-external", viewExternalFile);
+fileRoutes.get("/content", getFileContent);
 
 // Routes
 app.use("/api/auth", authRoutes);
@@ -84,6 +89,7 @@ app.use("/api/brand", brandRoutes);
 app.use("/api/market-strategy", marketStrategyRoutes);
 app.use("/api/slack", slackRoutes);
 app.use("/api/meta", metaRoutes);
+app.use("/api/blog", blogRoutes);
 
 // Health check endpoint
 app.get("/", (req, res) => {
