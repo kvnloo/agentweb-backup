@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { useAdmin } from "../contexts/AdminContext";
+import { useSearchParams } from "react-router-dom";
 import {
   Box,
   Tabs,
@@ -397,7 +398,29 @@ const ChatDialog = ({
 };
 
 export default function AdminDashboard() {
-  const [tabValue, setTabValue] = useState(0);
+  const [searchParams, setSearchParams] = useSearchParams();
+  
+  // Tab mapping for URL parameters
+  const TAB_MAP = {
+    overview: 0,
+    announcements: 1,
+    users: 2,
+    waitlist: 3,
+    tasks: 4,
+    workflows: 5,
+    'chat-history': 6,
+    'knowledge-base': 7,
+  };
+  
+  // Get initial tab value from URL or default to 0
+  const getInitialTabValue = () => {
+    const tabParam = searchParams.get('tab');
+    return tabParam && TAB_MAP[tabParam as keyof typeof TAB_MAP] !== undefined 
+      ? TAB_MAP[tabParam as keyof typeof TAB_MAP] 
+      : 0;
+  };
+  
+  const [tabValue, setTabValue] = useState(getInitialTabValue());
   const [startDate, setStartDate] = useState<Date | null>(
     new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
   );
@@ -488,6 +511,14 @@ export default function AdminDashboard() {
     loadData();
   }, []);
 
+  // Handle URL parameter changes
+  useEffect(() => {
+    const tabParam = searchParams.get('tab');
+    if (tabParam && TAB_MAP[tabParam as keyof typeof TAB_MAP] !== undefined) {
+      setTabValue(TAB_MAP[tabParam as keyof typeof TAB_MAP]);
+    }
+  }, [searchParams]);
+
   useEffect(() => {
     if (startDate && endDate && tabValue === 0 && !adminLoading) {
       loadAnalytics(
@@ -511,8 +542,8 @@ export default function AdminDashboard() {
       }
     };
 
-    // Load tasks when either Users tab (2) or Tasks tab (4) is selected, and only if not already loaded
-    if ((tabValue === 2 || tabValue === 4) && tasks.length === 0) {
+    // Only load tasks when Tasks tab (4) is selected
+    if (tabValue === 4 && tasks.length === 0) {
       loadTasks();
     }
   }, [tabValue, token, tasks.length]);
@@ -531,11 +562,11 @@ export default function AdminDashboard() {
       }
     };
 
-    if (tabValue === 5) {
-      // Workflows tab
+    // Only load workflows when Workflows tab (5) is selected
+    if (tabValue === 5 && workflows.length === 0) {
       loadWorkflows();
     }
-  }, [tabValue, token]);
+  }, [tabValue, token, workflows.length]);
 
   useEffect(() => {
     const loadChatSessions = async () => {
@@ -554,11 +585,11 @@ export default function AdminDashboard() {
       }
     };
 
-    if (tabValue === 6) {
-      // Chat History tab
+    // Only load chat sessions when Chat History tab (6) is selected
+    if (tabValue === 6 && chatSessions.length === 0) {
       loadChatSessions();
     }
-  }, [tabValue, token]);
+  }, [tabValue, token, chatSessions.length]);
 
   useEffect(() => {
     const loadKnowledgeBaseMetrics = async () => {
@@ -577,14 +608,22 @@ export default function AdminDashboard() {
       }
     };
 
-    if (tabValue === 7) {
-      // Knowledge Base tab
+    // Only load knowledge base metrics when Knowledge Base tab (7) is selected
+    if (tabValue === 7 && !knowledgeBaseMetrics) {
       loadKnowledgeBaseMetrics();
     }
-  }, [tabValue, token]);
+  }, [tabValue, token, knowledgeBaseMetrics]);
 
   const handleTabChange = (_event: React.SyntheticEvent, newValue: number) => {
     setTabValue(newValue);
+    
+    // Update URL with the selected tab
+    const tabName = Object.keys(TAB_MAP).find(key => TAB_MAP[key as keyof typeof TAB_MAP] === newValue);
+    if (tabName && tabName !== 'overview') {
+      setSearchParams({ tab: tabName });
+    } else {
+      setSearchParams({}); // Remove tab parameter for overview tab
+    }
   };
 
   const handleWaitlistAction = async (email: string, status: string) => {
