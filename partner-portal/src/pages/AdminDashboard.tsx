@@ -1617,54 +1617,79 @@ export default function AdminDashboard() {
                           />
                         </TableCell>
                         <TableCell>
-                          <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap" }}>
+                          <Box sx={{ display: "flex", gap: 0.5, alignItems: "center", flexWrap: "nowrap" }}>
                             {user.roles && user.roles.includes("customer") && (
-                              <Button
-                                variant="outlined"
+                              <Tooltip title="Access Customer Portal">
+                                <IconButton
+                                  size="small"
+                                  onClick={() => handleAccessCustomerPortal(user.userId)}
+                                  disabled={delegateAccessLoading === user.userId}
+                                  color="primary"
+                                  sx={{ 
+                                    border: '1px solid',
+                                    borderColor: 'primary.main',
+                                    '&:hover': { bgcolor: 'primary.50' }
+                                  }}
+                                >
+                                  {delegateAccessLoading === user.userId ? (
+                                    <CircularProgress size={16} />
+                                  ) : (
+                                    <OpenInNewIcon fontSize="small" />
+                                  )}
+                                </IconButton>
+                              </Tooltip>
+                            )}
+                            
+                            <Tooltip title="Manage Roles">
+                              <IconButton
                                 size="small"
-                                onClick={() => handleAccessCustomerPortal(user.userId)}
-                                startIcon={<OpenInNewIcon />}
-                                disabled={delegateAccessLoading === user.userId}
+                                onClick={() => handleRoleDialogOpen(user)}
                                 color="primary"
-                              >
-                                {delegateAccessLoading === user.userId ? "Creating..." : "Access Customer Portal"}
-                              </Button>
-                            )}
-                            <Button
-                              variant="outlined"
-                              size="small"
-                              onClick={() => handleRoleDialogOpen(user)}
-                              startIcon={<EditIcon />}
-                            >
-                              Manage Roles
-                            </Button>
-                            {!user.isAdmin && user.isActive !== false && (
-                              <Button
-                                variant="outlined"
-                                color="error"
-                                size="small"
-                                onClick={() => {
-                                  setSelectedUser(user);
-                                  setDeactivateDialogOpen(true);
+                                sx={{ 
+                                  border: '1px solid',
+                                  borderColor: 'primary.main',
+                                  '&:hover': { bgcolor: 'primary.50' }
                                 }}
-                                startIcon={<PersonOffIcon />}
                               >
-                                Deactivate
-                              </Button>
+                                <EditIcon fontSize="small" />
+                              </IconButton>
+                            </Tooltip>
+                            
+                            {!user.isAdmin && user.isActive !== false && (
+                              <Tooltip title="Deactivate User">
+                                <IconButton
+                                  size="small"
+                                  onClick={() => {
+                                    setSelectedUser(user);
+                                    setDeactivateDialogOpen(true);
+                                  }}
+                                  color="warning"
+                                  sx={{ 
+                                    border: '1px solid',
+                                    borderColor: 'warning.main',
+                                    '&:hover': { bgcolor: 'warning.50' }
+                                  }}
+                                >
+                                  <PersonOffIcon fontSize="small" />
+                                </IconButton>
+                              </Tooltip>
                             )}
-                            {!user.isAdmin && ( // Prevent deleting admin users
-                              <Button
-                                variant="outlined"
-                                color="error"
-                                size="small"
-                                onClick={() =>
-                                  handleOpenUserDeleteConfirm(user.userId)
-                                }
-                                startIcon={<DeleteIcon />}
-                                sx={{ ml: 1 }} // Add some margin if deactivate is also present
-                              >
-                                Delete User
-                              </Button>
+                            
+                            {!user.isAdmin && (
+                              <Tooltip title="Delete User">
+                                <IconButton
+                                  size="small"
+                                  onClick={() => handleOpenUserDeleteConfirm(user.userId)}
+                                  color="error"
+                                  sx={{ 
+                                    border: '1px solid',
+                                    borderColor: 'error.main',
+                                    '&:hover': { bgcolor: 'error.50' }
+                                  }}
+                                >
+                                  <DeleteIcon fontSize="small" />
+                                </IconButton>
+                              </Tooltip>
                             )}
                           </Box>
                         </TableCell>
