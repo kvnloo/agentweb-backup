@@ -57,15 +57,6 @@ export class OpenAIImageService {
       }
 
       // Generate new image from prompt only
-      console.log("Generating new image from prompt...");
-      console.log("🔧 Parameters being sent to OpenAI:", {
-        model: "gpt-image-1",
-        prompt: params.prompt,
-        size: params.size,
-        quality: params.quality,
-        filename: params.filename
-      });
-      
       try {
         const result = await this.client.images.generate({
           model: "gpt-image-1",
@@ -74,12 +65,9 @@ export class OpenAIImageService {
           quality: params.quality as any,
         });
 
-        console.log("🔍 OpenAI API response:", JSON.stringify(result, null, 2));
-
         // Return the image URL directly from OpenAI
         if (result.data && result.data.length > 0) {
           const imageData = result.data[0];
-          console.log("🔍 Image data:", JSON.stringify(imageData, null, 2));
           
           if (imageData.url) {
             // DALL-E returns URLs
@@ -90,7 +78,6 @@ export class OpenAIImageService {
             };
           } else if (imageData.b64_json) {
             // GPT Image 1 returns base64 data - convert to data URL
-            console.log("✅ Image generated with base64 data, converting to data URL");
             const dataUrl = `data:image/png;base64,${imageData.b64_json}`;
             return {
               success: true,
@@ -98,23 +85,12 @@ export class OpenAIImageService {
               filename: params.filename,
             };
           } else {
-            console.error("❌ No URL or base64 data in image response:", imageData);
             throw new Error(`No image data in response. Image data keys: ${Object.keys(imageData)}`);
           }
         } else {
-          console.error("❌ No data in OpenAI response:", result);
           throw new Error(`No data in OpenAI response: ${JSON.stringify(result)}`);
         }
       } catch (apiError: any) {
-        console.error("💥 OpenAI API error details:", {
-          status: apiError.status,
-          message: apiError.message,
-          error: apiError.error,
-          type: apiError.type,
-          code: apiError.code,
-          fullError: apiError
-        });
-        
         // Re-throw the error with more context
         throw new Error(`OpenAI API failed: ${apiError.message || apiError.error || 'Unknown error'}`);
       }
