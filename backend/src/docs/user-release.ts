@@ -7,6 +7,18 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-08-19',
+    changes: [
+      'Fixed percentage issue with Meta Campaigns',
+      '- CTR values now display correctly as percentages without incorrect multiplication',
+      'Made admin page tabs easier to access',
+      '- Added URL-based tab routing for direct access to specific admin sections',
+      '- Users can now bookmark direct links like /admin?tab=users or /admin?tab=tasks',
+      '- Improved admin page performance by only loading data for the active tab',
+      '- Compact Actions column in Users table with icon-based buttons and tooltips',
+    ],
+  },
+  {
     date: '2025-08-15',
     changes: [
       'Added Require Approval control for task execution',
