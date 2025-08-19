@@ -1,6 +1,4 @@
-import { spawn } from "child_process";
-import path from "path";
-import fs from "fs";
+import OpenAI from "openai";
 
 interface ImageGenerationResult {
   success: boolean;
@@ -17,231 +15,169 @@ interface ImageGenerationParams {
   inputImages?: string[];
 }
 
-export class AgentEngineImageService {
-  private agentEnginePath: string;
-  private pythonPath: string;
+export class OpenAIImageService {
+  private client: OpenAI;
 
   constructor() {
-    // Path to the agent-engine directory
-    this.agentEnginePath = path.join(process.cwd(), "..", "agent-engine");
-
-    // Use conda environment if available, otherwise use python
-    this.pythonPath = process.env.CONDA_PYTHON_PATH || "python3";
-  }
-
-  private getCondaCommand(): string[] {
-    if (process.env.CONDA_ENV_PATH) {
-      return ["conda", "run", "-p", process.env.CONDA_ENV_PATH, "python"];
+    // Get API key from environment
+    const apiKey = process.env.OPENAI_IMAGE_API_KEY;
+    if (!apiKey) {
+      throw new Error("OPENAI_IMAGE_API_KEY environment variable is not set");
     }
-    return [this.pythonPath];
+
+    // Initialize OpenAI client
+    this.client = new OpenAI({
+      apiKey: apiKey,
+    });
   }
 
   /**
-   * Generate an image using the agent-engine's image generation capability
+   * Generate an image using OpenAI's GPT Image 1 model
    */
   async generateImage(
     params: ImageGenerationParams
   ): Promise<ImageGenerationResult> {
     try {
-      // Prepare the Python script to call the agent-engine image generation
-      const scriptContent = `
-import sys
-import os
-import json
-import asyncio
-import logging
-from pathlib import Path
+      // Validate parameters
+      const validationResult = this.validateParams(params);
+      if (!validationResult.valid) {
+        return {
+          success: false,
+          error: validationResult.error,
+        };
+      }
 
-# Add agent-engine to path
-sys.path.insert(0, "${this.agentEnginePath}")
+      // For now, only support text-to-image generation
+      // Image-to-image support can be added later if needed
+      if (params.inputImages && params.inputImages.length > 0) {
+        return {
+          success: false,
+          error: "Image-to-image generation is not currently supported. Please use text prompts only.",
+        };
+      }
 
-# Configure logging to prevent excessive output
-logging.getLogger().setLevel(logging.WARNING)
-
-try:
-    from web_agent import WebAgent, GenerateImageParams
-    
-    async def generate_image():
-        try:
-            # Initialize WebAgent
-            agent = WebAgent()
-            
-            # Prepare parameters
-            params = GenerateImageParams(
-                input_file_names=${JSON.stringify(params.inputImages || [])},
-                prompt="${params.prompt.replace(/"/g, '\\"')}",
-                output_file_name="${params.filename}",
-                size="${params.size || "1024x1024"}",
-                quality="${params.quality || "medium"}"
-            )
-            
-            # Call the generate_image action
-            # Find the generate_image action in the registry
-            for action_name, action_func in agent.controller.registry.actions.items():
-                if "Generate image" in action_name:
-                    result = await action_func(params)
-                    
-                    if result.error:
-                        print(json.dumps({
-                            "success": False,
-                            "error": result.error
-                        }))
-                        return
-                    
-                    # Check if the image was created successfully
-                    downloads_path = agent._get_downloads_path()
-                    image_path = Path(downloads_path) / "${params.filename}"
-                    
-                    if image_path.exists():
-                        print(json.dumps({
-                            "success": True,
-                            "filename": "${params.filename}",
-                            "path": str(image_path)
-                        }))
-                    else:
-                        print(json.dumps({
-                            "success": False,
-                            "error": "Image file was not created"
-                        }))
-                    return
-            
-            print(json.dumps({
-                "success": False,
-                "error": "Image generation action not found"
-            }))
-            
-        except Exception as e:
-            print(json.dumps({
-                "success": False,
-                "error": f"Error in image generation: {str(e)}"
-            }))
-    
-    # Run the async function
-    asyncio.run(generate_image())
-    
-except ImportError as e:
-    print(json.dumps({
-        "success": False,
-        "error": f"Failed to import agent-engine modules: {str(e)}"
-    }))
-except Exception as e:
-    print(json.dumps({
-        "success": False,
-        "error": f"Unexpected error: {str(e)}"
-    }))
-`;
-
-      // Write the script to a temporary file
-      const tempScriptPath = path.join(
-        this.agentEnginePath,
-        "temp_image_gen.py"
-      );
-      fs.writeFileSync(tempScriptPath, scriptContent);
-
-      return new Promise((resolve) => {
-        const pythonProcess = spawn(
-          this.getCondaCommand()[0],
-          [...this.getCondaCommand().slice(1), tempScriptPath],
-          {
-            cwd: this.agentEnginePath,
-            env: {
-              ...process.env,
-              PYTHONPATH: this.agentEnginePath,
-            },
-          }
-        );
-
-        let outputData = "";
-        let errorData = "";
-
-        pythonProcess.stdout.on("data", (data) => {
-          outputData += data.toString();
-        });
-
-        pythonProcess.stderr.on("data", (data) => {
-          errorData += data.toString();
-        });
-
-        pythonProcess.on("close", async (code) => {
-          // Clean up temp script
-          try {
-            fs.unlinkSync(tempScriptPath);
-          } catch (e) {
-            console.warn("Could not clean up temp script:", e);
-          }
-
-          if (code === 0) {
-            try {
-              const result = JSON.parse(outputData.trim());
-
-              if (result.success && result.path) {
-                // Upload the generated image to S3 or return the local path
-                // For now, we'll just return the local path
-                resolve({
-                  success: true,
-                  imageUrl: `file://${result.path}`,
-                  filename: result.filename,
-                });
-              } else {
-                resolve({
-                  success: false,
-                  error: result.error || "Unknown error in image generation",
-                });
-              }
-            } catch (parseError) {
-              resolve({
-                success: false,
-                error: `Failed to parse result: ${parseError}. Output: ${outputData}`,
-              });
-            }
-          } else {
-            resolve({
-              success: false,
-              error: `Python process failed with code ${code}. Error: ${errorData}`,
-            });
-          }
-        });
-
-        pythonProcess.on("error", (error) => {
-          resolve({
-            success: false,
-            error: `Failed to start Python process: ${error.message}`,
-          });
-        });
+      // Generate new image from prompt only
+      console.log("Generating new image from prompt...");
+      console.log("🔧 Parameters being sent to OpenAI:", {
+        model: "gpt-image-1",
+        prompt: params.prompt,
+        size: params.size,
+        quality: params.quality,
+        filename: params.filename
       });
+      
+      try {
+        const result = await this.client.images.generate({
+          model: "gpt-image-1",
+          prompt: params.prompt,
+          size: params.size as any,
+          quality: params.quality as any,
+        });
+
+        console.log("🔍 OpenAI API response:", JSON.stringify(result, null, 2));
+
+        // Return the image URL directly from OpenAI
+        if (result.data && result.data.length > 0) {
+          const imageData = result.data[0];
+          console.log("🔍 Image data:", JSON.stringify(imageData, null, 2));
+          
+          if (imageData.url) {
+            // DALL-E returns URLs
+            return {
+              success: true,
+              imageUrl: imageData.url,
+              filename: params.filename,
+            };
+          } else if (imageData.b64_json) {
+            // GPT Image 1 returns base64 data - convert to data URL
+            console.log("✅ Image generated with base64 data, converting to data URL");
+            const dataUrl = `data:image/png;base64,${imageData.b64_json}`;
+            return {
+              success: true,
+              imageUrl: dataUrl,
+              filename: params.filename,
+            };
+          } else {
+            console.error("❌ No URL or base64 data in image response:", imageData);
+            throw new Error(`No image data in response. Image data keys: ${Object.keys(imageData)}`);
+          }
+        } else {
+          console.error("❌ No data in OpenAI response:", result);
+          throw new Error(`No data in OpenAI response: ${JSON.stringify(result)}`);
+        }
+      } catch (apiError: any) {
+        console.error("💥 OpenAI API error details:", {
+          status: apiError.status,
+          message: apiError.message,
+          error: apiError.error,
+          type: apiError.type,
+          code: apiError.code,
+          fullError: apiError
+        });
+        
+        // Re-throw the error with more context
+        throw new Error(`OpenAI API failed: ${apiError.message || apiError.error || 'Unknown error'}`);
+      }
     } catch (error: any) {
+      console.error("Error generating image:", error);
       return {
         success: false,
-        error: `Image generation service error: ${error.message}`,
+        error: `Failed to generate image: ${error.message}`,
       };
     }
   }
 
   /**
-   * Check if the agent-engine image generation is available
+   * Validate input parameters
+   */
+  private validateParams(params: ImageGenerationParams): { valid: boolean; error?: string } {
+    // Validate quality
+    const validQualities = ["low", "medium", "high", "auto"];
+    if (params.quality && !validQualities.includes(params.quality)) {
+      return {
+        valid: false,
+        error: `Invalid quality '${params.quality}'. Must be one of: ${validQualities.join(", ")}`,
+      };
+    }
+
+    // Validate size
+    const validSizes = ["1024x1024", "1536x1024", "1024x1536", "auto"];
+    if (params.size && !validSizes.includes(params.size)) {
+      return {
+        valid: false,
+        error: `Invalid size '${params.size}'. Must be one of: ${validSizes.join(", ")}`,
+      };
+    }
+
+    // Filename validation - just ensure it's not empty
+    if (!params.filename || params.filename.trim() === "") {
+      return {
+        valid: false,
+        error: "Filename is required",
+      };
+    }
+
+    return { valid: true };
+  }
+
+  /**
+   * Check if the OpenAI image generation service is available
    */
   async isAvailable(): Promise<boolean> {
     try {
-      // Check if agent-engine directory exists
-      if (!fs.existsSync(this.agentEnginePath)) {
-        console.warn("Agent-engine directory not found:", this.agentEnginePath);
-        return false;
-      }
-
-      // Check if web_agent.py exists
-      const webAgentPath = path.join(this.agentEnginePath, "web_agent.py");
-      if (!fs.existsSync(webAgentPath)) {
-        console.warn("web_agent.py not found in agent-engine");
+      // Check if API key is set
+      if (!process.env.OPENAI_IMAGE_API_KEY) {
+        console.warn("OPENAI_IMAGE_API_KEY environment variable is not set");
         return false;
       }
 
       return true;
     } catch (error) {
-      console.warn("Error checking agent-engine availability:", error);
+      console.warn("Error checking OpenAI image service availability:", error);
       return false;
     }
   }
 }
 
 // Create a singleton instance
-export const agentEngineImageService = new AgentEngineImageService();
+export const openaiImageService = new OpenAIImageService();

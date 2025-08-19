@@ -5,8 +5,8 @@ This document describes how to set up the blog management feature that allows us
 ## Features
 
 - **Research Report Integration**: Generate blog posts directly from research reports in the Research Reports page
-- **AI Content Generation**: Convert research reports into blog posts using Azure OpenAI
-- **Image Generation**: Create hero images using DALL-E 3
+- **AI Content Generation**: Convert research reports into blog posts using OpenAI
+- **Image Generation**: Create hero images using GPT Image 1 and DALL-E 3
 - **BaseHub Publishing**: Directly publish to BaseHub CMS
 - **One-Click Workflow**: Complete blog generation and publishing in a single streamlined process
 
@@ -22,61 +22,31 @@ BASEHUB_API_URL=https://api.basehub.com/graphql
 BASEHUB_TOKEN=your_basehub_token_here
 POSTS_COLLECTION_ID=dKrosxXlaGpnZCrAbHxlX
 
-# Azure OpenAI (required for content generation)
-AZURE_OPENAI_API_KEY=your_azure_openai_api_key
-AZURE_OPENAI_ENDPOINT=your_azure_openai_endpoint
-AZURE_OPENAI_DEPLOYMENT=your_deployment_name
-AZURE_OPENAI_API_VERSION=2024-08-01-preview
-
-# Image Generation (Optional - multiple methods available with automatic fallback)
-
-# Option 1: Agent-Engine (Primary) - Uses gpt-image-1 model
-OPENAI_IMAGE_API_KEY=your_openai_api_key
-
-# Option 2: Azure OpenAI DALL-E deployment (Fallback)
-AZURE_OPENAI_DALLE_DEPLOYMENT=your_dalle_deployment_name
-
-# Option 3: Direct OpenAI API (Fallback)
-OPENAI_API_KEY=your_openai_api_key
-
-# Agent-Engine Path (Optional - auto-detected if not specified)
-CONDA_ENV_PATH=/path/to/your/conda/env  # Optional: if using conda
-CONDA_PYTHON_PATH=/path/to/python3      # Optional: if using specific python
+# OpenAI Configuration (required for content and image generation)
+OPENAI_IMAGE_API_KEY=your_openai_api_key_here
 ```
 
-### Image Generation Options
+### Image Generation
 
-The blog system now supports **multiple image generation methods** with automatic fallback:
+The blog system now uses **OpenAI's image generation services** with automatic fallback:
 
-1. **Agent-Engine (Primary)** - Uses `gpt-image-1` model via the agent-engine
+1. **GPT Image 1 (Primary)** - Uses the advanced `gpt-image-1` model
+   - Automatically available when `OPENAI_IMAGE_API_KEY` is set
+   - Generates high-quality images from text prompts
+   - Currently supports text-to-image generation only
 
-   - Automatically detected if agent-engine is available
-   - Uses `OPENAI_IMAGE_API_KEY` environment variable
-   - Generates high-quality images with advanced capabilities
+2. **DALL-E 3 (Fallback)** - Direct DALL-E 3 API access
+   - Uses the same `OPENAI_IMAGE_API_KEY`
+   - Provides high-quality image generation as a backup
 
-2. **Azure OpenAI DALL-E (Fallback)** - Direct Azure DALL-E deployment
-
-   - Requires `AZURE_OPENAI_DALLE_DEPLOYMENT` environment variable
-   - Uses Azure OpenAI service
-
-3. **OpenAI DALL-E (Fallback)** - Direct OpenAI API
-
-   - Requires `OPENAI_API_KEY` environment variable
-   - Uses OpenAI's DALL-E service directly
-
-4. **Picsum Placeholder (Final Fallback)** - Beautiful placeholder images
+3. **Picsum Placeholder (Final Fallback)** - Beautiful placeholder images
    - If all AI image generation methods fail, uses [Picsum](https://picsum.photos/) for professional placeholder images
    - Ensures every blog post has a visually appealing hero image
    - Uses high-quality stock photography as placeholders
 
-### Agent-Engine Integration
-
-The system now integrates with the agent-engine's sophisticated image generation capabilities:
-
-- **Model**: Uses `gpt-image-1` (more advanced than DALL-E 3)
-- **Features**: Supports image editing, combining multiple images, and advanced prompting
-- **Environment**: Requires `OPENAI_IMAGE_API_KEY` in the agent-engine environment
-- **Path**: Automatically detects agent-engine in `../agent-engine/` relative to backend
+**Note**: 
+- Image-to-image editing and multi-image combination features are not currently supported but can be added in the future if needed.
+- Filenames are preserved as-is from the frontend request.
 
 ### API Endpoints
 
@@ -192,8 +162,8 @@ To extend the blog management feature:
 
 1. **BaseHub Token Missing**: Ensure `BASEHUB_TOKEN` is set in environment variables
 2. **Collection ID Wrong**: Verify `POSTS_COLLECTION_ID` matches your BaseHub collection
-3. **Image Generation Fails**: Check Azure OpenAI DALL-E 3 access
-4. **Content Generation Fails**: Verify Azure OpenAI configuration
+3. **Image Generation Fails**: Check `OPENAI_IMAGE_API_KEY` is set correctly
+4. **Content Generation Fails**: Verify OpenAI API key configuration
 
 ### Logs
 
