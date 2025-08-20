@@ -28,6 +28,7 @@ export interface Task {
   knowledgeBaseUpdatedAt?: string; // When the knowledge base was last updated
   createVideo?: boolean; // Whether to create a video recording of the task execution
   videoModel?: string; // The video model to use for video generation
+  imageModel?: string; // The image model to use for image generation
   description?: string; // Description of the task
   category?: string; // Category of the task
   requireApproval?: boolean; // Whether the task requires approval before sending results
@@ -62,6 +63,7 @@ export interface TaskUpdate {
   knowledgeBaseUpdatedAt?: string; // When the knowledge base was last updated
   createVideo?: boolean; // Whether to create a video recording of the task execution
   videoModel?: string; // The video model to use for video generation
+  imageModel?: string; // The image model to use for image generation
   requireApproval?: boolean; // Whether the task requires approval before sending results
   slackChannel?: string; // The Slack channel ID for approval requests
 } 
