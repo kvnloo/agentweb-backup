@@ -1,7 +1,7 @@
 import { Request, Response } from "express";
+import { openaiImageService } from "../services/imageGeneration";
 import OpenAI from "openai";
 import axios from "axios";
-import { openaiImageService } from "../services/imageGeneration";
 
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
@@ -92,25 +92,25 @@ export const generateBlogPost = async (req: AuthRequest, res: Response) => {
     Please provide:
     1. A compelling title (can be the same as the original if it's good)
     2. A brief description (1-2 sentences for SEO) summarizing the key points
-    3. The full blog content in clean markdown format, preserving all original content
+    3. The full blog content in clean markdown format (convert HTML to well-structured markdown)
     4. A detailed image prompt for generating a hero image that represents the article topic
 
     Format the response as JSON with the following structure:
     {
       "title": "Blog Post Title",
       "description": "SEO description highlighting key article points",
-      "content": "# Blog Post Content in Markdown...",
+      "content": "Blog content in clean markdown format...",
       "imagePrompt": "Detailed description for hero image generation"
     }
     
-    Remember: The article is already excellent. Just convert the format from HTML to blog-ready markdown while preserving all the quality content.`;
+    Remember: The article is already excellent. Convert from HTML to clean markdown format while preserving all the quality content. Use proper markdown syntax for headings, lists, emphasis, and formatting.`;
 
     // Generate blog post content using LLM
     try {
       const completion = await openai.chat.completions.create({
         model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
         messages: [
-          { role: 'system', content: 'You are a professional blog formatter who converts well-written HTML articles to blog-ready markdown format. The content is already excellent - focus on clean formatting and structure. Always respond with valid JSON.' },
+          { role: 'system', content: 'You are a professional blog formatter who converts well-written HTML articles to clean markdown format. Convert HTML tags to proper markdown syntax (headings with #, lists with -, emphasis with *, etc.). The content is already excellent - focus on clean formatting and structure. Always respond with valid JSON.' },
           { role: 'user', content: blogPrompt }
         ],
         temperature: 0.7,
@@ -143,9 +143,16 @@ export const generateBlogPost = async (req: AuthRequest, res: Response) => {
         throw new Error('LLM response missing required fields (title, content)');
       }
 
+      console.log("✅ Blog post generated successfully via LLM");
+
       return res.status(200).json({
         success: true,
-        data: blogData,
+        data: {
+          title: blogData.title,
+          description: blogData.description,
+          content: blogData.content,
+          imagePrompt: blogData.imagePrompt
+        },
       });
     } catch (llmError: any) {
       // Fallback to placeholder response if LLM fails
@@ -206,7 +213,7 @@ export const generateImage = async (req: AuthRequest, res: Response) => {
       const openaiResult = await openaiImageService.generateImage({
         prompt: prompt,
         size: "1536x1024",
-        quality: "standard",
+        quality: "medium",
         filename: filename || "generated-blog-image.png",
       });
 
@@ -220,6 +227,8 @@ export const generateImage = async (req: AuthRequest, res: Response) => {
           },
         });
       } else {
+        console.warn("⚠️ OpenAI API image generation failed:", openaiResult.error);
+        console.error("💥 Full error details:", openaiResult);
         // Continue to fallback methods
       }
     }
@@ -278,37 +287,116 @@ export const generateImage = async (req: AuthRequest, res: Response) => {
   }
 };
 
-export const publishToBaseHub = async (req: AuthRequest, res: Response) => {
+export const publishBlogPost = async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.user?.userId;
     if (!userId) {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
-    const { title, description, content, imageUrl } = req.body;
+    const { title, description, content, imageUrl, imageFilename } = req.body;
 
-    if (!title || !description || !content || !imageUrl) {
-      return res.status(400).json({
-        message: "Title, description, content, and imageUrl are required",
+    if (!title || !description || !content) {
+      return res
+        .status(400)
+        .json({ message: "Title, description, and content are required" });
+    }
+
+    console.log("🚀 Publishing blog post to BaseHub:", title);
+
+    const BASEHUB_API_URL =
+      process.env.BASEHUB_API_URL || "https://api.basehub.com/graphql";
+    const BASEHUB_TOKEN = process.env.BASEHUB_TOKEN || "";
+    const POSTS_COLLECTION_ID = "dKrosxXlaGpnZCrAbHxlX";
+
+    if (!BASEHUB_TOKEN) {
+      return res.status(500).json({
+        success: false,
+        message: "BaseHub token is not configured",
       });
     }
 
-    // For now, we'll return a success response since we don't have the BaseHub integration set up
+    // Create the transaction data structure
+    const transactionData = {
+      type: "create",
+      parentId: POSTS_COLLECTION_ID,
+      data: {
+        title: title,
+        type: "instance",
+        value: {
+          description: {
+            type: "text",
+            value: description,
+          },
+          publishedAt: {
+            type: "date",
+            value: new Date().toISOString(),
+          },
+          body: {
+            type: "rich-text",
+            value: {
+              format: "rich-text",
+              value: content,
+            },
+          },
+          authors: {
+            type: "reference",
+            value: ["PCMhesaHZ237t05iG8ms6"],
+          },
+        },
+      },
+    };
+
+    // Add image if provided
+    if (imageUrl && imageFilename) {
+      (transactionData.data.value as any).image = {
+        type: "instance",
+        mainComponentId: "AAzuzbz0jSbfwGJYvtMu3",
+        value: {
+          light: {
+            type: "media",
+            value: {
+              url: imageUrl,
+              fileName: imageFilename,
+            },
+          },
+        },
+      };
+    }
+
+    const mutation = `
+      mutation CreateBlogPost($data: String!) {
+        transaction(data: $data)
+      }
+    `;
+
+    const variables = { data: JSON.stringify(transactionData) };
+
+    const headers = {
+      Authorization: `Bearer ${BASEHUB_TOKEN}`,
+      "Content-Type": "application/json",
+    };
+
+    const response = await axios.post(
+      BASEHUB_API_URL,
+      { query: mutation, variables },
+      { headers }
+    );
+
+    console.log("✅ Blog post published successfully to BaseHub");
+
     return res.status(200).json({
       success: true,
-      message: "Blog post published successfully (placeholder)",
+      message: "Blog post published successfully",
       data: {
-        title,
-        description,
-        content,
-        imageUrl,
+        basehubResponse: response.data,
       },
     });
   } catch (error: any) {
-    console.error("❌ Error publishing to BaseHub:", error);
+    console.error("Error publishing blog post:", error);
     return res.status(500).json({
       success: false,
-      message: "Failed to publish blog post",
+      message: "Error publishing blog post",
       error: error.message,
     });
   }
