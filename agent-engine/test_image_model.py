@@ -61,7 +61,7 @@ def test_environment_variables():
     else:
         print("⚠️  OPENAI_IMAGE_API_KEY is not set")
     
-    # Test Azure OpenAI API key
+    # Test Azure AI Services API key
     azure_key = os.getenv('AZURE_OPENAI_API_KEY2')
     if azure_key:
         print(f"✅ AZURE_OPENAI_API_KEY2 is set (ends with ...{azure_key[-4:]})")

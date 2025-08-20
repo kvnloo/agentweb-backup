@@ -3034,11 +3034,11 @@ class WebAgent:
                 logger.error(f"Error performing video analysis: {e}")
                 return ActionResult(error=f"Failed to perform video analysis: {str(e)}")
 
-        @self.controller.registry.action('Generate image with input images using OpenAI GPT Image or Azure OpenAI FLUX', param_model=GenerateImageParams)
+        @self.controller.registry.action('Generate image with input images using OpenAI GPT Image or Azure AI Services FLUX', param_model=GenerateImageParams)
         async def generate_image(params: GenerateImageParams) -> ActionResult:
-            """Generate or edit images using OpenAI GPT Image or Azure OpenAI FLUX model with input images.
+            """Generate or edit images using OpenAI GPT Image or Azure AI Services FLUX model with input images.
             
-            This action uses OpenAI GPT Image or Azure OpenAI FLUX.1-Kontext-pro to generate or edit images based on input images
+            This action uses OpenAI GPT Image or Azure AI Services FLUX.1-Kontext-pro to generate or edit images based on input images
             from attachments or downloads folder. The generated image is saved to the downloads folder.
             
             Parameters:
@@ -3066,25 +3066,25 @@ class WebAgent:
                 
                 logger.info(f"Image generation - params.model: {params.model}, task.image_model: {self.image_model}, final model_to_use: {model_to_use}")
                 
-                # Initialize variables for Azure OpenAI
+                # Initialize variables for Azure AI Services
                 azure_model_name = None
                 
                 if model_to_use == "FLUX.1-Kontext-pro":
-                    # Use Azure OpenAI for FLUX model with direct HTTP requests
+                    # Use Azure AI Services for FLUX model with direct HTTP requests
                     api_key = os.getenv('AZURE_OPENAI_API_KEY2')
                     if not api_key:
                         return ActionResult(error="AZURE_OPENAI_API_KEY2 environment variable is not set for FLUX.1-Kontext-pro model")
                     
-                    logger.info(f"Using Azure OpenAI FLUX model with direct HTTP requests")
+                    logger.info(f"Using Azure AI Services FLUX model with direct HTTP requests")
                     
-                    # Azure OpenAI endpoint for FLUX model
+                    # Azure AI Services endpoint for FLUX model
                     azure_endpoint = "https://ai-ruiwangwarm7085ai345967089938.services.ai.azure.com"
                     deployment_name = "FLUX.1-Kontext-pro"
                     
-                    # For Azure OpenAI, we'll use direct HTTP requests
+                    # For Azure AI Services, we'll use direct HTTP requests
                     azure_model_name = "flux.1-kontext-pro"
                     
-                    logger.info(f"Azure OpenAI FLUX model configured: {azure_model_name}")
+                    logger.info(f"Azure AI Services FLUX model configured: {azure_model_name}")
                 else:
                     # Use OpenAI for default model
                     api_key = os.getenv('OPENAI_IMAGE_API_KEY')
@@ -3143,7 +3143,7 @@ class WebAgent:
                 if len(input_images) == 0:
                     # Generate new image from prompt only
                     if model_to_use == "FLUX.1-Kontext-pro":
-                        # Use direct HTTP request for Azure OpenAI FLUX model
+                        # Use direct HTTP request for Azure AI Services FLUX model
                         logger.info(f"Generating new image with FLUX model using direct HTTP request...")
                         
                         import requests
@@ -3163,16 +3163,16 @@ class WebAgent:
                         response = requests.post(url, headers=headers, json=data, params={"api-version": "2025-04-01-preview"})
                         
                         if response.status_code != 200:
-                            return ActionResult(error=f"Azure OpenAI API error: {response.status_code} - {response.text}")
+                            return ActionResult(error=f"Azure AI Services API error: {response.status_code} - {response.text}")
                         
                         result_data = response.json()
                         if not result_data.get('data') or len(result_data['data']) == 0:
-                            return ActionResult(error="No image data received from Azure OpenAI API")
+                            return ActionResult(error="No image data received from Azure AI Services API")
                         
                         # Extract the image data
                         image_base64 = result_data['data'][0].get('b64_json')
                         if not image_base64:
-                            return ActionResult(error="No b64_json data in Azure OpenAI response")
+                            return ActionResult(error="No b64_json data in Azure AI Services response")
                         
                         # Save the image
                         image_bytes = base64.b64decode(image_base64)
@@ -3214,7 +3214,7 @@ class WebAgent:
                 elif len(input_images) == 1:
                     # Edit single image
                     if model_to_use == "FLUX.1-Kontext-pro":
-                        # Use direct HTTP request for Azure OpenAI FLUX model
+                        # Use direct HTTP request for Azure AI Services FLUX model
                         logger.info(f"Editing image with FLUX model using direct HTTP request...")
                         
                         import requests
@@ -3235,16 +3235,16 @@ class WebAgent:
                             response = requests.post(url, headers=headers, files=files, params={"api-version": "2025-04-01-preview"})
                         
                         if response.status_code != 200:
-                            return ActionResult(error=f"Azure OpenAI API error: {response.status_code} - {response.text}")
+                            return ActionResult(error=f"Azure AI Services API error: {response.status_code} - {response.text}")
                         
                         result_data = response.json()
                         if not result_data.get('data') or len(result_data['data']) == 0:
-                            return ActionResult(error="No image data received from Azure OpenAI API")
+                            return ActionResult(error="No image data received from Azure AI Services API")
                         
                         # Extract the image data
                         image_base64 = result_data['data'][0].get('b64_json')
                         if not image_base64:
-                            return ActionResult(error="No b64_json data in Azure OpenAI response")
+                            return ActionResult(error="No b64_json data in Azure AI Services response")
                         
                         # Save the image
                         image_bytes = base64.b64decode(image_base64)
@@ -3287,7 +3287,7 @@ class WebAgent:
                 else:
                     # Edit multiple images (combine them)
                     if model_to_use == "FLUX.1-Kontext-pro":
-                        # Use direct HTTP request for Azure OpenAI FLUX model
+                        # Use direct HTTP request for Azure AI Services FLUX model
                         logger.info(f"Editing multiple images with FLUX model using direct HTTP request...")
                         
                         import requests
@@ -3302,7 +3302,7 @@ class WebAgent:
                             files = {
                                 "image": (params.input_file_names[0], img1, "image/png"),
                                 "model": (None, azure_model_name),
-                                "prompt": (None, params.prompt)
+                                "instructions": (None, params.prompt)
                             }
                             
                             # Add additional images if they exist
@@ -3313,16 +3313,16 @@ class WebAgent:
                             response = requests.post(url, headers=headers, files=files, params={"api-version": "2025-04-01-preview"})
                         
                         if response.status_code != 200:
-                            return ActionResult(error=f"Azure OpenAI API error: {response.status_code} - {response.text}")
+                            return ActionResult(error=f"Azure AI Services API error: {response.status_code} - {response.text}")
                         
                         result_data = response.json()
                         if not result_data.get('data') or len(result_data['data']) == 0:
-                            return ActionResult(error="No image data received from Azure OpenAI API")
+                            return ActionResult(error="No image data received from Azure AI Services API")
                         
                         # Extract the image data
                         image_base64 = result_data['data'][0].get('b64_json')
                         if not image_base64:
-                            return ActionResult(error="No b64_json data in Azure OpenAI response")
+                            return ActionResult(error="No b64_json data in Azure AI Services response")
                         
                         # Save the image
                         image_bytes = base64.b64decode(image_base64)
