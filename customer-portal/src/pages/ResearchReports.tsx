@@ -57,10 +57,14 @@ import {
   Users,
   Edit3,
   Image,
+  Maximize2,
 } from "lucide-react";
 import { format } from "date-fns";
 import { useNavigate } from "react-router-dom";
 import { useToast } from "@/hooks/use-toast";
+import AgentWorkflowDisplay, {
+  WorkflowStep,
+} from "@/components/blog/AgentWorkflowDisplay";
 
 interface ResultFile {
   url: string;
@@ -216,6 +220,18 @@ const ResearchReportsPage: React.FC = () => {
     imagePrompt: string;
     imageUrl?: string;
   } | null>(null);
+
+  // Regeneration state variables
+  const [regeneratingImage, setRegeneratingImage] = useState(false);
+  const [regeneratingTitle, setRegeneratingTitle] = useState(false);
+  const [regeneratingDescription, setRegeneratingDescription] = useState(false);
+  const [regeneratingContent, setRegeneratingContent] = useState(false);
+  const [regeneratingEntireBlog, setRegeneratingEntireBlog] = useState(false);
+  const [imagePreviewOpen, setImagePreviewOpen] = useState(false);
+
+  // AI Agent Workflow Display
+  const [showWorkflow, setShowWorkflow] = useState(false);
+  const [workflowSteps, setWorkflowSteps] = useState<WorkflowStep[]>([]);
 
   // Create Research Reports functionality
   const [createTaskDialogOpen, setCreateTaskDialogOpen] = useState(false);
@@ -1002,6 +1018,33 @@ const ResearchReportsPage: React.FC = () => {
     );
     console.log("⚙️ Blog options:", blogOptions);
 
+    // Initialize workflow steps - just the 3 core AI operations
+    const initialSteps: WorkflowStep[] = [
+      {
+        id: "analyze-content",
+        title: "Analyzing Content",
+        description:
+          "🧠 AI is analyzing the research report and planning content strategy",
+        status: "pending",
+      },
+      {
+        id: "generate-content",
+        title: "Generating Blog Content",
+        description: "✍️ AI is crafting engaging, founder-focused blog content",
+        status: "pending",
+      },
+      {
+        id: "generate-image",
+        title: "Creating Hero Image",
+        description:
+          "🎨 AI is generating a professional hero image using DALL-E",
+        status: "pending",
+      },
+    ];
+
+    setWorkflowSteps(initialSteps);
+    setShowWorkflow(true);
+
     if (!pendingBlogReport || !token) {
       console.error("❌ Missing required data:", {
         pendingBlogReport: !!pendingBlogReport,
@@ -1041,6 +1084,8 @@ const ResearchReportsPage: React.FC = () => {
           "📄 Report content fetched through backend, length:",
           reportContent.length
         );
+
+        // Report content fetched successfully - no workflow step needed
       } catch (reportError: any) {
         console.warn(
           "⚠️ Failed to fetch through backend, trying direct fetch..."
@@ -1095,6 +1140,21 @@ const ResearchReportsPage: React.FC = () => {
         "characters"
       );
 
+      // Update workflow step to active (analyze content)
+      setWorkflowSteps((prev) =>
+        prev.map((step) =>
+          step.id === "analyze-content"
+            ? {
+                ...step,
+                status: "active",
+                timestamp: new Date(),
+                description:
+                  "🧠 Analyzing topic and crafting content strategy...",
+              }
+            : step
+        )
+      );
+
       // Generate the blog post based on the report content
       const response = await axios.post(apiUrl, requestData, {
         headers: { Authorization: `Bearer ${token}` },
@@ -1102,8 +1162,74 @@ const ResearchReportsPage: React.FC = () => {
 
       console.log("✅ Blog generation response:", response.data);
 
+      // Complete analyze step and start writing content
+      setWorkflowSteps((prev) =>
+        prev.map((step) =>
+          step.id === "analyze-content"
+            ? {
+                ...step,
+                status: "completed",
+                timestamp: new Date(),
+                description:
+                  "✅ Analysis complete! Planning content strategy...",
+              }
+            : step
+        )
+      );
+
+      // Start generating content step
+      setTimeout(() => {
+        setWorkflowSteps((prev) =>
+          prev.map((step) =>
+            step.id === "generate-content"
+              ? {
+                  ...step,
+                  status: "active",
+                  timestamp: new Date(),
+                  description:
+                    "✍️ Writing engaging, founder-focused content...",
+                }
+              : step
+          )
+        );
+      }, 600);
+
+      // Complete generating content step
+      setTimeout(() => {
+        setWorkflowSteps((prev) =>
+          prev.map((step) =>
+            step.id === "generate-content"
+              ? {
+                  ...step,
+                  status: "completed",
+                  timestamp: new Date(),
+                  description:
+                    "✅ Content generation complete! Processing AI response...",
+                }
+              : step
+          )
+        );
+      }, 1200); // 1.2 second delay to make it feel more realistic
+
       if (response.data.success) {
         const blogData = response.data.data;
+
+        // Update workflow step to active (image generation)
+        setWorkflowSteps((prev) =>
+          prev.map((step) =>
+            step.id === "generate-image"
+              ? {
+                  ...step,
+                  status: "active",
+                  timestamp: new Date(),
+                  description: "🎨 Starting AI image generation workflow...",
+                }
+              : step
+          )
+        );
+
+        // Add realistic delay to simulate AI image generation time
+        await new Promise((resolve) => setTimeout(resolve, 1200)); // 1.2 second delay
 
         // Try to generate the image, but continue without it if it fails
         let imageUrl: string | undefined;
@@ -1122,6 +1248,22 @@ const ResearchReportsPage: React.FC = () => {
 
           if (imageResponse.data.success) {
             imageUrl = imageResponse.data.data.imageUrl;
+
+            // Complete image generation step
+            setWorkflowSteps((prev) =>
+              prev.map((step) =>
+                step.id === "generate-image"
+                  ? {
+                      ...step,
+                      status: "completed",
+                      timestamp: new Date(),
+                      description:
+                        "✅ Image generated successfully via OpenAI API",
+                    }
+                  : step
+              )
+            );
+
             if (imageResponse.data.data.isPlaceholder) {
               console.log("🖼️ Using placeholder image from backend");
               toast({
@@ -1150,10 +1292,15 @@ const ResearchReportsPage: React.FC = () => {
           });
         }
 
+        // Workflow complete - all 3 core steps done
+
         // Set the blog content (always with an image now - either generated or placeholder)
         setGeneratedBlogContent({
           ...blogData,
           imageUrl: imageUrl,
+          imageFilename: imageUrl
+            ? `generated-blog-image-${Date.now()}.png`
+            : undefined,
         });
         setBlogStep("preview");
       }
@@ -1259,6 +1406,240 @@ const ResearchReportsPage: React.FC = () => {
   const handleBackToOptions = () => {
     setBlogStep("options");
     setGeneratedBlogContent(null);
+  };
+
+  // Regeneration handler functions
+  const handleRegenerateImage = async () => {
+    if (!generatedBlogContent?.imagePrompt || !token) return;
+
+    setRegeneratingImage(true);
+    try {
+      console.log("🎨 Regenerating hero image...");
+      const imageResponse = await axios.post(
+        buildApiUrl("/api/blog/generate-image"),
+        {
+          prompt: generatedBlogContent.imagePrompt,
+          filename: `regenerated-image-${Date.now()}.png`,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      if (imageResponse.data.success) {
+        const newImageUrl = imageResponse.data.data.imageUrl;
+        setGeneratedBlogContent({
+          ...generatedBlogContent,
+          imageUrl: newImageUrl,
+          imageFilename: `regenerated-image-${Date.now()}.png`,
+        });
+
+        toast({
+          title: "Image Regenerated!",
+          description: "Your hero image has been regenerated successfully.",
+        });
+      }
+    } catch (error: any) {
+      console.error("❌ Error regenerating image:", error);
+      toast({
+        title: "Error Regenerating Image",
+        description: "Failed to regenerate the hero image. Please try again.",
+        variant: "destructive",
+      });
+    } finally {
+      setRegeneratingImage(false);
+    }
+  };
+
+  const handleRegenerateTitle = async () => {
+    if (!generatedBlogContent || !token) return;
+
+    setRegeneratingTitle(true);
+    try {
+      console.log("📝 Regenerating blog title...");
+      const response = await axios.post(
+        buildApiUrl("/api/blog/generate"),
+        {
+          topic: `Generate only a blog title for: ${generatedBlogContent.content.substring(
+            0,
+            200
+          )}...`,
+          tone: blogOptions.tone,
+          length: "short",
+          keywords: blogOptions.keywords,
+          researchContext: generatedBlogContent.content,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      if (response.data.success) {
+        const newTitle = response.data.data.title;
+        setGeneratedBlogContent({
+          ...generatedBlogContent,
+          title: newTitle,
+        });
+
+        toast({
+          title: "Title Regenerated!",
+          description: "Your blog title has been regenerated successfully.",
+        });
+      }
+    } catch (error: any) {
+      console.error("❌ Error regenerating title:", error);
+      toast({
+        title: "Error Regenerating Title",
+        description: "Failed to regenerate the blog title. Please try again.",
+        variant: "destructive",
+      });
+    } finally {
+      setRegeneratingTitle(false);
+    }
+  };
+
+  const handleRegenerateDescription = async () => {
+    if (!generatedBlogContent || !token) return;
+
+    setRegeneratingDescription(true);
+    try {
+      console.log("📝 Regenerating blog description...");
+      const response = await axios.post(
+        buildApiUrl("/api/blog/generate"),
+        {
+          topic: `Generate only an SEO description for: ${generatedBlogContent.title}`,
+          tone: blogOptions.tone,
+          length: "short",
+          keywords: blogOptions.keywords,
+          researchContext: generatedBlogContent.content,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      if (response.data.success) {
+        const newDescription = response.data.data.description;
+        setGeneratedBlogContent({
+          ...generatedBlogContent,
+          description: newDescription,
+        });
+
+        toast({
+          title: "Description Regenerated!",
+          description:
+            "Your SEO description has been regenerated successfully.",
+        });
+      }
+    } catch (error: any) {
+      console.error("❌ Error regenerating description:", error);
+      toast({
+        title: "Error Regenerating Description",
+        description:
+          "Failed to regenerate the SEO description. Please try again.",
+        variant: "destructive",
+      });
+    } finally {
+      setRegeneratingDescription(false);
+    }
+  };
+
+  const handleRegenerateContent = async () => {
+    if (!generatedBlogContent || !token) return;
+
+    setRegeneratingContent(true);
+    try {
+      console.log("📝 Regenerating blog content...");
+      const response = await axios.post(
+        buildApiUrl("/api/blog/generate"),
+        {
+          topic: `Regenerate blog content for: ${generatedBlogContent.title}`,
+          tone: blogOptions.tone,
+          length: blogOptions.length,
+          keywords: blogOptions.keywords,
+          researchContext: generatedBlogContent.content,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      if (response.data.success) {
+        const newContent = response.data.data.content;
+        setGeneratedBlogContent({
+          ...generatedBlogContent,
+          content: newContent,
+        });
+
+        toast({
+          title: "Content Regenerated!",
+          description: "Your blog content has been regenerated successfully.",
+        });
+      }
+    } catch (error: any) {
+      console.error("❌ Error regenerating content:", error);
+      toast({
+        title: "Error Regenerating Content",
+        description: "Failed to regenerate the blog content. Please try again.",
+        variant: "destructive",
+      });
+    } finally {
+      setRegeneratingContent(false);
+    }
+  };
+
+  const handleRegenerateEntireBlog = async () => {
+    if (!pendingBlogReport || !token) return;
+
+    setRegeneratingEntireBlog(true);
+    try {
+      console.log("🚀 Regenerating entire blog post...");
+
+      // Reset workflow steps for regeneration
+      const initialSteps: WorkflowStep[] = [
+        {
+          id: "analyze-content",
+          title: "Analyzing Content",
+          description:
+            "🧠 AI is analyzing the research report and planning content strategy",
+          status: "pending",
+        },
+        {
+          id: "generate-content",
+          title: "Generating Blog Content",
+          description:
+            "✍️ AI is crafting engaging, founder-focused blog content",
+          status: "pending",
+        },
+        {
+          id: "generate-image",
+          title: "Creating Hero Image",
+          description:
+            "🎨 AI is generating a professional hero image using DALL-E",
+          status: "pending",
+        },
+      ];
+      setWorkflowSteps(initialSteps);
+      setShowWorkflow(true);
+
+      // Start the regeneration process
+      await handleGenerateBlogContent();
+
+      toast({
+        title: "Blog Regenerated!",
+        description: "Your entire blog post has been regenerated successfully.",
+      });
+    } catch (error: any) {
+      console.error("❌ Error regenerating entire blog:", error);
+      toast({
+        title: "Error Regenerating Blog",
+        description:
+          "Failed to regenerate the entire blog post. Please try again.",
+        variant: "destructive",
+      });
+    } finally {
+      setRegeneratingEntireBlog(false);
+    }
   };
 
   // Helper functions for dropdown functionality
@@ -2409,10 +2790,43 @@ const ResearchReportsPage: React.FC = () => {
               {blogStep === "publishing" &&
                 "Your blog post is being published to BaseHub..."}
             </DialogDescription>
+
+            {/* Regenerate entire blog post button */}
+            {blogStep === "preview" && generatedBlogContent && (
+              <div className="flex justify-end pt-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleRegenerateEntireBlog}
+                  disabled={regeneratingEntireBlog}
+                  className="text-xs"
+                >
+                  {regeneratingEntireBlog ? (
+                    <>
+                      <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                      Regenerating Entire Blog...
+                    </>
+                  ) : (
+                    <>
+                      <RefreshCw className="h-3 w-3 mr-1" />
+                      Regenerate Entire Blog
+                    </>
+                  )}
+                </Button>
+              </div>
+            )}
           </DialogHeader>
 
           {blogStep === "options" && (
             <div className="space-y-4 py-4">
+              {/* AI Agent Workflow Display */}
+              <AgentWorkflowDisplay
+                steps={workflowSteps}
+                isVisible={showWorkflow}
+                onToggle={() => setShowWorkflow(!showWorkflow)}
+                className="mb-4"
+              />
+
               <div className="space-y-2">
                 <Label className="text-sm font-medium">Source Report</Label>
                 <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
@@ -2491,6 +2905,19 @@ const ResearchReportsPage: React.FC = () => {
                   }
                 />
               </div>
+
+              {/* Workflow Toggle Button */}
+              <div className="flex justify-center pt-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setShowWorkflow(!showWorkflow)}
+                  className="text-blue-600 hover:text-blue-700 border-blue-200 hover:border-blue-300"
+                >
+                  {showWorkflow ? "Hide" : "Show"} AI Agent Workflow
+                </Button>
+              </div>
             </div>
           )}
 
@@ -2498,13 +2925,35 @@ const ResearchReportsPage: React.FC = () => {
             <div className="space-y-4 py-4 max-h-[70vh] overflow-y-auto">
               {/* Hero Image */}
               <div className="space-y-2">
-                <Label className="text-sm font-medium">Hero Image</Label>
+                <div className="flex items-center justify-between">
+                  <Label className="text-sm font-medium">Hero Image</Label>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleRegenerateImage}
+                    disabled={regeneratingImage}
+                    className="text-xs"
+                  >
+                    {regeneratingImage ? (
+                      <>
+                        <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                        Regenerating...
+                      </>
+                    ) : (
+                      <>
+                        <RefreshCw className="h-3 w-3 mr-1" />
+                        Regenerate Image
+                      </>
+                    )}
+                  </Button>
+                </div>
                 {generatedBlogContent.imageUrl ? (
-                  <div className="relative">
+                  <div className="relative group">
                     <img
                       src={generatedBlogContent.imageUrl}
                       alt="Blog post hero image"
-                      className="w-full h-48 object-cover rounded-lg border"
+                      className="w-full h-48 object-cover rounded-lg border cursor-pointer hover:opacity-90 transition-opacity"
+                      onClick={() => setImagePreviewOpen(true)}
                     />
                     {generatedBlogContent.imageUrl.includes(
                       "picsum.photos"
@@ -2513,6 +2962,11 @@ const ResearchReportsPage: React.FC = () => {
                         Placeholder
                       </div>
                     )}
+                    <div className="absolute bottom-2 right-2 bg-black/70 text-white text-xs px-2 py-1 rounded flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                      <Maximize2 className="h-3 w-3" />
+                      Click to expand
+                    </div>
+                    <div className="absolute inset-0 bg-black/0 group-hover:bg-black/10 transition-colors rounded-lg pointer-events-none" />
                   </div>
                 ) : (
                   <div className="w-full h-48 bg-gray-100 dark:bg-gray-800 rounded-lg border border-dashed border-gray-300 dark:border-gray-600 flex items-center justify-center">
@@ -2529,7 +2983,28 @@ const ResearchReportsPage: React.FC = () => {
 
               {/* Title */}
               <div className="space-y-2">
-                <Label className="text-sm font-medium">Title</Label>
+                <div className="flex items-center justify-between">
+                  <Label className="text-sm font-medium">Title</Label>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleRegenerateTitle}
+                    disabled={regeneratingTitle}
+                    className="text-xs"
+                  >
+                    {regeneratingTitle ? (
+                      <>
+                        <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                        Regenerating...
+                      </>
+                    ) : (
+                      <>
+                        <RefreshCw className="h-3 w-3 mr-1" />
+                        Regenerate Title
+                      </>
+                    )}
+                  </Button>
+                </div>
                 <Input
                   value={generatedBlogContent.title}
                   onChange={(e) =>
@@ -2544,7 +3019,28 @@ const ResearchReportsPage: React.FC = () => {
 
               {/* Description */}
               <div className="space-y-2">
-                <Label className="text-sm font-medium">SEO Description</Label>
+                <div className="flex items-center justify-between">
+                  <Label className="text-sm font-medium">SEO Description</Label>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleRegenerateDescription}
+                    disabled={regeneratingDescription}
+                    className="text-xs"
+                  >
+                    {regeneratingDescription ? (
+                      <>
+                        <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                        Regenerating...
+                      </>
+                    ) : (
+                      <>
+                        <RefreshCw className="h-3 w-3 mr-1" />
+                        Regenerate Description
+                      </>
+                    )}
+                  </Button>
+                </div>
                 <Textarea
                   value={generatedBlogContent.description}
                   onChange={(e) =>
@@ -2560,9 +3056,30 @@ const ResearchReportsPage: React.FC = () => {
 
               {/* Content */}
               <div className="space-y-2">
-                <Label className="text-sm font-medium">
-                  Blog Content (Markdown)
-                </Label>
+                <div className="flex items-center justify-between">
+                  <Label className="text-sm font-medium">
+                    Blog Content (Markdown)
+                  </Label>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleRegenerateContent}
+                    disabled={regeneratingContent}
+                    className="text-xs"
+                  >
+                    {regeneratingContent ? (
+                      <>
+                        <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                        Regenerating...
+                      </>
+                    ) : (
+                      <>
+                        <RefreshCw className="h-3 w-3 mr-1" />
+                        Regenerate Content
+                      </>
+                    )}
+                  </Button>
+                </div>
                 <Textarea
                   value={generatedBlogContent.content}
                   onChange={(e) =>
@@ -2834,6 +3351,55 @@ const ResearchReportsPage: React.FC = () => {
                 </>
               ) : (
                 "Create Task"
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Image Preview Modal */}
+      <Dialog open={imagePreviewOpen} onOpenChange={setImagePreviewOpen}>
+        <DialogContent className="max-w-4xl max-h-[90vh] overflow-hidden">
+          <DialogHeader>
+            <DialogTitle>Hero Image Preview</DialogTitle>
+            <DialogDescription>
+              Full-size preview of your blog post hero image
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="flex justify-center items-center p-4">
+            {generatedBlogContent?.imageUrl && (
+              <div className="relative max-w-full max-h-[70vh] overflow-auto">
+                <img
+                  src={generatedBlogContent.imageUrl}
+                  alt="Blog post hero image - full size"
+                  className="max-w-full h-auto object-contain rounded-lg shadow-lg"
+                />
+              </div>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setImagePreviewOpen(false)}
+            >
+              Close
+            </Button>
+            <Button
+              onClick={handleRegenerateImage}
+              disabled={regeneratingImage}
+            >
+              {regeneratingImage ? (
+                <>
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Regenerating...
+                </>
+              ) : (
+                <>
+                  <RefreshCw className="h-4 w-4 mr-2" />
+                  Regenerate Image
+                </>
               )}
             </Button>
           </DialogFooter>

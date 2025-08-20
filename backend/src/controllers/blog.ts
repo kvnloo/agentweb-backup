@@ -2,6 +2,8 @@ import { Request, Response } from "express";
 import { openaiImageService } from "../services/imageGeneration";
 import OpenAI from "openai";
 import axios from "axios";
+import AWS from "aws-sdk";
+import { v4 as uuidv4 } from "uuid";
 
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
@@ -11,8 +13,8 @@ interface AuthRequest extends Request {
 const openai = new OpenAI({
   apiKey: process.env.AZURE_OPENAI_API_KEY,
   baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT}`,
-  defaultQuery: { 'api-version': process.env.AZURE_OPENAI_API_VERSION },
-  defaultHeaders: { 'api-key': process.env.AZURE_OPENAI_API_KEY }
+  defaultQuery: { "api-version": process.env.AZURE_OPENAI_API_VERSION },
+  defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
 });
 
 // Initialize OpenAI client for DALL-E fallback
@@ -28,12 +30,75 @@ if (process.env.OPENAI_IMAGE_API_KEY) {
   );
 }
 
+// Initialize AWS S3
+const s3 = new AWS.S3({
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  region: process.env.AWS_REGION || "us-east-1",
+});
+
+// Author IDs from your BaseHub setup
+const AUTHORS = {
+  HARSH: "B7hR0AMxxh8HyBOLRKfiU",
+  RUI: "OVx_pLwKj00xoAf6kXSSf",
+  FANGFANG: "Vxo_NPdrUf0Yzob_Im3_d",
+  MATTHEW: "UM7cOq3RuKX9OPKqYRt-2",
+};
+
 interface BlogPostData {
   title: string;
   description: string;
   content: string;
   imageFilename: string;
   imagePrompt: string;
+}
+
+// Function to upload image to S3
+async function uploadImageToS3(
+  imageUrl: string,
+  filename: string
+): Promise<string> {
+  try {
+    console.log("📤 Uploading image to S3:", filename);
+
+    // Download the image from the generated URL
+    console.log("⬇️ Downloading image from AI service...");
+    const imageResponse = await axios.get(imageUrl, {
+      responseType: "arraybuffer",
+    });
+    const imageBuffer = Buffer.from(imageResponse.data as ArrayBuffer);
+    console.log("✅ Image downloaded successfully");
+
+    // Determine content type
+    const contentType = filename.endsWith(".png")
+      ? "image/png"
+      : filename.endsWith(".jpg")
+      ? "image/jpeg"
+      : filename.endsWith(".webp")
+      ? "image/webp"
+      : "image/png";
+
+    // Create unique S3 key
+    const s3Key = `blog-images/${Date.now()}-${filename}`;
+    console.log("🔑 S3 Key:", s3Key);
+
+    // Upload to S3
+    console.log("☁️ Uploading to AWS S3...");
+    const uploadResult = await s3
+      .upload({
+        Bucket: process.env.S3_BUCKET_NAME!,
+        Key: s3Key,
+        Body: imageBuffer,
+        ContentType: contentType,
+      })
+      .promise();
+
+    console.log("✅ Image uploaded to S3:", uploadResult.Location);
+    return uploadResult.Location;
+  } catch (error) {
+    console.error("❌ Error uploading image to S3:", error);
+    throw error;
+  }
 }
 
 export const generateBlogPost = async (req: AuthRequest, res: Response) => {
@@ -55,95 +120,121 @@ export const generateBlogPost = async (req: AuthRequest, res: Response) => {
       return res.status(400).json({ message: "Topic is required" });
     }
 
-    // Generate blog post content using LLM
-    let blogPrompt = `Convert this well-written article from HTML format to a blog-ready format. 
+    console.log("🤖 Starting AI blog generation workflow...");
+    console.log("📝 Topic:", topic);
+    console.log("🎭 Tone:", tone);
+    console.log("📏 Length:", length);
+    if (keywords) console.log("🔑 Keywords:", keywords);
+    if (researchContext) console.log("📚 Research context provided");
+    console.log("---");
 
-    Requirements:
-    - Topic: ${topic}
-    - Keywords to include: ${keywords || "relevant industry keywords"}
-    - Tone: ${tone}
-    - Length: ${length} (400-800 words for short, 800-1200 for medium, 1200-2000 for long)
+    // Improved blog prompt for better content generation
+    let blogPrompt = `You are an expert marketing strategist and content writer for AgentWeb, an AI marketing agency. Your audience is early-stage (pre-seed to Series A) B2B SaaS founders who are technical and product-focused.
+
+    Create a high-quality, engaging blog post about: ${topic}
     
-    IMPORTANT: This is a format conversion task. The article content is already excellent - you just need to:
-    1. CONVERT from HTML format to clean markdown blog format
-    2. MAINTAIN all the existing content, insights, and structure
-    3. IMPROVE formatting for blog readability (better headings, spacing, etc.)
-    4. ENSURE the content is ready for immediate blog publishing
-    5. PRESERVE the article's quality and message`;
+    Requirements:
+    - Tone: ${tone} (be conversational but professional, avoid overly formal language)
+    - Length: ${length} (400-800 words for short, 800-1200 for medium, 1200-2000 for long)
+    - Keywords to naturally include: ${keywords || "relevant industry keywords"}
+    
+    Content Guidelines:
+    1. Write in a natural, human voice - avoid AI-generated patterns
+    2. Use practical examples and actionable insights
+    3. Structure with clear H2 and H3 headings (no H4+)
+    4. Include relevant internal links naturally:
+       - Link to https://www.agentweb.pro when discussing done-for-you marketing services
+       - Link to https://www.agentweb.pro/build for self-service options
+       - Link to https://www.agentweb.pro/pricing for cost discussions
+    5. End with this exact CTA: "Ready to put your marketing on autopilot? [Book a call with Harsha](https://calendly.com/harsha-agentweb/30min) to walk through your current marketing workflow and see how AgentWeb can help you scale."
+    6. If research context is provided, use it as a foundation but rewrite in your own voice
+    7. Avoid generic AI language - be specific, use real examples, and sound like a human expert
+    8. **NO TABLES** - Tables don't render well in our CMS. Use bullet points, numbered lists, or paragraphs instead
+
+    Format the response as JSON with this structure:
+    {
+      "title": "Compelling, SEO-optimized title",
+      "description": "1-2 sentence meta description for SEO",
+      "content": "Full blog content in markdown format",
+      "imagePrompt": "Detailed visual description for hero image (avoid text, be conceptual)"
+    }`;
 
     // Add research context if provided
     if (researchContext) {
       blogPrompt += `
     
-    HTML ARTICLE CONTENT:
-    ${researchContext}
-    
-    Convert this HTML article to blog format by:
-    - Removing HTML tags and converting to clean markdown
-    - Improving heading structure and readability
-    - Adding proper spacing and formatting
-    - Ensuring all content is preserved exactly as written
-    - Making it ready for immediate blog publication
-    - Keeping the same high quality and insights`;
+    Research Context (use as foundation but rewrite naturally):
+    ${researchContext}`;
     }
-
-    blogPrompt += `
-    
-    Please provide:
-    1. A compelling title (can be the same as the original if it's good)
-    2. A brief description (1-2 sentences for SEO) summarizing the key points
-    3. The full blog content in clean markdown format (convert HTML to well-structured markdown)
-    4. A detailed image prompt for generating a hero image that represents the article topic
-
-    Format the response as JSON with the following structure:
-    {
-      "title": "Blog Post Title",
-      "description": "SEO description highlighting key article points",
-      "content": "Blog content in clean markdown format...",
-      "imagePrompt": "Detailed description for hero image generation"
-    }
-    
-    Remember: The article is already excellent. Convert from HTML to clean markdown format while preserving all the quality content. Use proper markdown syntax for headings, lists, emphasis, and formatting.`;
 
     // Generate blog post content using LLM
+    console.log("🧠 Analyzing topic and crafting content strategy...");
+    console.log("💭 Generating engaging, founder-focused content...");
+
     try {
       const completion = await openai.chat.completions.create({
-        model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
+        model: process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4",
         messages: [
-          { role: 'system', content: 'You are a professional blog formatter who converts well-written HTML articles to clean markdown format. Convert HTML tags to proper markdown syntax (headings with #, lists with -, emphasis with *, etc.). The content is already excellent - focus on clean formatting and structure. Always respond with valid JSON.' },
-          { role: 'user', content: blogPrompt }
+          {
+            role: "system",
+            content:
+              "You are a seasoned marketing strategist and content writer. Write naturally, avoid AI patterns, and focus on providing real value to startup founders. Never create tables - use bullet points, numbered lists, or paragraphs instead. Always respond with valid JSON.",
+          },
+          { role: "user", content: blogPrompt },
         ],
-        temperature: 0.7,
-        max_tokens: 2000
+        temperature: 0.8,
+        max_tokens: 3000,
       });
 
       const responseContent = completion.choices[0].message.content;
       if (!responseContent) {
-        throw new Error('No content generated from LLM');
+        throw new Error("No content generated from LLM");
       }
 
-      // Try to parse the JSON response
+      console.log("✅ Content generation complete! Processing AI response...");
+
+      // Parse the JSON response
       let blogData;
       try {
-        // Sometimes the LLM wraps JSON in markdown code blocks, so let's clean that up
-        const cleanedContent = responseContent.replace(/```json\s*|\s*```/g, '').trim();
+        const cleanedContent = responseContent
+          .replace(/```json\s*|\s*```/g, "")
+          .trim();
         blogData = JSON.parse(cleanedContent);
       } catch (parseError) {
         // Fallback: create a structured response from the raw content
         blogData = {
-          title: `Article Insights: ${topic}`,
-          description: `Key insights and content from the HTML article on ${topic}, converted into an accessible blog format.`,
-          content: responseContent,
-          imagePrompt: `A professional business illustration representing content and insights on ${topic}, suitable for a business blog post. Clean, modern design with relevant visual elements.`
+          title: `Insights on ${topic}`,
+          description: `Key insights and strategies for ${topic}, tailored for early-stage startup founders looking to scale their marketing efforts.`,
+          content: `# Insights on ${topic}
+
+This article provides practical insights on ${topic} for startup founders.
+
+## Key Takeaways
+
+- Understanding the fundamentals of ${topic}
+- Practical strategies for implementation
+- Common pitfalls to avoid
+
+## Conclusion
+
+Ready to put your marketing on autopilot? [Book a call with Harsha](https://calendly.com/harsha-agentweb/30min) to walk through your current marketing workflow and see how AgentWeb can help you scale.`,
+          imagePrompt: `A modern, professional business illustration representing ${topic}. Clean design with relevant visual elements, suitable for a business blog. No text, conceptual representation.`,
         };
       }
 
       // Validate the response structure
       if (!blogData.title || !blogData.content) {
-        throw new Error('LLM response missing required fields (title, content)');
+        throw new Error(
+          "LLM response missing required fields (title, content)"
+        );
       }
 
-      console.log("✅ Blog post generated successfully via LLM");
+      console.log("✅ Content validation passed!");
+      console.log("📰 Title:", blogData.title);
+      console.log("📄 Content length:", blogData.content.length, "characters");
+      console.log("🎨 Image prompt ready for generation");
+      console.log("---");
+      console.log("🎉 Blog post generated successfully via LLM");
 
       return res.status(200).json({
         success: true,
@@ -151,34 +242,48 @@ export const generateBlogPost = async (req: AuthRequest, res: Response) => {
           title: blogData.title,
           description: blogData.description,
           content: blogData.content,
-          imagePrompt: blogData.imagePrompt
+          imagePrompt: blogData.imagePrompt,
         },
       });
     } catch (llmError: any) {
+      console.log(
+        "⚠️ Primary AI generation failed, activating fallback mode..."
+      );
+      console.log("🔄 Generating backup content structure...");
+
       // Fallback to placeholder response if LLM fails
       const fallbackResponse = {
-        title: `Article Insights: ${topic}`,
-        description: `Key insights and content from the HTML article on ${topic}, converted into an accessible blog format for business professionals.`,
-        content: `# Article Insights: ${topic}
+        title: `Essential Guide: ${topic}`,
+        description: `A comprehensive guide to ${topic} for startup founders, covering key strategies and practical implementation tips.`,
+        content: `# Essential Guide: ${topic}
 
-This is a fallback blog post about ${topic}. The AI generation failed, so this is a basic template.
+This guide covers the fundamentals of ${topic} for startup founders.
 
-## Key Points
+## Understanding ${topic}
 
-- Point 1 about ${topic}
-- Point 2 about ${topic}
-- Point 3 about ${topic}
+- Core concepts and principles
+- Why it matters for your startup
+- Key considerations for implementation
 
-## Conclusion
+## Practical Strategies
 
-This concludes our exploration of ${topic}.`,
-        imagePrompt: `A professional business illustration representing content and insights on ${topic}, suitable for a business blog post. Clean, modern design with relevant visual elements.`,
+- Step-by-step approach
+- Common challenges and solutions
+- Best practices from successful startups
+
+## Getting Started
+
+Ready to put your marketing on autopilot? [Book a call with Harsha](https://calendly.com/harsha-agentweb/30min) to walk through your current marketing workflow and see how AgentWeb can help you scale.`,
+        imagePrompt: `A professional business illustration representing ${topic}. Clean, modern design with relevant visual elements. No text, conceptual business representation.`,
       };
+
+      console.log("✅ Fallback content generated successfully");
+      console.log("---");
 
       return res.status(200).json({
         success: true,
         data: fallbackResponse,
-        message: "Used fallback response due to LLM generation failure"
+        message: "Used fallback response due to LLM generation failure",
       });
     }
   } catch (error: any) {
@@ -204,7 +309,16 @@ export const generateImage = async (req: AuthRequest, res: Response) => {
       return res.status(400).json({ message: "Image prompt is required" });
     }
 
+    console.log("🎨 Starting AI image generation workflow...");
+    console.log(
+      "💭 Prompt:",
+      prompt.substring(0, 100) + (prompt.length > 100 ? "..." : "")
+    );
+    console.log("📁 Filename:", filename || "auto-generated");
+    console.log("---");
+
     // Try OpenAI image generation first (uses gpt-image-1)
+    console.log("🤖 Attempting OpenAI GPT Image 1 generation...");
     const openaiImageAvailable = await openaiImageService.isAvailable();
 
     if (openaiImageAvailable) {
@@ -219,16 +333,45 @@ export const generateImage = async (req: AuthRequest, res: Response) => {
 
       if (openaiResult.success && openaiResult.imageUrl) {
         console.log("✅ Image generated successfully via OpenAI API");
-        return res.status(200).json({
-          success: true,
-          data: {
-            imageUrl: openaiResult.imageUrl,
-            filename: openaiResult.filename || filename || "generated-blog-image.png",
-          },
-        });
+        console.log("📤 Initiating S3 upload process...");
+
+        // Upload to S3 and return S3 URL
+        try {
+          const s3Url = await uploadImageToS3(
+            openaiResult.imageUrl,
+            openaiResult.filename || filename
+          );
+          console.log("✅ S3 upload completed successfully!");
+          console.log("🔗 Final image URL:", s3Url);
+          console.log("---");
+          return res.status(200).json({
+            success: true,
+            data: {
+              imageUrl: s3Url,
+              filename:
+                openaiResult.filename || filename || "generated-blog-image.png",
+            },
+          });
+        } catch (uploadError) {
+          console.error(
+            "S3 upload failed, returning original URL:",
+            uploadError
+          );
+          return res.status(200).json({
+            success: true,
+            data: {
+              imageUrl: openaiResult.imageUrl,
+              filename:
+                openaiResult.filename || filename || "generated-blog-image.png",
+            },
+          });
+        }
       } else {
-        console.warn("⚠️ OpenAI API image generation failed:", openaiResult.error);
-        console.error("💥 Full error details:", openaiResult);
+        console.warn(
+          "⚠️ OpenAI API image generation failed:",
+          openaiResult.error
+        );
+        console.log("🔄 Falling back to alternative generation method...");
         // Continue to fallback methods
       }
     }
@@ -245,6 +388,7 @@ export const generateImage = async (req: AuthRequest, res: Response) => {
     }
 
     console.log("🔄 Falling back to direct DALL-E image generation...");
+    console.log("🎯 Using DALL-E 3 model for high-quality image creation...");
 
     // Generate image using DALL-E with the dedicated image client
     const imageResponse = await dalleClient.images.generate({
@@ -261,20 +405,46 @@ export const generateImage = async (req: AuthRequest, res: Response) => {
       throw new Error("No image URL returned from DALL-E");
     }
 
-    console.log("✅ Image generated successfully");
+    console.log("✅ Image generated successfully via DALL-E");
+    console.log("📤 Initiating S3 upload process...");
 
-    return res.status(200).json({
-      success: true,
-      data: {
+    // Upload to S3 and return S3 URL
+    try {
+      const s3Url = await uploadImageToS3(
         imageUrl,
-        filename: filename || "generated-image.jpg",
-      },
-    });
+        filename || "generated-image.jpg"
+      );
+      console.log("✅ S3 upload completed successfully!");
+      console.log("🔗 Final image URL:", s3Url);
+      console.log("---");
+      return res.status(200).json({
+        success: true,
+        data: {
+          imageUrl: s3Url,
+          filename: filename || "generated-image.jpg",
+        },
+      });
+    } catch (uploadError) {
+      console.error("S3 upload failed, returning original URL:", uploadError);
+      return res.status(200).json({
+        success: true,
+        data: {
+          imageUrl,
+          filename: filename || "generated-image.jpg",
+        },
+      });
+    }
   } catch (error: any) {
     console.error("❌ All image generation methods failed:", error);
+    console.log(
+      "🆘 Activating emergency fallback: Professional placeholder image..."
+    );
 
     // Final fallback: Use Picsum placeholder image
     const placeholderImageUrl = "https://picsum.photos/1200/600?random=1";
+    console.log("✅ Placeholder image activated");
+    console.log("🔗 Placeholder URL:", placeholderImageUrl);
+    console.log("---");
 
     return res.status(200).json({
       success: true,
@@ -296,18 +466,29 @@ export const publishBlogPost = async (req: AuthRequest, res: Response) => {
 
     const { title, description, content, imageUrl, imageFilename } = req.body;
 
+    // Debug: Log the entire request body
+    console.log("📥 Request body received:", req.body);
+
     if (!title || !description || !content) {
       return res
         .status(400)
         .json({ message: "Title, description, and content are required" });
     }
 
-    console.log("🚀 Publishing blog post to BaseHub:", title);
+    console.log("🚀 Starting BaseHub publishing workflow...");
+    console.log("📰 Blog Title:", title);
+    console.log("📝 Description length:", description.length, "characters");
+    console.log("📄 Content length:", content.length, "characters");
+    console.log("🖼️ Image URL:", imageUrl);
+    console.log("🖼️ Image Filename:", imageFilename);
+    console.log("---");
 
     const BASEHUB_API_URL =
       process.env.BASEHUB_API_URL || "https://api.basehub.com/graphql";
     const BASEHUB_TOKEN = process.env.BASEHUB_TOKEN || "";
     const POSTS_COLLECTION_ID = "dKrosxXlaGpnZCrAbHxlX";
+    const IMAGE_COMPONENT_ID =
+      process.env.BASEHUB_IMAGE_COMPONENT_ID || "AAzuzbz0jSbfwGJYvtMu3";
 
     if (!BASEHUB_TOKEN) {
       return res.status(500).json({
@@ -316,7 +497,15 @@ export const publishBlogPost = async (req: AuthRequest, res: Response) => {
       });
     }
 
+    // Randomly select an author (you can modify this logic)
+    console.log("👤 Selecting author for this blog post...");
+    const authorIds = Object.values(AUTHORS);
+    const randomAuthorId =
+      authorIds[Math.floor(Math.random() * authorIds.length)];
+    console.log("✅ Author assigned:", randomAuthorId);
+
     // Create the transaction data structure
+    console.log("🏗️ Building BaseHub transaction structure...");
     const transactionData = {
       type: "create",
       parentId: POSTS_COLLECTION_ID,
@@ -335,23 +524,28 @@ export const publishBlogPost = async (req: AuthRequest, res: Response) => {
           body: {
             type: "rich-text",
             value: {
-              format: "rich-text",
+              format: "markdown",
               value: content,
             },
           },
           authors: {
             type: "reference",
-            value: ["PCMhesaHZ237t05iG8ms6"],
+            value: [randomAuthorId],
           },
         },
       },
     };
 
-    // Add image if provided
+    // Add image if provided - using the correct BaseHub structure from working Python code
     if (imageUrl && imageFilename) {
+      console.log("🖼️ Adding image data to transaction...");
+      console.log("🖼️ Image URL to add:", imageUrl);
+      console.log("🖼️ Image filename to add:", imageFilename);
+
+      // This is the correct structure based on the working Python code
       (transactionData.data.value as any).image = {
         type: "instance",
-        mainComponentId: "AAzuzbz0jSbfwGJYvtMu3",
+        mainComponentId: IMAGE_COMPONENT_ID, // This is the image component ID from BaseHub
         value: {
           light: {
             type: "media",
@@ -362,6 +556,18 @@ export const publishBlogPost = async (req: AuthRequest, res: Response) => {
           },
         },
       };
+      console.log("✅ Image data integrated into transaction");
+      console.log(
+        "🖼️ Final image data structure:",
+        (transactionData.data.value as any).image
+      );
+    } else {
+      console.log(
+        "⚠️ No image data provided - imageUrl:",
+        imageUrl,
+        "imageFilename:",
+        imageFilename
+      );
     }
 
     const mutation = `
@@ -372,16 +578,26 @@ export const publishBlogPost = async (req: AuthRequest, res: Response) => {
 
     const variables = { data: JSON.stringify(transactionData) };
 
+    // Debug: Log what we're sending to BaseHub
+    console.log(
+      "📤 Sending to BaseHub:",
+      JSON.stringify(transactionData, null, 2)
+    );
+
     const headers = {
       Authorization: `Bearer ${BASEHUB_TOKEN}`,
       "Content-Type": "application/json",
     };
 
+    console.log("🌐 Initiating BaseHub API request...");
     const response = await axios.post(
       BASEHUB_API_URL,
       { query: mutation, variables },
       { headers }
     );
+
+    // Debug: Log BaseHub response
+    console.log("📥 BaseHub Response:", JSON.stringify(response.data, null, 2));
 
     console.log("✅ Blog post published successfully to BaseHub");
 

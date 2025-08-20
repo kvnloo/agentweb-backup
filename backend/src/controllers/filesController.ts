@@ -7,11 +7,9 @@ export const viewExternalFile = async (req: Request, res: Response) => {
   const { url } = req.query;
 
   if (!url || typeof url !== "string") {
-    return res
-      .status(400)
-      .json({
-        message: "URL query parameter is required and must be a string.",
-      });
+    return res.status(400).json({
+      message: "URL query parameter is required and must be a string.",
+    });
   }
 
   try {
@@ -65,12 +63,10 @@ export const viewExternalFile = async (req: Request, res: Response) => {
       clientRequest.destroy(); // Destroy the request to prevent further data processing
       console.error(`Timeout fetching external file from URL: ${url}`);
       if (!res.headersSent) {
-        res
-          .status(504)
-          .json({
-            message:
-              "Error fetching file: Gateway timeout while connecting to external URL.",
-          });
+        res.status(504).json({
+          message:
+            "Error fetching file: Gateway timeout while connecting to external URL.",
+        });
       }
     });
 
@@ -78,11 +74,9 @@ export const viewExternalFile = async (req: Request, res: Response) => {
       console.error(`Error making request to external URL ${url}:`, e.message);
       if (!res.headersSent) {
         // Check if headers haven't been sent yet
-        res
-          .status(502)
-          .json({
-            message: "Error connecting to external file URL (Bad Gateway).",
-          }); // 502 for network errors connecting to upstream
+        res.status(502).json({
+          message: "Error connecting to external file URL (Bad Gateway).",
+        }); // 502 for network errors connecting to upstream
       }
     });
   } catch (error: any) {
@@ -92,13 +86,11 @@ export const viewExternalFile = async (req: Request, res: Response) => {
       error.message
     );
     if (!res.headersSent) {
-      res
-        .status(500)
-        .json({
-          message:
-            "Internal server error while attempting to fetch external file.",
-          error: error.message,
-        });
+      res.status(500).json({
+        message:
+          "Internal server error while attempting to fetch external file.",
+        error: error.message,
+      });
     }
   }
 };
@@ -107,11 +99,9 @@ export const getFileContent = async (req: Request, res: Response) => {
   const { url } = req.query;
 
   if (!url || typeof url !== "string") {
-    return res
-      .status(400)
-      .json({
-        message: "URL query parameter is required and must be a string.",
-      });
+    return res.status(400).json({
+      message: "URL query parameter is required and must be a string.",
+    });
   }
 
   try {
@@ -133,14 +123,15 @@ export const getFileContent = async (req: Request, res: Response) => {
       },
     });
 
+    const content = response.data as string;
     console.log(
-      `✅ Successfully fetched file content, length: ${response.data.length}`
+      `✅ Successfully fetched file content, length: ${content.length}`
     );
 
     return res.json({
       success: true,
-      content: response.data,
-      contentLength: response.data.length,
+      content: content,
+      contentLength: content.length,
       contentType: response.headers["content-type"],
     });
   } catch (error: any) {
