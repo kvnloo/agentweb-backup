@@ -93,6 +93,7 @@ interface Task {
   leadListIdentifier?: string;
   createVideo?: boolean; // Flag for creating video recording of task execution
   videoModel?: string; // The video model to use for video generation
+  imageModel?: string; // The image model to use for image generation
   knowledgeBase?: string; // The content of the task's knowledge base
   knowledgeBaseSize?: number; // Size of the knowledge base in bytes
   knowledgeBaseType?: "public" | "private"; // Type of knowledge base
@@ -1645,6 +1646,10 @@ export default function TaskDetails() {
     }
   };
 
+
+
+
+
   const handleCreateVideoToggle = async (
     event: React.ChangeEvent<HTMLInputElement>
   ) => {
@@ -2131,6 +2136,57 @@ export default function TaskDetails() {
                       }
                     />
                   </Tooltip>
+                          <Tooltip title="Select the image model to use for image generation tasks" placement="right">
+          <FormControl sx={{ width: "100%" }}>
+            <InputLabel id="image-model-select-label">Image Model</InputLabel>
+            <Select
+              labelId="image-model-select-label"
+              value={task?.imageModel || "openai-image-1"}
+              onChange={(e) => {
+                const newModel = e.target.value;
+                console.log('Image model selection changed:', {
+                  newModel,
+                  currentModel: task?.imageModel,
+                  taskId
+                });
+                // Always update to ensure the selection is saved in the database
+                axios.put(
+                  buildApiUrl(`/api/tasks/${taskId}`),
+                  {
+                    imageModel: newModel,
+                  },
+                  {
+                    headers: { Authorization: `Bearer ${token}` },
+                  }
+                ).then(() => {
+                  console.log('Image model updated successfully, fetching task...');
+                  return fetchTask();
+                }).catch((error) => {
+                  console.error("Error updating image model:", error);
+                  toast.error("Failed to update image model");
+                });
+              }}
+              label="Image Model"
+            >
+              <MenuItem value="openai-image-1">
+                <Box>
+                  <Typography>openai-image-1 (OpenAI)</Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    Default OpenAI image generation model
+                  </Typography>
+                </Box>
+              </MenuItem>
+              <MenuItem value="FLUX.1-Kontext-pro">
+                <Box>
+                  <Typography>FLUX.1-Kontext-pro (Azure)</Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    Advanced image generation and editing model
+                  </Typography>
+                </Box>
+              </MenuItem>
+            </Select>
+          </FormControl>
+        </Tooltip>
                 </Box>
                 <Tooltip
                   title={
@@ -2994,6 +3050,8 @@ export default function TaskDetails() {
           </Button>
         </DialogActions>
       </Dialog>
+
+
     </Container>
   );
 }

@@ -8,6 +8,16 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-08-20",
+    changes: [
+      "Added Flux model for image generation",
+      "- Users can now select FLUX.1-Kontext-pro (Azure) as an alternative to openai-image-1 (OpenAI)",
+      "- FLUX model provides advanced image generation and editing capabilities",
+      "- Model selection is available on the Task Details page with a dropdown menu",
+      "- Selected model is automatically saved and used for image generation tasks",
+    ],
+  },
+  {
     date: "2025-08-12",
     changes: [
       "Added OpenAI GPT-5 mode via Azure",

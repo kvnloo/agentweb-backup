@@ -52,6 +52,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       updateLeadList,
       createVideo,
       videoModel,
+      imageModel,
       requireApproval,
       slackChannel
     } = req.body;
@@ -103,6 +104,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           updateLeadList: req.body.updateLeadList !== undefined ? Boolean(req.body.updateLeadList) : template.updateLeadList,
           createVideo: req.body.createVideo !== undefined ? Boolean(req.body.createVideo) : template.createVideo,
           videoModel: videoModel || null,
+          imageModel: imageModel || null,
           knowledgeBaseType: 'private',
           requireApproval: req.body.requireApproval !== undefined ? Boolean(req.body.requireApproval) : template.requireApproval || false,
           slackChannel: req.body.slackChannel || template.slackChannel || null,
@@ -147,6 +149,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       updateLeadList: Boolean(req.body.updateLeadList),
       createVideo: Boolean(req.body.createVideo),
       videoModel: videoModel || null,
+      imageModel: imageModel || null,
       knowledgeBaseType: 'private', // Default to private for new tasks
       createdAt: new Date().toISOString(),
       llmName: req.body.llmName || null,
@@ -303,6 +306,11 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
       updates.videoModel = req.body.videoModel;
     }
 
+    if (req.body.imageModel !== undefined) {
+      updates.imageModel = req.body.imageModel;
+      console.log('Adding imageModel to updates:', req.body.imageModel);
+    }
+
     if (req.body.leadListIdentifier !== undefined) {
       updates.leadListIdentifier = req.body.leadListIdentifier;
     }
@@ -351,6 +359,7 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
     // Check if we're unarchiving a task (changing status from 'archived' to 'active')
     const isUnarchiving = task.status === 'archived' && updates.status === 'active';
 
+    console.log('Final updates object:', updates);
     await taskDb.updateTask(taskId, updates);
     
     // If unarchiving, reactivate schedules that were disabled when the task was archived

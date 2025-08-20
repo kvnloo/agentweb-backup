@@ -511,7 +511,7 @@ async def update_workflow_execution(workflow_id: str, execution_id: str, updates
         logger.error(f"Error updating workflow execution: {e}")
         return False
 
-async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str, run_user_id: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False, use_knowledge_base: bool = False, update_knowledge_base: bool = False, update_lead_list: bool = False, lead_list_identifier: str = None, has_attachments: bool = False, create_video: bool = False, video_model: str = None) -> Dict[str, Any]:
+async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_id: str, is_interactive: bool, task_id: str, gif_path: str, run_user_id: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False, use_knowledge_base: bool = False, update_knowledge_base: bool = False, update_lead_list: bool = False, lead_list_identifier: str = None, has_attachments: bool = False, create_video: bool = False, video_model: str = None, image_model: str = None) -> Dict[str, Any]:
     global running_processes
     log_sync_manager = None
     process = None
@@ -585,6 +585,8 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
             cmd.append('--create-video')
         if video_model:
             cmd.extend(['--video-model', video_model])
+        if image_model:
+            cmd.extend(['--image-model', image_model])
         
         # Run command with output redirection
         logger.info(f"Running command: {' '.join(cmd)}")
@@ -1076,6 +1078,7 @@ Context - Original Task: {base_prompt}"""
                         update_lead_list = bool(task.get('updateLeadList', False)) if task else False
                         create_video = bool(task.get('createVideo', False)) if task else False
                         video_model = task.get('videoModel') if task else None
+                        image_model = task.get('imageModel') if task else None
                         
                         # Override has_attachments for HTML report revisions to enable read_attached_file
                         if original_report_url and revision_prompt:
@@ -1109,7 +1112,8 @@ Context - Original Task: {base_prompt}"""
                             lead_list_identifier,
                             has_attachments,
                             create_video,
-                            video_model
+                            video_model,
+                            image_model
                         )
                     except Exception as e:
                         logger.error(f"Error running web agent: {str(e)}")
