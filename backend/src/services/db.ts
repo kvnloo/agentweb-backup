@@ -464,6 +464,7 @@ export const taskDb = {
     turnOffHeadless?: boolean;
     createVideo?: boolean;
     videoModel?: string;
+    imageModel?: string;
     requireApproval?: boolean;
     slackChannel?: string;
   }) {
@@ -485,7 +486,7 @@ export const taskDb = {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Tasks`,
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, createVideo, videoModel, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, requireApproval, slackChannel",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, createVideo, videoModel, imageModel, requireApproval, slackChannel",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -556,7 +557,7 @@ export const taskDb = {
           ":userId": userId,
         },
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, knowledgeBaseSize, createVideo, videoModel, requireApproval, slackChannel",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, knowledgeBaseSize, createVideo, videoModel, imageModel, requireApproval, slackChannel",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -611,7 +612,7 @@ export const taskDb = {
           taskId,
         },
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, updateLeadList, createVideo, videoModel, leadListIdentifier, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt, requireApproval, slackChannel",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, updateLeadList, createVideo, videoModel, imageModel, leadListIdentifier, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt, requireApproval, slackChannel",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -667,6 +668,7 @@ export const taskDb = {
       updateLeadList?: boolean;
       createVideo?: boolean;
       videoModel?: string;
+      imageModel?: string;
       leadListIdentifier?: string | null;
       knowledgeBaseUpdatedAt?: string;
       requireApproval?: boolean;

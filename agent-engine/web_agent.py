@@ -80,6 +80,7 @@ class GenerateImageParams(BaseModel):
     output_file_name: str
     size: str = "1024x1024"
     quality: str = "medium"
+    model: str = "openai-image-1"  # Default to OpenAI image model
 
 class VideoAnalysisParams(BaseModel):
     """Parameters for performing video analysis."""
@@ -226,6 +227,7 @@ class WebAgent:
         self.lead_list_identifier = None  # Initialize lead_list_identifier property
         self.has_attachments = False  # Initialize has_attachments property
         self.code_execution = False  # Initialize code_execution property
+        self.image_model = None  # Initialize image_model property
 
     def setup_execution_logging(self, execution_id: str):
         """Setup logging for the current execution"""
@@ -293,7 +295,7 @@ class WebAgent:
         # Clear the reference to the log filter thread to help with garbage collection
         self.log_filter_thread = None
 
-    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False, use_knowledge_base: bool = False, update_knowledge_base: bool = False, update_lead_list: bool = False, lead_list_identifier: str = None, has_attachments: bool = False, create_video: bool = False, video_model: str = None) -> Dict[str, Any]:
+    async def execute_task(self, prompt: str, execution_id: str = None, is_interactive: bool = False, task_id: str = None, generate_gif: str = None, is_complex_task: bool = False, extract_page_content: bool = False, validate_output: bool = False, output_as_json: bool = False, is_agentic_dev_mode: bool = False, output_as_html: bool = False, use_shared_browser: bool = False, turn_off_headless: bool = False, use_knowledge_base: bool = False, update_knowledge_base: bool = False, update_lead_list: bool = False, lead_list_identifier: str = None, has_attachments: bool = False, create_video: bool = False, video_model: str = None, image_model: str = None) -> Dict[str, Any]:
         """Execute a task based on the natural language prompt"""
         log_file = None
         try:
@@ -313,6 +315,7 @@ class WebAgent:
             self.has_attachments = has_attachments
             self.create_video = create_video
             self.video_model = video_model
+            self.image_model = image_model
             # Set up logging
             log_file = self.setup_execution_logging(execution_id)
             
@@ -3031,11 +3034,11 @@ class WebAgent:
                 logger.error(f"Error performing video analysis: {e}")
                 return ActionResult(error=f"Failed to perform video analysis: {str(e)}")
 
-        @self.controller.registry.action('Generate image with input images using OpenAI GPT Image', param_model=GenerateImageParams)
+        @self.controller.registry.action('Generate image with input images using OpenAI GPT Image or Azure AI Services FLUX', param_model=GenerateImageParams)
         async def generate_image(params: GenerateImageParams) -> ActionResult:
-            """Generate or edit images using OpenAI GPT Image with input images.
+            """Generate or edit images using OpenAI GPT Image or Azure AI Services FLUX model with input images.
             
-            This action uses OpenAI GPT Image to generate or edit images based on input images
+            This action uses OpenAI GPT Image or Azure AI Services FLUX.1-Kontext-pro to generate or edit images based on input images
             from attachments or downloads folder. The generated image is saved to the downloads folder.
             
             Parameters:
@@ -3045,6 +3048,7 @@ class WebAgent:
               - output_file_name: Name of the output image file to save in downloads folder
               - size: Image size (default: "1024x1024")
               - quality: Image quality (default: "medium")
+              - model: Image model to use (default: "openai-image-1", can also use "FLUX.1-Kontext-pro")
             
             Returns:
             - ActionResult with the generation results or error message
@@ -3056,14 +3060,42 @@ class WebAgent:
                 except ImportError:
                     return ActionResult(error="OpenAI package not installed. Install with: pip install openai")
 
-                # Get API key
-                api_key = os.getenv('OPENAI_IMAGE_API_KEY')
-                if not api_key:
-                    return ActionResult(error="OPENAI_IMAGE_API_KEY environment variable is not set")
-
-                # Initialize the client
-                client = OpenAI(api_key=api_key)
+                # Determine which model to use and get appropriate API key
+                # Use params.model if specified, otherwise use task's imageModel, otherwise default to "openai-image-1"
+                model_to_use = params.model if params.model != "openai-image-1" else (self.image_model or "openai-image-1")
                 
+                logger.info(f"Image generation - params.model: {params.model}, task.image_model: {self.image_model}, final model_to_use: {model_to_use}")
+                
+                # Initialize variables for Azure AI Services
+                azure_model_name = None
+                
+                if model_to_use == "FLUX.1-Kontext-pro":
+                    # Use Azure AI Services for FLUX model with direct HTTP requests
+                    api_key = os.getenv('AZURE_OPENAI_API_KEY2')
+                    if not api_key:
+                        return ActionResult(error="AZURE_OPENAI_API_KEY2 environment variable is not set for FLUX.1-Kontext-pro model")
+                    
+                    logger.info(f"Using Azure AI Services FLUX model with direct HTTP requests")
+                    
+                    # Azure AI Services endpoint for FLUX model
+                    azure_endpoint = "https://ai-ruiwangwarm7085ai345967089938.services.ai.azure.com"
+                    deployment_name = "FLUX.1-Kontext-pro"
+                    
+                    # For Azure AI Services, we'll use direct HTTP requests
+                    azure_model_name = "flux.1-kontext-pro"
+                    
+                    logger.info(f"Azure AI Services FLUX model configured: {azure_model_name}")
+                else:
+                    # Use OpenAI for default model
+                    api_key = os.getenv('OPENAI_IMAGE_API_KEY')
+                    if not api_key:
+                        return ActionResult(error="OPENAI_IMAGE_API_KEY environment variable is not set")
+                    
+                    logger.info(f"Using OpenAI default model: {model_to_use}")
+                    
+                    # Initialize OpenAI client
+                    client = OpenAI(api_key=api_key)
+
                 # Validate parameters
                 # Validate quality
                 valid_qualities = ["low", "medium", "high", "auto"]
@@ -3110,35 +3142,228 @@ class WebAgent:
                 # Determine the operation based on number of input images
                 if len(input_images) == 0:
                     # Generate new image from prompt only
-                    logger.info("Generating new image from prompt...")
-                    result = client.images.generate(
-                        model="gpt-image-1",
-                        prompt=params.prompt,
-                        size=params.size,
-                        quality=params.quality
-                    )
+                    if model_to_use == "FLUX.1-Kontext-pro":
+                        # Use direct HTTP request for Azure AI Services FLUX model
+                        logger.info(f"Generating new image with FLUX model using direct HTTP request...")
+                        
+                        import requests
+                        
+                        url = f"{azure_endpoint}/openai/deployments/{deployment_name}/images/generations"
+                        headers = {
+                            "Content-Type": "application/json",
+                            "api-key": api_key
+                        }
+                        data = {
+                            "prompt": params.prompt,
+                            "size": params.size,
+                            "n": 1,
+                            "model": azure_model_name
+                        }
+                        
+                        response = requests.post(url, headers=headers, json=data, params={"api-version": "2025-04-01-preview"})
+                        
+                        if response.status_code != 200:
+                            return ActionResult(error=f"Azure AI Services API error: {response.status_code} - {response.text}")
+                        
+                        result_data = response.json()
+                        if not result_data.get('data') or len(result_data['data']) == 0:
+                            return ActionResult(error="No image data received from Azure AI Services API")
+                        
+                        # Extract the image data
+                        image_base64 = result_data['data'][0].get('b64_json')
+                        if not image_base64:
+                            return ActionResult(error="No b64_json data in Azure AI Services response")
+                        
+                        # Save the image
+                        image_bytes = base64.b64decode(image_base64)
+                        with open(output_path, "wb") as f:
+                            f.write(image_bytes)
+                        
+                        logger.info(f"Generated image with FLUX model saved to: {output_path}")
+                        
+                        # Upload the generated image to S3 and get the URL
+                        result_files = []
+                        if self.current_execution_id:
+                            result_files = upload_task_result_files(downloads_path, self.current_execution_id)
+                        
+                        # Find the uploaded file info for our generated image
+                        uploaded_file_info = None
+                        for file_info in result_files:
+                            if file_info.get('filename') == params.output_file_name:
+                                uploaded_file_info = file_info
+                                break
+                        
+                        # Create success message
+                        if uploaded_file_info and uploaded_file_info.get('url'):
+                            success_msg = f"✅ Image {params.output_file_name} generated successfully using FLUX.1-Kontext-pro! It has been uploaded and available at {uploaded_file_info['url']}. You MUST use the URL to refer this image in any HTML or Markdown content."
+                            logger.info(f"Generated image uploaded to S3: {uploaded_file_info['url']}")
+                        else:
+                            success_msg = f"✅ Image {params.output_file_name} generated successfully using FLUX.1-Kontext-pro and saved to downloads folder! "
+                            logger.warning("Could not retrieve S3 URL for generated image")
+                        
+                        return ActionResult(extracted_content=success_msg)
+                    else:
+                        # Use OpenAI client for default model
+                        logger.info(f"Generating new image from prompt with model: {azure_model_name if model_to_use == 'FLUX.1-Kontext-pro' else 'gpt-image-1'}...")
+                        result = client.images.generate(
+                            model=azure_model_name if model_to_use == "FLUX.1-Kontext-pro" else "gpt-image-1",
+                            prompt=params.prompt,
+                            size=params.size,
+                            quality=params.quality
+                        )
                 elif len(input_images) == 1:
                     # Edit single image
-                    logger.info("Editing single input image...")
-                    with open(input_images[0], "rb") as img_input:
-                        result = client.images.edit(
-                            model="gpt-image-1",
-                            image=img_input,
-                            prompt=params.prompt,
-                            size=params.size
-                        )
+                    if model_to_use == "FLUX.1-Kontext-pro":
+                        # Use direct HTTP request for Azure AI Services FLUX model
+                        logger.info(f"Editing image with FLUX model using direct HTTP request...")
+                        
+                        import requests
+                        
+                        url = f"{azure_endpoint}/openai/deployments/{deployment_name}/images/edits"
+                        headers = {
+                            "api-key": api_key
+                        }
+                        
+                        # Prepare the image file for upload
+                        with open(input_images[0], "rb") as img_input:
+                            files = {
+                                "image": (params.input_file_names[0], img_input, "image/png"),
+                                "model": (None, azure_model_name),
+                                "prompt": (None, params.prompt)
+                            }
+                            
+                            response = requests.post(url, headers=headers, files=files, params={"api-version": "2025-04-01-preview"})
+                        
+                        if response.status_code != 200:
+                            return ActionResult(error=f"Azure AI Services API error: {response.status_code} - {response.text}")
+                        
+                        result_data = response.json()
+                        if not result_data.get('data') or len(result_data['data']) == 0:
+                            return ActionResult(error="No image data received from Azure AI Services API")
+                        
+                        # Extract the image data
+                        image_base64 = result_data['data'][0].get('b64_json')
+                        if not image_base64:
+                            return ActionResult(error="No b64_json data in Azure AI Services response")
+                        
+                        # Save the image
+                        image_bytes = base64.b64decode(image_base64)
+                        with open(output_path, "wb") as f:
+                            f.write(image_bytes)
+                        
+                        logger.info(f"Edited image with FLUX model saved to: {output_path}")
+                        
+                        # Upload the generated image to S3 and get the URL
+                        result_files = []
+                        if self.current_execution_id:
+                            result_files = upload_task_result_files(downloads_path, self.current_execution_id)
+                        
+                        # Find the uploaded file info for our generated image
+                        uploaded_file_info = None
+                        for file_info in result_files:
+                            if file_info.get('filename') == params.output_file_name:
+                                uploaded_file_info = file_info
+                                break
+                        
+                        # Create success message
+                        if uploaded_file_info and uploaded_file_info.get('url'):
+                            success_msg = f"✅ Image {params.output_file_name} edited successfully using FLUX.1-Kontext-pro! It has been uploaded and available at {uploaded_file_info['url']}. You MUST use the URL to refer this image in any HTML or Markdown content."
+                            logger.info(f"Edited image uploaded to S3: {uploaded_file_info['url']}")
+                        else:
+                            success_msg = f"✅ Image {params.output_file_name} edited successfully using FLUX.1-Kontext-pro and saved to downloads folder! "
+                            logger.warning("Could not retrieve S3 URL for edited image")
+                        
+                        return ActionResult(extracted_content=success_msg)
+                    else:
+                        # Use OpenAI client for default model
+                        logger.info("Editing single input image...")
+                        with open(input_images[0], "rb") as img_input:
+                            result = client.images.edit(
+                                model=azure_model_name if model_to_use == "FLUX.1-Kontext-pro" else "gpt-image-1",
+                                image=img_input,
+                                prompt=params.prompt,
+                                size=params.size
+                            )
                 else:
                     # Edit multiple images (combine them)
-                    logger.info("Editing multiple input images...")
-                    with open(input_images[0], "rb") as img1, open(input_images[1], "rb") as img2:
-                        result = client.images.edit(
-                            model="gpt-image-1",
-                            image=[img1, img2] + [open(img, "rb") for img in input_images[2:]],
-                            prompt=params.prompt,
-                            size=params.size
-                        )
+                    if model_to_use == "FLUX.1-Kontext-pro":
+                        # Use direct HTTP request for Azure AI Services FLUX model
+                        logger.info(f"Editing multiple images with FLUX model using direct HTTP request...")
+                        
+                        import requests
+                        
+                        url = f"{azure_endpoint}/openai/deployments/{deployment_name}/images/edits"
+                        headers = {
+                            "api-key": api_key
+                        }
+                        
+                        # Prepare the image files for upload
+                        with open(input_images[0], "rb") as img1, open(input_images[1], "rb") as img2:
+                            files = {
+                                "image": (params.input_file_names[0], img1, "image/png"),
+                                "model": (None, azure_model_name),
+                                "instructions": (None, params.prompt)
+                            }
+                            
+                            # Add additional images if they exist
+                            for i, img_path in enumerate(input_images[2:], 2):
+                                with open(img_path, "rb") as img:
+                                    files[f"image_{i}"] = (params.input_file_names[i], img, "image/png")
+                            
+                            response = requests.post(url, headers=headers, files=files, params={"api-version": "2025-04-01-preview"})
+                        
+                        if response.status_code != 200:
+                            return ActionResult(error=f"Azure AI Services API error: {response.status_code} - {response.text}")
+                        
+                        result_data = response.json()
+                        if not result_data.get('data') or len(result_data['data']) == 0:
+                            return ActionResult(error="No image data received from Azure AI Services API")
+                        
+                        # Extract the image data
+                        image_base64 = result_data['data'][0].get('b64_json')
+                        if not image_base64:
+                            return ActionResult(error="No b64_json data in Azure AI Services response")
+                        
+                        # Save the image
+                        image_bytes = base64.b64decode(image_base64)
+                        with open(output_path, "wb") as f:
+                            f.write(image_bytes)
+                        
+                        logger.info(f"Edited multiple images with FLUX model saved to: {output_path}")
+                        
+                        # Upload the generated image to S3 and get the URL
+                        result_files = []
+                        if self.current_execution_id:
+                            result_files = upload_task_result_files(downloads_path, self.current_execution_id)
+                        
+                        # Find the uploaded file info for our generated image
+                        uploaded_file_info = None
+                        for file_info in result_files:
+                            if file_info.get('filename') == params.output_file_name:
+                                uploaded_file_info = file_info
+                                break
+                        
+                        # Create success message
+                        if uploaded_file_info and uploaded_file_info.get('url'):
+                            success_msg = f"✅ Image {params.output_file_name} edited successfully using FLUX.1-Kontext-pro! It has been uploaded and available at {uploaded_file_info['url']}. You MUST use the URL to refer this image in any HTML or Markdown content."
+                            logger.info(f"Edited image uploaded to S3: {uploaded_file_info['url']}")
+                        else:
+                            success_msg = f"✅ Image {params.output_file_name} edited successfully using FLUX.1-Kontext-pro and saved to downloads folder! "
+                            logger.warning("Could not retrieve S3 URL for edited image")
+                        
+                        return ActionResult(extracted_content=success_msg)
+                    else:
+                        # Use OpenAI client for default model
+                        logger.info("Editing multiple input images...")
+                        with open(input_images[0], "rb") as img1, open(input_images[1], "rb") as img2:
+                            result = client.images.edit(
+                                model="gpt-image-1",
+                                image=[img1, img2] + [open(img, "rb") for img in input_images[2:]],
+                                prompt=params.prompt,
+                                size=params.size
+                            )
                 
-                # Save the generated image
+                # Save the generated image (for OpenAI default model only)
                 if result.data and len(result.data) > 0:
                     image_base64 = result.data[0].b64_json
                     image_bytes = base64.b64decode(image_base64)
@@ -3353,6 +3578,7 @@ async def main():
     parser.add_argument('--has-attachments', action='store_true', help='Task has attachments')
     parser.add_argument('--create-video', action='store_true', help='Create video recording of task execution')
     parser.add_argument('--video-model', help='Video model to use for video generation (veo-3.0-generate-preview, gen4_turbo, or kling-v2.1-std)')
+    parser.add_argument('--image-model', help='Image model to use for image generation (openai-image-1 or FLUX.1-Kontext-pro)')
     args = parser.parse_args()
 
     # Read prompt from file
@@ -3390,7 +3616,8 @@ async def main():
             lead_list_identifier=args.lead_list_identifier,
             has_attachments=args.has_attachments,
             create_video=args.create_video,
-            video_model=args.video_model
+            video_model=args.video_model,
+            image_model=args.image_model
         )
         print(json.dumps(result))
         sys.exit(0 if result["success"] else 1)
