@@ -166,5 +166,20 @@ export class OpenAIImageService {
   }
 }
 
-// Create a singleton instance
-export const openaiImageService = new OpenAIImageService();
+// Create a singleton instance with error handling
+let openaiImageService: OpenAIImageService;
+
+try {
+  openaiImageService = new OpenAIImageService();
+  console.log("✅ OpenAI Image Service initialized successfully");
+} catch (error) {
+  console.warn("⚠️ Failed to initialize OpenAI Image Service, creating fallback service");
+  
+  // Create a fallback service that always returns false for isAvailable
+  openaiImageService = {
+    isAvailable: async () => false,
+    generateImage: async () => ({ success: false, error: "Service not available" })
+  } as any;
+}
+
+export { openaiImageService };
