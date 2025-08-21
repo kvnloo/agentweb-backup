@@ -189,9 +189,9 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
 
             # If we have HTML content, send a simplified email with just the HTML report
             if html_content_from_file_section:
-                subject = task_name
-                if new_info_summary:
-                    subject = f"{task_name} [NEW: {new_info_summary}]"
+                from datetime import datetime
+                current_date = datetime.now().strftime("%b %d, %Y")
+                subject = f"{task_name} - {current_date}"  # Task name with date
 
                 simplified_html = f"""<html>
 <head>

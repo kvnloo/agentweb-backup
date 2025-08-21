@@ -204,13 +204,17 @@ export const emailService = {
 
         // If we have HTML content, send a simplified email with just the HTML report
         if (htmlContentFromFile) {
+          const currentDate = new Date().toLocaleDateString('en-US', { 
+            year: 'numeric', 
+            month: 'short', 
+            day: 'numeric' 
+          });
           const simplifiedHtml = `
             <html>
             <head>
               <style>
                 body { font-family: sans-serif; margin: 0; padding: 0; color: #333; background-color: #fff; }
                 .container { padding: 0; background-color: #fdfdfd; }
-                .header { font-size: 1.5em; font-weight: bold; margin-bottom: 15px; color: #2c3e50; }
                 .html-result { border: none; padding: 0; margin: 0; border-radius: 0; }
                 .html-result h3 { margin-top:0; }
                 .html-result * { margin: 0; padding: 0; }
@@ -236,7 +240,7 @@ export const emailService = {
             </body></html>
           `;
 
-          const subject = task.name;
+          const subject = `${task.name} - ${currentDate}`;
           const text = `Task Report: ${task.name}\n\nView the HTML report in the email body.\n\nManage task and history at: ${customerFrontendUrl}/tasks/${task.taskId}`;
           
           await this.sendEmail(toEmail, subject, text, simplifiedHtml);
