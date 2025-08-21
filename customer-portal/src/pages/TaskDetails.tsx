@@ -96,6 +96,7 @@ interface Subscriber {
   unsubscribed?: boolean;
   unsubscribedAt?: string;
   resubscribedAt?: string;
+  feedback?: string;
 }
 
 // Update TaskDetail interface
@@ -1454,6 +1455,12 @@ const TaskDetailsPage: React.FC = () => {
                         `Subscribed on ${new Date(subscriber.subscribedAt).toLocaleDateString()}`
                       )}
                     </p>
+                    {subscriber.feedback && (
+                      <div className="mt-2 p-2 bg-gray-50 rounded border-l-2 border-gray-300">
+                        <p className="text-xs font-medium text-gray-600 mb-1">Feedback:</p>
+                        <p className="text-xs text-gray-700 italic">"{subscriber.feedback}"</p>
+                      </div>
+                    )}
                   </div>
                   <div className="flex items-center gap-2">
                     {subscriber.unsubscribed ? (

@@ -4,6 +4,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card'
 import { Button } from '../components/ui/button';
 import { Alert, AlertDescription } from '../components/ui/alert';
 import { CheckCircle, XCircle, AlertCircle } from 'lucide-react';
+import { Textarea } from '../components/ui/textarea';
 import axios from 'axios';
 import { buildApiUrl } from '../config';
 
@@ -14,6 +15,7 @@ const UnsubscribePage: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [taskName, setTaskName] = useState<string>('');
   const [subscriberEmail, setSubscriberEmail] = useState<string>('');
+  const [feedback, setFeedback] = useState<string>('');
 
   const taskId = searchParams.get('taskId');
   const email = searchParams.get('email');
@@ -58,7 +60,8 @@ const UnsubscribePage: React.FC = () => {
 
     try {
       await axios.post(buildApiUrl(`/api/tasks/${taskId}/unsubscribe`), {
-        email: email
+        email: email,
+        feedback: feedback
       });
       setSuccess(true);
     } catch (err: any) {
@@ -190,6 +193,19 @@ const UnsubscribePage: React.FC = () => {
               You will no longer receive email notifications when this task runs or completes. You can always resubscribe later if you change your mind.
             </AlertDescription>
           </Alert>
+
+          <div className="space-y-2">
+            <label htmlFor="feedback" className="text-sm font-medium text-gray-700">
+              Optional Feedback (Why are you unsubscribing?)
+            </label>
+            <Textarea
+              id="feedback"
+              placeholder="Please let us know why you're unsubscribing. This helps us improve our service."
+              value={feedback}
+              onChange={(e) => setFeedback(e.target.value)}
+              className="min-h-[80px]"
+            />
+          </div>
 
           {error && (
             <Alert variant="destructive">

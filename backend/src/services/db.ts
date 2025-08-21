@@ -1511,19 +1511,29 @@ export const subscriberDb = {
     }
   },
 
-  async softUnsubscribe(taskId: string, email: string) {
+  async softUnsubscribe(taskId: string, email: string, feedback?: string) {
     try {
+      const updateExpression = feedback 
+        ? "SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt, feedback = :feedback"
+        : "SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt";
+      
+      const expressionAttributeValues: any = {
+        ":unsubscribed": true,
+        ":unsubscribedAt": new Date().toISOString(),
+      };
+      
+      if (feedback) {
+        expressionAttributeValues[":feedback"] = feedback;
+      }
+
       const params = {
         TableName: `${TABLE_PREFIX}AW-Subscribers`,
         Key: {
           taskId,
           email,
         },
-        UpdateExpression: "SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt",
-        ExpressionAttributeValues: {
-          ":unsubscribed": true,
-          ":unsubscribedAt": new Date().toISOString(),
-        },
+        UpdateExpression: updateExpression,
+        ExpressionAttributeValues: expressionAttributeValues,
         ReturnValues: "ALL_NEW",
       };
 
@@ -1542,10 +1552,11 @@ export const subscriberDb = {
           taskId,
           email,
         },
-        UpdateExpression: "SET unsubscribed = :unsubscribed, resubscribedAt = :resubscribedAt",
+        UpdateExpression: "SET unsubscribed = :unsubscribed, resubscribedAt = :resubscribedAt, feedback = :feedback",
         ExpressionAttributeValues: {
           ":unsubscribed": false,
           ":resubscribedAt": new Date().toISOString(),
+          ":feedback": null,
         },
         ReturnValues: "ALL_NEW",
       };

@@ -94,7 +94,8 @@ router.get('/:taskId/subscribers/:email/status', async (req, res) => {
       subscribedAt: subscriber.subscribedAt,
       unsubscribed: subscriber.unsubscribed || false,
       unsubscribedAt: subscriber.unsubscribedAt,
-      resubscribedAt: subscriber.resubscribedAt
+      resubscribedAt: subscriber.resubscribedAt,
+      feedback: subscriber.feedback
     });
   } catch (error: any) {
     console.error('Error checking subscriber status:', error);
@@ -121,7 +122,7 @@ router.get('/:id/name', async (req, res) => {
 router.post('/:taskId/unsubscribe', async (req, res) => {
   try {
     const { taskId } = req.params;
-    const { email } = req.body;
+    const { email, feedback } = req.body;
 
     if (!email) {
       return res.status(400).json({ message: 'Email is required' });
@@ -138,7 +139,7 @@ router.post('/:taskId/unsubscribe', async (req, res) => {
       return res.status(404).json({ message: 'Subscriber not found for this task' });
     }
 
-    await subscriberDb.softUnsubscribe(taskId, email);
+    await subscriberDb.softUnsubscribe(taskId, email, feedback);
     res.json({ message: 'Successfully unsubscribed' });
   } catch (error: any) {
     console.error('Error unsubscribing:', error);
