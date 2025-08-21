@@ -50,6 +50,39 @@ const s3 = new AWS.S3({
   region: process.env.AWS_REGION || "us-east-1",
 });
 
+// Function to get BaseHub configuration from Secrets Manager
+async function getBaseHubConfig(): Promise<{
+  apiUrl: string;
+  token: string;
+  postsCollectionId: string;
+  imageComponentId: string;
+}> {
+  try {
+    const secretName = process.env.NODE_ENV === "development" 
+      ? "dev/AgentWeb/BaseHub" 
+      : "prod/AgentWeb/BaseHub";
+    
+    const { getSecret } = await import("../utils/secretsManager");
+    const configJson = await getSecret(secretName);
+    
+    const config = JSON.parse(configJson);
+    
+    if (!config.apiUrl || !config.token || !config.postsCollectionId) {
+      throw new Error("BaseHub configuration missing required fields");
+    }
+    
+    return {
+      apiUrl: config.apiUrl,
+      token: config.token,
+      postsCollectionId: config.postsCollectionId,
+      imageComponentId: config.imageComponentId || "AAzuzbz0jSbfwGJYvtMu3"
+    };
+  } catch (error) {
+    console.error("Error fetching BaseHub configuration from Secrets Manager:", error);
+    throw new Error("Failed to fetch BaseHub configuration from Secrets Manager");
+  }
+}
+
 // Author IDs from your BaseHub setup
 const AUTHORS = {
   HARSH: "B7hR0AMxxh8HyBOLRKfiU",
@@ -355,7 +388,7 @@ export const generateImage = async (req: AuthRequest, res: Response) => {
             openaiResult.filename || filename
           );
           console.log("✅ S3 upload completed successfully!");
-          console.log("🔗 Final image URL:", s3Url);
+          console.log("�� Final image URL:", s3Url);
           console.log("---");
           return res.status(200).json({
             success: true,
@@ -505,14 +538,9 @@ export const publishBlogPost = async (req: AuthRequest, res: Response) => {
     console.log("📊 HTML Report URL:", htmlReportUrl);
     console.log("---");
 
-    const BASEHUB_API_URL =
-      process.env.BASEHUB_API_URL || "https://api.basehub.com/graphql";
-    const BASEHUB_TOKEN = process.env.BASEHUB_TOKEN || "";
-    const POSTS_COLLECTION_ID = "dKrosxXlaGpnZCrAbHxlX";
-    const IMAGE_COMPONENT_ID =
-      process.env.BASEHUB_IMAGE_COMPONENT_ID || "AAzuzbz0jSbfwGJYvtMu3";
+    const { apiUrl, token, postsCollectionId, imageComponentId } = await getBaseHubConfig();
 
-    if (!BASEHUB_TOKEN) {
+    if (!token) {
       return res.status(500).json({
         success: false,
         message: "BaseHub token is not configured",
@@ -530,7 +558,7 @@ export const publishBlogPost = async (req: AuthRequest, res: Response) => {
     console.log("🏗️ Building BaseHub transaction structure...");
     const transactionData = {
       type: "create",
-      parentId: POSTS_COLLECTION_ID,
+      parentId: postsCollectionId,
       data: {
         title: title,
         type: "instance",
@@ -567,7 +595,7 @@ export const publishBlogPost = async (req: AuthRequest, res: Response) => {
       // This is the correct structure based on the working Python code
       (transactionData.data.value as any).image = {
         type: "instance",
-        mainComponentId: IMAGE_COMPONENT_ID, // This is the image component ID from BaseHub
+        mainComponentId: imageComponentId, // This is the image component ID from BaseHub
         value: {
           light: {
             type: "media",
@@ -607,13 +635,13 @@ export const publishBlogPost = async (req: AuthRequest, res: Response) => {
     );
 
     const headers = {
-      Authorization: `Bearer ${BASEHUB_TOKEN}`,
+      Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
     };
 
     console.log("🌐 Initiating BaseHub API request...");
     const response = await axios.post(
-      BASEHUB_API_URL,
+      apiUrl,
       { query: mutation, variables },
       { headers }
     );

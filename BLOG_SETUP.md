@@ -19,17 +19,20 @@ Add the following environment variables to your backend `.env` file:
 
 ```env
 # BaseHub Configuration
-BASEHUB_API_URL=https://api.basehub.com/graphql
-BASEHUB_TOKEN=your_basehub_token_here
-POSTS_COLLECTION_ID=dKrosxXlaGpnZCrAbHxlX
-BASEHUB_IMAGE_COMPONENT_ID=AAzuzbz0jSbfwGJYvtMu3
+# These are now stored in AWS Secrets Manager as JSON objects
+# Secret names: dev/AgentWeb/BaseHub (development) or prod/AgentWeb/BaseHub (production)
+# JSON structure:
+# {
+#   "apiUrl": "https://api.basehub.com/graphql",
+#   "token": "your_basehub_token_here",
+#   "postsCollectionId": "dKrosxXlaGpnZCrAbHxlX",
+#   "imageComponentId": "AAzuzbz0jSbfwGJYvtMu3"
+# }
 
 # OpenAI Configuration (required for content and image generation)
-OPENAI_IMAGE_API_KEY=your_openai_api_key_here
-AZURE_OPENAI_API_KEY=your_azure_openai_api_key
-AZURE_OPENAI_ENDPOINT=your_azure_openai_endpoint
-AZURE_OPENAI_DEPLOYMENT=your_azure_openai_deployment
-AZURE_OPENAI_API_VERSION=your_azure_openai_api_version
+# These are now stored in AWS Secrets Manager
+# Secret names: dev/AgentWeb/OpenAI/Image (development) or prod/AgentWeb/OpenAI/Image (production)
+# The secret should contain the OpenAI API key as a string
 
 # AWS S3 Configuration (required for image storage)
 S3_BUCKET_NAME=your_s3_bucket_name
