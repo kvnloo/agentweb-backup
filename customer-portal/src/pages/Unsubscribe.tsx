@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { useSearchParams, useNavigate } from 'react-router-dom';
+import { useSearchParams } from 'react-router-dom';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Button } from '../components/ui/button';
 import { Alert, AlertDescription } from '../components/ui/alert';
@@ -9,7 +9,6 @@ import { buildApiUrl } from '../config';
 
 const UnsubscribePage: React.FC = () => {
   const [searchParams] = useSearchParams();
-  const navigate = useNavigate();
   const [loading, setLoading] = useState(false);
   const [success, setSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -105,9 +104,12 @@ const UnsubscribePage: React.FC = () => {
               </AlertDescription>
             </Alert>
             <div className="mt-4 text-center">
-              <Button onClick={() => navigate('/')} variant="outline">
-                Go to Home
-              </Button>
+              <a 
+                href="/" 
+                className="text-sm text-gray-500 hover:text-gray-700 transition-colors"
+              >
+                Powered by AgentWeb
+              </a>
             </div>
           </CardContent>
         </Card>
@@ -149,12 +151,15 @@ const UnsubscribePage: React.FC = () => {
               >
                 {loading ? 'Resubscribing...' : 'Resubscribe'}
               </Button>
-              <Button 
-                onClick={() => navigate('/')} 
-                className="flex-1"
+            </div>
+            
+            <div className="text-center mt-4">
+              <a 
+                href="/" 
+                className="text-sm text-gray-500 hover:text-gray-700 transition-colors"
               >
-                Go to Home
-              </Button>
+                Powered by AgentWeb
+              </a>
             </div>
           </CardContent>
         </Card>
@@ -202,13 +207,15 @@ const UnsubscribePage: React.FC = () => {
             >
               {loading ? 'Unsubscribing...' : 'Unsubscribe'}
             </Button>
-            <Button 
-              onClick={() => navigate('/')} 
-              className="flex-1"
-              variant="outline"
+          </div>
+          
+          <div className="text-center mt-4">
+            <a 
+              href="/" 
+              className="text-sm text-gray-500 hover:text-gray-700 transition-colors"
             >
-              Cancel
-            </Button>
+              Powered by AgentWeb
+            </a>
           </div>
         </CardContent>
       </Card>
