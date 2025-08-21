@@ -197,11 +197,17 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
 <head>
   <style>
     body {{ font-family: sans-serif; margin: 0; padding: 0; color: #333; background-color: #fff; }}
-    .container {{ padding: 20px; background-color: #fdfdfd; }}
+    .container {{ padding: 0; background-color: #fdfdfd; }}
     .header {{ font-size: 1.5em; font-weight: bold; margin-bottom: 15px; color: #2c3e50; }}
-    .html-result {{ border: 1px solid #ddd; padding: 10px; margin-top: 15px; border-radius: 5px; }}
+    .html-result {{ border: none; padding: 0; margin: 0; border-radius: 0; }}
     .html-result h3 {{ margin-top:0; }}
-    .footer {{ margin-top: 25px; font-size: 0.9em; color: #7f8c8d; }}
+    .html-result * {{ margin: 0; padding: 0; }}
+    .html-result p:first-child {{ margin-top: 0; }}
+    .html-result div:first-child {{ margin-top: 0; }}
+    .html-result h1:first-child {{ margin-top: 0; }}
+    .html-result h2:first-child {{ margin-top: 0; }}
+    .html-result h3:first-child {{ margin-top: 0; }}
+    .footer {{ margin-top: 25px; font-size: 0.9em; color: #7f8c8d; padding: 20px; }}
     a {{ color: #3498db; text-decoration: none; }}
     a:hover {{ text-decoration: underline; }}
   </style>
@@ -247,6 +253,12 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
     pre {{ white-space: pre-wrap; word-wrap: break-word; background: #ecf0f1; padding: 15px; border-radius: 5px; font-size: 0.9em; color: #555; }}
     .html-result {{ border: 1px solid #ddd; padding: 10px; margin-top: 15px; border-radius: 5px; }}
     .html-result h3 {{ margin-top:0; }}
+    .html-result * {{ margin: 0; padding: 0; }}
+    .html-result p:first-child {{ margin-top: 0; }}
+    .html-result div:first-child {{ margin-top: 0; }}
+    .html-result h1:first-child {{ margin-top: 0; }}
+    .html-result h2:first-child {{ margin-top: 0; }}
+    .html-result h3:first-child {{ margin-top: 0; }}
     .footer {{ margin-top: 25px; font-size: 0.9em; color: #7f8c8d; }}
     a {{ color: #3498db; text-decoration: none; }}
     a:hover {{ text-decoration: underline; }}
