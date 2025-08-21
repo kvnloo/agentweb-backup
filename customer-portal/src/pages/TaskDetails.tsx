@@ -93,6 +93,10 @@ interface TaskAttachment {
 interface Subscriber {
   email: string;
   subscribedAt: string;
+  unsubscribed?: boolean;
+  unsubscribedAt?: string;
+  resubscribedAt?: string;
+  feedback?: string;
 }
 
 // Update TaskDetail interface
@@ -104,6 +108,7 @@ interface TaskDetail extends Task {
   isInteractive?: boolean;
   isDeepResearch?: boolean;
   attachments?: TaskAttachment[];
+  sendHtmlReportOnly?: boolean; // Added for HTML report only toggle
 }
 
 // Base Task interface
@@ -647,21 +652,21 @@ const TaskDetailsPage: React.FC = () => {
 
   // Subscriber management functions
   const fetchSubscribers = async () => {
-    if (!taskId || !token) return;
+    if (!token || !taskId) return;
+    
     setLoadingSubscribers(true);
     try {
       const response = await axios.get(
-        buildApiUrl(`/api/tasks/${taskId}/subscribers`),
+        buildApiUrl(`/api/tasks/${taskId}/subscribers/all`),
         {
           headers: { Authorization: `Bearer ${token}` },
         }
       );
       setSubscribers(response.data);
-      setSubscriberError("");
-    } catch (error: any) {
-      console.error("Error fetching subscribers:", error);
+    } catch (err: any) {
+      console.error("Failed to fetch subscribers:", err);
       setSubscriberError(
-        error.response?.data?.message || "Failed to fetch subscribers"
+        err.response?.data?.message || "Failed to load subscribers"
       );
     } finally {
       setLoadingSubscribers(false);
@@ -679,6 +684,7 @@ const TaskDetailsPage: React.FC = () => {
         { headers: { Authorization: `Bearer ${token}` } }
       );
 
+      // Add new subscriber to the list
       const newSubscriber: Subscriber = {
         email: response.data.email,
         subscribedAt: response.data.subscribedAt || new Date().toISOString(),
@@ -693,36 +699,116 @@ const TaskDetailsPage: React.FC = () => {
       });
     } catch (error: any) {
       console.error("Error adding subscriber:", error);
-      const errorMessage =
-        error.response?.data?.message ||
-        (error.response?.status === 400
-          ? "Invalid email address"
-          : "Failed to add subscriber");
-      setSubscriberError(errorMessage);
+      if (error.response?.status === 409) {
+        setSubscriberError("This email is already in the subscriber list for this task.");
+      } else {
+        const errorMessage =
+          error.response?.data?.message ||
+          (error.response?.status === 400
+            ? "Invalid email address"
+            : "Failed to add subscriber");
+        setSubscriberError(errorMessage);
+      }
     }
   };
 
   const handleRemoveSubscriber = async (email: string) => {
-    if (!taskId || !token) return;
+    if (!token || !taskId) return;
     
+    setLoadingSubscribers(true);
     try {
       await axios.delete(
-        buildApiUrl(
-          `/api/tasks/${taskId}/subscribers/${encodeURIComponent(email)}`
-        ),
+        buildApiUrl(`/api/tasks/${taskId}/subscribers/${encodeURIComponent(email)}`),
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      
+      setSubscribers(subscribers.filter(s => s.email !== email));
+      toast({ title: "Success", description: "Subscriber removed successfully." });
+    } catch (err: any) {
+      setSubscriberError(
+        err.response?.data?.message || "Failed to remove subscriber"
+      );
+    } finally {
+      setLoadingSubscribers(false);
+    }
+  };
+
+  const checkSubscriberStatus = async (email: string) => {
+    if (!taskId) return;
+    
+    try {
+      const response = await axios.get(
+        buildApiUrl(`/api/tasks/${taskId}/subscribers/${encodeURIComponent(email)}/status`)
+      );
+      console.log('Subscriber status:', response.data);
+      return response.data;
+    } catch (err: any) {
+      console.error('Failed to check subscriber status:', err);
+      return null;
+    }
+  };
+
+  const handleResubscribe = async (email: string) => {
+    if (!token || !taskId) return;
+    
+    setLoadingSubscribers(true);
+    try {
+      console.log('Resubscribing subscriber:', email);
+      
+      // Check status before resubscribing
+      const beforeStatus = await checkSubscriberStatus(email);
+      console.log('Status before resubscribe:', beforeStatus);
+      
+      await axios.post(
+        buildApiUrl(`/api/tasks/${taskId}/subscribers/${encodeURIComponent(email)}/resubscribe`),
+        {},
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      
+      console.log('Resubscribe API call successful');
+      
+      // Check status after resubscribing
+      const afterStatus = await checkSubscriberStatus(email);
+      console.log('Status after resubscribe:', afterStatus);
+      
+      // Refresh the subscriber list to get updated data
+      await fetchSubscribers();
+      
+      toast({ title: "Success", description: "Subscriber resubscribed successfully." });
+    } catch (err: any) {
+      console.error('Resubscribe error:', err);
+      setSubscriberError(
+        err.response?.data?.message || "Failed to resubscribe subscriber"
+      );
+    } finally {
+      setLoadingSubscribers(false);
+    }
+  };
+
+  const handleToggleHtmlReportOnly = async () => {
+    if (!task) return;
+    setIsUpdatingApproval(true);
+    try {
+      const newValue = !task.sendHtmlReportOnly;
+      await axios.put(
+        buildApiUrl(`/api/tasks/${task.taskId}`),
+        { sendHtmlReportOnly: newValue },
         { headers: { Authorization: `Bearer ${token}` } }
       );
-      setSubscribers(subscribers.filter((s) => s.email !== email));
-      setSubscriberError("");
+      setTask({ ...task, sendHtmlReportOnly: newValue });
+      toast({ title: "Success", description: "HTML Report Only setting updated." });
+    } catch (err) {
       toast({
-        title: "Success",
-        description: "Subscriber removed successfully.",
+        title: "Error",
+        description: "Failed to update HTML Report Only setting.",
+        variant: "destructive",
       });
-    } catch (error: any) {
-      console.error("Error removing subscriber:", error);
-      setSubscriberError(
-        error.response?.data?.message || "Failed to remove subscriber"
-      );
+    } finally {
+      setIsUpdatingApproval(false);
     }
   };
 
@@ -1302,6 +1388,23 @@ const TaskDetailsPage: React.FC = () => {
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
+            {/* HTML Report Only Toggle */}
+            <div className="flex items-center space-x-2">
+              <Switch
+                id="html-report-only"
+                checked={!!task?.sendHtmlReportOnly}
+                onCheckedChange={handleToggleHtmlReportOnly}
+                disabled={loadingSubscribers}
+              />
+              <Label htmlFor="html-report-only" className="text-sm font-medium">
+                Send HTML Report Only
+              </Label>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              When enabled, emails to subscribers will only contain the HTML report if available, 
+              making them focused on well-formatted content instead of task execution context.
+            </p>
+
             {/* Add Subscriber Form */}
             <form onSubmit={handleAddSubscriber} className="flex gap-2">
               <input
@@ -1344,18 +1447,43 @@ const TaskDetailsPage: React.FC = () => {
                   <div>
                     <p className="font-medium">{subscriber.email}</p>
                     <p className="text-sm text-muted-foreground">
-                      Subscribed on {new Date(subscriber.subscribedAt).toLocaleDateString()}
+                      {subscriber.unsubscribed ? (
+                        <span className="text-red-600">
+                          Email owner unsubscribed on {new Date(subscriber.unsubscribedAt!).toLocaleDateString()}
+                        </span>
+                      ) : (
+                        `Subscribed on ${new Date(subscriber.subscribedAt).toLocaleDateString()}`
+                      )}
                     </p>
+                    {subscriber.feedback && (
+                      <div className="mt-2 p-2 bg-gray-50 rounded border-l-2 border-gray-300">
+                        <p className="text-xs font-medium text-gray-600 mb-1">Feedback:</p>
+                        <p className="text-xs text-gray-700 italic">"{subscriber.feedback}"</p>
+                      </div>
+                    )}
                   </div>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => handleRemoveSubscriber(subscriber.email)}
-                    disabled={loadingSubscribers}
-                    className="text-destructive hover:text-destructive hover:bg-destructive/10"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </Button>
+                  <div className="flex items-center gap-2">
+                    {subscriber.unsubscribed ? (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => handleResubscribe(subscriber.email)}
+                        disabled={loadingSubscribers}
+                      >
+                        Resubscribe
+                      </Button>
+                    ) : (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleRemoveSubscriber(subscriber.email)}
+                        disabled={loadingSubscribers}
+                        className="text-destructive hover:text-destructive hover:bg-destructive/10"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    )}
+                  </div>
                 </div>
               ))}
               

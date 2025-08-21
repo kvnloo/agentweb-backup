@@ -24,6 +24,7 @@ import MetaCampaigns from "@/pages/MetaCampaigns.tsx";
 import ImagesPage from "@/pages/Images.tsx";
 import VideosPage from "@/pages/Videos.tsx";
 import ResearchReportsPage from "@/pages/ResearchReports.tsx";
+import UnsubscribePage from "@/pages/Unsubscribe.tsx";
 
 const queryClient = new QueryClient();
 
@@ -40,6 +41,7 @@ const App = () => (
               <Route path="/login" element={<Login />} />
               <Route path="/register" element={<Register />} />
               <Route path="/oauth-callback" element={<OAuthCallback />} />
+              <Route path="/unsubscribe" element={<UnsubscribePage />} />
 
               {/* Protected routes */}
               <Route

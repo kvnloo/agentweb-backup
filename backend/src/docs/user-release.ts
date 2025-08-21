@@ -14,6 +14,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- AI-powered blog content generation with customizable tone, length, and keywords',
       '- Automatic hero image generation using GPT Image models',
       '- Blog post history tracking to help avoid duplicate content creation',
+      'Improved Task Subscribers management',
+      '- Added "Send HTML Report Only" toggle for cleaner email delivery',
+      '- Supported unsubscribing from task updates',
+      '- Optional feedback collection when users unsubscribe',
+      '- Enhanced subscriber list display showing unsubscribed users and their feedback',
     ],
   },
   {

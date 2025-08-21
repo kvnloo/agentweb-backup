@@ -557,7 +557,7 @@ export const taskDb = {
           ":userId": userId,
         },
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, knowledgeBaseSize, createVideo, videoModel, imageModel, requireApproval, slackChannel",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, knowledgeBaseSize, createVideo, videoModel, imageModel, requireApproval, slackChannel, sendHtmlReportOnly",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -612,7 +612,7 @@ export const taskDb = {
           taskId,
         },
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, updateLeadList, createVideo, videoModel, imageModel, leadListIdentifier, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt, requireApproval, slackChannel",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, updateLeadList, createVideo, videoModel, imageModel, leadListIdentifier, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt, requireApproval, slackChannel, sendHtmlReportOnly",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -673,6 +673,7 @@ export const taskDb = {
       knowledgeBaseUpdatedAt?: string;
       requireApproval?: boolean;
       slackChannel?: string;
+      sendHtmlReportOnly?: boolean;
     }>
   ) {
     try {
@@ -1463,6 +1464,19 @@ export const scheduleDb = {
 export const subscriberDb = {
   async addSubscriber(taskId: string, email: string) {
     try {
+      // Check if subscriber already exists
+      const existingSubscribers = await this.getAllTaskSubscribers(taskId);
+      if (!existingSubscribers) {
+        throw new Error('Failed to fetch existing subscribers');
+      }
+      const existingSubscriber = existingSubscribers.find(s => s.email === email);
+      
+      if (existingSubscriber) {
+        // Email already exists - throw error regardless of subscription status
+        throw new Error(`Email ${email} is already in the subscriber list for this task`);
+      }
+      
+      // Add new subscriber only if they don't exist at all
       const subscribedAt = new Date().toISOString();
       const params = {
         TableName: `${TABLE_PREFIX}AW-Subscribers`,
@@ -1470,17 +1484,13 @@ export const subscriberDb = {
           taskId,
           email,
           subscribedAt,
+          unsubscribed: false,
         },
-        ConditionExpression:
-          "attribute_not_exists(taskId) AND attribute_not_exists(email)",
       };
 
       await dynamodb.put(params).promise();
-      return { taskId, email, subscribedAt };
+      return { taskId, email, subscribedAt, unsubscribed: false };
     } catch (error: any) {
-      if (error.code === "ConditionalCheckFailedException") {
-        throw new Error(`Email ${email} is already subscribed to this task`);
-      }
       handleDynamoDbError(error, "addSubscriber");
     }
   },
@@ -1501,7 +1511,83 @@ export const subscriberDb = {
     }
   },
 
+  async softUnsubscribe(taskId: string, email: string, feedback?: string) {
+    try {
+      const updateExpression = feedback 
+        ? "SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt, feedback = :feedback"
+        : "SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt";
+      
+      const expressionAttributeValues: any = {
+        ":unsubscribed": true,
+        ":unsubscribedAt": new Date().toISOString(),
+      };
+      
+      if (feedback) {
+        expressionAttributeValues[":feedback"] = feedback;
+      }
+
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
+        Key: {
+          taskId,
+          email,
+        },
+        UpdateExpression: updateExpression,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: "ALL_NEW",
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "softUnsubscribe");
+    }
+  },
+
+  async resubscribe(taskId: string, email: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
+        Key: {
+          taskId,
+          email,
+        },
+        UpdateExpression: "SET unsubscribed = :unsubscribed, resubscribedAt = :resubscribedAt, feedback = :feedback",
+        ExpressionAttributeValues: {
+          ":unsubscribed": false,
+          ":resubscribedAt": new Date().toISOString(),
+          ":feedback": null,
+        },
+        ReturnValues: "ALL_NEW",
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "resubscribe");
+    }
+  },
+
   async getTaskSubscribers(taskId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
+        KeyConditionExpression: "taskId = :taskId",
+        FilterExpression: "attribute_not_exists(unsubscribed) OR unsubscribed = :unsubscribed",
+        ExpressionAttributeValues: {
+          ":taskId": taskId,
+          ":unsubscribed": false,
+        },
+      };
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, "getTaskSubscribers");
+    }
+  },
+
+  async getAllTaskSubscribers(taskId: string) {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Subscribers`,
@@ -1514,7 +1600,7 @@ export const subscriberDb = {
       const result = await dynamodb.query(params).promise();
       return result.Items || [];
     } catch (error) {
-      handleDynamoDbError(error, "getTaskSubscribers");
+      handleDynamoDbError(error, "getAllTaskSubscribers");
     }
   },
 };
@@ -1694,3 +1780,4 @@ class TaskTemplateDB {
 }
 
 export const taskTemplateDb = new TaskTemplateDB();
+

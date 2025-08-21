@@ -227,8 +227,9 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                 
                 // Get task subscribers
                 const subscribers = await subscriberDb.getTaskSubscribers(execution.taskId);
-                const subscriberEmails = subscribers ? subscribers.map(sub => sub.email) : [];
-                console.log(`📧 Found ${subscriberEmails.length} subscribers for task: ${execution.taskId}`);
+                const activeSubscribers = subscribers ? subscribers.filter(sub => !sub.unsubscribed) : [];
+                const subscriberEmails = activeSubscribers.map(sub => sub.email);
+                console.log(`📧 Found ${subscriberEmails.length} active subscribers for task: ${execution.taskId}`);
                 
                 if (subscriberEmails.length > 0) {
                   // Send task results to subscribers using common function

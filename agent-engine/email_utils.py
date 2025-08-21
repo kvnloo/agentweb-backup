@@ -28,13 +28,15 @@ executions_table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskExecutions')
 
 def get_task_subscribers(task_id):
     """
-    Get all subscribers for a given task.
+    Get all active subscribers for a given task.
     """
     try:
         response = subscribers_table.query(
             KeyConditionExpression='taskId = :taskId',
+            FilterExpression='attribute_not_exists(unsubscribed) OR unsubscribed = :unsubscribed',
             ExpressionAttributeValues={
-                ':taskId': task_id
+                ':taskId': task_id,
+                ':unsubscribed': False
             }
         )
         return [item['email'] for item in response.get('Items', [])]
@@ -96,7 +98,7 @@ def send_task_notification(to_email, task_name, task_id, execution_status, execu
         logger.error(f"Failed to send email notification: {e}")
         return False
 
-def send_task_results(to_email, task_name, task_id, execution_status, result=None, error=None, start_time=None, end_time=None, new_info_summary=None, result_files=None, llm_name=None):
+def send_task_results(to_email, task_name, task_id, execution_status, result=None, error=None, start_time=None, end_time=None, new_info_summary=None, result_files=None, llm_name=None, send_html_report_only=False):
     """
     Send a detailed task results email to subscribers.
     Sends content as HTML only.
@@ -159,6 +161,87 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
 </div>"""
                     break # Process only the first HTML file found, even if error
 
+        # If send_html_report_only is enabled, try to find HTML content and send only that
+        if send_html_report_only and result_files:
+            html_content_from_file_section = ""
+            for file_info in result_files:
+                if file_info.get('view_type') == 'html' and file_info.get('url'):
+                    try:
+                        response = requests.get(file_info['url'], timeout=10)
+                        response.raise_for_status()
+                        fetched_html_content = response.text
+                        html_content_from_file_section = f"""<div class="html-result">
+    {fetched_html_content}
+</div>"""
+                        logger.info(f"Successfully fetched HTML content from {file_info['url']}")
+                        break
+                    except requests.RequestException as e:
+                        logger.error(f"Failed to fetch HTML content from {file_info['url']}: {e}")
+                        html_content_from_file_section = f"""<div class="html-result">
+    <h3>HTML Result File:</h3>
+    <p><i>Error fetching HTML content from {file_info['url']}: {e}</i></p>
+</div>"""
+                    except Exception as e:
+                        logger.error(f"Unexpected error fetching HTML content from {file_info['url']}: {e}")
+                        html_content_from_file_section = f"""<div class="html-result">
+    <h3>HTML Result File:</h3>
+    <p><i>Unexpected error fetching HTML content from {file_info['url']}.</i></p>
+</div>"""
+                    break
+
+            # If we have HTML content, send a simplified email with just the HTML report
+            if html_content_from_file_section:
+                from datetime import datetime
+                current_date = datetime.now().strftime("%b %d, %Y")
+                subject = f"{task_name} - {current_date}"  # Task name with date
+
+                simplified_html = f"""<html>
+<head>
+  <style>
+    body {{ font-family: sans-serif; margin: 0; padding: 0; color: #333; background-color: #fff; }}
+    .container {{ padding: 0; background-color: #fdfdfd; }}
+    .header {{ font-size: 1.5em; font-weight: bold; margin-bottom: 15px; color: #2c3e50; }}
+    .html-result {{ border: none; padding: 0; margin: 0; border-radius: 0; }}
+    .html-result h3 {{ margin-top:0; }}
+    .html-result * {{ margin: 0; padding: 0; }}
+    .html-result p:first-child {{ margin-top: 0; }}
+    .html-result div:first-child {{ margin-top: 0; }}
+    .html-result h1:first-child {{ margin-top: 0; }}
+    .html-result h2:first-child {{ margin-top: 0; }}
+    .html-result h3:first-child {{ margin-top: 0; }}
+    .footer {{ margin-top: 25px; font-size: 0.9em; color: #7f8c8d; padding: 20px; }}
+    a {{ color: #3498db; text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    {html_content_from_file_section}
+    <div class="footer">
+      <p>Manage task and history at: <a href="{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/tasks/{task_id}">{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/tasks/{task_id}</a></p>
+      <hr>
+      <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>
+      <p><small><a href="{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/unsubscribe?taskId={task_id}&email={to_email}" style="color: #e74c3c;">Unsubscribe from future updates</a></small></p>
+    </div>
+  </div>
+</body></html>"""
+
+                msg = MIMEText(simplified_html, 'html')
+                msg['Subject'] = subject
+                msg['From'] = from_email
+                msg['Reply-To'] = 'support@agentweb.pro'
+                msg['To'] = to_email
+                
+                # Send email
+                with smtplib.SMTP(smtp_host, smtp_port) as server:
+                    server.starttls()
+                    server.login(smtp_user, smtp_pass)
+                    server.send_message(msg)
+
+                logger.info(f"Sent simplified HTML report email to subscriber: {to_email}")
+                return True
+
+        # If send_html_report_only is disabled or no HTML content found, send the full email
         # --- Construct HTML Body ---
         html_body_content = f"""<html>
 <head>
@@ -173,6 +256,12 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
     pre {{ white-space: pre-wrap; word-wrap: break-word; background: #ecf0f1; padding: 15px; border-radius: 5px; font-size: 0.9em; color: #555; }}
     .html-result {{ border: 1px solid #ddd; padding: 10px; margin-top: 15px; border-radius: 5px; }}
     .html-result h3 {{ margin-top:0; }}
+    .html-result * {{ margin: 0; padding: 0; }}
+    .html-result p:first-child {{ margin-top: 0; }}
+    .html-result div:first-child {{ margin-top: 0; }}
+    .html-result h1:first-child {{ margin-top: 0; }}
+    .html-result h2:first-child {{ margin-top: 0; }}
+    .html-result h3:first-child {{ margin-top: 0; }}
     .footer {{ margin-top: 25px; font-size: 0.9em; color: #7f8c8d; }}
     a {{ color: #3498db; text-decoration: none; }}
     a:hover {{ text-decoration: underline; }}
@@ -207,6 +296,7 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
       <p>Manage task and history at: <a href="{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/tasks/{task_id}">{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/tasks/{task_id}</a></p>
       <hr>
       <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>
+      <p><small><a href="{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/unsubscribe?taskId={task_id}&email={to_email}" style="color: #e74c3c;">Unsubscribe from future updates</a></small></p>
     </div>
   </div>
 </body></html>
@@ -235,28 +325,51 @@ def notify_task_subscribers(task_id, task_name, execution_status, execution_id=N
     """
     Send detailed task results to all subscribers.
     """
-    subscribers = get_task_subscribers(task_id)
-    logger.info(f"Found {len(subscribers)} subscribers for task {task_id}")
-    
-    for subscriber_email in subscribers:
-        success = send_task_results(
-            subscriber_email,
-            task_name,
-            task_id,
-            execution_status,
-            result,
-            error,
-            start_time,
-            end_time,
-            new_info_summary,
-            result_files=result_files,
-            llm_name=llm_name
+    try:
+        # Get task details to check sendHtmlReportOnly setting
+        task_response = dynamodb.Table(f'{TABLE_PREFIX}AW-Tasks').get_item(
+            Key={'taskId': task_id}
         )
+        task = task_response.get('Item', {})
+        send_html_report_only = task.get('sendHtmlReportOnly', False)
         
-        if success:
-            logger.info(f"Successfully sent results to subscriber: {subscriber_email}")
-        else:
-            logger.error(f"Failed to send results to subscriber: {subscriber_email}")
+        response = subscribers_table.query(
+            KeyConditionExpression='taskId = :taskId',
+            FilterExpression='attribute_not_exists(unsubscribed) OR unsubscribed = :unsubscribed',
+            ExpressionAttributeValues={
+                ':taskId': task_id,
+                ':unsubscribed': False
+            }
+        )
+        subscribers = response.get('Items', [])
+        logger.info(f"Found {len(subscribers)} subscribers for task {task_id}")
+        
+        for subscriber in subscribers:
+            email = subscriber.get('email')
+            
+            if email:
+                success = send_task_results(
+                    email,
+                    task_name,
+                    task_id,
+                    execution_status,
+                    result,
+                    error,
+                    start_time,
+                    end_time,
+                    new_info_summary,
+                    result_files=result_files,
+                    llm_name=llm_name,
+                    send_html_report_only=send_html_report_only
+                )
+                
+                if success:
+                    logger.info(f"Successfully sent results to subscriber: {email}")
+                else:
+                    logger.error(f"Failed to send results to subscriber: {email}")
+    except Exception as e:
+        logger.error(f"Error getting subscribers for task {task_id}: {e}")
+        return False
 
 def get_previous_execution(task_id, current_execution_id=None):
     """

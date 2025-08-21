@@ -72,6 +72,154 @@ interface ResultFile {
 // Public routes (no authentication required)
 router.get('/execution/:executionId/token/:token', getExecutionWithToken);
 router.get('/:id/executions/:executionId/log', getExecutionLog);
+// Check subscriber status (public - no authentication required)
+router.get('/:taskId/subscribers/:email/status', async (req, res) => {
+  try {
+    const { taskId, email } = req.params;
+    
+    // Get all subscribers for this task
+    const subscribers = await subscriberDb.getAllTaskSubscribers(taskId);
+    if (!subscribers) {
+      return res.status(500).json({ message: 'Failed to fetch subscribers' });
+    }
+    
+    // Find the specific subscriber
+    const subscriber = subscribers.find(s => s.email === email);
+    if (!subscriber) {
+      return res.status(404).json({ message: 'Subscriber not found for this task' });
+    }
+    
+    res.json({
+      email: subscriber.email,
+      subscribedAt: subscriber.subscribedAt,
+      unsubscribed: subscriber.unsubscribed || false,
+      unsubscribedAt: subscriber.unsubscribedAt,
+      resubscribedAt: subscriber.resubscribedAt,
+      feedback: subscriber.feedback
+    });
+  } catch (error: any) {
+    console.error('Error checking subscriber status:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Get task name (public)
+router.get('/:id/name', async (req, res) => {
+  try {
+    const { id: taskId } = req.params;
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+    res.json({ name: task.name });
+  } catch (error: any) {
+    console.error('Error getting task name:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Soft unsubscribe from task (public)
+router.post('/:taskId/unsubscribe', async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { email, feedback } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ message: 'Email is required' });
+    }
+
+    // Check if subscriber exists
+    const subscribers = await subscriberDb.getAllTaskSubscribers(taskId);
+    if (!subscribers) {
+      return res.status(500).json({ message: 'Failed to fetch subscribers' });
+    }
+    const subscriber = subscribers.find(s => s.email === email);
+    
+    if (!subscriber) {
+      return res.status(404).json({ message: 'Subscriber not found for this task' });
+    }
+
+    await subscriberDb.softUnsubscribe(taskId, email, feedback);
+    res.json({ message: 'Successfully unsubscribed' });
+  } catch (error: any) {
+    console.error('Error unsubscribing:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Resubscribe to task (public)
+router.post('/:taskId/resubscribe', async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ message: 'Email is required' });
+    }
+
+    // Check if subscriber exists
+    const subscribers = await subscriberDb.getAllTaskSubscribers(taskId);
+    if (!subscribers) {
+      return res.status(500).json({ message: 'Failed to fetch subscribers' });
+    }
+    const subscriber = subscribers.find(s => s.email === email);
+    
+    if (!subscriber) {
+      return res.status(404).json({ message: 'Subscriber not found for this task' });
+    }
+
+    await subscriberDb.resubscribe(taskId, email);
+    res.json({ message: 'Successfully resubscribed' });
+  } catch (error: any) {
+    console.error('Error resubscribing:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Resubscribe subscriber (admin only - requires authentication)
+router.post('/:taskId/subscribers/:email/resubscribe', authenticateToken, async (req, res) => {
+  try {
+    const { taskId, email } = req.params;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Get task to verify ownership
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Verify task belongs to user or user is admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Check if subscriber exists
+    const subscribers = await subscriberDb.getAllTaskSubscribers(taskId);
+    if (!subscribers) {
+      return res.status(500).json({ message: 'Failed to fetch subscribers' });
+    }
+    const subscriber = subscribers.find(s => s.email === email);
+    
+    if (!subscriber) {
+      return res.status(404).json({ message: 'Subscriber not found for this task' });
+    }
+
+    await subscriberDb.resubscribe(taskId, email);
+    res.json({ message: 'Successfully resubscribed' });
+  } catch (error: any) {
+    console.error('Error resubscribing:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
 
 // All other task routes require authentication
 router.use(authenticateToken);
@@ -192,7 +340,7 @@ router.put('/:taskId/executions/:executionId/kill', authenticateToken, async (re
   }
 });
 
-// Get task subscribers
+// Get task subscribers (active only - public)
 router.get('/:taskId/subscribers', async (req, res) => {
   try {
     const { taskId } = req.params;
@@ -200,6 +348,41 @@ router.get('/:taskId/subscribers', async (req, res) => {
     res.json(subscribers);
   } catch (error: any) {
     console.error('Error getting task subscribers:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Get all task subscribers including unsubscribed (admin only - requires authentication)
+router.get('/:taskId/subscribers/all', authenticateToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Get task to verify ownership
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Verify task belongs to user or user is admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const subscribers = await subscriberDb.getAllTaskSubscribers(taskId);
+    console.log(`Admin endpoint: Found ${subscribers?.length || 0} subscribers for task ${taskId}:`, subscribers);
+    res.json(subscribers);
+  } catch (error: any) {
+    console.error('Error getting all subscribers:', error);
     res.status(500).json({ message: error.message });
   }
 });
@@ -218,7 +401,11 @@ router.post('/:taskId/subscribers', async (req, res) => {
     res.status(201).json(subscriber);
   } catch (error: any) {
     console.error('Error adding subscriber:', error);
-    res.status(500).json({ message: error.message });
+    if (error.message.includes('already subscribed')) {
+      res.status(409).json({ message: error.message });
+    } else {
+      res.status(500).json({ message: error.message });
+    }
   }
 });
 
