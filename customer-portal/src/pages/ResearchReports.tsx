@@ -2846,11 +2846,11 @@ const ResearchReportsPage: React.FC = () => {
         <DialogContent
           className={
             blogStep === "preview"
-              ? "sm:max-w-[800px] max-h-[90vh]"
-              : "sm:max-w-[500px]"
+              ? "sm:max-w-[800px] max-h-[90vh] flex flex-col"
+              : "sm:max-w-[500px] max-h-[90vh] flex flex-col"
           }
         >
-          <DialogHeader>
+          <DialogHeader className="flex-shrink-0">
             <DialogTitle>
               {blogStep === "options" &&
                 "Generate Blog Post from Research Report"}
@@ -2893,7 +2893,7 @@ const ResearchReportsPage: React.FC = () => {
           </DialogHeader>
 
           {blogStep === "options" && (
-            <div className="space-y-4 py-4">
+            <div className="space-y-4 py-4 flex-1 overflow-y-auto">
               {/* AI Agent Workflow Display */}
               <AgentWorkflowDisplay
                 steps={workflowSteps}
@@ -3026,7 +3026,7 @@ const ResearchReportsPage: React.FC = () => {
           )}
 
           {blogStep === "preview" && generatedBlogContent && (
-            <div className="space-y-4 py-4 max-h-[70vh] overflow-y-auto">
+            <div className="space-y-4 py-4 flex-1 overflow-y-auto">
               {/* Hero Image */}
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
@@ -3045,7 +3045,7 @@ const ResearchReportsPage: React.FC = () => {
                       </>
                     ) : (
                       <>
-                        <RefreshCw className="h-3 w-3 mr-1" />
+                        <RefreshCw className="h-3 w-3 mr-1 animate-spin" />
                         Regenerate Image
                       </>
                     )}
@@ -3173,12 +3173,12 @@ const ResearchReportsPage: React.FC = () => {
                   >
                     {regeneratingContent ? (
                       <>
-                        <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                        <Loader2 className="h-4 w-4 mr-2 animate-spin" />
                         Regenerating...
                       </>
                     ) : (
                       <>
-                        <RefreshCw className="h-3 w-3 mr-1" />
+                        <RefreshCw className="h-4 w-4 mr-2" />
                         Regenerate Content
                       </>
                     )}
@@ -3200,7 +3200,7 @@ const ResearchReportsPage: React.FC = () => {
           )}
 
           {blogStep === "publishing" && (
-            <div className="flex flex-col items-center justify-center py-12">
+            <div className="flex flex-col items-center justify-center py-12 flex-1">
               <Loader2 className="h-8 w-8 animate-spin mb-4" />
               <h3 className="text-lg font-semibold mb-2">
                 Publishing Blog Post
@@ -3212,7 +3212,7 @@ const ResearchReportsPage: React.FC = () => {
             </div>
           )}
 
-          <DialogFooter>
+          <DialogFooter className="flex-shrink-0">
             {blogStep === "options" && (
               <>
                 <Button
