@@ -152,7 +152,11 @@ router.post('/tasks/:taskId/subscribers', authenticateToken, async (req, res) =>
     res.status(201).json(subscriber);
   } catch (error: any) {
     console.error('Error adding subscriber:', error);
-    res.status(500).json({ message: error.message });
+    if (error.message.includes('already subscribed')) {
+      res.status(409).json({ message: error.message });
+    } else {
+      res.status(500).json({ message: error.message });
+    }
   }
 });
 

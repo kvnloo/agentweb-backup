@@ -683,6 +683,7 @@ const TaskDetailsPage: React.FC = () => {
         { headers: { Authorization: `Bearer ${token}` } }
       );
 
+      // Add new subscriber to the list
       const newSubscriber: Subscriber = {
         email: response.data.email,
         subscribedAt: response.data.subscribedAt || new Date().toISOString(),
@@ -697,12 +698,16 @@ const TaskDetailsPage: React.FC = () => {
       });
     } catch (error: any) {
       console.error("Error adding subscriber:", error);
-      const errorMessage =
-        error.response?.data?.message ||
-        (error.response?.status === 400
-          ? "Invalid email address"
-          : "Failed to add subscriber");
-      setSubscriberError(errorMessage);
+      if (error.response?.status === 409) {
+        setSubscriberError("This email is already in the subscriber list for this task.");
+      } else {
+        const errorMessage =
+          error.response?.data?.message ||
+          (error.response?.status === 400
+            ? "Invalid email address"
+            : "Failed to add subscriber");
+        setSubscriberError(errorMessage);
+      }
     }
   };
 

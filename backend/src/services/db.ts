@@ -1464,8 +1464,6 @@ export const scheduleDb = {
 export const subscriberDb = {
   async addSubscriber(taskId: string, email: string) {
     try {
-      const subscribedAt = new Date().toISOString();
-      
       // Check if subscriber already exists
       const existingSubscribers = await this.getAllTaskSubscribers(taskId);
       if (!existingSubscribers) {
@@ -1474,15 +1472,12 @@ export const subscriberDb = {
       const existingSubscriber = existingSubscribers.find(s => s.email === email);
       
       if (existingSubscriber) {
-        if (existingSubscriber.unsubscribed) {
-          // Resubscribe existing unsubscribed subscriber
-          return await this.resubscribe(taskId, email);
-        } else {
-          throw new Error(`Email ${email} is already subscribed to this task`);
-        }
+        // Email already exists - throw error regardless of subscription status
+        throw new Error(`Email ${email} is already in the subscriber list for this task`);
       }
       
-      // Add new subscriber
+      // Add new subscriber only if they don't exist at all
+      const subscribedAt = new Date().toISOString();
       const params = {
         TableName: `${TABLE_PREFIX}AW-Subscribers`,
         Item: {
@@ -1496,9 +1491,6 @@ export const subscriberDb = {
       await dynamodb.put(params).promise();
       return { taskId, email, subscribedAt, unsubscribed: false };
     } catch (error: any) {
-      if (error.code === "ConditionalCheckFailedException") {
-        throw new Error(`Email ${email} is already subscribed to this task`);
-      }
       handleDynamoDbError(error, "addSubscriber");
     }
   },
@@ -1777,3 +1769,4 @@ class TaskTemplateDB {
 }
 
 export const taskTemplateDb = new TaskTemplateDB();
+
