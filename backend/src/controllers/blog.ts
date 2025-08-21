@@ -464,7 +464,7 @@ export const publishBlogPost = async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
-    const { title, description, content, imageUrl, imageFilename } = req.body;
+    const { title, description, content, imageUrl, imageFilename, executionId, htmlReportUrl } = req.body;
 
     // Debug: Log the entire request body
     console.log("📥 Request body received:", req.body);
@@ -481,6 +481,8 @@ export const publishBlogPost = async (req: AuthRequest, res: Response) => {
     console.log("📄 Content length:", content.length, "characters");
     console.log("🖼️ Image URL:", imageUrl);
     console.log("🖼️ Image Filename:", imageFilename);
+    console.log("🔍 Execution ID:", executionId);
+    console.log("📊 HTML Report URL:", htmlReportUrl);
     console.log("---");
 
     const BASEHUB_API_URL =
@@ -600,6 +602,45 @@ export const publishBlogPost = async (req: AuthRequest, res: Response) => {
     console.log("📥 BaseHub Response:", JSON.stringify(response.data, null, 2));
 
     console.log("✅ Blog post published successfully to BaseHub");
+
+    // Update the existing execution record with publishedToBasehub timestamp
+    if (executionId && htmlReportUrl) {
+      try {
+        const { taskDb } = await import('../services/db');
+        
+        // Get the existing execution
+        const existingExecution = await taskDb.getTaskExecutionById(executionId);
+        
+        if (existingExecution && existingExecution.userId === userId) {
+          console.log("✅ Found existing execution, updating with publishedToBasehub timestamp");
+          
+          // Find the HTML report file in result_files by URL and add publishedToBasehub timestamp
+          const currentResultFiles = existingExecution.result_files || [];
+          const updatedResultFiles = currentResultFiles.map((file: any) => {
+            if (file.url === htmlReportUrl) {
+              // Add publishedToBasehub timestamp to this file
+              return {
+                ...file,
+                publishedToBasehub: new Date().toISOString()
+              };
+            }
+            return file;
+          });
+          
+          // Update the execution with the modified result_files
+          await taskDb.updateTaskExecution(executionId, {
+            result_files: updatedResultFiles
+          });
+          
+          console.log("✅ publishedToBasehub timestamp added to existing execution record");
+        } else {
+          console.log("⚠️ Execution not found or access denied, cannot update record");
+        }
+      } catch (dbError) {
+        console.error("⚠️ Failed to update execution record with publishedToBasehub timestamp:", dbError);
+        // Don't fail the request if database update fails
+      }
+    }
 
     return res.status(200).json({
       success: true,

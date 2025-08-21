@@ -1,6 +1,10 @@
 import { Router } from "express";
 import { authenticateToken } from "../middleware/auth";
-import { generateBlogPost, generateImage, publishBlogPost } from "../controllers/blog";
+import { 
+  generateBlogPost, 
+  generateImage, 
+  publishBlogPost
+} from "../controllers/blog";
 
 const router = Router();
 

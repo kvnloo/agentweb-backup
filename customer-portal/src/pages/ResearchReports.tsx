@@ -76,6 +76,7 @@ interface ResultFile {
   approval_status?: "pending" | "approved" | "needs_changes" | null;
   slack_message_ts?: string | null;
   approval_channel?: string | null;
+  publishedToBasehub?: string;
 }
 
 interface TaskExecution {
@@ -206,6 +207,7 @@ const ResearchReportsPage: React.FC = () => {
     reportUrl: string;
     filename: string;
     reportContent?: string;
+    taskId?: string;
   } | null>(null);
   const [blogOptions, setBlogOptions] = useState({
     tone: "professional",
@@ -1003,9 +1005,57 @@ const ResearchReportsPage: React.FC = () => {
 
   // Blog generation functions
   const handleGenerateBlog = async (reportUrl: string, filename: string) => {
-    setPendingBlogReport({ reportUrl, filename });
+    // Find the task ID for this research report
+    let currentTaskId: string | null = null;
+    
+    for (const task of Object.values(tasksWithExecutions)) {
+      if (task.executions) {
+        for (const execution of task.executions) {
+          if (execution.result_files) {
+            const htmlFile = execution.result_files.find(file => file.url === reportUrl);
+            if (htmlFile) {
+              currentTaskId = task.taskId;
+              break;
+            }
+          }
+        }
+      }
+      if (currentTaskId) break;
+    }
+
+    setPendingBlogReport({ reportUrl, filename, taskId: currentTaskId });
     setBlogStep("options");
     setBlogDialogOpen(true);
+  };
+
+  // Get blog history from existing result_files data for the same task
+  const getBlogHistory = (currentTaskId?: string) => {
+    if (!currentTaskId) return [];
+    
+    const blogPosts: any[] = [];
+    
+    // Only look at the current task
+    const currentTask = tasksWithExecutions[currentTaskId];
+    if (!currentTask || !currentTask.executions) return [];
+    
+    currentTask.executions.forEach((execution) => {
+      if (execution.result_files) {
+        execution.result_files.forEach((file) => {
+          if (file.publishedToBasehub) {
+            blogPosts.push({
+              executionId: execution.executionId,
+              taskId: currentTask.taskId,
+              taskName: currentTask.taskName,
+              filename: file.filename,
+              publishedAt: file.publishedToBasehub
+            });
+          }
+        });
+      }
+    });
+    
+    // Sort by publish date (most recent first)
+    return blogPosts.sort((a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime());
   };
 
   const handleGenerateBlogContent = async () => {
@@ -1340,12 +1390,35 @@ const ResearchReportsPage: React.FC = () => {
   };
 
   const handlePublishBlog = async () => {
-    if (!generatedBlogContent || !token) return;
+    if (!generatedBlogContent || !token || !pendingBlogReport) return;
 
     setPublishingBlog(true);
     setBlogStep("publishing");
 
     try {
+      // Find the execution that generated the HTML report
+      let executionId: string | null = null;
+      
+      // Search through all tasks to find the execution with this HTML report
+      for (const task of Object.values(tasksWithExecutions)) {
+        if (task.executions) {
+          for (const execution of task.executions) {
+            if (execution.result_files) {
+              const htmlFile = execution.result_files.find(file => file.url === pendingBlogReport.reportUrl);
+              if (htmlFile) {
+                executionId = execution.executionId;
+                break;
+              }
+            }
+          }
+        }
+        if (executionId) break;
+      }
+
+      if (!executionId) {
+        throw new Error("Could not find the execution that generated this HTML report");
+      }
+
       // Publish the blog post
       const publishResponse = await axios.post(
         buildApiUrl("/api/blog/publish"),
@@ -1355,6 +1428,8 @@ const ResearchReportsPage: React.FC = () => {
           content: generatedBlogContent.content,
           imageUrl: generatedBlogContent.imageUrl,
           imageFilename: generatedBlogContent.imageFilename,
+          executionId: executionId,
+          htmlReportUrl: pendingBlogReport.reportUrl,
         },
         {
           headers: { Authorization: `Bearer ${token}` },
@@ -2918,6 +2993,35 @@ const ResearchReportsPage: React.FC = () => {
                   {showWorkflow ? "Hide" : "Show"} AI Agent Workflow
                 </Button>
               </div>
+
+              {/* Blog History */}
+              {pendingBlogReport?.taskId && getBlogHistory(pendingBlogReport.taskId).length > 0 && (
+                <div className="mt-4 p-4 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg">
+                  <div className="flex items-start gap-3">
+                    <FileText className="h-5 w-5 text-blue-600 dark:text-blue-400 mt-0.5 flex-shrink-0" />
+                    <div className="flex-1">
+                      <h4 className="text-sm font-medium text-blue-800 dark:text-blue-200 mb-2">
+                        You have published Blog Posts before ({getBlogHistory(pendingBlogReport.taskId).length})
+                      </h4>
+                      <p className="text-sm text-blue-700 dark:text-blue-300 mb-3">
+                        Here are your previously published blog posts from this same task to help avoid duplicate content.
+                      </p>
+                      <div className="space-y-2 max-h-32 overflow-y-auto">
+                        {getBlogHistory(pendingBlogReport.taskId).slice(0, 5).map((blog: any, index: number) => (
+                          <div key={index} className="text-xs bg-blue-100 dark:bg-blue-800/30 p-2 rounded">
+                            <div className="font-medium text-blue-800 dark:text-blue-200">
+                              {blog.filename}
+                            </div>
+                            <div className="text-blue-700 dark:text-blue-300">
+                              Published: {new Date(blog.publishedAt).toLocaleDateString()}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
