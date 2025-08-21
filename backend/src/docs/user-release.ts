@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-08-21',
+    changes: [
+      'Added Blog Post Publishing feature',
+      '- Users can now convert research reports into blog posts and publish them directly to BaseHub',
+      '- AI-powered blog content generation with customizable tone, length, and keywords',
+      '- Automatic hero image generation using GPT Image models',
+      '- Blog post history tracking to help avoid duplicate content creation',
+    ],
+  },
+  {
     date: '2025-08-19',
     changes: [
       'Fixed percentage issue with Meta Campaigns',
