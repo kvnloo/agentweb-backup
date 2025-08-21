@@ -695,12 +695,6 @@ export const taskDb = {
         }
       });
 
-      console.log('Updates object:', updates);
-      console.log('Set clauses:', setClauses);
-      console.log('Remove clauses:', removeClauses);
-      console.log('Expression attribute names:', expressionAttributeNames);
-      console.log('Expression attribute values:', expressionAttributeValues);
-
       if (setClauses.length === 0 && removeClauses.length === 0) {
         console.warn(
           `[db.ts] updateTask called for taskId ${taskId} with no effective update operations. Returning current task attributes.`
@@ -1471,19 +1465,36 @@ export const subscriberDb = {
   async addSubscriber(taskId: string, email: string) {
     try {
       const subscribedAt = new Date().toISOString();
+      
+      // Check if subscriber already exists
+      const existingSubscribers = await this.getAllTaskSubscribers(taskId);
+      if (!existingSubscribers) {
+        throw new Error('Failed to fetch existing subscribers');
+      }
+      const existingSubscriber = existingSubscribers.find(s => s.email === email);
+      
+      if (existingSubscriber) {
+        if (existingSubscriber.unsubscribed) {
+          // Resubscribe existing unsubscribed subscriber
+          return await this.resubscribe(taskId, email);
+        } else {
+          throw new Error(`Email ${email} is already subscribed to this task`);
+        }
+      }
+      
+      // Add new subscriber
       const params = {
         TableName: `${TABLE_PREFIX}AW-Subscribers`,
         Item: {
           taskId,
           email,
           subscribedAt,
+          unsubscribed: false,
         },
-        ConditionExpression:
-          "attribute_not_exists(taskId) AND attribute_not_exists(email)",
       };
 
       await dynamodb.put(params).promise();
-      return { taskId, email, subscribedAt };
+      return { taskId, email, subscribedAt, unsubscribed: false };
     } catch (error: any) {
       if (error.code === "ConditionalCheckFailedException") {
         throw new Error(`Email ${email} is already subscribed to this task`);
@@ -1508,7 +1519,72 @@ export const subscriberDb = {
     }
   },
 
+  async softUnsubscribe(taskId: string, email: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
+        Key: {
+          taskId,
+          email,
+        },
+        UpdateExpression: "SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt",
+        ExpressionAttributeValues: {
+          ":unsubscribed": true,
+          ":unsubscribedAt": new Date().toISOString(),
+        },
+        ReturnValues: "ALL_NEW",
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "softUnsubscribe");
+    }
+  },
+
+  async resubscribe(taskId: string, email: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
+        Key: {
+          taskId,
+          email,
+        },
+        UpdateExpression: "SET unsubscribed = :unsubscribed, resubscribedAt = :resubscribedAt",
+        ExpressionAttributeValues: {
+          ":unsubscribed": false,
+          ":resubscribedAt": new Date().toISOString(),
+        },
+        ReturnValues: "ALL_NEW",
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "resubscribe");
+    }
+  },
+
   async getTaskSubscribers(taskId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
+        KeyConditionExpression: "taskId = :taskId",
+        FilterExpression: "attribute_not_exists(unsubscribed) OR unsubscribed = :unsubscribed",
+        ExpressionAttributeValues: {
+          ":taskId": taskId,
+          ":unsubscribed": false,
+        },
+      };
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, "getTaskSubscribers");
+    }
+  },
+
+  async getAllTaskSubscribers(taskId: string) {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Subscribers`,
@@ -1521,7 +1597,7 @@ export const subscriberDb = {
       const result = await dynamodb.query(params).promise();
       return result.Items || [];
     } catch (error) {
-      handleDynamoDbError(error, "getTaskSubscribers");
+      handleDynamoDbError(error, "getAllTaskSubscribers");
     }
   },
 };

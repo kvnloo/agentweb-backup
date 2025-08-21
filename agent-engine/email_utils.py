@@ -28,13 +28,15 @@ executions_table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskExecutions')
 
 def get_task_subscribers(task_id):
     """
-    Get all subscribers for a given task.
+    Get all active subscribers for a given task.
     """
     try:
         response = subscribers_table.query(
             KeyConditionExpression='taskId = :taskId',
+            FilterExpression='attribute_not_exists(unsubscribed) OR unsubscribed = :unsubscribed',
             ExpressionAttributeValues={
-                ':taskId': task_id
+                ':taskId': task_id,
+                ':unsubscribed': False
             }
         )
         return [item['email'] for item in response.get('Items', [])]
@@ -219,6 +221,7 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
       <p>Manage task and history at: <a href="{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/tasks/{task_id}">{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/tasks/{task_id}</a></p>
       <hr>
       <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>
+      <p><small><a href="{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/unsubscribe?taskId={task_id}&email={to_email}" style="color: #e74c3c;">Unsubscribe from this task</a></small></p>
     </div>
   </div>
 </body></html>"""
@@ -293,6 +296,7 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
       <p>Manage task and history at: <a href="{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/tasks/{task_id}">{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/tasks/{task_id}</a></p>
       <hr>
       <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>
+      <p><small><a href="{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/unsubscribe?taskId={task_id}&email={to_email}" style="color: #e74c3c;">Unsubscribe from this task</a></small></p>
     </div>
   </div>
 </body></html>
@@ -331,8 +335,10 @@ def notify_task_subscribers(task_id, task_name, execution_status, execution_id=N
         
         response = subscribers_table.query(
             KeyConditionExpression='taskId = :taskId',
+            FilterExpression='attribute_not_exists(unsubscribed) OR unsubscribed = :unsubscribed',
             ExpressionAttributeValues={
-                ':taskId': task_id
+                ':taskId': task_id,
+                ':unsubscribed': False
             }
         )
         subscribers = response.get('Items', [])

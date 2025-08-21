@@ -93,6 +93,9 @@ interface TaskAttachment {
 interface Subscriber {
   email: string;
   subscribedAt: string;
+  unsubscribed?: boolean;
+  unsubscribedAt?: string;
+  resubscribedAt?: string;
 }
 
 // Update TaskDetail interface
@@ -262,8 +265,6 @@ const TaskDetailsPage: React.FC = () => {
         }
       );
       const taskData = taskResponse.data as TaskDetail;
-      console.log('Fetched task data:', taskData);
-      console.log('Task sendHtmlReportOnly:', taskData.sendHtmlReportOnly);
       setTask(taskData);
 
       const executionsResponse = await axios.get(
@@ -650,21 +651,21 @@ const TaskDetailsPage: React.FC = () => {
 
   // Subscriber management functions
   const fetchSubscribers = async () => {
-    if (!taskId || !token) return;
+    if (!token || !taskId) return;
+    
     setLoadingSubscribers(true);
     try {
       const response = await axios.get(
-        buildApiUrl(`/api/tasks/${taskId}/subscribers`),
+        buildApiUrl(`/api/tasks/${taskId}/subscribers/all`),
         {
           headers: { Authorization: `Bearer ${token}` },
         }
       );
       setSubscribers(response.data);
-      setSubscriberError("");
-    } catch (error: any) {
-      console.error("Error fetching subscribers:", error);
+    } catch (err: any) {
+      console.error("Failed to fetch subscribers:", err);
       setSubscriberError(
-        error.response?.data?.message || "Failed to fetch subscribers"
+        err.response?.data?.message || "Failed to load subscribers"
       );
     } finally {
       setLoadingSubscribers(false);
@@ -706,47 +707,95 @@ const TaskDetailsPage: React.FC = () => {
   };
 
   const handleRemoveSubscriber = async (email: string) => {
-    if (!taskId || !token) return;
+    if (!token || !taskId) return;
     
+    setLoadingSubscribers(true);
     try {
       await axios.delete(
-        buildApiUrl(
-          `/api/tasks/${taskId}/subscribers/${encodeURIComponent(email)}`
-        ),
-        { headers: { Authorization: `Bearer ${token}` } }
+        buildApiUrl(`/api/tasks/${taskId}/subscribers/${encodeURIComponent(email)}`),
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
       );
-      setSubscribers(subscribers.filter((s) => s.email !== email));
-      setSubscriberError("");
-      toast({
-        title: "Success",
-        description: "Subscriber removed successfully.",
-      });
-    } catch (error: any) {
-      console.error("Error removing subscriber:", error);
+      
+      setSubscribers(subscribers.filter(s => s.email !== email));
+      toast({ title: "Success", description: "Subscriber removed successfully." });
+    } catch (err: any) {
       setSubscriberError(
-        error.response?.data?.message || "Failed to remove subscriber"
+        err.response?.data?.message || "Failed to remove subscriber"
       );
+    } finally {
+      setLoadingSubscribers(false);
+    }
+  };
+
+  const checkSubscriberStatus = async (email: string) => {
+    if (!taskId) return;
+    
+    try {
+      const response = await axios.get(
+        buildApiUrl(`/api/tasks/${taskId}/subscribers/${encodeURIComponent(email)}/status`)
+      );
+      console.log('Subscriber status:', response.data);
+      return response.data;
+    } catch (err: any) {
+      console.error('Failed to check subscriber status:', err);
+      return null;
+    }
+  };
+
+  const handleResubscribe = async (email: string) => {
+    if (!token || !taskId) return;
+    
+    setLoadingSubscribers(true);
+    try {
+      console.log('Resubscribing subscriber:', email);
+      
+      // Check status before resubscribing
+      const beforeStatus = await checkSubscriberStatus(email);
+      console.log('Status before resubscribe:', beforeStatus);
+      
+      await axios.post(
+        buildApiUrl(`/api/tasks/${taskId}/subscribers/${encodeURIComponent(email)}/resubscribe`),
+        {},
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      
+      console.log('Resubscribe API call successful');
+      
+      // Check status after resubscribing
+      const afterStatus = await checkSubscriberStatus(email);
+      console.log('Status after resubscribe:', afterStatus);
+      
+      // Refresh the subscriber list to get updated data
+      await fetchSubscribers();
+      
+      toast({ title: "Success", description: "Subscriber resubscribed successfully." });
+    } catch (err: any) {
+      console.error('Resubscribe error:', err);
+      setSubscriberError(
+        err.response?.data?.message || "Failed to resubscribe subscriber"
+      );
+    } finally {
+      setLoadingSubscribers(false);
     }
   };
 
   const handleToggleHtmlReportOnly = async () => {
     if (!task) return;
-    console.log('Current task.sendHtmlReportOnly:', task.sendHtmlReportOnly);
     setIsUpdatingApproval(true);
     try {
       const newValue = !task.sendHtmlReportOnly;
-      console.log('Setting sendHtmlReportOnly to:', newValue);
       await axios.put(
         buildApiUrl(`/api/tasks/${task.taskId}`),
         { sendHtmlReportOnly: newValue },
         { headers: { Authorization: `Bearer ${token}` } }
       );
-      console.log('Successfully updated task in backend');
       setTask({ ...task, sendHtmlReportOnly: newValue });
-      console.log('Updated task in frontend state:', { ...task, sendHtmlReportOnly: newValue });
       toast({ title: "Success", description: "HTML Report Only setting updated." });
     } catch (err) {
-      console.error('Error updating sendHtmlReportOnly:', err);
       toast({
         title: "Error",
         description: "Failed to update HTML Report Only setting.",
@@ -1392,18 +1441,37 @@ const TaskDetailsPage: React.FC = () => {
                   <div>
                     <p className="font-medium">{subscriber.email}</p>
                     <p className="text-sm text-muted-foreground">
-                      Subscribed on {new Date(subscriber.subscribedAt).toLocaleDateString()}
+                      {subscriber.unsubscribed ? (
+                        <span className="text-red-600">
+                          Email owner unsubscribed on {new Date(subscriber.unsubscribedAt!).toLocaleDateString()}
+                        </span>
+                      ) : (
+                        `Subscribed on ${new Date(subscriber.subscribedAt).toLocaleDateString()}`
+                      )}
                     </p>
                   </div>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => handleRemoveSubscriber(subscriber.email)}
-                    disabled={loadingSubscribers}
-                    className="text-destructive hover:text-destructive hover:bg-destructive/10"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </Button>
+                  <div className="flex items-center gap-2">
+                    {subscriber.unsubscribed ? (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => handleResubscribe(subscriber.email)}
+                        disabled={loadingSubscribers}
+                      >
+                        Resubscribe
+                      </Button>
+                    ) : (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleRemoveSubscriber(subscriber.email)}
+                        disabled={loadingSubscribers}
+                        className="text-destructive hover:text-destructive hover:bg-destructive/10"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    )}
+                  </div>
                 </div>
               ))}
               

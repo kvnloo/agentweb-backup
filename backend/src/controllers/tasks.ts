@@ -222,11 +222,8 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
     }
 
     const taskId = req.params.id;
-    console.log('Updating task:', taskId);
-    console.log('Request body:', req.body);
 
     const task = await taskDb.getTaskById(taskId);
-    console.log('Current task:', task);
 
     if (!task) {
       return res.status(404).json({ message: 'Task not found' });
@@ -308,7 +305,6 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
 
     if (req.body.imageModel !== undefined) {
       updates.imageModel = req.body.imageModel;
-      console.log('Adding imageModel to updates:', req.body.imageModel);
     }
 
     if (req.body.leadListIdentifier !== undefined) {
@@ -358,14 +354,11 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
     
     if (req.body.sendHtmlReportOnly !== undefined) {
       updates.sendHtmlReportOnly = Boolean(req.body.sendHtmlReportOnly);
-      console.log('Setting sendHtmlReportOnly to:', updates.sendHtmlReportOnly);
     }
     
     // Check if we're unarchiving a task (changing status from 'archived' to 'active')
     const isUnarchiving = task.status === 'archived' && updates.status === 'active';
 
-    console.log('Final updates object:', updates);
-    console.log('sendHtmlReportOnly in updates:', updates.sendHtmlReportOnly);
     await taskDb.updateTask(taskId, updates);
     
     // If unarchiving, reactivate schedules that were disabled when the task was archived
