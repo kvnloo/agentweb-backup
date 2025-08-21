@@ -18,6 +18,8 @@ import {
   TaskExecution,
 } from "@/components/tasks/ExecutionHistory";
 import { TaskActions } from "@/components/tasks/TaskActions";
+import { Switch } from "@/components/ui/switch";
+import { Label } from "@/components/ui/label";
 
 // Re-export types properly for isolatedModules mode
 export type { TaskSubscriber };
@@ -42,6 +44,33 @@ export interface TaskUpdates {
   };
   subscribers?: TaskSubscriber[];
   preferred_llm?: string;
+  sendHtmlReportOnly?: boolean; // Whether to send only HTML reports to all subscribers
+}
+
+export interface Task {
+  id: string;
+  title: string;
+  description: string;
+  status: string;
+  created: string;
+  completed?: string;
+  options?: {
+    emailMe?: boolean;
+    interactiveMode?: boolean;
+    performDeepResearch?: boolean;
+    complexTask?: boolean;
+    extractPageContent?: boolean;
+    validateOutput?: boolean;
+    outputAsJSON?: boolean;
+  };
+  schedule?: {
+    frequency: string;
+    enabled: boolean;
+  };
+  subscribers?: TaskSubscriber[];
+  executions?: TaskExecution[];
+  preferred_llm?: string;
+  sendHtmlReportOnly?: boolean; // Whether to send only HTML reports to all subscribers
 }
 
 export interface TaskDetailProps {
@@ -68,6 +97,7 @@ export interface TaskDetailProps {
       validateOutput: boolean;
       outputAsJSON: boolean;
     };
+    sendHtmlReportOnly?: boolean; // Whether to send only HTML reports to all subscribers
   };
   isOpen: boolean;
   onClose: () => void;
@@ -143,6 +173,7 @@ const TaskDetailModal: React.FC<TaskDetailProps> = ({
       schedule,
       subscribers,
       preferred_llm: preferredLLM,
+      sendHtmlReportOnly: task.sendHtmlReportOnly,
     });
     setIsEditing(false);
     toast.success("Task updated successfully");
@@ -188,6 +219,35 @@ const TaskDetailModal: React.FC<TaskDetailProps> = ({
 
               {/* Schedule Task */}
               <TaskScheduler taskId={task.id} />
+
+              {/* HTML Report Only Toggle */}
+              <div className="space-y-3">
+                <h4 className="text-md font-medium">Email Settings</h4>
+                <div className="flex items-center space-x-2">
+                  <Switch
+                    id="html-report-only-modal"
+                    checked={!!task.sendHtmlReportOnly}
+                    onCheckedChange={(checked) => {
+                      const updatedTask = { ...task, sendHtmlReportOnly: checked };
+                      onUpdateTask(task.id, {
+                        title: updatedTask.title,
+                        description: updatedTask.description,
+                        options: updatedTask.options,
+                        schedule: updatedTask.schedule,
+                        subscribers: updatedTask.subscribers,
+                        preferred_llm: updatedTask.preferred_llm,
+                        sendHtmlReportOnly: updatedTask.sendHtmlReportOnly,
+                      });
+                    }}
+                  />
+                  <Label htmlFor="html-report-only-modal" className="text-sm">
+                    Send HTML Report Only
+                  </Label>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  When enabled, emails to subscribers will only contain the HTML report without task execution context. It is suited for tasks such as news letters, blog posts, and other content-based tasks.
+                </p>
+              </div>
 
               {/* Subscribers */}
               <SubscriberManager

@@ -356,10 +356,16 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
       updates.slackChannel = req.body.slackChannel || null;
     }
     
+    if (req.body.sendHtmlReportOnly !== undefined) {
+      updates.sendHtmlReportOnly = Boolean(req.body.sendHtmlReportOnly);
+      console.log('Setting sendHtmlReportOnly to:', updates.sendHtmlReportOnly);
+    }
+    
     // Check if we're unarchiving a task (changing status from 'archived' to 'active')
     const isUnarchiving = task.status === 'archived' && updates.status === 'active';
 
     console.log('Final updates object:', updates);
+    console.log('sendHtmlReportOnly in updates:', updates.sendHtmlReportOnly);
     await taskDb.updateTask(taskId, updates);
     
     // If unarchiving, reactivate schedules that were disabled when the task was archived

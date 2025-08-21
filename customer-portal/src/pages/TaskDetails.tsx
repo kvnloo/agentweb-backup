@@ -104,6 +104,7 @@ interface TaskDetail extends Task {
   isInteractive?: boolean;
   isDeepResearch?: boolean;
   attachments?: TaskAttachment[];
+  sendHtmlReportOnly?: boolean; // Added for HTML report only toggle
 }
 
 // Base Task interface
@@ -261,6 +262,8 @@ const TaskDetailsPage: React.FC = () => {
         }
       );
       const taskData = taskResponse.data as TaskDetail;
+      console.log('Fetched task data:', taskData);
+      console.log('Task sendHtmlReportOnly:', taskData.sendHtmlReportOnly);
       setTask(taskData);
 
       const executionsResponse = await axios.get(
@@ -723,6 +726,34 @@ const TaskDetailsPage: React.FC = () => {
       setSubscriberError(
         error.response?.data?.message || "Failed to remove subscriber"
       );
+    }
+  };
+
+  const handleToggleHtmlReportOnly = async () => {
+    if (!task) return;
+    console.log('Current task.sendHtmlReportOnly:', task.sendHtmlReportOnly);
+    setIsUpdatingApproval(true);
+    try {
+      const newValue = !task.sendHtmlReportOnly;
+      console.log('Setting sendHtmlReportOnly to:', newValue);
+      await axios.put(
+        buildApiUrl(`/api/tasks/${task.taskId}`),
+        { sendHtmlReportOnly: newValue },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      console.log('Successfully updated task in backend');
+      setTask({ ...task, sendHtmlReportOnly: newValue });
+      console.log('Updated task in frontend state:', { ...task, sendHtmlReportOnly: newValue });
+      toast({ title: "Success", description: "HTML Report Only setting updated." });
+    } catch (err) {
+      console.error('Error updating sendHtmlReportOnly:', err);
+      toast({
+        title: "Error",
+        description: "Failed to update HTML Report Only setting.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsUpdatingApproval(false);
     }
   };
 
@@ -1302,6 +1333,23 @@ const TaskDetailsPage: React.FC = () => {
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
+            {/* HTML Report Only Toggle */}
+            <div className="flex items-center space-x-2">
+              <Switch
+                id="html-report-only"
+                checked={!!task?.sendHtmlReportOnly}
+                onCheckedChange={handleToggleHtmlReportOnly}
+                disabled={loadingSubscribers}
+              />
+              <Label htmlFor="html-report-only" className="text-sm font-medium">
+                Send HTML Report Only
+              </Label>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              When enabled, emails to subscribers will only contain the HTML report if available, 
+              making them focused on well-formatted content instead of task execution context.
+            </p>
+
             {/* Add Subscriber Form */}
             <form onSubmit={handleAddSubscriber} className="flex gap-2">
               <input

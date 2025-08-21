@@ -557,7 +557,7 @@ export const taskDb = {
           ":userId": userId,
         },
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, knowledgeBaseSize, createVideo, videoModel, imageModel, requireApproval, slackChannel",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, knowledgeBaseSize, createVideo, videoModel, imageModel, requireApproval, slackChannel, sendHtmlReportOnly",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -612,7 +612,7 @@ export const taskDb = {
           taskId,
         },
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, updateLeadList, createVideo, videoModel, imageModel, leadListIdentifier, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt, requireApproval, slackChannel",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, updateLeadList, createVideo, videoModel, imageModel, leadListIdentifier, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt, requireApproval, slackChannel, sendHtmlReportOnly",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -673,6 +673,7 @@ export const taskDb = {
       knowledgeBaseUpdatedAt?: string;
       requireApproval?: boolean;
       slackChannel?: string;
+      sendHtmlReportOnly?: boolean;
     }>
   ) {
     try {
@@ -693,6 +694,12 @@ export const taskDb = {
           expressionAttributeValues[`:${key}`] = value;
         }
       });
+
+      console.log('Updates object:', updates);
+      console.log('Set clauses:', setClauses);
+      console.log('Remove clauses:', removeClauses);
+      console.log('Expression attribute names:', expressionAttributeNames);
+      console.log('Expression attribute values:', expressionAttributeValues);
 
       if (setClauses.length === 0 && removeClauses.length === 0) {
         console.warn(

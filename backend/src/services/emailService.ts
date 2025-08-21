@@ -158,6 +158,85 @@ export const emailService = {
       if (!task) {
         throw new Error(`Task not found: ${execution.taskId}`);
       }
+
+      // If sendHtmlReportOnly is enabled, try to find HTML content and send only that
+      if (task.sendHtmlReportOnly && execution.result_files && execution.result_files.length > 0) {
+        let htmlContentFromFile = '';
+        
+        // Look for HTML files in result_files
+        for (const file of execution.result_files) {
+          if ((file.is_html || file.view_type === 'html') && file.url) {
+            try {
+              // Import fetch
+              const fetch = require('node-fetch');
+              const response = await fetch(file.url);
+              
+              if (response.ok) {
+                const fetchedHtmlContent = await response.text();
+                htmlContentFromFile = `
+                  <div class="html-result">
+                    ${fetchedHtmlContent}
+                  </div>
+                `;
+                console.log(`Successfully fetched HTML content from ${file.url}`);
+                break; // Use the first HTML file found
+              } else {
+                console.error(`Failed to fetch HTML content from ${file.url}: ${response.statusText}`);
+                htmlContentFromFile = `
+                  <div class="html-result">
+                    <h3>HTML Result File:</h3>
+                    <p><i>Error fetching HTML content: ${response.statusText}</i></p>
+                  </div>
+                `;
+              }
+            } catch (error) {
+              console.error(`Error fetching HTML content from ${file.url}:`, error);
+              htmlContentFromFile = `
+                <div class="html-result">
+                  <h3>HTML Result File:</h3>
+                  <p><i>Error fetching HTML content</i></p>
+                </div>
+              `;
+            }
+            break; // Process only the first HTML file found, even if error
+          }
+        }
+
+        // If we have HTML content, send a simplified email with just the HTML report
+        if (htmlContentFromFile) {
+          const simplifiedHtml = `
+            <html>
+            <head>
+              <style>
+                body { font-family: sans-serif; margin: 0; padding: 0; color: #333; background-color: #fff; }
+                .container { padding: 20px; background-color: #fdfdfd; }
+                .header { font-size: 1.5em; font-weight: bold; margin-bottom: 15px; color: #2c3e50; }
+                .html-result { border: 1px solid #ddd; padding: 10px; margin-top: 15px; border-radius: 5px; }
+                .html-result h3 { margin-top:0; }
+                .footer { margin-top: 25px; font-size: 0.9em; color: #7f8c8d; }
+                a { color: #3498db; text-decoration: none; }
+                a:hover { text-decoration: underline; }
+              </style>
+            </head>
+            <body>
+              <div class="container">
+                ${htmlContentFromFile}
+                <div class="footer">
+                  <p>Manage task and history at: <a href="${customerFrontendUrl}/tasks/${task.taskId}">${customerFrontendUrl}/tasks/${task.taskId}</a></p>
+                  <hr>
+                  <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>
+                </div>
+              </div>
+            </body></html>
+          `;
+
+          const subject = task.name;
+          const text = `Task Report: ${task.name}\n\nView the HTML report in the email body.\n\nManage task and history at: ${customerFrontendUrl}/tasks/${task.taskId}`;
+          
+          await this.sendEmail(toEmail, subject, text, simplifiedHtml);
+          return;
+        }
+      }
       
       // Create execution start/end time strings
       const startTime = execution.startTime ? new Date(execution.startTime).toLocaleString() : 'Not available';

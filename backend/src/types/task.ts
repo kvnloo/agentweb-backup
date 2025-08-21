@@ -33,6 +33,7 @@ export interface Task {
   category?: string; // Category of the task
   requireApproval?: boolean; // Whether the task requires approval before sending results
   slackChannel?: string; // The Slack channel ID for approval requests
+  sendHtmlReportOnly?: boolean; // Whether to send only HTML reports to all subscribers
 }
 
 export interface TaskUpdate {
@@ -66,4 +67,5 @@ export interface TaskUpdate {
   imageModel?: string; // The image model to use for image generation
   requireApproval?: boolean; // Whether the task requires approval before sending results
   slackChannel?: string; // The Slack channel ID for approval requests
+  sendHtmlReportOnly?: boolean; // Whether to send only HTML reports to all subscribers
 } 
