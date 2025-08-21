@@ -20,14 +20,27 @@ const openai = new OpenAI({
 // Initialize OpenAI client for DALL-E fallback
 let dalleClient: OpenAI | null = null;
 
-if (process.env.OPENAI_IMAGE_API_KEY) {
-  dalleClient = new OpenAI({
-    apiKey: process.env.OPENAI_IMAGE_API_KEY,
-  });
-} else {
-  console.warn(
-    "⚠️ No image generation client available. Set OPENAI_IMAGE_API_KEY to enable image generation."
-  );
+// Initialize DALL-E client when needed using Secrets Manager
+async function initializeDalleClient(): Promise<OpenAI | null> {
+  if (!dalleClient) {
+    try {
+      const secretName = process.env.NODE_ENV === "development" 
+        ? "dev/AgentWeb/OpenAI/Image" 
+        : "prod/AgentWeb/OpenAI/Image";
+      
+      const { getSecret } = await import("../utils/secretsManager");
+      const apiKey = await getSecret(secretName);
+      
+      dalleClient = new OpenAI({
+        apiKey: apiKey,
+      });
+      console.log("✅ DALL-E client initialized successfully");
+    } catch (error) {
+      console.warn("⚠️ Failed to initialize DALL-E client:", error);
+      dalleClient = null;
+    }
+  }
+  return dalleClient;
 }
 
 // Initialize AWS S3
@@ -377,62 +390,69 @@ export const generateImage = async (req: AuthRequest, res: Response) => {
     }
 
     // Fallback to direct DALL-E if OpenAI API fails or isn't available
-    if (!dalleClient) {
-      console.warn("🚫 No image generation methods available");
-      return res.status(503).json({
-        success: false,
-        message:
-          "Image generation service not available. Please configure OPENAI_IMAGE_API_KEY.",
-        error: "No image generation client configured",
-      });
-    }
-
-    console.log("🔄 Falling back to direct DALL-E image generation...");
-    console.log("🎯 Using DALL-E 3 model for high-quality image creation...");
-
-    // Generate image using DALL-E with the dedicated image client
-    const imageResponse = await dalleClient.images.generate({
-      model: "dall-e-3",
-      prompt: prompt,
-      size: "1792x1024",
-      quality: "standard",
-      n: 1,
-    });
-
-    const imageUrl = imageResponse.data?.[0]?.url;
-
-    if (!imageUrl) {
-      throw new Error("No image URL returned from DALL-E");
-    }
-
-    console.log("✅ Image generated successfully via DALL-E");
-    console.log("📤 Initiating S3 upload process...");
-
-    // Upload to S3 and return S3 URL
     try {
-      const s3Url = await uploadImageToS3(
-        imageUrl,
-        filename || "generated-image.jpg"
-      );
-      console.log("✅ S3 upload completed successfully!");
-      console.log("🔗 Final image URL:", s3Url);
-      console.log("---");
-      return res.status(200).json({
-        success: true,
-        data: {
-          imageUrl: s3Url,
-          filename: filename || "generated-image.jpg",
-        },
+      dalleClient = await initializeDalleClient();
+      
+      if (!dalleClient) {
+        console.warn("🚫 No image generation methods available");
+        return res.status(503).json({
+          success: false,
+          message:
+            "Image generation service not available. Please configure image key in secrets manager.",
+          error: "No image generation client configured",
+        });
+      }
+
+      console.log("🔄 Falling back to direct DALL-E image generation...");
+      console.log("🎯 Using DALL-E 3 model for high-quality image creation...");
+
+      // Generate image using DALL-E with the dedicated image client
+      const imageResponse = await dalleClient.images.generate({
+        model: "dall-e-3",
+        prompt: prompt,
+        size: "1792x1024",
+        quality: "standard",
+        n: 1,
       });
-    } catch (uploadError) {
-      console.error("S3 upload failed, returning original URL:", uploadError);
-      return res.status(200).json({
-        success: true,
-        data: {
+
+      const imageUrl = imageResponse.data?.[0]?.url;
+
+      if (!imageUrl) {
+        throw new Error("No image URL returned from DALL-E");
+      }
+
+      console.log("✅ Image generated successfully via DALL-E");
+      console.log("📤 Initiating S3 upload process...");
+
+      // Upload to S3 and return S3 URL
+      try {
+        const s3Url = await uploadImageToS3(
           imageUrl,
-          filename: filename || "generated-image.jpg",
-        },
-      });
+          filename || "generated-image.jpg"
+        );
+        console.log("✅ S3 upload completed successfully!");
+        console.log("🔗 Final image URL:", s3Url);
+        console.log("---");
+        return res.status(200).json({
+          success: true,
+          data: {
+            imageUrl: s3Url,
+            filename: filename || "generated-image.jpg",
+          },
+        });
+      } catch (uploadError) {
+        console.error("S3 upload failed, returning original URL:", uploadError);
+        return res.status(200).json({
+          success: true,
+          data: {
+            imageUrl,
+            filename: filename || "generated-image.jpg",
+          },
+        });
+      }
+    } catch (dalleError) {
+      console.error("❌ DALL-E fallback failed:", dalleError);
+      // Continue to final fallback
     }
   } catch (error: any) {
     console.error("❌ All image generation methods failed:", error);

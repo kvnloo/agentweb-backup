@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { getSecret } from "../utils/secretsManager";
 
 interface ImageGenerationResult {
   success: boolean;
@@ -19,16 +20,30 @@ export class OpenAIImageService {
   private client: OpenAI;
 
   constructor() {
-    // Get API key from environment
-    const apiKey = process.env.OPENAI_IMAGE_API_KEY;
-    if (!apiKey) {
-      throw new Error("OPENAI_IMAGE_API_KEY environment variable is not set");
-    }
+    // Initialize without API key - will be fetched when needed
+    this.client = new OpenAI();
+  }
 
-    // Initialize OpenAI client
-    this.client = new OpenAI({
-      apiKey: apiKey,
-    });
+  /**
+   * Get the API key from Secrets Manager
+   */
+  private async getApiKey(): Promise<string> {
+    try {
+      const secretName = process.env.NODE_ENV === "development" 
+        ? "dev/AgentWeb/OpenAI/Image" 
+        : "prod/AgentWeb/OpenAI/Image";
+      
+      const apiKey = await getSecret(secretName);
+      
+      if (!apiKey || apiKey.trim() === "") {
+        throw new Error("OpenAI API key is empty");
+      }
+      
+      return apiKey;
+    } catch (error) {
+      console.error("Error fetching OpenAI API key from Secrets Manager:", error);
+      throw new Error("Failed to fetch OpenAI API key from Secrets Manager");
+    }
   }
 
   /**
@@ -58,6 +73,12 @@ export class OpenAIImageService {
 
       // Generate new image from prompt only
       try {
+        // Get API key from Secrets Manager
+        const apiKey = await this.getApiKey();
+        
+        // Update client with the fetched API key
+        this.client.apiKey = apiKey;
+
         const result = await this.client.images.generate({
           model: "gpt-image-1",
           prompt: params.prompt,
@@ -152,15 +173,11 @@ export class OpenAIImageService {
    */
   async isAvailable(): Promise<boolean> {
     try {
-      // Check if API key is set
-      if (!process.env.OPENAI_IMAGE_API_KEY) {
-        console.warn("OPENAI_IMAGE_API_KEY environment variable is not set");
-        return false;
-      }
-
+      // Try to get API key from Secrets Manager
+      await this.getApiKey();
       return true;
     } catch (error) {
-      console.warn("Error checking OpenAI image service availability:", error);
+      console.warn("OpenAI image service not available - cannot fetch API key from Secrets Manager:", error);
       return false;
     }
   }
