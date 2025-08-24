@@ -162,8 +162,14 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
                     break # Process only the first HTML file found, even if error
 
         # If send_html_report_only is enabled, try to find HTML content and send only that
-        if send_html_report_only and result_files:
+        if send_html_report_only:
+            if not result_files:
+                # No result files available, don't send email
+                logger.info(f"send_html_report_only enabled but no result files available for task {task_id}, skipping email to {to_email}")
+                return False
+            
             html_content_from_file_section = ""
+            
             for file_info in result_files:
                 if file_info.get('view_type') == 'html' and file_info.get('url'):
                     try:
@@ -177,19 +183,12 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
                         break
                     except requests.RequestException as e:
                         logger.error(f"Failed to fetch HTML content from {file_info['url']}: {e}")
-                        html_content_from_file_section = f"""<div class="html-result">
-    <h3>HTML Result File:</h3>
-    <p><i>Error fetching HTML content from {file_info['url']}: {e}</i></p>
-</div>"""
+                        # Don't set html_content_from_file_section for errors
                     except Exception as e:
                         logger.error(f"Unexpected error fetching HTML content from {file_info['url']}: {e}")
-                        html_content_from_file_section = f"""<div class="html-result">
-    <h3>HTML Result File:</h3>
-    <p><i>Unexpected error fetching HTML content from {file_info['url']}.</i></p>
-</div>"""
-                    break
+                        # Don't set html_content_from_file_section for errors
 
-            # If we have HTML content, send a simplified email with just the HTML report
+            # Only send email if we successfully found and fetched HTML content
             if html_content_from_file_section:
                 from datetime import datetime
                 current_date = datetime.now().strftime("%b %d, %Y")
@@ -240,8 +239,12 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
 
                 logger.info(f"Sent simplified HTML report email to subscriber: {to_email}")
                 return True
+            else:
+                # HTML content not available, don't send email
+                logger.info(f"send_html_report_only enabled but no valid HTML content found for task {task_id}, skipping email to {to_email}")
+                return False
 
-        # If send_html_report_only is disabled or no HTML content found, send the full email
+        # If send_html_report_only is disabled, send the full email
         # --- Construct HTML Body ---
         html_body_content = f"""<html>
 <head>

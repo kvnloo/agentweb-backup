@@ -160,7 +160,13 @@ export const emailService = {
       }
 
       // If sendHtmlReportOnly is enabled, try to find HTML content and send only that
-      if (task.sendHtmlReportOnly && execution.result_files && execution.result_files.length > 0) {
+      if (task.sendHtmlReportOnly) {
+        if (!execution.result_files || execution.result_files.length === 0) {
+          // No result files available, don't send email
+          console.log(`sendHtmlReportOnly enabled but no result files available for task ${task.taskId}, skipping email to ${toEmail}`);
+          return;
+        }
+        
         let htmlContentFromFile = '';
         
         // Look for HTML files in result_files
@@ -182,27 +188,17 @@ export const emailService = {
                 break; // Use the first HTML file found
               } else {
                 console.error(`Failed to fetch HTML content from ${file.url}: ${response.statusText}`);
-                htmlContentFromFile = `
-                  <div class="html-result">
-                    <h3>HTML Result File:</h3>
-                    <p><i>Error fetching HTML content: ${response.statusText}</i></p>
-                  </div>
-                `;
+                // Don't set htmlContentFromFile for errors
               }
             } catch (error) {
               console.error(`Error fetching HTML content from ${file.url}:`, error);
-              htmlContentFromFile = `
-                <div class="html-result">
-                  <h3>HTML Result File:</h3>
-                  <p><i>Error fetching HTML content</i></p>
-                </div>
-              `;
+              // Don't set htmlContentFromFile for errors
             }
-            break; // Process only the first HTML file found, even if error
+            break; // Process only the first HTML file found
           }
         }
 
-        // If we have HTML content, send a simplified email with just the HTML report
+        // Only send email if we successfully found and fetched HTML content
         if (htmlContentFromFile) {
           const currentDate = new Date().toLocaleDateString('en-US', { 
             year: 'numeric', 
@@ -245,6 +241,10 @@ export const emailService = {
           const text = `Task Report: ${task.name}\n\nView the HTML report in the email body.\n\nManage task and history at: ${customerFrontendUrl}/tasks/${task.taskId}`;
           
           await this.sendEmail(toEmail, subject, text, simplifiedHtml);
+          return;
+        } else {
+          // HTML content not available, don't send email
+          console.log(`sendHtmlReportOnly enabled but no valid HTML content found for task ${task.taskId}, skipping email to ${toEmail}`);
           return;
         }
       }
