@@ -15,6 +15,7 @@ const router = express.Router();
 // Define Frontend URLs based on environment or defaults
 const PARTNER_FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 const CUSTOMER_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+const GROWTH_GENIUS_CHAT_URL = process.env.GROWTH_GENIUS_CHAT_URL || 'http://localhost:8080';
 
 // console.log('OAuth Configuration:', {
 //   backendUrl: process.env.BACKEND_URL || 'http://localhost:3001',
@@ -66,7 +67,8 @@ router.post('/login', authController.login);
 
 // Google OAuth routes
 router.get('/google', (req: Request, res: Response, next: NextFunction) => {
-  const portal = req.query.portal === 'customer' ? 'customer' : 'partner';
+  const portal = req.query.portal === 'customer' ? 'customer' : 
+                 req.query.portal === 'genius' ? 'genius' : 'partner';
   passport.authenticate('google', { 
     scope: ['profile', 'email'], 
     state: portal
@@ -75,13 +77,23 @@ router.get('/google', (req: Request, res: Response, next: NextFunction) => {
 
 const googleAuthFinalHandler = (req: Request, res: Response) => {
     if (!req.user) {
-        const failureRedirectPortal = req.query.state === 'customer' ? CUSTOMER_FRONTEND_URL : PARTNER_FRONTEND_URL;
+        let failureRedirectPortal = PARTNER_FRONTEND_URL;
+        if (req.query.state === 'customer') {
+            failureRedirectPortal = CUSTOMER_FRONTEND_URL;
+        } else if (req.query.state === 'genius') {
+            failureRedirectPortal = GROWTH_GENIUS_CHAT_URL;
+        }
         return res.redirect(`${failureRedirectPortal}/oauth-callback?error=${encodeURIComponent('Google authentication session error. Please try again.')}&code=session_error`);
     }
 
     const userAuthInfo = req.user as any;
     const portalState = req.query.state as string;
-    const targetFrontendUrl = portalState === 'customer' ? CUSTOMER_FRONTEND_URL : PARTNER_FRONTEND_URL;
+    let targetFrontendUrl = PARTNER_FRONTEND_URL;
+    if (portalState === 'customer') {
+        targetFrontendUrl = CUSTOMER_FRONTEND_URL;
+    } else if (portalState === 'genius') {
+        targetFrontendUrl = GROWTH_GENIUS_CHAT_URL;
+    }
 
     if (!userAuthInfo || !userAuthInfo.token) {
         return res.redirect(`${targetFrontendUrl}/oauth-callback?error=${encodeURIComponent('Authentication token is missing after Google auth. Please try again.')}&code=token_missing`);
@@ -95,7 +107,12 @@ router.get('/google/callback',
     const state = req.query.state as string;
     
     const customPassportAuthCallback = (err: any, user: any, info: any, status: any) => {
-      const frontendUrl = state === 'customer' ? CUSTOMER_FRONTEND_URL : PARTNER_FRONTEND_URL;
+      let frontendUrl = PARTNER_FRONTEND_URL;
+      if (state === 'customer') {
+        frontendUrl = CUSTOMER_FRONTEND_URL;
+      } else if (state === 'genius') {
+        frontendUrl = GROWTH_GENIUS_CHAT_URL;
+      }
 
       if (err) {
         const errMsg = err.message || 'Authentication failed due to an error.';

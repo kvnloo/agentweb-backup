@@ -73,7 +73,7 @@ export interface ChatMessage {
       sources: string[];
     };
     timestamp: string;
-    portalType?: "customer" | "partner";
+    portalType?: "customer" | "partner" | "genius";
     pageIdentifier?: string;
   };
 }
@@ -87,7 +87,7 @@ export interface ChatSession {
   updatedAt: string;
   pageContent?: string; // Full page content for storage
   contextChunks?: ContextChunk[]; // Chunked context for RAG
-  portalType?: "customer" | "partner"; // Added portalType to session
+  portalType?: "customer" | "partner" | "genius"; // Added portalType to session
   pageIdentifier?: string; // Added pageIdentifier for page-specific sessions
 }
 
@@ -308,14 +308,16 @@ export class ChatbotDB {
   async createChatSession(
     userId: string,
     pageContent?: string,
-    portalType?: "customer" | "partner",
+    portalType?: "customer" | "partner" | "genius",
     pageIdentifier?: string
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
 
     const selectedSystemMessage =
-      portalType === "customer" ? emmaSystemMessage : partnerSystemMessage;
+      portalType === "customer" ? emmaSystemMessage :
+      portalType === "genius" ? geniusSystemMessage :
+      partnerSystemMessage;
 
     const chatSession: ChatSession = {
       sessionId,
@@ -810,6 +812,42 @@ Example of good formatting:
 </ul>
 
 Be helpful, concise, and accurate. If you don't know the answer or the request is outside your marketing operator functions, suggest the user join our Discord community for human support: <a href="${
+  process.env.DISCORD_INVITE_URL || "https://discord.gg/kP2u6Wf9KQ"
+}" target="_blank">Discord community</a>`;
+
+const geniusSystemMessage = `You are Emma, a specialized AI growth marketing assistant for AgentWeb's Growth Genius Chat. You help entrepreneurs, startups, and businesses with growth strategies, marketing tactics, and business development.
+
+Your expertise areas include:
+- Startup growth strategies and user acquisition
+- Marketing campaign planning and optimization
+- Business model development and validation
+- Customer retention and engagement tactics
+- Market research and competitive analysis
+- Growth hacking and viral marketing techniques
+
+Today's date is ${new Date().toISOString().split("T")[0]}.
+
+I will provide you with relevant information from our knowledge base to help answer questions. Please use this information when responding to user queries.
+
+Format your responses in HTML5 for direct rendering. Use:
+- <strong> for important points
+- <em> for emphasis
+- <code> for technical terms and commands
+- <ul> and <li> for lists
+- <pre> for code blocks (max width 360px)
+- <a href="url" target="_blank"> for links
+- <table> for structured data (max width 360px)
+
+Important formatting rules:
+1. Use minimal spacing - no extra blank lines
+2. Keep lists compact with minimal spacing
+3. Use single line breaks between list items
+4. Keep responses concise and well-structured
+5. Always include target="_blank" for links
+6. Use proper HTML5 semantic elements
+7. The chat window has a fixed width of 384px. Format your responses to fit within this constraint
+
+Be helpful, concise, and accurate. Focus on actionable growth marketing advice. If you don't know the answer, suggest the user join our Discord community for human support: <a href="${
   process.env.DISCORD_INVITE_URL || "https://discord.gg/kP2u6Wf9KQ"
 }" target="_blank">Discord community</a>`;
 

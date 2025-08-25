@@ -328,6 +328,8 @@ AWS_REGION=your_aws_region
 FRONTEND_URL=https://agentweb.pro
 BACKEND_URL=https://api.agentweb.pro
 SITE_DOMAIN=https://agentweb.pro
+CUSTOMER_FRONTEND_URL=https://customer.agentweb.pro
+GROWTH_GENIUS_CHAT_URL=https://genius.agentweb.pro
 SMTP_HOST=your_smtp_host
 SMTP_PORT=your_smtp_port
 SMTP_USER=your_smtp_user
@@ -411,6 +413,37 @@ zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json serve
 
 Note: Environment variables must be set during build time for the frontend, as Vite replaces them at build time. Runtime environment variables in Elastic Beanstalk are not used by the frontend application.
 
+### Growth Genius Chat Deployment
+
+1. Build the production version and create deployment package:
+
+```bash
+cd growth-chat && \
+VITE_API_URL=https://api.agentweb.pro \
+npm run build && \
+VERSION="0.21" && \
+mkdir -p builds && \
+zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json server.js
+```
+
+2. Create a new application in Elastic Beanstalk:
+   - Go to AWS Management Console > Elastic Beanstalk
+   - Click "Create application"
+   - Enter application name (e.g., "agentweb-growth-genius-chat")
+   - Choose "Node.js" as platform
+   - Upload the versioned zip file from `builds/deploy_v${VERSION}.zip`
+   - Click "Create application"
+
+3. Configure environment variables:
+   - In your environment, go to Configuration > Software
+   - Click "Edit"
+   - Add environment variables:
+     - PORT = 3000
+   - Click "Apply"
+   - Wait for the environment update to complete
+
+Note: Environment variables must be set during build time for the frontend, as Vite replaces them at build time. Runtime environment variables in Elastic Beanstalk are not used by the frontend application.
+
 ### Backend Deployment
 
 1. Build the backend and create deployment package:
@@ -474,6 +507,8 @@ Note: The managed policy grants broad permissions for development purposes. Cons
      - JWT_SECRET = <your-jwt-secret>
      - FRONTEND_URL = https://agentweb.pro
      - BACKEND_URL = https://api.agentweb.pro
+     - CUSTOMER_FRONTEND_URL = https://customer.agentweb.pro
+     - GROWTH_GENIUS_CHAT_URL = https://genius.agentweb.pro
      - SMTP_HOST = <your-smtp-host>
      - SMTP_PORT = <your-smtp-port>
      - SMTP_USER = <your-smtp-user>
@@ -522,9 +557,11 @@ If you haven't created the production build yet, follow the build instructions i
    - AWS_REGION = us-west-2
    - NODE_ENV = staging
    - JWT_SECRET = <your-staging-jwt-secret>
-   - FRONTEND_URL = https://agentweb-frontend.lovable.app
-   - BACKEND_URL = https://api-stage.agentweb.pro
-   - SMTP_HOST = <your-smtp-host>
+        - FRONTEND_URL = https://agentweb-frontend.lovable.app
+     - BACKEND_URL = https://api-stage.agentweb.pro
+     - CUSTOMER_FRONTEND_URL = https://customer-stage.agentweb.pro
+     - GROWTH_GENIUS_CHAT_URL = https://genius-stage.agentweb.pro
+     - SMTP_HOST = <your-smtp-host>
    - SMTP_PORT = <your-smtp-port>
    - SMTP_USER = <your-smtp-user>
    - SMTP_PASS = <your-smtp-password>
@@ -547,7 +584,11 @@ If you haven't created the production build yet, follow the build instructions i
    - Choose "Alias" option
    - Route traffic to: Alias to Elastic Beanstalk environment
    - Select your region and Elastic Beanstalk environment
-   - Click "Create records"
+        - Click "Create records"
+
+    - Create additional records for staging frontends:
+    - Name: customer-stage (customer-stage.agentweb.pro)
+    - Name: genius-stage (genius-stage.agentweb.pro)
 
 2. Configure HTTPS in Elastic Beanstalk:
    - In your environment, go to Configuration
@@ -558,6 +599,8 @@ If you haven't created the production build yet, follow the build instructions i
    - Wait for the environment update to complete
 
 After the changes propagate, both http://api-stage.agentweb.pro and https://api-stage.agentweb.pro should work properly.
+
+Note: The staging frontends (customer-stage.agentweb.pro and genius-stage.agentweb.pro) will need their own Elastic Beanstalk environments and HTTPS configurations.
 
 #### 5. Updating the staging deployment
 

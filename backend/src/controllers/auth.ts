@@ -267,6 +267,18 @@ export const googleCallback = async (
       return done(errorObj, null);
     }
 
+    // For genius portal, allow both customer and partner roles
+    if (
+      portalOrigin === "genius" &&
+      (!user.roles || (user.roles.length === 0))
+    ) {
+      // If user has no roles, assign customer role by default
+      await userDb.updateUser(user.userId, {
+        roles: ["customer"]
+      });
+      user.roles = ["customer"];
+    }
+
     // Update last login time for OAuth login
     try {
       await userDb.updateUser(user.userId, {
@@ -282,6 +294,8 @@ export const googleCallback = async (
         ? user.roles
         : portalOrigin === "customer"
         ? ["customer"]
+        : portalOrigin === "genius"
+        ? ["customer"] // Default to customer for genius portal
         : ["partner"];
 
     const tokenPayload = {
