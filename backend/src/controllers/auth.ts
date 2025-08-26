@@ -225,7 +225,7 @@ export const googleCallback = async (
       const finalDisplayName =
         profile.displayName || waitlistEntry.fullName || email.split("@")[0];
 
-      const roles: ("partner" | "customer")[] = ["customer"];
+      const roles: ("partner" | "customer" | "free")[] = ["free"];
 
       user = await userDb.createUser(
         email,
@@ -267,16 +267,16 @@ export const googleCallback = async (
       return done(errorObj, null);
     }
 
-    // For genius portal, allow both customer and partner roles
+    // For genius portal, assign free role to prevent access to customer portal
     if (
       portalOrigin === "genius" &&
       (!user.roles || (user.roles.length === 0))
     ) {
-      // If user has no roles, assign customer role by default
+      // If user has no roles, assign free role by default
       await userDb.updateUser(user.userId, {
-        roles: ["customer"]
+        roles: ["free"]
       });
-      user.roles = ["customer"];
+      user.roles = ["free"];
     }
 
     // Update last login time for OAuth login
@@ -295,7 +295,7 @@ export const googleCallback = async (
         : portalOrigin === "customer"
         ? ["customer"]
         : portalOrigin === "genius"
-        ? ["customer"] // Default to customer for genius portal
+        ? ["free"] // Default to free for genius portal
         : ["partner"];
 
     const tokenPayload = {

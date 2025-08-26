@@ -55,7 +55,7 @@ export interface User {
   createdAt: string;
   lastLoginTime?: string;
   supportNote?: string;
-  roles?: ("partner" | "customer")[];
+  roles?: ("partner" | "customer" | "free")[];
   stripe_customer_id?: string;
   adAccount?: string; // Meta ad account ID
   companyName?: string;
@@ -167,7 +167,7 @@ class UserDB {
     password: string,
     isOAuthUser: boolean = false,
     isAdmin: boolean = false,
-    roles: ("partner" | "customer")[] = ["partner"],
+    roles: ("partner" | "customer" | "free")[] = ["partner"],
     displayName?: string,
     googleId?: string,
     stripe_customer_id?: string,
