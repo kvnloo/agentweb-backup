@@ -8,16 +8,16 @@ export const growthGeniusController = {
   async createSession(req: Request, res: Response) {
     try {
       const user = req.user as UserPayload;
-      const { title, pageContext, pageIdentifier } = req.body;
+      const { title } = req.body;
 
       console.log(`GrowthGenius: Creating session for user ${user.userId}`);
 
       // Create session using the database with portalType: 'genius'
       const session = await chatbotDb.createChatSession(
         user.userId,
-        title || pageContext || 'Growth Strategy Session',
+        title || 'Growth Strategy Session',
         'genius', // portalType
-        pageIdentifier || 'growth-genius-chat'
+        'growth-genius-chat'
       );
 
       res.status(201).json(session);
