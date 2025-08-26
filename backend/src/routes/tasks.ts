@@ -22,19 +22,30 @@ const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
 // Initialize GCS with service account credentials
+import { getGCSPPrivateKey } from '../utils/secretsManager';
+
 // For Elastic Beanstalk deployment:
 // 1. Replace all newlines in the private key with [NEWLINE]
 // 2. Example format:
 //    -----BEGIN PRIVATE KEY-----[NEWLINE]MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC9QFi67K6Z...[NEWLINE]...[NEWLINE]-----END PRIVATE KEY-----[NEWLINE]
-const privateKey = process.env.GCS_PRIVATE_KEY?.replace(/\[NEWLINE\]/g, '\n');
 
-const storage = new Storage({
-  projectId: process.env.GCS_PROJECT_ID,
-  credentials: {
-    client_email: process.env.GCS_CLIENT_EMAIL,
-    private_key: privateKey
+// Initialize storage with async function to get private key
+let storage: Storage;
+
+// Initialize storage when needed
+async function initializeStorage() {
+  if (!storage) {
+    const privateKey = await getGCSPPrivateKey();
+    storage = new Storage({
+      projectId: process.env.GCS_PROJECT_ID,
+      credentials: {
+        client_email: process.env.GCS_CLIENT_EMAIL,
+        private_key: privateKey
+      }
+    });
   }
-});
+  return storage;
+}
 
 // Initialize Azure OpenAI client
 const openai = new OpenAI({
@@ -641,8 +652,9 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
 
     // If knowledgeBaseType is not set, determine it based on file content
     if (!task.knowledgeBaseType) {
-      const publicBucket = storage.bucket(BUCKET_NAME);
-      const privateBucket = storage.bucket(PRIVATE_BUCKET_NAME);
+      const storageInstance = await initializeStorage();
+      const publicBucket = storageInstance.bucket(BUCKET_NAME);
+      const privateBucket = storageInstance.bucket(PRIVATE_BUCKET_NAME);
       const filePath = `tasks/${taskId}/knowledge-base.txt`;
 
       const publicSize = await getFileSize(publicBucket, filePath);
@@ -660,7 +672,8 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
     }
 
     // Use the appropriate bucket based on knowledgeBaseType
-    const bucket = storage.bucket(task.knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
+    const storageInstance = await initializeStorage();
+    const bucket = storageInstance.bucket(task.knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
     const filePath = `tasks/${taskId}/knowledge-base.txt`;
     const file = bucket.file(filePath);
 
@@ -727,7 +740,8 @@ router.put('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
     }
 
     // Use the appropriate bucket based on knowledgeBaseType
-    const bucket = storage.bucket(task.knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
+    const storageInstance = await initializeStorage();
+    const bucket = storageInstance.bucket(task.knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
     const filePath = `tasks/${taskId}/knowledge-base.txt`;
     const file = bucket.file(filePath);
 
@@ -795,7 +809,8 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
 
     // Determine which bucket to use based on knowledgeBaseType
     let bucketType = task.knowledgeBaseType;
-    const bucket = storage.bucket(bucketType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
+    const storageInstance = await initializeStorage();
+    const bucket = storageInstance.bucket(bucketType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
     const filePath = `tasks/${taskId}/knowledge-base.txt`;
     const file = bucket.file(filePath);
     const [exists] = await file.exists();
@@ -922,8 +937,9 @@ router.put('/:id/knowledge-base-type', authenticateToken, async (req: Request, r
     // Only move file if type is actually changing
     if (task.knowledgeBaseType !== knowledgeBaseType) {
       const filePath = `tasks/${taskId}/knowledge-base.txt`;
-      const currentBucket = storage.bucket(task.knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
-      const newBucket = storage.bucket(knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
+      const storageInstance = await initializeStorage();
+      const currentBucket = storageInstance.bucket(task.knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
+      const newBucket = storageInstance.bucket(knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
       const currentFile = currentBucket.file(filePath);
       const newFile = newBucket.file(filePath);
       // Check if current file exists

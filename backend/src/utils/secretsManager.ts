@@ -46,3 +46,28 @@ export async function getMetaAccessToken(): Promise<string> {
     throw new Error('Failed to fetch Meta access token from Secrets Manager');
   }
 }
+
+/**
+ * Get GCS private key from Secrets Manager based on environment
+ * @returns The GCS private key as a string with newlines properly formatted
+ */
+export async function getGCSPPrivateKey(): Promise<string> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production' 
+      ? 'prod/AgentWeb/GCS/PK' 
+      : 'dev/AgentWeb/GCS/PK';
+    
+    const privateKey = await getSecret(secretName);
+    
+    if (!privateKey || privateKey.trim() === '') {
+      throw new Error('GCS private key is empty');
+    }
+    
+    // Replace [NEWLINE] with actual newlines as done in the original code
+    return privateKey.replace(/\[NEWLINE\]/g, '\n');
+  } catch (error) {
+    console.error('Error fetching GCS private key from Secrets Manager:', error);
+    throw new Error('Failed to fetch GCS private key from Secrets Manager');
+  }
+}

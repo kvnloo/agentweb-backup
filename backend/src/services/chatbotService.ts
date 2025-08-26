@@ -13,6 +13,7 @@ import { EngineServiceClient } from '@google-cloud/discoveryengine';
 import { Storage } from '@google-cloud/storage';
 import { SearchServiceClient, protos } from '@google-cloud/discoveryengine';
 import { taskDb } from '../services/db';
+import { getGCSPPrivateKey } from '../utils/secretsManager';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -57,6 +58,7 @@ const embeddingsClient = new OpenAI({
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
   content: string;
+  timestamp?: string; // Add direct timestamp field
   usage?: {
     prompt_tokens: number;
     completion_tokens: number;
@@ -73,7 +75,7 @@ export interface ChatMessage {
       sources: string[];
     };
     timestamp: string;
-    portalType?: "customer" | "partner";
+    portalType?: "customer" | "partner" | "genius";
     pageIdentifier?: string;
   };
 }
@@ -82,13 +84,15 @@ export interface ChatMessage {
 export interface ChatSession {
   sessionId: string;
   userId: string;
+  title?: string; // Session title for display
   messages: ChatMessage[];
   createdAt: string;
   updatedAt: string;
   pageContent?: string; // Full page content for storage
   contextChunks?: ContextChunk[]; // Chunked context for RAG
-  portalType?: "customer" | "partner"; // Added portalType to session
+  portalType?: "customer" | "partner" | "genius"; // Added portalType to session
   pageIdentifier?: string; // Added pageIdentifier for page-specific sessions
+  archived?: boolean; // Archive status for soft deletion
 }
 
 // Interface for context chunks
@@ -308,18 +312,21 @@ export class ChatbotDB {
   async createChatSession(
     userId: string,
     pageContent?: string,
-    portalType?: "customer" | "partner",
+    portalType?: "customer" | "partner" | "genius",
     pageIdentifier?: string
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
 
     const selectedSystemMessage =
-      portalType === "customer" ? emmaSystemMessage : partnerSystemMessage;
+      portalType === "customer" ? emmaSystemMessage :
+      portalType === "genius" ? geniusSystemMessage :
+      partnerSystemMessage;
 
     const chatSession: ChatSession = {
       sessionId,
       userId,
+      title: 'New Chat Session', // Default title that will be updated after first message
       messages: [
         {
           role: "system",
@@ -428,12 +435,17 @@ export class ChatbotDB {
     }
   }
 
-  async getUserSessions(userId: string): Promise<ChatSession[]> {
+  async getUserSessions(
+    userId: string,
+    portalType?: "customer" | "partner" | "genius",
+    limit?: number,
+    sortDescending: boolean = true
+  ): Promise<ChatSession[]> {
     console.log(
-      `Getting chat sessions for user: ${userId} from table: ${this.tableName}`
+      `Getting chat sessions for user: ${userId} from table: ${this.tableName}, portalType: ${portalType || 'all'}, limit: ${limit || 'unlimited'}`
     );
 
-    const params = {
+    const params: any = {
       TableName: this.tableName,
       IndexName: "UserIdIndex",
       KeyConditionExpression: "userId = :userId",
@@ -442,14 +454,149 @@ export class ChatbotDB {
       },
     };
 
+    // Add portal type filter if specified
+    if (portalType) {
+      params.FilterExpression = 'portalType = :portalType';
+      params.ExpressionAttributeValues[':portalType'] = portalType;
+    }
+
+    // Add limit if specified
+    if (limit) {
+      params.Limit = limit;
+    }
+
+    // Add scan index forward for sorting (false = descending, true = ascending)
+    // Note: DynamoDB UserIdIndex doesn't support sorting by updatedAt, so we'll sort in memory
+    params.ScanIndexForward = false; // Always get in consistent order
+
     try {
       const result = await dynamodb.query(params).promise();
+      let sessions = (result.Items as ChatSession[]) || [];
+      
       console.log(
-        `Found ${result.Items?.length || 0} chat sessions for user: ${userId}`
+        `Found ${sessions.length} chat sessions for user: ${userId}`
       );
-      return (result.Items as ChatSession[]) || [];
+
+      // Filter out archived sessions
+      sessions = sessions.filter(session => !session.archived);
+      
+      console.log(
+        `Found ${sessions.length} non-archived chat sessions for user: ${userId}`
+      );
+
+      // Sort by updatedAt in memory (DynamoDB UserIdIndex doesn't support updatedAt sorting)
+      if (sortDescending) {
+        sessions = sessions.sort((a, b) => 
+          new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+        );
+      } else {
+        sessions = sessions.sort((a, b) => 
+          new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime()
+        );
+      }
+
+      return sessions;
     } catch (error) {
       console.error("Error getting user chat sessions:", error);
+      throw error;
+    }
+  }
+
+  async getUserSessionCount(userId: string, portalType?: "customer" | "partner" | "genius"): Promise<number> {
+    console.log(
+      `Getting session count for user: ${userId} from table: ${this.tableName}, portalType: ${portalType || 'all'}`
+    );
+
+    const params: any = {
+      TableName: this.tableName,
+      IndexName: "UserIdIndex",
+      KeyConditionExpression: "userId = :userId",
+      Select: "COUNT",
+      ExpressionAttributeValues: {
+        ":userId": userId,
+      },
+    };
+
+    // Add portal type filter if specified
+    if (portalType) {
+      params.FilterExpression = 'portalType = :portalType';
+      params.ExpressionAttributeValues[':portalType'] = portalType;
+    }
+
+    try {
+      const result = await dynamodb.query(params).promise();
+      let sessions = (result.Items as ChatSession[]) || [];
+      
+      // Filter out archived sessions for accurate count
+      sessions = sessions.filter(session => !session.archived);
+      const count = sessions.length;
+      
+      console.log(
+        `Found ${count} non-archived chat sessions for user: ${userId}`
+      );
+      return count;
+    } catch (error) {
+      console.error("Error getting user session count:", error);
+      throw error;
+    }
+  }
+
+  // Get archived sessions for admin management
+  async getArchivedSessions(userId?: string, portalType?: "customer" | "partner" | "genius"): Promise<ChatSession[]> {
+    console.log(
+      `Getting archived sessions from table: ${this.tableName}, userId: ${userId || 'all'}, portalType: ${portalType || 'all'}`
+    );
+
+    const params: any = {
+      TableName: this.tableName,
+      IndexName: "UserIdIndex",
+      KeyConditionExpression: "userId = :userId",
+      FilterExpression: "archived = :archived",
+      ExpressionAttributeValues: {
+        ":userId": userId,
+        ":archived": true,
+      },
+    };
+
+    // Add portal type filter if specified
+    if (portalType) {
+      params.FilterExpression += " AND portalType = :portalType";
+      params.ExpressionAttributeValues[':portalType'] = portalType;
+    }
+
+    try {
+      const result = await dynamodb.query(params).promise();
+      const sessions = (result.Items as ChatSession[]) || [];
+      
+      console.log(
+        `Found ${sessions.length} archived chat sessions`
+      );
+      return sessions;
+    } catch (error) {
+      console.error("Error getting archived chat sessions:", error);
+      throw error;
+    }
+  }
+
+  async archiveSession(sessionId: string): Promise<void> {
+    const timestamp = new Date().toISOString();
+    
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression: "SET archived = :archived, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":archived": true,
+        ":updatedAt": timestamp,
+      },
+    };
+
+    try {
+      await dynamodb.update(params).promise();
+    } catch (error) {
+      console.error("Error archiving chat session:", error);
       throw error;
     }
   }
@@ -510,6 +657,64 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating page content:", error);
+      throw error;
+    }
+  }
+
+  async updateSessionTitle(
+    sessionId: string,
+    title: string
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression:
+        "SET title = :title, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":title": title,
+        ":updatedAt": timestamp,
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating session title:", error);
+      throw error;
+    }
+  }
+
+  async updateSessionPortalType(
+    sessionId: string,
+    portalType: "customer" | "partner" | "genius"
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression:
+        "SET portalType = :portalType, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":portalType": portalType,
+        ":updatedAt": timestamp,
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating session portal type:", error);
       throw error;
     }
   }
@@ -813,6 +1018,42 @@ Be helpful, concise, and accurate. If you don't know the answer or the request i
   process.env.DISCORD_INVITE_URL || "https://discord.gg/kP2u6Wf9KQ"
 }" target="_blank">Discord community</a>`;
 
+const geniusSystemMessage = `You are Growth Genius, a specialized AI growth marketing assistant for AgentWeb's Growth Genius Chat. You help entrepreneurs, startups, and businesses with growth strategies, marketing tactics, and business development.
+
+Your expertise areas include:
+- Startup growth strategies and user acquisition
+- Marketing campaign planning and optimization
+- Business model development and validation
+- Customer retention and engagement tactics
+- Market research and competitive analysis
+- Growth hacking and viral marketing techniques
+
+Today's date is ${new Date().toISOString().split("T")[0]}.
+
+I will provide you with relevant information from our knowledge base to help answer questions. Please use this information when responding to user queries.
+
+Format your responses in HTML5 for direct rendering. Use:
+- <strong> for important points
+- <em> for emphasis
+- <code> for technical terms and commands
+- <ul> and <li> for lists
+- <pre> for code blocks (max width 360px)
+- <a href="url" target="_blank"> for links
+- <table> for structured data (max width 360px)
+
+Important formatting rules:
+1. Use minimal spacing - no extra blank lines
+2. Keep lists compact with minimal spacing
+3. Use single line breaks between list items
+4. Keep responses concise and well-structured
+5. Always include target="_blank" for links
+6. Use proper HTML5 semantic elements
+7. The chat window has a fixed width of 384px. Format your responses to fit within this constraint
+
+Be helpful, concise, and accurate. Focus on actionable growth marketing advice. If you don't know the answer, suggest the user join our Discord community for human support: <a href="${
+  process.env.DISCORD_INVITE_URL || "https://discord.gg/kP2u6Wf9KQ"
+}" target="_blank">Discord community</a>`;
+
 // Helper function to calculate token cost
 function calculateCost(
   promptTokens: number,
@@ -897,7 +1138,7 @@ export async function searchKnowledgeBase(query: string, maxResults: number = 5)
 export async function searchPlatformKnowledgeBase(query: string, maxResults: number = 10, userId?: string): Promise<ContextChunk[]> {
   try {
     // Initialize the Search Service clients
-    const privateKey = process.env.GCS_PRIVATE_KEY?.replace(/\[NEWLINE\]/g, '\n');
+    const privateKey = await getGCSPPrivateKey();
 
     const publicClient = new SearchServiceClient({
       apiEndpoint: process.env.VERTEX_AI_LOCATION === 'global' 

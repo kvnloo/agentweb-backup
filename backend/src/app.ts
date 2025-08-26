@@ -10,6 +10,7 @@ import configRouter from "./routes/config";
 import workflowRoutes from "./routes/workflows";
 import templateRoutes from "./routes/templates";
 import chatbotRoutes from "./routes/chatbot";
+import growthGeniusRoutes from "./routes/growthGenius";
 import docsRoutes from "./routes/docs";
 import stripeRoutes from "./routes/stripe";
 import brandRoutes from "./routes/brand";
@@ -37,6 +38,7 @@ const corsOptions = {
       "https://agentweb.pro", // Main Production Partner URL
       process.env.FRONTEND_URL || "http://localhost:5173", // Partner Portal (Deployed or Local)
       process.env.CUSTOMER_FRONTEND_URL || "http://localhost:5174", // Customer Portal (Deployed or Local)
+      process.env.GROWTH_GENIUS_CHAT_URL || "http://localhost:8080", // Growth Genius Chat (Deployed or Local)
     ];
 
     // Allow requests with no origin (like mobile apps or curl requests)
@@ -82,6 +84,7 @@ app.use("/api/config", configRouter);
 app.use("/api/workflows", workflowRoutes);
 app.use("/api/templates", templateRoutes);
 app.use("/api/chatbot", chatbotRoutes);
+app.use("/api/growth-genius", growthGeniusRoutes);
 app.use("/api/docs", docsRoutes);
 app.use("/api/files", fileRoutes);
 app.use("/api/stripe", stripeRoutes);

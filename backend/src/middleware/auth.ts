@@ -7,7 +7,7 @@ export interface AuthenticatedRequest extends Request {
     userId: string;
     email: string;
     isAdmin: boolean;
-    roles?: ('partner' | 'customer')[];
+    roles?: ('partner' | 'customer' | 'free')[];
   };
   delegateInfo?: {
     adminUserId: string;
@@ -20,7 +20,7 @@ export interface UserPayload {
   userId: string;
   email: string;
   isAdmin: boolean;
-  roles?: ('partner' | 'customer')[];
+  roles?: ('partner' | 'customer' | 'free')[];
   // Delegation fields
   delegateAccess?: {
     adminUserId: string;
@@ -64,7 +64,7 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
         userId: targetUser.userId,
         email: targetUser.email,
         isAdmin: false, // Target user permissions, not admin permissions
-        roles: (targetUser.roles && targetUser.roles.length > 0 ? targetUser.roles : ['customer']) as ('partner' | 'customer')[]
+        roles: (targetUser.roles && targetUser.roles.length > 0 ? targetUser.roles : ['customer']) as ('partner' | 'customer' | 'free')[]
       };
       
       // Add delegation info for logging/audit purposes
@@ -87,7 +87,7 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
         userId: user.userId,
         email: user.email,
         isAdmin: user.isAdmin || false,
-        roles: (user.roles && user.roles.length > 0 ? user.roles : ['partner']) as ('partner' | 'customer')[] // Use roles array, default if empty
+        roles: (user.roles && user.roles.length > 0 ? user.roles : ['partner']) as ('partner' | 'customer' | 'free')[] // Use roles array, default if empty
       };
     }
 

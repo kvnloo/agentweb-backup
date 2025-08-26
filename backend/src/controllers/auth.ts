@@ -28,42 +28,50 @@ export const register = async (req: Request, res: Response) => {
       return res.status(400).json({ message: "User already exists" });
     }
 
-    // Check waitlist status
-    const waitlistEntry = await waitlistDb.getByEmail(email);
+    // Determine roles: use reqRoles if provided, otherwise default to ["customer"]
+    const finalRoles =
+      reqRoles && Array.isArray(reqRoles) && reqRoles.length > 0
+        ? reqRoles
+        : ["customer"];
 
-    if (!waitlistEntry) {
-      const landingSiteUrl =
-        process.env.LANDING_SITE_URL || "https://agentweb.pro";
-      return res.status(403).json({
-        message: `Please join our waitlist first at ${landingSiteUrl}`,
-        code: "not_in_waitlist",
-      });
-    }
+    // Check waitlist status only for non-free users
+    let waitlistEntry = null;
+    let stripe_customer_id = undefined;
+    let companyNameFromWaitlist = undefined;
+    let useCaseCategoriesFromWaitlist = undefined;
+    let displayNameFromWaitlist = undefined;
 
-    if (waitlistEntry.status !== "invited") {
-      return res.status(403).json({
-        message:
-          "Your account is on our waitlist but hasn't been invited yet. Please look out for an invitation email.",
-        code: "not_invited",
-      });
+    if (!finalRoles.includes('free')) {
+      // Only check waitlist for premium users (customer/partner)
+      waitlistEntry = await waitlistDb.getByEmail(email);
+
+      if (!waitlistEntry) {
+        const landingSiteUrl =
+          process.env.LANDING_SITE_URL || "https://agentweb.pro";
+        return res.status(403).json({
+          message: `Please join our waitlist first at ${landingSiteUrl}`,
+          code: "not_in_waitlist",
+        });
+      }
+
+      if (waitlistEntry.status !== "invited") {
+        return res.status(403).json({
+          message:
+            "Your account is on our waitlist but hasn't been invited yet. Please look out for an invitation email.",
+          code: "not_invited",
+        });
+      }
+
+      // Extract additional details from waitlist entry for premium users
+      stripe_customer_id = waitlistEntry.stripe_customer_id;
+      companyNameFromWaitlist = waitlistEntry.companyName;
+      useCaseCategoriesFromWaitlist = waitlistEntry.useCaseCategories;
+      displayNameFromWaitlist = waitlistEntry.fullName;
     }
 
     // If waitlist entry exists and status is invited
     const userId = uuidv4();
     const hashedPassword = await bcrypt.hash(password, 10);
-
-    // Extract additional details from waitlist entry to pass to createUser
-    const stripe_customer_id = waitlistEntry.stripe_customer_id;
-    const companyNameFromWaitlist = waitlistEntry.companyName;
-    const useCaseCategoriesFromWaitlist = waitlistEntry.useCaseCategories;
-    const displayNameFromWaitlist = waitlistEntry.fullName; // Assuming fullName from waitlist is a good default for displayName
-
-    // Determine roles: use reqRoles if provided, otherwise default to ["customer"]
-    // This also depends on your logic for how partner roles are assigned, adjust if necessary
-    const finalRoles =
-      reqRoles && Array.isArray(reqRoles) && reqRoles.length > 0
-        ? reqRoles
-        : ["customer"];
 
     const finalDisplayName =
       reqDisplayName || displayNameFromWaitlist || email.split("@")[0];
@@ -225,7 +233,7 @@ export const googleCallback = async (
       const finalDisplayName =
         profile.displayName || waitlistEntry.fullName || email.split("@")[0];
 
-      const roles: ("partner" | "customer")[] = ["customer"];
+      const roles: ("partner" | "customer" | "free")[] = ["free"];
 
       user = await userDb.createUser(
         email,
@@ -267,6 +275,18 @@ export const googleCallback = async (
       return done(errorObj, null);
     }
 
+    // For genius portal, assign free role to prevent access to customer portal
+    if (
+      portalOrigin === "genius" &&
+      (!user.roles || (user.roles.length === 0))
+    ) {
+      // If user has no roles, assign free role by default
+      await userDb.updateUser(user.userId, {
+        roles: ["free"]
+      });
+      user.roles = ["free"];
+    }
+
     // Update last login time for OAuth login
     try {
       await userDb.updateUser(user.userId, {
@@ -282,6 +302,8 @@ export const googleCallback = async (
         ? user.roles
         : portalOrigin === "customer"
         ? ["customer"]
+        : portalOrigin === "genius"
+        ? ["free"] // Default to free for genius portal
         : ["partner"];
 
     const tokenPayload = {

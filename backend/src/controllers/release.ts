@@ -8,6 +8,17 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-08-26",
+    changes: [
+      "Created Growth Genius chat service",
+      "- New AI-powered startup growth assistant chatbot",
+      "- Dedicated frontend application with modern UI/UX",
+      "- Integration with existing AgentWeb authentication system",
+      "- Knowledge base search capabilities via Azure OpenAI function calling",
+      "- Chat session management with persistent history",
+    ],
+  },
+  {
     date: "2025-08-20",
     changes: [
       "Added Flux model for image generation",
