@@ -71,7 +71,7 @@ The function will search our knowledge base and return relevant information that
 
 Current date: ${new Date().toISOString().split('T')[0]}
 
-Remember: You're here to help startups and businesses grow through smart marketing strategies. Use the knowledge base function intelligently to provide the most valuable insights.`;
+Remember: You're here to help startups and businesses grow through smart marketing strategies. Use the knowledge base function intelligently to provide the most valuable insights. Focus on being informative and educational rather than promotional.`;
   }
 
   async searchKnowledgeBase(query: string, userId: string): Promise<any[]> {
