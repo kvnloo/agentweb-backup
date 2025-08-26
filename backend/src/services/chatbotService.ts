@@ -13,6 +13,7 @@ import { EngineServiceClient } from '@google-cloud/discoveryengine';
 import { Storage } from '@google-cloud/storage';
 import { SearchServiceClient, protos } from '@google-cloud/discoveryengine';
 import { taskDb } from '../services/db';
+import { getGCSPPrivateKey } from '../utils/secretsManager';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -1137,7 +1138,7 @@ export async function searchKnowledgeBase(query: string, maxResults: number = 5)
 export async function searchPlatformKnowledgeBase(query: string, maxResults: number = 10, userId?: string): Promise<ContextChunk[]> {
   try {
     // Initialize the Search Service clients
-    const privateKey = process.env.GCS_PRIVATE_KEY?.replace(/\[NEWLINE\]/g, '\n');
+    const privateKey = await getGCSPPrivateKey();
 
     const publicClient = new SearchServiceClient({
       apiEndpoint: process.env.VERTEX_AI_LOCATION === 'global' 
