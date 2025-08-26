@@ -29,9 +29,9 @@ export class GrowthGeniusService {
   constructor() {
     this.openai = new OpenAI({
       apiKey: process.env.AZURE_OPENAI_API_KEY,
-      baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT}`,
+      baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS}`,
       defaultQuery: {
-        "api-version": process.env.AZURE_OPENAI_API_VERSION || "2024-08-01-preview",
+        "api-version": process.env.AZURE_OPENAI_API_VERSION_GROWTH_GENIUS || "2024-08-01-preview",
       },
       defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
     });
@@ -93,17 +93,16 @@ Remember: You're here to help startups and businesses grow through smart marketi
     try {
       console.log('GrowthGenius: Generating session title for message:', userMessage);
       
-      const response = await this.openai.chat.completions.create({
-        model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
+            const response = await this.openai.chat.completions.create({
+        model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5',
         messages: [
           { 
             role: 'system', 
-            content: `You are a session title generator. Based on the user's first message, generate a concise, descriptive title (max 60 characters) that captures the main topic or question. Return ONLY the title, nothing else.` 
+            content: `You are a session title generator. Based on the user's first message, generate a concise, descriptive title (max 60 characters) that captures the main topic or question. Return ONLY the title, nothing else.`
           },
           { role: 'user', content: userMessage }
         ],
-        max_tokens: 100,
-        temperature: 0.3
+        max_completion_tokens: 100
       });
 
       const title = response.choices[0]?.message?.content?.trim();
@@ -131,7 +130,7 @@ Remember: You're here to help startups and businesses grow through smart marketi
       
       // First API call: Ask the model to use the functions
       const response = await this.openai.chat.completions.create({
-        model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
+        model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5',
         messages: [
           { role: 'system', content: this.getSystemPrompt() },
           { role: 'user', content: initialContext }
@@ -160,8 +159,7 @@ Remember: You're here to help startups and businesses grow through smart marketi
           }
         ],
         tool_choice: 'auto',
-        max_tokens: 1500,
-        temperature: 0.7
+        max_completion_tokens: 1500
       });
 
       const responseMessage = response.choices[0].message;
@@ -214,7 +212,7 @@ Remember: You're here to help startups and businesses grow through smart marketi
         // Second API call: Get the final response with knowledge base results
         const finalContext = this.buildContext(userMessage, sessionHistory, knowledgeBaseResults);
         const finalResponse = await this.openai.chat.completions.create({
-          model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
+          model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5',
           messages: [
             { role: 'system', content: this.getSystemPrompt() },
             { role: 'user', content: finalContext },
@@ -230,8 +228,7 @@ Remember: You're here to help startups and businesses grow through smart marketi
               })
             })) || []
           ],
-          max_tokens: 1500,
-          temperature: 0.7
+          max_completion_tokens: 1500
         });
         
         const finalContent = finalResponse.choices[0]?.message?.content || 'Sorry, I could not generate a response.';
