@@ -90,6 +90,7 @@ export interface ChatSession {
   contextChunks?: ContextChunk[]; // Chunked context for RAG
   portalType?: "customer" | "partner" | "genius"; // Added portalType to session
   pageIdentifier?: string; // Added pageIdentifier for page-specific sessions
+  archived?: boolean; // Archive status for soft deletion
 }
 
 // Interface for context chunks
@@ -474,6 +475,13 @@ export class ChatbotDB {
         `Found ${sessions.length} chat sessions for user: ${userId}`
       );
 
+      // Filter out archived sessions
+      sessions = sessions.filter(session => !session.archived);
+      
+      console.log(
+        `Found ${sessions.length} non-archived chat sessions for user: ${userId}`
+      );
+
       // Sort by updatedAt in memory (DynamoDB UserIdIndex doesn't support updatedAt sorting)
       if (sortDescending) {
         sessions = sessions.sort((a, b) => 
@@ -515,13 +523,78 @@ export class ChatbotDB {
 
     try {
       const result = await dynamodb.query(params).promise();
-      const count = result.Count || 0;
+      let sessions = (result.Items as ChatSession[]) || [];
+      
+      // Filter out archived sessions for accurate count
+      sessions = sessions.filter(session => !session.archived);
+      const count = sessions.length;
+      
       console.log(
-        `Found ${count} chat sessions for user: ${userId}`
+        `Found ${count} non-archived chat sessions for user: ${userId}`
       );
       return count;
     } catch (error) {
       console.error("Error getting user session count:", error);
+      throw error;
+    }
+  }
+
+  // Get archived sessions for admin management
+  async getArchivedSessions(userId?: string, portalType?: "customer" | "partner" | "genius"): Promise<ChatSession[]> {
+    console.log(
+      `Getting archived sessions from table: ${this.tableName}, userId: ${userId || 'all'}, portalType: ${portalType || 'all'}`
+    );
+
+    const params: any = {
+      TableName: this.tableName,
+      IndexName: "UserIdIndex",
+      KeyConditionExpression: "userId = :userId",
+      FilterExpression: "archived = :archived",
+      ExpressionAttributeValues: {
+        ":userId": userId,
+        ":archived": true,
+      },
+    };
+
+    // Add portal type filter if specified
+    if (portalType) {
+      params.FilterExpression += " AND portalType = :portalType";
+      params.ExpressionAttributeValues[':portalType'] = portalType;
+    }
+
+    try {
+      const result = await dynamodb.query(params).promise();
+      const sessions = (result.Items as ChatSession[]) || [];
+      
+      console.log(
+        `Found ${sessions.length} archived chat sessions`
+      );
+      return sessions;
+    } catch (error) {
+      console.error("Error getting archived chat sessions:", error);
+      throw error;
+    }
+  }
+
+  async archiveSession(sessionId: string): Promise<void> {
+    const timestamp = new Date().toISOString();
+    
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression: "SET archived = :archived, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":archived": true,
+        ":updatedAt": timestamp,
+      },
+    };
+
+    try {
+      await dynamodb.update(params).promise();
+    } catch (error) {
+      console.error("Error archiving chat session:", error);
       throw error;
     }
   }

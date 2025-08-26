@@ -31,4 +31,7 @@ router.post('/migrate-sessions', growthGeniusController.migrateSessions);
 // Get session counts for debugging
 router.get('/session-counts', growthGeniusController.getSessionCounts);
 
+// Get archived sessions for admin management
+router.get('/archived-sessions', growthGeniusController.getArchivedSessions);
+
 export default router;

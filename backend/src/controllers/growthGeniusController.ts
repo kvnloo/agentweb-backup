@@ -179,13 +179,13 @@ export const growthGeniusController = {
     }
   },
 
-  // Delete a chat session
+  // Archive a chat session (soft delete)
   async deleteSession(req: Request, res: Response) {
     try {
       const user = req.user as UserPayload;
       const { sessionId } = req.params;
 
-      console.log(`GrowthGenius: Deleting session ${sessionId} for user ${user.userId}`);
+      console.log(`GrowthGenius: Archiving session ${sessionId} for user ${user.userId}`);
 
       // Get the session first to verify ownership and type
       const session = await chatbotDb.getChatSession(sessionId);
@@ -204,13 +204,13 @@ export const growthGeniusController = {
         return res.status(400).json({ message: 'Invalid session type' });
       }
 
-      // Delete the session from the database
-      await chatbotDb.deleteSession(sessionId);
+      // Archive the session instead of deleting it
+      await chatbotDb.archiveSession(sessionId);
 
-      res.json({ message: 'Session deleted successfully' });
+      res.json({ message: 'Session archived successfully' });
     } catch (error) {
-      console.error('GrowthGenius: Delete session error:', error);
-      res.status(500).json({ message: 'Failed to delete chat session' });
+      console.error('GrowthGenius: Archive session error:', error);
+      res.status(500).json({ message: 'Failed to archive chat session' });
     }
   },
 
@@ -315,6 +315,26 @@ export const growthGeniusController = {
     } catch (error) {
       console.error('GrowthGenius: Get session counts error:', error);
       res.status(500).json({ message: 'Failed to get session counts' });
+    }
+  },
+
+  // Get archived sessions for admin management
+  async getArchivedSessions(req: Request, res: Response) {
+    try {
+      const user = req.user as UserPayload;
+      const { portalType } = req.query;
+      
+      console.log(`GrowthGenius: Getting archived sessions for user ${user.userId}, portalType: ${portalType || 'all'}`);
+
+      const archivedSessions = await chatbotDb.getArchivedSessions(
+        user.userId, 
+        portalType as "customer" | "partner" | "genius" | undefined
+      );
+
+      res.json(archivedSessions);
+    } catch (error) {
+      console.error('GrowthGenius: Get archived sessions error:', error);
+      res.status(500).json({ message: 'Failed to get archived sessions' });
     }
   }
 };
