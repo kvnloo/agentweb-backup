@@ -206,59 +206,96 @@ export const googleCallback = async (
     const portalOrigin = (req.query.state as string) || "partner";
 
     if (!user) {
-      const waitlistEntry = await waitlistDb.getByEmail(email);
+      if (portalOrigin === "genius") {
+        // For genius portal, automatically create user using existing signup logic
+        const userId = uuidv4();
+        const placeholderPassword = `oauth_placeholder_${uuidv4()}`;
+        const finalDisplayName = profile.displayName || email.split("@")[0];
+        const roles: ("partner" | "customer" | "free")[] = ["free"];
 
-      if (!waitlistEntry) {
-        const landingSiteUrl =
-          process.env.LANDING_SITE_URL || "https://agentweb.pro";
-        return done(null, false, {
-          message: `Please join our waitlist first at ${landingSiteUrl}`,
-          code: "not_in_waitlist",
-        });
-      }
-
-      if (waitlistEntry.status !== "invited") {
-        return done(null, false, {
-          message: "You are on the waitlist but not yet invited.",
-          code: "not_invited",
-        });
-      }
-
-      const userId = uuidv4();
-      const placeholderPassword = `oauth_placeholder_${uuidv4()}`;
-
-      const stripe_customer_id = waitlistEntry.stripe_customer_id;
-      const companyNameFromWaitlist = waitlistEntry.companyName;
-      const useCaseCategoriesFromWaitlist = waitlistEntry.useCaseCategories;
-      const finalDisplayName =
-        profile.displayName || waitlistEntry.fullName || email.split("@")[0];
-
-      const roles: ("partner" | "customer" | "free")[] = ["free"];
-
-      user = await userDb.createUser(
-        email,
-        userId,
-        placeholderPassword,
-        true,
-        false,
-        roles,
-        finalDisplayName,
-        profile.id,
-        stripe_customer_id,
-        companyNameFromWaitlist,
-        useCaseCategoriesFromWaitlist
-      );
-      console.log("New user created via Google OAuth:", user?.email);
-
-      if (!user) {
-        console.error(
-          "Failed to create user via Google OAuth for email:",
-          email
+        // Reuse existing user creation logic (same as waitlist flow)
+        user = await userDb.createUser(
+          email,
+          userId,
+          placeholderPassword,
+          true, // isOAuthUser
+          false, // isAdmin
+          roles,
+          finalDisplayName,
+          profile.id, // googleId
+          undefined, // No stripe_customer_id for direct signup
+          undefined, // No companyNameFromWaitlist for direct signup
+          undefined  // No useCaseCategoriesFromWaitlist for direct signup
         );
-        return done(
-          new Error("User creation failed after Google OAuth process."),
-          null
+        console.log("New user created via Google OAuth (auto-signup):", user?.email);
+
+        if (!user) {
+          console.error(
+            "Failed to create user via Google OAuth for email:",
+            email
+          );
+          return done(
+            new Error("User creation failed after Google OAuth process."),
+            null
+          );
+        }
+      } else {
+        // For other portals, check waitlist as before
+        const waitlistEntry = await waitlistDb.getByEmail(email);
+
+        if (!waitlistEntry) {
+          const landingSiteUrl =
+            process.env.LANDING_SITE_URL || "https://agentweb.pro";
+          return done(null, false, {
+            message: `Please join our waitlist first at ${landingSiteUrl}`,
+            code: "not_in_waitlist",
+          });
+        }
+
+        if (waitlistEntry.status !== "invited") {
+          return done(null, false, {
+            message: "You are on the waitlist but not yet invited.",
+            code: "not_invited",
+          });
+        }
+
+        // Create user from waitlist entry
+        const userId = uuidv4();
+        const placeholderPassword = `oauth_placeholder_${uuidv4()}`;
+
+        const stripe_customer_id = waitlistEntry.stripe_customer_id;
+        const companyNameFromWaitlist = waitlistEntry.companyName;
+        const useCaseCategoriesFromWaitlist = waitlistEntry.useCaseCategories;
+        const finalDisplayName =
+          profile.displayName || waitlistEntry.fullName || email.split("@")[0];
+
+        const roles: ("partner" | "customer" | "free")[] = ["free"];
+
+        user = await userDb.createUser(
+          email,
+          userId,
+          placeholderPassword,
+          true,
+          false,
+          roles,
+          finalDisplayName,
+          profile.id,
+          stripe_customer_id,
+          companyNameFromWaitlist,
+          useCaseCategoriesFromWaitlist
         );
+        console.log("New user created via Google OAuth:", user?.email);
+
+        if (!user) {
+          console.error(
+            "Failed to create user via Google OAuth for email:",
+            email
+          );
+          return done(
+            new Error("User creation failed after Google OAuth process."),
+            null
+          );
+        }
       }
     }
 
