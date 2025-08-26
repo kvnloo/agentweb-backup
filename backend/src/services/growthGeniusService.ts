@@ -89,6 +89,33 @@ Remember: You're here to help startups and businesses grow through smart marketi
     }
   }
 
+  async generateSessionTitle(userMessage: string): Promise<string> {
+    try {
+      console.log('GrowthGenius: Generating session title for message:', userMessage);
+      
+      const response = await this.openai.chat.completions.create({
+        model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
+        messages: [
+          { 
+            role: 'system', 
+            content: `You are a session title generator. Based on the user's first message, generate a concise, descriptive title (max 60 characters) that captures the main topic or question. Return ONLY the title, nothing else.` 
+          },
+          { role: 'user', content: userMessage }
+        ],
+        max_tokens: 100,
+        temperature: 0.3
+      });
+
+      const title = response.choices[0]?.message?.content?.trim();
+      console.log('GrowthGenius: Generated title:', title);
+      
+      return title || 'Unknown topic';
+    } catch (error) {
+      console.error('GrowthGenius: Failed to generate session title:', error);
+      return 'Unknown topic';
+    }
+  }
+
 
 
   async generateResponse(

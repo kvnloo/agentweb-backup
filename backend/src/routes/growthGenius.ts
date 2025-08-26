@@ -25,4 +25,10 @@ router.delete('/sessions/:sessionId', growthGeniusController.deleteSession);
 // Search knowledge base (Growth Genius specific)
 router.get('/search', growthGeniusController.searchKnowledgeBase);
 
+// Migrate existing sessions to genius portal type
+router.post('/migrate-sessions', growthGeniusController.migrateSessions);
+
+// Get session counts for debugging
+router.get('/session-counts', growthGeniusController.getSessionCounts);
+
 export default router;

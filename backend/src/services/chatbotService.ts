@@ -82,6 +82,7 @@ export interface ChatMessage {
 export interface ChatSession {
   sessionId: string;
   userId: string;
+  title?: string; // Session title for display
   messages: ChatMessage[];
   createdAt: string;
   updatedAt: string;
@@ -322,6 +323,7 @@ export class ChatbotDB {
     const chatSession: ChatSession = {
       sessionId,
       userId,
+      title: 'New Chat Session', // Default title that will be updated after first message
       messages: [
         {
           role: "system",
@@ -430,12 +432,17 @@ export class ChatbotDB {
     }
   }
 
-  async getUserSessions(userId: string): Promise<ChatSession[]> {
+  async getUserSessions(
+    userId: string,
+    portalType?: "customer" | "partner" | "genius",
+    limit?: number,
+    sortDescending: boolean = true
+  ): Promise<ChatSession[]> {
     console.log(
-      `Getting chat sessions for user: ${userId} from table: ${this.tableName}`
+      `Getting chat sessions for user: ${userId} from table: ${this.tableName}, portalType: ${portalType || 'all'}, limit: ${limit || 'unlimited'}`
     );
 
-    const params = {
+    const params: any = {
       TableName: this.tableName,
       IndexName: "UserIdIndex",
       KeyConditionExpression: "userId = :userId",
@@ -444,14 +451,77 @@ export class ChatbotDB {
       },
     };
 
+    // Add portal type filter if specified
+    if (portalType) {
+      params.FilterExpression = 'portalType = :portalType';
+      params.ExpressionAttributeValues[':portalType'] = portalType;
+    }
+
+    // Add limit if specified
+    if (limit) {
+      params.Limit = limit;
+    }
+
+    // Add scan index forward for sorting (false = descending, true = ascending)
+    // Note: DynamoDB UserIdIndex doesn't support sorting by updatedAt, so we'll sort in memory
+    params.ScanIndexForward = false; // Always get in consistent order
+
     try {
       const result = await dynamodb.query(params).promise();
+      let sessions = (result.Items as ChatSession[]) || [];
+      
       console.log(
-        `Found ${result.Items?.length || 0} chat sessions for user: ${userId}`
+        `Found ${sessions.length} chat sessions for user: ${userId}`
       );
-      return (result.Items as ChatSession[]) || [];
+
+      // Sort by updatedAt in memory (DynamoDB UserIdIndex doesn't support updatedAt sorting)
+      if (sortDescending) {
+        sessions = sessions.sort((a, b) => 
+          new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+        );
+      } else {
+        sessions = sessions.sort((a, b) => 
+          new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime()
+        );
+      }
+
+      return sessions;
     } catch (error) {
       console.error("Error getting user chat sessions:", error);
+      throw error;
+    }
+  }
+
+  async getUserSessionCount(userId: string, portalType?: "customer" | "partner" | "genius"): Promise<number> {
+    console.log(
+      `Getting session count for user: ${userId} from table: ${this.tableName}, portalType: ${portalType || 'all'}`
+    );
+
+    const params: any = {
+      TableName: this.tableName,
+      IndexName: "UserIdIndex",
+      KeyConditionExpression: "userId = :userId",
+      Select: "COUNT",
+      ExpressionAttributeValues: {
+        ":userId": userId,
+      },
+    };
+
+    // Add portal type filter if specified
+    if (portalType) {
+      params.FilterExpression = 'portalType = :portalType';
+      params.ExpressionAttributeValues[':portalType'] = portalType;
+    }
+
+    try {
+      const result = await dynamodb.query(params).promise();
+      const count = result.Count || 0;
+      console.log(
+        `Found ${count} chat sessions for user: ${userId}`
+      );
+      return count;
+    } catch (error) {
+      console.error("Error getting user session count:", error);
       throw error;
     }
   }
@@ -512,6 +582,64 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating page content:", error);
+      throw error;
+    }
+  }
+
+  async updateSessionTitle(
+    sessionId: string,
+    title: string
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression:
+        "SET title = :title, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":title": title,
+        ":updatedAt": timestamp,
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating session title:", error);
+      throw error;
+    }
+  }
+
+  async updateSessionPortalType(
+    sessionId: string,
+    portalType: "customer" | "partner" | "genius"
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression:
+        "SET portalType = :portalType, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":portalType": portalType,
+        ":updatedAt": timestamp,
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating session portal type:", error);
       throw error;
     }
   }
@@ -815,7 +943,7 @@ Be helpful, concise, and accurate. If you don't know the answer or the request i
   process.env.DISCORD_INVITE_URL || "https://discord.gg/kP2u6Wf9KQ"
 }" target="_blank">Discord community</a>`;
 
-const geniusSystemMessage = `You are Emma, a specialized AI growth marketing assistant for AgentWeb's Growth Genius Chat. You help entrepreneurs, startups, and businesses with growth strategies, marketing tactics, and business development.
+const geniusSystemMessage = `You are Growth Genius, a specialized AI growth marketing assistant for AgentWeb's Growth Genius Chat. You help entrepreneurs, startups, and businesses with growth strategies, marketing tactics, and business development.
 
 Your expertise areas include:
 - Startup growth strategies and user acquisition
