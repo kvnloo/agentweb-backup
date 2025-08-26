@@ -29,9 +29,9 @@ export class GrowthGeniusService {
   constructor() {
     this.openai = new OpenAI({
       apiKey: process.env.AZURE_OPENAI_API_KEY,
-      baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS}`,
+      baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2'}`,
       defaultQuery: {
-        "api-version": process.env.AZURE_OPENAI_API_VERSION_GROWTH_GENIUS || "2024-08-01-preview",
+        "api-version": process.env.AZURE_OPENAI_API_VERSION_GROWTH_GENIUS || "2025-01-01-preview",
       },
       defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
     });
@@ -94,7 +94,7 @@ Remember: You're here to help startups and businesses grow through smart marketi
       console.log('GrowthGenius: Generating session title for message:', userMessage);
       
             const response = await this.openai.chat.completions.create({
-        model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5',
+        model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
         messages: [
           { 
             role: 'system', 
@@ -130,7 +130,7 @@ Remember: You're here to help startups and businesses grow through smart marketi
       
       // First API call: Ask the model to use the functions
       const response = await this.openai.chat.completions.create({
-        model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5',
+        model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
         messages: [
           { role: 'system', content: this.getSystemPrompt() },
           { role: 'user', content: initialContext }
@@ -212,7 +212,7 @@ Remember: You're here to help startups and businesses grow through smart marketi
         // Second API call: Get the final response with knowledge base results
         const finalContext = this.buildContext(userMessage, sessionHistory, knowledgeBaseResults);
         const finalResponse = await this.openai.chat.completions.create({
-          model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5',
+          model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
           messages: [
             { role: 'system', content: this.getSystemPrompt() },
             { role: 'user', content: finalContext },
