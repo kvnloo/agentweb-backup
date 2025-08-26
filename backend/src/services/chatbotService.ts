@@ -57,6 +57,7 @@ const embeddingsClient = new OpenAI({
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
   content: string;
+  timestamp?: string; // Add direct timestamp field
   usage?: {
     prompt_tokens: number;
     completion_tokens: number;

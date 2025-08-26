@@ -112,6 +112,7 @@ export const growthGeniusController = {
       const userMessage = {
         role: 'user' as const,
         content,
+        timestamp: new Date().toISOString(),
         metadata: {
           portalType: 'genius' as const,
           timestamp: new Date().toISOString()
@@ -156,6 +157,7 @@ export const growthGeniusController = {
       const assistantMessage = {
         role: 'assistant' as const,
         content: aiResponse.content,
+        timestamp: new Date().toISOString(),
         metadata: {
           portalType: 'genius' as const,
           timestamp: new Date().toISOString(),
