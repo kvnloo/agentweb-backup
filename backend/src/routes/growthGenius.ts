@@ -34,4 +34,10 @@ router.get('/session-counts', growthGeniusController.getSessionCounts);
 // Get archived sessions for admin management
 router.get('/archived-sessions', growthGeniusController.getArchivedSessions);
 
+// Startup profile management
+router.get('/startup-profiles', growthGeniusController.getStartupProfiles);
+router.post('/startup-profiles', growthGeniusController.createStartupProfile);
+router.put('/startup-profiles/:profileId', growthGeniusController.updateStartupProfile);
+router.delete('/startup-profiles/:profileId', growthGeniusController.deleteStartupProfile);
+
 export default router;

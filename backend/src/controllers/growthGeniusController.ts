@@ -338,5 +338,152 @@ export const growthGeniusController = {
       console.error('GrowthGenius: Get archived sessions error:', error);
       res.status(500).json({ message: 'Failed to get archived sessions' });
     }
+  },
+
+  // Get all startup profiles for the user
+  async getStartupProfiles(req: Request, res: Response) {
+    try {
+      const user = req.user as UserPayload;
+      console.log(`GrowthGenius: Getting startup profiles for user ${user.userId}`);
+
+      // Get user from database to access startup profiles
+      const userDb = require('../services/db').userDb;
+      const userData = await userDb.getUserById(user.userId);
+      
+      if (!userData) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+
+      const startupProfiles = userData.startupProfiles || [];
+      res.json(startupProfiles);
+    } catch (error) {
+      console.error('GrowthGenius: Get startup profiles error:', error);
+      res.status(500).json({ message: 'Failed to get startup profiles' });
+    }
+  },
+
+  // Create a new startup profile
+  async createStartupProfile(req: Request, res: Response) {
+    try {
+      const user = req.user as UserPayload;
+      const { companyName, industry, companySize, targetMarket, currentChallenges, goals } = req.body;
+
+      console.log(`GrowthGenius: Creating startup profile for user ${user.userId}`);
+
+      if (!companyName || !industry) {
+        return res.status(400).json({ message: 'Company name and industry are required' });
+      }
+
+      const userDb = require('../services/db').userDb;
+      const userData = await userDb.getUserById(user.userId);
+      
+      if (!userData) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+
+      const newProfile = {
+        id: `startup-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+        companyName,
+        industry,
+        companySize: companySize || '',
+        targetMarket: targetMarket || '',
+        currentChallenges: currentChallenges || '',
+        goals: goals || '',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+
+      const existingProfiles = userData.startupProfiles || [];
+      const updatedProfiles = [...existingProfiles, newProfile];
+
+      await userDb.updateUser(user.userId, {
+        startupProfiles: updatedProfiles
+      });
+
+      res.status(201).json(newProfile);
+    } catch (error) {
+      console.error('GrowthGenius: Create startup profile error:', error);
+      res.status(500).json({ message: 'Failed to create startup profile' });
+    }
+  },
+
+  // Update an existing startup profile
+  async updateStartupProfile(req: Request, res: Response) {
+    try {
+      const user = req.user as UserPayload;
+      const { profileId } = req.params;
+      const { companyName, industry, companySize, targetMarket, currentChallenges, goals } = req.body;
+
+      console.log(`GrowthGenius: Updating startup profile ${profileId} for user ${user.userId}`);
+
+      if (!companyName || !industry) {
+        return res.status(400).json({ message: 'Company name and industry are required' });
+      }
+
+      const userDb = require('../services/db').userDb;
+      const userData = await userDb.getUserById(user.userId);
+      
+      if (!userData) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+
+      const existingProfiles = userData.startupProfiles || [];
+      const profileIndex = existingProfiles.findIndex((p: any) => p.id === profileId);
+      
+      if (profileIndex === -1) {
+        return res.status(404).json({ message: 'Startup profile not found' });
+      }
+
+      const updatedProfile = {
+        ...existingProfiles[profileIndex],
+        companyName,
+        industry,
+        companySize: companySize || '',
+        targetMarket: targetMarket || '',
+        currentChallenges: currentChallenges || '',
+        goals: goals || '',
+        updatedAt: new Date().toISOString()
+      };
+
+      existingProfiles[profileIndex] = updatedProfile;
+
+      await userDb.updateUser(user.userId, {
+        startupProfiles: existingProfiles
+      });
+
+      res.json(updatedProfile);
+    } catch (error) {
+      console.error('GrowthGenius: Update startup profile error:', error);
+      res.status(500).json({ message: 'Failed to update startup profile' });
+    }
+  },
+
+  // Delete a startup profile
+  async deleteStartupProfile(req: Request, res: Response) {
+    try {
+      const user = req.user as UserPayload;
+      const { profileId } = req.params;
+
+      console.log(`GrowthGenius: Deleting startup profile ${profileId} for user ${user.userId}`);
+
+      const userDb = require('../services/db').userDb;
+      const userData = await userDb.getUserById(user.userId);
+      
+      if (!userData) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+
+      const existingProfiles = userData.startupProfiles || [];
+      const updatedProfiles = existingProfiles.filter((p: any) => p.id !== profileId);
+
+      await userDb.updateUser(user.userId, {
+        startupProfiles: updatedProfiles
+      });
+
+      res.json({ message: 'Startup profile deleted successfully' });
+    } catch (error) {
+      console.error('GrowthGenius: Delete startup profile error:', error);
+      res.status(500).json({ message: 'Failed to delete startup profile' });
+    }
   }
 };
