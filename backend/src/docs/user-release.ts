@@ -7,6 +7,12 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-08-27',
+    changes: [
+      'Fixed format issue of subscriber emails',
+    ],
+  },
+  {
     date: '2025-08-24',
     changes: [
       'Added Gemini-2.5-Pro GA LLM',
