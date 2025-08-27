@@ -210,15 +210,7 @@ export const emailService = {
             <head>
               <style>
                 body { font-family: sans-serif; margin: 0; padding: 0; color: #333; background-color: #fff; }
-                .container { padding: 0; background-color: #fdfdfd; }
-                .html-result { border: none; padding: 0; margin: 0; border-radius: 0; }
-                .html-result h3 { margin-top:0; }
-                .html-result * { margin: 0; padding: 0; }
-                .html-result p:first-child { margin-top: 0; }
-                .html-result div:first-child { margin-top: 0; }
-                .html-result h1:first-child { margin-top: 0; }
-                .html-result h2:first-child { margin-top: 0; }
-                .html-result h3:first-child { margin-top: 0; }
+                .container { padding: 20px; background-color: #fdfdfd; }
                 .footer { margin-top: 25px; font-size: 0.9em; color: #7f8c8d; padding: 20px; }
                 a { color: #3498db; text-decoration: none; }
                 a:hover { text-decoration: underline; }
@@ -328,13 +320,7 @@ export const emailService = {
           .section h3 { font-size: 1.2em; margin-top: 0; border-bottom: 2px solid #ecf0f1; padding-bottom: 8px; color: #34495e; }
           pre { white-space: pre-wrap; word-wrap: break-word; background: #ecf0f1; padding: 15px; border-radius: 5px; font-size: 0.9em; color: #555; }
           .html-result { border: 1px solid #ddd; padding: 10px; margin-top: 15px; border-radius: 5px; }
-          .html-result h3 { margin-top:0; }
-          .html-result * { margin: 0; padding: 0; }
-          .html-result p:first-child { margin-top: 0; }
-          .html-result div:first-child { margin-top: 0; }
-          .html-result h1:first-child { margin-top: 0; }
-          .html-result h2:first-child { margin-top: 0; }
-          .html-result h3:first-child { margin-top: 0; }
+
           .footer { margin-top: 25px; font-size: 0.9em; color: #7f8c8d; padding: 20px; }
           a { color: #3498db; text-decoration: none; }
           a:hover { text-decoration: underline; }
