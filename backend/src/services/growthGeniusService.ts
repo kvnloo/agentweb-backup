@@ -120,13 +120,14 @@ Remember: You're here to help startups and businesses grow through smart marketi
   async generateResponse(
     userMessage: string,
     sessionHistory: GrowthGeniusMessage[],
-    userId: string
+    userId: string,
+    selectedStartupId?: string
   ): Promise<{ content: string; knowledgeBaseQueries: string[]; sources: string[] }> {
     try {
       console.log('GrowthGenius: Generating response for user message:', userMessage);
       
       // Prepare initial context
-      const initialContext = this.buildContext(userMessage, sessionHistory, []);
+      const initialContext = this.buildContext(userMessage, sessionHistory, [], selectedStartupId);
       
       // First API call: Ask the model to use the functions
       const response = await this.openai.chat.completions.create({
@@ -210,7 +211,7 @@ Remember: You're here to help startups and businesses grow through smart marketi
         }
         
         // Second API call: Get the final response with knowledge base results
-        const finalContext = this.buildContext(userMessage, sessionHistory, knowledgeBaseResults);
+        const finalContext = this.buildContext(userMessage, sessionHistory, knowledgeBaseResults, selectedStartupId);
         const finalResponse = await this.openai.chat.completions.create({
           model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
           messages: [
@@ -264,9 +265,17 @@ Remember: You're here to help startups and businesses grow through smart marketi
   private buildContext(
     userMessage: string,
     sessionHistory: GrowthGeniusMessage[],
-    knowledgeBaseResults: any[]
+    knowledgeBaseResults: any[],
+    selectedStartupId?: string
   ): string {
     let context = `User Message: ${userMessage}\n\n`;
+    
+    // Add startup context if available
+    if (selectedStartupId && selectedStartupId !== 'no-startup') {
+      context += 'Startup Context:\n';
+      context += `The user is asking about their startup with ID: ${selectedStartupId}\n`;
+      context += 'Use this context to provide more personalized and relevant advice.\n\n';
+    }
     
     // Add recent conversation history (last 5 messages)
     if (sessionHistory.length > 0) {

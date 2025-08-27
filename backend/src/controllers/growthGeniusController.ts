@@ -8,16 +8,17 @@ export const growthGeniusController = {
   async createSession(req: Request, res: Response) {
     try {
       const user = req.user as UserPayload;
-      const { title } = req.body;
+      const { title, selectedStartupId } = req.body;
 
-      console.log(`GrowthGenius: Creating session for user ${user.userId}`);
+      console.log(`GrowthGenius: Creating session for user ${user.userId} with startup: ${selectedStartupId || 'none'}`);
 
       // Create session using the database with portalType: 'genius'
       const session = await chatbotDb.createChatSession(
         user.userId,
         title || 'Growth Strategy Session',
         'genius', // portalType
-        'growth-genius-chat'
+        'growth-genius-chat',
+        selectedStartupId
       );
 
       res.status(201).json(session);
@@ -80,6 +81,37 @@ export const growthGeniusController = {
     } catch (error) {
       console.error('GrowthGenius: Get session error:', error);
       res.status(500).json({ message: 'Failed to get chat session' });
+    }
+  },
+
+  // Update session startup selection
+  async updateSession(req: Request, res: Response) {
+    try {
+      const user = req.user as UserPayload;
+      const { sessionId } = req.params;
+      const { selectedStartupId } = req.body;
+
+      console.log(`GrowthGenius: Updating session ${sessionId} startup selection to ${selectedStartupId} for user ${user.userId}`);
+
+      // Verify the session exists and belongs to the user
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        return res.status(404).json({ message: 'Chat session not found' });
+      }
+      if (session.userId !== user.userId) {
+        return res.status(403).json({ message: 'Unauthorized access to chat session' });
+      }
+      if (session.portalType !== 'genius') {
+        return res.status(400).json({ message: 'Invalid session type' });
+      }
+
+      // Update the session with new startup selection
+      await chatbotDb.updateSessionStartupSelection(sessionId, selectedStartupId);
+
+      res.json({ message: 'Session startup selection updated successfully' });
+    } catch (error) {
+      console.error('GrowthGenius: Update session error:', error);
+      res.status(500).json({ message: 'Failed to update session startup selection' });
     }
   },
 
@@ -150,7 +182,8 @@ export const growthGeniusController = {
             content: msg.content,
             timestamp: new Date(msg.metadata?.timestamp || Date.now())
           })) || [], // Convert ChatMessage to GrowthGeniusMessage format
-        user.userId
+        user.userId,
+        session.selectedStartupId // Pass startup context
       );
 
       // Create assistant message object
