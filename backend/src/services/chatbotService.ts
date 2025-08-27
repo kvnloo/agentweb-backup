@@ -77,6 +77,7 @@ export interface ChatMessage {
     timestamp: string;
     portalType?: "customer" | "partner" | "genius";
     pageIdentifier?: string;
+    isContextMessage?: boolean;
   };
 }
 
@@ -93,6 +94,7 @@ export interface ChatSession {
   portalType?: "customer" | "partner" | "genius"; // Added portalType to session
   pageIdentifier?: string; // Added pageIdentifier for page-specific sessions
   archived?: boolean; // Archive status for soft deletion
+  selectedStartupId?: string; // Selected startup profile for context
 }
 
 // Interface for context chunks
@@ -313,7 +315,8 @@ export class ChatbotDB {
     userId: string,
     pageContent?: string,
     portalType?: "customer" | "partner" | "genius",
-    pageIdentifier?: string
+    pageIdentifier?: string,
+    selectedStartupId?: string
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
@@ -343,6 +346,7 @@ export class ChatbotDB {
       updatedAt: timestamp,
       portalType,
       pageIdentifier,
+      selectedStartupId,
     };
 
     if (pageContent) {
@@ -699,7 +703,7 @@ export class ChatbotDB {
     const params = {
       TableName: this.tableName,
       Key: {
-        sessionId,
+      sessionId,
       },
       UpdateExpression:
         "SET portalType = :portalType, updatedAt = :updatedAt",
@@ -715,6 +719,35 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session portal type:", error);
+      throw error;
+    }
+  }
+
+  async updateSessionStartupSelection(
+    sessionId: string,
+    selectedStartupId: string
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression:
+        "SET selectedStartupId = :selectedStartupId, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":selectedStartupId": selectedStartupId,
+        ":updatedAt": timestamp,
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating session startup selection:", error);
       throw error;
     }
   }
@@ -745,6 +778,45 @@ export class ChatbotDB {
     } while (lastEvaluatedKey);
 
     return allSessions;
+  }
+
+  async updateMessageInSession(sessionId: string, messageIndex: number, updatedMessage: ChatMessage): Promise<ChatSession> {
+    try {
+      // First get the current session
+      const currentSession = await this.getChatSession(sessionId);
+      if (!currentSession) {
+        throw new Error(`Session ${sessionId} not found`);
+      }
+
+      // Check if message index is valid
+      if (messageIndex < 0 || messageIndex >= currentSession.messages.length) {
+        throw new Error(`Message index ${messageIndex} is out of bounds for session ${sessionId}`);
+      }
+
+      // Create a copy of messages array and update the specific message
+      const updatedMessages = [...currentSession.messages];
+      updatedMessages[messageIndex] = updatedMessage;
+
+      // Update the session with the new messages array
+      const params = {
+        TableName: this.tableName,
+        Key: {
+          sessionId,
+        },
+        UpdateExpression: "SET messages = :messages, updatedAt = :updatedAt",
+        ExpressionAttributeValues: {
+          ":messages": updatedMessages,
+          ":updatedAt": new Date().toISOString(),
+        },
+        ReturnValues: "ALL_NEW",
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating message in session:", error);
+      throw error;
+    }
   }
 }
 

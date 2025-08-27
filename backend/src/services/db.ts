@@ -84,6 +84,17 @@ export interface User {
     createdAt: string;
     updatedAt: string;
   };
+  startupProfiles?: Array<{
+    id: string;
+    companyName: string;
+    industry: string;
+    companySize: string;
+    targetMarket: string;
+    currentChallenges: string;
+    goals: string;
+    createdAt: string;
+    updatedAt: string;
+  }>;
 }
 
 interface UserInteraction {

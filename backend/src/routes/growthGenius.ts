@@ -16,6 +16,9 @@ router.get('/sessions', growthGeniusController.getSessions);
 // Get a specific Growth Genius chat session
 router.get('/sessions/:sessionId', growthGeniusController.getSession);
 
+// Update session startup selection
+router.patch('/sessions/:sessionId', growthGeniusController.updateSession);
+
 // Send a message in a Growth Genius chat session
 router.post('/sessions/:sessionId/messages', growthGeniusController.sendMessage);
 
@@ -33,5 +36,11 @@ router.get('/session-counts', growthGeniusController.getSessionCounts);
 
 // Get archived sessions for admin management
 router.get('/archived-sessions', growthGeniusController.getArchivedSessions);
+
+// Startup profile management
+router.get('/startup-profiles', growthGeniusController.getStartupProfiles);
+router.post('/startup-profiles', growthGeniusController.createStartupProfile);
+router.put('/startup-profiles/:profileId', growthGeniusController.updateStartupProfile);
+router.delete('/startup-profiles/:profileId', growthGeniusController.deleteStartupProfile);
 
 export default router;

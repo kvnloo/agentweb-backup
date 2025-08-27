@@ -8,6 +8,16 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-08-27",
+    changes: [
+      "Improved Growth Genius chat service",
+      "- Added chat interface with ChatGPT-like sidebar and dedicated chat pages",
+      "- Improved system prompt to make sure the chatbot is less salesy",
+      "- Added startup profile management system for personalized context",
+      "- Home page will direct the user to chat page when the user sends a message",
+    ],
+  },
+  {
     date: "2025-08-26",
     changes: [
       "Created Growth Genius chat service",
