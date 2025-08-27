@@ -21,6 +21,11 @@ export const growthGeniusController = {
         selectedStartupId
       );
 
+      // Add context message based on startup selection
+      console.log('GrowthGenius: About to call addOrUpdateContextMessage for new session with:', { sessionId: session.sessionId, selectedStartupId: selectedStartupId || 'no-startup', userId: user.userId });
+      await growthGeniusController.addOrUpdateContextMessage(session.sessionId, selectedStartupId || 'no-startup', user.userId);
+      console.log('GrowthGenius: Finished calling addOrUpdateContextMessage for new session');
+
       res.status(201).json(session);
     } catch (error) {
       console.error('GrowthGenius: Create session error:', error);
@@ -108,10 +113,72 @@ export const growthGeniusController = {
       // Update the session with new startup selection
       await chatbotDb.updateSessionStartupSelection(sessionId, selectedStartupId);
 
+      // Add or update context message based on startup selection
+      console.log('GrowthGenius: About to call addOrUpdateContextMessage with:', { sessionId, selectedStartupId, userId: user.userId });
+      await growthGeniusController.addOrUpdateContextMessage(sessionId, selectedStartupId, user.userId);
+      console.log('GrowthGenius: Finished calling addOrUpdateContextMessage');
+
       res.json({ message: 'Session startup selection updated successfully' });
     } catch (error) {
       console.error('GrowthGenius: Update session error:', error);
       res.status(500).json({ message: 'Failed to update session startup selection' });
+    }
+  },
+
+  // Helper method to add or update context message
+  async addOrUpdateContextMessage(sessionId: string, selectedStartupId: string, userId: string) {
+    try {
+      console.log('GrowthGenius: addOrUpdateContextMessage called with:', { sessionId, selectedStartupId, userId });
+      
+      // Get user's startup profiles to build context message
+      const userDb = require('../services/db').userDb;
+      console.log('GrowthGenius: Getting user data for userId:', userId);
+      const userData = await userDb.getUserById(userId);
+      
+      if (!userData) {
+        console.error('GrowthGenius: User not found for context message:', userId);
+        return;
+      }
+      
+      console.log('GrowthGenius: User data found, startupProfiles:', userData.startupProfiles);
+      const userStartups = userData.startupProfiles || [];
+      
+      let contextContent: string;
+      
+      if (selectedStartupId !== 'no-startup') {
+        // Find the selected startup
+        const startup = userStartups.find((s: any) => s.id === selectedStartupId);
+        if (startup) {
+          contextContent = `🎯 **Startup Context**\n\nI'm focusing on **${startup.companyName}** (${startup.industry} industry, ${startup.companySize}).\n\n**Target Market:** ${startup.targetMarket}\n**Current Challenges:** ${startup.currentChallenges}\n**Goals:** ${startup.goals}\n\nI'll tailor my advice specifically for this startup's context.`;
+        } else {
+          // Startup not found, use generic context
+          contextContent = `🎯 **Context**\n\nI'm focusing on generic business advice. I'll provide insights based on the business details you describe in our conversation. Feel free to share information about your company, industry, challenges, and goals so I can tailor my advice accordingly.`;
+        }
+      } else {
+        // Generic business context
+        contextContent = `🎯 **Context**\n\nI'm focusing on generic business advice. I'll provide insights based on the business details you describe in our conversation. Feel free to share information about your company, industry, challenges, and goals so I can tailor my advice accordingly.`;
+      }
+
+      console.log('GrowthGenius: Context content generated:', contextContent.substring(0, 100) + '...');
+
+      // For now, just add a new context message (we'll handle replacement later)
+      const contextMessage = {
+        role: 'assistant' as const,
+        content: contextContent,
+        timestamp: new Date().toISOString(),
+        metadata: {
+          portalType: 'genius' as const,
+          timestamp: new Date().toISOString(),
+          isContextMessage: true
+        }
+      };
+      
+      console.log('GrowthGenius: About to add context message to session:', sessionId);
+      await chatbotDb.addMessageToSession(sessionId, contextMessage);
+      console.log('GrowthGenius: Successfully added context message for session:', sessionId);
+    } catch (error) {
+      console.error('GrowthGenius: Failed to add/update context message:', error);
+      // Don't fail the entire update if context message fails
     }
   },
 
