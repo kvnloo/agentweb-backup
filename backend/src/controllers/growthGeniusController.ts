@@ -22,9 +22,7 @@ export const growthGeniusController = {
       );
 
       // Add context message based on startup selection
-      console.log('GrowthGenius: About to call addOrUpdateContextMessage for new session with:', { sessionId: session.sessionId, selectedStartupId: selectedStartupId || 'no-startup', userId: user.userId });
       await growthGeniusController.addOrUpdateContextMessage(session.sessionId, selectedStartupId || 'no-startup', user.userId);
-      console.log('GrowthGenius: Finished calling addOrUpdateContextMessage for new session');
 
       res.status(201).json(session);
     } catch (error) {
@@ -114,9 +112,7 @@ export const growthGeniusController = {
       await chatbotDb.updateSessionStartupSelection(sessionId, selectedStartupId);
 
       // Add or update context message based on startup selection
-      console.log('GrowthGenius: About to call addOrUpdateContextMessage with:', { sessionId, selectedStartupId, userId: user.userId });
       await growthGeniusController.addOrUpdateContextMessage(sessionId, selectedStartupId, user.userId);
-      console.log('GrowthGenius: Finished calling addOrUpdateContextMessage');
 
       res.json({ message: 'Session startup selection updated successfully' });
     } catch (error) {
@@ -128,11 +124,8 @@ export const growthGeniusController = {
   // Helper method to add or update context message
   async addOrUpdateContextMessage(sessionId: string, selectedStartupId: string, userId: string) {
     try {
-      console.log('GrowthGenius: addOrUpdateContextMessage called with:', { sessionId, selectedStartupId, userId });
-      
       // Get user's startup profiles to build context message
       const userDb = require('../services/db').userDb;
-      console.log('GrowthGenius: Getting user data for userId:', userId);
       const userData = await userDb.getUserById(userId);
       
       if (!userData) {
@@ -140,7 +133,6 @@ export const growthGeniusController = {
         return;
       }
       
-      console.log('GrowthGenius: User data found, startupProfiles:', userData.startupProfiles);
       const userStartups = userData.startupProfiles || [];
       
       let contextContent: string;
@@ -159,8 +151,6 @@ export const growthGeniusController = {
         contextContent = `🎯 **Context**\n\nI'm focusing on generic business advice. I'll provide insights based on the business details you describe in our conversation. Feel free to share information about your company, industry, challenges, and goals so I can tailor my advice accordingly.`;
       }
 
-      console.log('GrowthGenius: Context content generated:', contextContent.substring(0, 100) + '...');
-
       // For now, just add a new context message (we'll handle replacement later)
       const contextMessage = {
         role: 'assistant' as const,
@@ -173,9 +163,7 @@ export const growthGeniusController = {
         }
       };
       
-      console.log('GrowthGenius: About to add context message to session:', sessionId);
       await chatbotDb.addMessageToSession(sessionId, contextMessage);
-      console.log('GrowthGenius: Successfully added context message for session:', sessionId);
     } catch (error) {
       console.error('GrowthGenius: Failed to add/update context message:', error);
       // Don't fail the entire update if context message fails
