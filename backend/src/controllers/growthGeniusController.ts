@@ -141,7 +141,42 @@ export const growthGeniusController = {
         // Find the selected startup
         const startup = userStartups.find((s: any) => s.id === selectedStartupId);
         if (startup) {
-          contextContent = `🎯 **Startup Context**\n\nI'm focusing on **${startup.companyName}** (${startup.industry} industry, ${startup.companySize}).\n\n**Target Market:** ${startup.targetMarket}\n**Current Challenges:** ${startup.currentChallenges}\n**Goals:** ${startup.goals}\n\nI'll tailor my advice specifically for this startup's context.`;
+          // Build context message with only non-empty fields
+          let contextParts = [`🎯 **Startup Context**\n\nI'm focusing on **${startup.companyName}**`];
+          
+          // Add industry if available
+          if (startup.industry && startup.industry.trim()) {
+            contextParts.push(`(${startup.industry} industry`);
+            
+            // Add company size if available
+            if (startup.companySize && startup.companySize.trim()) {
+              contextParts.push(`, ${startup.companySize}`);
+            }
+            contextParts.push(')');
+          } else if (startup.companySize && startup.companySize.trim()) {
+            // Only company size available
+            contextParts.push(`(${startup.companySize})`);
+          }
+          
+          contextParts.push('.\n');
+          
+          // Add target market if available
+          if (startup.targetMarket && startup.targetMarket.trim()) {
+            contextParts.push(`**Target Market:** ${startup.targetMarket}\n`);
+          }
+          
+          // Add current challenges if available
+          if (startup.currentChallenges && startup.currentChallenges.trim()) {
+            contextParts.push(`**Current Challenges:** ${startup.currentChallenges}\n`);
+          }
+          
+          // Add goals if available
+          if (startup.goals && startup.goals.trim()) {
+            contextParts.push(`**Goals:** ${startup.goals}\n`);
+          }
+          
+          contextParts.push('\nI\'ll tailor my advice specifically for this startup\'s context.');
+          contextContent = contextParts.join('');
         } else {
           // Startup not found, use generic context
           contextContent = `🎯 **Context**\n\nI'm focusing on generic business advice. I'll provide insights based on the business details you describe in our conversation. Feel free to share information about your company, industry, challenges, and goals so I can tailor my advice accordingly.`;
@@ -151,7 +186,28 @@ export const growthGeniusController = {
         contextContent = `🎯 **Context**\n\nI'm focusing on generic business advice. I'll provide insights based on the business details you describe in our conversation. Feel free to share information about your company, industry, challenges, and goals so I can tailor my advice accordingly.`;
       }
 
-      // For now, just add a new context message (we'll handle replacement later)
+      // Check if the last message is a context message
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (session && session.messages && session.messages.length > 0) {
+        const lastMessageIndex = session.messages.length - 1;
+        const lastMessage = session.messages[lastMessageIndex];
+        
+        // If last message is a context message, replace it instead of adding new one
+        if (lastMessage.metadata && lastMessage.metadata.isContextMessage) {
+          // Update the last message content
+          const updatedMessage = {
+            ...lastMessage,
+            content: contextContent,
+            timestamp: new Date().toISOString()
+          };
+          
+          // Replace the last message in the session
+          await chatbotDb.updateMessageInSession(sessionId, lastMessageIndex, updatedMessage);
+          return;
+        }
+      }
+
+      // If no context message to replace, add a new one
       const contextMessage = {
         role: 'assistant' as const,
         content: contextContent,
