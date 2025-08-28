@@ -886,6 +886,16 @@ EOF
 
 **Note**: Make sure to replace `your_google_image_api_key_here` with your actual Google Gemini API key. The `DEFAULT_IMAGE_MODEL` environment variable allows you to set the default image generation model for all tasks.
 
+**⚠️ Important**: When changing the default image model, you must update **both** the frontend and backend together:
+
+1. **Frontend (partner-portal)**: Rebuild with the new `VITE_IMAGE_MODEL` value
+2. **Backend (agent-engine)**: Update the `DEFAULT_IMAGE_MODEL` environment variable
+
+This coordination is required because:
+- The frontend uses `VITE_IMAGE_MODEL` at build time to set the default in the UI
+- The backend uses `DEFAULT_IMAGE_MODEL` to determine which model to use when no explicit selection is made
+- Mismatched values will cause the frontend to show one default while the backend uses a different one
+
 #### 5. Running the Agent Engine
 
 ```bash
