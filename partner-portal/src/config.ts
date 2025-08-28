@@ -29,6 +29,9 @@ export const DEEP_RESEARCH_LLMS = (
   .map((llm: string) => llm.trim())
   .filter((llm: string) => llm); // Remove empty strings
 
+// Get the default image model from environment variable or use OpenAI as fallback
+export const DEFAULT_IMAGE_MODEL = import.meta.env.VITE_IMAGE_MODEL || "gemini-2.5-flash-image-preview";
+
 // Function to get the appropriate LLM list based on whether deep research is enabled
 export const getLLMsForTask = (isDeepResearch: boolean) => {
   return isDeepResearch ? DEEP_RESEARCH_LLMS : AVAILABLE_LLMS;
@@ -40,6 +43,7 @@ if (DEBUG) {
   console.log("API_URL:", API_URL);
   console.log("AVAILABLE_LLMS:", AVAILABLE_LLMS);
   console.log("DEEP_RESEARCH_LLMS:", DEEP_RESEARCH_LLMS);
+  console.log("DEFAULT_IMAGE_MODEL:", DEFAULT_IMAGE_MODEL);
   console.log("import.meta.env:", import.meta.env);
 }
 

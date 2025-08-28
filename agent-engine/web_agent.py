@@ -80,7 +80,7 @@ class GenerateImageParams(BaseModel):
     output_file_name: str
     size: str = "1024x1024"
     quality: str = "medium"
-    model: str = "openai-image-1"  # Default to OpenAI image model
+    model: str = os.getenv('DEFAULT_IMAGE_MODEL', "openai-image-1")  # Default from env or OpenAI image model
 
 class VideoAnalysisParams(BaseModel):
     """Parameters for performing video analysis."""

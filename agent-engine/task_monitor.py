@@ -1083,6 +1083,9 @@ Context - Original Task: {base_prompt}"""
                         create_video = bool(task.get('createVideo', False)) if task else False
                         video_model = task.get('videoModel') if task else None
                         image_model = task.get('imageModel') if task else None
+                        # If no image model is set in task, use the default from environment
+                        if not image_model:
+                            image_model = os.getenv('DEFAULT_IMAGE_MODEL', "openai-image-1")
                         
                         # Override has_attachments for HTML report revisions to enable read_attached_file
                         if original_report_url and revision_prompt:
