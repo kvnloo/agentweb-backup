@@ -2184,6 +2184,14 @@ export default function TaskDetails() {
                   </Typography>
                 </Box>
               </MenuItem>
+              <MenuItem value="gemini-2.5-flash-image-preview">
+                <Box>
+                  <Typography>Nano Banana (Google Gemini)</Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    gemini-2.5-flash-image-preview for image + text
+                  </Typography>
+                </Box>
+              </MenuItem>
             </Select>
           </FormControl>
         </Tooltip>
