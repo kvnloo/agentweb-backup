@@ -46,6 +46,7 @@ interface TaskExecution {
     is_html?: boolean;
   }[];
   llmName?: string;
+  imageModel?: string;
 }
 
 interface TaskInfo {
@@ -198,6 +199,13 @@ export default function SharedExecution() {
                   <Chip
                     label={`LLM: ${execution.llmName}`}
                     variant="outlined"
+                  />
+                )}
+                {execution.imageModel && (
+                  <Chip
+                    label={`Image Model: ${execution.imageModel}`}
+                    variant="outlined"
+                    sx={{ ml: 1 }}
                   />
                 )}
               </Box>

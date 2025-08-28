@@ -137,6 +137,8 @@ interface TaskExecution {
     token: string;
     is_html?: boolean;
   }[];
+  llmName?: string;
+  imageModel?: string;
   archived: boolean;
   knowledge_base_updated_at?: string;
 }
