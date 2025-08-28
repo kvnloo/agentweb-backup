@@ -3211,10 +3211,10 @@ class WebAgent:
                         
                         # Create success message
                         if uploaded_file_info and uploaded_file_info.get('url'):
-                            success_msg = f"✅ Image {params.output_file_name} generated successfully using FLUX.1-Kontext-pro! It has been uploaded and available at {uploaded_file_info['url']}. You MUST use the URL to refer this image in any HTML or Markdown content."
+                            success_msg = f"✅ Image {params.output_file_name} generated successfully using {model_to_use}! It has been uploaded and available at {uploaded_file_info['url']}. You MUST use the URL to refer this image in any HTML or Markdown content."
                             logger.info(f"Generated image uploaded to S3: {uploaded_file_info['url']}")
                         else:
-                            success_msg = f"✅ Image {params.output_file_name} generated successfully using FLUX.1-Kontext-pro and saved to downloads folder! "
+                            success_msg = f"✅ Image {params.output_file_name} generated successfully using {model_to_use} and saved to downloads folder! "
                             logger.warning("Could not retrieve S3 URL for generated image")
                         
                         return ActionResult(extracted_content=success_msg)
@@ -3268,9 +3268,9 @@ class WebAgent:
                                 break
 
                         if uploaded_file_info and uploaded_file_info.get('url'):
-                            success_msg = f"✅ Image {params.output_file_name} generated successfully using Google Nano Banana! It has been uploaded and available at {uploaded_file_info['url']}."
+                            success_msg = f"✅ Image {params.output_file_name} generated successfully using {model_to_use}! It has been uploaded and available at {uploaded_file_info['url']}."
                         else:
-                            success_msg = f"✅ Image {params.output_file_name} generated successfully using Google Nano Banana and saved to downloads folder!"
+                            success_msg = f"✅ Image {params.output_file_name} generated successfully using {model_to_use} and saved to downloads folder!"
 
                         if emitted_text_parts:
                             success_msg += "\n\n" + "".join(emitted_text_parts)
@@ -3408,9 +3408,9 @@ class WebAgent:
                                 uploaded_file_info = file_info
                                 break
                         if uploaded_file_info and uploaded_file_info.get('url'):
-                            success_msg = f"✅ Image {params.output_file_name} edited successfully using Google Nano Banana! It has been uploaded and available at {uploaded_file_info['url']}."
+                            success_msg = f"✅ Image {params.output_file_name} edited successfully using {model_to_use}! It has been uploaded and available at {uploaded_file_info['url']}."
                         else:
-                            success_msg = f"✅ Image {params.output_file_name} edited successfully using Google Nano Banana and saved to downloads folder!"
+                            success_msg = f"✅ Image {params.output_file_name} edited successfully using {model_to_use} and saved to downloads folder!"
                         if emitted_text_parts:
                             success_msg += "\n\n" + "".join(emitted_text_parts)
                         return ActionResult(extracted_content=success_msg)
@@ -3546,9 +3546,9 @@ class WebAgent:
                                 uploaded_file_info = file_info
                                 break
                         if uploaded_file_info and uploaded_file_info.get('url'):
-                            success_msg = f"✅ Image {params.output_file_name} edited successfully using Google Nano Banana! It has been uploaded and available at {uploaded_file_info['url']}."
+                            success_msg = f"✅ Image {params.output_file_name} edited successfully using {model_to_use}! It has been uploaded and available at {uploaded_file_info['url']}."
                         else:
-                            success_msg = f"✅ Image {params.output_file_name} edited successfully using Google Nano Banana and saved to downloads folder!"
+                            success_msg = f"✅ Image {params.output_file_name} edited successfully using {model_to_use} and saved to downloads folder!"
                         if emitted_text_parts:
                             success_msg += "\n\n" + "".join(emitted_text_parts)
                         return ActionResult(extracted_content=success_msg)
@@ -3588,10 +3588,10 @@ class WebAgent:
                     
                     # Create success message
                     if uploaded_file_info and uploaded_file_info.get('url'):
-                        success_msg = f"✅ Image {params.output_file_name} generated successfully! It has been uploaded and available at {uploaded_file_info['url']}. You MUST use the URL to refer this image in any HTML or Markdown content."
+                        success_msg = f"✅ Image {params.output_file_name} generated successfully using {model_to_use}! It has been uploaded and available at {uploaded_file_info['url']}. You MUST use the URL to refer this image in any HTML or Markdown content."
                         logger.info(f"Generated image uploaded to S3: {uploaded_file_info['url']}")
                     else:
-                        success_msg = f"✅ Image {params.output_file_name} generated successfully and saved to downloads folder! "
+                        success_msg = f"✅ Image {params.output_file_name} generated successfully using {model_to_use} and saved to downloads folder! "
                         logger.warning("Could not retrieve S3 URL for generated image")
                     
                     return ActionResult(extracted_content=success_msg)
