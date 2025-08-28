@@ -8,6 +8,16 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-08-28",
+    changes: [
+      "Added new image model Nano Banana from Google Gemini",
+      "- Users can now select gemini-2.5-flash-image-preview as an alternative to OpenAI and FLUX models",
+      "- Nano Banana provides advanced image generation and editing capabilities through Google's Gemini API",
+      "- Model selection is available on the Task Details page with a dropdown menu",
+      "- Selected model is automatically saved and used for image generation tasks",
+    ],
+  },
+  {
     date: "2025-08-27",
     changes: [
       "Improved Growth Genius chat service",
