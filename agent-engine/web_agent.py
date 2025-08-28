@@ -3555,13 +3555,22 @@ class WebAgent:
                     else:
                         # Use OpenAI client for default model
                         logger.info("Editing multiple input images...")
-                        with open(input_images[0], "rb") as img1, open(input_images[1], "rb") as img2:
+                        # Open all images and pass them to OpenAI
+                        image_files = []
+                        for img_path in input_images:
+                            image_files.append(open(img_path, "rb"))
+                        
+                        try:
                             result = client.images.edit(
                                 model="gpt-image-1",
-                                image=[img1, img2] + [open(img, "rb") for img in input_images[2:]],
+                                image=image_files,
                                 prompt=params.prompt,
                                 size=params.size
                             )
+                        finally:
+                            # Close all opened files
+                            for img_file in image_files:
+                                img_file.close()
                 
                 # Save the generated image (for OpenAI default model only)
                 if result.data and len(result.data) > 0:
