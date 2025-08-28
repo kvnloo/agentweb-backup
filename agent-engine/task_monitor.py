@@ -226,7 +226,7 @@ async def process_schedules():
     except Exception as e:
         logger.error(f"Error in process_schedules: {e}")
 
-def update_execution_status(execution_id, status, result=None, error=None, details_gif=None, prompt=None, llm_name=None, output_as_json=False):
+def update_execution_status(execution_id, status, result=None, error=None, details_gif=None, prompt=None, llm_name=None, output_as_json=False, image_model=None):
     try:
         update_expression = "SET #status = :status"
         expression_values = {
@@ -266,6 +266,10 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
         if output_as_json is not None:
             update_expression += ", outputAsJson = :outputAsJson"
             expression_values[':outputAsJson'] = output_as_json
+            
+        if image_model is not None:
+            update_expression += ", imageModel = :imageModel"
+            expression_values[':imageModel'] = image_model
 
         # Get the execution to get the taskId and startTime
         execution = executions_table.get_item(Key={'executionId': execution_id}).get('Item')
@@ -1079,6 +1083,9 @@ Context - Original Task: {base_prompt}"""
                         create_video = bool(task.get('createVideo', False)) if task else False
                         video_model = task.get('videoModel') if task else None
                         image_model = task.get('imageModel') if task else None
+                        # If no image model is set in task, use the default from environment
+                        if not image_model:
+                            image_model = os.getenv('DEFAULT_IMAGE_MODEL', "openai-image-1")
                         
                         # Override has_attachments for HTML report revisions to enable read_attached_file
                         if original_report_url and revision_prompt:
@@ -1139,7 +1146,8 @@ Context - Original Task: {base_prompt}"""
                             result=result_summary,
                             details_gif=details_gif,
                             llm_name=llm_name,
-                            output_as_json=output_as_json
+                            output_as_json=output_as_json,
+                            image_model=image_model
                         )
                         logger.info(f"Updated execution status to completed for {execution_id}")
 

@@ -80,7 +80,7 @@ class GenerateImageParams(BaseModel):
     output_file_name: str
     size: str = "1024x1024"
     quality: str = "medium"
-    model: str = "openai-image-1"  # Default to OpenAI image model
+    model: str = os.getenv('DEFAULT_IMAGE_MODEL', "openai-image-1")  # Default from env or OpenAI image model
 
 class VideoAnalysisParams(BaseModel):
     """Parameters for performing video analysis."""
@@ -3054,7 +3054,7 @@ class WebAgent:
             - ActionResult with the generation results or error message
             """
             try:
-                # Import OpenAI client
+                # Import OpenAI client (used for OpenAI and default path)
                 try:
                     from openai import OpenAI
                 except ImportError:
@@ -3066,8 +3066,10 @@ class WebAgent:
                 
                 logger.info(f"Image generation - params.model: {params.model}, task.image_model: {self.image_model}, final model_to_use: {model_to_use}")
                 
-                # Initialize variables for Azure AI Services
+                # Initialize variables for Azure AI Services / Google Gemini
                 azure_model_name = None
+                google_model_name = None
+                google_client = None
                 
                 if model_to_use == "FLUX.1-Kontext-pro":
                     # Use Azure AI Services for FLUX model with direct HTTP requests
@@ -3085,6 +3087,20 @@ class WebAgent:
                     azure_model_name = "flux.1-kontext-pro"
                     
                     logger.info(f"Azure AI Services FLUX model configured: {azure_model_name}")
+                elif model_to_use == "gemini-2.5-flash-image-preview":
+                    # Use Google Gemini Nano Banana image model
+                    api_key = os.getenv('GOOGLE_IMAGE_API_KEY')
+                    if not api_key:
+                        return ActionResult(error="GOOGLE_IMAGE_API_KEY environment variable is not set for Google Nano Banana model")
+                    try:
+                        from google import genai
+                        from google.genai import types as google_types
+                    except ImportError:
+                        return ActionResult(error="google-genai package not installed. Install with: pip install google-genai")
+
+                    logger.info("Using Google Nano Banana (gemini-2.5-flash-image-preview)")
+                    google_client = genai.Client(api_key=api_key)
+                    google_model_name = "gemini-2.5-flash-image-preview"
                 else:
                     # Use OpenAI for default model
                     api_key = os.getenv('OPENAI_IMAGE_API_KEY')
@@ -3195,12 +3211,69 @@ class WebAgent:
                         
                         # Create success message
                         if uploaded_file_info and uploaded_file_info.get('url'):
-                            success_msg = f"✅ Image {params.output_file_name} generated successfully using FLUX.1-Kontext-pro! It has been uploaded and available at {uploaded_file_info['url']}. You MUST use the URL to refer this image in any HTML or Markdown content."
+                            success_msg = f"✅ Image {params.output_file_name} generated successfully using {model_to_use}! It has been uploaded and available at {uploaded_file_info['url']}. You MUST use the URL to refer this image in any HTML or Markdown content."
                             logger.info(f"Generated image uploaded to S3: {uploaded_file_info['url']}")
                         else:
-                            success_msg = f"✅ Image {params.output_file_name} generated successfully using FLUX.1-Kontext-pro and saved to downloads folder! "
+                            success_msg = f"✅ Image {params.output_file_name} generated successfully using {model_to_use} and saved to downloads folder! "
                             logger.warning("Could not retrieve S3 URL for generated image")
                         
+                        return ActionResult(extracted_content=success_msg)
+                    elif google_client is not None:
+                        # Google Nano Banana: text-only generation
+                        logger.info("Generating new image with Google Nano Banana from text prompt")
+                        contents = [
+                            google_types.Content(
+                                role="user",
+                                parts=[
+                                    google_types.Part.from_text(text=params.prompt),
+                                ],
+                            )
+                        ]
+                        generate_content_config = google_types.GenerateContentConfig(
+                            response_modalities=["IMAGE", "TEXT"]
+                        )
+
+                        file_index = 0
+                        emitted_text_parts = []
+                        for chunk in google_client.models.generate_content_stream(
+                            model=google_model_name,
+                            contents=contents,
+                            config=generate_content_config,
+                        ):
+                            if (
+                                not chunk.candidates
+                                or not chunk.candidates[0].content
+                                or not chunk.candidates[0].content.parts
+                            ):
+                                continue
+                            part = chunk.candidates[0].content.parts[0]
+                            if getattr(part, 'inline_data', None) and getattr(part.inline_data, 'data', None):
+                                target_path = output_path if file_index == 0 else output_path.with_stem(f"{output_path.stem}_{file_index}")
+                                file_index += 1
+                                data_buffer = part.inline_data.data
+                                with open(target_path, "wb") as f:
+                                    f.write(data_buffer)
+                                logger.info(f"Generated image (Google) saved to: {target_path}")
+                            elif getattr(chunk, 'text', None):
+                                emitted_text_parts.append(chunk.text)
+
+                        # Upload the generated image(s) to S3 and get URLs
+                        result_files = []
+                        if self.current_execution_id:
+                            result_files = upload_task_result_files(downloads_path, self.current_execution_id)
+                        uploaded_file_info = None
+                        for file_info in result_files:
+                            if file_info.get('filename') == params.output_file_name:
+                                uploaded_file_info = file_info
+                                break
+
+                        if uploaded_file_info and uploaded_file_info.get('url'):
+                            success_msg = f"✅ Image {params.output_file_name} generated successfully using {model_to_use}! It has been uploaded and available at {uploaded_file_info['url']}."
+                        else:
+                            success_msg = f"✅ Image {params.output_file_name} generated successfully using {model_to_use} and saved to downloads folder!"
+
+                        if emitted_text_parts:
+                            success_msg += "\n\n" + "".join(emitted_text_parts)
                         return ActionResult(extracted_content=success_msg)
                     else:
                         # Use OpenAI client for default model
@@ -3273,6 +3346,73 @@ class WebAgent:
                             success_msg = f"✅ Image {params.output_file_name} edited successfully using FLUX.1-Kontext-pro and saved to downloads folder! "
                             logger.warning("Could not retrieve S3 URL for edited image")
                         
+                        return ActionResult(extracted_content=success_msg)
+                    elif google_client is not None:
+                        # Google Nano Banana with one input image
+                        logger.info("Editing image with Google Nano Banana using input image and prompt")
+                        from google.genai import types as google_types  # type: ignore
+                        # Prepare contents: image then text
+                        image_path = input_images[0]
+                        mime = "image/png"
+                        if str(image_path).lower().endswith(".jpg") or str(image_path).lower().endswith(".jpeg"):
+                            mime = "image/jpeg"
+                        with open(image_path, "rb") as f:
+                            image_bytes = f.read()
+                        contents = [
+                            google_types.Content(
+                                role="user",
+                                parts=[
+                                    google_types.Part.from_bytes(mime_type=mime, data=image_bytes),
+                                ],
+                            ),
+                            google_types.Content(
+                                role="user",
+                                parts=[google_types.Part.from_text(text=params.prompt)],
+                            ),
+                        ]
+                        generate_content_config = google_types.GenerateContentConfig(
+                            response_modalities=["IMAGE", "TEXT"]
+                        )
+
+                        file_index = 0
+                        emitted_text_parts = []
+                        for chunk in google_client.models.generate_content_stream(
+                            model=google_model_name,
+                            contents=contents,
+                            config=generate_content_config,
+                        ):
+                            if (
+                                not chunk.candidates
+                                or not chunk.candidates[0].content
+                                or not chunk.candidates[0].content.parts
+                            ):
+                                continue
+                            part = chunk.candidates[0].content.parts[0]
+                            if getattr(part, 'inline_data', None) and getattr(part.inline_data, 'data', None):
+                                target_path = output_path if file_index == 0 else output_path.with_stem(f"{output_path.stem}_{file_index}")
+                                file_index += 1
+                                data_buffer = part.inline_data.data
+                                with open(target_path, "wb") as f:
+                                    f.write(data_buffer)
+                                logger.info(f"Edited image (Google) saved to: {target_path}")
+                            elif getattr(chunk, 'text', None):
+                                emitted_text_parts.append(chunk.text)
+
+                        # Upload and return
+                        result_files = []
+                        if self.current_execution_id:
+                            result_files = upload_task_result_files(downloads_path, self.current_execution_id)
+                        uploaded_file_info = None
+                        for file_info in result_files:
+                            if file_info.get('filename') == params.output_file_name:
+                                uploaded_file_info = file_info
+                                break
+                        if uploaded_file_info and uploaded_file_info.get('url'):
+                            success_msg = f"✅ Image {params.output_file_name} edited successfully using {model_to_use}! It has been uploaded and available at {uploaded_file_info['url']}."
+                        else:
+                            success_msg = f"✅ Image {params.output_file_name} edited successfully using {model_to_use} and saved to downloads folder!"
+                        if emitted_text_parts:
+                            success_msg += "\n\n" + "".join(emitted_text_parts)
                         return ActionResult(extracted_content=success_msg)
                     else:
                         # Use OpenAI client for default model
@@ -3352,16 +3492,85 @@ class WebAgent:
                             logger.warning("Could not retrieve S3 URL for edited image")
                         
                         return ActionResult(extracted_content=success_msg)
+                    elif google_client is not None:
+                        # Google Nano Banana with multiple images: send all as parts
+                        logger.info("Editing multiple images with Google Nano Banana")
+                        from google.genai import types as google_types  # type: ignore
+                        parts_list = []
+                        for idx, img_path in enumerate(input_images):
+                            mime = "image/png"
+                            lower = str(img_path).lower()
+                            if lower.endswith(".jpg") or lower.endswith(".jpeg"):
+                                mime = "image/jpeg"
+                            with open(img_path, "rb") as f:
+                                parts_list.append(google_types.Part.from_bytes(mime_type=mime, data=f.read()))
+                        contents = [
+                            google_types.Content(role="user", parts=parts_list),
+                            google_types.Content(role="user", parts=[google_types.Part.from_text(text=params.prompt)]),
+                        ]
+                        generate_content_config = google_types.GenerateContentConfig(
+                            response_modalities=["IMAGE", "TEXT"]
+                        )
+
+                        file_index = 0
+                        emitted_text_parts = []
+                        for chunk in google_client.models.generate_content_stream(
+                            model=google_model_name,
+                            contents=contents,
+                            config=generate_content_config,
+                        ):
+                            if (
+                                not chunk.candidates
+                                or not chunk.candidates[0].content
+                                or not chunk.candidates[0].content.parts
+                            ):
+                                continue
+                            part = chunk.candidates[0].content.parts[0]
+                            if getattr(part, 'inline_data', None) and getattr(part.inline_data, 'data', None):
+                                target_path = output_path if file_index == 0 else output_path.with_stem(f"{output_path.stem}_{file_index}")
+                                file_index += 1
+                                data_buffer = part.inline_data.data
+                                with open(target_path, "wb") as f:
+                                    f.write(data_buffer)
+                                logger.info(f"Edited images (Google) saved to: {target_path}")
+                            elif getattr(chunk, 'text', None):
+                                emitted_text_parts.append(chunk.text)
+
+                        # Upload and return
+                        result_files = []
+                        if self.current_execution_id:
+                            result_files = upload_task_result_files(downloads_path, self.current_execution_id)
+                        uploaded_file_info = None
+                        for file_info in result_files:
+                            if file_info.get('filename') == params.output_file_name:
+                                uploaded_file_info = file_info
+                                break
+                        if uploaded_file_info and uploaded_file_info.get('url'):
+                            success_msg = f"✅ Image {params.output_file_name} edited successfully using {model_to_use}! It has been uploaded and available at {uploaded_file_info['url']}."
+                        else:
+                            success_msg = f"✅ Image {params.output_file_name} edited successfully using {model_to_use} and saved to downloads folder!"
+                        if emitted_text_parts:
+                            success_msg += "\n\n" + "".join(emitted_text_parts)
+                        return ActionResult(extracted_content=success_msg)
                     else:
                         # Use OpenAI client for default model
                         logger.info("Editing multiple input images...")
-                        with open(input_images[0], "rb") as img1, open(input_images[1], "rb") as img2:
+                        # Open all images and pass them to OpenAI
+                        image_files = []
+                        for img_path in input_images:
+                            image_files.append(open(img_path, "rb"))
+                        
+                        try:
                             result = client.images.edit(
                                 model="gpt-image-1",
-                                image=[img1, img2] + [open(img, "rb") for img in input_images[2:]],
+                                image=image_files,
                                 prompt=params.prompt,
                                 size=params.size
                             )
+                        finally:
+                            # Close all opened files
+                            for img_file in image_files:
+                                img_file.close()
                 
                 # Save the generated image (for OpenAI default model only)
                 if result.data and len(result.data) > 0:
@@ -3388,10 +3597,10 @@ class WebAgent:
                     
                     # Create success message
                     if uploaded_file_info and uploaded_file_info.get('url'):
-                        success_msg = f"✅ Image {params.output_file_name} generated successfully! It has been uploaded and available at {uploaded_file_info['url']}. You MUST use the URL to refer this image in any HTML or Markdown content."
+                        success_msg = f"✅ Image {params.output_file_name} generated successfully using {model_to_use}! It has been uploaded and available at {uploaded_file_info['url']}. You MUST use the URL to refer this image in any HTML or Markdown content."
                         logger.info(f"Generated image uploaded to S3: {uploaded_file_info['url']}")
                     else:
-                        success_msg = f"✅ Image {params.output_file_name} generated successfully and saved to downloads folder! "
+                        success_msg = f"✅ Image {params.output_file_name} generated successfully using {model_to_use} and saved to downloads folder! "
                         logger.warning("Could not retrieve S3 URL for generated image")
                     
                     return ActionResult(extracted_content=success_msg)

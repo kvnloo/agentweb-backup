@@ -50,6 +50,7 @@ interface WorkflowTask {
   browser_use_log?: string;
   startTime?: string;
   llmName?: string;
+  imageModel?: string;
   result_files?: {
     url: string;
     filename: string;

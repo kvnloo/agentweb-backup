@@ -57,7 +57,7 @@ import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
 import ScheduleForm from "../components/ScheduleForm";
 import ScheduleList from "../components/ScheduleList";
-import { buildApiUrl, getLLMsForTask, MAX_FILE_SIZE } from "../config";
+import { buildApiUrl, getLLMsForTask, MAX_FILE_SIZE, DEFAULT_IMAGE_MODEL } from "../config";
 import { toast } from "react-hot-toast";
 import LockIcon from "@mui/icons-material/Lock";
 import LockOpenIcon from "@mui/icons-material/LockOpen";
@@ -137,6 +137,8 @@ interface TaskExecution {
     token: string;
     is_html?: boolean;
   }[];
+  llmName?: string;
+  imageModel?: string;
   archived: boolean;
   knowledge_base_updated_at?: string;
 }
@@ -2141,7 +2143,7 @@ export default function TaskDetails() {
             <InputLabel id="image-model-select-label">Image Model</InputLabel>
             <Select
               labelId="image-model-select-label"
-              value={task?.imageModel || "openai-image-1"}
+              value={task?.imageModel || DEFAULT_IMAGE_MODEL}
               onChange={(e) => {
                 const newModel = e.target.value;
                 console.log('Image model selection changed:', {
@@ -2181,6 +2183,14 @@ export default function TaskDetails() {
                   <Typography>FLUX.1-Kontext-pro (Azure)</Typography>
                   <Typography variant="caption" color="text.secondary">
                     Advanced image generation and editing model
+                  </Typography>
+                </Box>
+              </MenuItem>
+              <MenuItem value="gemini-2.5-flash-image-preview">
+                <Box>
+                  <Typography>Nano Banana (Google Gemini)</Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    gemini-2.5-flash-image-preview for image + text
                   </Typography>
                 </Box>
               </MenuItem>
