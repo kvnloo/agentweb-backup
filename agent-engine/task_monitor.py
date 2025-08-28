@@ -843,10 +843,14 @@ async def execute_task(execution):
                 logger.info(f"Processing revision execution for task {task_id} execution {execution_id}")
                 logger.info(f"Original execution: {original_execution_id}")
                 
+                # Get variations count for image revisions
+                variations = execution.get('variations', 1)
+                logger.info(f"Image revision variations requested: {variations}")
+                
                 if original_image_url:
                     logger.info(f"Original image: {original_image_url}")
                     # Image revision
-                    prompt = f"""Task: Create a new image based on the revision prompt and the original image. Use download_image to download reference images and generate_image to create the result images. Valid size values for generate_image include "1024x1024", "1536x1024", "1024x1536", "auto". Valid quality values for generate_image include "low", "medium", "high", "auto". DO NOT browse the internet for other images.\n\n
+                    prompt = f"""Task: Create {variations} image{'s' if variations > 1 else ''} based on the revision prompt and the original image. Use download_image to download reference images and generate_image to create the result images. Valid size values for generate_image include "1024x1024", "1536x1024", "1024x1536", "auto". Valid quality values for generate_image include "low", "medium", "high", "auto". DO NOT browse the internet for other images.\n\n
                     Revision Prompt: {revision_prompt}\n    
                     Original Image URL: {original_image_url}\n\n"""
                 elif original_report_url:

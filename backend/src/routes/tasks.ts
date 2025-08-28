@@ -255,7 +255,7 @@ router.post('/:id/upload-file', upload.single('file'), uploadFileToExecution);
 router.post('/:id/executions/revision', authenticateToken, async (req: Request, res: Response) => {
   try {
     const { id: taskId } = req.params;
-    const { revision_prompt, image_url, report_url, original_execution_id } = req.body;
+    const { revision_prompt, image_url, report_url, original_execution_id, variations } = req.body;
     const userId = (req as AuthenticatedRequest).user?.userId;
 
     if (!userId) {
@@ -295,7 +295,8 @@ router.post('/:id/executions/revision', authenticateToken, async (req: Request, 
       revision_prompt: revision_prompt,
       original_image_url: image_url || undefined,
       original_report_url: report_url || undefined,
-      original_execution_id: original_execution_id
+      original_execution_id: original_execution_id,
+      variations: variations || 1
     };
 
     await taskDb.createTaskExecution(execution);
