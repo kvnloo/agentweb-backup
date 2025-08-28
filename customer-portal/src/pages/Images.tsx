@@ -145,6 +145,7 @@ const ImagesPage: React.FC = () => {
   const [imagePreviewOpen, setImagePreviewOpen] = useState(false);
   const [previewImage, setPreviewImage] = useState<{ url: string; filename: string; taskId: string; executionId: string } | null>(null);
   const [revisionPrompt, setRevisionPrompt] = useState('');
+  const [revisionVariations, setRevisionVariations] = useState(1);
   const [isSubmittingRevision, setIsSubmittingRevision] = useState(false);
   // Placid Canvas states
   const [editorDialogOpen, setEditorDialogOpen] = useState(false);
@@ -223,6 +224,7 @@ const ImagesPage: React.FC = () => {
   useEffect(() => {
     if (!imagePreviewOpen) {
       setRevisionPrompt('');
+      setRevisionVariations(1);
     }
   }, [imagePreviewOpen]);
 
@@ -697,7 +699,8 @@ const ImagesPage: React.FC = () => {
         {
           revision_prompt: revisionPrompt.trim(),
           image_url: previewImage.url,
-          original_execution_id: previewImage.executionId
+          original_execution_id: previewImage.executionId,
+          variations: revisionVariations
         },
         {
           headers: { Authorization: `Bearer ${token}` },
@@ -707,10 +710,11 @@ const ImagesPage: React.FC = () => {
       if (response.data.success) {
         toast({
           title: "Revision Submitted",
-          description: "Your image revision request has been submitted. The new execution will start shortly.",
+          description: `Your image revision request for ${revisionVariations} variation${revisionVariations > 1 ? 's' : ''} has been submitted. The new execution will start shortly.`,
         });
         setImagePreviewOpen(false);
         setRevisionPrompt('');
+        setRevisionVariations(1);
         // Refresh the executions to show the new pending execution
         await fetchExecutionsWithImages();
       }
@@ -2216,8 +2220,28 @@ const ImagesPage: React.FC = () => {
                 <div className="w-80 bg-gray-900 border-l border-gray-600 p-4 flex flex-col">
                   <div className="flex-1">
                     <Label htmlFor="revisionPrompt" className="text-white text-sm font-medium mb-3 block">
-                      Image Revision Prompt
+                      Image Revision/Variation
                     </Label>
+                    
+                    {/* Variations Input */}
+                    <div className="mb-4">
+                      <Label htmlFor="variations" className="text-white text-xs font-medium mb-2 block">
+                        Number of Variations
+                      </Label>
+                      <Select value={revisionVariations.toString()} onValueChange={(value) => setRevisionVariations(parseInt(value))}>
+                        <SelectTrigger className="w-full bg-gray-800 border-gray-600 text-white">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent className="bg-gray-800 border-gray-600 text-white">
+                          <SelectItem value="1">1</SelectItem>
+                          <SelectItem value="2">2</SelectItem>
+                          <SelectItem value="3">3</SelectItem>
+                          <SelectItem value="4">4</SelectItem>
+                          <SelectItem value="5">5</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    
                     <Textarea
                       id="revisionPrompt"
                       placeholder="Describe how you'd like to revise this image (e.g., 'Make it more vibrant', 'Change the background to blue', 'Add more details')"
@@ -2226,6 +2250,14 @@ const ImagesPage: React.FC = () => {
                       className="min-h-[120px] bg-gray-800 border-gray-600 text-white placeholder-gray-400 resize-none mb-4 w-full"
                       onClick={(e) => e.stopPropagation()}
                     />
+                    
+                    {/* Tip about adding other image URLs */}
+                    <div className="mb-4 p-3 bg-blue-900/20 border border-blue-600/30 rounded-md">
+                      <p className="text-blue-300 text-xs">
+                        💡 <strong>Tip:</strong> You can include other image URLs in your prompt to use as references. 
+                        For example: "Make it similar to https://example.com/image.jpg but with a blue background"
+                      </p>
+                    </div>
                     <Button
                       onClick={(e) => {
                         e.stopPropagation();
@@ -2242,7 +2274,7 @@ const ImagesPage: React.FC = () => {
                       ) : (
                         <>
                           <Zap className="h-4 w-4 mr-2" />
-                          Submit Revision
+                          Submit Revision{revisionVariations > 1 ? ` (${revisionVariations} variations)` : ''}
                         </>
                       )}
                     </Button>

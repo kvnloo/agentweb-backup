@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-08-28',
+    changes: [
+      'Supported image variation generation',
+      '- Users can now request 1-5 variations when revising images',
+      '- Image revision feature renamed to "Image Revision/Variation" for clarity',
+      '- Added helpful tip about including other image URLs as references in revision prompts',
+    ],
+  },
+  {
     date: '2025-08-27',
     changes: [
       'Fixed format issue of subscriber emails',
