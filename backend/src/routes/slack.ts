@@ -281,6 +281,29 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
         console.log(`📝 Opened feedback modal for: ${assetUrl}`);
         res.status(200).json({}); // Empty response for modal trigger
 
+      } else if (action.action_id === 'reject_asset') {
+        // Handle rejection directly
+        await updateApprovalMessage(
+          channel.id,
+          message.ts,
+          'rejected',
+          user.username || user.id,
+          undefined,
+          'asset'
+        );
+
+        await approvalDb.updateApprovalStatus(
+          assetUrl,
+          'rejected',
+          user.username || user.id
+        );
+
+        console.log(`❌ Rejected: ${assetUrl} by ${user.username}`);
+        res.status(200).json({
+          response_type: "in_channel",
+          text: `❌ Rejected by @${user.username}`
+        });
+
       } else {
         return res.status(200).json({ text: "Unknown action" });
       }

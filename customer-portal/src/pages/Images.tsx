@@ -1195,7 +1195,7 @@ const ImagesPage: React.FC = () => {
       for (const file of execution.result_files) {
         if (!file.is_archived && file.url !== revisionImage.assetUrl) {
           const approval = getApprovalStatus(file.url);
-          const isUnreviewed = !approval || (approval.status !== 'pending' && approval.status !== 'approved' && approval.status !== 'needs_changes' && approval.status !== 'revision_submitted');
+          const isUnreviewed = !approval || (approval.status !== 'pending' && approval.status !== 'approved' && approval.status !== 'needs_changes' && approval.status !== 'revision_submitted' && approval.status !== 'rejected');
           
           // Only include unreviewed images
           if (isUnreviewed) {
@@ -1773,6 +1773,9 @@ const ImagesPage: React.FC = () => {
                                 } else if (status === 'revision_submitted') {
                                   const submittedTime = approval?.updatedAt ? new Date(approval.updatedAt).toLocaleString() : 'Unknown time';
                                   tooltip = `Revision submitted at ${submittedTime}`;
+                                } else if (status === 'rejected') {
+                                  const rejectedTime = approval?.updatedAt ? new Date(approval.updatedAt).toLocaleString() : 'Unknown time';
+                                  tooltip = `Rejected by ${approval?.reviewedBy || 'Unknown'} at ${rejectedTime}`;
                                 } else {
                                   tooltip = 'Request Approval';
                                 }
@@ -1784,7 +1787,7 @@ const ImagesPage: React.FC = () => {
                                         size="sm"
                                         className="h-8 w-8 p-0 hover:bg-gray-100 dark:hover:bg-gray-800"
                                         onClick={
-                                          status === 'pending' || status === 'approved' || status === 'revision_submitted'
+                                          status === 'pending' || status === 'approved' || status === 'revision_submitted' || status === 'rejected'
                                             ? undefined 
                                             : status === 'needs_changes'
                                               ? () => handleRevisionClick(execution.executionId, file.url, file.filename, approval?.feedback || '', task.taskId, approval?.note)
@@ -1800,6 +1803,8 @@ const ImagesPage: React.FC = () => {
                                       <MessageSquare className="h-4 w-4 text-blue-500" />
                                     ) : status === 'revision_submitted' ? (
                                       <Send className="h-4 w-4 text-gray-400" />
+                                    ) : status === 'rejected' ? (
+                                      <X className="h-4 w-4 text-red-500" />
                                     ) : (
                                       <MessageSquare className="h-4 w-4 text-gray-400 hover:text-blue-500" />
                                     )}
@@ -3174,7 +3179,7 @@ const ImagesPage: React.FC = () => {
                         .filter(file => {
                           if (file.is_archived || file.url === revisionImage.assetUrl) return false;
                           const approval = getApprovalStatus(file.url);
-                          return !approval || (approval.status !== 'pending' && approval.status !== 'approved' && approval.status !== 'needs_changes' && approval.status !== 'revision_submitted');
+                          return !approval || (approval.status !== 'pending' && approval.status !== 'approved' && approval.status !== 'needs_changes' && approval.status !== 'revision_submitted' && approval.status !== 'rejected');
                         })
                         .map((file, fileIndex) => (
                           <div 
