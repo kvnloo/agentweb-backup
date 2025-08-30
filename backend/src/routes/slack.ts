@@ -10,6 +10,7 @@ import {
 import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
 import { taskDb, subscriberDb } from "../services/db";
 import { emailService } from "../services/emailService";
+import { createRevisionExecutionFromSlack } from "../controllers/tasks";
 
 const router = express.Router();
 
@@ -346,6 +347,39 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
             feedbackValue,
             originalApproval.assetType || 'asset'
           );
+        }
+
+        // Automatically start a new revision execution with the feedback
+        if (originalApproval && originalApproval.executionId) {
+          try {
+            // Get the original execution to find the task ID
+            const execution = await taskDb.getTaskExecutionById(originalApproval.executionId);
+            if (execution) {
+              console.log(`🚀 Starting feedback-based revision for task: ${execution.taskId}`);
+              
+              // Use the common function to create revision execution
+              const revisionResult = await createRevisionExecutionFromSlack(
+                execution.taskId,
+                `Please revise this ${originalApproval.assetType || 'asset'} based on the following feedback: ${feedbackValue}`,
+                originalApproval.assetUrl,
+                originalApproval.executionId,
+                originalApproval.assetType || 'asset',
+                user.username || user.id,
+                1
+              );
+              
+              if (revisionResult.success) {
+                console.log(`✅ Feedback-based revision started: ${revisionResult.execution.executionId}`);
+              } else {
+                console.error(`❌ Failed to start feedback-based revision`);
+              }
+            } else {
+              console.error(`❌ Could not find execution for ID: ${originalApproval.executionId}`);
+            }
+          } catch (error) {
+            console.error('❌ Error starting feedback-based revision:', error);
+            // Don't fail the feedback submission if revision start fails
+          }
         }
 
         console.log(`🔶 Changes requested for: ${assetUrl} by ${user.username}`);

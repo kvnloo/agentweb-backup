@@ -1182,3 +1182,99 @@ export const listPlacidTemplates = async (req: AuthRequest, res: Response) => {
     return res.status(500).json({ message: 'Error listing templates' });
   }
 };
+
+export const createRevisionExecution = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const taskId = req.params.id;
+    const { revision_prompt, image_url, report_url, original_execution_id, variations } = req.body;
+    
+    // Support both image_url (for images) and report_url (for HTML reports)
+    const assetUrl = image_url || report_url;
+    if (!revision_prompt || !assetUrl || !original_execution_id) {
+      return res.status(400).json({ message: 'Missing required fields: revision_prompt, asset_url (image_url or report_url), original_execution_id' });
+    }
+
+    // Get the task to verify ownership and get the original prompt
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Get user to check if admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    // Verify task belongs to user or user is admin
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Create a new task execution with revision prompt
+    const execution = {
+      executionId: Date.now().toString(),
+      taskId,
+      userId: task.userId, // Use the task owner's ID for execution
+      run_user_id: userId !== task.userId ? userId : undefined, // Record who actually ran the task if different from owner
+      status: 'pending',
+      startTime: new Date().toISOString(),
+      revision_prompt: revision_prompt,
+      original_image_url: image_url || undefined,
+      original_report_url: report_url || undefined,
+      original_execution_id: original_execution_id,
+      variations: variations || 1
+    };
+
+    await taskDb.createTaskExecution(execution);
+    res.status(201).json({ success: true, execution });
+  } catch (error) {
+    console.error('Error creating revision execution:', error);
+    res.status(500).json({ message: 'Error creating revision execution' });
+  }
+};
+
+// Function that can be called from Slack without Express request/response objects
+export const createRevisionExecutionFromSlack = async (
+  taskId: string,
+  revisionPrompt: string,
+  assetUrl: string,
+  originalExecutionId: string,
+  assetType: string,
+  runUserId: string,
+  variations: number = 1
+) => {
+  try {
+    // Get the task to verify ownership
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      throw new Error('Task not found');
+    }
+
+    // Create a new task execution with revision prompt
+    const execution = {
+      executionId: Date.now().toString(),
+      taskId,
+      userId: task.userId, // Use the task owner's ID for execution
+      run_user_id: runUserId, // Record who provided the feedback
+      status: 'pending',
+      startTime: new Date().toISOString(),
+      revision_prompt: revisionPrompt,
+      original_image_url: assetType === 'image' ? assetUrl : undefined,
+      original_report_url: assetType === 'html' ? assetUrl : undefined,
+      original_execution_id: originalExecutionId,
+      variations: variations
+    };
+
+    await taskDb.createTaskExecution(execution);
+    return { success: true, execution };
+  } catch (error) {
+    console.error('Error creating revision execution from Slack:', error);
+    throw error;
+  }
+};
