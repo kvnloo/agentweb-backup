@@ -1250,6 +1250,12 @@ export const createRevisionExecutionFromSlack = async (
   variations: number = 1
 ) => {
   try {
+    // Only support revision for image and html assets
+    if (assetType !== 'image' && assetType !== 'html') {
+      console.log(`⚠️ Skipping revision for unsupported asset type: ${assetType}`);
+      return { success: false, message: `Revision not supported for asset type: ${assetType}` };
+    }
+
     // Get the task to verify ownership
     const task = await taskDb.getTaskById(taskId);
     if (!task) {
@@ -1272,6 +1278,16 @@ export const createRevisionExecutionFromSlack = async (
     };
 
     await taskDb.createTaskExecution(execution);
+
+    // Update the approval status to 'revision_submitted' to indicate revision is in progress
+    const { approvalDb } = await import('../services/approvalDb');
+    await approvalDb.updateApprovalStatus(
+      assetUrl,
+      'revision_submitted',
+      runUserId,
+      `Revision execution ${execution.executionId} started based on feedback: ${revisionPrompt}`
+    );
+
     return { success: true, execution };
   } catch (error) {
     console.error('Error creating revision execution from Slack:', error);

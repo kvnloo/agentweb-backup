@@ -368,7 +368,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                 1
               );
               
-              if (revisionResult.success) {
+              if (revisionResult.success && revisionResult.execution) {
                 console.log(`✅ Feedback-based revision started: ${revisionResult.execution.executionId}`);
               } else {
                 console.error(`❌ Failed to start feedback-based revision`);
