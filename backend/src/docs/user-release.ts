@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-09-02',
+    changes: [
+      'Automated asset revision based on feedback',
+      '- When users provide feedback via Slack "Needs Changes" button, the system now automatically creates revision executions',
+      '- Supports automated revision for image and HTML assets (video assets require manual review)',
+      '- Revision executions are sent back to the same Slack channel where the original feedback was provided',
+      '- Added "Reject" button option in Slack approval workflow for definitive asset rejection',
+    ],
+  },
+  {
     date: '2025-08-28',
     changes: [
       'Supported image variation generation',
