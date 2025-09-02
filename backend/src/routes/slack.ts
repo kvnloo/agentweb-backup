@@ -271,12 +271,17 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
         });
 
       } else if (action.action_id === 'needs_changes_asset') {
+        // Get asset type for proper display and revision hint
+        const approval = await approvalDb.getApproval(assetUrl);
+        const assetType = approval?.assetType || 'asset';
+        
         // Open feedback modal instead of direct rejection
         await openFeedbackModal(
           payload.trigger_id,
           assetUrl,
           filename,
-          executionId
+          executionId,
+          assetType
         );
 
         console.log(`📝 Opened feedback modal for: ${assetUrl}`);
@@ -317,7 +322,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
       
       if (view.callback_id === 'feedback_modal') {
         const metadata = JSON.parse(view.private_metadata);
-        const { assetUrl, filename, executionId } = metadata;
+        const { assetUrl, filename, executionId, assetType } = metadata;
         
         // Get feedback from the modal
         const feedbackValue = view.state.values.feedback_input.feedback_text.value;
