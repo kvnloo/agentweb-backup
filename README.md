@@ -239,6 +239,16 @@ This creates a public URL that Slack can use to send approval button interaction
 
 ### Frontend Setup for Development
 
+**Note**: The frontend applications are now separate repositories:
+
+- **Partner Portal**: [AgentWeb Partner Portal](https://github.com/AgentWebPro/agentweb-partner-portal) (if separate)
+- **Customer Portal**: [AgentWeb Customer Portal](https://github.com/AgentWebPro/agentweb-customer-portal)
+- **Growth Genius Chat**: [Growth Genius Chat](https://github.com/AgentWebPro/growth-genius-chat)
+
+For development setup, please refer to the individual repository README files.
+
+#### Partner Portal Development (if still in this repo)
+
 1. Install dependencies:
 
 ```bash
@@ -302,18 +312,20 @@ npm run create-admin
 
 ```
 .
-├── backend/
+├── backend/             # Backend API and services
 │   ├── src/
 │   │   ├── routes/      # API routes
 │   │   ├── services/    # Database and business logic
 │   │   └── utils/       # Utility functions
 │   └── scripts/         # Database setup scripts
-└── partner-portal/
-    └── src/
-        ├── components/  # React components
-        ├── contexts/    # React contexts
-        └── pages/       # Page components
+├── agent-engine/        # Agent execution engine
+├── partner-portal/      # Partner portal frontend (if still in this repo)
+└── misc/               # Documentation and assets
 ```
+
+**Note**: Frontend applications are now separate repositories:
+- [AgentWeb Customer Portal](https://github.com/AgentWebPro/agentweb-customer-portal)
+- [Growth Genius Chat](https://github.com/AgentWebPro/growth-genius-chat)
 
 ### Environment Variables
 
@@ -392,10 +404,17 @@ Note: Environment variables must be set during build time for the frontend, as V
 
 ### Customer Portal Deployment
 
-1. Build the production version and create deployment package:
+**Note**: The Customer Portal is now a separate repository. Please refer to the [AgentWeb Customer Portal repository](https://github.com/AgentWebPro/agentweb-customer-portal) for deployment instructions.
+
+1. Clone the customer portal repository:
+```bash
+git clone https://github.com/AgentWebPro/agentweb-customer-portal.git
+cd agentweb-customer-portal
+```
+
+2. Build the production version and create deployment package:
 
 ```bash
-cd customer-portal && \
 VITE_API_URL=https://api.agentweb.pro \
 VITE_PARTNER_PORTAL_URL=https://partner.agentweb.pro \
 VITE_DEBUG=false \
@@ -405,7 +424,7 @@ mkdir -p builds && \
 zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json server.js
 ```
 
-2. Create a new application in Elastic Beanstalk:
+3. Create a new application in Elastic Beanstalk:
    - Go to AWS Management Console > Elastic Beanstalk
    - Click "Create application"
    - Enter application name (e.g., "agentweb-customer-portal")
@@ -417,10 +436,17 @@ Note: Environment variables must be set during build time for the frontend, as V
 
 ### Growth Genius Chat Deployment
 
-1. Build the production version and create deployment package:
+**Note**: The Growth Genius Chat is now a separate repository. Please refer to the [Growth Genius Chat repository](https://github.com/AgentWebPro/growth-genius-chat) for deployment instructions.
+
+1. Clone the growth chat repository:
+```bash
+git clone https://github.com/AgentWebPro/growth-genius-chat.git
+cd growth-genius-chat
+```
+
+2. Build the production version and create deployment package:
 
 ```bash
-cd growth-chat && \
 VITE_API_URL=https://api.agentweb.pro \
 npm run build && \
 VERSION="0.21" && \
@@ -428,7 +454,7 @@ mkdir -p builds && \
 zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json server.js
 ```
 
-2. Create a new application in Elastic Beanstalk:
+3. Create a new application in Elastic Beanstalk:
    - Go to AWS Management Console > Elastic Beanstalk
    - Click "Create application"
    - Enter application name (e.g., "agentweb-growth-genius-chat")
@@ -436,7 +462,7 @@ zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json serve
    - Upload the versioned zip file from `builds/deploy_v${VERSION}.zip`
    - Click "Create application"
 
-3. Configure environment variables:
+4. Configure environment variables:
    - In your environment, go to Configuration > Software
    - Click "Edit"
    - Add environment variables:
