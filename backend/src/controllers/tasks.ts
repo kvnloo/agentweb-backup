@@ -1247,7 +1247,9 @@ export const createRevisionExecutionFromSlack = async (
   originalExecutionId: string,
   assetType: string,
   runUserId: string,
-  variations: number = 1
+  variations: number = 1,
+  slackChannel?: string,
+  slackChannelName?: string
 ) => {
   try {
     // Only support revision for image and html assets
@@ -1274,7 +1276,12 @@ export const createRevisionExecutionFromSlack = async (
       original_image_url: assetType === 'image' ? assetUrl : undefined,
       original_report_url: assetType === 'html' ? assetUrl : undefined,
       original_execution_id: originalExecutionId,
-      variations: variations
+      variations: variations,
+      // Add Slack channel info for agent-engine to use
+      slack_channel: slackChannel,
+      slack_channel_name: slackChannelName,
+      requireApproval: true,  // Revision executions always require approval
+      approvalAssetType: assetType  // Record the asset type that was approved/rejected
     };
 
     await taskDb.createTaskExecution(execution);

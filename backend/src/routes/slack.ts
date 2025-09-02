@@ -370,7 +370,9 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                 originalApproval.executionId,
                 originalApproval.assetType || 'asset',
                 user.username || user.id,
-                1
+                1,
+                originalApproval.slackChannel,
+                originalApproval.slackChannelName
               );
               
               if (revisionResult.success && revisionResult.execution) {
