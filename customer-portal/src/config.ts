@@ -1,5 +1,5 @@
-// Default API URL from environment variable or fallback to localhost
-const apiBaseUrl = import.meta.env.VITE_API_URL || "http://localhost:3001";
+// Default API URL from environment variable or fallback to ngrok tunnel
+const apiBaseUrl = import.meta.env.VITE_API_URL || "https://14355e80a361.ngrok-free.app";
 
 // Partner Portal URL from environment variable or fallback to localhost
 const partnerPortalUrl = import.meta.env.VITE_PARTNER_PORTAL_URL || "http://localhost:5173";
