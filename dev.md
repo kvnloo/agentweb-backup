@@ -74,3 +74,5 @@ deploying Growth Genius: creating a beanstalk service could easily got stuck bec
 August 28, 2025
 supporting multiple image input for openai model require using latest openai model
 > pip install --upgrade openai
+
+We have issues creating new environment in elastic beanstalk. We tested using AWSEBSSecurityGroup for EC2 security groups because the service instances (EC2) needs to communicate with the load balancer but it still not working.

@@ -903,7 +903,7 @@ const VideosPage: React.FC = () => {
       for (const file of execution.result_files) {
         if (!file.is_archived && file.url !== revisionVideo.url) {
           const approval = getApprovalStatus(file.url);
-          const isUnreviewed = !approval || (approval.status !== 'pending' && approval.status !== 'approved' && approval.status !== 'needs_changes' && approval.status !== 'revision_submitted');
+          const isUnreviewed = !approval || (approval.status !== 'pending' && approval.status !== 'approved' && approval.status !== 'needs_changes' && approval.status !== 'revision_submitted' && approval.status !== 'rejected');
           
           // Only include unreviewed videos
           if (isUnreviewed) {
@@ -1249,7 +1249,7 @@ const VideosPage: React.FC = () => {
                                 onClick={(e) => {
                                   e.stopPropagation();
                                   const approval = getApprovalStatus(file.url);
-                                  if (approval?.status === 'pending' || approval?.status === 'approved' || approval?.status === 'revision_submitted') {
+                                  if (approval?.status === 'pending' || approval?.status === 'approved' || approval?.status === 'revision_submitted' || approval?.status === 'rejected') {
                                     return; // Non-clickable for these statuses
                                   }
                                   
@@ -1272,6 +1272,8 @@ const VideosPage: React.FC = () => {
                                       return `Changes requested by ${approval.reviewedBy} at ${new Date(approval.updatedAt).toLocaleString()} in ${approval.slackChannelName || 'Slack channel'}${approval.feedback ? `\nFeedback: ${approval.feedback}` : ''}`;
                                     case 'revision_submitted':
                                       return `Revision submitted at ${new Date(approval.updatedAt).toLocaleString()} in ${approval.slackChannelName || 'Slack channel'}`;
+                                    case 'rejected':
+                                      return `Rejected by ${approval.reviewedBy} at ${new Date(approval.updatedAt).toLocaleString()} in ${approval.slackChannelName || 'Slack channel'}`;
                                     default:
                                       return "Send for approval";
                                   }
@@ -1292,6 +1294,8 @@ const VideosPage: React.FC = () => {
                                       return <AlertTriangle className="h-4 w-4 text-orange-500" />;
                                     case 'revision_submitted':
                                       return <Send className="h-4 w-4 text-gray-400" />;
+                                    case 'rejected':
+                                      return <X className="h-4 w-4 text-red-500" />;
                                     default:
                                       return <MessageSquare className="h-4 w-4 text-gray-400 hover:text-blue-500" />;
                                   }

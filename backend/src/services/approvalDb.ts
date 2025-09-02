@@ -56,7 +56,7 @@ export interface AssetApproval {
   assetType: AssetType;
   executionId?: string; // Optional reference to execution
   userId: string;
-  status: 'pending' | 'approved' | 'needs_changes' | 'revision_submitted';
+  status: 'pending' | 'approved' | 'needs_changes' | 'revision_submitted' | 'rejected';
   slackChannel: string; // Channel ID
   slackChannelName: string; // Channel name (e.g., "approvals")
   slackMessageTs: string | null;
@@ -117,11 +117,11 @@ export class ApprovalDB {
   }
 
   /**
-   * Update approval status (approved/needs_changes)
+   * Update approval status (approved/needs_changes/rejected)
    */
   async updateApprovalStatus(
     assetUrl: string,
-    status: 'approved' | 'needs_changes' | 'revision_submitted',
+    status: 'approved' | 'needs_changes' | 'revision_submitted' | 'rejected',
     reviewedBy: string,
     feedback?: string
   ): Promise<AssetApproval | null> {

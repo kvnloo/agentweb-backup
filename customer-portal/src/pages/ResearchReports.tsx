@@ -2373,6 +2373,13 @@ const ResearchReportsPage: React.FC = () => {
                                         ).toLocaleString()
                                       : "Unknown time";
                                     tooltip = `Revision submitted at ${submittedTime}`;
+                                  } else if (status === "rejected") {
+                                    const rejectedTime = approval?.updatedAt
+                                      ? new Date(
+                                          approval.updatedAt
+                                        ).toLocaleString()
+                                      : "Unknown time";
+                                    tooltip = `Rejected by ${approval?.reviewedBy || "Unknown"} at ${rejectedTime}`;
                                   } else {
                                     tooltip = "Request Approval";
                                   }
@@ -2386,7 +2393,8 @@ const ResearchReportsPage: React.FC = () => {
                                         onClick={
                                           status === "pending" ||
                                           status === "approved" ||
-                                          status === "revision_submitted"
+                                          status === "revision_submitted" ||
+                                          status === "rejected"
                                             ? undefined
                                             : status === "needs_changes"
                                             ? () =>
@@ -2415,6 +2423,8 @@ const ResearchReportsPage: React.FC = () => {
                                           <MessageSquare className="h-4 w-4 text-blue-500" />
                                         ) : status === "revision_submitted" ? (
                                           <Send className="h-4 w-4 text-gray-400" />
+                                        ) : status === "rejected" ? (
+                                          <X className="h-4 w-4 text-red-500" />
                                         ) : (
                                           <MessageSquare className="h-4 w-4 text-gray-400 hover:text-blue-500" />
                                         )}
@@ -2707,7 +2717,8 @@ const ResearchReportsPage: React.FC = () => {
                           (approval.status !== "pending" &&
                             approval.status !== "approved" &&
                             approval.status !== "needs_changes" &&
-                            approval.status !== "revision_submitted")
+                            approval.status !== "revision_submitted" &&
+                            approval.status !== "rejected")
                         );
                       })
                       .map((file, fileIndex) => (

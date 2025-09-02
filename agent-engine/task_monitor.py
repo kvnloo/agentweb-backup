@@ -360,39 +360,57 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                     
                     # Check if task requires approval (regardless of subscribers)
                     # This ensures approval requests are sent even for tasks with no subscribers
-                    if task.get('requireApproval') and task.get('slackChannel'):
+                    # Use execution-level channel info if available (for revisions), otherwise use task-level
+                    slack_channel = execution.get('slack_channel') or task.get('slackChannel')
+                    # Use execution-level requireApproval if available (for revisions), otherwise use task-level
+                    requires_approval = execution.get('requireApproval') if execution.get('requireApproval') is not None else task.get('requireApproval')
+                    if requires_approval and slack_channel:
                         # Send Slack approval request instead of emails
                         logger.info(f"Task {execution['taskId']} requires approval. Sending Slack approval request.")
                         try:
-                            # Find the first HTML report in result_files
-                            html_report = None
+                            # Determine the expected asset type from execution record
+                            expected_asset_type = execution.get('approvalAssetType')
+                            
+                            # Find the asset matching the expected type in result_files
+                            asset_file = None
+                            asset_type = None
                             if execution.get('result_files'):
                                 for file_info in execution['result_files']:
-                                    # Check if file is HTML using view_type
-                                    if file_info.get('view_type') == 'html':
-                                        html_report = file_info
-                                        break
+                                    # If we have an expected asset type, look for that specific type
+                                    if expected_asset_type:
+                                        if file_info.get('view_type') == expected_asset_type:
+                                            asset_file = file_info
+                                            asset_type = expected_asset_type
+                                            break
+                                    else:
+                                        # Fallback: Check if file is HTML using view_type
+                                        if file_info.get('view_type') == 'html':
+                                            asset_file = file_info
+                                            asset_type = 'html'
+                                            break
                             
-                            if html_report:
+                            if asset_file:
                                 # Send Slack approval request
                                 from slack_utils import send_task_approval_request
                                 send_task_approval_request(
                                     task_id=execution['taskId'],
                                     task_name=task['name'],
                                     execution_id=execution_id,
-                                    html_report_url=html_report['url'],
-                                    filename=html_report['filename'],
-                                    slack_channel=task['slackChannel'],
+                                    asset_url=asset_file['url'],
+                                    filename=asset_file['filename'],
+                                    asset_type=asset_type,
+                                    slack_channel=slack_channel,
                                     user_id=task['userId']
                                 )
-                                logger.info(f"Slack approval request sent for task {execution['taskId']}")
+                                logger.info(f"Slack approval request sent for task {execution['taskId']} to channel {slack_channel} for {asset_type} asset (expected: {expected_asset_type or 'auto-detect'})")
                             else:
-                                logger.warning(f"No HTML report found for task {execution['taskId']} that requires approval")
+                                expected_msg = f" (expected: {expected_asset_type})" if expected_asset_type else ""
+                                logger.warning(f"No {expected_asset_type or 'HTML report'} found for task {execution['taskId']} that requires approval{expected_msg}")
                         except Exception as e:
                             logger.error(f"Failed to send Slack approval request for task {execution['taskId']}: {e}")
                     
                     # Send detailed results to all subscribers (if any and not requiring approval)
-                    if has_subscribers and not (task.get('requireApproval') and task.get('slackChannel')):
+                    if has_subscribers and not (requires_approval and slack_channel):
                         # Send regular email notifications
                         from email_utils import notify_task_subscribers
                         notify_task_subscribers(

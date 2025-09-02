@@ -10,7 +10,7 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-def send_task_approval_request(task_id, task_name, execution_id, html_report_url, filename, slack_channel, user_id):
+def send_task_approval_request(task_id, task_name, execution_id, asset_url, filename, asset_type, slack_channel, user_id):
     """
     Send a task approval request to Slack via the backend API using JWT authentication.
     
@@ -18,8 +18,9 @@ def send_task_approval_request(task_id, task_name, execution_id, html_report_url
         task_id: The ID of the task
         task_name: The name of the task
         execution_id: The ID of the execution
-        html_report_url: The URL of the HTML report
-        filename: The filename of the report
+        asset_url: The URL of the asset (HTML report or image)
+        filename: The filename of the asset
+        asset_type: The type of asset ('html' or 'image')
         slack_channel: The Slack channel ID to send to
         user_id: The ID of the user who owns the task
     """
@@ -33,15 +34,20 @@ def send_task_approval_request(task_id, task_name, execution_id, html_report_url
             logger.error(f"Failed to create JWT token for user {user_id}")
             return False
         
-        # Prepare the approval request data
+        # Prepare the approval request data with asset-type specific messaging
+        if asset_type == 'image':
+            note = f'An image has been generated. Please review and approve.'
+        else:
+            note = f'A {asset_type} has been generated. Please review and approve. Once approved, results will be automatically sent to all task subscribers. You can manage subscribers at: {os.getenv("CUSTOMER_FRONTEND_URL", "http://localhost:5174")}/tasks/{task_id}#subscribers'
+        
         approval_data = {
             'channel': slack_channel,
             'channelName': slack_channel,  # Will be updated by backend
-            'assetUrl': html_report_url,
+            'assetUrl': asset_url,
             'filename': filename,
-            'assetType': 'html',
+            'assetType': asset_type,
             'executionId': execution_id,
-            'note': f'A report has been generated. Please review and approve. Once approved, results will be automatically sent to all task subscribers. You can manage subscribers at: {os.getenv("CUSTOMER_FRONTEND_URL", "http://localhost:5174")}/tasks/{task_id}#subscribers'
+            'note': note
         }
         
         # Send the approval request to the backend using JWT authentication

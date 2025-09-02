@@ -10,6 +10,7 @@ import {
 import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
 import { taskDb, subscriberDb } from "../services/db";
 import { emailService } from "../services/emailService";
+import { createRevisionExecutionFromSlack } from "../controllers/tasks";
 
 const router = express.Router();
 
@@ -270,16 +271,44 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
         });
 
       } else if (action.action_id === 'needs_changes_asset') {
+        // Get asset type for proper display and revision hint
+        const approval = await approvalDb.getApproval(assetUrl);
+        const assetType = approval?.assetType || 'asset';
+        
         // Open feedback modal instead of direct rejection
         await openFeedbackModal(
           payload.trigger_id,
           assetUrl,
           filename,
-          executionId
+          executionId,
+          assetType
         );
 
         console.log(`📝 Opened feedback modal for: ${assetUrl}`);
         res.status(200).json({}); // Empty response for modal trigger
+
+      } else if (action.action_id === 'reject_asset') {
+        // Handle rejection directly
+        await updateApprovalMessage(
+          channel.id,
+          message.ts,
+          'rejected',
+          user.username || user.id,
+          undefined,
+          'asset'
+        );
+
+        await approvalDb.updateApprovalStatus(
+          assetUrl,
+          'rejected',
+          user.username || user.id
+        );
+
+        console.log(`❌ Rejected: ${assetUrl} by ${user.username}`);
+        res.status(200).json({
+          response_type: "in_channel",
+          text: `❌ Rejected by @${user.username}`
+        });
 
       } else {
         return res.status(200).json({ text: "Unknown action" });
@@ -293,7 +322,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
       
       if (view.callback_id === 'feedback_modal') {
         const metadata = JSON.parse(view.private_metadata);
-        const { assetUrl, filename, executionId } = metadata;
+        const { assetUrl, filename, executionId, assetType } = metadata;
         
         // Get feedback from the modal
         const feedbackValue = view.state.values.feedback_input.feedback_text.value;
@@ -323,6 +352,41 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
             feedbackValue,
             originalApproval.assetType || 'asset'
           );
+        }
+
+        // Automatically start a new revision execution with the feedback
+        if (originalApproval && originalApproval.executionId) {
+          try {
+            // Get the original execution to find the task ID
+            const execution = await taskDb.getTaskExecutionById(originalApproval.executionId);
+            if (execution) {
+              console.log(`🚀 Starting feedback-based revision for task: ${execution.taskId}`);
+              
+              // Use the common function to create revision execution
+              const revisionResult = await createRevisionExecutionFromSlack(
+                execution.taskId,
+                `Please revise this ${originalApproval.assetType || 'asset'} based on the following feedback: ${feedbackValue}`,
+                originalApproval.assetUrl,
+                originalApproval.executionId,
+                originalApproval.assetType || 'asset',
+                user.username || user.id,
+                1,
+                originalApproval.slackChannel,
+                originalApproval.slackChannelName
+              );
+              
+              if (revisionResult.success && revisionResult.execution) {
+                console.log(`✅ Feedback-based revision started: ${revisionResult.execution.executionId}`);
+              } else {
+                console.error(`❌ Failed to start feedback-based revision`);
+              }
+            } else {
+              console.error(`❌ Could not find execution for ID: ${originalApproval.executionId}`);
+            }
+          } catch (error) {
+            console.error('❌ Error starting feedback-based revision:', error);
+            // Don't fail the feedback submission if revision start fails
+          }
         }
 
         console.log(`🔶 Changes requested for: ${assetUrl} by ${user.username}`);

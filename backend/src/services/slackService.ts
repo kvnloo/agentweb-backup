@@ -164,6 +164,21 @@ export async function sendApprovalRequest(
                 executionId: request.executionId,
               }),
             },
+            {
+              type: "button",
+              text: {
+                type: "plain_text",
+                text: "❌ Reject",
+                emoji: true,
+              },
+              style: "danger",
+              action_id: "reject_asset",
+              value: JSON.stringify({
+                assetUrl: request.imageUrl,
+                filename: request.filename,
+                executionId: request.executionId,
+              }),
+            },
           ],
         },
       ],
@@ -188,7 +203,7 @@ export async function sendApprovalRequest(
 export async function updateApprovalMessage(
   channel: string,
   messageTs: string,
-  decision: "approved" | "needs_changes",
+  decision: "approved" | "needs_changes" | "rejected",
   reviewedBy: string,
   feedback?: string,
   assetType?: string
@@ -227,8 +242,7 @@ export async function updateApprovalMessage(
         block.text.text.includes("*Status:*")
     );
 
-    const decisionText = decision === "approved" ? "✅ Approved" : "🔶 Needs Changes";
-    let statusUpdateText = `*Status:* ${decisionText} by @${reviewedBy}`;
+    let statusUpdateText = `*Status:* ${decision === "approved" ? "✅ Approved" : decision === "needs_changes" ? "🔶 Needs Changes" : "❌ Rejected"} by @${reviewedBy}`;
     if (decision === "needs_changes" && feedback) {
       statusUpdateText += `\n*Feedback:* ${feedback}`;
     }
@@ -265,7 +279,7 @@ export async function updateApprovalMessage(
       await slackClient.chat.update({
         channel,
         ts: messageTs,
-        text: `${assetDisplayName} ${decision}: ${decision === "approved" ? "Approved" : "Needs Changes"}`,
+        text: `${assetDisplayName} ${decision}: ${decision === "approved" ? "Approved" : decision === "needs_changes" ? "Needs Changes" : "Rejected"}`,
         blocks: finalBlocks as any,
       });
 
@@ -283,13 +297,29 @@ export async function openFeedbackModal(
   triggerId: string,
   assetUrl: string,
   filename: string,
-  executionId?: string
+  executionId?: string,
+  assetType?: string
 ): Promise<void> {
   if (!slackClient) {
     throw new Error("Slack client not initialized. Check SLACK_BOT_TOKEN environment variable.");
   }
 
   try {
+    // Determine if this asset type supports automated revision
+    const supportsAutomatedRevision = assetType === 'image' || assetType === 'html';
+    const revisionHint = supportsAutomatedRevision 
+      ? "✅ Your feedback will automatically trigger our AI Agent to create a revision. You will receive a new approval request once the revision is complete."
+      : "⚠️ This asset type does not support automated revision. Your feedback will be recorded for manual review.";
+
+    // Customize placeholder text based on asset type
+    let placeholderText = "Please provide specific feedback about what changes are needed...";
+    
+    if (assetType === 'image') {
+      placeholderText = "e.g., 'Change background from white to dark blue', 'Move the text to the left side', 'Add a drop shadow to the main element'";
+    } else if (assetType === 'html') {
+      placeholderText = "e.g., 'Remove section about the product', 'Change button color to blue', 'Add 20px margin between sections'";
+    }
+
     await slackClient.views.open({
       trigger_id: triggerId,
       view: {
@@ -311,13 +341,21 @@ export async function openFeedbackModal(
           assetUrl,
           filename,
           executionId,
+          assetType,
         }),
         blocks: [
           {
             type: "section",
             text: {
               type: "mrkdwn",
-              text: `*Asset:* ${filename}\n*Action:* Request Changes`,
+              text: `*Asset:* ${filename}\n*Type:* ${assetType ? assetType.charAt(0).toUpperCase() + assetType.slice(1) : 'Unknown'}\n*Action:* Request Changes`,
+            },
+          },
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: revisionHint,
             },
           },
           {
@@ -329,7 +367,7 @@ export async function openFeedbackModal(
               multiline: true,
               placeholder: {
                 type: "plain_text",
-                text: "Please provide specific feedback about what changes are needed...",
+                text: placeholderText,
               },
             },
             label: {
