@@ -8,6 +8,15 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-09-02",
+    changes: [
+      "Fixed issue with header color issue with subscriber emails",
+      "- Removed unnecessary styling from email templates to prevent white text visibility issues",
+      "- Headers and footers in subscriber emails are now properly visible",
+      "- Applied fixes to both agent-engine and backend email services",
+    ],
+  },
+  {
     date: "2025-08-28",
     changes: [
       "Added new image model Nano Banana from Google Gemini",
