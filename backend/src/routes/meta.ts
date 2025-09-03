@@ -180,10 +180,19 @@ router.get("/ad-performance", async (req, res) => {
     const adSetsData = await processAdSetsData(adSets, insights, campaigns);
     const campaignSummary = generateCampaignSummary(adPerformance);
     
+    // Set cache-busting headers
+    res.set({
+      'Cache-Control': 'no-cache, no-store, must-revalidate',
+      'Pragma': 'no-cache',
+      'Expires': '0'
+    });
+    
     res.json({
       adPerformance,
       adSetsData,
-      campaignSummary
+      campaignSummary,
+      timeframe,
+      timestamp: new Date().toISOString()
     });
   } catch (error: any) {
     console.error("Error fetching ad performance:", error);
@@ -199,10 +208,16 @@ router.get("/ad-performance", async (req, res) => {
 });
 
 // Helper function to process campaign data from Meta API
-async function processCampaignData(campaigns: any, insights: any): Promise<any[]> {
+async function processCampaignData(campaigns: any, insights: any, adSets: any): Promise<any[]> {
   const campaignMap = new Map();
   
-  // Process campaigns
+  // Create ad set to campaign mapping
+  const adSetToCampaignMap = new Map();
+  for (const adSet of adSets) {
+    adSetToCampaignMap.set(adSet.id, adSet.campaign_id);
+  }
+  
+  // Initialize campaigns with zero metrics
   for (const campaign of campaigns) {
     campaignMap.set(campaign.id, {
       id: campaign.id,
@@ -220,22 +235,43 @@ async function processCampaignData(campaigns: any, insights: any): Promise<any[]
     });
   }
   
-  // Process insights and merge with campaigns
+  // Aggregate insights data by campaign
   for (const insight of insights) {
-    const campaignId = insight.campaign_id;
-    if (campaignMap.has(campaignId)) {
+    const adSetId = insight.adset_id;
+    const campaignId = adSetToCampaignMap.get(adSetId);
+    
+    if (campaignId && campaignMap.has(campaignId)) {
       const campaign = campaignMap.get(campaignId);
-      campaign.impressions = parseInt(insight.impressions) || 0;
-      campaign.clicks = parseInt(insight.clicks) || 0;
-      campaign.spend = parseFloat(insight.spend) || 0;
-      campaign.ctr = parseFloat(insight.ctr) || 0;
-      campaign.cpc = parseFloat(insight.cpc) || 0;
-      campaign.reach = parseInt(insight.reach) || 0;
-      campaign.frequency = parseFloat(insight.frequency) || 0;
+      
+      // Sum up metrics from all ad sets in this campaign
+      campaign.impressions += parseInt(insight.impressions) || 0;
+      campaign.clicks += parseInt(insight.clicks) || 0;
+      campaign.spend += parseFloat(insight.spend) || 0;
+      campaign.reach += parseInt(insight.reach) || 0;
+      
+      // Calculate weighted averages for CTR and CPC
+      // CTR = total clicks / total impressions
+      // CPC = total spend / total clicks
     }
   }
   
-  return Array.from(campaignMap.values());
+  // Calculate derived metrics (CTR, CPC) after aggregation
+  for (const campaign of campaignMap.values()) {
+    if (campaign.impressions > 0) {
+      campaign.ctr = (campaign.clicks / campaign.impressions) * 100; // Convert to percentage
+    }
+    if (campaign.clicks > 0) {
+      campaign.cpc = campaign.spend / campaign.clicks;
+    }
+    if (campaign.reach > 0) {
+      campaign.frequency = campaign.impressions / campaign.reach;
+    }
+  }
+  
+  // Filter out campaigns with no activity in the selected timeframe
+  return Array.from(campaignMap.values()).filter(campaign => 
+    campaign.impressions > 0 || campaign.clicks > 0 || campaign.spend > 0
+  );
 }
 
 // Helper function to generate campaign summary
@@ -301,7 +337,10 @@ async function processAdSetsData(adSets: any, insights: any, campaigns: any): Pr
     }
   }
   
-  return Array.from(adSetsMap.values());
+  // Filter out ad sets with no activity in the selected timeframe
+  return Array.from(adSetsMap.values()).filter(adSet => 
+    adSet.impressions > 0 || adSet.clicks > 0 || adSet.spend > 0
+  );
 }
 
 
