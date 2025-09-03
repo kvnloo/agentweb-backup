@@ -209,10 +209,10 @@ export const emailService = {
             <html>
             <head>
               <style>
-                body { font-family: sans-serif; margin: 0; padding: 0; color: #333; background-color: #fff; }
-                .container { padding: 20px; background-color: #fdfdfd; }
-                .footer { margin-top: 25px; font-size: 0.9em; color: #7f8c8d; padding: 20px; }
-                a { color: #3498db; text-decoration: none; }
+                body { font-family: sans-serif; margin: 0; padding: 0; }
+                .container { padding: 20px; }
+                .footer { margin-top: 25px; font-size: 0.9em; padding: 20px; }
+                a { text-decoration: none; }
                 a:hover { text-decoration: underline; }
               </style>
             </head>
@@ -311,18 +311,17 @@ export const emailService = {
       <html>
       <head>
         <style>
-          body { font-family: sans-serif; margin: 0; padding: 0; color: #333; background-color: #fff; }
-          .container { padding: 0; background-color: #fdfdfd; }
-          .header { font-size: 1.5em; font-weight: bold; margin-bottom: 15px; color: #2c3e50; }
-          .details { margin-bottom: 20px; padding: 15px; border: 1px solid #eee; background-color: #f9f9f9; border-radius: 5px; }
+          body { font-family: sans-serif; margin: 0; padding: 0; }
+          .container { padding: 0; }
+          .header { font-size: 1.5em; font-weight: bold; margin-bottom: 15px; }
+          .details { margin-bottom: 20px; padding: 15px; border: 1px solid #eee; border-radius: 5px; }
           .details p { margin: 5px 0; }
           .section { margin-top: 20px; }
-          .section h3 { font-size: 1.2em; margin-top: 0; border-bottom: 2px solid #ecf0f1; padding-bottom: 8px; color: #34495e; }
-          pre { white-space: pre-wrap; word-wrap: break-word; background: #ecf0f1; padding: 15px; border-radius: 5px; font-size: 0.9em; color: #555; }
+          .section h3 { font-size: 1.2em; margin-top: 0; border-bottom: 2px solid #ecf0f1; padding-bottom: 8px; }
+          pre { white-space: pre-wrap; word-wrap: break-word; padding: 15px; border-radius: 5px; font-size: 0.9em; }
           .html-result { border: 1px solid #ddd; padding: 10px; margin-top: 15px; border-radius: 5px; }
-
-          .footer { margin-top: 25px; font-size: 0.9em; color: #7f8c8d; padding: 20px; }
-          a { color: #3498db; text-decoration: none; }
+          .footer { margin-top: 25px; font-size: 0.9em; padding: 20px; }
+          a { text-decoration: none; }
           a:hover { text-decoration: underline; }
         </style>
       </head>
