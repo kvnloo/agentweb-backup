@@ -368,6 +368,66 @@ VITE_API_URL=https://agentweb.pro
 VITE_IMAGE_MODEL=gemini-2.5-flash-image-preview
 ```
 
+### Google OAuth Configuration
+
+To enable Google OAuth authentication, you need to configure both the backend environment variables and the Google OAuth app settings. Note the current account is under ruiwangwarm@gmail.com account, not ruiw@agentweb.pro. (TODO: migrate)
+
+#### Backend Environment Variables
+
+Add these variables to your backend `.env` file:
+
+```env
+GOOGLE_CLIENT_ID=your_google_client_id
+GOOGLE_CLIENT_SECRET=your_google_client_secret
+```
+
+#### Google OAuth App Configuration
+
+1. **Go to Google Cloud Console**:
+   - Visit [Google Cloud Console](https://console.cloud.google.com/)
+   - Select your project or create a new one
+
+2. **Enable Google+ API**:
+   - Go to "APIs & Services" > "Library"
+   - Search for "Google+ API" and enable it
+
+3. **Create OAuth 2.0 Credentials**:
+   - Go to "APIs & Services" > "Credentials"
+   - Click "Create Credentials" > "OAuth 2.0 Client IDs"
+   - Choose "Web application"
+
+4. **Configure Authorized Redirect URIs**:
+   
+   **For Production:**
+   ```
+   https://api.agentweb.pro/api/auth/google/callback
+   ```
+   
+   **For Staging:**
+   ```
+   https://api-stage.agentweb.pro/api/auth/google/callback
+   ```
+   
+   **For Development:**
+   ```
+   http://localhost:3001/api/auth/google/callback
+   ```
+
+5. **Copy Credentials**:
+   - Copy the Client ID and Client Secret
+   - Add them to your backend `.env` file
+
+#### Troubleshooting OAuth Issues
+
+If you encounter redirect URL errors:
+
+1. **Check Google Console**: Ensure the redirect URI matches exactly
+2. **Verify Environment Variables**: Make sure `BACKEND_URL` is set correctly
+3. **Check Backend Logs**: Look for OAuth-related errors in the backend logs
+4. **Test with Different Environments**: Try with localhost first, then staging, then production
+
+The backend includes a fallback handler for malformed OAuth URLs, but the proper fix is to configure the correct redirect URI in Google Console.
+
 ## Deployment to AWS Elastic Beanstalk
 
 ### Prerequisites
