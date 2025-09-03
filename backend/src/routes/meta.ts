@@ -176,7 +176,7 @@ router.get("/ad-performance", async (req, res) => {
       }
 
     // Process the data
-    const adPerformance = await processCampaignData(campaigns, insights);
+    const adPerformance = await processCampaignData(campaigns, insights, adSets);
     const adSetsData = await processAdSetsData(adSets, insights, campaigns);
     const campaignSummary = generateCampaignSummary(adPerformance);
     
