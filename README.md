@@ -239,6 +239,16 @@ This creates a public URL that Slack can use to send approval button interaction
 
 ### Frontend Setup for Development
 
+**Note**: The frontend applications are now separate repositories:
+
+- **Partner Portal**: [AgentWeb Partner Portal](https://github.com/AgentWebPro/agentweb-partner-portal) (if separate)
+- **Customer Portal**: [AgentWeb Customer Portal](https://github.com/AgentWebPro/agentweb-customer-portal)
+- **Growth Genius Chat**: [Growth Genius Chat](https://github.com/AgentWebPro/growth-genius-chat)
+
+For development setup, please refer to the individual repository README files.
+
+#### Partner Portal Development (if still in this repo)
+
 1. Install dependencies:
 
 ```bash
@@ -302,18 +312,20 @@ npm run create-admin
 
 ```
 .
-├── backend/
+├── backend/             # Backend API and services
 │   ├── src/
 │   │   ├── routes/      # API routes
 │   │   ├── services/    # Database and business logic
 │   │   └── utils/       # Utility functions
 │   └── scripts/         # Database setup scripts
-└── partner-portal/
-    └── src/
-        ├── components/  # React components
-        ├── contexts/    # React contexts
-        └── pages/       # Page components
+├── agent-engine/        # Agent execution engine
+├── partner-portal/      # Partner portal frontend (if still in this repo)
+└── misc/               # Documentation and assets
 ```
+
+**Note**: Frontend applications are now separate repositories:
+- [AgentWeb Customer Portal](https://github.com/AgentWebPro/agentweb-customer-portal)
+- [Growth Genius Chat](https://github.com/AgentWebPro/growth-genius-chat)
 
 ### Environment Variables
 
@@ -356,6 +368,66 @@ VITE_API_URL=https://agentweb.pro
 VITE_IMAGE_MODEL=gemini-2.5-flash-image-preview
 ```
 
+### Google OAuth Configuration
+
+To enable Google OAuth authentication, you need to configure both the backend environment variables and the Google OAuth app settings. Note the current account is under ruiwangwarm@gmail.com account, not ruiw@agentweb.pro. (TODO: migrate)
+
+#### Backend Environment Variables
+
+Add these variables to your backend `.env` file:
+
+```env
+GOOGLE_CLIENT_ID=your_google_client_id
+GOOGLE_CLIENT_SECRET=your_google_client_secret
+```
+
+#### Google OAuth App Configuration
+
+1. **Go to Google Cloud Console**:
+   - Visit [Google Cloud Console](https://console.cloud.google.com/)
+   - Select your project or create a new one
+
+2. **Enable Google+ API**:
+   - Go to "APIs & Services" > "Library"
+   - Search for "Google+ API" and enable it
+
+3. **Create OAuth 2.0 Credentials**:
+   - Go to "APIs & Services" > "Credentials"
+   - Click "Create Credentials" > "OAuth 2.0 Client IDs"
+   - Choose "Web application"
+
+4. **Configure Authorized Redirect URIs**:
+   
+   **For Production:**
+   ```
+   https://api.agentweb.pro/api/auth/google/callback
+   ```
+   
+   **For Staging:**
+   ```
+   https://api-stage.agentweb.pro/api/auth/google/callback
+   ```
+   
+   **For Development:**
+   ```
+   http://localhost:3001/api/auth/google/callback
+   ```
+
+5. **Copy Credentials**:
+   - Copy the Client ID and Client Secret
+   - Add them to your backend `.env` file
+
+#### Troubleshooting OAuth Issues
+
+If you encounter redirect URL errors:
+
+1. **Check Google Console**: Ensure the redirect URI matches exactly
+2. **Verify Environment Variables**: Make sure `BACKEND_URL` is set correctly
+3. **Check Backend Logs**: Look for OAuth-related errors in the backend logs
+4. **Test with Different Environments**: Try with localhost first, then staging, then production
+
+The backend includes a fallback handler for malformed OAuth URLs, but the proper fix is to configure the correct redirect URI in Google Console.
+
 ## Deployment to AWS Elastic Beanstalk
 
 ### Prerequisites
@@ -392,10 +464,17 @@ Note: Environment variables must be set during build time for the frontend, as V
 
 ### Customer Portal Deployment
 
-1. Build the production version and create deployment package:
+**Note**: The Customer Portal is now a separate repository. Please refer to the [AgentWeb Customer Portal repository](https://github.com/AgentWebPro/agentweb-customer-portal) for deployment instructions.
+
+1. Clone the customer portal repository:
+```bash
+git clone https://github.com/AgentWebPro/agentweb-customer-portal.git
+cd agentweb-customer-portal
+```
+
+2. Build the production version and create deployment package:
 
 ```bash
-cd customer-portal && \
 VITE_API_URL=https://api.agentweb.pro \
 VITE_PARTNER_PORTAL_URL=https://partner.agentweb.pro \
 VITE_DEBUG=false \
@@ -405,7 +484,7 @@ mkdir -p builds && \
 zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json server.js
 ```
 
-2. Create a new application in Elastic Beanstalk:
+3. Create a new application in Elastic Beanstalk:
    - Go to AWS Management Console > Elastic Beanstalk
    - Click "Create application"
    - Enter application name (e.g., "agentweb-customer-portal")
@@ -417,10 +496,17 @@ Note: Environment variables must be set during build time for the frontend, as V
 
 ### Growth Genius Chat Deployment
 
-1. Build the production version and create deployment package:
+**Note**: The Growth Genius Chat is now a separate repository. Please refer to the [Growth Genius Chat repository](https://github.com/AgentWebPro/growth-genius-chat) for deployment instructions.
+
+1. Clone the growth chat repository:
+```bash
+git clone https://github.com/AgentWebPro/growth-genius-chat.git
+cd growth-genius-chat
+```
+
+2. Build the production version and create deployment package:
 
 ```bash
-cd growth-chat && \
 VITE_API_URL=https://api.agentweb.pro \
 npm run build && \
 VERSION="0.21" && \
@@ -428,7 +514,7 @@ mkdir -p builds && \
 zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json server.js
 ```
 
-2. Create a new application in Elastic Beanstalk:
+3. Create a new application in Elastic Beanstalk:
    - Go to AWS Management Console > Elastic Beanstalk
    - Click "Create application"
    - Enter application name (e.g., "agentweb-growth-genius-chat")
@@ -436,7 +522,7 @@ zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json serve
    - Upload the versioned zip file from `builds/deploy_v${VERSION}.zip`
    - Click "Create application"
 
-3. Configure environment variables:
+4. Configure environment variables:
    - In your environment, go to Configuration > Software
    - Click "Edit"
    - Add environment variables:

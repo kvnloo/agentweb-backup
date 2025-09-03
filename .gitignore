@@ -101,4 +101,8 @@ prompts/
 .env.development.local
 .env.test.local
 .env.production.local
-OAI_CONFIG_LIST 
+OAI_CONFIG_LIST
+
+# Separate repositories (now independent)
+growth-chat/
+customer-portal/ 
