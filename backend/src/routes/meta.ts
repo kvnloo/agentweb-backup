@@ -154,11 +154,32 @@ router.get("/ad-performance", async (req, res) => {
         throw new Error(`Failed to fetch ad sets: ${adSetsError.message || 'Unknown error'}`);
       }
 
+      // Get ads using Graph API
+      console.log("Fetching ads for timeframe:", timeframe);
+      let ads;
+      try {
+        const adsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}&access_token=${accessToken}`;
+        console.log("Ads URL:", adsUrl);
+        
+        const adsResponse = await fetch(adsUrl);
+        const adsData = await adsResponse.json();
+        
+        if (adsData.error) {
+          throw new Error(`Graph API Error: ${adsData.error.message}`);
+        }
+        
+        ads = adsData.data || [];
+        console.log("Ads fetched successfully:", ads.length);
+      } catch (adsError: any) {
+        console.error("Error fetching ads:", adsError);
+        throw new Error(`Failed to fetch ads: ${adsError.message || 'Unknown error'}`);
+      }
+
       // Get insights using Graph API
       console.log("Fetching insights for timeframe:", timeframe);
       let insights;
       try {
-        const insightsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=adset&access_token=${accessToken}`;
+        const insightsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=ad&access_token=${accessToken}`;
         console.log("Insights URL:", insightsUrl);
         
         const insightsResponse = await fetch(insightsUrl);
@@ -178,6 +199,7 @@ router.get("/ad-performance", async (req, res) => {
     // Process the data
     const adPerformance = await processCampaignData(campaigns, insights, adSets);
     const adSetsData = await processAdSetsData(adSets, insights, campaigns);
+    const adsData = await processAdsData(ads, insights, adSets, campaigns);
     const campaignSummary = generateCampaignSummary(adPerformance);
     
     // Set cache-busting headers
@@ -190,6 +212,7 @@ router.get("/ad-performance", async (req, res) => {
     res.json({
       adPerformance,
       adSetsData,
+      adsData,
       campaignSummary,
       timeframe,
       timestamp: new Date().toISOString()
@@ -343,6 +366,62 @@ async function processAdSetsData(adSets: any, insights: any, campaigns: any): Pr
   );
 }
 
-
+// Helper function to process ads data from Meta API
+async function processAdsData(ads: any, insights: any, adSets: any, campaigns: any): Promise<any[]> {
+  const adsMap = new Map();
+  const adSetMap = new Map();
+  const campaignMap = new Map();
+  
+  // Create ad set and campaign lookup maps
+  for (const adSet of adSets) {
+    adSetMap.set(adSet.id, adSet.name);
+  }
+  
+  for (const campaign of campaigns) {
+    campaignMap.set(campaign.id, campaign.name);
+  }
+  
+  // Process ads
+  for (const ad of ads) {
+    adsMap.set(ad.id, {
+      id: ad.id,
+      name: ad.name,
+      status: ad.status,
+      adSetId: ad.adset_id,
+      adSetName: adSetMap.get(ad.adset_id) || 'Unknown Ad Set',
+      campaignId: ad.campaign_id,
+      campaignName: campaignMap.get(ad.campaign_id) || 'Unknown Campaign',
+      creative: ad.creative,
+      impressions: 0,
+      clicks: 0,
+      spend: 0,
+      ctr: 0,
+      cpc: 0,
+      reach: 0,
+      frequency: 0,
+      lastUpdated: new Date().toISOString(),
+    });
+  }
+  
+  // Process insights and merge with ads
+  for (const insight of insights) {
+    const adId = insight.ad_id;
+    if (adsMap.has(adId)) {
+      const ad = adsMap.get(adId);
+      ad.impressions = parseInt(insight.impressions) || 0;
+      ad.clicks = parseInt(insight.clicks) || 0;
+      ad.spend = parseFloat(insight.spend) || 0;
+      ad.ctr = parseFloat(insight.ctr) || 0;
+      ad.cpc = parseFloat(insight.cpc) || 0;
+      ad.reach = parseInt(insight.reach) || 0;
+      ad.frequency = parseFloat(insight.frequency) || 0;
+    }
+  }
+  
+  // Filter out ads with no activity in the selected timeframe
+  return Array.from(adsMap.values()).filter(ad => 
+    ad.impressions > 0 || ad.clicks > 0 || ad.spend > 0
+  );
+}
 
 export default router;
