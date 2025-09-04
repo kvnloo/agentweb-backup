@@ -616,9 +616,36 @@ router.post("/create-ad", async (req, res) => {
     // Get file extension from URL for proper filename
     const urlParts = imageUrl.split('.');
     const extension = urlParts[urlParts.length - 1].split('?')[0]; // Remove query params
-    const filename = `ad_image.${extension}`;
     
-    const imageBlob = new Blob([imageBuffer], { type: `image/${extension}` });
+    // Meta adimages API only supports JPEG and PNG
+    // Convert unsupported formats (like WebP) to JPEG
+    let finalBuffer = imageBuffer;
+    let finalExtension = extension;
+    let finalMimeType = `image/${extension}`;
+    
+    if (extension === 'webp' || extension === 'gif' || extension === 'bmp' || extension === 'tiff') {
+      console.log(`Converting ${extension} to JPEG for Meta compatibility`);
+      try {
+        // Try to use sharp for conversion
+        const sharp = require('sharp');
+        finalBuffer = await sharp(imageBuffer)
+          .jpeg({ quality: 90 })
+          .toBuffer();
+        finalExtension = 'jpg';
+        finalMimeType = 'image/jpeg';
+        console.log(`Successfully converted ${extension} to JPEG`);
+      } catch (sharpError) {
+        console.log("Sharp not available, trying basic conversion");
+        // Fallback: just use the original buffer but with JPEG MIME type
+        finalBuffer = imageBuffer;
+        finalExtension = 'jpg';
+        finalMimeType = 'image/jpeg';
+        console.log(`Using fallback conversion for ${extension}`);
+      }
+    }
+    
+    const filename = `ad_image.${finalExtension}`;
+    const imageBlob = new Blob([finalBuffer], { type: finalMimeType });
     
     console.log("Image prepared for upload:", filename, "Size:", imageBlob.size, "bytes");
     
