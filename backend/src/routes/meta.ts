@@ -424,4 +424,319 @@ async function processAdsData(ads: any, insights: any, adSets: any, campaigns: a
   );
 }
 
+// Get campaigns and ad sets for ad creation
+router.get("/campaigns-and-adsets", async (req, res) => {
+  const userId = (req as any).user.userId;
+  
+  try {
+    // Get user from database
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Check if user has ad account configured
+    if (!user.adAccount || user.adAccount.trim() === "") {
+      return res.status(400).json({ message: "Ad account not configured" });
+    }
+
+    // Get Meta API access token from Secrets Manager
+    let accessToken: string;
+    try {
+      accessToken = await getMetaAccessToken();
+    } catch (error: any) {
+      console.error("Error fetching Meta access token:", error);
+      return res.status(500).json({ 
+        message: "Meta access token not configured",
+        error: error.message || "Failed to fetch access token from Secrets Manager"
+      });
+    }
+
+    const apiVersion = process.env.META_API_VERSION || 'v18.0';
+    
+    // Fetch campaigns
+    const campaignsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status&access_token=${accessToken}`;
+    const campaignsResponse = await fetch(campaignsUrl);
+    const campaignsData = await campaignsResponse.json();
+    
+    if (campaignsData.error) {
+      throw new Error(`Graph API Error: ${campaignsData.error.message}`);
+    }
+    
+    // Fetch ad sets
+    const adSetsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,campaign_id,status&access_token=${accessToken}`;
+    const adSetsResponse = await fetch(adSetsUrl);
+    const adSetsData = await adSetsResponse.json();
+    
+    if (adSetsData.error) {
+      throw new Error(`Graph API Error: ${adSetsData.error.message}`);
+    }
+    
+    // First, get the business account associated with the ad account
+    console.log("=== Fetching Business Account ===");
+    console.log("Ad Account:", user.adAccount);
+    
+    const businessUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}?fields=account_id,name,currency,timezone_name,business&access_token=${accessToken}`;
+    console.log("Business URL:", businessUrl);
+    
+    const businessResponse = await fetch(businessUrl);
+    const businessData = await businessResponse.json();
+    
+    console.log("Business API Response:", JSON.stringify(businessData, null, 2));
+    
+    if (businessData.error) {
+      console.error("Business API Error:", businessData.error);
+      throw new Error(`Business API Error: ${businessData.error.message}`);
+    }
+    
+    const businessId = businessData.business?.id;
+    if (!businessId) {
+      throw new Error("No business account found for this ad account.");
+    }
+    
+    console.log("Business ID:", businessId);
+    
+    // Now fetch pages from the business portfolio
+    console.log("=== Fetching Pages from Business Portfolio ===");
+    const pagesUrl = `https://graph.facebook.com/${apiVersion}/${businessId}/owned_pages?fields=id,name,category&access_token=${accessToken}`;
+    console.log("Pages URL:", pagesUrl);
+    
+    const pagesResponse = await fetch(pagesUrl);
+    const pagesData = await pagesResponse.json();
+    
+    console.log("Pages API Response:", JSON.stringify(pagesData, null, 2));
+    
+    if (pagesData.error) {
+      console.error("Pages API Error:", pagesData.error);
+      throw new Error(`Pages API Error: ${pagesData.error.message}`);
+    }
+    
+    // Load all campaigns and ad sets (not just active ones)
+    const allCampaigns = (campaignsData.data || []).map((campaign: any) => ({ 
+      id: campaign.id, 
+      name: campaign.name,
+      status: campaign.status 
+    }));
+    const allAdSets = (adSetsData.data || []).map((adSet: any) => ({ 
+      id: adSet.id, 
+      name: adSet.name,
+      campaign_id: adSet.campaign_id,
+      status: adSet.status 
+    }));
+    const pages = (pagesData.data || []).map((page: any) => ({ id: page.id, name: page.name }));
+    
+    console.log("Processed campaigns:", allCampaigns.length);
+    console.log("Processed ad sets:", allAdSets.length);
+    console.log("Processed pages:", pages);
+    console.log("Total pages found:", pages.length);
+    
+    res.json({
+      campaigns: allCampaigns,
+      adSets: allAdSets,
+      pages: pages
+    });
+  } catch (error: any) {
+    console.error("Error fetching campaigns and ad sets:", error);
+    res.status(500).json({ 
+      message: "Error fetching campaigns and ad sets",
+      error: error.message || "Unknown error"
+    });
+  }
+});
+
+// Create Meta ad
+router.post("/create-ad", async (req, res) => {
+  const userId = (req as any).user.userId;
+  const { imageUrl, campaignId, adSetId, adName, adText, adHeadline, adDescription, adCallToAction, pageId } = req.body;
+  
+  try {
+    // Validate required fields
+    if (!imageUrl || !campaignId || !adSetId || !adName || !pageId) {
+      return res.status(400).json({ message: "Missing required fields" });
+    }
+
+    // Get user from database
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Check if user has ad account configured
+    if (!user.adAccount || user.adAccount.trim() === "") {
+      return res.status(400).json({ message: "Ad account not configured" });
+    }
+
+    // Get Meta API access token from Secrets Manager
+    let accessToken: string;
+    try {
+      accessToken = await getMetaAccessToken();
+    } catch (error: any) {
+      console.error("Error fetching Meta access token:", error);
+      return res.status(500).json({ 
+        message: "Meta access token not configured",
+        error: error.message || "Failed to fetch access token from Secrets Manager"
+      });
+    }
+
+    const apiVersion = process.env.META_API_VERSION || 'v18.0';
+    
+    console.log("=== Creating Meta Ad ===");
+    console.log("Received pageId:", pageId);
+    console.log("Received adName:", adName);
+    console.log("Received adSetId:", adSetId);
+    console.log("Received imageUrl:", imageUrl);
+    console.log("Creating ad with data:", { adName, adSetId, imageUrl, pageId });
+    
+    // First, verify the ad account exists and get its details
+    console.log("=== Verifying Ad Account ===");
+    const accountUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}?fields=account_id,name,currency,timezone_name,account_status&access_token=${accessToken}`;
+    console.log("Account URL:", accountUrl);
+    
+    const accountResponse = await fetch(accountUrl);
+    const accountData = await accountResponse.json();
+    console.log("Account response:", JSON.stringify(accountData, null, 2));
+    
+    if (accountData.error) {
+      console.error("Account verification error:", accountData.error);
+      throw new Error(`Account verification failed: ${accountData.error.message}`);
+    }
+    
+    console.log("Account verified:", accountData.name, "Status:", accountData.account_status);
+    
+    // Try uploading image to the ad account
+    console.log("=== Uploading Image ===");
+    const uploadUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adimages`;
+    console.log("Upload URL:", uploadUrl);
+    
+    // Download the image
+    console.log("=== Downloading Image ===");
+    const imageResponse = await fetch(imageUrl);
+    const imageBuffer = await imageResponse.arrayBuffer();
+    
+    // Get file extension from URL for proper filename
+    const urlParts = imageUrl.split('.');
+    const extension = urlParts[urlParts.length - 1].split('?')[0]; // Remove query params
+    const filename = `ad_image.${extension}`;
+    
+    const imageBlob = new Blob([imageBuffer], { type: `image/${extension}` });
+    
+    console.log("Image prepared for upload:", filename, "Size:", imageBlob.size, "bytes");
+    
+    // Upload the converted image
+    const uploadData = new FormData();
+    uploadData.append('filename', filename);
+    uploadData.append('access_token', accessToken);
+    uploadData.append('file', imageBlob, filename);
+    
+    const uploadResponse = await fetch(uploadUrl, {
+      method: 'POST',
+      body: uploadData
+    });
+    
+    const uploadResult = await uploadResponse.json();
+    console.log("Image upload response:", JSON.stringify(uploadResult, null, 2));
+    
+    if (uploadResult.error) {
+      console.error("Image upload error:", uploadResult.error);
+      throw new Error(`Image upload failed: ${uploadResult.error.message}`);
+    }
+    
+    const imageHash = uploadResult.images[Object.keys(uploadResult.images)[0]].hash;
+    console.log("Image hash:", imageHash);
+    
+    // Create the ad creative with the image hash
+    // Use object_story_spec for standard ad creatives (Dynamic Creative is deprecated)
+    const creativeData = {
+      name: `${adName} - Creative`,
+      object_story_spec: {
+        page_id: pageId,
+        link_data: {
+          image_hash: imageHash,
+          link: "https://example.com", // Placeholder link
+          message: adText || "",
+          name: adHeadline || "",
+          description: adDescription || "",
+          call_to_action: adCallToAction ? {
+            type: adCallToAction,
+            value: {
+              link: "https://example.com"
+            }
+          } : undefined
+        }
+      }
+    };
+
+    // Create the creative
+    const creativeUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adcreatives`;
+    const creativeResponse = await fetch(creativeUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        ...creativeData,
+        access_token: accessToken
+      })
+    });
+
+    const creativeResult = await creativeResponse.json();
+    
+    console.log("Creative creation response:", creativeResult);
+    
+    if (creativeResult.error) {
+      console.error("Creative API Error details:", creativeResult.error);
+      
+      // Check if it's a Dynamic Creative Ad Set issue
+      if (creativeResult.error.error_subcode === 2446391) {
+        throw new Error(`Creative API Error: This ad set is configured for Dynamic Creative, which has been deprecated. Please use a different ad set or create a new one without Dynamic Creative enabled. (Code: ${creativeResult.error.code})`);
+      }
+      
+      throw new Error(`Creative API Error: ${creativeResult.error.message} (Code: ${creativeResult.error.code})`);
+    }
+
+    // Now create the ad using the creative ID
+    const adData = {
+      name: adName,
+      adset_id: adSetId,
+      creative: {
+        creative_id: creativeResult.id
+      },
+      status: 'PAUSED' // Create in paused status for review
+    };
+
+    const createAdUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads`;
+    const createAdResponse = await fetch(createAdUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        ...adData,
+        access_token: accessToken
+      })
+    });
+
+    const createAdData = await createAdResponse.json();
+    
+    console.log("Ad creation response:", createAdData);
+    
+    if (createAdData.error) {
+      console.error("Ad creation API Error details:", createAdData.error);
+      throw new Error(`Graph API Error: ${createAdData.error.message} (Code: ${createAdData.error.code})`);
+    }
+    
+    res.json({
+      success: true,
+      adId: createAdData.id,
+      message: "Ad created successfully in paused status. Please review and publish in Facebook Business Manager."
+    });
+  } catch (error: any) {
+    console.error("Error creating Meta ad:", error);
+    res.status(500).json({ 
+      message: "Error creating Meta ad",
+      error: error.message || "Unknown error"
+    });
+  }
+});
+
 export default router;
