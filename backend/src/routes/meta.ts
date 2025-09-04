@@ -816,9 +816,14 @@ router.post("/create-ad", async (req, res) => {
     });
   } catch (error: any) {
     console.error("Error creating Meta ad:", error);
-    res.status(500).json({ 
-      message: "Error creating Meta ad",
-      error: error.message || "Unknown error"
+    
+    // Return the actual error message from Meta API
+    const errorMessage = error.message || "Unknown error";
+    const statusCode = error.message?.includes('Graph API Error') || error.message?.includes('Creative API Error') || error.message?.includes('Image upload failed') ? 400 : 500;
+    
+    res.status(statusCode).json({ 
+      message: errorMessage,
+      error: errorMessage
     });
   }
 });
