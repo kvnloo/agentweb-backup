@@ -7,6 +7,20 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-09-04',
+    changes: [
+      'Support Create Meta Ad for Ad Images',
+      '- Users can now create Meta ads directly from their generated images on the Ad Images page',
+      '- Create Meta Ads icon appears on each image for easy access to ad creation',
+      '- Ad creation popup allows users to select campaigns, ad sets, and Facebook pages',
+      '- Supports all ad creative fields including ad name, text, headline, description, and call-to-action',
+      '- Images are automatically uploaded to Meta and converted to compatible formats when needed',
+      '- Created ads are stored in paused status for review and publishing in Facebook Business Manager',
+      '- Ad history tracking shows recently created ads with direct links to Facebook Ads Manager',
+      "- Also added Ads table in Meta Campaigns page for users to view all ads",
+    ],
+  },
+  {
     date: '2025-09-02',
     changes: [
       'Automated asset revision based on feedback',
