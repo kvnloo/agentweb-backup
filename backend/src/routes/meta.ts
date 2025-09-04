@@ -547,7 +547,7 @@ router.get("/campaigns-and-adsets", async (req, res) => {
 // Create Meta ad
 router.post("/create-ad", async (req, res) => {
   const userId = (req as any).user.userId;
-  const { imageUrl, campaignId, adSetId, adName, adText, adHeadline, adDescription, adCallToAction, pageId } = req.body;
+  const { imageUrl, campaignId, adSetId, adName, adText, adHeadline, adDescription, adCallToAction, pageId, taskId, executionId } = req.body;
   
   try {
     // Validate required fields
@@ -752,10 +752,67 @@ router.post("/create-ad", async (req, res) => {
       throw new Error(`Graph API Error: ${createAdData.error.message} (Code: ${createAdData.error.code})`);
     }
     
+    // Generate ad management URL using Facebook Ads Manager
+    const adManagementUrl = `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${user.adAccount}`;
+    console.log("Ad Management URL:", adManagementUrl);
+    
+    // Record the ad creation in the existing image file in result_files
+    try {
+      const { taskId, executionId } = req.body;
+      if (taskId && executionId) {
+        // Import taskDb to update the execution
+        const { taskDb } = await import('../services/db');
+        
+        // Get the existing execution
+        const existingExecution = await taskDb.getTaskExecutionById(executionId);
+        
+        if (existingExecution && existingExecution.userId === userId) {
+          console.log("✅ Found existing execution, adding Meta ad info to image file");
+          
+          // Find the image file in result_files and add Meta ad information
+          const currentResultFiles = existingExecution.result_files || [];
+          const updatedResultFiles = currentResultFiles.map((file: any) => {
+            if (file.url === imageUrl) {
+              // Add Meta ad information to the existing image file
+              return {
+                ...file,
+                meta_ad: {
+                  adId: createAdData.id,
+                  adName: adName,
+                  campaignId: campaignId,
+                  adSetId: adSetId,
+                  pageId: pageId,
+                  creativeId: creativeResult.id,
+                  imageHash: imageHash,
+                  managementUrl: adManagementUrl,
+                  status: 'PAUSED',
+                  createdAt: new Date().toISOString()
+                }
+              };
+            }
+            return file;
+          });
+          
+          // Update the execution with the modified result files
+          await taskDb.updateTaskExecution(executionId, {
+            result_files: updatedResultFiles
+          });
+          
+          console.log("✅ Meta ad information added to image file in result_files");
+        } else {
+          console.log("⚠️ Execution not found or access denied, cannot add ad info");
+        }
+      }
+    } catch (recordError) {
+      console.error("Error recording ad creation:", recordError);
+      // Don't fail the request if recording fails
+    }
+    
     res.json({
       success: true,
       adId: createAdData.id,
-      message: "Ad created successfully in paused status. Please review and publish in Facebook Business Manager."
+      message: "Ad created successfully in paused status. Please review and publish in Facebook Business Manager.",
+      managementUrl: adManagementUrl
     });
   } catch (error: any) {
     console.error("Error creating Meta ad:", error);
@@ -765,5 +822,6 @@ router.post("/create-ad", async (req, res) => {
     });
   }
 });
+
 
 export default router;
