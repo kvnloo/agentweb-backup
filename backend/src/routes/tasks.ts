@@ -391,6 +391,51 @@ router.put('/:taskId/subscribers/:email', authenticateToken, async (req, res) =>
   }
 });
 
+// Batch upload subscribers from CSV
+router.post('/:taskId/subscribers/batch', authenticateToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    const { subscribers } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!subscribers || !Array.isArray(subscribers)) {
+      return res.status(400).json({ message: 'Subscribers array is required' });
+    }
+
+    // Get task to verify ownership
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Verify task belongs to user or user is admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Process batch upload
+    const results = await subscriberDb.batchAddSubscribers(taskId, subscribers);
+    
+    res.json({
+      successCount: results.successCount,
+      errorCount: results.errorCount,
+      errors: results.errors
+    });
+  } catch (error: any) {
+    console.error('Error batch uploading subscribers:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // Add subscriber to task
 router.post('/:taskId/subscribers', async (req, res) => {
   try {

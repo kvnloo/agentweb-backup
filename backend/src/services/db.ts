@@ -1659,6 +1659,94 @@ export const subscriberDb = {
       handleDynamoDbError(error, "updateSubscriberCustomFields");
     }
   },
+
+  async batchAddSubscribers(taskId: string, subscribers: Array<{ email: string; customFields: { [key: string]: string } }>) {
+    try {
+      const results = {
+        successCount: 0,
+        errorCount: 0,
+        errors: [] as string[]
+      };
+
+      // Deduplicate subscribers by email (case-insensitive)
+      const uniqueSubscribers = new Map<string, { email: string; customFields: { [key: string]: string } }>();
+      subscribers.forEach((subscriber, index) => {
+        const emailLower = subscriber.email.toLowerCase();
+        if (uniqueSubscribers.has(emailLower)) {
+          results.errorCount++;
+          results.errors.push(`Row ${index + 1}: Duplicate email "${subscriber.email}" found in upload data`);
+        } else {
+          uniqueSubscribers.set(emailLower, subscriber);
+        }
+      });
+
+      // Get existing subscribers to check for duplicates
+      const existingSubscribers = await this.getAllTaskSubscribers(taskId);
+      const existingEmails = new Set((existingSubscribers || []).map(sub => sub.email.toLowerCase()));
+
+      // Filter out existing subscribers
+      const newSubscribers: Array<{ email: string; customFields: { [key: string]: string } }> = [];
+      uniqueSubscribers.forEach((subscriber, emailLower) => {
+        if (existingEmails.has(emailLower)) {
+          results.errorCount++;
+          results.errors.push(`Email "${subscriber.email}" already exists in subscriber list`);
+        } else {
+          newSubscribers.push(subscriber);
+        }
+      });
+
+      // Process new subscribers in batches of 25 (DynamoDB batch write limit)
+      const batchSize = 25;
+      for (let i = 0; i < newSubscribers.length; i += batchSize) {
+        const batch = newSubscribers.slice(i, i + batchSize);
+        
+        const writeRequests = batch.map(subscriber => ({
+          PutRequest: {
+            Item: {
+              taskId: taskId,
+              email: subscriber.email,
+              subscribedAt: new Date().toISOString(),
+              customFields: subscriber.customFields || {}
+            }
+          }
+        }));
+
+        try {
+          const params = {
+            RequestItems: {
+              [`${TABLE_PREFIX}AW-Subscribers`]: writeRequests
+            }
+          };
+
+          await dynamodb.batchWrite(params).promise();
+          results.successCount += batch.length;
+        } catch (batchError: any) {
+          // Handle individual item errors
+          if (batchError.code === 'ValidationException' || batchError.code === 'ConditionalCheckFailedException') {
+            batch.forEach((subscriber, index) => {
+              results.errorCount++;
+              results.errors.push(`Row ${i + index + 1}: ${subscriber.email} - ${batchError.message}`);
+            });
+          } else {
+            // If it's a different error, mark all items in this batch as failed
+            batch.forEach((subscriber, index) => {
+              results.errorCount++;
+              results.errors.push(`Row ${i + index + 1}: ${subscriber.email} - Batch write failed`);
+            });
+          }
+        }
+      }
+
+      return results;
+    } catch (error: any) {
+      handleDynamoDbError(error, "batchAddSubscribers");
+      return {
+        successCount: 0,
+        errorCount: subscribers.length,
+        errors: [`Batch upload failed: ${error.message}`]
+      };
+    }
+  },
 };
 
 // Add minimal workflow methods for counting
