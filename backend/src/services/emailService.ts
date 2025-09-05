@@ -142,7 +142,7 @@ export const emailService = {
   ) {
     try {
       // Import required services
-      const { taskDb } = require('../services/db');
+      const { taskDb, subscriberDb } = require('../services/db');
       
       // Get environment variables
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
@@ -168,6 +168,7 @@ export const emailService = {
         }
         
         let htmlContentFromFile = '';
+        let htmlContentUrl = '';
         
         // Look for HTML files in result_files
         for (const file of execution.result_files) {
@@ -184,6 +185,7 @@ export const emailService = {
                     ${fetchedHtmlContent}
                   </div>
                 `;
+                htmlContentUrl = file.url; // Capture the URL for email history
                 console.log(`Successfully fetched HTML content from ${file.url}`);
                 break; // Use the first HTML file found
               } else {
@@ -233,6 +235,23 @@ export const emailService = {
           const text = `Task Report: ${task.name}\n\nView the HTML report in the email body.\n\nManage task and history at: ${customerFrontendUrl}/tasks/${task.taskId}`;
           
           await this.sendEmail(toEmail, subject, text, simplifiedHtml);
+          
+          // Add email history to subscriber
+          try {
+            await subscriberDb.addEmailHistory(execution.taskId, toEmail, {
+              id: `email_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+              sentAt: new Date().toISOString(),
+              subject: subject,
+              status: 'sent',
+              taskExecutionId: executionId,
+              htmlContentUrl: htmlContentUrl
+            });
+            console.log(`Added email history for subscriber: ${toEmail}`);
+          } catch (historyError) {
+            console.error(`Failed to add email history for ${toEmail}:`, historyError);
+            // Don't throw error, email was sent successfully
+          }
+          
           return;
         } else {
           // HTML content not available, don't send email
@@ -263,6 +282,7 @@ export const emailService = {
     
     // Fetch HTML content from result_files
     let htmlContentFromFile = '';
+    let htmlContentUrl = '';
     if (execution.result_files && execution.result_files.length > 0) {
       for (const file of execution.result_files) {
         if ((file.is_html || file.view_type === 'html') && file.url) {
@@ -279,6 +299,7 @@ export const emailService = {
                   ${fetchedHtmlContent}
                 </div>
               `;
+              htmlContentUrl = file.url; // Capture the URL for email history
               console.log(`Successfully fetched HTML content from ${file.url}`);
               break; // Use the first HTML file found
             } else {
@@ -370,6 +391,23 @@ export const emailService = {
     const text = `Task: ${task.name}\nStatus: ${execution.status.toUpperCase()}\nManage task and history at: ${customerFrontendUrl}/tasks/${task.taskId}`;
     
     await this.sendEmail(toEmail, subject, text, html);
+    
+    // Add email history to subscriber
+    try {
+      await subscriberDb.addEmailHistory(execution.taskId, toEmail, {
+        id: `email_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        sentAt: new Date().toISOString(),
+        subject: subject,
+        status: 'sent',
+        taskExecutionId: executionId,
+        htmlContentUrl: htmlContentUrl
+      });
+      console.log(`Added email history for subscriber: ${toEmail}`);
+    } catch (historyError) {
+      console.error(`Failed to add email history for ${toEmail}:`, historyError);
+      // Don't throw error, email was sent successfully
+    }
+    
     } catch (error) {
       console.error(`Error sending task execution email to ${toEmail}:`, error);
       throw error;

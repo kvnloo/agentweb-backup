@@ -1660,6 +1660,70 @@ export const subscriberDb = {
     }
   },
 
+  async addEmailHistory(taskId: string, email: string, emailHistory: {
+    id: string;
+    sentAt: string;
+    subject: string;
+    status: 'sent' | 'delivered' | 'opened' | 'clicked' | 'bounced' | 'failed';
+    taskExecutionId?: string;
+    htmlContentUrl?: string;
+  }) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
+        Key: {
+          taskId: taskId,
+          email: email,
+        },
+        UpdateExpression: "SET emailHistory = list_append(if_not_exists(emailHistory, :empty_list), :newEmail)",
+        ExpressionAttributeValues: {
+          ":empty_list": [],
+          ":newEmail": [emailHistory],
+        },
+        ReturnValues: "ALL_NEW",
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "addEmailHistory");
+    }
+  },
+
+  async updateEmailStatus(taskId: string, email: string, emailId: string, status: 'delivered' | 'opened' | 'clicked' | 'bounced' | 'failed') {
+    try {
+      // First get the current subscriber record
+      const subscribers = await this.getTaskSubscribers(taskId);
+      const subscriber = subscribers?.find(sub => sub.email === email);
+      if (!subscriber || !subscriber.emailHistory) {
+        return null;
+      }
+
+      // Update the specific email history entry
+      const updatedHistory = subscriber.emailHistory.map((emailHistory: any) => 
+        emailHistory.id === emailId ? { ...emailHistory, status } : emailHistory
+      );
+
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
+        Key: {
+          taskId: taskId,
+          email: email,
+        },
+        UpdateExpression: "SET emailHistory = :updatedHistory",
+        ExpressionAttributeValues: {
+          ":updatedHistory": updatedHistory,
+        },
+        ReturnValues: "ALL_NEW",
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "updateEmailStatus");
+    }
+  },
+
   async batchAddSubscribers(taskId: string, subscribers: Array<{ email: string; customFields: { [key: string]: string } }>) {
     try {
       const results = {
