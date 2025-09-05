@@ -230,11 +230,19 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                 const subscribers = await subscriberDb.getTaskSubscribers(execution.taskId);
                 const activeSubscribers = subscribers ? subscribers.filter(sub => !sub.unsubscribed) : [];
                 const subscriberEmails = activeSubscribers.map(sub => sub.email);
-                console.log(`📧 Found ${subscriberEmails.length} active subscribers for task: ${execution.taskId}`);
                 
-                if (subscriberEmails.length > 0) {
+                // Apply subscriber email limit
+                const emailLimit = parseInt(process.env.SUBSCRIBER_EMAIL_LIMIT || '1000');
+                const limitedSubscriberEmails = subscriberEmails.slice(0, emailLimit);
+                
+                console.log(`📧 Found ${subscriberEmails.length} active subscribers for task: ${execution.taskId}`);
+                if (subscriberEmails.length > emailLimit) {
+                  console.log(`⚠️ Subscriber count (${subscriberEmails.length}) exceeds limit (${emailLimit}). Sending to first ${emailLimit} subscribers only.`);
+                }
+                
+                if (limitedSubscriberEmails.length > 0) {
                   // Send task results to subscribers using common function
-                  for (const email of subscriberEmails) {
+                  for (const email of limitedSubscriberEmails) {
                     try {
                       await emailService.sendTaskExecutionEmail(
                         email,
@@ -246,7 +254,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                       // Continue with other subscribers even if one fails
                     }
                   }
-                  console.log(`📧 Task results sent to ${subscriberEmails.length} subscribers for task: ${execution.taskId}`);
+                  console.log(`📧 Task results sent to ${limitedSubscriberEmails.length} subscribers for task: ${execution.taskId}`);
                 } else {
                   console.log(`No subscribers to notify for task: ${execution.taskId}`);
                 }

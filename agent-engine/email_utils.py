@@ -408,8 +408,15 @@ def notify_task_subscribers(task_id, task_name, execution_status, execution_id=N
                 ':unsubscribed': False
             }
         )
-        subscribers = response.get('Items', [])
-        logger.info(f"Found {len(subscribers)} subscribers for task {task_id}")
+        all_subscribers = response.get('Items', [])
+        
+        # Apply subscriber email limit
+        email_limit = int(os.getenv('SUBSCRIBER_EMAIL_LIMIT', '1000'))
+        subscribers = all_subscribers[:email_limit]
+        
+        logger.info(f"Found {len(all_subscribers)} subscribers for task {task_id}")
+        if len(all_subscribers) > email_limit:
+            logger.warning(f"Subscriber count ({len(all_subscribers)}) exceeds limit ({email_limit}). Sending to first {email_limit} subscribers only.")
         
         for subscriber in subscribers:
             email = subscriber.get('email')
