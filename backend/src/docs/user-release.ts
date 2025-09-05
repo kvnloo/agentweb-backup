@@ -7,6 +7,18 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-09-05',
+    changes: [
+      'Added Batch Upload for Subscriber List',
+      '- Users can now upload subscriber lists via CSV files on the Task Details page',
+      '- CSV files support email column as the key with other columns treated as custom profile fields',
+      '- Automatic deduplication of emails both within the CSV and against existing subscribers',
+      '- Upload preview shows all valid rows before processing',
+      '- Subscriber details popup displays custom profile fields with inline editing capabilities',
+      '- Added subscriber email limit (configurable via SUBSCRIBER_EMAIL_LIMIT, default 1000)',
+    ],
+  },
+  {
     date: '2025-09-04',
     changes: [
       'Support Create Meta Ad for Ad Images',

@@ -1614,6 +1614,203 @@ export const subscriberDb = {
       handleDynamoDbError(error, "getAllTaskSubscribers");
     }
   },
+
+  async updateSubscriberDetails(taskId: string, email: string, feedback: string, customFields: { [key: string]: string }) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
+        Key: {
+          taskId: taskId,
+          email: email,
+        },
+        UpdateExpression: "SET feedback = :feedback, customFields = :customFields",
+        ExpressionAttributeValues: {
+          ":feedback": feedback,
+          ":customFields": customFields,
+        },
+        ReturnValues: "ALL_NEW",
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "updateSubscriberDetails");
+    }
+  },
+
+  async updateSubscriberCustomFields(taskId: string, email: string, customFields: { [key: string]: string }) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
+        Key: {
+          taskId: taskId,
+          email: email,
+        },
+        UpdateExpression: "SET customFields = :customFields",
+        ExpressionAttributeValues: {
+          ":customFields": customFields,
+        },
+        ReturnValues: "ALL_NEW",
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "updateSubscriberCustomFields");
+    }
+  },
+
+  async addEmailHistory(taskId: string, email: string, emailHistory: {
+    id: string;
+    sentAt: string;
+    subject: string;
+    status: 'sent' | 'delivered' | 'opened' | 'clicked' | 'bounced' | 'failed';
+    taskExecutionId?: string;
+    htmlContentUrl?: string;
+  }) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
+        Key: {
+          taskId: taskId,
+          email: email,
+        },
+        UpdateExpression: "SET emailHistory = list_append(if_not_exists(emailHistory, :empty_list), :newEmail)",
+        ExpressionAttributeValues: {
+          ":empty_list": [],
+          ":newEmail": [emailHistory],
+        },
+        ReturnValues: "ALL_NEW",
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "addEmailHistory");
+    }
+  },
+
+  async updateEmailStatus(taskId: string, email: string, emailId: string, status: 'delivered' | 'opened' | 'clicked' | 'bounced' | 'failed') {
+    try {
+      // First get the current subscriber record
+      const subscribers = await this.getTaskSubscribers(taskId);
+      const subscriber = subscribers?.find(sub => sub.email === email);
+      if (!subscriber || !subscriber.emailHistory) {
+        return null;
+      }
+
+      // Update the specific email history entry
+      const updatedHistory = subscriber.emailHistory.map((emailHistory: any) => 
+        emailHistory.id === emailId ? { ...emailHistory, status } : emailHistory
+      );
+
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
+        Key: {
+          taskId: taskId,
+          email: email,
+        },
+        UpdateExpression: "SET emailHistory = :updatedHistory",
+        ExpressionAttributeValues: {
+          ":updatedHistory": updatedHistory,
+        },
+        ReturnValues: "ALL_NEW",
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "updateEmailStatus");
+    }
+  },
+
+  async batchAddSubscribers(taskId: string, subscribers: Array<{ email: string; customFields: { [key: string]: string } }>) {
+    try {
+      const results = {
+        successCount: 0,
+        errorCount: 0,
+        errors: [] as string[]
+      };
+
+      // Deduplicate subscribers by email (case-insensitive)
+      const uniqueSubscribers = new Map<string, { email: string; customFields: { [key: string]: string } }>();
+      subscribers.forEach((subscriber, index) => {
+        const emailLower = subscriber.email.toLowerCase();
+        if (uniqueSubscribers.has(emailLower)) {
+          results.errorCount++;
+          results.errors.push(`Row ${index + 1}: Duplicate email "${subscriber.email}" found in upload data`);
+        } else {
+          uniqueSubscribers.set(emailLower, subscriber);
+        }
+      });
+
+      // Get existing subscribers to check for duplicates
+      const existingSubscribers = await this.getAllTaskSubscribers(taskId);
+      const existingEmails = new Set((existingSubscribers || []).map(sub => sub.email.toLowerCase()));
+
+      // Filter out existing subscribers
+      const newSubscribers: Array<{ email: string; customFields: { [key: string]: string } }> = [];
+      uniqueSubscribers.forEach((subscriber, emailLower) => {
+        if (existingEmails.has(emailLower)) {
+          results.errorCount++;
+          results.errors.push(`Email "${subscriber.email}" already exists in subscriber list`);
+        } else {
+          newSubscribers.push(subscriber);
+        }
+      });
+
+      // Process new subscribers in batches of 25 (DynamoDB batch write limit)
+      const batchSize = 25;
+      for (let i = 0; i < newSubscribers.length; i += batchSize) {
+        const batch = newSubscribers.slice(i, i + batchSize);
+        
+        const writeRequests = batch.map(subscriber => ({
+          PutRequest: {
+            Item: {
+              taskId: taskId,
+              email: subscriber.email,
+              subscribedAt: new Date().toISOString(),
+              customFields: subscriber.customFields || {}
+            }
+          }
+        }));
+
+        try {
+          const params = {
+            RequestItems: {
+              [`${TABLE_PREFIX}AW-Subscribers`]: writeRequests
+            }
+          };
+
+          await dynamodb.batchWrite(params).promise();
+          results.successCount += batch.length;
+        } catch (batchError: any) {
+          // Handle individual item errors
+          if (batchError.code === 'ValidationException' || batchError.code === 'ConditionalCheckFailedException') {
+            batch.forEach((subscriber, index) => {
+              results.errorCount++;
+              results.errors.push(`Row ${i + index + 1}: ${subscriber.email} - ${batchError.message}`);
+            });
+          } else {
+            // If it's a different error, mark all items in this batch as failed
+            batch.forEach((subscriber, index) => {
+              results.errorCount++;
+              results.errors.push(`Row ${i + index + 1}: ${subscriber.email} - Batch write failed`);
+            });
+          }
+        }
+      }
+
+      return results;
+    } catch (error: any) {
+      handleDynamoDbError(error, "batchAddSubscribers");
+      return {
+        successCount: 0,
+        errorCount: subscribers.length,
+        errors: [`Batch upload failed: ${error.message}`]
+      };
+    }
+  },
 };
 
 // Add minimal workflow methods for counting

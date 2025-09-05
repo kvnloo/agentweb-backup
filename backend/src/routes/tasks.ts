@@ -346,6 +346,195 @@ router.get('/:taskId/subscribers/all', authenticateToken, async (req, res) => {
   }
 });
 
+// Add email history to subscriber
+router.post('/:taskId/subscribers/:email/email-history', authenticateToken, async (req, res) => {
+  try {
+    const { taskId, email } = req.params;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    const { subject, taskExecutionId, htmlContentUrl } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!subject) {
+      return res.status(400).json({ message: 'Subject is required' });
+    }
+
+    // Get task to verify ownership
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Verify task belongs to user or user is admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Add email history
+    const emailHistory = {
+      id: `email_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      sentAt: new Date().toISOString(),
+      subject,
+      status: 'sent' as const,
+      taskExecutionId,
+      htmlContentUrl
+    };
+
+    const updatedSubscriber = await subscriberDb.addEmailHistory(taskId, email, emailHistory);
+    
+    if (!updatedSubscriber) {
+      return res.status(404).json({ message: 'Subscriber not found' });
+    }
+
+    res.json(updatedSubscriber);
+  } catch (error: any) {
+    console.error('Error adding email history:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Update email status
+router.put('/:taskId/subscribers/:email/email-history/:emailId', authenticateToken, async (req, res) => {
+  try {
+    const { taskId, email, emailId } = req.params;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    const { status } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!status || !['delivered', 'opened', 'clicked', 'bounced', 'failed'].includes(status)) {
+      return res.status(400).json({ message: 'Valid status is required' });
+    }
+
+    // Get task to verify ownership
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Verify task belongs to user or user is admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Update email status
+    const updatedSubscriber = await subscriberDb.updateEmailStatus(taskId, email, emailId, status);
+    
+    if (!updatedSubscriber) {
+      return res.status(404).json({ message: 'Subscriber or email not found' });
+    }
+
+    res.json(updatedSubscriber);
+  } catch (error: any) {
+    console.error('Error updating email status:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Update subscriber details
+router.put('/:taskId/subscribers/:email', authenticateToken, async (req, res) => {
+  try {
+    const { taskId, email } = req.params;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    const { customFields } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Get task to verify ownership
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Verify task belongs to user or user is admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Update subscriber custom fields only
+    const updatedSubscriber = await subscriberDb.updateSubscriberCustomFields(
+      taskId, 
+      email, 
+      customFields || {}
+    );
+    
+    if (!updatedSubscriber) {
+      return res.status(404).json({ message: 'Subscriber not found' });
+    }
+
+    res.json(updatedSubscriber);
+  } catch (error: any) {
+    console.error('Error updating subscriber:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Batch upload subscribers from CSV
+router.post('/:taskId/subscribers/batch', authenticateToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    const { subscribers } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!subscribers || !Array.isArray(subscribers)) {
+      return res.status(400).json({ message: 'Subscribers array is required' });
+    }
+
+    // Get task to verify ownership
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Verify task belongs to user or user is admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Process batch upload
+    const results = await subscriberDb.batchAddSubscribers(taskId, subscribers);
+    
+    res.json({
+      successCount: results.successCount,
+      errorCount: results.errorCount,
+      errors: results.errors
+    });
+  } catch (error: any) {
+    console.error('Error batch uploading subscribers:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // Add subscriber to task
 router.post('/:taskId/subscribers', async (req, res) => {
   try {

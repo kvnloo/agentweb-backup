@@ -9,6 +9,7 @@ from datetime import datetime
 from aws_utils import get_dynamodb_resource
 from task_utils import check_new_information
 import requests # Added for fetching HTML content
+import json
 
 # Load environment variables
 load_dotenv()
@@ -43,6 +44,67 @@ def get_task_subscribers(task_id):
     except Exception as e:
         logger.error(f"Failed to get task subscribers: {e}")
         return []
+
+def add_email_history(task_id, email, subject, execution_id=None, html_content_url=None):
+    """
+    Add email history to subscriber record via backend API.
+    """
+    try:
+        from task_utils import create_jwt_token
+        
+        backend_url = os.getenv('BACKEND_URL', 'http://localhost:3001')
+        api_url = f"{backend_url}/api/tasks/{task_id}/subscribers/{email}/email-history"
+        
+        # Get the user_id from the task_id (assuming task_id contains user info or we can get it from the task)
+        # For now, we'll need to get the user_id from the task
+        try:
+            # Get task details to find the user_id
+            task_response = dynamodb.Table(f'{TABLE_PREFIX}AW-Tasks').get_item(
+                Key={'taskId': task_id}
+            )
+            task = task_response.get('Item', {})
+            user_id = task.get('userId')
+            
+            if not user_id:
+                logger.error(f"Could not find user_id for task {task_id}")
+                return False
+                
+            # Create JWT token for the user
+            jwt_token = create_jwt_token(user_id)
+            if not jwt_token:
+                logger.error(f"Failed to create JWT token for user {user_id}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error getting user_id for task {task_id}: {e}")
+            return False
+        
+        payload = {
+            "subject": subject,
+            "taskExecutionId": execution_id,
+            "htmlContentUrl": html_content_url
+        }
+        
+        response = requests.post(
+            api_url,
+            json=payload,
+            headers={
+                'Authorization': f'Bearer {jwt_token}',
+                'Content-Type': 'application/json'
+            },
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            logger.info(f"Added email history for subscriber: {email}")
+            return True
+        else:
+            logger.error(f"Failed to add email history for {email}: {response.status_code} - {response.text}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error adding email history for {email}: {e}")
+        return False
 
 def send_task_notification(to_email, task_name, task_id, execution_status, execution_id=None, result=None, error=None, new_info_summary=None, llm_name=None):
     """
@@ -92,13 +154,17 @@ def send_task_notification(to_email, task_name, task_id, execution_status, execu
             server.send_message(msg)
 
         logger.info(f"Sent task completion notification to {to_email}")
+        
+        # Add email history to subscriber
+        add_email_history(task_id, to_email, msg['Subject'], execution_id)
+        
         return True
 
     except Exception as e:
         logger.error(f"Failed to send email notification: {e}")
         return False
 
-def send_task_results(to_email, task_name, task_id, execution_status, result=None, error=None, start_time=None, end_time=None, new_info_summary=None, result_files=None, llm_name=None, send_html_report_only=False):
+def send_task_results(to_email, task_name, task_id, execution_status, result=None, error=None, start_time=None, end_time=None, new_info_summary=None, result_files=None, llm_name=None, send_html_report_only=False, execution_id=None):
     """
     Send a detailed task results email to subscribers.
     Sends content as HTML only.
@@ -134,6 +200,7 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
 
         # --- Fetch HTML content from result_files ---
         html_content_from_file_section = ""
+        html_content_url = None
         if result_files:
             for file_info in result_files:
                 if file_info.get('view_type') == 'html' and file_info.get('url'):
@@ -145,6 +212,7 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
     <h3>HTML Result File:</h3>
     {fetched_html_content}
 </div>"""
+                        html_content_url = file_info['url']  # Capture the URL for email history
                         logger.info(f"Successfully fetched HTML content from {file_info['url']}")
                         break # Use the first HTML file found
                     except requests.RequestException as e:
@@ -169,6 +237,7 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
                 return False
             
             html_content_from_file_section = ""
+            html_content_url = None
             
             for file_info in result_files:
                 if file_info.get('view_type') == 'html' and file_info.get('url'):
@@ -179,6 +248,7 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
                         html_content_from_file_section = f"""<div class="html-result">
     {fetched_html_content}
 </div>"""
+                        html_content_url = file_info['url']  # Capture the URL for email history
                         logger.info(f"Successfully fetched HTML content from {file_info['url']}")
                         break
                     except requests.RequestException as e:
@@ -210,6 +280,7 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
     {html_content_from_file_section}
     <div class="footer">
       <p>Manage task and history at: <a href="{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/tasks/{task_id}">{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/tasks/{task_id}</a></p>
+      {f'<p><small><strong>Note:</strong> Some visuals may not display properly in the email. <a href="{html_content_url}">View full report here</a> for the complete experience.</small></p>' if html_content_url else ''}
       <hr>
       <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>
       <p><small><a href="{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/unsubscribe?taskId={task_id}&email={to_email}" style="color: #e74c3c;">Unsubscribe from future updates</a></small></p>
@@ -230,6 +301,10 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
                     server.send_message(msg)
 
                 logger.info(f"Sent simplified HTML report email to subscriber: {to_email}")
+                
+                # Add email history to subscriber
+                add_email_history(task_id, to_email, subject, execution_id, html_content_url)
+                
                 return True
             else:
                 # HTML content not available, don't send email
@@ -282,6 +357,7 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
         html_body_content += f"""
     <div class="footer">
       <p>Manage task and history at: <a href="{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/tasks/{task_id}">{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/tasks/{task_id}</a></p>
+      {f'<p><small><strong>Note:</strong> Some visuals may not display properly in the email. <a href="{html_content_url}">View full report here</a> for the complete experience.</small></p>' if html_content_url else ''}
       <hr>
       <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>
       <p><small><a href="{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/unsubscribe?taskId={task_id}&email={to_email}" style="color: #e74c3c;">Unsubscribe from future updates</a></small></p>
@@ -303,10 +379,15 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
             server.send_message(msg)
 
         logger.info(f"Sent task run results (HTML only) to subscriber: {to_email}")
+        
+        # Add email history to subscriber
+        add_email_history(task_id, to_email, subject, execution_id, html_content_url)
+        
         return True
 
     except Exception as e:
-        logger.error(f"Failed to send task results email (HTML only): {e}", exc_info=True)
+        logger.error(f"Failed to send task results email (HTML only): {e}")
+        logger.exception("Full traceback:")
         return False
 
 def notify_task_subscribers(task_id, task_name, execution_status, execution_id=None, result=None, error=None, start_time=None, end_time=None, new_info_summary=None, result_files=None, llm_name=None):
@@ -329,8 +410,15 @@ def notify_task_subscribers(task_id, task_name, execution_status, execution_id=N
                 ':unsubscribed': False
             }
         )
-        subscribers = response.get('Items', [])
-        logger.info(f"Found {len(subscribers)} subscribers for task {task_id}")
+        all_subscribers = response.get('Items', [])
+        
+        # Apply subscriber email limit
+        email_limit = int(os.getenv('SUBSCRIBER_EMAIL_LIMIT', '1000'))
+        subscribers = all_subscribers[:email_limit]
+        
+        logger.info(f"Found {len(all_subscribers)} subscribers for task {task_id}")
+        if len(all_subscribers) > email_limit:
+            logger.warning(f"Subscriber count ({len(all_subscribers)}) exceeds limit ({email_limit}). Sending to first {email_limit} subscribers only.")
         
         for subscriber in subscribers:
             email = subscriber.get('email')
@@ -348,7 +436,8 @@ def notify_task_subscribers(task_id, task_name, execution_status, execution_id=N
                     new_info_summary,
                     result_files=result_files,
                     llm_name=llm_name,
-                    send_html_report_only=send_html_report_only
+                    send_html_report_only=send_html_report_only,
+                    execution_id=execution_id
                 )
                 
                 if success:
