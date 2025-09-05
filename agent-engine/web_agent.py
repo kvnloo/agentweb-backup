@@ -28,6 +28,7 @@ import random
 import aiohttp
 import base64  # Add at the top with other imports
 import boto3  # Add at the top with other imports
+from datetime import datetime, timezone
 from urllib.parse import quote
 from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content, generate_content_hash, get_agent_code_base_path, call_github_api, run_python_code_in_sandbox, fetch_api_credentials, decrypt_password, get_all_configs, parse_json
 from knowledge_base_utils import get_knowledge_base_manager
@@ -46,6 +47,8 @@ load_dotenv()
 
 # Get table prefix based on NODE_ENV
 TABLE_PREFIX = 'Dev-' if os.getenv('NODE_ENV') == 'development' else ''
+
+HTML_OUTPUT_INSTRUCTION = """Requirement: The final output for this task MUST be in well-formatted HTML5 with modern styling. You MUST use the 'Write file' action to save this HTML content into a file with an .html extension. The HTML output should include:\n1. A clean, modern layout with proper spacing and typography\n2. Visual elements like tables, charts or diagrams to represent data (using Chart.js)\n3. DO NOT use bar chart if data range is large as it will be hard to read.\n4. Clear section headers and organized content structure\n5. CSS styling for visual appeal\n6. Proper citations and references for any external sources or data"""
 
 # Initialize DynamoDB client
 dynamodb = get_dynamodb_resource()
@@ -337,7 +340,8 @@ class WebAgent:
             if output_as_json:
                 prompt = f"{prompt}\n\nRequirement: Output result as JSON instead of free text."
             elif self.output_as_html:
-                prompt = f"{prompt}\n\nRequirement: The final output for this task MUST be in well-formatted HTML5 with modern styling. You MUST use the 'Write file' action to save this HTML content into a file with an .html extension. The HTML output should include:\n1. A clean, modern layout with proper spacing and typography\n2. Visual elements like tables, charts or diagrams to represent data (using Chart.js)\n3. DO NOT use bar chart if data range is large as it will be hard to read.\n4. Clear section headers and organized content structure\n5. CSS styling for visual appeal\n6. Proper citations and references for any external sources or data"
+                prompt = f"{prompt}\n\n{HTML_OUTPUT_INSTRUCTION}"
+                self.retry_count = int(os.getenv('RETRY_COUNT', '2'))
 
             # Add knowledge base instruction if enabled
             if self.use_knowledge_base:
@@ -1455,7 +1459,7 @@ class WebAgent:
                     return ActionResult(error=validation_error)
                 
                 # Write content to file
-                filepath.write_text(content)
+                #filepath.write_text(content)
                 
                 msg = f"Successfully wrote content to {full_filename}"
                 logger.info(msg)
@@ -3610,6 +3614,21 @@ class WebAgent:
             except Exception as e:
                 logger.error(f"Error generating image: {e}")
                 return ActionResult(error=f"Failed to generate image: {str(e)}")
+
+        @self.controller.registry.action('Done with task')
+        async def done(result_summary: str):
+            if self.output_as_html:
+                downloads_path = Path(self._get_downloads_path())
+                html_file = next((f for f in downloads_path.iterdir() if f.suffix == '.html'), None)
+                if not html_file:
+                    if self.retry_count > 0:
+                        logger.info(f"HTML file not found in downloads path. Retry count: {self.retry_count}")
+                        self.retry_count -= 1
+                        return ActionResult(is_done=False, extracted_content=HTML_OUTPUT_INSTRUCTION)
+                    else:
+                        logger.error("HTML file not found in downloads path after retries. Giving up.")
+            return ActionResult(is_done=True, extracted_content=result_summary)
+                
 
     def _get_cookies_path(self):
         """Get the path to the user's cookies file"""
