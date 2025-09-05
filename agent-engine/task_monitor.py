@@ -168,19 +168,6 @@ def create_execution(task_id, user_id, prompt=None, workflow_execution_id=None):
         }
         if workflow_execution_id:
             execution['workflowExecutionId'] = workflow_execution_id
-            
-        # Check if task has outputAsHtml set to true and add retryCount
-        if not task_id.startswith('task-'):
-            try:
-                task_response = tasks_table.get_item(Key={'taskId': task_id})
-                task = task_response.get('Item')
-                if task and task.get('outputAsHtml', False):
-                    retry_count = int(os.getenv('RETRY_COUNT', '3'))
-                    execution['retryCount'] = retry_count
-                    logger.info(f"Added retryCount={retry_count} for task {task_id} with outputAsHtml=true")
-            except Exception as e:
-                logger.error(f"Error checking task outputAsHtml for retryCount: {e}")
-        
         executions_table.put_item(Item=execution)
         logger.info(f"Created execution {execution_id} for task {task_id}")
         return execution_id
@@ -810,6 +797,14 @@ async def execute_task(execution):
             
             if not task:
                 raise Exception(f"Task {task_id} not found")
+            
+            # Set retryCount if not present and task has outputAsHtml set to true
+            if 'retryCount' not in execution and task.get('outputAsHtml', False):
+                retry_count = int(os.getenv('RETRY_COUNT', '2'))
+                execution['retryCount'] = retry_count
+                # Update original_execution for retry logic
+                original_execution['retryCount'] = retry_count
+                logger.info(f"Added retryCount={retry_count} for execution {execution_id} with outputAsHtml=true")
                 
             # Check if this is a deep research task and track it
             is_deep_research = task.get('isDeepResearch', False)
