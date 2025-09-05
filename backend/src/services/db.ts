@@ -1614,6 +1614,51 @@ export const subscriberDb = {
       handleDynamoDbError(error, "getAllTaskSubscribers");
     }
   },
+
+  async updateSubscriberDetails(taskId: string, email: string, feedback: string, customFields: { [key: string]: string }) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
+        Key: {
+          taskId: taskId,
+          email: email,
+        },
+        UpdateExpression: "SET feedback = :feedback, customFields = :customFields",
+        ExpressionAttributeValues: {
+          ":feedback": feedback,
+          ":customFields": customFields,
+        },
+        ReturnValues: "ALL_NEW",
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "updateSubscriberDetails");
+    }
+  },
+
+  async updateSubscriberCustomFields(taskId: string, email: string, customFields: { [key: string]: string }) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
+        Key: {
+          taskId: taskId,
+          email: email,
+        },
+        UpdateExpression: "SET customFields = :customFields",
+        ExpressionAttributeValues: {
+          ":customFields": customFields,
+        },
+        ReturnValues: "ALL_NEW",
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "updateSubscriberCustomFields");
+    }
+  },
 };
 
 // Add minimal workflow methods for counting
