@@ -1468,42 +1468,46 @@ Context - Original Task: {base_prompt}"""
                         # Check if retryCount is present and not 0
                         retry_count = original_execution.get('retryCount')
                         if retry_count and retry_count > 0:
-                            # Get the current execution record from DB to check result_files
+                            # Get the current execution record from DB to check result_files and status
                             try:
                                 current_execution_response = executions_table.get_item(Key={'executionId': execution_id})
                                 current_execution = current_execution_response.get('Item', {})
-                                result_files = current_execution.get('result_files', [])
+                                
+                                # Only consider retry if execution is in completed status
+                                if current_execution.get('status') == 'completed':
+                                    result_files = current_execution.get('result_files', [])
+                                    
+                                    html_file_found = False
+                                    
+                                    for file_info in result_files:
+                                        if file_info.get('view_type') == 'html' or file_info.get('filename', '').endswith('.html'):
+                                            html_file_found = True
+                                            break
+                                            
+                                    if not html_file_found:
+                                        # HTML file was not created but outputAsHtml is true and retryCount > 0
+                                        logger.info(f"HTML file not found for execution {execution_id} with outputAsHtml=true and retryCount={retry_count}, creating retry execution")
+                                        
+                                        # Create retry execution by copying the original execution
+                                        retry_execution = original_execution.copy()
+                                        
+                                        # Generate new execution ID and update key fields
+                                        new_execution_id = str(int(time.time() * 1000))
+                                        retry_execution['executionId'] = new_execution_id
+                                        retry_execution['startTime'] = datetime.now(timezone.utc).isoformat()
+                                        retry_execution['retryCount'] = retry_count - 1
+                                        retry_execution['originalExecutionId'] = original_execution['executionId']
+                                        
+                                        # Create the new execution record
+                                        executions_table.put_item(Item=retry_execution)
+                                        
+                                        logger.info(f"Created retry execution {new_execution_id} for task {original_execution['taskId']} with retryCount {retry_count - 1}")
+                                    else:
+                                        logger.info(f"HTML file found in execution {execution_id}, no retry needed")
+                                else:
+                                    logger.info(f"Execution {execution_id} is not in completed status ({current_execution.get('status')}), skipping retry check")
                             except Exception as e:
                                 logger.error(f"Error fetching current execution for retry check: {e}")
-                                result_files = []
-                            
-                            html_file_found = False
-                            
-                            for file_info in result_files:
-                                if file_info.get('view_type') == 'html' or file_info.get('filename', '').endswith('.html'):
-                                    html_file_found = True
-                                    break
-                                    
-                            if not html_file_found:
-                                # HTML file was not created but outputAsHtml is true and retryCount > 0
-                                logger.info(f"HTML file not found for execution {execution_id} with outputAsHtml=true and retryCount={retry_count}, creating retry execution")
-                                
-                                # Create retry execution by copying the original execution
-                                retry_execution = original_execution.copy()
-                                
-                                # Generate new execution ID and update key fields
-                                new_execution_id = str(int(time.time() * 1000))
-                                retry_execution['executionId'] = new_execution_id
-                                retry_execution['startTime'] = datetime.now(timezone.utc).isoformat()
-                                retry_execution['retryCount'] = retry_count - 1
-                                retry_execution['originalExecutionId'] = original_execution['executionId']
-                                
-                                # Create the new execution record
-                                executions_table.put_item(Item=retry_execution)
-                                
-                                logger.info(f"Created retry execution {new_execution_id} for task {original_execution['taskId']} with retryCount {retry_count - 1}")
-                            else:
-                                logger.info(f"HTML file found in execution {execution_id}, no retry needed")
             except Exception as retry_error:
                 logger.error(f"Error checking HTML retry: {retry_error}")
                 
