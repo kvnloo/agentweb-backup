@@ -264,7 +264,7 @@ class UserDB {
     try {
       const params = {
         TableName: this.tableName,
-        Limit: 50,
+        Limit: 5000,
       };
 
       const result = await this.docClient.scan(params).promise();
