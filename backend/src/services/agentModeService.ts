@@ -1,6 +1,6 @@
 import OpenAI from 'openai';
 import { chatbotDb, ChatMessage } from './chatbotService';
-import { taskDb } from './db';
+import { taskDb, taskTemplateDb } from './db';
 import { v4 as uuidv4 } from 'uuid';
 
 export class AgentModeService {
@@ -28,12 +28,17 @@ export class AgentModeService {
       
       const systemPrompt = this.getMarketingSystemPrompt();
       const currentTaskStatuses = await this.getCurrentTaskStatuses(userId);
+      const availableTemplates = await this.getAvailableTemplates();
       const context = this.buildMarketingContext(userMessage, sessionHistory, currentTaskStatuses);
+      
+      // Build templates context message
+      const templatesContext = this.buildTemplatesContext(availableTemplates);
       
       const response = await this.openai.chat.completions.create({
         model: process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
         messages: [
           { role: 'system', content: systemPrompt },
+          { role: 'assistant', content: templatesContext },
           { role: 'user', content: context }
         ],
         tools: this.getAvailableTools(),
@@ -95,26 +100,53 @@ export class AgentModeService {
   private getMarketingSystemPrompt(): string {
     return `You are Emma, an AI-powered assistant from AgentWeb. You help users execute marketing campaigns through natural conversation and task creation.
 
-You can execute various marketing tasks including:
-- SWOT analysis of landing pages
-- Marketing strategy generation
-- Ad creative creation
-- Campaign publishing
-- Performance analysis
+## Your Capabilities
+You can help with various marketing tasks including:
+- Market research and competitive analysis
+- SWOT analysis for businesses
+- Marketing strategy development
+- Ad creative generation and campaign management
+- Performance analysis and optimization
+- Social media listening and brand monitoring
+
+## Task Creation Approach
+- **Primary Method**: Use the 'create_task_from_template' tool with a specific template_id and parameters_json string
+- All available templates are provided in the context above - select the most appropriate one based on the user's request
+- Extract the required parameters from the user's message and pass them as a JSON string where keys are parameter names and values are the actual values
+- Example: {"site_url": "example.com", "business_area": "e-commerce"}
+- Templates provide structured, proven approaches to common marketing tasks
+- **Fallback Method**: If no suitable template is available, use 'create_task_from_prompt' to create a task with a raw prompt
+- The 'create_task_from_prompt' tool allows you to create custom tasks with specific instructions when templates don't fit
+
+## Task Execution
+- When you create tasks, they will show execution status in the UI (pending, running, completed, failed)
+- The tool call results will include the current status of any running tasks
+- You can reference the status information provided in the tool call results
+- If a user asks about task status, use the current status from the tool call results
+
+## Communication Style
+- Be helpful, professional, and conversational
+- Ask clarifying questions when needed
+- Provide clear explanations of what you're doing
+- Keep responses concise but informative
+- Always confirm task creation and provide relevant details
+- When using templates, explain which template was selected and why
 
 Use the available tools to create tasks in the agent-engine when complex work is required. Guide users through marketing flows naturally through conversation.`;
   }
 
   private getStatusMessage(toolName: string, status: string): string {
-    const statusEmoji = {
+    const statusEmoji: Record<string, string> = {
       'pending': '⏳',
       'running': '🔄',
       'completed': '✅',
       'failed': '❌'
-    }[status] || '⏳';
+    };
+    const emoji = statusEmoji[status] || '⏳';
 
-    const toolDescriptions = {
-      'perform_swot_analysis': 'SWOT analysis',
+    const toolDescriptions: Record<string, string> = {
+      'create_task_from_template': 'template-based task',
+      'create_task_from_prompt': 'custom prompt task',
       'publish_meta_ads': 'Meta ads campaign',
       'analyze_ad_performance': 'ad performance analysis'
     };
@@ -123,15 +155,15 @@ Use the available tools to create tasks in the agent-engine when complex work is
     
     switch (status) {
       case 'pending':
-        return `${statusEmoji} **${toolDescription}** is queued and will start shortly.`;
+        return `${emoji} **${toolDescription}** is queued and will start shortly.`;
       case 'running':
-        return `${statusEmoji} **${toolDescription}** is currently running. This may take a few minutes.`;
+        return `${emoji} **${toolDescription}** is currently running. This may take a few minutes.`;
       case 'completed':
-        return `${statusEmoji} **${toolDescription}** has completed successfully!`;
+        return `${emoji} **${toolDescription}** has completed successfully!`;
       case 'failed':
-        return `${statusEmoji} **${toolDescription}** failed to complete. Please check the task details for more information.`;
+        return `${emoji} **${toolDescription}** failed to complete. Please check the task details for more information.`;
       default:
-        return `${statusEmoji} **${toolDescription}** status: ${status}`;
+        return `${emoji} **${toolDescription}** status: ${status}`;
     }
   }
 
@@ -142,13 +174,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
     if (currentTaskStatuses.length > 0) {
       context += 'Current Task Statuses:\n';
       currentTaskStatuses.forEach(task => {
-        const statusEmoji = {
+        const statusEmoji: Record<string, string> = {
           'pending': '⏳',
           'running': '🔄',
           'completed': '✅',
           'failed': '❌'
-        }[task.status] || '⏳';
-        context += `${statusEmoji} ${task.taskName} (${task.status}) - Task ID: ${task.taskId}\n`;
+        };
+        const emoji = statusEmoji[task.status] || '⏳';
+        context += `${emoji} ${task.taskName} (${task.status}) - Task ID: ${task.taskId}\n`;
       });
       context += '\n';
     }
@@ -166,72 +199,87 @@ Use the available tools to create tasks in the agent-engine when complex work is
     return context;
   }
 
+  private buildTemplatesContext(templates: any[]): string {
+    if (templates.length === 0) {
+      return 'No templates are currently available.';
+    }
+
+    let context = 'Available Templates:\n\n';
+    
+    // Group templates by category
+    const groupedTemplates: Record<string, any[]> = {};
+    templates.forEach(template => {
+      const category = template.category || 'General';
+      if (!groupedTemplates[category]) {
+        groupedTemplates[category] = [];
+      }
+      groupedTemplates[category].push(template);
+    });
+
+    // Build context for each category
+    Object.entries(groupedTemplates).forEach(([category, categoryTemplates]) => {
+      context += `## ${category}\n`;
+      categoryTemplates.forEach(template => {
+        context += `**${template.name}** (ID: ${template.templateId})\n`;
+        context += `Description: ${template.description}\n`;
+        if (template.parameters && template.parameters.length > 0) {
+          const paramNames = template.parameters.map((p: any) => typeof p === 'string' ? p : p.name || p.id);
+          context += `Parameters: ${paramNames.join(', ')}\n`;
+        }
+        context += `\n`;
+      });
+    });
+
+    context += `\nTo use a template, call the 'create_task_from_template' tool with the template_id and parameters_json string (JSON format where keys are parameter names and values are the actual values).`;
+    
+    return context;
+  }
+
   private getAvailableTools() {
     return [
       {
         type: 'function' as const,
         function: {
-          name: 'perform_swot_analysis',
-          description: 'Perform a comprehensive SWOT analysis for a business or website',
+          name: 'create_task_from_template',
+          description: 'Create a task using a specific template with the provided parameters',
           parameters: {
             type: 'object',
             properties: {
-              url: {
+              template_id: {
                 type: 'string',
-                description: 'The website URL to analyze'
+                description: 'The ID of the template to use for creating the task'
               },
-              business_context: {
+              parameters_json: {
                 type: 'string',
-                description: 'Additional business context or information'
+                description: 'JSON string containing parameter values where keys are parameter names and values are the actual values. Example: {"site_url": "example.com", "business_area": "e-commerce"}'
               }
             },
-            required: ['url']
+            required: ['template_id', 'parameters_json']
           }
         }
       },
       {
         type: 'function' as const,
         function: {
-          name: 'generate_marketing_strategy',
-          description: 'Generate a comprehensive marketing strategy based on analysis data',
+          name: 'create_task_from_prompt',
+          description: 'Create a task using a raw prompt when no suitable template is available',
           parameters: {
             type: 'object',
             properties: {
-              swot_data: {
+              task_name: {
                 type: 'string',
-                description: 'SWOT analysis results to base strategy on'
+                description: 'Name for the task'
               },
-              business_goals: {
+              prompt: {
                 type: 'string',
-                description: 'Specific business goals and objectives'
+                description: 'The raw prompt/instructions for the task'
+              },
+              category: {
+                type: 'string',
+                description: 'Category for the task (e.g., Research, Marketing, Analysis)'
               }
             },
-            required: ['swot_data']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'create_ad_creatives',
-          description: 'Create ad creatives including images and copy',
-          parameters: {
-            type: 'object',
-            properties: {
-              campaign_theme: {
-                type: 'string',
-                description: 'The theme or concept for the ad creatives'
-              },
-              target_audience: {
-                type: 'string',
-                description: 'Target audience description'
-              },
-              count: {
-                type: 'number',
-                description: 'Number of creatives to generate (default: 5)'
-              }
-            },
-            required: ['campaign_theme']
+            required: ['task_name', 'prompt', 'category']
           }
         }
       },
@@ -322,13 +370,22 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   private async executeTool(toolName: string, args: any, userId: string): Promise<any> {
+    console.log('AgentMode: Executing tool:', toolName, 'with args:', JSON.stringify(args, null, 2));
     switch (toolName) {
-      case 'perform_swot_analysis':
-        return await this.performSwotAnalysis(args.url, args.business_context, userId);
-      case 'generate_marketing_strategy':
-        return await this.generateMarketingStrategy(args.swot_data, args.business_goals, userId);
-      case 'create_ad_creatives':
-        return await this.createAdCreatives(args.campaign_theme, args.target_audience, args.count, userId);
+      case 'create_task_from_template':
+        try {
+          const parameters = JSON.parse(args.parameters_json || '{}');
+          return await this.createTaskFromTemplate(args.template_id, parameters, userId);
+        } catch (parseError) {
+          console.error('AgentMode: Error parsing parameters JSON:', parseError);
+          return {
+            success: false,
+            message: 'Invalid parameters JSON format. Please provide a valid JSON string.',
+            status: 'invalid_json'
+          };
+        }
+      case 'create_task_from_prompt':
+        return await this.createTaskFromPrompt(args.task_name, args.prompt, args.category, userId);
       case 'publish_meta_ads':
         return await this.publishMetaAds(args.campaign_name, args.budget, args.targeting, args.creatives, userId);
       case 'analyze_ad_performance':
@@ -343,7 +400,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       // Get recent task executions for this user
       const allExecutions = await taskDb.getAllTaskExecutionsByUserId(userId);
       // Get the 10 most recent executions
-      const recentExecutions = allExecutions
+      const recentExecutions = (allExecutions || [])
         .sort((a, b) => new Date(b.createdAt || b.startTime).getTime() - new Date(a.createdAt || a.startTime).getTime())
         .slice(0, 10);
       
@@ -357,6 +414,252 @@ Use the available tools to create tasks in the agent-engine when complex work is
     } catch (error) {
       console.error('Error fetching current task statuses:', error);
       return [];
+    }
+  }
+
+  // Get available templates
+  private async getAvailableTemplates(): Promise<any[]> {
+    try {
+      const templates = await taskTemplateDb.getPublishedTemplates();
+      return templates.map(template => ({
+        templateId: template.templateId,
+        name: template.name,
+        description: template.description,
+        category: template.category,
+        parameters: template.parameters || [],
+        promptTemplate: template.prompt,
+        isDeepResearch: template.isDeepResearch,
+        isComplexTask: template.isComplexTask,
+        outputAsJson: template.outputAsJson,
+        outputAsHtml: template.outputAsHtml,
+        selectedLLMs: template.selectedLLMs,
+        useSharedBrowser: template.useSharedBrowser,
+        turnOffHeadless: template.turnOffHeadless
+      }));
+    } catch (error) {
+      console.error('Error fetching templates:', error);
+      return [];
+    }
+  }
+
+
+
+  // Create task from template
+  private async createTaskFromTemplate(templateId: string, parameters: Record<string, string>, userId: string): Promise<any> {
+    try {
+      console.log('AgentMode: Creating task from template ID:', templateId, 'with parameters:', parameters);
+
+      // Validate parameters
+      if (!parameters || typeof parameters !== 'object') {
+        return {
+          success: false,
+          message: 'Invalid parameters provided. Parameters must be a dictionary with parameter IDs as keys.',
+          status: 'invalid_parameters'
+        };
+      }
+
+      // Load specific template by ID
+      const template = await taskTemplateDb.getTemplateById(templateId);
+      if (!template) {
+        return {
+          success: false,
+          message: 'Template not found. Please check the template ID and try again.',
+          status: 'template_not_found'
+        };
+      }
+
+      // Check if user has access to the template (either owns it or it's published)
+      if (template.userId !== userId && !template.published) {
+        return {
+          success: false,
+          message: 'You do not have access to this template.',
+          status: 'access_denied'
+        };
+      }
+
+      console.log('AgentMode: Using template:', template.name);
+
+      // Map template to the expected format
+      const templateData = {
+        templateId: template.templateId,
+        name: template.name,
+        description: template.description,
+        category: template.category,
+        parameters: template.parameters || [],
+        promptTemplate: template.prompt,
+        isInteractive: template.isInteractive,
+        isDeepResearch: template.isDeepResearch,
+        isComplexTask: template.isComplexTask,
+        outputAsJson: template.outputAsJson,
+        outputAsHtml: template.outputAsHtml,
+        selectedLLMs: template.selectedLLMs,
+        useSharedBrowser: template.useSharedBrowser,
+        turnOffHeadless: template.turnOffHeadless,
+        nameParameter: template.nameParameter
+      };
+
+      // Check if required parameters are missing
+      const missingRequired = (templateData.parameters || [])
+        .filter((p: any) => {
+          const paramName = typeof p === 'string' ? p : p.name || p.id;
+          return !parameters[paramName];
+        })
+        .map((p: any) => typeof p === 'string' ? p : p.name || p.id);
+
+      if (missingRequired.length > 0) {
+        return {
+          success: false,
+          message: `I need more information to create this task. Please provide the following required details: ${missingRequired.join(', ')}`,
+          status: 'missing_parameters',
+          missingParameters: missingRequired
+        };
+      }
+
+      // Generate final prompt by replacing parameters in template
+      let finalPrompt = templateData.promptTemplate;
+      if (templateData.parameters && templateData.parameters.length > 0) {
+        templateData.parameters.forEach((param: any) => {
+          // Use the parameter name directly as the key
+          const paramName = typeof param === 'string' ? param : param.name || param.id;
+          const value = parameters[paramName] || `[${paramName}]`;
+          finalPrompt = finalPrompt?.replace(
+            new RegExp(`\\[${paramName}\\]`, 'g'),
+            value
+          );
+        });
+      }
+
+      // Generate task name
+      let taskName = templateData.name;
+      if (templateData.nameParameter && parameters[templateData.nameParameter]) {
+        taskName = `${templateData.name} - ${parameters[templateData.nameParameter]}`;
+      }
+
+      // Create task using template
+      const task = {
+        taskId: Date.now().toString(),
+        userId,
+        name: taskName,
+        prompt: finalPrompt,
+        status: 'active',
+        emailNotification: templateData.isDeepResearch || false,
+        isInteractive: templateData.isInteractive || false,
+        isDeepResearch: templateData.isDeepResearch || false,
+        isComplexTask: templateData.isComplexTask || false,
+        extractPageContent: false,
+        outputAsJson: templateData.outputAsJson || false,
+        outputAsHtml: templateData.outputAsHtml || false,
+        useSharedBrowser: templateData.useSharedBrowser || false,
+        turnOffHeadless: templateData.turnOffHeadless || true,
+        useKnowledgeBase: false,
+        updateKnowledgeBase: false,
+        updateLeadList: false,
+        createVideo: false,
+        videoModel: undefined,
+        imageModel: undefined,
+        category: templateData.category || 'General',
+        description: templateData.description,
+        templateId: templateData.templateId,
+        parameterValues: parameters,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+
+      // Save task to database
+      await taskDb.createTask(task);
+
+      // Create task execution
+      const execution = await taskDb.createTaskExecution({
+        executionId: uuidv4(),
+        taskId: task.taskId,
+        userId: userId,
+        status: 'pending',
+        startTime: new Date().toISOString()
+      });
+
+      console.log('AgentMode: Task created successfully:', task.taskId);
+
+      return {
+        success: true,
+        message: `Task "${taskName}" has been created successfully using the ${templateData.name} template. The task will start running shortly.`,
+        status: 'pending',
+        taskId: task.taskId,
+        executionId: execution?.executionId,
+        templateName: templateData.name,
+        taskName: taskName
+      };
+    } catch (error) {
+      console.error('AgentMode: Error creating task from template:', error);
+      return {
+        success: false,
+        message: 'Failed to create task from template. Please try again.',
+        status: 'error'
+      };
+    }
+  }
+
+  // Create task from raw prompt
+  private async createTaskFromPrompt(taskName: string, prompt: string, category: string, userId: string): Promise<any> {
+    try {
+      console.log('AgentMode: Creating task from prompt:', taskName);
+
+      // Create task using raw prompt
+      const task = {
+        taskId: Date.now().toString(),
+        userId,
+        name: taskName,
+        prompt: prompt,
+        status: 'active',
+        emailNotification: false,
+        isInteractive: false,
+        isDeepResearch: false,
+        isComplexTask: false,
+        extractPageContent: false,
+        outputAsJson: false,
+        outputAsHtml: true,
+        useSharedBrowser: false,
+        turnOffHeadless: true,
+        useKnowledgeBase: false,
+        updateKnowledgeBase: false,
+        updateLeadList: false,
+        createVideo: false,
+        videoModel: undefined,
+        imageModel: undefined,
+        category: category,
+        description: `Custom task created from prompt: ${taskName}`,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+
+      // Save task to database
+      await taskDb.createTask(task);
+
+      // Create task execution
+      const execution = await taskDb.createTaskExecution({
+        executionId: uuidv4(),
+        taskId: task.taskId,
+        userId: userId,
+        status: 'pending',
+        startTime: new Date().toISOString()
+      });
+
+      console.log('AgentMode: Task created successfully:', task.taskId);
+
+      return {
+        success: true,
+        message: `Task "${taskName}" has been created successfully using a custom prompt. The task will start running shortly.`,
+        status: 'pending',
+        taskId: task.taskId,
+        executionId: execution?.executionId,
+        taskName: taskName
+      };
+    } catch (error) {
+      console.error('AgentMode: Error creating task from prompt:', error);
+      return {
+        success: false,
+        message: 'Failed to create task from prompt. Please try again.',
+        status: 'error'
+      };
     }
   }
 
@@ -386,76 +689,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
-  private async performSwotAnalysis(url: string, businessContext: string | undefined, userId: string): Promise<any> {
-    try {
-      const taskData = {
-        name: `SWOT Analysis - ${url}`,
-        prompt: `Perform a comprehensive SWOT analysis for the website: ${url}\n\n${businessContext ? `Business Context: ${businessContext}` : ''}\n\nPlease analyze the website and provide:\n1. Strengths - What the website does well\n2. Weaknesses - Areas for improvement\n3. Opportunities - Potential growth areas\n4. Threats - Competitive challenges\n\nUse web scraping to gather information about the website, its content, design, functionality, and user experience. Provide specific, actionable insights based on your analysis.`,
-        category: 'Research',
-        description: 'SWOT analysis for marketing strategy development',
-        outputAsHtml: true,
-        useKnowledgeBase: true
-      };
-
-      const task = await taskDb.createTask({
-        taskId: uuidv4(),
-        userId: userId,
-        name: taskData.name,
-        prompt: taskData.prompt,
-        status: 'active',
-        createdAt: new Date().toISOString(),
-        category: taskData.category,
-        description: taskData.description,
-        outputAsHtml: taskData.outputAsHtml,
-        extractPageContent: false,
-        useSharedBrowser: false,
-        turnOffHeadless: true,
-        createVideo: false,
-        requireApproval: false
-      });
-
-      if (!task) { throw new Error('Failed to create task'); }
-
-      const execution = await taskDb.createTaskExecution({
-        executionId: uuidv4(),
-        taskId: task.taskId,
-        userId: userId,
-        status: 'pending',
-        startTime: new Date().toISOString()
-      });
-
-      if (!execution) { throw new Error('Failed to create task execution'); }
-
-      return {
-        taskId: task.taskId,
-        executionId: execution.executionId,
-        status: 'pending',
-        message: 'SWOT analysis task created and started. The analysis will be completed shortly.'
-      };
-    } catch (error) {
-      console.error('Error creating SWOT analysis task:', error);
-      throw new Error('Failed to create SWOT analysis task');
-    }
-  }
-
-  private async generateMarketingStrategy(swotData: string, businessGoals: string | undefined, userId: string): Promise<any> {
-    // This would create a task for strategy generation
-    return {
-      message: 'Marketing strategy generation is not yet implemented as a task. Please provide more details about your business goals.',
-      swotData,
-      businessGoals
-    };
-  }
-
-  private async createAdCreatives(campaignTheme: string, targetAudience: string | undefined, count: number | undefined, userId: string): Promise<any> {
-    // This would create a task for creative generation
-    return {
-      message: 'Ad creative generation is not yet implemented as a task. Please provide more details about your campaign theme.',
-      campaignTheme,
-      targetAudience,
-      count: count || 5
-    };
-  }
 
   private async publishMetaAds(campaignName: string, budget: number, targeting: any, creatives: any[], userId: string): Promise<any> {
     // This would integrate with Meta API
