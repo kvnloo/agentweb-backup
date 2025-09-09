@@ -130,7 +130,7 @@ router.post('/:id/run', async (req: Request, res: Response) => {
           }
         } else {
           // Create a new task ID if none exists
-          taskId = `task-${uuidv4()}`;
+          taskId = `task-${Date.now()}`;
         }
         
         // Store the taskId in the node data for dependency resolution

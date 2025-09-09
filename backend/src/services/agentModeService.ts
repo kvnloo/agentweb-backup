@@ -1,7 +1,6 @@
 import OpenAI from 'openai';
 import { chatbotDb, ChatMessage } from './chatbotService';
 import { taskDb, taskTemplateDb } from './db';
-import { v4 as uuidv4 } from 'uuid';
 
 export class AgentModeService {
   private openai: OpenAI;
@@ -117,6 +116,11 @@ You can help with various marketing tasks including:
 - Templates provide structured, proven approaches to common marketing tasks
 - **Fallback Method**: If no suitable template is available, use 'create_task_from_prompt' to create a task with a raw prompt
 - The 'create_task_from_prompt' tool allows you to create custom tasks with specific instructions when templates don't fit
+- **Revision Method**: Use 'create_revision' tool to revise existing completed task executions
+- Provide the task_id, execution_id, and detailed revision_prompt
+- Use the execution_id from the Current Task Statuses context above
+- This creates a new execution with the revision instructions
+- Only completed executions can be revised
 
 ## Task Execution
 - When you create tasks, they will show execution status in the UI (pending, running, completed, failed)
@@ -200,7 +204,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           'failed': '❌'
         };
         const emoji = statusEmoji[task.status] || '⏳';
-        context += `${emoji} ${task.taskName} (${task.status}) - Task ID: ${task.taskId}\n`;
+        context += `${emoji} ${task.taskName} (${task.status}) - Task ID: ${task.taskId}, Execution ID: ${task.executionId}\n`;
       });
       context += '\n';
     }
@@ -384,6 +388,31 @@ Use the available tools to create tasks in the agent-engine when complex work is
             required: ['campaign_id']
           }
         }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'create_revision',
+          description: 'Create a revision of an existing completed task execution',
+          parameters: {
+            type: 'object',
+            properties: {
+              task_id: {
+                type: 'string',
+                description: 'The ID of the task to revise'
+              },
+              execution_id: {
+                type: 'string',
+                description: 'The ID of the execution to revise'
+              },
+              revision_prompt: {
+                type: 'string',
+                description: 'Detailed instructions for how to revise the report'
+              }
+            },
+            required: ['task_id', 'execution_id', 'revision_prompt']
+          }
+        }
       }
     ];
   }
@@ -409,6 +438,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.publishMetaAds(args.campaign_name, args.budget, args.targeting, args.creatives, userId);
       case 'analyze_ad_performance':
         return await this.analyzeAdPerformance(args.campaign_id, args.date_range, args.creatives, userId);
+      case 'create_revision':
+        return await this.createRevision(args.task_id, args.execution_id, args.revision_prompt, userId);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -589,7 +620,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Create task execution
       const execution = await taskDb.createTaskExecution({
-        executionId: uuidv4(),
+        executionId: Date.now().toString(),
         taskId: task.taskId,
         userId: userId,
         status: 'pending',
@@ -655,7 +686,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Create task execution
       const execution = await taskDb.createTaskExecution({
-        executionId: uuidv4(),
+        executionId: Date.now().toString(),
         taskId: task.taskId,
         userId: userId,
         status: 'pending',
@@ -728,6 +759,91 @@ Use the available tools to create tasks in the agent-engine when complex work is
       dateRange,
       creatives
     };
+  }
+
+  private async createRevision(taskId: string, executionId: string, revisionPrompt: string, userId: string): Promise<any> {
+    try {
+      console.log('AgentMode: Creating revision for task:', taskId, 'execution:', executionId);
+      
+      // Get the task to verify ownership
+      const task = await taskDb.getTaskById(taskId);
+      if (!task) {
+        return {
+          success: false,
+          message: 'Task not found',
+          status: 'error'
+        };
+      }
+
+      // Get the execution to verify it exists and is completed
+      const execution = await taskDb.getTaskExecutionById(executionId);
+      if (!execution) {
+        return {
+          success: false,
+          message: 'Execution not found',
+          status: 'error'
+        };
+      }
+
+      if (execution.status !== 'completed') {
+        return {
+          success: false,
+          message: 'Can only revise completed executions',
+          status: 'error'
+        };
+      }
+
+      // Find the original report URL from the execution's result files
+      let originalReportUrl = undefined;
+      if (execution.result_files && execution.result_files.length > 0) {
+        const htmlFile = execution.result_files.find((file: any) => 
+          file.is_html || file.view_type === 'html' || file.filename.toLowerCase().endsWith('.html')
+        );
+        if (htmlFile) {
+          originalReportUrl = htmlFile.url;
+        }
+      }
+
+      // Check if original report URL exists
+      if (!originalReportUrl) {
+        return {
+          success: false,
+          message: 'Original report not found for revision. The execution must have a completed HTML report to create a revision.',
+          status: 'error'
+        };
+      }
+
+      // Create a new task execution with revision prompt
+      const revisionExecution = {
+        executionId: Date.now().toString(),
+        taskId,
+        userId: task.userId,
+        run_user_id: userId !== task.userId ? userId : undefined,
+        status: 'pending',
+        startTime: new Date().toISOString(),
+        revision_prompt: revisionPrompt,
+        original_execution_id: executionId,
+        original_report_url: originalReportUrl,
+        variations: 1
+      };
+
+      await taskDb.createTaskExecution(revisionExecution);
+
+      return {
+        success: true,
+        message: `Revision created successfully. New execution ID: ${revisionExecution.executionId}`,
+        taskId: revisionExecution.taskId,
+        executionId: revisionExecution.executionId,
+        status: 'pending'
+      };
+    } catch (error) {
+      console.error('AgentMode: Error creating revision:', error);
+      return {
+        success: false,
+        message: 'Failed to create revision. Please try again.',
+        status: 'error'
+      };
+    }
   }
 }
 

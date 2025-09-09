@@ -1,13 +1,13 @@
 import { Request, Response } from 'express';
 import { agentModeService } from '../services/agentModeService';
 import { chatbotDb, updateTaskExecutionStatus } from '../services/chatbotService';
-import { UserPayload } from '../types/auth';
+import { User } from '../types/auth';
 
 export const agentModeController = {
   // Get user's agent chat sessions
   async getSessions(req: Request, res: Response) {
     try {
-      const user = req.user as UserPayload;
+      const user = req.user as User;
       console.log(`AgentMode: Getting sessions for user ${user.userId}`);
 
       const sessions = await chatbotDb.getUserSessions(user.userId, 'agent');
@@ -21,7 +21,7 @@ export const agentModeController = {
   // Create new agent chat session
   async createSession(req: Request, res: Response) {
     try {
-      const user = req.user as UserPayload;
+      const user = req.user as User;
       const { portalType = 'agent', pageIdentifier = 'agent-mode' } = req.body;
 
       console.log(`AgentMode: Creating new session for user ${user.userId}`);
@@ -64,7 +64,7 @@ export const agentModeController = {
   // Generate AI response for marketing conversation
   async generateResponse(req: Request, res: Response) {
     try {
-      const user = req.user as UserPayload;
+      const user = req.user as User;
       const { sessionId, userMessage } = req.body;
 
       if (!sessionId || !userMessage) {
@@ -129,7 +129,7 @@ export const agentModeController = {
         content: response.content,
         metadata: {
           timestamp: new Date().toISOString(),
-          portalType: 'agent',
+          portalType: 'agent' as const,
           toolCalls: response.toolCalls,
           knowledgeBaseQueries: response.knowledgeBaseQueries,
           sources: response.sources
@@ -154,7 +154,7 @@ export const agentModeController = {
   async archiveSession(req: Request, res: Response) {
     try {
       const { sessionId } = req.params;
-      const user = req.user as UserPayload;
+      const user = req.user as User;
 
       console.log(`AgentMode: Archiving session ${sessionId} for user ${user.userId}`);
 
@@ -171,7 +171,7 @@ export const agentModeController = {
     try {
       const { sessionId, taskId, executionId } = req.params;
       const { status } = req.body;
-      const user = req.user as UserPayload;
+      const user = req.user as User;
       
       console.log(`AgentMode: Updating task status for session ${sessionId}, task ${taskId}, execution ${executionId} to ${status}`);
 
