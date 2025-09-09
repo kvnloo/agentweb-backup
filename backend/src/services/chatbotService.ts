@@ -75,7 +75,7 @@ export interface ChatMessage {
       sources: string[];
     };
     timestamp: string;
-    portalType?: "customer" | "partner" | "genius";
+    portalType?: "customer" | "partner" | "genius" | "agent";
     pageIdentifier?: string;
     isContextMessage?: boolean;
   };
@@ -91,10 +91,12 @@ export interface ChatSession {
   updatedAt: string;
   pageContent?: string; // Full page content for storage
   contextChunks?: ContextChunk[]; // Chunked context for RAG
-  portalType?: "customer" | "partner" | "genius"; // Added portalType to session
+  portalType?: "customer" | "partner" | "genius" | "agent"; // Added portalType to session
   pageIdentifier?: string; // Added pageIdentifier for page-specific sessions
   archived?: boolean; // Archive status for soft deletion
   selectedStartupId?: string; // Selected startup profile for context
+  workflowId?: string; // Added workflowId for agent mode sessions
+  executionId?: string; // Added executionId for agent mode sessions
 }
 
 // Interface for context chunks
@@ -314,9 +316,11 @@ export class ChatbotDB {
   async createChatSession(
     userId: string,
     pageContent?: string,
-    portalType?: "customer" | "partner" | "genius",
+    portalType?: "customer" | "partner" | "genius" | "agent",
     pageIdentifier?: string,
-    selectedStartupId?: string
+    selectedStartupId?: string,
+    workflowId?: string,
+    executionId?: string
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
@@ -324,6 +328,7 @@ export class ChatbotDB {
     const selectedSystemMessage =
       portalType === "customer" ? emmaSystemMessage :
       portalType === "genius" ? geniusSystemMessage :
+      portalType === "agent" ? agentSystemMessage :
       partnerSystemMessage;
 
     const chatSession: ChatSession = {
@@ -347,6 +352,8 @@ export class ChatbotDB {
       portalType,
       pageIdentifier,
       selectedStartupId,
+      workflowId,
+      executionId,
     };
 
     if (pageContent) {
@@ -441,7 +448,7 @@ export class ChatbotDB {
 
   async getUserSessions(
     userId: string,
-    portalType?: "customer" | "partner" | "genius",
+    portalType?: "customer" | "partner" | "genius" | "agent",
     limit?: number,
     sortDescending: boolean = true
   ): Promise<ChatSession[]> {
@@ -506,7 +513,7 @@ export class ChatbotDB {
     }
   }
 
-  async getUserSessionCount(userId: string, portalType?: "customer" | "partner" | "genius"): Promise<number> {
+  async getUserSessionCount(userId: string, portalType?: "customer" | "partner" | "genius" | "agent"): Promise<number> {
     console.log(
       `Getting session count for user: ${userId} from table: ${this.tableName}, portalType: ${portalType || 'all'}`
     );
@@ -546,7 +553,7 @@ export class ChatbotDB {
   }
 
   // Get archived sessions for admin management
-  async getArchivedSessions(userId?: string, portalType?: "customer" | "partner" | "genius"): Promise<ChatSession[]> {
+  async getArchivedSessions(userId?: string, portalType?: "customer" | "partner" | "genius" | "agent"): Promise<ChatSession[]> {
     console.log(
       `Getting archived sessions from table: ${this.tableName}, userId: ${userId || 'all'}, portalType: ${portalType || 'all'}`
     );
@@ -696,7 +703,7 @@ export class ChatbotDB {
 
   async updateSessionPortalType(
     sessionId: string,
-    portalType: "customer" | "partner" | "genius"
+    portalType: "customer" | "partner" | "genius" | "agent"
   ): Promise<ChatSession> {
     const timestamp = new Date().toISOString();
 
@@ -1123,6 +1130,72 @@ Important formatting rules:
 7. The chat window has a fixed width of 384px. Format your responses to fit within this constraint
 
 Be helpful, concise, and accurate. Focus on actionable growth marketing advice. If you don't know the answer, suggest the user join our Discord community for human support: <a href="${
+  process.env.DISCORD_INVITE_URL || "https://discord.gg/kP2u6Wf9KQ"
+}" target="_blank">Discord community</a>`;
+
+const agentSystemMessage = `You are Emma, an AI-powered assistant from AgentWeb. You help users execute complete marketing campaigns through natural conversation and task creation.
+
+## Your Capabilities
+- **SWOT Analysis**: Analyze landing pages and business contexts to identify strengths, weaknesses, opportunities, and threats
+- **Strategy Development**: Generate marketing strategies based on analysis results
+- **Creative Generation**: Create ad creatives and marketing materials
+- **Campaign Management**: Help publish and manage Meta advertising campaigns
+- **Performance Analysis**: Analyze campaign metrics and suggest optimizations
+- **Task Creation**: Create and execute tasks in the agent-engine for complex operations
+
+## Common Marketing Flows
+When users ask for marketing help, guide them through these natural flows:
+
+### 1. **Complete Campaign Analysis Flow**
+- Start with SWOT analysis of their landing page
+- Generate marketing strategy based on findings
+- Create ad creatives for the strategy
+- Help publish campaigns to Meta
+- Monitor performance and suggest improvements
+
+### 2. **Quick Strategy Session**
+- Analyze their current marketing approach
+- Identify key opportunities
+- Suggest specific tactics and channels
+- Create actionable next steps
+
+### 3. **Campaign Optimization Flow**
+- Review existing campaign performance
+- Identify underperforming areas
+- Suggest creative variations and targeting changes
+- Help implement improvements
+
+## Task Creation
+When you need to perform complex operations (like web scraping, analysis, or creative generation), use the available tools to create tasks in the agent-engine. These tasks will run automatically and provide detailed results.
+
+## Conversation Style
+- Be conversational and helpful
+- Ask clarifying questions when needed
+- Provide step-by-step guidance
+- Create tasks when complex work is required
+- Always explain what you're doing and why
+
+Today's date is ${new Date().toISOString().split("T")[0]}.
+
+Format your responses in HTML5 for direct rendering. Use:
+- <strong> for important points
+- <em> for emphasis
+- <code> for technical terms and commands
+- <ul> and <li> for lists
+- <pre> for code blocks (max width 360px)
+- <a href="url" target="_blank"> for links
+- <table> for structured data (max width 360px)
+
+Important formatting rules:
+1. Use minimal spacing - no extra blank lines
+2. Keep lists compact with minimal spacing
+3. Use single line breaks between list items
+4. Keep responses concise and well-structured
+5. Always include target="_blank" for links
+6. Use proper HTML5 semantic elements
+7. The chat window has a fixed width of 384px. Format your responses to fit within this constraint
+
+Be helpful, concise, and accurate. Focus on actionable marketing guidance through natural conversation. If you don't know the answer, suggest the user join our Discord community for human support: <a href="${
   process.env.DISCORD_INVITE_URL || "https://discord.gg/kP2u6Wf9KQ"
 }" target="_blank">Discord community</a>`;
 
