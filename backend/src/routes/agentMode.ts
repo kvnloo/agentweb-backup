@@ -36,4 +36,8 @@ router.post('/generate', asyncHandler(agentModeController.generateResponse));
 // Archive a chat session
 router.delete('/session/:sessionId', asyncHandler(agentModeController.archiveSession));
 
+// PUT /api/agent-mode/session/:sessionId/task/:taskId/execution/:executionId/status
+// Update task execution status in session
+router.put('/session/:sessionId/task/:taskId/execution/:executionId/status', asyncHandler(agentModeController.updateTaskStatus));
+
 export default router;

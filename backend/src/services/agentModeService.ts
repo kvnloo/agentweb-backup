@@ -27,7 +27,8 @@ export class AgentModeService {
       console.log('AgentMode: Generating marketing response');
       
       const systemPrompt = this.getMarketingSystemPrompt();
-      const context = this.buildMarketingContext(userMessage, sessionHistory);
+      const currentTaskStatuses = await this.getCurrentTaskStatuses(userId);
+      const context = this.buildMarketingContext(userMessage, sessionHistory, currentTaskStatuses);
       
       const response = await this.openai.chat.completions.create({
         model: process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
@@ -62,8 +63,11 @@ export class AgentModeService {
               result: result
             });
 
-            // Add tool result to content
-            content += `\n\n**Tool Result:** ${JSON.stringify(result, null, 2)}`;
+            // Add status information to the content for the AI to see
+            if (result.taskId && result.executionId) {
+              const statusMessage = this.getStatusMessage(toolCall.function.name, result.status);
+              content += `\n\n${statusMessage}`;
+            }
           } catch (error) {
             console.error(`AgentMode: Tool execution error for ${toolCall.function.name}:`, error);
             toolCalls.push({
@@ -101,8 +105,53 @@ You can execute various marketing tasks including:
 Use the available tools to create tasks in the agent-engine when complex work is required. Guide users through marketing flows naturally through conversation.`;
   }
 
-  private buildMarketingContext(userMessage: string, sessionHistory: ChatMessage[]): string {
+  private getStatusMessage(toolName: string, status: string): string {
+    const statusEmoji = {
+      'pending': '⏳',
+      'running': '🔄',
+      'completed': '✅',
+      'failed': '❌'
+    }[status] || '⏳';
+
+    const toolDescriptions = {
+      'perform_swot_analysis': 'SWOT analysis',
+      'publish_meta_ads': 'Meta ads campaign',
+      'analyze_ad_performance': 'ad performance analysis'
+    };
+
+    const toolDescription = toolDescriptions[toolName] || 'task';
+    
+    switch (status) {
+      case 'pending':
+        return `${statusEmoji} **${toolDescription}** is queued and will start shortly.`;
+      case 'running':
+        return `${statusEmoji} **${toolDescription}** is currently running. This may take a few minutes.`;
+      case 'completed':
+        return `${statusEmoji} **${toolDescription}** has completed successfully!`;
+      case 'failed':
+        return `${statusEmoji} **${toolDescription}** failed to complete. Please check the task details for more information.`;
+      default:
+        return `${statusEmoji} **${toolDescription}** status: ${status}`;
+    }
+  }
+
+  private buildMarketingContext(userMessage: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = []): string {
     let context = `User Message: ${userMessage}\n\n`;
+    
+    // Add current task statuses if any
+    if (currentTaskStatuses.length > 0) {
+      context += 'Current Task Statuses:\n';
+      currentTaskStatuses.forEach(task => {
+        const statusEmoji = {
+          'pending': '⏳',
+          'running': '🔄',
+          'completed': '✅',
+          'failed': '❌'
+        }[task.status] || '⏳';
+        context += `${statusEmoji} ${task.taskName} (${task.status}) - Task ID: ${task.taskId}\n`;
+      });
+      context += '\n';
+    }
     
     // Add recent conversation history
     if (sessionHistory.length > 0) {
@@ -289,6 +338,28 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
+  private async getCurrentTaskStatuses(userId: string): Promise<any[]> {
+    try {
+      // Get recent task executions for this user
+      const allExecutions = await taskDb.getAllTaskExecutionsByUserId(userId);
+      // Get the 10 most recent executions
+      const recentExecutions = allExecutions
+        .sort((a, b) => new Date(b.createdAt || b.startTime).getTime() - new Date(a.createdAt || a.startTime).getTime())
+        .slice(0, 10);
+      
+      return recentExecutions.map(execution => ({
+        taskId: execution.taskId,
+        executionId: execution.executionId,
+        status: execution.status,
+        taskName: execution.taskName || 'Unknown Task',
+        createdAt: execution.createdAt || execution.startTime
+      }));
+    } catch (error) {
+      console.error('Error fetching current task statuses:', error);
+      return [];
+    }
+  }
+
   async generateSessionTitle(userMessage: string): Promise<string> {
     try {
       console.log('AgentMode: Generating session title for message:', userMessage);
@@ -358,7 +429,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       return {
         taskId: task.taskId,
         executionId: execution.executionId,
-        status: 'running',
+        status: 'pending',
         message: 'SWOT analysis task created and started. The analysis will be completed shortly.'
       };
     } catch (error) {

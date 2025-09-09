@@ -78,6 +78,13 @@ export interface ChatMessage {
     portalType?: "customer" | "partner" | "genius" | "agent";
     pageIdentifier?: string;
     isContextMessage?: boolean;
+    toolCalls?: Array<{
+      id: string;
+      name: string;
+      arguments: any;
+      result?: any;
+      error?: string;
+    }>;
   };
 }
 
@@ -1168,6 +1175,12 @@ When users ask for marketing help, guide them through these natural flows:
 ## Task Creation
 When you need to perform complex operations (like web scraping, analysis, or creative generation), use the available tools to create tasks in the agent-engine. These tasks will run automatically and provide detailed results.
 
+## Task Execution Status
+- When you create tasks, they will show execution status in the UI (pending, running, completed, failed)
+- The tool call results will include the current status of any running tasks
+- You can reference the status information provided in the tool call results
+- If a user asks about task status, use the current status from the tool call results
+
 ## Conversation Style
 - Be conversational and helpful
 - Ask clarifying questions when needed
@@ -1578,6 +1591,70 @@ export async function generateChatResponse(
     return assistantReply;
   } catch (error) {
     console.error("[generateChatResponse] Error:", error);
+    throw error;
+  }
+}
+
+// Update task execution status in chat session
+export async function updateTaskExecutionStatus(
+  sessionId: string,
+  taskId: string,
+  executionId: string,
+  newStatus: string
+): Promise<void> {
+  try {
+    console.log(`Updating task execution status for session ${sessionId}, task ${taskId}, execution ${executionId} to ${newStatus}`);
+    
+    // Get the current session
+    const session = await chatbotDb.getChatSession(sessionId);
+    if (!session) {
+      throw new Error('Session not found');
+    }
+
+    // Find the message with the task execution and update its status
+    const updatedMessages = session.messages?.map((message: ChatMessage) => {
+      if (message.metadata?.toolCalls) {
+        const updatedToolCalls = message.metadata.toolCalls.map((toolCall: any) => {
+          if (toolCall.result && 
+              toolCall.result.taskId === taskId && 
+              toolCall.result.executionId === executionId) {
+            return {
+              ...toolCall,
+              result: {
+                ...toolCall.result,
+                status: newStatus
+              }
+            };
+          }
+          return toolCall;
+        });
+
+        return {
+          ...message,
+          metadata: {
+            ...message.metadata,
+            toolCalls: updatedToolCalls
+          }
+        };
+      }
+      return message;
+    });
+
+    // Update the session with the modified messages
+    const params = {
+      TableName: `${TABLE_PREFIX}AW-ChatSessions`,
+      Key: { sessionId },
+      UpdateExpression: "SET messages = :messages, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":messages": updatedMessages,
+        ":updatedAt": new Date().toISOString()
+      }
+    };
+
+    await dynamodb.update(params).promise();
+    console.log(`Successfully updated task execution status for session ${sessionId}`);
+  } catch (error) {
+    console.error('Error updating task execution status:', error);
     throw error;
   }
 }

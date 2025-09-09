@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import { agentModeService } from '../services/agentModeService';
-import { chatbotDb } from '../services/chatbotService';
+import { chatbotDb, updateTaskExecutionStatus } from '../services/chatbotService';
 import { UserPayload } from '../types/auth';
 
 export const agentModeController = {
@@ -163,6 +163,23 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Archive session error:', error);
       res.status(500).json({ error: 'Failed to archive session' });
+    }
+  },
+
+  // Update task execution status in session
+  async updateTaskStatus(req: Request, res: Response) {
+    try {
+      const { sessionId, taskId, executionId } = req.params;
+      const { status } = req.body;
+      const user = req.user as UserPayload;
+      
+      console.log(`AgentMode: Updating task status for session ${sessionId}, task ${taskId}, execution ${executionId} to ${status}`);
+
+      await updateTaskExecutionStatus(sessionId, taskId, executionId, status);
+      res.json({ message: 'Task status updated successfully' });
+    } catch (error) {
+      console.error('AgentMode: Update task status error:', error);
+      res.status(500).json({ error: 'Failed to update task status' });
     }
   }
 };
