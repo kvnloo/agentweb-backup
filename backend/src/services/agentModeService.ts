@@ -289,6 +289,32 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
+  async generateSessionTitle(userMessage: string): Promise<string> {
+    try {
+      console.log('AgentMode: Generating session title for message:', userMessage);
+      
+      const response = await this.openai.chat.completions.create({
+        model: process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
+        messages: [
+          { 
+            role: 'system', 
+            content: `You are a session title generator for AgentWeb's Agent Mode. Based on the user's first message, generate a concise, descriptive title (max 60 characters) that captures the main marketing topic or task. Return ONLY the title, nothing else.`
+          },
+          { role: 'user', content: userMessage }
+        ],
+        max_completion_tokens: 100
+      });
+
+      const title = response.choices[0]?.message?.content?.trim();
+      console.log('AgentMode: Generated title:', title);
+      
+      return title || 'Marketing Task';
+    } catch (error) {
+      console.error('AgentMode: Failed to generate session title:', error);
+      return 'Marketing Task';
+    }
+  }
+
   private async performSwotAnalysis(url: string, businessContext: string | undefined, userId: string): Promise<any> {
     try {
       const taskData = {

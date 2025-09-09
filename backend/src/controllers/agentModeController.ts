@@ -79,10 +79,47 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found' });
       }
 
+      // Create user message object
+      const userMessageObj = {
+        role: 'user' as const,
+        content: userMessage,
+        timestamp: new Date().toISOString(),
+        metadata: {
+          portalType: 'agent' as const,
+          timestamp: new Date().toISOString()
+        }
+      };
+
+      // Add user message to session in database
+      await chatbotDb.addMessageToSession(sessionId, userMessageObj);
+
+      // Check if this is the first user message (excluding system message)
+      const userMessages = session.messages?.filter(msg => msg.role === 'user') || [];
+      const isFirstMessage = userMessages.length === 0;
+
+      // If this is the first message, generate a session title
+      if (isFirstMessage) {
+        try {
+          console.log('AgentMode: First message detected, generating session title');
+          const title = await agentModeService.generateSessionTitle(userMessage);
+          await chatbotDb.updateSessionTitle(sessionId, title);
+          console.log('AgentMode: Session title updated to:', title);
+        } catch (error) {
+          console.error('AgentMode: Failed to update session title:', error);
+          // Continue with the message processing even if title generation fails
+        }
+      }
+
+      // Get updated session with the new user message
+      const updatedSession = await chatbotDb.getChatSession(sessionId);
+      if (!updatedSession) {
+        return res.status(404).json({ error: 'Session not found after update' });
+      }
+
       // Generate AI response
       const response = await agentModeService.generateMarketingResponse(
         userMessage,
-        session.messages,
+        updatedSession.messages,
         user.userId
       );
 
