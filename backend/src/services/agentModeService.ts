@@ -122,8 +122,11 @@ You can help with various marketing tasks including:
 - This includes the latest HTML results from previous completed tasks in the same conversation
 - Set attach_previous_task_results to false only if you don't want previous results included
 - **Revision Method**: Use 'create_revision' tool to revise existing completed task executions
+- Supports both HTML reports and images for revision
 - Provide the task_id, execution_id, and detailed revision_prompt
 - Use the execution_id from the Current Task Statuses context above
+- If execution has multiple results, specify target_result_name to choose which one to revise
+- If multiple results exist and no target specified, the tool will return available options
 - This creates a new execution with the revision instructions
 - Only completed executions can be revised
 
@@ -440,7 +443,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'create_revision',
-          description: 'Create a revision of an existing completed task execution',
+          description: 'Create a revision of an existing completed task execution (supports both reports and images)',
           parameters: {
             type: 'object',
             properties: {
@@ -454,7 +457,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
               },
               revision_prompt: {
                 type: 'string',
-                description: 'Detailed instructions for how to revise the report'
+                description: 'Detailed instructions for the revision'
+              },
+              target_result_name: {
+                type: 'string',
+                description: 'Name of the specific result file to revise (if execution has multiple results). If not provided, will use the first available result.',
+                default: null
               }
             },
             required: ['task_id', 'execution_id', 'revision_prompt']
@@ -491,7 +499,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'analyze_ad_performance':
         return await this.analyzeAdPerformance(args.campaign_id, args.date_range, args.creatives, userId);
       case 'create_revision':
-        return await this.createRevision(args.task_id, args.execution_id, args.revision_prompt, userId);
+        return await this.createRevision(args.task_id, args.execution_id, args.revision_prompt, userId, args.target_result_name);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -990,9 +998,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
     };
   }
 
-  private async createRevision(taskId: string, executionId: string, revisionPrompt: string, userId: string): Promise<any> {
+  private async createRevision(taskId: string, executionId: string, revisionPrompt: string, userId: string, targetResultName?: string): Promise<any> {
     try {
-      console.log('AgentMode: Creating revision for task:', taskId, 'execution:', executionId);
+      console.log('AgentMode: Creating revision for task:', taskId, 'execution:', executionId, 'targetResultName:', targetResultName);
       
       // Get the task to verify ownership
       const task = await taskDb.getTaskById(taskId);
@@ -1022,24 +1030,86 @@ Use the available tools to create tasks in the agent-engine when complex work is
         };
       }
 
-      // Find the original report URL from the execution's result files
-      let originalReportUrl = undefined;
-      if (execution.result_files && execution.result_files.length > 0) {
-        const htmlFile = execution.result_files.find((file: any) => 
-          file.is_html || file.view_type === 'html' || file.filename.toLowerCase().endsWith('.html')
-        );
-        if (htmlFile) {
-          originalReportUrl = htmlFile.url;
-        }
-      }
+      // Analyze result files to find available reports and images
+      const resultFiles = execution.result_files || [];
+      const htmlFiles = resultFiles.filter((file: any) => 
+        file.is_html || file.view_type === 'html' || file.filename.toLowerCase().endsWith('.html')
+      );
+      const imageFiles = resultFiles.filter((file: any) => {
+        const filename = file.filename.toLowerCase();
+        return file.view_type === 'image' || 
+               filename.endsWith('.jpg') || filename.endsWith('.jpeg') || 
+               filename.endsWith('.png') || filename.endsWith('.gif') || 
+               filename.endsWith('.webp') || filename.endsWith('.svg');
+      });
 
-      // Check if original report URL exists
-      if (!originalReportUrl) {
+      // If no results available, return error
+      if (htmlFiles.length === 0 && imageFiles.length === 0) {
         return {
           success: false,
-          message: 'Original report not found for revision. The execution must have a completed HTML report to create a revision.',
+          message: 'No results found for revision. The execution must have completed HTML reports or images to create a revision.',
           status: 'error'
         };
+      }
+
+      // If multiple results and no target specified, return list of available results
+      const totalResults = htmlFiles.length + imageFiles.length;
+      if (totalResults > 1 && !targetResultName) {
+        const availableResults = [
+          ...htmlFiles.map((f: any) => ({ name: f.filename, type: 'report', url: f.url })),
+          ...imageFiles.map((f: any) => ({ name: f.filename, type: 'image', url: f.url }))
+        ];
+        
+        return {
+          success: false,
+          message: `Multiple results found. Please specify which result to revise by providing the target_result_name parameter. Available results: ${availableResults.map(r => `${r.name} (${r.type})`).join(', ')}`,
+          availableResults,
+          status: 'multiple_results'
+        };
+      }
+
+      // Find the target result file
+      let targetFile = null;
+      let assetType = '';
+      let originalAssetUrl = '';
+
+      if (targetResultName) {
+        // Look for the specific file by name
+        targetFile = resultFiles.find((file: any) => file.filename === targetResultName);
+        if (!targetFile) {
+          return {
+            success: false,
+            message: `Target result file '${targetResultName}' not found. Available files: ${resultFiles.map((f: any) => f.filename).join(', ')}`,
+            status: 'error'
+          };
+        }
+      } else {
+        // Use the first available result
+        targetFile = htmlFiles[0] || imageFiles[0];
+      }
+
+      if (!targetFile) {
+        return {
+          success: false,
+          message: 'No target result file found',
+          status: 'error'
+        };
+      }
+
+      // Determine asset type and URL
+      if (targetFile.is_html || targetFile.view_type === 'html' || targetFile.filename.toLowerCase().endsWith('.html')) {
+        assetType = 'report';
+        originalAssetUrl = targetFile.url;
+      } else {
+        assetType = 'image';
+        originalAssetUrl = targetFile.url;
+      }
+
+      // Format revision prompt based on asset type (similar to Ad Images page)
+      let formattedRevisionPrompt = revisionPrompt;
+      if (assetType === 'image') {
+        // For images, add specific instructions similar to Ad Images page
+        formattedRevisionPrompt = `Please create a revised version of the image based on the following feedback: ${revisionPrompt}. Use the original image as a reference and create a new version that addresses the requested changes.`;
       }
 
       // Create a new task execution with revision prompt
@@ -1050,9 +1120,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
         run_user_id: userId !== task.userId ? userId : undefined,
         status: 'pending',
         startTime: new Date().toISOString(),
-        revision_prompt: revisionPrompt,
+        revision_prompt: formattedRevisionPrompt,
         original_execution_id: executionId,
-        original_report_url: originalReportUrl,
+        original_report_url: assetType === 'report' ? originalAssetUrl : undefined,
+        original_image_url: assetType === 'image' ? originalAssetUrl : undefined,
         variations: 1
       };
 
@@ -1060,10 +1131,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       return {
         success: true,
-        message: `Revision created successfully. New execution ID: ${revisionExecution.executionId}`,
+        message: `Revision created successfully for ${assetType} '${targetFile.filename}'. New execution ID: ${revisionExecution.executionId}`,
         taskId: revisionExecution.taskId,
         executionId: revisionExecution.executionId,
-        status: 'pending'
+        status: 'pending',
+        assetType,
+        targetFile: targetFile.filename
       };
     } catch (error) {
       console.error('AgentMode: Error creating revision:', error);
