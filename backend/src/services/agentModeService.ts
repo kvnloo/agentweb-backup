@@ -132,6 +132,25 @@ You can help with various marketing tasks including:
 - Always confirm task creation and provide relevant details
 - When using templates, explain which template was selected and why
 
+## Response Formatting
+Format your responses in HTML5 for direct rendering. Use:
+- <strong> for important points
+- <em> for emphasis
+- <code> for technical terms and commands
+- <ul> and <li> for lists
+- <pre> for code blocks (max width 360px)
+- <a href="url" target="_blank"> for links
+- <table> for structured data (max width 360px)
+
+Important formatting rules:
+1. Use minimal spacing - no extra blank lines
+2. Keep lists compact with minimal spacing
+3. Use single line breaks between list items
+4. Keep responses concise and well-structured
+5. Always include target="_blank" for links
+6. Use proper HTML5 semantic elements
+7. The chat window has a fixed width of 384px. Format your responses to fit within this constraint
+
 Use the available tools to create tasks in the agent-engine when complex work is required. Guide users through marketing flows naturally through conversation.`;
   }
 
