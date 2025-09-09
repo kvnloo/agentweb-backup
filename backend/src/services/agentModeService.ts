@@ -20,7 +20,8 @@ export class AgentModeService {
   async generateMarketingResponse(
     userMessage: string,
     sessionHistory: ChatMessage[],
-    userId: string
+    userId: string,
+    sessionId: string
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[] }> {
     try {
       console.log('AgentMode: Generating marketing response');
@@ -58,7 +59,7 @@ export class AgentModeService {
             const functionArgs = JSON.parse(toolCall.function.arguments);
             console.log(`AgentMode: Executing tool ${toolCall.function.name}`);
             
-            const result = await this.executeTool(toolCall.function.name, functionArgs, userId);
+            const result = await this.executeTool(toolCall.function.name, functionArgs, userId, sessionId);
             
             toolCalls.push({
               id: toolCall.id,
@@ -116,6 +117,9 @@ You can help with various marketing tasks including:
 - Templates provide structured, proven approaches to common marketing tasks
 - **Fallback Method**: If no suitable template is available, use 'create_task_from_prompt' to create a task with a raw prompt
 - The 'create_task_from_prompt' tool allows you to create custom tasks with specific instructions when templates don't fit
+- **Previous Task Results**: Previous task results are automatically attached by default to provide context
+- This includes the latest HTML results from previous completed tasks in the same conversation
+- Set attach_previous_task_results to false only if you don't want previous results included
 - **Revision Method**: Use 'create_revision' tool to revise existing completed task executions
 - Provide the task_id, execution_id, and detailed revision_prompt
 - Use the execution_id from the Current Task Statuses context above
@@ -275,6 +279,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
               parameters_json: {
                 type: 'string',
                 description: 'JSON string containing parameter values where keys are parameter names and values are the actual values. Example: {"site_url": "example.com", "business_area": "e-commerce"}'
+              },
+              attach_previous_task_results: {
+                type: 'boolean',
+                description: 'Whether to attach previous task results to this task. Set to true for follow-up tasks that need to reference previous work.',
+                default: true
               }
             },
             required: ['template_id', 'parameters_json']
@@ -300,6 +309,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
               category: {
                 type: 'string',
                 description: 'Category for the task (e.g., Research, Marketing, Analysis)'
+              },
+              attach_previous_task_results: {
+                type: 'boolean',
+                description: 'Whether to attach previous task results to this task. Set to true for follow-up tasks that need to reference previous work.',
+                default: true
               }
             },
             required: ['task_name', 'prompt', 'category']
@@ -417,13 +431,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
     ];
   }
 
-  private async executeTool(toolName: string, args: any, userId: string): Promise<any> {
+  private async executeTool(toolName: string, args: any, userId: string, sessionId: string): Promise<any> {
     console.log('AgentMode: Executing tool:', toolName, 'with args:', JSON.stringify(args, null, 2));
     switch (toolName) {
       case 'create_task_from_template':
         try {
           const parameters = JSON.parse(args.parameters_json || '{}');
-          return await this.createTaskFromTemplate(args.template_id, parameters, userId);
+          const attachPreviousTaskResults = args.attach_previous_task_results !== false;
+          return await this.createTaskFromTemplate(args.template_id, parameters, userId, sessionId, attachPreviousTaskResults);
         } catch (parseError) {
           console.error('AgentMode: Error parsing parameters JSON:', parseError);
           return {
@@ -433,7 +448,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
           };
         }
       case 'create_task_from_prompt':
-        return await this.createTaskFromPrompt(args.task_name, args.prompt, args.category, userId);
+        const attachPreviousTaskResults = args.attach_previous_task_results !== false;
+        return await this.createTaskFromPrompt(args.task_name, args.prompt, args.category, userId, sessionId, attachPreviousTaskResults);
       case 'publish_meta_ads':
         return await this.publishMetaAds(args.campaign_name, args.budget, args.targeting, args.creatives, userId);
       case 'analyze_ad_performance':
@@ -442,6 +458,87 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.createRevision(args.task_id, args.execution_id, args.revision_prompt, userId);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
+    }
+  }
+
+  private async getPreviousTaskResults(userId: string, sessionId: string): Promise<string> {
+    try {
+      // Get the current conversation to find previous task executions
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session || !session.messages) {
+        return '';
+      }
+
+      // Extract task IDs from previous tool calls in this conversation
+      const taskIds = new Set<string>();
+      session.messages.forEach((message: ChatMessage) => {
+        if (message.metadata?.toolCalls) {
+          message.metadata.toolCalls.forEach((toolCall: any) => {
+            if (toolCall.name === 'create_task_from_template' || toolCall.name === 'create_task_from_prompt') {
+              if (toolCall.result?.taskId) {
+                taskIds.add(toolCall.result.taskId);
+              }
+            }
+          });
+        }
+      });
+
+      if (taskIds.size === 0) {
+        return '';
+      }
+
+      // Get executions for each specific task
+      const completedExecutions: any[] = [];
+      
+      for (const taskId of taskIds) {
+        const taskExecutions = await taskDb.getTaskExecutions(taskId);
+        if (taskExecutions && taskExecutions.length > 0) {
+          // Find the latest completed execution with HTML results
+          const latestCompleted = taskExecutions
+            .filter(execution => 
+              execution.status === 'completed' && 
+              execution.result_files && 
+              execution.result_files.length > 0
+            )
+            .sort((a, b) => new Date(b.createdAt || b.startTime).getTime() - new Date(a.createdAt || a.startTime).getTime())[0];
+          
+          if (latestCompleted) {
+            // Fetch task details to get the task name
+            const task = await taskDb.getTaskById(taskId);
+            if (task) {
+              latestCompleted.taskName = task.name;
+            }
+            completedExecutions.push(latestCompleted);
+          }
+        }
+      }
+
+      if (completedExecutions.length === 0) {
+        return '';
+      }
+
+      // Build context with HTML result URLs
+      let context = '\n\n## Previous Task Results\n';
+      context += 'The following are results from your previous completed tasks that you can reference:\n\n';
+
+      completedExecutions.forEach(execution => {
+        const htmlFiles = execution.result_files.filter((file: any) => 
+          file.is_html || file.view_type === 'html' || file.filename.toLowerCase().endsWith('.html')
+        );
+        
+        if (htmlFiles.length > 0) {
+          context += `**Task ${execution.taskId}** (${execution.taskName || 'Unknown Task'}):\n`;
+          htmlFiles.forEach((file: any) => {
+            context += `- Result: ${file.url}\n`;
+          });
+          context += '\n';
+        }
+      });
+
+      return context;
+    } catch (error) {
+      console.error('Error fetching previous task results:', error);
+      return '';
     }
   }
 
@@ -495,7 +592,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
 
   // Create task from template
-  private async createTaskFromTemplate(templateId: string, parameters: Record<string, string>, userId: string): Promise<any> {
+  private async createTaskFromTemplate(templateId: string, parameters: Record<string, string>, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true): Promise<any> {
     try {
       console.log('AgentMode: Creating task from template ID:', templateId, 'with parameters:', parameters);
 
@@ -579,6 +676,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
         });
       }
 
+      // Attach previous task results if requested
+      if (attachPreviousTaskResults) {
+        const previousResults = await this.getPreviousTaskResults(userId, sessionId);
+        if (previousResults) {
+          finalPrompt += previousResults;
+        }
+      }
+
       // Generate task name
       let taskName = templateData.name;
       if (templateData.nameParameter && parameters[templateData.nameParameter]) {
@@ -649,16 +754,25 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   // Create task from raw prompt
-  private async createTaskFromPrompt(taskName: string, prompt: string, category: string, userId: string): Promise<any> {
+  private async createTaskFromPrompt(taskName: string, prompt: string, category: string, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true): Promise<any> {
     try {
       console.log('AgentMode: Creating task from prompt:', taskName);
+
+      // Attach previous task results if requested
+      let finalPrompt = prompt;
+      if (attachPreviousTaskResults) {
+        const previousResults = await this.getPreviousTaskResults(userId, sessionId);
+        if (previousResults) {
+          finalPrompt += previousResults;
+        }
+      }
 
       // Create task using raw prompt
       const task = {
         taskId: Date.now().toString(),
         userId,
         name: taskName,
-        prompt: prompt,
+        prompt: finalPrompt,
         status: 'active',
         emailNotification: false,
         isInteractive: false,

@@ -120,7 +120,8 @@ export const agentModeController = {
       const response = await agentModeService.generateMarketingResponse(
         userMessage,
         updatedSession.messages,
-        user.userId
+        user.userId,
+        sessionId
       );
 
       // Add assistant message to session
