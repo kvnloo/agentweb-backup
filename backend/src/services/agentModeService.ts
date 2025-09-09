@@ -117,6 +117,7 @@ You can help with various marketing tasks including:
 - Templates provide structured, proven approaches to common marketing tasks
 - **Fallback Method**: If no suitable template is available, use 'create_task_from_prompt' to create a task with a raw prompt
 - The 'create_task_from_prompt' tool allows you to create custom tasks with specific instructions when templates don't fit
+- **Image Generation**: Use 'create_image_task_from_prompt' to create image generation tasks for visual content like ad creatives, social media images, or marketing visuals
 - **Previous Task Results**: Previous task results are automatically attached by default to provide context
 - This includes the latest HTML results from previous completed tasks in the same conversation
 - Set attach_previous_task_results to false only if you don't want previous results included
@@ -174,6 +175,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     const toolDescriptions: Record<string, string> = {
       'create_task_from_template': 'template-based task',
       'create_task_from_prompt': 'custom prompt task',
+      'create_image_task_from_prompt': 'image generation task',
       'publish_meta_ads': 'Meta ads campaign',
       'analyze_ad_performance': 'ad performance analysis'
     };
@@ -323,6 +325,37 @@ Use the available tools to create tasks in the agent-engine when complex work is
       {
         type: 'function' as const,
         function: {
+          name: 'create_image_task_from_prompt',
+          description: 'Create an image generation task using a raw prompt for creating visual content',
+          parameters: {
+            type: 'object',
+            properties: {
+              task_name: {
+                type: 'string',
+                description: 'Name for the image generation task'
+              },
+              prompt: {
+                type: 'string',
+                description: 'The detailed prompt describing what images to generate, including style, content, and specifications'
+              },
+              category: {
+                type: 'string',
+                description: 'Category for the task (e.g., Creatives, Marketing, Social Media)',
+                default: 'Creatives'
+              },
+              attach_previous_task_results: {
+                type: 'boolean',
+                description: 'Whether to attach previous task results to this task. Set to true for follow-up tasks that need to reference previous work.',
+                default: true
+              }
+            },
+            required: ['task_name', 'prompt']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
           name: 'publish_meta_ads',
           description: 'Publish ad creatives to Meta advertising platform',
           parameters: {
@@ -450,6 +483,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'create_task_from_prompt':
         const attachPreviousTaskResults = args.attach_previous_task_results !== false;
         return await this.createTaskFromPrompt(args.task_name, args.prompt, args.category, userId, sessionId, attachPreviousTaskResults);
+      case 'create_image_task_from_prompt':
+        const attachPreviousTaskResultsForImage = args.attach_previous_task_results !== false;
+        return await this.createImageTaskFromPrompt(args.task_name, args.prompt, args.category || 'Creatives', userId, sessionId, attachPreviousTaskResultsForImage);
       case 'publish_meta_ads':
         return await this.publishMetaAds(args.campaign_name, args.budget, args.targeting, args.creatives, userId);
       case 'analyze_ad_performance':
@@ -474,7 +510,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       session.messages.forEach((message: ChatMessage) => {
         if (message.metadata?.toolCalls) {
           message.metadata.toolCalls.forEach((toolCall: any) => {
-            if (toolCall.name === 'create_task_from_template' || toolCall.name === 'create_task_from_prompt') {
+            if (toolCall.name === 'create_task_from_template' || toolCall.name === 'create_task_from_prompt' || toolCall.name === 'create_image_task_from_prompt') {
               if (toolCall.result?.taskId) {
                 taskIds.add(toolCall.result.taskId);
               }
@@ -822,6 +858,85 @@ Use the available tools to create tasks in the agent-engine when complex work is
       return {
         success: false,
         message: 'Failed to create task from prompt. Please try again.',
+        status: 'error'
+      };
+    }
+  }
+
+  // Create image generation task from raw prompt
+  private async createImageTaskFromPrompt(taskName: string, prompt: string, category: string, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true): Promise<any> {
+    try {
+      console.log('AgentMode: Creating image task from prompt:', taskName);
+
+      // Format the prompt using the same format as handleCreateAdImageTask
+      let formattedPrompt = "Please create high-quality ad images that align with the below context and target the specified audience. The images should be professional, engaging, and suitable for various marketing channels. Use download_image to download reference images and generate_image to create the result images. Valid size values for generate_image include \"1024x1024\", \"1536x1024\", \"1024x1536\", \"auto\". Valid quality values for generate_image include \"low\", \"medium\", \"high\", \"auto\". DO NOT browse the internet for other images.\n\n";
+      
+      // Add the user's image prompt
+      if (prompt.trim()) {
+        formattedPrompt += `Image Prompt:\n${prompt.trim()}\n\n`;
+      }
+
+      // Attach previous task results if requested
+      if (attachPreviousTaskResults) {
+        const previousResults = await this.getPreviousTaskResults(userId, sessionId);
+        if (previousResults) {
+          formattedPrompt += previousResults;
+        }
+      }
+
+      // Create image generation task with standard settings
+      const task = {
+        taskId: Date.now().toString(),
+        userId,
+        name: taskName,
+        prompt: formattedPrompt,
+        status: 'active',
+        emailNotification: false,
+        isInteractive: false,
+        isDeepResearch: false,
+        isComplexTask: false,
+        extractPageContent: false,
+        outputAsJson: false,
+        outputAsHtml: false, // Images don't need HTML output
+        useSharedBrowser: false,
+        turnOffHeadless: true,
+        useKnowledgeBase: false,
+        updateKnowledgeBase: false,
+        updateLeadList: false,
+        createVideo: false,
+        category: category,
+        description: `Image generation task: ${taskName}`,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+
+      // Save task to database
+      await taskDb.createTask(task);
+
+      // Create task execution
+      const execution = await taskDb.createTaskExecution({
+        executionId: Date.now().toString(),
+        taskId: task.taskId,
+        userId: userId,
+        status: 'pending',
+        startTime: new Date().toISOString()
+      });
+
+      console.log('AgentMode: Image task created successfully:', task.taskId);
+
+      return {
+        success: true,
+        message: `Image generation task "${taskName}" has been created successfully. The task will start running shortly.`,
+        status: 'pending',
+        taskId: task.taskId,
+        executionId: execution?.executionId,
+        taskName: taskName
+      };
+    } catch (error) {
+      console.error('AgentMode: Error creating image task from prompt:', error);
+      return {
+        success: false,
+        message: 'Failed to create image generation task. Please try again.',
         status: 'error'
       };
     }
