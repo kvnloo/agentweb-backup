@@ -4,15 +4,20 @@ import { agentModeController } from '../controllers/agentModeController';
 
 const router = express.Router();
 
-// All routes require authentication
-router.use(authenticateToken);
-
 // Helper function to wrap async handlers
 const asyncHandler = (fn: (req: Request, res: Response, next: express.NextFunction) => Promise<any>) => {
   return (req: Request, res: Response, next: express.NextFunction) => {
     Promise.resolve(fn(req, res, next)).catch(next);
   };
 };
+
+// Public routes (no authentication required)
+// GET /api/agent-mode/share/:shareId
+// Get shared conversation (public)
+router.get('/share/:shareId', asyncHandler(agentModeController.getSharedConversation));
+
+// All other routes require authentication
+router.use(authenticateToken);
 
 // Agent Mode Chat Routes
 
@@ -43,5 +48,13 @@ router.delete('/session/:sessionId', asyncHandler(agentModeController.archiveSes
 // PUT /api/agent-mode/session/:sessionId/task/:taskId/execution/:executionId/status
 // Update task execution status in session
 router.put('/session/:sessionId/task/:taskId/execution/:executionId/status', asyncHandler(agentModeController.updateTaskStatus));
+
+// POST /api/agent-mode/share
+// Create shareable link for conversation
+router.post('/share', asyncHandler(agentModeController.createShareLink));
+
+// DELETE /api/agent-mode/session/:sessionId/share
+// Stop sharing conversation
+router.delete('/session/:sessionId/share', asyncHandler(agentModeController.stopSharing));
 
 export default router;

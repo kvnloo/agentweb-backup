@@ -671,6 +671,38 @@ export const getTaskExecution = async (req: AuthRequest, res: Response) => {
   }
 };
 
+export const getTaskExecutionPublic = async (req: Request, res: Response) => {
+  try {
+    const taskId = req.params.id;
+    const executionId = req.params.executionId;
+
+    // Get the execution
+    const execution = await taskDb.getTaskExecutionById(executionId);
+    if (!execution) {
+      return res.status(404).json({ message: 'Execution not found' });
+    }
+
+    // Verify the execution belongs to the task
+    if (execution.taskId !== taskId) {
+      return res.status(404).json({ message: 'Execution not found for this task' });
+    }
+
+    // Only return basic execution data for public access
+    res.json({
+      executionId: execution.executionId,
+      taskId: execution.taskId,
+      status: execution.status,
+      message: execution.message,
+      result_files: execution.result_files || [],
+      startTime: execution.startTime,
+      endTime: execution.endTime
+    });
+  } catch (error) {
+    console.error('Error in getTaskExecutionPublic:', error);
+    res.status(500).json({ message: 'Error fetching task execution' });
+  }
+};
+
 export const getExecutionLog = async (req: Request, res: Response) => {
   try {
     const taskId = req.params.id;
