@@ -179,7 +179,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
       'create_task_from_template': 'template-based task',
       'create_task_from_prompt': 'custom prompt task',
       'create_image_task_from_prompt': 'image generation task',
-      'publish_meta_ads': 'Meta ads campaign',
       'analyze_ad_performance': 'ad performance analysis'
     };
 
@@ -359,50 +358,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
       {
         type: 'function' as const,
         function: {
-          name: 'publish_meta_ads',
-          description: 'Publish ad creatives to Meta advertising platform',
-          parameters: {
-            type: 'object',
-            properties: {
-              campaign_name: {
-                type: 'string',
-                description: 'Name for the Meta ad campaign'
-              },
-              budget: {
-                type: 'number',
-                description: 'Daily budget for the campaign'
-              },
-              targeting: {
-                type: 'object',
-                description: 'Targeting parameters for the ads',
-                properties: {
-                  age_range: { type: 'string' },
-                  interests: { type: 'array', items: { type: 'string' } },
-                  locations: { type: 'array', items: { type: 'string' } }
-                }
-              },
-              creatives: {
-                type: 'array',
-                description: 'The creatives to publish',
-                items: {
-                  type: 'object',
-                  properties: {
-                    id: { type: 'string' },
-                    headline: { type: 'string' },
-                    description: { type: 'string' },
-                    cta: { type: 'string' },
-                    image_prompt: { type: 'string' }
-                  }
-                }
-              }
-            },
-            required: ['campaign_name', 'budget', 'creatives']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
           name: 'analyze_ad_performance',
           description: 'Analyze performance metrics for Meta ad campaigns',
           parameters: {
@@ -494,8 +449,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'create_image_task_from_prompt':
         const attachPreviousTaskResultsForImage = args.attach_previous_task_results !== false;
         return await this.createImageTaskFromPrompt(args.task_name, args.prompt, args.category || 'Creatives', userId, sessionId, attachPreviousTaskResultsForImage);
-      case 'publish_meta_ads':
-        return await this.publishMetaAds(args.campaign_name, args.budget, args.targeting, args.creatives, userId);
       case 'analyze_ad_performance':
         return await this.analyzeAdPerformance(args.campaign_id, args.date_range, args.creatives, userId);
       case 'create_revision':
@@ -977,16 +930,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
 
-  private async publishMetaAds(campaignName: string, budget: number, targeting: any, creatives: any[], userId: string): Promise<any> {
-    // This would integrate with Meta API
-    return {
-      message: 'Meta ads publishing is not yet implemented. Please provide your Meta API credentials.',
-      campaignName,
-      budget,
-      targeting,
-      creatives
-    };
-  }
 
   private async analyzeAdPerformance(campaignId: string, dateRange: any, creatives: any[], userId: string): Promise<any> {
     // This would integrate with Meta API
