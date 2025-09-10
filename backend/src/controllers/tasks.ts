@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { taskDb } from '../services/db';
 import { userDb } from '../services/db';
 import { scheduleDb } from '../services/db';
+import { chatbotDb } from '../services/chatbotService';
 import AWS from 'aws-sdk';
 import { taskTemplateDb } from '../services/db';
 import crypto from 'crypto';
@@ -675,6 +676,47 @@ export const getTaskExecutionPublic = async (req: Request, res: Response) => {
   try {
     const taskId = req.params.id;
     const executionId = req.params.executionId;
+    const sessionId = req.query.sessionId as string;
+
+    if (!sessionId) {
+      return res.status(400).json({ message: 'Session ID is required' });
+    }
+
+    // Get the session to verify the task execution belongs to it
+    const session = await chatbotDb.getChatSession(sessionId);
+    if (!session) {
+      return res.status(404).json({ message: 'Session not found' });
+    }
+
+    // Check if the session is shared
+    if (!session.shareMetadata?.isShared) {
+      return res.status(404).json({ message: 'Session is not shared' });
+    }
+
+    // Check if the session has expired
+    if (session.shareMetadata.expiresAt && new Date() > new Date(session.shareMetadata.expiresAt)) {
+      return res.status(410).json({ message: 'Share link has expired' });
+    }
+
+    // Verify that the task execution exists in this session's messages
+    let taskExecutionFound = false;
+    for (const message of session.messages || []) {
+      if (message.metadata?.toolCalls) {
+        for (const toolCall of message.metadata.toolCalls) {
+          if (toolCall.result && 
+              toolCall.result.taskId === taskId && 
+              toolCall.result.executionId === executionId) {
+            taskExecutionFound = true;
+            break;
+          }
+        }
+      }
+      if (taskExecutionFound) break;
+    }
+
+    if (!taskExecutionFound) {
+      return res.status(404).json({ message: 'Task execution not found in this session' });
+    }
 
     // Get the execution
     const execution = await taskDb.getTaskExecutionById(executionId);
