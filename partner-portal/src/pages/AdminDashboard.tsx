@@ -410,6 +410,7 @@ export default function AdminDashboard() {
     workflows: 5,
     'chat-history': 6,
     'knowledge-base': 7,
+    'agent-mode': 8,
   };
   
   // Get initial tab value from URL or default to 0
@@ -1085,6 +1086,7 @@ export default function AdminDashboard() {
             <Tab label="Workflows" {...a11yProps(5)} />
             <Tab label="Chat History" {...a11yProps(6)} />
             <Tab label="Knowledge Base" {...a11yProps(7)} />
+            <Tab label="Agent Mode" {...a11yProps(8)} />
           </Tabs>
         </Box>
 
@@ -2590,6 +2592,10 @@ export default function AdminDashboard() {
             </Grid>
           </Grid>
         </TabPanel>
+
+        <TabPanel value={tabValue} index={8}>
+          <AgentModeSettings />
+        </TabPanel>
       </Paper>
 
       {/* Deactivation Confirmation Dialog */}
@@ -3101,3 +3107,170 @@ export default function AdminDashboard() {
     </Container>
   );
 }
+
+// Agent Mode Settings Component
+const AgentModeSettings = () => {
+  const [systemPrompt, setSystemPrompt] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+  const { token } = useAuth();
+
+  useEffect(() => {
+    loadSystemPrompt();
+  }, []);
+
+  const loadSystemPrompt = async () => {
+    try {
+      setLoading(true);
+      setError('');
+      
+      try {
+        // Try to get custom system prompt from settings
+        const response = await axios.get(buildApiUrl('/api/settings/agent_mode_system_prompt'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        
+        if (response.data && response.data.settingValue) {
+          setSystemPrompt(response.data.settingValue);
+          return;
+        }
+      } catch (settingsError: any) {
+        // If setting doesn't exist (404) or other error, fall back to default
+        if (settingsError.response?.status !== 404) {
+          console.error('Error loading custom system prompt:', settingsError);
+        }
+      }
+      
+      // Load default system prompt
+      const defaultResponse = await axios.get(buildApiUrl('/api/agent-mode/system-prompt'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setSystemPrompt(defaultResponse.data);
+    } catch (error) {
+      console.error('Error loading system prompt:', error);
+      setError('Failed to load system prompt');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const saveSystemPrompt = async () => {
+    try {
+      setSaving(true);
+      setError('');
+      setSuccess('');
+      
+      await axios.put(buildApiUrl('/api/settings/agent_mode_system_prompt'), {
+        settingValue: systemPrompt,
+        description: 'Agent Mode system prompt for Emma AI assistant'
+      }, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      
+      setSuccess('System prompt updated successfully!');
+    } catch (error) {
+      console.error('Error saving system prompt:', error);
+      setError('Failed to save system prompt');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const resetToDefault = async () => {
+    try {
+      setSaving(true);
+      setError('');
+      setSuccess('');
+      
+      const response = await axios.get(buildApiUrl('/api/agent-mode/system-prompt'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      
+      setSystemPrompt(response.data);
+      setSuccess('Reset to default system prompt');
+    } catch (error) {
+      console.error('Error resetting system prompt:', error);
+      setError('Failed to reset system prompt');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <Box display="flex" justifyContent="center" alignItems="center" minHeight="400px">
+        <CircularProgress />
+      </Box>
+    );
+  }
+
+  return (
+    <Box>
+      <Typography variant="h6" gutterBottom>
+        Agent Mode System Prompt Configuration
+      </Typography>
+      <Typography variant="body2" color="text.secondary" paragraph>
+        Customize the system prompt for Emma, the AI assistant in Agent Mode. 
+        Changes will apply to new chat sessions. The system prompt version is 
+        automatically tracked in chat history.
+      </Typography>
+
+      {error && (
+        <Alert severity="error" sx={{ mb: 2 }}>
+          {error}
+        </Alert>
+      )}
+
+      {success && (
+        <Alert severity="success" sx={{ mb: 2 }}>
+          {success}
+        </Alert>
+      )}
+
+      <Card>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">
+              System Prompt
+            </Typography>
+            <Box>
+              <Button
+                variant="outlined"
+                onClick={resetToDefault}
+                disabled={saving}
+                sx={{ mr: 1 }}
+              >
+                Reset to Default
+              </Button>
+              <Button
+                variant="contained"
+                onClick={saveSystemPrompt}
+                disabled={saving}
+              >
+                {saving ? <CircularProgress size={20} /> : 'Save Changes'}
+              </Button>
+            </Box>
+          </Box>
+          
+          <TextField
+            fullWidth
+            multiline
+            rows={20}
+            value={systemPrompt}
+            onChange={(e) => setSystemPrompt(e.target.value)}
+            placeholder="Enter the system prompt for Emma..."
+            variant="outlined"
+            sx={{ fontFamily: 'monospace' }}
+          />
+          
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            The system prompt defines Emma's behavior, capabilities, and response format. 
+            Use HTML formatting for responses. Changes will be versioned and tracked in chat history.
+          </Typography>
+        </CardContent>
+      </Card>
+    </Box>
+  );
+};

@@ -1,5 +1,5 @@
 import express, { Request, Response } from 'express';
-import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
+import { authenticateToken, AuthenticatedRequest, requireAdmin } from '../middleware/auth';
 import { agentModeController } from '../controllers/agentModeController';
 
 const router = express.Router();
@@ -31,6 +31,10 @@ router.get('/session/:sessionId', asyncHandler(agentModeController.getSession));
 // POST /api/agent-mode/generate
 // Generate AI response for marketing conversation
 router.post('/generate', asyncHandler(agentModeController.generateResponse));
+
+// GET /api/agent-mode/system-prompt
+// Get current system prompt (admin only)
+router.get('/system-prompt', requireAdmin, asyncHandler(agentModeController.getSystemPrompt));
 
 // DELETE /api/agent-mode/session/:sessionId
 // Archive a chat session

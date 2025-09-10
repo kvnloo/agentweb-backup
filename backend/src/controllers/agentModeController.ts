@@ -90,14 +90,40 @@ export const agentModeController = {
         }
       };
 
-      // Add user message to session in database
-      await chatbotDb.addMessageToSession(sessionId, userMessageObj);
-
       // Check if this is the first user message (excluding system message)
       const userMessages = session.messages?.filter(msg => msg.role === 'user') || [];
       const isFirstMessage = userMessages.length === 0;
 
-      // If this is the first message, generate a session title
+      // If this is the first message, add system message with version info first
+      if (isFirstMessage) {
+        try {
+          // Get the current system prompt version
+          const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+          const systemPromptHash = require('crypto').createHash('md5').update(systemPrompt).digest('hex').substring(0, 8);
+          
+          // Add system message with version info (hash only in metadata)
+          const systemMessage = {
+            role: 'system' as const,
+            content: systemPrompt,
+            metadata: {
+              timestamp: new Date().toISOString(),
+              portalType: 'agent' as const,
+              systemPromptVersion: systemPromptHash
+            }
+          };
+          
+          await chatbotDb.addMessageToSession(sessionId, systemMessage);
+          console.log('AgentMode: Added system message with version:', systemPromptHash);
+        } catch (error) {
+          console.error('AgentMode: Failed to add system message:', error);
+          // Continue with the message processing even if this fails
+        }
+      }
+
+      // Add user message to session in database
+      await chatbotDb.addMessageToSession(sessionId, userMessageObj);
+
+      // If this is the first message, generate session title
       if (isFirstMessage) {
         try {
           console.log('AgentMode: First message detected, generating session title');
@@ -106,7 +132,7 @@ export const agentModeController = {
           console.log('AgentMode: Session title updated to:', title);
         } catch (error) {
           console.error('AgentMode: Failed to update session title:', error);
-          // Continue with the message processing even if title generation fails
+          // Continue with the message processing even if this fails
         }
       }
 
@@ -148,6 +174,17 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Generate response error:', error);
       res.status(500).json({ error: 'Failed to generate response' });
+    }
+  },
+
+  // Get system prompt
+  async getSystemPrompt(req: Request, res: Response) {
+    try {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      res.json(systemPrompt);
+    } catch (error) {
+      console.error('AgentMode: Get system prompt error:', error);
+      res.status(500).json({ error: 'Failed to get system prompt' });
     }
   },
 

@@ -1,6 +1,7 @@
 import OpenAI from 'openai';
 import { chatbotDb, ChatMessage } from './chatbotService';
 import { taskDb, taskTemplateDb } from './db';
+import { settingsService } from './settingsService';
 
 export class AgentModeService {
   private openai: OpenAI;
@@ -26,7 +27,7 @@ export class AgentModeService {
     try {
       console.log('AgentMode: Generating marketing response');
       
-      const systemPrompt = this.getMarketingSystemPrompt();
+      const systemPrompt = await this.getMarketingSystemPrompt();
       const currentTaskStatuses = await this.getCurrentTaskStatuses(userId);
       const availableTemplates = await this.getAvailableTemplates();
       const context = this.buildMarketingContext(userMessage, sessionHistory, currentTaskStatuses);
@@ -101,7 +102,18 @@ export class AgentModeService {
     }
   }
 
-  private getMarketingSystemPrompt(): string {
+  async getMarketingSystemPrompt(): Promise<string> {
+    // Try to get custom system prompt from settings
+    try {
+      const setting = await settingsService.getSetting('agent_mode_system_prompt');
+      if (setting && setting.settingValue) {
+        return setting.settingValue;
+      }
+    } catch (error) {
+      console.error('Error getting custom system prompt:', error);
+    }
+    
+    // Fallback to default system prompt
     return `You are Emma, an AI-powered assistant from AgentWeb. You help users execute marketing campaigns through natural conversation and task creation.
 
 ## Your Capabilities
@@ -166,9 +178,9 @@ Format your responses in HTML5 for direct rendering. Use:
 - <em> for emphasis
 - <code> for technical terms and commands
 - <ul> and <li> for lists
-- <pre> for code blocks (max width 360px)
+- <pre> for code blocks
 - <a href="url" target="_blank"> for links
-- <table> for structured data (max width 360px)
+- <table> for structured data
 
 Important formatting rules:
 1. Use minimal spacing - no extra blank lines
@@ -233,9 +245,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
       context += '\n';
     }
     
-    // Add recent conversation history
+    // Add recent conversation history (excluding system messages)
     if (sessionHistory.length > 0) {
-      const recentHistory = sessionHistory.slice(-5);
+      const nonSystemMessages = sessionHistory.filter(msg => msg.role !== 'system');
+      const recentHistory = nonSystemMessages.slice(-5);
       context += 'Recent Conversation:\n';
       recentHistory.forEach(msg => {
         context += `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}\n`;
