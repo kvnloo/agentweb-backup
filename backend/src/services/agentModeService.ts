@@ -72,6 +72,10 @@ export class AgentModeService {
             if (result.taskId && result.executionId) {
               const statusMessage = this.getStatusMessage(toolCall.function.name, result.status);
               content += `\n\n${statusMessage}`;
+            } else if (toolCall.function.name === 'get_meta_ads_metrics' && result.success) {
+              // Special handling for metrics data - provide summary for AI analysis
+              const metricsSummary = this.formatMetricsSummary(result.data);
+              content += `\n\n${metricsSummary}`;
             }
           } catch (error) {
             console.error(`AgentMode: Tool execution error for ${toolCall.function.name}:`, error);
@@ -107,6 +111,7 @@ You can help with various marketing tasks including:
 - Marketing strategy development
 - Ad creative generation and campaign management
 - Performance analysis and optimization
+- Meta ads metrics analysis and insights
 - Social media listening and brand monitoring
 
 ## Task Creation Approach
@@ -118,6 +123,12 @@ You can help with various marketing tasks including:
 - **Fallback Method**: If no suitable template is available, use 'create_task_from_prompt' to create a task with a raw prompt
 - The 'create_task_from_prompt' tool allows you to create custom tasks with specific instructions when templates don't fit
 - **Image Generation**: Use 'create_image_task_from_prompt' to create image generation tasks for visual content like ad creatives, social media images, or marketing visuals
+- **Meta Ads Metrics**: Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data
+- When metrics data is loaded, provide contextual analysis based on the conversation history and user's business goals
+- Don't just repeat the numbers - provide meaningful insights, strategic recommendations, and actionable next steps
+- Consider the user's industry, business stage, and previous conversation context when analyzing performance
+- Compare metrics against industry benchmarks and identify specific optimization opportunities
+- If a user asks about a specific ad that doesn't appear in the metrics data, explain that the ad may be disabled, paused, or have no activity in the selected timeframe
 - **Previous Task Results**: Previous task results are automatically attached by default to provide context
 - This includes the latest HTML results from previous completed tasks in the same conversation
 - Set attach_previous_task_results to false only if you don't want previous results included
@@ -143,6 +154,9 @@ You can help with various marketing tasks including:
 - Keep responses concise but informative
 - Always confirm task creation and provide relevant details
 - When using templates, explain which template was selected and why
+- When analyzing metrics data, provide insights and recommendations rather than just repeating the numbers
+- Focus on actionable insights and strategic guidance based on the conversation context
+- If a user asks about a specific ad that doesn't appear in the metrics data, simply explain that the ad may be disabled, paused, or have no activity in the selected timeframe
 
 ## Response Formatting
 Format your responses in HTML5 for direct rendering. Use:
@@ -179,7 +193,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       'create_task_from_template': 'template-based task',
       'create_task_from_prompt': 'custom prompt task',
       'create_image_task_from_prompt': 'image generation task',
-      'analyze_ad_performance': 'ad performance analysis'
+      'get_meta_ads_metrics': 'Meta ads metrics analysis'
     };
 
     const toolDescription = toolDescriptions[toolName] || 'task';
@@ -358,39 +372,19 @@ Use the available tools to create tasks in the agent-engine when complex work is
       {
         type: 'function' as const,
         function: {
-          name: 'analyze_ad_performance',
-          description: 'Analyze performance metrics for Meta ad campaigns',
+          name: 'get_meta_ads_metrics',
+          description: 'Get Meta ad performance metrics and campaign data',
           parameters: {
             type: 'object',
             properties: {
-              campaign_id: {
+              timeframe: {
                 type: 'string',
-                description: 'Meta campaign ID to analyze'
-              },
-              date_range: {
-                type: 'object',
-                description: 'Date range for analysis',
-                properties: {
-                  start_date: { type: 'string' },
-                  end_date: { type: 'string' }
-                }
-              },
-              creatives: {
-                type: 'array',
-                description: 'Specific creatives to analyze',
-                items: {
-                  type: 'object',
-                  properties: {
-                    id: { type: 'string' },
-                    headline: { type: 'string' },
-                    description: { type: 'string' },
-                    cta: { type: 'string' },
-                    image_prompt: { type: 'string' }
-                  }
-                }
+                description: 'Time period for metrics (7d, 30d, 90d)',
+                enum: ['7d', '30d', '90d'],
+                default: '7d'
               }
             },
-            required: ['campaign_id']
+            required: []
           }
         }
       },
@@ -449,8 +443,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'create_image_task_from_prompt':
         const attachPreviousTaskResultsForImage = args.attach_previous_task_results !== false;
         return await this.createImageTaskFromPrompt(args.task_name, args.prompt, args.category || 'Creatives', userId, sessionId, attachPreviousTaskResultsForImage);
-      case 'analyze_ad_performance':
-        return await this.analyzeAdPerformance(args.campaign_id, args.date_range, args.creatives, userId);
+      case 'get_meta_ads_metrics':
+        return await this.getMetaAdsMetrics(args.timeframe || '7d', userId);
       case 'create_revision':
         return await this.createRevision(args.task_id, args.execution_id, args.revision_prompt, userId, args.target_result_name);
       default:
@@ -931,14 +925,149 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
 
 
-  private async analyzeAdPerformance(campaignId: string, dateRange: any, creatives: any[], userId: string): Promise<any> {
-    // This would integrate with Meta API
-    return {
-      message: 'Ad performance analysis is not yet implemented. Please provide your Meta API credentials.',
-      campaignId,
-      dateRange,
-      creatives
-    };
+  private async getMetaAdsMetrics(timeframe: string, userId: string): Promise<any> {
+    try {
+      console.log('AgentMode: Getting Meta ads metrics for timeframe:', timeframe, 'userId:', userId);
+      
+      // Import the Meta API functions directly to reuse the same logic
+      const { getMetaAccessToken } = await import('../utils/secretsManager');
+      const { userDb } = await import('./db');
+      
+      // Get user from database
+      console.log('AgentMode: Fetching user from database...');
+      const user = await userDb.getUserById(userId);
+      if (!user) {
+        console.log('AgentMode: User not found in database');
+        return {
+          success: false,
+          message: 'User not found',
+          error: 'User not found'
+        };
+      }
+      console.log('AgentMode: User found, adAccount:', user.adAccount);
+
+      // Check if user has ad account configured
+      if (!user.adAccount || user.adAccount.trim() === "") {
+        console.log('AgentMode: User ad account not configured');
+        return {
+          success: false,
+          message: 'Ad account not configured. Please configure your Meta ad account first.',
+          error: 'Ad account not configured'
+        };
+      }
+
+      // Get Meta API access token from Secrets Manager
+      let accessToken: string;
+      try {
+        console.log('AgentMode: Fetching Meta access token from Secrets Manager...');
+        accessToken = await getMetaAccessToken();
+        console.log('AgentMode: Meta access token retrieved successfully from Secrets Manager');
+      } catch (error: any) {
+        console.error('AgentMode: Error fetching Meta access token:', error);
+        return {
+          success: false,
+          message: 'Meta access token not configured. Please contact your administrator.',
+          error: error.message || 'Failed to fetch access token from Secrets Manager'
+        };
+      }
+
+      // Get API version from environment or default to v18.0
+      const apiVersion = process.env.META_API_VERSION || 'v18.0';
+      console.log('AgentMode: Using Meta API version:', apiVersion);
+      
+      // Calculate date range based on timeframe
+      const endDate = new Date();
+      const startDate = new Date();
+      if (timeframe === "7d") {
+        startDate.setDate(endDate.getDate() - 7);
+      } else if (timeframe === "30d") {
+        startDate.setDate(endDate.getDate() - 30);
+      } else if (timeframe === "90d") {
+        startDate.setDate(endDate.getDate() - 90);
+      }
+      console.log('AgentMode: Date range:', startDate.toISOString().split('T')[0], 'to', endDate.toISOString().split('T')[0]);
+
+      // Get campaigns, ad sets, ads, and insights using Graph API
+      console.log('AgentMode: Making parallel API calls to Meta Graph API...');
+      const [campaignsResponse, adSetsResponse, adsResponse, insightsResponse] = await Promise.all([
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`),
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting&access_token=${accessToken}`),
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}&access_token=${accessToken}`),
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=ad&access_token=${accessToken}`)
+      ]);
+
+      console.log('AgentMode: API calls completed, parsing responses...');
+      const [campaignsData, adSetsData, adsData, insightsData] = await Promise.all([
+        campaignsResponse.json(),
+        adSetsResponse.json(),
+        adsResponse.json(),
+        insightsResponse.json()
+      ]);
+
+      console.log('AgentMode: API responses parsed:');
+      console.log('- Campaigns response status:', campaignsResponse.status, 'data length:', campaignsData.data?.length || 0);
+      console.log('- Ad Sets response status:', adSetsResponse.status, 'data length:', adSetsData.data?.length || 0);
+      console.log('- Ads response status:', adsResponse.status, 'data length:', adsData.data?.length || 0);
+      console.log('- Insights response status:', insightsResponse.status, 'data length:', insightsData.data?.length || 0);
+
+      // Check for errors in any of the responses
+      if (campaignsData.error) {
+        console.error('AgentMode: Campaigns API Error:', campaignsData.error);
+        throw new Error(`Campaigns API Error: ${campaignsData.error.message}`);
+      }
+      if (adSetsData.error) {
+        console.error('AgentMode: Ad Sets API Error:', adSetsData.error);
+        throw new Error(`Ad Sets API Error: ${adSetsData.error.message}`);
+      }
+      if (adsData.error) {
+        console.error('AgentMode: Ads API Error:', adsData.error);
+        throw new Error(`Ads API Error: ${adsData.error.message}`);
+      }
+      if (insightsData.error) {
+        console.error('AgentMode: Insights API Error:', insightsData.error);
+        throw new Error(`Insights API Error: ${insightsData.error.message}`);
+      }
+
+      // Process the data using simplified logic
+      console.log('AgentMode: Processing campaign data...');
+      const adPerformance = this.processCampaignData(campaignsData.data || [], insightsData.data || [], adSetsData.data || []);
+      console.log('AgentMode: Processed campaigns:', adPerformance.length);
+      
+      console.log('AgentMode: Processing ad sets data...');
+      const processedAdSetsData = this.processAdSetsData(adSetsData.data || [], insightsData.data || [], campaignsData.data || []);
+      console.log('AgentMode: Processed ad sets:', processedAdSetsData.length);
+      
+      console.log('AgentMode: Processing ads data...');
+      const processedAdsData = this.processAdsData(adsData.data || [], insightsData.data || [], adSetsData.data || [], campaignsData.data || []);
+      console.log('AgentMode: Processed ads:', processedAdsData.length);
+      
+      console.log('AgentMode: Generating campaign summary...');
+      const campaignSummary = this.generateCampaignSummary(adPerformance);
+      console.log('AgentMode: Campaign summary:', campaignSummary);
+      
+      const result = {
+        success: true,
+        message: `Meta ads metrics loaded for ${timeframe} timeframe`,
+        timeframe,
+        data: {
+          adPerformance,
+          adSetsData: processedAdSetsData,
+          adsData: processedAdsData,
+          campaignSummary
+        }
+      };
+      
+      console.log('AgentMode: Returning result with', adPerformance.length, 'campaigns,', processedAdSetsData.length, 'ad sets,', processedAdsData.length, 'ads');
+      return result;
+    } catch (error) {
+      console.error('AgentMode: Error fetching Meta ads metrics:', error);
+      console.error('AgentMode: Error stack:', error instanceof Error ? error.stack : 'No stack trace');
+      return {
+        success: false,
+        message: 'Failed to fetch Meta ads metrics. Please ensure your Meta ad account is properly configured.',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
   }
 
   private async createRevision(taskId: string, executionId: string, revisionPrompt: string, userId: string, targetResultName?: string): Promise<any> {
@@ -1089,6 +1218,279 @@ Use the available tools to create tasks in the agent-engine when complex work is
         status: 'error'
       };
     }
+  }
+
+  // Helper function to process campaign data from Meta API
+  private processCampaignData(campaigns: any[], insights: any[], adSets: any[]): any[] {
+    const campaignMap = new Map();
+    
+    // Create ad set to campaign mapping
+    const adSetToCampaignMap = new Map();
+    for (const adSet of adSets) {
+      adSetToCampaignMap.set(adSet.id, adSet.campaign_id);
+    }
+    
+    // Initialize campaigns with zero metrics
+    for (const campaign of campaigns) {
+      campaignMap.set(campaign.id, {
+        id: campaign.id,
+        name: campaign.name,
+        status: campaign.status,
+        objective: campaign.objective,
+        impressions: 0,
+        clicks: 0,
+        spend: 0,
+        ctr: 0,
+        cpc: 0,
+        reach: 0,
+        frequency: 0,
+        lastUpdated: new Date().toISOString(),
+      });
+    }
+    
+    // Aggregate insights data by campaign
+    for (const insight of insights) {
+      const adSetId = insight.adset_id;
+      const campaignId = adSetToCampaignMap.get(adSetId);
+      
+      if (campaignId && campaignMap.has(campaignId)) {
+        const campaign = campaignMap.get(campaignId);
+        
+        // Sum up metrics from all ad sets in this campaign
+        campaign.impressions += parseInt(insight.impressions) || 0;
+        campaign.clicks += parseInt(insight.clicks) || 0;
+        campaign.spend += parseFloat(insight.spend) || 0;
+        campaign.reach += parseInt(insight.reach) || 0;
+      }
+    }
+    
+    // Calculate derived metrics (CTR, CPC) after aggregation
+    for (const campaign of campaignMap.values()) {
+      if (campaign.impressions > 0) {
+        campaign.ctr = (campaign.clicks / campaign.impressions) * 100; // Convert to percentage
+      }
+      if (campaign.clicks > 0) {
+        campaign.cpc = campaign.spend / campaign.clicks;
+      }
+      if (campaign.reach > 0) {
+        campaign.frequency = campaign.impressions / campaign.reach;
+      }
+    }
+    
+    // Filter out campaigns with no activity in the selected timeframe
+    return Array.from(campaignMap.values()).filter(campaign => 
+      campaign.impressions > 0 || campaign.clicks > 0 || campaign.spend > 0
+    );
+  }
+
+  // Helper function to process ad sets data
+  private processAdSetsData(adSets: any[], insights: any[], campaigns: any[]): any[] {
+    const adSetMap = new Map();
+    const campaignMap = new Map();
+    
+    // Create campaign mapping
+    for (const campaign of campaigns) {
+      campaignMap.set(campaign.id, campaign);
+    }
+    
+    // Initialize ad sets with zero metrics
+    for (const adSet of adSets) {
+      const campaign = campaignMap.get(adSet.campaign_id);
+      adSetMap.set(adSet.id, {
+        id: adSet.id,
+        name: adSet.name,
+        status: adSet.status,
+        campaignId: adSet.campaign_id,
+        campaignName: campaign ? campaign.name : 'Unknown Campaign',
+        impressions: 0,
+        clicks: 0,
+        spend: 0,
+        ctr: 0,
+        cpc: 0,
+        reach: 0,
+        frequency: 0,
+        lastUpdated: new Date().toISOString(),
+      });
+    }
+    
+    // Aggregate insights data by ad set
+    for (const insight of insights) {
+      const adSetId = insight.adset_id;
+      if (adSetMap.has(adSetId)) {
+        const adSet = adSetMap.get(adSetId);
+        adSet.impressions += parseInt(insight.impressions) || 0;
+        adSet.clicks += parseInt(insight.clicks) || 0;
+        adSet.spend += parseFloat(insight.spend) || 0;
+        adSet.reach += parseInt(insight.reach) || 0;
+      }
+    }
+    
+    // Calculate derived metrics
+    for (const adSet of adSetMap.values()) {
+      if (adSet.impressions > 0) {
+        adSet.ctr = (adSet.clicks / adSet.impressions) * 100;
+      }
+      if (adSet.clicks > 0) {
+        adSet.cpc = adSet.spend / adSet.clicks;
+      }
+      if (adSet.reach > 0) {
+        adSet.frequency = adSet.impressions / adSet.reach;
+      }
+    }
+    
+    return Array.from(adSetMap.values()).filter(adSet => 
+      adSet.impressions > 0 || adSet.clicks > 0 || adSet.spend > 0
+    );
+  }
+
+  // Helper function to process ads data
+  private processAdsData(ads: any[], insights: any[], adSets: any[], campaigns: any[]): any[] {
+    const adMap = new Map();
+    const adSetMap = new Map();
+    const campaignMap = new Map();
+    
+    // Create mappings
+    for (const adSet of adSets) {
+      adSetMap.set(adSet.id, adSet);
+    }
+    for (const campaign of campaigns) {
+      campaignMap.set(campaign.id, campaign);
+    }
+    
+    // Initialize ads with zero metrics
+    for (const ad of ads) {
+      const adSet = adSetMap.get(ad.adset_id);
+      const campaign = campaignMap.get(ad.campaign_id);
+      
+      adMap.set(ad.id, {
+        id: ad.id,
+        name: ad.name,
+        status: ad.status,
+        adSetId: ad.adset_id,
+        adSetName: adSet ? adSet.name : 'Unknown Ad Set',
+        campaignId: ad.campaign_id,
+        campaignName: campaign ? campaign.name : 'Unknown Campaign',
+        creative: ad.creative,
+        impressions: 0,
+        clicks: 0,
+        spend: 0,
+        ctr: 0,
+        cpc: 0,
+        reach: 0,
+        frequency: 0,
+        lastUpdated: new Date().toISOString(),
+      });
+    }
+    
+    // Aggregate insights data by ad
+    for (const insight of insights) {
+      const adId = insight.ad_id;
+      if (adMap.has(adId)) {
+        const ad = adMap.get(adId);
+        ad.impressions += parseInt(insight.impressions) || 0;
+        ad.clicks += parseInt(insight.clicks) || 0;
+        ad.spend += parseFloat(insight.spend) || 0;
+        ad.reach += parseInt(insight.reach) || 0;
+      }
+    }
+    
+    // Calculate derived metrics
+    for (const ad of adMap.values()) {
+      if (ad.impressions > 0) {
+        ad.ctr = (ad.clicks / ad.impressions) * 100;
+      }
+      if (ad.clicks > 0) {
+        ad.cpc = ad.spend / ad.clicks;
+      }
+      if (ad.reach > 0) {
+        ad.frequency = ad.impressions / ad.reach;
+      }
+    }
+    
+    return Array.from(adMap.values()).filter(ad => 
+      ad.impressions > 0 || ad.clicks > 0 || ad.spend > 0
+    );
+  }
+
+  // Helper function to generate campaign summary
+  private generateCampaignSummary(adPerformance: any[]): any {
+    const totalCampaigns = adPerformance.length;
+    const activeCampaigns = adPerformance.filter(campaign => campaign.status === 'ACTIVE').length;
+    
+    const totalSpend = adPerformance.reduce((sum, campaign) => sum + campaign.spend, 0);
+    const totalImpressions = adPerformance.reduce((sum, campaign) => sum + campaign.impressions, 0);
+    const totalClicks = adPerformance.reduce((sum, campaign) => sum + campaign.clicks, 0);
+    
+    const averageCtr = totalImpressions > 0 ? (totalClicks / totalImpressions) * 100 : 0;
+    const averageCpc = totalClicks > 0 ? totalSpend / totalClicks : 0;
+    
+    return {
+      totalCampaigns,
+      activeCampaigns,
+      totalSpend,
+      totalImpressions,
+      totalClicks,
+      averageCtr,
+      averageCpc
+    };
+  }
+
+  // Helper function to format metrics summary for AI analysis
+  private formatMetricsSummary(data: any): string {
+    const { adPerformance, adSetsData, adsData, campaignSummary } = data;
+    
+    // Create a structured data summary for the AI to analyze contextually
+    let summary = `📊 **Meta Ads Performance Data Retrieved**\n\n`;
+    summary += `I've successfully pulled your latest Meta ads performance data. Here's what I found:\n\n`;
+    
+    // Provide key metrics in a conversational format
+    if (campaignSummary) {
+      summary += `**Performance Summary:**\n`;
+      summary += `• You have ${campaignSummary.totalCampaigns} active campaign${campaignSummary.totalCampaigns > 1 ? 's' : ''} running\n`;
+      summary += `• Total investment: $${campaignSummary.totalSpend.toFixed(2)}\n`;
+      summary += `• Reached ${campaignSummary.totalImpressions.toLocaleString()} people with ${campaignSummary.totalClicks.toLocaleString()} clicks\n`;
+      summary += `• Your CTR is ${campaignSummary.averageCtr.toFixed(2)}% (industry average is ~1-2%)\n`;
+      summary += `• Cost per click: $${campaignSummary.averageCpc.toFixed(2)}\n\n`;
+    }
+    
+    // Highlight top performers
+    if (adsData && adsData.length > 0) {
+      const topAds = adsData
+        .sort((a: any, b: any) => b.clicks - a.clicks)
+        .slice(0, 3);
+      
+      summary += `**Top Performing Ads:**\n`;
+      topAds.forEach((ad: any, index: number) => {
+        summary += `${index + 1}. "${ad.name}" - ${ad.clicks} clicks (${ad.ctr.toFixed(2)}% CTR, $${ad.cpc.toFixed(2)} CPC)\n`;
+      });
+      summary += `\n`;
+    }
+    
+    // Add performance context
+    if (campaignSummary) {
+      summary += `**Performance Context:**\n`;
+      if (campaignSummary.averageCtr > 2.0) {
+        summary += `• Your CTR of ${campaignSummary.averageCtr.toFixed(2)}% is performing well above industry standards\n`;
+      } else if (campaignSummary.averageCtr < 1.0) {
+        summary += `• Your CTR of ${campaignSummary.averageCtr.toFixed(2)}% is below industry average and could be improved\n`;
+      } else {
+        summary += `• Your CTR of ${campaignSummary.averageCtr.toFixed(2)}% is performing at industry standard levels\n`;
+      }
+      
+      if (campaignSummary.averageCpc < 0.50) {
+        summary += `• Your CPC of $${campaignSummary.averageCpc.toFixed(2)} is excellent - very cost efficient\n`;
+      } else if (campaignSummary.averageCpc > 2.0) {
+        summary += `• Your CPC of $${campaignSummary.averageCpc.toFixed(2)} is high and may need optimization\n`;
+      } else {
+        summary += `• Your CPC of $${campaignSummary.averageCpc.toFixed(2)} is reasonable for your industry\n`;
+      }
+    }
+    
+    summary += `\n*Based on ${adPerformance?.length || 0} campaigns, ${adSetsData?.length || 0} ad sets, and ${adsData?.length || 0} individual ads.*\n`;
+    summary += `*Note: Only ads with activity in the selected timeframe are included. Disabled, paused, or inactive ads won't appear in this data.*\n\n`;
+    summary += `**Please provide your analysis and recommendations based on this performance data and our conversation context.**`;
+    
+    return summary;
   }
 }
 
