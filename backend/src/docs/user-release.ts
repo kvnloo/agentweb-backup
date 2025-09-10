@@ -7,6 +7,19 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-09-10',
+    changes: [
+      'Added Agent Mode',
+      '- Emma AI assistant for automated marketing campaign execution through natural conversation',
+      '- Complete marketing workflow support including SWOT analysis, strategy development, and creative generation',
+      '- Task creation and execution with real-time status tracking and HTML result previews',
+      '- Meta ads integration for creating and analyzing advertising campaigns',
+      '- Image generation capabilities for marketing visuals and ad creatives',
+      '- Admin-configurable system prompts with version tracking in chat history',
+      '- ChatGPT-like interface with conversation history and quick start templates',
+    ],
+  },
+  {
     date: '2025-09-05',
     changes: [
       'Added Batch Upload for Subscriber List',
