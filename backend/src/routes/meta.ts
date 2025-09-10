@@ -811,7 +811,7 @@ router.post("/create-ad", async (req, res) => {
           
           // Create assistant message about the ad creation
           const assistantMessage = {
-            role: 'assistant',
+            role: 'assistant' as const,
             content: `<p>✅ Great news! Your Meta Ad "<strong>${adName}</strong>" has been successfully created and is now live in your account.</p>
 <p><strong>Ad Name:</strong> ${adName}<br>
 <strong>Manage here:</strong> <a href="${adManagementUrl}" target="_blank">Facebook Business Manager</a></p>
