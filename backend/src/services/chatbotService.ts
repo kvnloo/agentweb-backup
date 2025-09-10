@@ -104,6 +104,11 @@ export interface ChatSession {
   selectedStartupId?: string; // Selected startup profile for context
   workflowId?: string; // Added workflowId for agent mode sessions
   executionId?: string; // Added executionId for agent mode sessions
+  shareMetadata?: {
+    isShared: boolean;
+    sharedAt?: string;
+    expiresAt?: string;
+  };
 }
 
 // Interface for context chunks
@@ -762,6 +767,34 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session startup selection:", error);
+      throw error;
+    }
+  }
+
+  async updateSessionShareMetadata(
+    sessionId: string,
+    shareMetadata: { isShared: boolean; sharedAt?: string; expiresAt?: string }
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression: "SET shareMetadata = :shareMetadata, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":shareMetadata": shareMetadata,
+        ":updatedAt": timestamp,
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating session share metadata:", error);
       throw error;
     }
   }

@@ -188,6 +188,103 @@ export const agentModeController = {
     }
   },
 
+  // Create shareable link for conversation
+  async createShareLink(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { sessionId } = req.body;
+
+      if (!sessionId) {
+        return res.status(400).json({ error: 'Session ID is required' });
+      }
+
+      // Verify the session belongs to the user
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session || session.userId !== user.userId) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Use session ID as share ID
+      const shareId = sessionId;
+      
+      // Add share metadata to the session (no expiration by default)
+      const shareMetadata = {
+        isShared: true,
+        sharedAt: new Date().toISOString()
+        // expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString() // 30 days - disabled for now
+      };
+
+      // Update the session with share metadata
+      await chatbotDb.updateSessionShareMetadata(sessionId, shareMetadata);
+
+      res.json({ shareId });
+    } catch (error) {
+      console.error('AgentMode: Create share link error:', error);
+      res.status(500).json({ error: 'Failed to create share link' });
+    }
+  },
+
+  // Stop sharing conversation
+  async stopSharing(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { sessionId } = req.params;
+
+      // Verify the session belongs to the user
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session || session.userId !== user.userId) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Remove share metadata from the session
+      await chatbotDb.updateSessionShareMetadata(sessionId, { isShared: false });
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error('AgentMode: Stop sharing error:', error);
+      res.status(500).json({ error: 'Failed to stop sharing' });
+    }
+  },
+
+  // Get shared conversation
+  async getSharedConversation(req: Request, res: Response) {
+    try {
+      const { shareId } = req.params;
+
+      // Get the session data directly using shareId as sessionId
+      const session = await chatbotDb.getChatSession(shareId);
+      if (!session) {
+        return res.status(404).json({ error: 'Conversation not found' });
+      }
+
+      // Check if the session is shared
+      if (!session.shareMetadata?.isShared) {
+        return res.status(404).json({ error: 'This conversation is not shared' });
+      }
+
+      // Check if expired (only if expiresAt is set)
+      if (session.shareMetadata.expiresAt && new Date() > new Date(session.shareMetadata.expiresAt)) {
+        // Remove share metadata if expired
+        await chatbotDb.updateSessionShareMetadata(shareId, { isShared: false });
+        return res.status(410).json({ error: 'Share link has expired' });
+      }
+
+      res.json({
+        session: {
+          sessionId: session.sessionId,
+          title: session.title,
+          messages: session.messages,
+          createdAt: session.createdAt,
+          updatedAt: session.updatedAt,
+          shareMetadata: session.shareMetadata
+        }
+      });
+    } catch (error) {
+      console.error('AgentMode: Get shared conversation error:', error);
+      res.status(500).json({ error: 'Failed to get shared conversation' });
+    }
+  },
+
   // Archive a chat session
   async archiveSession(req: Request, res: Response) {
     try {
