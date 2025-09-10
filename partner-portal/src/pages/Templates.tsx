@@ -242,13 +242,15 @@ export default function Templates() {
         isDeepResearch,
         isComplexTask,
         nameParameter: selectedNameParameter,
-        category: finalCategory || undefined,
         outputAsJson: outputAsJson,
         outputAsHtml: outputAsHtml,
         selectedLLMs: selectedLLMs,
         useSharedBrowser: useSharedBrowser,
         turnOffHeadless: turnOffHeadless,
       };
+
+      // Set category - if empty, set to empty string
+      templateData.category = finalCategory || '';
 
       // Check if we're updating an existing template (has a valid templateId)
       if (

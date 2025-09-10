@@ -75,9 +75,16 @@ export interface ChatMessage {
       sources: string[];
     };
     timestamp: string;
-    portalType?: "customer" | "partner" | "genius";
+    portalType?: "customer" | "partner" | "genius" | "agent";
     pageIdentifier?: string;
     isContextMessage?: boolean;
+    toolCalls?: Array<{
+      id: string;
+      name: string;
+      arguments: any;
+      result?: any;
+      error?: string;
+    }>;
   };
 }
 
@@ -91,10 +98,12 @@ export interface ChatSession {
   updatedAt: string;
   pageContent?: string; // Full page content for storage
   contextChunks?: ContextChunk[]; // Chunked context for RAG
-  portalType?: "customer" | "partner" | "genius"; // Added portalType to session
+  portalType?: "customer" | "partner" | "genius" | "agent"; // Added portalType to session
   pageIdentifier?: string; // Added pageIdentifier for page-specific sessions
   archived?: boolean; // Archive status for soft deletion
   selectedStartupId?: string; // Selected startup profile for context
+  workflowId?: string; // Added workflowId for agent mode sessions
+  executionId?: string; // Added executionId for agent mode sessions
 }
 
 // Interface for context chunks
@@ -314,9 +323,11 @@ export class ChatbotDB {
   async createChatSession(
     userId: string,
     pageContent?: string,
-    portalType?: "customer" | "partner" | "genius",
+    portalType?: "customer" | "partner" | "genius" | "agent",
     pageIdentifier?: string,
-    selectedStartupId?: string
+    selectedStartupId?: string,
+    workflowId?: string,
+    executionId?: string
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
@@ -324,13 +335,14 @@ export class ChatbotDB {
     const selectedSystemMessage =
       portalType === "customer" ? emmaSystemMessage :
       portalType === "genius" ? geniusSystemMessage :
+      portalType === "agent" ? null : // Agent Mode uses its own system prompt
       partnerSystemMessage;
 
     const chatSession: ChatSession = {
       sessionId,
       userId,
       title: 'New Chat Session', // Default title that will be updated after first message
-      messages: [
+      messages: selectedSystemMessage ? [
         {
           role: "system",
           content: selectedSystemMessage,
@@ -341,12 +353,14 @@ export class ChatbotDB {
             pageIdentifier,
           },
         },
-      ],
+      ] : [],
       createdAt: timestamp,
       updatedAt: timestamp,
       portalType,
       pageIdentifier,
       selectedStartupId,
+      workflowId,
+      executionId,
     };
 
     if (pageContent) {
@@ -441,7 +455,7 @@ export class ChatbotDB {
 
   async getUserSessions(
     userId: string,
-    portalType?: "customer" | "partner" | "genius",
+    portalType?: "customer" | "partner" | "genius" | "agent",
     limit?: number,
     sortDescending: boolean = true
   ): Promise<ChatSession[]> {
@@ -506,7 +520,7 @@ export class ChatbotDB {
     }
   }
 
-  async getUserSessionCount(userId: string, portalType?: "customer" | "partner" | "genius"): Promise<number> {
+  async getUserSessionCount(userId: string, portalType?: "customer" | "partner" | "genius" | "agent"): Promise<number> {
     console.log(
       `Getting session count for user: ${userId} from table: ${this.tableName}, portalType: ${portalType || 'all'}`
     );
@@ -546,7 +560,7 @@ export class ChatbotDB {
   }
 
   // Get archived sessions for admin management
-  async getArchivedSessions(userId?: string, portalType?: "customer" | "partner" | "genius"): Promise<ChatSession[]> {
+  async getArchivedSessions(userId?: string, portalType?: "customer" | "partner" | "genius" | "agent"): Promise<ChatSession[]> {
     console.log(
       `Getting archived sessions from table: ${this.tableName}, userId: ${userId || 'all'}, portalType: ${portalType || 'all'}`
     );
@@ -696,7 +710,7 @@ export class ChatbotDB {
 
   async updateSessionPortalType(
     sessionId: string,
-    portalType: "customer" | "partner" | "genius"
+    portalType: "customer" | "partner" | "genius" | "agent"
   ): Promise<ChatSession> {
     const timestamp = new Date().toISOString();
 
@@ -1126,6 +1140,7 @@ Be helpful, concise, and accurate. Focus on actionable growth marketing advice. 
   process.env.DISCORD_INVITE_URL || "https://discord.gg/kP2u6Wf9KQ"
 }" target="_blank">Discord community</a>`;
 
+
 // Helper function to calculate token cost
 function calculateCost(
   promptTokens: number,
@@ -1505,6 +1520,70 @@ export async function generateChatResponse(
     return assistantReply;
   } catch (error) {
     console.error("[generateChatResponse] Error:", error);
+    throw error;
+  }
+}
+
+// Update task execution status in chat session
+export async function updateTaskExecutionStatus(
+  sessionId: string,
+  taskId: string,
+  executionId: string,
+  newStatus: string
+): Promise<void> {
+  try {
+    console.log(`Updating task execution status for session ${sessionId}, task ${taskId}, execution ${executionId} to ${newStatus}`);
+    
+    // Get the current session
+    const session = await chatbotDb.getChatSession(sessionId);
+    if (!session) {
+      throw new Error('Session not found');
+    }
+
+    // Find the message with the task execution and update its status
+    const updatedMessages = session.messages?.map((message: ChatMessage) => {
+      if (message.metadata?.toolCalls) {
+        const updatedToolCalls = message.metadata.toolCalls.map((toolCall: any) => {
+          if (toolCall.result && 
+              toolCall.result.taskId === taskId && 
+              toolCall.result.executionId === executionId) {
+            return {
+              ...toolCall,
+              result: {
+                ...toolCall.result,
+                status: newStatus
+              }
+            };
+          }
+          return toolCall;
+        });
+
+        return {
+          ...message,
+          metadata: {
+            ...message.metadata,
+            toolCalls: updatedToolCalls
+          }
+        };
+      }
+      return message;
+    });
+
+    // Update the session with the modified messages
+    const params = {
+      TableName: `${TABLE_PREFIX}AW-ChatSessions`,
+      Key: { sessionId },
+      UpdateExpression: "SET messages = :messages, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":messages": updatedMessages,
+        ":updatedAt": new Date().toISOString()
+      }
+    };
+
+    await dynamodb.update(params).promise();
+    console.log(`Successfully updated task execution status for session ${sessionId}`);
+  } catch (error) {
+    console.error('Error updating task execution status:', error);
     throw error;
   }
 }

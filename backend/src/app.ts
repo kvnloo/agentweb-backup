@@ -18,6 +18,8 @@ import marketStrategyRoutes from "./routes/marketStrategy";
 import slackRoutes from "./routes/slack";
 import metaRoutes from "./routes/meta";
 import blogRoutes from "./routes/blog";
+import agentModeRoutes from "./routes/agentMode";
+import settingsRoutes from "./routes/settings";
 
 // Import the new controller
 import {
@@ -93,6 +95,8 @@ app.use("/api/market-strategy", marketStrategyRoutes);
 app.use("/api/slack", slackRoutes);
 app.use("/api/meta", metaRoutes);
 app.use("/api/blog", blogRoutes);
+app.use("/api/agent-mode", agentModeRoutes);
+app.use("/api/settings", settingsRoutes);
 
 // Health check endpoint
 app.get("/", (req, res) => {

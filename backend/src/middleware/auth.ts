@@ -97,6 +97,20 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
   }
 }
 
+export function requireAdmin(req: Request, res: Response, next: NextFunction) {
+  const authReq = req as AuthenticatedRequest;
+  
+  if (!authReq.user) {
+    return res.status(401).json({ message: 'Authentication required' });
+  }
+  
+  if (!authReq.user.isAdmin) {
+    return res.status(403).json({ message: 'Admin access required' });
+  }
+  
+  next();
+}
+
 export async function isAdmin(req: Request, res: Response, next: NextFunction) {
   const authReq = req as AuthenticatedRequest;
   
