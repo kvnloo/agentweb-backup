@@ -758,7 +758,7 @@ router.post("/create-ad", async (req, res) => {
     
     // Record the ad creation in the existing image file in result_files
     try {
-      const { taskId, executionId } = req.body;
+      const { taskId, executionId, sessionId } = req.body;
       if (taskId && executionId) {
         // Import taskDb to update the execution
         const { taskDb } = await import('../services/db');
@@ -801,6 +801,33 @@ router.post("/create-ad", async (req, res) => {
           console.log("✅ Meta ad information added to image file in result_files");
         } else {
           console.log("⚠️ Execution not found or access denied, cannot add ad info");
+        }
+      }
+
+      // Add assistant message to chat session if sessionId is provided
+      if (sessionId) {
+        try {
+          const { chatbotDb } = await import('../services/chatbotService');
+          
+          // Create assistant message about the ad creation
+          const assistantMessage = {
+            role: 'assistant',
+            content: `<p>✅ Great news! Your Meta Ad "<strong>${adName}</strong>" has been successfully created and is now live in your account.</p>
+<p><strong>Ad Name:</strong> ${adName}<br>
+<strong>Manage here:</strong> <a href="${adManagementUrl}" target="_blank">Facebook Business Manager</a></p>
+<p>Would you like me to monitor its performance over the next few days and give you optimization suggestions? That way, we can ensure the updated creative works effectively.</p>`,
+            metadata: {
+              timestamp: new Date().toISOString(),
+              portalType: 'agent' as const
+            }
+          };
+
+          // Add message to session
+          await chatbotDb.addMessageToSession(sessionId, assistantMessage);
+          console.log("✅ Assistant message added to chat session about Meta ad creation");
+        } catch (messageError) {
+          console.error("Error adding assistant message to session:", messageError);
+          // Don't fail the request if message addition fails
         }
       }
     } catch (recordError) {
