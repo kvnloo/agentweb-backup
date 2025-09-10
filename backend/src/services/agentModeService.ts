@@ -574,21 +574,27 @@ Use the available tools to create tasks in the agent-engine when complex work is
   private async getAvailableTemplates(): Promise<any[]> {
     try {
       const templates = await taskTemplateDb.getPublishedTemplates();
-      return templates.map(template => ({
-        templateId: template.templateId,
-        name: template.name,
-        description: template.description,
-        category: template.category,
-        parameters: template.parameters || [],
-        promptTemplate: template.prompt,
-        isDeepResearch: template.isDeepResearch,
-        isComplexTask: template.isComplexTask,
-        outputAsJson: template.outputAsJson,
-        outputAsHtml: template.outputAsHtml,
-        selectedLLMs: template.selectedLLMs,
-        useSharedBrowser: template.useSharedBrowser,
-        turnOffHeadless: template.turnOffHeadless
-      }));
+      return templates
+        .filter(template => {
+          // Only include templates with valid categories
+          const category = template.category;
+          return category && category.trim() !== '';
+        })
+        .map(template => ({
+          templateId: template.templateId,
+          name: template.name,
+          description: template.description,
+          category: template.category,
+          parameters: template.parameters || [],
+          promptTemplate: template.prompt,
+          isDeepResearch: template.isDeepResearch,
+          isComplexTask: template.isComplexTask,
+          outputAsJson: template.outputAsJson,
+          outputAsHtml: template.outputAsHtml,
+          selectedLLMs: template.selectedLLMs,
+          useSharedBrowser: template.useSharedBrowser,
+          turnOffHeadless: template.turnOffHeadless
+        }));
     } catch (error) {
       console.error('Error fetching templates:', error);
       return [];
