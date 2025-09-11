@@ -58,7 +58,7 @@ import { useAuth } from "../contexts/AuthContext";
 import ScheduleForm from "../components/ScheduleForm";
 import ScheduleList from "../components/ScheduleList";
 import { buildApiUrl, getLLMsForTask, MAX_FILE_SIZE } from "../config";
-import { fetchImageModelConfig, ImageModel } from "../services/imageModelService";
+import { fetchImageModelConfig, ImageModel, getEffectiveImageModel } from "../services/imageModelService";
 import { toast } from "react-hot-toast";
 import LockIcon from "@mui/icons-material/Lock";
 import LockOpenIcon from "@mui/icons-material/LockOpen";
@@ -2157,12 +2157,14 @@ export default function TaskDetails() {
             <InputLabel id="image-model-select-label">Image Model</InputLabel>
             <Select
               labelId="image-model-select-label"
-              value={task?.imageModel || defaultImageModel}
+              value={getEffectiveImageModel(task?.imageModel, defaultImageModel)}
               onChange={(e) => {
                 const newModel = e.target.value;
                 console.log('Image model selection changed:', {
                   newModel,
                   currentModel: task?.imageModel,
+                  defaultModel: defaultImageModel,
+                  effectiveModel: getEffectiveImageModel(task?.imageModel, defaultImageModel),
                   taskId
                 });
                 // Always update to ensure the selection is saved in the database
@@ -2187,7 +2189,12 @@ export default function TaskDetails() {
               {imageModels.map((model) => (
                 <MenuItem key={model.value} value={model.value}>
                   <Box>
-                    <Typography>{model.label}</Typography>
+                    <Typography>
+                      {model.label}
+                      {model.value === defaultImageModel && !task?.imageModel && (
+                        <Chip label="Default" size="small" color="primary" sx={{ ml: 1 }} />
+                      )}
+                    </Typography>
                     <Typography variant="caption" color="text.secondary">
                       {model.description}
                     </Typography>

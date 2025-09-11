@@ -72,3 +72,13 @@ export const clearImageModelCache = (): void => {
   imageModelConfigCache = null;
   cacheTimestamp = 0;
 };
+
+// Get the effective image model for a task (user preference overrides default)
+export const getEffectiveImageModel = (taskImageModel?: string, defaultModel?: string): string => {
+  // User's task-specific preference takes precedence over default
+  if (taskImageModel) {
+    return taskImageModel;
+  }
+  // Fall back to default model if no user preference
+  return defaultModel || 'openai-image-1';
+};

@@ -65,6 +65,58 @@ export default function ImageModelsSettings() {
     provider: '',
   });
 
+  // Initialize default image model settings if they don't exist
+  const initializeSettings = async () => {
+    try {
+      const defaultModels = [
+        {
+          value: "openai-image-1",
+          label: "openai-image-1 (OpenAI)",
+          description: "Default OpenAI image generation model",
+          provider: "OpenAI"
+        },
+        {
+          value: "FLUX.1-Kontext-pro",
+          label: "FLUX.1-Kontext-pro (Azure)",
+          description: "Advanced image generation and editing model",
+          provider: "Azure"
+        },
+        {
+          value: "gemini-2.5-flash-image-preview",
+          label: "Nano Banana (Google Gemini)",
+          description: "gemini-2.5-flash-image-preview for image + text",
+          provider: "Google"
+        }
+      ];
+
+      // Set default image model
+      await axios.post(
+        buildApiUrl('/api/settings'),
+        {
+          settingName: 'default_image_model',
+          settingValue: 'openai-image-1',
+          description: 'Default image model used for image generation tasks',
+        },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      // Set supported image models
+      await axios.post(
+        buildApiUrl('/api/settings'),
+        {
+          settingName: 'supported_image_models',
+          settingValue: JSON.stringify(defaultModels),
+          description: 'List of supported image models with their metadata',
+        },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      setSuccess('Image model settings initialized successfully');
+    } catch (err: any) {
+      setError(err.response?.data?.error || 'Failed to initialize image model settings');
+    }
+  };
+
   // Fetch image model configuration
   const fetchConfig = async () => {
     try {
@@ -72,7 +124,19 @@ export default function ImageModelsSettings() {
       const response = await axios.get(buildApiUrl('/api/image-models'), {
         headers: { Authorization: `Bearer ${token}` },
       });
-      setConfig(response.data);
+      
+      // Check if we have any supported models
+      if (response.data.supportedImageModels.length === 0) {
+        // No models exist, initialize with defaults
+        await initializeSettings();
+        // Fetch again after initialization
+        const newResponse = await axios.get(buildApiUrl('/api/image-models'), {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        setConfig(newResponse.data);
+      } else {
+        setConfig(response.data);
+      }
       setError('');
     } catch (err: any) {
       setError(err.response?.data?.error || 'Failed to fetch image model configuration');
@@ -194,9 +258,18 @@ export default function ImageModelsSettings() {
 
   if (!config) {
     return (
-      <Alert severity="error">
-        Failed to load image model configuration
-      </Alert>
+      <Box sx={{ p: 3 }}>
+        <Alert severity="error" sx={{ mb: 2 }}>
+          Failed to load image model configuration
+        </Alert>
+        <Button
+          variant="contained"
+          onClick={initializeSettings}
+          disabled={loading}
+        >
+          Initialize Default Settings
+        </Button>
+      </Box>
     );
   }
 
@@ -226,17 +299,29 @@ export default function ImageModelsSettings() {
             <FormControl fullWidth>
               <InputLabel>Default Model</InputLabel>
               <Select
-                value={config.defaultImageModel}
+                value={config.defaultImageModel || ''}
                 onChange={(e) => updateDefaultModel(e.target.value)}
                 label="Default Model"
+                disabled={config.supportedImageModels.length === 0}
               >
-                {config.supportedImageModels.map((model) => (
-                  <MenuItem key={model.value} value={model.value}>
-                    {model.label}
+                {config.supportedImageModels.length === 0 ? (
+                  <MenuItem disabled>
+                    <em>No models available</em>
                   </MenuItem>
-                ))}
+                ) : (
+                  config.supportedImageModels.map((model) => (
+                    <MenuItem key={model.value} value={model.value}>
+                      {model.label}
+                    </MenuItem>
+                  ))
+                )}
               </Select>
             </FormControl>
+            {config.supportedImageModels.length === 0 && (
+              <Typography variant="caption" color="text.secondary" sx={{ mt: 1 }}>
+                Add some image models first to set a default
+              </Typography>
+            )}
           </Paper>
         </Grid>
 
@@ -259,52 +344,77 @@ export default function ImageModelsSettings() {
               Manage the list of available image models for task creation
             </Typography>
             
-            <TableContainer>
-              <Table>
-                <TableHead>
-                  <TableRow>
-                    <TableCell>Model Value</TableCell>
-                    <TableCell>Label</TableCell>
-                    <TableCell>Provider</TableCell>
-                    <TableCell>Description</TableCell>
-                    <TableCell align="right">Actions</TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {config.supportedImageModels.map((model) => (
-                    <TableRow key={model.value}>
-                      <TableCell>
-                        <Chip label={model.value} size="small" />
-                      </TableCell>
-                      <TableCell>{model.label}</TableCell>
-                      <TableCell>
-                        <Chip label={model.provider} size="small" color="primary" variant="outlined" />
-                      </TableCell>
-                      <TableCell>{model.description}</TableCell>
-                      <TableCell align="right">
-                        <Tooltip title="Edit model">
-                          <IconButton
-                            size="small"
-                            onClick={() => handleEditModel(model)}
-                          >
-                            <EditIcon />
-                          </IconButton>
-                        </Tooltip>
-                        <Tooltip title="Delete model">
-                          <IconButton
-                            size="small"
-                            onClick={() => handleDeleteModel(model.value)}
-                            color="error"
-                          >
-                            <DeleteIcon />
-                          </IconButton>
-                        </Tooltip>
-                      </TableCell>
+            {config.supportedImageModels.length === 0 ? (
+              <Box sx={{ textAlign: 'center', py: 4 }}>
+                <Typography variant="h6" color="text.secondary" gutterBottom>
+                  No image models configured
+                </Typography>
+                <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
+                  Get started by adding your first image model or initializing with default settings.
+                </Typography>
+                <Button
+                  variant="contained"
+                  startIcon={<AddIcon />}
+                  onClick={handleAddModel}
+                  sx={{ mr: 2 }}
+                >
+                  Add First Model
+                </Button>
+                <Button
+                  variant="outlined"
+                  onClick={initializeSettings}
+                >
+                  Initialize Defaults
+                </Button>
+              </Box>
+            ) : (
+              <TableContainer>
+                <Table>
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>Model Value</TableCell>
+                      <TableCell>Label</TableCell>
+                      <TableCell>Provider</TableCell>
+                      <TableCell>Description</TableCell>
+                      <TableCell align="right">Actions</TableCell>
                     </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </TableContainer>
+                  </TableHead>
+                  <TableBody>
+                    {config.supportedImageModels.map((model) => (
+                      <TableRow key={model.value}>
+                        <TableCell>
+                          <Chip label={model.value} size="small" />
+                        </TableCell>
+                        <TableCell>{model.label}</TableCell>
+                        <TableCell>
+                          <Chip label={model.provider} size="small" color="primary" variant="outlined" />
+                        </TableCell>
+                        <TableCell>{model.description}</TableCell>
+                        <TableCell align="right">
+                          <Tooltip title="Edit model">
+                            <IconButton
+                              size="small"
+                              onClick={() => handleEditModel(model)}
+                            >
+                              <EditIcon />
+                            </IconButton>
+                          </Tooltip>
+                          <Tooltip title="Delete model">
+                            <IconButton
+                              size="small"
+                              onClick={() => handleDeleteModel(model.value)}
+                              color="error"
+                            >
+                              <DeleteIcon />
+                            </IconButton>
+                          </Tooltip>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+            )}
           </Paper>
         </Grid>
       </Grid>
