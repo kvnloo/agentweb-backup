@@ -29,7 +29,7 @@ import aiohttp
 import base64  # Add at the top with other imports
 import boto3  # Add at the top with other imports
 from urllib.parse import quote
-from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content, generate_content_hash, get_agent_code_base_path, call_github_api, run_python_code_in_sandbox, fetch_api_credentials, decrypt_password, get_all_configs, parse_json
+from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content, generate_content_hash, get_agent_code_base_path, call_github_api, run_python_code_in_sandbox, fetch_api_credentials, decrypt_password, get_all_configs, parse_json, convert_svg_to_png
 from knowledge_base_utils import get_knowledge_base_manager
 from datetime import datetime, timezone
 import PyPDF2
@@ -1667,8 +1667,28 @@ class WebAgent:
                         
                         # Check if file is an image
                         image_ext = Path(params.image_file_name).suffix.lower()
-                        if image_ext not in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp']:
-                            return ActionResult(error=f"File {params.image_file_name} is not a supported image format. Supported formats: PNG, JPG, JPEG, GIF, BMP, WEBP")
+                        if image_ext not in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg']:
+                            return ActionResult(error=f"File {params.image_file_name} is not a supported image format. Supported formats: PNG, JPG, JPEG, GIF, BMP, WEBP, SVG")
+                        
+                        # Convert SVG to high-quality PNG if needed for video generation
+                        if image_ext == '.svg':
+                            # Create a high-quality PNG file for the converted SVG in attachment directory
+                            png_file_name = Path(params.image_file_name).with_suffix('.png').name
+                            attachment_dir = self._get_attachment_dir()
+                            if not attachment_dir:
+                                return ActionResult(error="Failed to get attachment directory for SVG conversion")
+                            png_path = attachment_dir / png_file_name
+                            
+                            # Use high DPI (300) and 2048px width for better quality
+                            if not convert_svg_to_png(str(image_path), str(png_path), dpi=300, width=2048):
+                                return ActionResult(error=f"Failed to convert SVG file {params.image_file_name} to high-quality PNG format")
+                            
+                            # Replace SVG filename with PNG filename in the prompt
+                            params.prompt = params.prompt.replace(params.image_file_name, png_file_name)
+                            
+                            # Use the converted PNG file instead
+                            image_path = png_path
+                            logger.info(f"Converted SVG {params.image_file_name} to high-quality PNG {png_file_name} in attachment directory for video generation")
                         
                         logger.info(f"Using input image: {params.image_file_name}")
                     
@@ -3150,10 +3170,30 @@ class WebAgent:
 
                     # Check if file is an image
                     file_ext = Path(file_name).suffix.lower()
-                    if file_ext not in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp']:
-                        return ActionResult(error=f"File {file_name} is not a supported image format. Supported formats: PNG, JPG, JPEG, GIF, BMP, WEBP")
+                    if file_ext not in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg']:
+                        return ActionResult(error=f"File {file_name} is not a supported image format. Supported formats: PNG, JPG, JPEG, GIF, BMP, WEBP, SVG")
 
-                    input_images.append(file_path)
+                    # Convert SVG to high-quality PNG if needed
+                    if file_ext == '.svg':
+                        # Create a high-quality PNG file for the converted SVG in attachment directory
+                        png_file_name = Path(file_name).with_suffix('.png').name
+                        attachment_dir = self._get_attachment_dir()
+                        if not attachment_dir:
+                            return ActionResult(error="Failed to get attachment directory for SVG conversion")
+                        png_path = attachment_dir / png_file_name
+                        
+                        # Use high DPI (300) and 2048px width for better quality
+                        if not convert_svg_to_png(str(file_path), str(png_path), dpi=300, width=2048):
+                            return ActionResult(error=f"Failed to convert SVG file {file_name} to high-quality PNG format")
+                        
+                        # Replace SVG filename with PNG filename in the prompt
+                        params.prompt = params.prompt.replace(file_name, png_file_name)
+                        
+                        # Use the converted PNG file instead
+                        input_images.append(png_path)
+                        logger.info(f"Converted SVG {file_name} to high-quality PNG {png_file_name} in attachment directory for processing")
+                    else:
+                        input_images.append(file_path)
                 
                 # Determine the operation based on number of input images
                 if len(input_images) == 0:
