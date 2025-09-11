@@ -20,6 +20,7 @@ import metaRoutes from "./routes/meta";
 import blogRoutes from "./routes/blog";
 import agentModeRoutes from "./routes/agentMode";
 import settingsRoutes from "./routes/settings";
+import imageModelsRoutes from "./routes/image-models";
 
 // Import the new controller
 import {
@@ -97,6 +98,7 @@ app.use("/api/meta", metaRoutes);
 app.use("/api/blog", blogRoutes);
 app.use("/api/agent-mode", agentModeRoutes);
 app.use("/api/settings", settingsRoutes);
+app.use("/api/image-models", imageModelsRoutes);
 
 // Health check endpoint
 app.get("/", (req, res) => {

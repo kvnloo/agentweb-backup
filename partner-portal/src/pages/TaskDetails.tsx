@@ -57,7 +57,8 @@ import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
 import ScheduleForm from "../components/ScheduleForm";
 import ScheduleList from "../components/ScheduleList";
-import { buildApiUrl, getLLMsForTask, MAX_FILE_SIZE, DEFAULT_IMAGE_MODEL } from "../config";
+import { buildApiUrl, getLLMsForTask, MAX_FILE_SIZE } from "../config";
+import { fetchImageModelConfig, ImageModel, getEffectiveImageModel } from "../services/imageModelService";
 import { toast } from "react-hot-toast";
 import LockIcon from "@mui/icons-material/Lock";
 import LockOpenIcon from "@mui/icons-material/LockOpen";
@@ -454,6 +455,8 @@ export default function TaskDetails() {
   const [isEditingKnowledgeBase, setIsEditingKnowledgeBase] = useState(false);
   const [editedKnowledgeBase, setEditedKnowledgeBase] = useState("");
   const [knowledgeBaseError, setKnowledgeBaseError] = useState("");
+  const [imageModels, setImageModels] = useState<ImageModel[]>([]);
+  const [defaultImageModel, setDefaultImageModel] = useState<string>("openai-image-1");
   const [isUpdatingKnowledgeBase, setIsUpdatingKnowledgeBase] = useState<
     string | null
   >(null);
@@ -560,6 +563,17 @@ export default function TaskDetails() {
 
     fetchSubscribers();
   }, [taskId, token]);
+
+  // Fetch image model configuration on component mount
+  useEffect(() => {
+    const fetchImageModels = async () => {
+      const config = await fetchImageModelConfig();
+      setImageModels(config.supportedImageModels);
+      setDefaultImageModel(config.defaultImageModel);
+    };
+
+    fetchImageModels();
+  }, []);
 
   const handleArchive = async () => {
     if (!task) return;
@@ -2143,12 +2157,14 @@ export default function TaskDetails() {
             <InputLabel id="image-model-select-label">Image Model</InputLabel>
             <Select
               labelId="image-model-select-label"
-              value={task?.imageModel || DEFAULT_IMAGE_MODEL}
+              value={getEffectiveImageModel(task?.imageModel, defaultImageModel)}
               onChange={(e) => {
                 const newModel = e.target.value;
                 console.log('Image model selection changed:', {
                   newModel,
                   currentModel: task?.imageModel,
+                  defaultModel: defaultImageModel,
+                  effectiveModel: getEffectiveImageModel(task?.imageModel, defaultImageModel),
                   taskId
                 });
                 // Always update to ensure the selection is saved in the database
@@ -2170,30 +2186,21 @@ export default function TaskDetails() {
               }}
               label="Image Model"
             >
-              <MenuItem value="openai-image-1">
-                <Box>
-                  <Typography>openai-image-1 (OpenAI)</Typography>
-                  <Typography variant="caption" color="text.secondary">
-                    Default OpenAI image generation model
-                  </Typography>
-                </Box>
-              </MenuItem>
-              <MenuItem value="FLUX.1-Kontext-pro">
-                <Box>
-                  <Typography>FLUX.1-Kontext-pro (Azure)</Typography>
-                  <Typography variant="caption" color="text.secondary">
-                    Advanced image generation and editing model
-                  </Typography>
-                </Box>
-              </MenuItem>
-              <MenuItem value="gemini-2.5-flash-image-preview">
-                <Box>
-                  <Typography>Nano Banana (Google Gemini)</Typography>
-                  <Typography variant="caption" color="text.secondary">
-                    gemini-2.5-flash-image-preview for image + text
-                  </Typography>
-                </Box>
-              </MenuItem>
+              {imageModels.map((model) => (
+                <MenuItem key={model.value} value={model.value}>
+                  <Box>
+                    <Typography>
+                      {model.label}
+                      {model.value === defaultImageModel && !task?.imageModel && (
+                        <Chip label="Default" size="small" color="primary" sx={{ ml: 1 }} />
+                      )}
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      {model.description}
+                    </Typography>
+                  </Box>
+                </MenuItem>
+              ))}
             </Select>
           </FormControl>
         </Tooltip>
