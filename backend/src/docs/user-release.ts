@@ -7,6 +7,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-09-11',
+    changes: [
+      'Enable Customer Portal to config image model',
+      '- Users can now select and configure image models directly from the Task Details page',
+      '- Supports all available image models with clear descriptions and provider information',
+      '- User-selected image models override the system default for personalized generation',
+      'Added popup modal support for quick task configuration on Ad Images, Ad Videos, and Research Reports pages',
+      '- Users can now view and modify task settings without leaving their current page',
+    ],
+  },
+  {
     date: '2025-09-10',
     changes: [
       'Added Agent Mode',
