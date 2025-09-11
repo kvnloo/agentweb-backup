@@ -716,6 +716,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         extractPageContent: false,
         outputAsJson: templateData.outputAsJson || false,
         outputAsHtml: templateData.outputAsHtml || false,
+        selectedLLMs: templateData.selectedLLMs || undefined,
         useSharedBrowser: templateData.useSharedBrowser || false,
         turnOffHeadless: templateData.turnOffHeadless || true,
         useKnowledgeBase: false,
