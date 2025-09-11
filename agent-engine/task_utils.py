@@ -39,6 +39,50 @@ global_use_vision = True
 # Initialize DynamoDB client
 dynamodb = get_dynamodb_resource()
 
+def convert_svg_to_png(svg_path: str, output_path: str, dpi: int = 300, width: int = None, height: int = None) -> bool:
+    """
+    Convert an SVG file to high-quality PNG format using cairosvg.
+    
+    Args:
+        svg_path: Path to the input SVG file
+        output_path: Path where the PNG file should be saved
+        dpi: Dots per inch for high-quality output (default: 300)
+        width: Target width in pixels (optional, maintains aspect ratio if not specified)
+        height: Target height in pixels (optional, maintains aspect ratio if not specified)
+        
+    Returns:
+        bool: True if conversion was successful, False otherwise
+    """
+    try:
+        import cairosvg
+        from PIL import Image
+        import io
+        
+        # Convert SVG to high-resolution PNG bytes using cairosvg
+        # Use high DPI for better quality
+        png_bytes = cairosvg.svg2png(
+            url=svg_path,
+            dpi=dpi,
+            output_width=width,
+            output_height=height
+        )
+        
+        # Open the PNG bytes with PIL to ensure it's a valid image
+        image = Image.open(io.BytesIO(png_bytes))
+        
+        # Save as high-quality PNG with optimization
+        image.save(output_path, "PNG", optimize=True, compress_level=6)
+        
+        logger.info(f"Successfully converted SVG {svg_path} to high-quality PNG {output_path} (DPI: {dpi}, Size: {image.size})")
+        return True
+        
+    except ImportError:
+        logger.error("cairosvg or PIL not installed. Install with: pip install cairosvg Pillow")
+        return False
+    except Exception as e:
+        logger.error(f"Error converting SVG to PNG: {e}")
+        return False
+
 def create_jwt_token(user_id: str) -> str:
     """
     Create a JWT token for the given user_id using JWT_SECRET.

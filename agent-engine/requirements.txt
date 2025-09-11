@@ -22,3 +22,5 @@ instaloader
 gdown
 yt-dlp
 runwayml
+Pillow
+cairosvg
