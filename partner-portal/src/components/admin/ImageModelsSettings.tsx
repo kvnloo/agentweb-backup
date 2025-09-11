@@ -296,6 +296,14 @@ export default function ImageModelsSettings() {
             <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
               Select the default image model that will be used for new tasks
             </Typography>
+            <Alert severity="info" sx={{ mb: 2 }}>
+              <Typography variant="body2">
+                <strong>Important:</strong> When you change the default image model, make sure to update the{' '}
+                <code>DEFAULT_IMAGE_MODEL</code>{' '}
+                environment variable in the agent-engine to match this value. 
+                The agent-engine uses this environment variable as a fallback when no specific model is selected for a task.
+              </Typography>
+            </Alert>
             <FormControl fullWidth>
               <InputLabel>Default Model</InputLabel>
               <Select
