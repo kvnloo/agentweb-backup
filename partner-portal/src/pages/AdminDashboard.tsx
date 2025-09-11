@@ -44,6 +44,7 @@ import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
 import { buildApiUrl } from "../config";
 import DOMPurify from "dompurify";
+import ImageModelsSettings from "../components/admin/ImageModelsSettings";
 import {
   Info as InfoIcon,
   Close as CloseIcon,
@@ -411,6 +412,7 @@ export default function AdminDashboard() {
     'chat-history': 6,
     'knowledge-base': 7,
     'agent-mode': 8,
+    'image-models': 9,
   };
   
   // Get initial tab value from URL or default to 0
@@ -1087,6 +1089,7 @@ export default function AdminDashboard() {
             <Tab label="Chat History" {...a11yProps(6)} />
             <Tab label="Knowledge Base" {...a11yProps(7)} />
             <Tab label="Agent Mode" {...a11yProps(8)} />
+            <Tab label="Image Models" {...a11yProps(9)} />
           </Tabs>
         </Box>
 
@@ -2595,6 +2598,10 @@ export default function AdminDashboard() {
 
         <TabPanel value={tabValue} index={8}>
           <AgentModeSettings />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={9}>
+          <ImageModelsSettings />
         </TabPanel>
       </Paper>
 

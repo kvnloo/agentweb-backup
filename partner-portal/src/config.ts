@@ -30,6 +30,8 @@ export const DEEP_RESEARCH_LLMS = (
   .filter((llm: string) => llm); // Remove empty strings
 
 // Get the default image model from environment variable or use OpenAI as fallback
+// Note: This is now primarily used as a fallback. The actual default should be fetched from the API.
+// TODO: Remove this once all components are updated to use the API
 export const DEFAULT_IMAGE_MODEL = import.meta.env.VITE_IMAGE_MODEL || "openai-image-1";
 
 // Function to get the appropriate LLM list based on whether deep research is enabled
