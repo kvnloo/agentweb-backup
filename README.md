@@ -365,7 +365,6 @@ Frontend Production:
 
 ```
 VITE_API_URL=https://agentweb.pro
-VITE_IMAGE_MODEL=gemini-2.5-flash-image-preview
 ```
 
 ### Google OAuth Configuration
@@ -443,7 +442,6 @@ The backend includes a fallback handler for malformed OAuth URLs, but the proper
 cd partner-portal && \
 VITE_API_URL=https://api.agentweb.pro \
 VITE_DEBUG=false \
-VITE_IMAGE_MODEL=gemini-2.5-flash-image-preview \
 VITE_LIST_FULL_LLM_NAMES="azure->openai->gpt-4.1,google->google->gemini-2.5-pro-preview-05-06,azure->openai->gpt-4o,aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0,openai->openai->gpt-4o,aws->anthropic->us.anthropic.claude-3-7-sonnet-20250219-v1:0,google->google->gemini-2.5-flash,google->google->gemini-2.5-flash-lite,azure->openai->gpt-5-chat,google->google->gemini-2.5-pro" \
 VITE_DEEP_RESEARCH_LLM_NAMES="azure->openai->o1-mini,azure->openai->gpt-4o" \
 npm run build && \
@@ -964,23 +962,13 @@ cat > .env << EOF
 # Google Gemini API key for image generation
 GOOGLE_IMAGE_API_KEY=your_google_image_api_key_here
 
-# Default image model (optional, defaults to openai-image-1)
-DEFAULT_IMAGE_MODEL=gemini-2.5-flash-image-preview
 
 # Other environment variables as needed
 EOF
 
-**Note**: Make sure to replace `your_google_image_api_key_here` with your actual Google Gemini API key. The `DEFAULT_IMAGE_MODEL` environment variable allows you to set the default image generation model for all tasks.
+**Note**: Make sure to replace `your_google_image_api_key_here` with your actual Google Gemini API key.
 
-**⚠️ Important**: When changing the default image model, you must update **both** the frontend and backend together:
-
-1. **Frontend (partner-portal)**: Rebuild with the new `VITE_IMAGE_MODEL` value
-2. **Backend (agent-engine)**: Update the `DEFAULT_IMAGE_MODEL` environment variable
-
-This coordination is required because:
-- The frontend uses `VITE_IMAGE_MODEL` at build time to set the default in the UI
-- The backend uses `DEFAULT_IMAGE_MODEL` to determine which model to use when no explicit selection is made
-- Mismatched values will cause the frontend to show one default while the backend uses a different one
+**Image Model Configuration**: Image models are now configured through the database via the partner portal admin interface. The default image model and supported models are managed centrally and don't require environment variable updates.
 
 #### 5. Running the Agent Engine
 
