@@ -244,6 +244,79 @@ router.get('/:id/executions/:executionId', getTaskExecution);
 router.get('/:id/executions/:executionId/share', generateShareToken);
 router.post('/:id/executions/:executionId/email', sendExecutionEmail);
 router.put('/:id', updateTask);
+router.put('/:id/email-sender', authenticateToken, async (req: AuthRequest, res: Response) => {
+  try {
+    const { id: taskId } = req.params;
+    const { emailSender, fromName } = req.body;
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'User not authenticated' });
+    }
+
+    // Validate email sender format if provided
+    if (emailSender && !/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(emailSender)) {
+      return res.status(400).json({ message: 'Invalid email sender format' });
+    }
+
+    // Check if task exists and user owns it
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    if (task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Update the task's email sender and from name
+    await taskDb.updateTask(taskId, { emailSender, fromName });
+    
+    res.json({ message: 'Email sender updated successfully', emailSender, fromName });
+  } catch (error) {
+    console.error('Error updating email sender:', error);
+    res.status(500).json({ message: 'Error updating email sender' });
+  }
+});
+
+// Check if user has email domain configured
+router.get('/:id/email-domain-status', authenticateToken, async (req: AuthRequest, res: Response) => {
+  try {
+    const { id: taskId } = req.params;
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'User not authenticated' });
+    }
+
+    // Check if task exists and user owns it
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    if (task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Get user's email domain
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const hasEmailDomain = !!(user.emailDomain && user.emailDomain.trim() !== '');
+    
+    res.json({ 
+      hasEmailDomain,
+      emailDomain: user.emailDomain || null
+    });
+  } catch (error) {
+    console.error('Error checking email domain status:', error);
+    res.status(500).json({ message: 'Error checking email domain status' });
+  }
+});
+
 router.delete('/:id', deleteTask);
 router.post('/:id/execute', executeTask);
 router.put('/:id/executions/:executionId', updateTaskExecution);
