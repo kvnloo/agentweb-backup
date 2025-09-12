@@ -3651,6 +3651,66 @@ class WebAgent:
                 logger.error(f"Error generating image: {e}")
                 return ActionResult(error=f"Failed to generate image: {str(e)}")
 
+        @self.controller.registry.action('Done with task')
+        async def done(result: str) -> ActionResult:
+            """Mark the task as done and check for HTML output if required.
+            
+            This action checks if output_as_html is enabled and ensures an HTML file
+            exists in the downloads folder. If not, it will ask the agent to create one
+            using the write_file action. Supports retry mechanism via RETRY_COUNT env var.
+            
+            Parameters:
+            - result: The task completion result
+            
+            Returns:
+            - ActionResult
+            """
+            try:
+                # Log only a short version of the result if it's too long
+                if len(result) > 200:
+                    logger.info(f"Task completed with result: {result[:200]}... (truncated, full length: {len(result)} chars)")
+                else:
+                    logger.info(f"Task completed with result: {result}")
+                
+                # Check if output_as_html is enabled
+                self.output_as_html = True # tests
+                if not self.output_as_html:
+                    logger.info("output_as_html is not enabled, proceeding with normal completion")
+                    return ActionResult(is_done=True, extracted_content=result)
+                
+                # Get retry count from environment variable, default to 2
+                retry_count = int(os.getenv('RETRY_COUNT', '2'))
+                logger.info(f"Using retry count: {retry_count}")
+                
+                # Check if HTML file exists in downloads folder
+                downloads_path = self._get_downloads_path()
+                html_files = list(Path(downloads_path).glob("*.html"))
+                
+                if html_files:
+                    logger.info(f"Found HTML file(s) in downloads folder: {[f.name for f in html_files]}")
+                    return ActionResult(is_done=True, extracted_content=result)
+                
+                # No HTML file found, need to ask agent to create one
+                logger.warning("output_as_html is enabled but no HTML file found in downloads folder")
+                
+                # Check if we've exceeded retry count
+                if hasattr(self, '_done_retry_count'):
+                    self._done_retry_count += 1
+                else:
+                    self._done_retry_count = 1
+                
+                logger.info(f"Retry attempt {self._done_retry_count}/{retry_count + 1}")
+                
+                if self._done_retry_count > retry_count:
+                    logger.error(f"Exceeded maximum retry count ({retry_count}). Giving up.")
+                    return ActionResult(is_done=True, extracted_content=result)
+                
+                return ActionResult(is_done=False, extracted_content='You must use the "write_file" action to create a HTML report')
+                
+            except Exception as e:
+                logger.error(f"Error in done action: {e}")
+                return ActionResult(error=f"Failed to complete task: {str(e)}")
+
     def _get_cookies_path(self):
         """Get the path to the user's cookies file"""
         if not self.user_id:
