@@ -1666,12 +1666,13 @@ export const subscriberDb = {
   },
 
   async addEmailHistory(taskId: string, email: string, emailHistory: {
-    id: string;
     sentAt: string;
     subject: string;
     status: 'sent' | 'delivered' | 'opened' | 'clicked' | 'bounced' | 'failed';
     taskExecutionId?: string;
     htmlContentUrl?: string;
+    senderType: 'SMTP' | 'resend';
+    emailId?: string;
   }) {
     try {
       const params = {

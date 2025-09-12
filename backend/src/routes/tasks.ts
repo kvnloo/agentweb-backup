@@ -452,13 +452,15 @@ router.post('/:taskId/subscribers/:email/email-history', authenticateToken, asyn
     }
 
     // Add email history
+    const sentAt = new Date().toISOString();
     const emailHistory = {
-      id: `email_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      sentAt: new Date().toISOString(),
+      sentAt: sentAt,
       subject,
       status: 'sent' as const,
       taskExecutionId,
-      htmlContentUrl
+      htmlContentUrl,
+      senderType: 'SMTP' as const,
+      emailId: undefined
     };
 
     const updatedSubscriber = await subscriberDb.addEmailHistory(taskId, email, emailHistory);
