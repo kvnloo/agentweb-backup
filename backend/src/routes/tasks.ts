@@ -425,7 +425,7 @@ router.post('/:taskId/subscribers/:email/email-history', authenticateToken, asyn
   try {
     const { taskId, email } = req.params;
     const userId = (req as AuthenticatedRequest).user?.userId;
-    const { subject, taskExecutionId, htmlContentUrl } = req.body;
+    const { subject, taskExecutionId, htmlContentUrl, senderType, emailId } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -459,8 +459,8 @@ router.post('/:taskId/subscribers/:email/email-history', authenticateToken, asyn
       status: 'sent' as const,
       taskExecutionId,
       htmlContentUrl,
-      senderType: 'SMTP' as const,
-      emailId: undefined
+      senderType: senderType || 'SMTP',
+      emailId: emailId || undefined
     };
 
     const updatedSubscriber = await subscriberDb.addEmailHistory(taskId, email, emailHistory);

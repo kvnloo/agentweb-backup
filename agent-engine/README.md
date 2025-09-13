@@ -15,6 +15,22 @@ conda env create -f environment.yml
 conda activate agent-engine
 ```
 
+### Environment Variables
+
+The agent-engine supports custom email senders via Resend. To enable this feature:
+
+1. Set the `RESEND_API_KEY` environment variable:
+```bash
+export RESEND_API_KEY=your_resend_api_key_here
+```
+
+2. Or add it to your `.env` file:
+```
+RESEND_API_KEY=your_resend_api_key_here
+```
+
+Get your API key from [Resend API Keys](https://resend.com/api-keys).
+
 ### Alternative Setup (pip)
 
 You can install dependencies directly with pip:

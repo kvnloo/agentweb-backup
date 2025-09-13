@@ -10,6 +10,7 @@ from aws_utils import get_dynamodb_resource
 from task_utils import check_new_information
 import requests # Added for fetching HTML content
 import json
+from resend_service import resend_service
 
 # Load environment variables
 load_dotenv()
@@ -45,7 +46,7 @@ def get_task_subscribers(task_id):
         logger.error(f"Failed to get task subscribers: {e}")
         return []
 
-def add_email_history(task_id, email, subject, execution_id=None, html_content_url=None):
+def add_email_history(task_id, email, subject, execution_id=None, html_content_url=None, sender_type='SMTP', email_id=None):
     """
     Add email history to subscriber record via backend API.
     """
@@ -82,7 +83,9 @@ def add_email_history(task_id, email, subject, execution_id=None, html_content_u
         payload = {
             "subject": subject,
             "taskExecutionId": execution_id,
-            "htmlContentUrl": html_content_url
+            "htmlContentUrl": html_content_url,
+            "senderType": sender_type,
+            "emailId": email_id
         }
         
         response = requests.post(
@@ -96,7 +99,7 @@ def add_email_history(task_id, email, subject, execution_id=None, html_content_u
         )
         
         if response.status_code == 200:
-            logger.info(f"Added email history for subscriber: {email}")
+            logger.info(f"Added email history for subscriber: {email} ({sender_type})")
             return True
         else:
             logger.error(f"Failed to add email history for {email}: {response.status_code} - {response.text}")
@@ -171,6 +174,16 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
     Includes HTML content if available in result_files.
     """
     try:
+        # Get task details to check for custom email sender
+        task_response = dynamodb.Table(f'{TABLE_PREFIX}AW-Tasks').get_item(
+            Key={'taskId': task_id}
+        )
+        task = task_response.get('Item', {})
+        
+        # Check if task has custom email sender configured
+        email_sender = task.get('emailSender')
+        from_name = task.get('fromName')
+        
         smtp_host = os.getenv('SMTP_HOST', 'smtp.gmail.com')
         smtp_port = int(os.getenv('SMTP_PORT', '587'))
         smtp_user = os.getenv('SMTP_USER')
@@ -288,22 +301,44 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
   </div>
 </body></html>"""
 
-                msg = MIMEText(simplified_html, 'html')
-                msg['Subject'] = subject
-                msg['From'] = from_email
-                msg['Reply-To'] = 'support@agentweb.pro'
-                msg['To'] = to_email
+                # Determine sender type and email ID
+                sender_type = 'SMTP'
+                email_id = None
                 
-                # Send email
-                with smtplib.SMTP(smtp_host, smtp_port) as server:
-                    server.starttls()
-                    server.login(smtp_user, smtp_pass)
-                    server.send_message(msg)
+                if email_sender and from_name:
+                    # Use Resend service for custom email sender
+                    from_email_resend = f"{from_name} <{email_sender}>"
+                    resend_result = resend_service.send_email(
+                        from_email=from_email_resend,
+                        to_email=to_email,
+                        subject=subject,
+                        html=simplified_html
+                    )
+                    
+                    if resend_result and 'id' in resend_result:
+                        email_id = resend_result['id']
+                        sender_type = 'resend'
+                        logger.info(f"Sent simplified HTML report via Resend to subscriber: {to_email} (ID: {email_id})")
+                    else:
+                        logger.error("Resend failed, email not sent")
+                        return False
+                else:
+                    # Use default SMTP service
+                    msg = MIMEText(simplified_html, 'html')
+                    msg['Subject'] = subject
+                    msg['From'] = from_email
+                    msg['Reply-To'] = 'support@agentweb.pro'
+                    msg['To'] = to_email
+                    
+                    with smtplib.SMTP(smtp_host, smtp_port) as server:
+                        server.starttls()
+                        server.login(smtp_user, smtp_pass)
+                        server.send_message(msg)
 
-                logger.info(f"Sent simplified HTML report email to subscriber: {to_email}")
+                    logger.info(f"Sent simplified HTML report via SMTP to subscriber: {to_email}")
                 
                 # Add email history to subscriber
-                add_email_history(task_id, to_email, subject, execution_id, html_content_url)
+                add_email_history(task_id, to_email, subject, execution_id, html_content_url, sender_type, email_id)
                 
                 return True
             else:
@@ -366,22 +401,44 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
 </body></html>
 """
         
-        msg = MIMEText(html_body_content, 'html')
-        msg['Subject'] = subject
-        msg['From'] = from_email
-        msg['Reply-To'] = 'support@agentweb.pro'
-        msg['To'] = to_email
+        # Determine sender type and email ID
+        sender_type = 'SMTP'
+        email_id = None
         
-        # Send email
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.starttls()
-            server.login(smtp_user, smtp_pass)
-            server.send_message(msg)
-
-        logger.info(f"Sent task run results (HTML only) to subscriber: {to_email}")
+        if email_sender and from_name:
+            # Use Resend service for custom email sender
+            from_email_resend = f"{from_name} <{email_sender}>"
+            resend_result = resend_service.send_email(
+                from_email=from_email_resend,
+                to_email=to_email,
+                subject=subject,
+                html=html_body_content
+            )
+            
+            if resend_result and 'id' in resend_result:
+                email_id = resend_result['id']
+                sender_type = 'resend'
+                logger.info(f"Sent task run results via Resend to subscriber: {to_email} (ID: {email_id})")
+            else:
+                logger.error("Resend failed, email not sent")
+                return False
+        else:
+            # Use default SMTP service
+            msg = MIMEText(html_body_content, 'html')
+            msg['Subject'] = subject
+            msg['From'] = from_email
+            msg['Reply-To'] = 'support@agentweb.pro'
+            msg['To'] = to_email
+            
+            with smtplib.SMTP(smtp_host, smtp_port) as server:
+                server.starttls()
+                server.login(smtp_user, smtp_pass)
+                server.send_message(msg)
+            
+            logger.info(f"Sent task run results via SMTP to subscriber: {to_email}")
         
         # Add email history to subscriber
-        add_email_history(task_id, to_email, subject, execution_id, html_content_url)
+        add_email_history(task_id, to_email, subject, execution_id, html_content_url, sender_type, email_id)
         
         return True
 
