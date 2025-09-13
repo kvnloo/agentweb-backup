@@ -8,11 +8,6 @@ const router = express.Router();
 
 // Resend webhook endpoint
 router.post('/resend', async (req: express.Request, res: express.Response) => {
-  console.log('=== WEBHOOK RECEIVED ===');
-  console.log('Method:', req.method);
-  console.log('URL:', req.url);
-  console.log('Headers:', JSON.stringify(req.headers, null, 2));
-  
   try {
     // Initialize webhook service if not already done
     await webhookService.initialize();
@@ -20,29 +15,9 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
     // Use the parsed body from Express (since we can't easily get raw body with signature verification)
     const payload = JSON.stringify(req.body);
     const headers = req.headers as IncomingMessage['headers'] & WebhookRequiredHeaders;
-    
-    console.log('Raw payload:', payload);
-    console.log('Payload length:', payload?.length || 0);
-    console.log('Webhook headers:', {
-      'svix-id': headers['svix-id'],
-      'svix-timestamp': headers['svix-timestamp'],
-      'svix-signature': headers['svix-signature']
-    });
 
     // Verify webhook signature
-    let event;
-    try {
-      event = webhookService.verifyWebhook(payload, headers);
-      console.log('Verified event:', JSON.stringify(event, null, 2));
-    } catch (verificationError) {
-      console.error('Webhook verification failed:', verificationError);
-      console.log('This might be due to missing or invalid webhook secret');
-      console.log('Continuing without verification for debugging...');
-      
-      // For debugging, use the parsed body directly
-      event = req.body as ResendWebhookEvent;
-      console.log('Using parsed event without verification:', JSON.stringify(event, null, 2));
-    }
+    const event = webhookService.verifyWebhook(payload, headers);
 
     console.log(`Received Resend webhook: ${event.type} for email ${event.data.email_id}`);
 

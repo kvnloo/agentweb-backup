@@ -33,7 +33,6 @@ class EmailEventsDb {
     };
 
     await dynamodb.put(params).promise();
-    console.log(`Email event stored: ${eventId} for email ${event.data.email_id}`);
     
     return emailEvent;
   }

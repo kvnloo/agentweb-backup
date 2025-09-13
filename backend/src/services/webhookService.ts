@@ -65,9 +65,7 @@ class WebhookService {
 
   verifyWebhook(payload: string, headers: IncomingMessage['headers'] & WebhookRequiredHeaders): ResendWebhookEvent {
     if (!this.webhook) {
-      console.log('Webhook verification skipped - no webhook secret available');
-      // For debugging, just parse the JSON payload
-      return JSON.parse(payload) as ResendWebhookEvent;
+      throw new Error('Webhook service not initialized - webhook secret not available');
     }
 
     return this.webhook.verify(payload, headers) as ResendWebhookEvent;
