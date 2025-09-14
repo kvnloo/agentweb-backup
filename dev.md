@@ -76,3 +76,6 @@ supporting multiple image input for openai model require using latest openai mod
 > pip install --upgrade openai
 
 We have issues creating new environment in elastic beanstalk. We tested using AWSEBSSecurityGroup for EC2 security groups because the service instances (EC2) needs to communicate with the load balancer but it still not working.
+
+Sept. 14, 2025
+Debug with full log from Elastic Beanstalk: web.stdout.log has the app log.
