@@ -1481,11 +1481,7 @@ export const subscriberDb = {
   async addSubscriber(taskId: string, email: string) {
     try {
       // Check if subscriber already exists
-      const existingSubscribers = await this.getAllTaskSubscribers(taskId);
-      if (!existingSubscribers) {
-        throw new Error('Failed to fetch existing subscribers');
-      }
-      const existingSubscriber = existingSubscribers.find(s => s.email === email);
+      const existingSubscriber = await this.getTaskSubscriberByEmail(taskId, email);
       
       if (existingSubscriber) {
         // Email already exists - throw error regardless of subscription status
@@ -1617,6 +1613,23 @@ export const subscriberDb = {
       return result.Items || [];
     } catch (error) {
       handleDynamoDbError(error, "getAllTaskSubscribers");
+    }
+  },
+
+  async getTaskSubscriberByEmail(taskId: string, email: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
+        Key: {
+          taskId: taskId,
+          email: email,
+        },
+      };
+
+      const result = await dynamodb.get(params).promise();
+      return result.Item || null;
+    } catch (error) {
+      handleDynamoDbError(error, "getTaskSubscriberByEmail");
     }
   },
 
