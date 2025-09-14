@@ -702,8 +702,8 @@ router.get('/:taskId/subscribers/metrics', authenticateToken, async (req, res) =
       });
     }
 
-    // Get email domain from task or user
-    const emailDomain = task.emailDomain || user.emailDomain;
+    // Get email domain from user
+    const emailDomain = user.emailDomain;
     
     if (!emailDomain) {
       return res.json({
