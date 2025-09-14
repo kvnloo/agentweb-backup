@@ -761,7 +761,7 @@ router.get('/:taskId/subscribers/metrics', authenticateToken, async (req, res) =
         events,
         total: Object.values(events).reduce((sum, count) => sum + count, 0)
       }))
-      .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
     res.json({
       subscribers,
