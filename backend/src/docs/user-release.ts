@@ -7,6 +7,18 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-09-14',
+    changes: [
+      'Supported Scalable Email Sending with Resend',
+      '- Integrated Resend service for high-volume email delivery with custom sender domains',
+      '- Added Email Domain configuration in Admin Portal for custom sender setup',
+      '- Implemented custom email sender configuration in Task Details with format: <username>@<domain>',
+      '- Added email events tracking and webhook integration for delivery analytics',
+      '- Enhanced subscriber management with email metrics and timeline views',
+      '- Improved email content with conditional "Manage task" links based on HTML Report Only mode',
+    ],
+  },
+  {
     date: '2025-09-11',
     changes: [
       'Enable Customer Portal to config image model',
