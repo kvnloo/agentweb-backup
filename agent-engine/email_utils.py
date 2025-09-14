@@ -292,7 +292,7 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
   <div class="container">
     {html_content_from_file_section}
     <div class="footer">
-      <p>Manage task and history at: <a href="{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/tasks/{task_id}">{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/tasks/{task_id}</a></p>
+      {f'<p>Manage task and history at: <a href="{os.getenv("CUSTOMER_FRONTEND_URL", "http://localhost:5174")}/tasks/{task_id}">{os.getenv("CUSTOMER_FRONTEND_URL", "http://localhost:5174")}/tasks/{task_id}</a></p>' if not send_html_report_only else ''}
       {f'<p><small><strong>Note:</strong> Some visuals may not display properly in the email. <a href="{html_content_url}">View full report here</a> for the complete experience.</small></p>' if html_content_url else ''}
       <hr>
       <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>
@@ -391,7 +391,7 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
 
         html_body_content += f"""
     <div class="footer">
-      <p>Manage task and history at: <a href="{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/tasks/{task_id}">{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/tasks/{task_id}</a></p>
+      {f'<p>Manage task and history at: <a href="{os.getenv("CUSTOMER_FRONTEND_URL", "http://localhost:5174")}/tasks/{task_id}">{os.getenv("CUSTOMER_FRONTEND_URL", "http://localhost:5174")}/tasks/{task_id}</a></p>' if not send_html_report_only else ''}
       {f'<p><small><strong>Note:</strong> Some visuals may not display properly in the email. <a href="{html_content_url}">View full report here</a> for the complete experience.</small></p>' if html_content_url else ''}
       <hr>
       <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>

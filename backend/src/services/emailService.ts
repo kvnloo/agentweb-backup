@@ -223,7 +223,7 @@ export const emailService = {
               <div class="container">
                 ${htmlContentFromFile}
                 <div class="footer">
-                  <p>Manage task and history at: <a href="${customerFrontendUrl}/tasks/${task.taskId}">${customerFrontendUrl}/tasks/${task.taskId}</a></p>
+                  ${!task.sendHtmlReportOnly ? `<p>Manage task and history at: <a href="${customerFrontendUrl}/tasks/${task.taskId}">${customerFrontendUrl}/tasks/${task.taskId}</a></p>` : ''}
                   ${htmlContentUrl ? `<p><small><strong>Note:</strong> Some visuals may not display properly in the email. <a href="${htmlContentUrl}">View full report here</a> for the complete experience.</small></p>` : ''}
                   <hr>
                   <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>
@@ -234,7 +234,7 @@ export const emailService = {
           `;
 
           const subject = `${task.name} - ${currentDate}`;
-          const text = `Task Report: ${task.name}\n\nView the HTML report in the email body.\n\nManage task and history at: ${customerFrontendUrl}/tasks/${task.taskId}`;
+          const text = `Task Report: ${task.name}\n\nView the HTML report in the email body.${!task.sendHtmlReportOnly ? `\n\nManage task and history at: ${customerFrontendUrl}/tasks/${task.taskId}` : ''}`;
           
           // Check if task has custom email sender configured
           let resendEmailId = null;
@@ -404,7 +404,7 @@ export const emailService = {
           ` : ''}
           
           <div class="footer">
-            <p>Manage task and history at: <a href="${customerFrontendUrl}/tasks/${task.taskId}">${customerFrontendUrl}/tasks/${task.taskId}</a></p>
+            ${!task.sendHtmlReportOnly ? `<p>Manage task and history at: <a href="${customerFrontendUrl}/tasks/${task.taskId}">${customerFrontendUrl}/tasks/${task.taskId}</a></p>` : ''}
             ${htmlContentUrl ? `<p><small><strong>Note:</strong> Some visuals may not display properly in the email. <a href="${htmlContentUrl}">View full report here</a> for the complete experience.</small></p>` : ''}
             <hr>
             <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>
@@ -415,7 +415,7 @@ export const emailService = {
     `;
 
     const subject = `AgentWeb - Task Run Results: ${task.name}`;
-    const text = `Task: ${task.name}\nStatus: ${execution.status.toUpperCase()}\nManage task and history at: ${customerFrontendUrl}/tasks/${task.taskId}`;
+    const text = `Task: ${task.name}\nStatus: ${execution.status.toUpperCase()}${!task.sendHtmlReportOnly ? `\nManage task and history at: ${customerFrontendUrl}/tasks/${task.taskId}` : ''}`;
     
     // Check if task has custom email sender configured
     let resendEmailId = null;
