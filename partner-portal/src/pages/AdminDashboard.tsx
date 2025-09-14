@@ -134,6 +134,7 @@ interface User {
   isOAuthUser?: boolean; // Ensured from API structure
   stripe_customer_id?: string; // Added stripe_customer_id
   adAccount?: string; // Meta ad account ID
+  emailDomain?: string; // Email sender domain
 }
 
 // Define an interface for the task data shown in the admin tasks tab
@@ -455,6 +456,9 @@ export default function AdminDashboard() {
   const [editingAdAccountUserId, setEditingAdAccountUserId] = useState<string | null>(null);
   const [currentAdAccountText, setCurrentAdAccountText] = useState("");
   const [adAccountEditLoading, setAdAccountEditLoading] = useState(false);
+  const [editingEmailDomainUserId, setEditingEmailDomainUserId] = useState<string | null>(null);
+  const [currentEmailDomainText, setCurrentEmailDomainText] = useState("");
+  const [emailDomainEditLoading, setEmailDomainEditLoading] = useState(false);
   const [delegateAccessLoading, setDelegateAccessLoading] = useState<string | null>(null);
   const [emailToDelete, setEmailToDelete] = useState<string | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -1014,6 +1018,40 @@ export default function AdminDashboard() {
     }
   };
 
+  const handleSaveEmailDomain = async (userId: string) => {
+    try {
+      setEmailDomainEditLoading(true);
+      
+      // Validate email domain format - allow empty domain or valid format
+      const emailDomain = currentEmailDomainText.trim();
+      if (emailDomain && !/^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/.test(emailDomain)) {
+        setError("Please enter a valid email domain (e.g., example.com)");
+        return;
+      }
+      
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/users/${userId}/email-domain`),
+        { emailDomain: emailDomain },
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+
+      if (response.status === 200) {
+        // Update the user in the context
+        await loadUsers();
+        setSuccess("Email domain updated successfully!");
+        setEditingEmailDomainUserId(null);
+        setCurrentEmailDomainText("");
+      }
+    } catch (error: any) {
+      console.error("Error updating email domain:", error);
+      setError(error.response?.data?.message || "Failed to update email domain");
+    } finally {
+      setEmailDomainEditLoading(false);
+    }
+  };
+
   const handleAccessCustomerPortal = async (userId: string) => {
     try {
       setDelegateAccessLoading(userId);
@@ -1409,6 +1447,7 @@ export default function AdminDashboard() {
                   <TableCell>User ID</TableCell>
                   <TableCell>Stripe Customer ID</TableCell>
                   <TableCell>Ad Account</TableCell>
+                  <TableCell>Email Domain</TableCell>
                   <TableCell>Created</TableCell>
                   <TableCell>Last Login</TableCell>
                   <TableCell>Support Note</TableCell>
@@ -1424,7 +1463,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={14} align="center">
+                    <TableCell colSpan={15} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -1485,6 +1524,62 @@ export default function AdminDashboard() {
                                   setCurrentAdAccountText(user.adAccount || "");
                                 }}
                                 disabled={adAccountEditLoading}
+                              >
+                                <EditIcon />
+                              </IconButton>
+                            </>
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          {editingEmailDomainUserId === user.userId ? (
+                            <>
+                              <TextField
+                                size="small"
+                                value={currentEmailDomainText}
+                                onChange={(e) => setCurrentEmailDomainText(e.target.value)}
+                                placeholder="Enter email domain (e.g., example.com)..."
+                                sx={{ minWidth: 200 }}
+                                disabled={emailDomainEditLoading}
+                                helperText="Email sender domain for this user"
+                              />
+                              <IconButton
+                                type="button"
+                                size="small"
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  handleSaveEmailDomain(user.userId);
+                                }}
+                                disabled={emailDomainEditLoading}
+                                color="primary"
+                              >
+                                <CheckIcon />
+                              </IconButton>
+                              <IconButton
+                                type="button"
+                                size="small"
+                                onClick={() => {
+                                  setEditingEmailDomainUserId(null);
+                                  setCurrentEmailDomainText("");
+                                }}
+                                disabled={emailDomainEditLoading}
+                              >
+                                <CloseIcon />
+                              </IconButton>
+                            </>
+                          ) : (
+                            <>
+                              <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
+                                {user.emailDomain || "-"}
+                              </Typography>
+                              <IconButton
+                                type="button"
+                                size="small"
+                                onClick={() => {
+                                  setEditingEmailDomainUserId(user.userId);
+                                  setCurrentEmailDomainText(user.emailDomain || "");
+                                }}
+                                disabled={emailDomainEditLoading}
                               >
                                 <EditIcon />
                               </IconButton>

@@ -58,6 +58,7 @@ export interface User {
   roles?: ("partner" | "customer" | "free")[];
   stripe_customer_id?: string;
   adAccount?: string; // Meta ad account ID
+  emailDomain?: string; // Email sender domain
   companyName?: string;
   useCaseCategories?: string[];
   brandGuidelines?: {
@@ -478,6 +479,8 @@ export const taskDb = {
     imageModel?: string;
     requireApproval?: boolean;
     slackChannel?: string;
+    emailSender?: string;
+    fromName?: string;
   }) {
     try {
       const params = {
@@ -497,7 +500,7 @@ export const taskDb = {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Tasks`,
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, createVideo, videoModel, imageModel, requireApproval, slackChannel",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, createVideo, videoModel, imageModel, requireApproval, slackChannel, emailSender, fromName",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -623,7 +626,7 @@ export const taskDb = {
           taskId,
         },
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, updateLeadList, createVideo, videoModel, imageModel, leadListIdentifier, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt, requireApproval, slackChannel, sendHtmlReportOnly",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, updateLeadList, createVideo, videoModel, imageModel, leadListIdentifier, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt, requireApproval, slackChannel, sendHtmlReportOnly, emailSender, fromName",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -685,6 +688,8 @@ export const taskDb = {
       requireApproval?: boolean;
       slackChannel?: string;
       sendHtmlReportOnly?: boolean;
+      emailSender?: string;
+      fromName?: string;
     }>
   ) {
     try {
@@ -1476,11 +1481,7 @@ export const subscriberDb = {
   async addSubscriber(taskId: string, email: string) {
     try {
       // Check if subscriber already exists
-      const existingSubscribers = await this.getAllTaskSubscribers(taskId);
-      if (!existingSubscribers) {
-        throw new Error('Failed to fetch existing subscribers');
-      }
-      const existingSubscriber = existingSubscribers.find(s => s.email === email);
+      const existingSubscriber = await this.getTaskSubscriberByEmail(taskId, email);
       
       if (existingSubscriber) {
         // Email already exists - throw error regardless of subscription status
@@ -1615,6 +1616,23 @@ export const subscriberDb = {
     }
   },
 
+  async getTaskSubscriberByEmail(taskId: string, email: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
+        Key: {
+          taskId: taskId,
+          email: email,
+        },
+      };
+
+      const result = await dynamodb.get(params).promise();
+      return result.Item || null;
+    } catch (error) {
+      handleDynamoDbError(error, "getTaskSubscriberByEmail");
+    }
+  },
+
   async updateSubscriberDetails(taskId: string, email: string, feedback: string, customFields: { [key: string]: string }) {
     try {
       const params = {
@@ -1661,12 +1679,13 @@ export const subscriberDb = {
   },
 
   async addEmailHistory(taskId: string, email: string, emailHistory: {
-    id: string;
     sentAt: string;
     subject: string;
     status: 'sent' | 'delivered' | 'opened' | 'clicked' | 'bounced' | 'failed';
     taskExecutionId?: string;
     htmlContentUrl?: string;
+    senderType: 'SMTP' | 'resend';
+    emailId?: string;
   }) {
     try {
       const params = {

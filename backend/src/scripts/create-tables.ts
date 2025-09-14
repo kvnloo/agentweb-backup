@@ -745,6 +745,64 @@ const createSettingsTable = async () => {
   }
 };
 
+// Create Email Events table
+const createEmailEventsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-EmailEvents`,
+    KeySchema: [
+      { AttributeName: 'eventId', KeyType: 'HASH' }
+    ],
+    AttributeDefinitions: [
+      { AttributeName: 'eventId', AttributeType: 'S' },
+      { AttributeName: 'emailId', AttributeType: 'S' },
+      { AttributeName: 'emailDomain', AttributeType: 'S' }
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'EmailIdIndex',
+        KeySchema: [
+          { AttributeName: 'emailId', KeyType: 'HASH' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5
+        }
+      },
+      {
+        IndexName: 'EmailDomainIndex',
+        KeySchema: [
+          { AttributeName: 'emailDomain', KeyType: 'HASH' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5
+        }
+      }
+    ],
+    ProvisionedThroughput: {
+      ReadCapacityUnits: 5,
+      WriteCapacityUnits: 5
+    }
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 const main = async () => {
   try {
     console.log(`Creating tables for environment: ${process.env.NODE_ENV || 'production'}`);
@@ -762,6 +820,7 @@ const main = async () => {
     await createTaskLeadListTable();
     await createAssetApprovalsTable();
     await createSettingsTable();
+    await createEmailEventsTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);

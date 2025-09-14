@@ -32,6 +32,7 @@ interface User {
   isOAuthUser?: boolean;
   stripe_customer_id?: string;
   adAccount?: string; // Meta ad account ID
+  emailDomain?: string; // Email sender domain
 }
 
 interface AdminContextType {

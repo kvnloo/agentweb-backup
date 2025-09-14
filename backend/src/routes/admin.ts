@@ -112,6 +112,27 @@ router.put("/users/:userId/ad-account", async (req, res) => {
   }
 });
 
+// Update user email domain
+router.put("/users/:userId/email-domain", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { emailDomain } = req.body;
+
+    // Check if user exists
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Update the user's email domain
+    const updatedUser = await userDb.updateUser(userId, { emailDomain });
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error updating user email domain:", error);
+    res.status(500).json({ message: "Error updating email domain" });
+  }
+});
+
 // Create delegate access token for customer portal
 router.post("/users/:userId/delegate-access", async (req, res) => {
   try {

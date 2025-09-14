@@ -34,6 +34,8 @@ export interface Task {
   requireApproval?: boolean; // Whether the task requires approval before sending results
   slackChannel?: string; // The Slack channel ID for approval requests
   sendHtmlReportOnly?: boolean; // Whether to send only HTML reports to all subscribers
+  emailSender?: string; // Email sender for this task (format: username@domain)
+  fromName?: string; // From name for this task
 }
 
 export interface TaskUpdate {
@@ -68,4 +70,6 @@ export interface TaskUpdate {
   requireApproval?: boolean; // Whether the task requires approval before sending results
   slackChannel?: string; // The Slack channel ID for approval requests
   sendHtmlReportOnly?: boolean; // Whether to send only HTML reports to all subscribers
+  emailSender?: string; // Email sender for this task (format: username@domain)
+  fromName?: string; // From name for this task
 } 

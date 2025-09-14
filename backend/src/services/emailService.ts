@@ -1,5 +1,6 @@
 import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
+import { resendService } from './resendService';
 
 dotenv.config();
 
@@ -40,7 +41,7 @@ export const emailService = {
       console.log('Email sent successfully to:', to, cc ? `CC: ${cc}` : '');
     } catch (error) {
       console.error('Error sending email:', error);
-      throw error;
+      // Don't throw - just log the error
     }
   },
 
@@ -222,7 +223,7 @@ export const emailService = {
               <div class="container">
                 ${htmlContentFromFile}
                 <div class="footer">
-                  <p>Manage task and history at: <a href="${customerFrontendUrl}/tasks/${task.taskId}">${customerFrontendUrl}/tasks/${task.taskId}</a></p>
+                  ${!task.sendHtmlReportOnly ? `<p>Manage task and history at: <a href="${customerFrontendUrl}/tasks/${task.taskId}">${customerFrontendUrl}/tasks/${task.taskId}</a></p>` : ''}
                   ${htmlContentUrl ? `<p><small><strong>Note:</strong> Some visuals may not display properly in the email. <a href="${htmlContentUrl}">View full report here</a> for the complete experience.</small></p>` : ''}
                   <hr>
                   <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>
@@ -233,21 +234,45 @@ export const emailService = {
           `;
 
           const subject = `${task.name} - ${currentDate}`;
-          const text = `Task Report: ${task.name}\n\nView the HTML report in the email body.\n\nManage task and history at: ${customerFrontendUrl}/tasks/${task.taskId}`;
+          const text = `Task Report: ${task.name}\n\nView the HTML report in the email body.${!task.sendHtmlReportOnly ? `\n\nManage task and history at: ${customerFrontendUrl}/tasks/${task.taskId}` : ''}`;
           
-          await this.sendEmail(toEmail, subject, text, simplifiedHtml);
+          // Check if task has custom email sender configured
+          let resendEmailId = null;
+          let senderType: 'SMTP' | 'resend' = 'SMTP';
+          
+          if (task.emailSender && task.fromName) {
+            // Use Resend service for custom email sender
+            const from = `${task.fromName} <${task.emailSender}>`;
+            const resendResult = await resendService.sendEmail({
+              from,
+              to: toEmail,
+              subject,
+              html: simplifiedHtml,
+              text
+            });
+            resendEmailId = resendResult?.id || null;
+            senderType = 'resend';
+            console.log(`HTML-only task execution email sent via Resend to: ${toEmail} from: ${from}`, resendEmailId ? `(ID: ${resendEmailId})` : '');
+          } else {
+            // Use default SMTP service
+            await this.sendEmail(toEmail, subject, text, simplifiedHtml);
+            senderType = 'SMTP';
+            console.log(`HTML-only task execution email sent via SMTP to: ${toEmail}`);
+          }
           
           // Add email history to subscriber
           try {
+            const sentAt = new Date().toISOString();
             await subscriberDb.addEmailHistory(execution.taskId, toEmail, {
-              id: `email_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-              sentAt: new Date().toISOString(),
+              sentAt: sentAt,
               subject: subject,
               status: 'sent',
               taskExecutionId: executionId,
-              htmlContentUrl: htmlContentUrl
+              htmlContentUrl: htmlContentUrl,
+              senderType: senderType,
+              emailId: resendEmailId || undefined
             });
-            console.log(`Added email history for subscriber: ${toEmail}`);
+            console.log(`Added email history for subscriber: ${toEmail}`, resendEmailId ? `(Resend ID: ${resendEmailId})` : '(SMTP)');
           } catch (historyError) {
             console.error(`Failed to add email history for ${toEmail}:`, historyError);
             // Don't throw error, email was sent successfully
@@ -379,7 +404,7 @@ export const emailService = {
           ` : ''}
           
           <div class="footer">
-            <p>Manage task and history at: <a href="${customerFrontendUrl}/tasks/${task.taskId}">${customerFrontendUrl}/tasks/${task.taskId}</a></p>
+            ${!task.sendHtmlReportOnly ? `<p>Manage task and history at: <a href="${customerFrontendUrl}/tasks/${task.taskId}">${customerFrontendUrl}/tasks/${task.taskId}</a></p>` : ''}
             ${htmlContentUrl ? `<p><small><strong>Note:</strong> Some visuals may not display properly in the email. <a href="${htmlContentUrl}">View full report here</a> for the complete experience.</small></p>` : ''}
             <hr>
             <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>
@@ -390,21 +415,45 @@ export const emailService = {
     `;
 
     const subject = `AgentWeb - Task Run Results: ${task.name}`;
-    const text = `Task: ${task.name}\nStatus: ${execution.status.toUpperCase()}\nManage task and history at: ${customerFrontendUrl}/tasks/${task.taskId}`;
+    const text = `Task: ${task.name}\nStatus: ${execution.status.toUpperCase()}${!task.sendHtmlReportOnly ? `\nManage task and history at: ${customerFrontendUrl}/tasks/${task.taskId}` : ''}`;
     
-    await this.sendEmail(toEmail, subject, text, html);
+    // Check if task has custom email sender configured
+    let resendEmailId = null;
+    let senderType: 'SMTP' | 'resend' = 'SMTP';
+    
+    if (task.emailSender && task.fromName) {
+      // Use Resend service for custom email sender
+      const from = `${task.fromName} <${task.emailSender}>`;
+      const resendResult = await resendService.sendEmail({
+        from,
+        to: toEmail,
+        subject,
+        html,
+        text
+      });
+      resendEmailId = resendResult?.id || null;
+      senderType = 'resend';
+      console.log(`Task execution email sent via Resend to: ${toEmail} from: ${from}`, resendEmailId ? `(ID: ${resendEmailId})` : '');
+    } else {
+      // Use default SMTP service
+      await this.sendEmail(toEmail, subject, text, html);
+      senderType = 'SMTP';
+      console.log(`Task execution email sent via SMTP to: ${toEmail}`);
+    }
     
     // Add email history to subscriber
     try {
+      const sentAt = new Date().toISOString();
       await subscriberDb.addEmailHistory(execution.taskId, toEmail, {
-        id: `email_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-        sentAt: new Date().toISOString(),
+        sentAt: sentAt,
         subject: subject,
         status: 'sent',
         taskExecutionId: executionId,
-        htmlContentUrl: htmlContentUrl
+        htmlContentUrl: htmlContentUrl,
+        senderType: senderType,
+        emailId: resendEmailId || undefined
       });
-      console.log(`Added email history for subscriber: ${toEmail}`);
+      console.log(`Added email history for subscriber: ${toEmail}`, resendEmailId ? `(Resend ID: ${resendEmailId})` : '(SMTP)');
     } catch (historyError) {
       console.error(`Failed to add email history for ${toEmail}:`, historyError);
       // Don't throw error, email was sent successfully
