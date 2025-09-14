@@ -661,6 +661,123 @@ router.get('/:taskId/subscribers/:email/email-events', authenticateToken, async 
   }
 });
 
+// Get email metrics for all subscribers in a task
+router.get('/:taskId/subscribers/metrics', authenticateToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Get task to verify ownership
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Verify task belongs to user or user is admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Get all subscribers for this task
+    const subscribers = await subscriberDb.getAllTaskSubscribers(taskId);
+    
+    if (!subscribers || subscribers.length === 0) {
+      return res.json({
+        subscribers: [],
+        events: [],
+        metrics: {
+          timeline: [],
+          totalEvents: 0,
+          eventTypes: {}
+        }
+      });
+    }
+
+    // Get email domain from task or user
+    const emailDomain = task.emailDomain || user.emailDomain;
+    
+    if (!emailDomain) {
+      return res.json({
+        subscribers,
+        events: [],
+        metrics: {
+          timeline: [],
+          totalEvents: 0,
+          eventTypes: {}
+        }
+      });
+    }
+
+    // Get all email events for this domain
+    const { emailEventsDb } = await import('../services/emailEventsDb');
+    const allEvents = await emailEventsDb.getEventsByEmailDomain(emailDomain);
+
+    // Collect all emailIds from subscribers' email history
+    const taskEmailIds = new Set<string>();
+    subscribers.forEach(subscriber => {
+      if (subscriber.emailHistory) {
+        subscriber.emailHistory.forEach((email: any) => {
+          if (email.senderType === 'resend' && email.emailId) {
+            taskEmailIds.add(email.emailId);
+          }
+        });
+      }
+    });
+
+    // Filter events to only include those with emailIds that match task subscribers' email history
+    const taskEvents = allEvents.filter(event => taskEmailIds.has(event.emailId));
+
+    // Process events into metrics data
+    const eventTypes: { [eventType: string]: number } = {};
+    const dateMap: { [date: string]: { [eventType: string]: number } } = {};
+    
+    taskEvents.forEach(event => {
+      const eventType = event.eventType;
+      const date = new Date(event.createdAt).toISOString().split('T')[0];
+      
+      // Count by event type
+      eventTypes[eventType] = (eventTypes[eventType] || 0) + 1;
+      
+      // Count by date
+      if (!dateMap[date]) {
+        dateMap[date] = {};
+      }
+      dateMap[date][eventType] = (dateMap[date][eventType] || 0) + 1;
+    });
+    
+    // Convert to timeline array
+    const timeline = Object.entries(dateMap)
+      .map(([date, events]) => ({
+        date,
+        events,
+        total: Object.values(events).reduce((sum, count) => sum + count, 0)
+      }))
+      .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+
+    res.json({
+      subscribers,
+      events: taskEvents,
+      metrics: {
+        timeline,
+        totalEvents: taskEvents.length,
+        eventTypes
+      }
+    });
+  } catch (error: any) {
+    console.error('Error fetching subscriber metrics:', error);
+    res.status(500).json({ message: 'Failed to fetch subscriber metrics' });
+  }
+});
+
 // Add subscriber to task
 router.post('/:taskId/subscribers', async (req, res) => {
   try {
