@@ -739,6 +739,7 @@ router.get('/:taskId/subscribers/metrics', authenticateToken, async (req, res) =
     // Process events into metrics data
     const eventTypes: { [eventType: string]: number } = {};
     const dateMap: { [date: string]: { [eventType: string]: number } } = {};
+    const clickedEmailsByDate: { [date: string]: string[] } = {};
     
     taskEvents.forEach(event => {
       const eventType = event.eventType;
@@ -752,15 +753,32 @@ router.get('/:taskId/subscribers/metrics', authenticateToken, async (req, res) =
         dateMap[date] = {};
       }
       dateMap[date][eventType] = (dateMap[date][eventType] || 0) + 1;
+      
+      // Collect clicked email addresses by date
+      if (eventType === 'email.clicked' && event.data && event.data.to) {
+        if (!clickedEmailsByDate[date]) {
+          clickedEmailsByDate[date] = [];
+        }
+        const emails = Array.isArray(event.data.to) ? event.data.to : [event.data.to];
+        clickedEmailsByDate[date].push(...emails);
+      }
     });
     
     // Convert to timeline array
     const timeline = Object.entries(dateMap)
-      .map(([date, events]) => ({
-        date,
-        events,
-        total: Object.values(events).reduce((sum, count) => sum + count, 0)
-      }))
+      .map(([date, events]) => {
+        // Get unique clicked emails for this date
+        const clickedEmails = clickedEmailsByDate[date] 
+          ? [...new Set(clickedEmailsByDate[date])] // Remove duplicates
+          : [];
+        
+        return {
+          date,
+          events,
+          total: Object.values(events).reduce((sum, count) => sum + count, 0),
+          clickedEmails
+        };
+      })
       .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
     res.json({
