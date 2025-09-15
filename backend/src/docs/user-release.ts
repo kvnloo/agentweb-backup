@@ -9,6 +9,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2025-09-15',
     changes: [
+      'Improved Report Revision to Realtime',
+      '- Report revisions now process instantly in the backend instead of waiting for agent-engine startup',
+      '- Enhanced revision workflow with proper Slack approval integration when "Require Approval" is enabled',
+    ],
+  },
+  {
+    date: '2025-09-15',
+    changes: [
       'Improved scalable email sending with delay, retry and more detailed engagement data',
       '- Implemented retry strategy with exponential backoff for 429 errors (3 attempts max)',
       '- Enhanced Email Metrics with detailed engagement tracking per date',
