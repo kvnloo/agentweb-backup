@@ -1290,28 +1290,70 @@ export const createRevisionExecution = async (req: AuthRequest, res: Response) =
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    // Create a new task execution with revision prompt
-    const execution = {
-      executionId: Date.now().toString(),
-      taskId,
-      userId: task.userId, // Use the task owner's ID for execution
-      run_user_id: userId !== task.userId ? userId : undefined, // Record who actually ran the task if different from owner
-      status: 'pending',
-      startTime: new Date().toISOString(),
-      revision_prompt: revision_prompt,
-      original_image_url: image_url || undefined,
-      original_report_url: report_url || undefined,
-      original_execution_id: original_execution_id,
-      variations: variations || 1
-    };
+    // Check if this is a report revision (has report_url but no image_url)
+    const isReportRevision = report_url && !image_url;
 
-    await taskDb.createTaskExecution(execution);
-    res.status(201).json({ success: true, execution });
+    if (isReportRevision) {
+      // Use backend revision for HTML reports
+      const revisionExecution = {
+        executionId: Date.now().toString(),
+        taskId,
+        userId: task.userId,
+        run_user_id: userId !== task.userId ? userId : undefined,
+        status: 'running',
+        startTime: new Date().toISOString(),
+        revision_prompt: revision_prompt,
+        original_report_url: report_url,
+        original_execution_id: original_execution_id,
+        revision_type: 'backend_ai'
+      };
+
+      await taskDb.createTaskExecution(revisionExecution);
+
+      // Import the report revision service
+      const { reportRevisionService } = await import('../services/reportRevisionService');
+
+      // Start the revision process asynchronously
+      reportRevisionService.createReportRevision(
+        taskId,
+        revisionExecution.executionId,
+        report_url,
+        revision_prompt,
+        userId
+      ).catch(error => {
+        console.error('Error in background report revision:', error);
+      });
+
+      res.status(201).json({ 
+        success: true, 
+        execution: revisionExecution,
+        message: 'Report revision started. The revision will be processed in the background.'
+      });
+    } else {
+      // Use agent-engine for image revisions (original behavior)
+      const execution = {
+        executionId: Date.now().toString(),
+        taskId,
+        userId: task.userId, // Use the task owner's ID for execution
+        run_user_id: userId !== task.userId ? userId : undefined, // Record who actually ran the task if different from owner
+        status: 'pending',
+        startTime: new Date().toISOString(),
+        revision_prompt: revision_prompt,
+        original_image_url: image_url || undefined,
+        original_report_url: report_url || undefined,
+        original_execution_id: original_execution_id,
+        variations: variations || 1
+      };
+
+      await taskDb.createTaskExecution(execution);
+      res.status(201).json({ success: true, execution });
+    }
   } catch (error) {
     console.error('Error creating revision execution:', error);
     res.status(500).json({ message: 'Error creating revision execution' });
   }
 };
+
 
 // Function that can be called from Slack without Express request/response objects
 export const createRevisionExecutionFromSlack = async (
@@ -1338,38 +1380,92 @@ export const createRevisionExecutionFromSlack = async (
       throw new Error('Task not found');
     }
 
-    // Create a new task execution with revision prompt
-    const execution = {
-      executionId: Date.now().toString(),
-      taskId,
-      userId: task.userId, // Use the task owner's ID for execution
-      run_user_id: runUserId, // Record who provided the feedback
-      status: 'pending',
-      startTime: new Date().toISOString(),
-      revision_prompt: revisionPrompt,
-      original_image_url: assetType === 'image' ? assetUrl : undefined,
-      original_report_url: assetType === 'html' ? assetUrl : undefined,
-      original_execution_id: originalExecutionId,
-      variations: variations,
-      // Add Slack channel info for agent-engine to use
-      slack_channel: slackChannel,
-      slack_channel_name: slackChannelName,
-      requireApproval: true,  // Revision executions always require approval
-      approvalAssetType: assetType  // Record the asset type that was approved/rejected
-    };
+    // Check if this is a report revision (html asset type)
+    const isReportRevision = assetType === 'html';
 
-    await taskDb.createTaskExecution(execution);
+    if (isReportRevision) {
+      // Use backend revision for HTML reports
+      const revisionExecution = {
+        executionId: Date.now().toString(),
+        taskId,
+        userId: task.userId,
+        run_user_id: runUserId,
+        status: 'running',
+        startTime: new Date().toISOString(),
+        revision_prompt: revisionPrompt,
+        original_report_url: assetUrl,
+        original_execution_id: originalExecutionId,
+        revision_type: 'backend_ai',
+        slack_channel: slackChannel,
+        slack_channel_name: slackChannelName,
+        requireApproval: true,
+        approvalAssetType: assetType
+      };
 
-    // Update the approval status to 'revision_submitted' to indicate revision is in progress
-    const { approvalDb } = await import('../services/approvalDb');
-    await approvalDb.updateApprovalStatus(
-      assetUrl,
-      'revision_submitted',
-      runUserId,
-      `Revision execution ${execution.executionId} started based on feedback: ${revisionPrompt}`
-    );
+      await taskDb.createTaskExecution(revisionExecution);
 
-    return { success: true, execution };
+      // Import the report revision service
+      const { reportRevisionService } = await import('../services/reportRevisionService');
+
+      // Start the revision process asynchronously
+      reportRevisionService.createReportRevision(
+        taskId,
+        revisionExecution.executionId,
+        assetUrl,
+        revisionPrompt,
+        runUserId
+      ).catch(error => {
+        console.error('Error in background report revision from Slack:', error);
+      });
+
+      // Update the approval status to 'revision_submitted' to indicate revision is in progress
+      const { approvalDb } = await import('../services/approvalDb');
+      await approvalDb.updateApprovalStatus(
+        originalExecutionId,
+        'revision_submitted',
+        runUserId,
+        revisionExecution.executionId
+      );
+
+      return { 
+        success: true, 
+        execution: revisionExecution,
+        message: 'Report revision started. The revision will be processed in the background.'
+      };
+    } else {
+      // Use agent-engine for image revisions (original behavior)
+      const execution = {
+        executionId: Date.now().toString(),
+        taskId,
+        userId: task.userId, // Use the task owner's ID for execution
+        run_user_id: runUserId, // Record who provided the feedback
+        status: 'pending',
+        startTime: new Date().toISOString(),
+        revision_prompt: revisionPrompt,
+        original_image_url: assetUrl,
+        original_report_url: undefined,
+        original_execution_id: originalExecutionId,
+        variations: variations,
+        // Add Slack channel info for agent-engine to use
+        slack_channel: slackChannel,
+        slack_channel_name: slackChannelName,
+        requireApproval: true,  // Revision executions always require approval
+        approvalAssetType: assetType  // Record the asset type that was approved/rejected
+      };
+
+      await taskDb.createTaskExecution(execution);
+
+      // Update the approval status to 'revision_submitted' to indicate revision is in progress
+      const { approvalDb } = await import('../services/approvalDb');
+      await approvalDb.updateApprovalStatus(
+        originalExecutionId,
+        'revision_submitted',
+        runUserId,
+        `Revision execution ${execution.executionId} started based on feedback: ${revisionPrompt}`
+      );
+
+      return { success: true, execution };
+    }
   } catch (error) {
     console.error('Error creating revision execution from Slack:', error);
     throw error;
