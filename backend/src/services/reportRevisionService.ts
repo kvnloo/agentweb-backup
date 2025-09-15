@@ -1,0 +1,328 @@
+import AWS from 'aws-sdk';
+import { taskDb } from './db';
+import OpenAI from 'openai';
+import axios from 'axios';
+
+// Configure AWS SDK
+AWS.config.update({
+  region: process.env.AWS_REGION || "us-west-2",
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
+  },
+});
+
+const dynamodb = new AWS.DynamoDB.DocumentClient();
+const TABLE_PREFIX = process.env.NODE_ENV === 'production' ? '' : 'Dev-';
+
+export class ReportRevisionService {
+  private s3: AWS.S3;
+  private openai: OpenAI;
+
+  constructor() {
+    this.s3 = new AWS.S3({
+      region: process.env.AWS_REGION || 'us-west-2',
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    });
+
+    this.openai = new OpenAI({
+      apiKey: process.env.AZURE_OPENAI_API_KEY,
+      baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2'}`,
+      defaultQuery: {
+        "api-version": process.env.AZURE_OPENAI_API_VERSION_AGENT_MODE || "2025-01-01-preview",
+      },
+      defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
+    });
+  }
+
+  /**
+   * Create a revision of an HTML report using backend AI
+   */
+  async createReportRevision(
+    taskId: string,
+    executionId: string,
+    originalReportUrl: string,
+    revisionPrompt: string,
+    userId: string
+  ): Promise<{ success: boolean; resultFile?: any; error?: string }> {
+    try {
+      console.log(`Creating report revision for task ${taskId}, execution ${executionId}`);
+
+      // Execution is already set to 'running' status, no need to update
+
+      // Download the original report
+      const originalReport = await this.fetchContentFromUrl(originalReportUrl);
+      if (!originalReport) {
+        throw new Error('Failed to download original report');
+      }
+
+      // Generate the revised report using AI
+      const { revisedContent, resultFile } = await this.generateRevisedReport(
+        originalReport, 
+        revisionPrompt, 
+        taskId, 
+        executionId
+      );
+
+      // Update execution with completion status and result files (using direct DynamoDB update)
+      await this.updateExecutionDirect(executionId, {
+        status: 'completed',
+        completedAt: new Date().toISOString(),
+        result_files: [resultFile]
+      });
+
+      console.log(`Report revision completed successfully for execution ${executionId}`);
+      return { success: true, resultFile };
+
+    } catch (error) {
+      console.error('Error creating report revision:', error);
+      
+      // Update execution status to failed (using direct DynamoDB update)
+      await this.updateExecutionDirect(executionId, {
+        status: 'failed',
+        completedAt: new Date().toISOString(),
+        error: error instanceof Error ? error.message : 'Unknown error'
+      });
+
+      return { 
+        success: false, 
+        error: error instanceof Error ? error.message : 'Unknown error' 
+      };
+    }
+  }
+
+  /**
+   * Update task execution using direct DynamoDB update (following agent-engine pattern)
+   */
+  private async updateExecutionDirect(executionId: string, updates: any): Promise<void> {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
+        Key: { executionId },
+        UpdateExpression: `SET ${Object.keys(updates).map(key => `#${key} = :${key}`).join(', ')}`,
+        ExpressionAttributeNames: Object.keys(updates).reduce((acc, key) => ({ ...acc, [`#${key}`]: key }), {}),
+        ExpressionAttributeValues: Object.entries(updates).reduce((acc, [key, value]) => ({ ...acc, [`:${key}`]: value }), {}),
+        ReturnValues: "ALL_NEW"
+      };
+
+      await dynamodb.update(params).promise();
+      console.log(`✅ Updated execution ${executionId} with:`, Object.keys(updates));
+    } catch (error) {
+      console.error(`❌ Error updating execution ${executionId}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Fetch content from URL using axios (similar to filesController.getFileContent)
+   */
+  private async fetchContentFromUrl(url: string): Promise<string | null> {
+    try {
+      console.log(`🔽 Fetching content from URL: ${url}`);
+
+      const response = await axios.get(url, {
+        timeout: 15000, // 15 seconds timeout
+        responseType: 'text',
+        headers: {
+          'User-Agent': 'AgentWeb-Backend/1.0',
+        },
+      });
+
+      const content = response.data as string;
+      console.log(`✅ Successfully fetched content, length: ${content.length}`);
+
+      return content;
+    } catch (error: any) {
+      console.error(`❌ Error fetching content from URL: ${url}`, error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Function to handle write_revised_report call
+   */
+  private async handleWriteRevisedReport(
+    revisedContent: string,
+    filename: string,
+    taskId: string,
+    executionId: string
+  ): Promise<any> {
+    return await this.uploadRevisedReport(taskId, executionId, revisedContent, filename);
+  }
+
+  /**
+   * Generate revised report using AI with function calls
+   */
+  private async generateRevisedReport(
+    originalReport: string,
+    revisionPrompt: string,
+    taskId: string,
+    executionId: string
+  ): Promise<{ revisedContent: string; resultFile: any }> {
+    const systemPrompt = `You are an expert web developer and content editor. You will be given an HTML report and revision instructions. 
+    Your task is to revise the report according to the instructions, which may include content changes, style modifications, or both.
+    
+    Guidelines:
+    - Follow the revision instructions exactly - they may ask for content changes, style changes, etc.
+    - Maintain professional formatting and readability
+    - Preserve data tables, charts, and structured content unless specifically asked to modify them
+    - Keep the overall HTML structure intact unless specifically asked to change it
+    - If adding new styles, use appropriate CSS classes or inline styles
+    - Ensure any new styles are consistent with the existing design
+    
+    You MUST use the write_revised_report function to provide the complete revised HTML report with a filename.`;
+
+    const userPrompt = `Please revise the HTML report according to these instructions: ${revisionPrompt}
+
+    Original HTML Report:
+    \`\`\`html
+    ${originalReport}
+    \`\`\`
+
+    You MUST use the write_revised_report function to provide the complete revised HTML report with a filename.`;
+
+    const tools = [
+      {
+        type: 'function' as const,
+        function: {
+          name: 'write_revised_report',
+          description: 'Write the revised HTML report content and upload it',
+          parameters: {
+            type: 'object',
+            properties: {
+              revised_content: {
+                type: 'string',
+                description: 'The complete revised HTML report content'
+              },
+              filename: {
+                type: 'string',
+                description: 'The filename for the revised report (e.g., revised_report.html)'
+              }
+            },
+            required: ['revised_content', 'filename']
+          }
+        }
+      }
+    ];
+
+    // Build messages array for conversation
+    const messages: any[] = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt }
+    ];
+
+    // Retry up to 3 times
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        console.log(`Attempt ${attempt} to generate revised report...`);
+
+        const response = await this.openai.chat.completions.create({
+          model: process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
+          messages,
+          tools,
+          tool_choice: 'required', // Force the AI to use the function
+          temperature: 0.7
+        });
+
+        const responseMessage = response.choices[0].message;
+        
+        // Handle function calls
+        if (responseMessage.tool_calls) {
+          for (const toolCall of responseMessage.tool_calls) {
+            if (toolCall.function.name === 'write_revised_report') {
+              const args = JSON.parse(toolCall.function.arguments);
+              const revisedContent = args.revised_content;
+              const filename = args.filename;
+              
+              if (!revisedContent || !filename) {
+                throw new Error('No revised content or filename generated by AI');
+              }
+
+              // Upload the revised report to S3 and get the result file
+              const resultFile = await this.handleWriteRevisedReport(
+                revisedContent,
+                filename,
+                taskId,
+                executionId
+              );
+
+              console.log(`Successfully generated revised report on attempt ${attempt}`);
+              return { revisedContent, resultFile };
+            }
+          }
+        }
+
+        // If we get here, the AI didn't call the function properly
+        // Add the AI's response and retry message to the conversation
+        messages.push(responseMessage as any);
+        messages.push({
+          role: 'user',
+          content: 'Please try again. You MUST call the write_revised_report function with both revised_content and filename parameters.'
+        });
+
+      } catch (error) {
+        console.error(`Attempt ${attempt} failed:`, error);
+        
+        if (attempt === 3) {
+          // Last attempt failed, throw the error
+          throw new Error(`Failed to generate revised report after 3 attempts. Last error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+      }
+    }
+
+    // This should never be reached due to the throw in the loop, but TypeScript needs it
+    throw new Error('Unexpected error in retry loop');
+  }
+
+  /**
+   * Upload the revised report to S3
+   */
+  private async uploadRevisedReport(
+    taskId: string,
+    executionId: string,
+    revisedContent: string,
+    filename: string
+  ): Promise<any> {
+    try {
+      // Generate a random token for the S3 path
+      const randomToken = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+
+      const s3Key = `tasks/${taskId}/executions/${executionId}/revisions/${randomToken}/${filename}`;
+
+      // Upload to S3 (matching agent-engine format)
+      await this.s3.putObject({
+        Bucket: process.env.AWS_S3_BUCKET || 'agentweb-user-files',
+        Key: s3Key,
+        Body: revisedContent,
+        ContentType: 'text/html; charset=utf-8',
+        ContentDisposition: `inline; filename="${filename}"`
+      }).promise();
+
+      // Generate the public URL
+      const url = `https://${process.env.AWS_S3_BUCKET || 'agentweb-user-files'}.s3.${process.env.AWS_REGION || 'us-west-2'}.amazonaws.com/${s3Key}`;
+
+      // Return result file object (matching agent-engine format)
+      return {
+        url,
+        filename,
+        token: randomToken,
+        is_html: true,
+        view_type: 'html',
+        revision_info: {
+          original_execution_id: executionId,
+          revised_at: new Date().toISOString(),
+          revision_type: 'backend_ai'
+        }
+      };
+
+    } catch (error) {
+      console.error('Error uploading revised report:', error);
+      throw error;
+    }
+  }
+}
+
+export const reportRevisionService = new ReportRevisionService();
