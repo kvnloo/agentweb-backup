@@ -4,6 +4,8 @@ import { getSecret } from '../utils/secretsManager';
 class ResendService {
   private resend: Resend | null = null;
   private apiKey: string | null = null;
+  private readonly MAX_RETRIES = 3;
+  private readonly BASE_DELAY = 1000; // 1 second base delay
 
   private async initializeResend() {
     if (this.resend) return;
@@ -28,6 +30,43 @@ class ResendService {
     }
   }
 
+  private async sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  private isRateLimitError(error: any): boolean {
+    return error?.statusCode === 429 || 
+           error?.message?.includes('rate_limit_exceeded') ||
+           error?.message?.includes('Too many requests');
+  }
+
+  private async retryWithBackoff<T>(
+    operation: () => Promise<T>,
+    operationName: string
+  ): Promise<T | null> {
+    let lastError: any;
+    
+    for (let attempt = 1; attempt <= this.MAX_RETRIES; attempt++) {
+      try {
+        return await operation();
+      } catch (error: any) {
+        lastError = error;
+        
+        if (this.isRateLimitError(error) && attempt < this.MAX_RETRIES) {
+          const delay = this.BASE_DELAY * Math.pow(2, attempt - 1); // Exponential backoff
+          console.log(`${operationName} failed with rate limit (attempt ${attempt}/${this.MAX_RETRIES}), retrying in ${delay}ms...`);
+          await this.sleep(delay);
+        } else {
+          console.error(`${operationName} failed on attempt ${attempt}:`, error);
+          break;
+        }
+      }
+    }
+    
+    console.error(`${operationName} failed after ${this.MAX_RETRIES} attempts:`, lastError);
+    return null;
+  }
+
   async sendEmail({
     from,
     to,
@@ -41,41 +80,54 @@ class ResendService {
     html?: string;
     text?: string;
   }) {
-    try {
-      await this.initializeResend();
-      
-      if (!this.resend) {
-        console.error('Resend service not initialized');
-        return;
-      }
-
-      const emailOptions: any = {
-        from,
-        to: Array.isArray(to) ? to : [to],
-        subject
-      };
-
-      // Add content based on what's provided
-      if (html) {
-        emailOptions.html = html;
-      }
-      if (text) {
-        emailOptions.text = text;
-      }
-
-      const { data, error } = await this.resend.emails.send(emailOptions);
-
-      if (error) {
-        console.error('Resend email error:', error);
-        return;
-      }
-
-      console.log('Resend email sent successfully:', data);
-      return data;
-    } catch (error) {
-      console.error('Error sending email via Resend:', error);
-      // Don't throw - just log the error
+    await this.initializeResend();
+    
+    if (!this.resend) {
+      console.error('Resend service not initialized');
+      return;
     }
+
+    const emailOptions: any = {
+      from,
+      to: Array.isArray(to) ? to : [to],
+      subject
+    };
+
+    // Add content based on what's provided
+    if (html) {
+      emailOptions.html = html;
+    }
+    if (text) {
+      emailOptions.text = text;
+    }
+
+    const recipient = Array.isArray(to) ? to.join(', ') : to;
+    console.log(`Sending Resend email to: ${recipient}`);
+
+    // Add 500ms delay before attempting to send to minimize rate limit hits
+    console.log(`Waiting 500ms before sending email to ${recipient}...`);
+    await this.sleep(500);
+
+    const result = await this.retryWithBackoff(
+      async () => {
+        const { data, error } = await this.resend!.emails.send(emailOptions);
+        
+        if (error) {
+          throw new Error(`Resend API error: ${JSON.stringify(error)}`);
+        }
+        
+        return data;
+      },
+      `Email send to ${recipient}`
+    );
+
+    if (result) {
+      console.log('Resend email sent successfully:', result);
+    } else {
+      console.error(`Failed to send email to ${recipient} after ${this.MAX_RETRIES} attempts`);
+    }
+
+    return result;
   }
 
 }

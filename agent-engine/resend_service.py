@@ -2,6 +2,7 @@
 import os
 import resend
 import logging
+import time
 from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,10 @@ class ResendService:
             return None
         
         try:
+            # Add 500ms delay before sending to minimize rate limit hits
+            logger.info(f"Waiting 500ms before sending email to {to_email}...")
+            time.sleep(0.5)  # 500ms delay
+            
             params = {
                 "from": from_email,
                 "to": [to_email],
