@@ -1294,7 +1294,7 @@ export const createRevisionExecution = async (req: AuthRequest, res: Response) =
     const isReportRevision = report_url && !image_url;
 
     if (isReportRevision) {
-      // Use backend revision for HTML reports
+      // Use backend revision for HTML reports - process synchronously
       const revisionExecution = {
         executionId: Date.now().toString(),
         taskId,
@@ -1305,30 +1305,75 @@ export const createRevisionExecution = async (req: AuthRequest, res: Response) =
         revision_prompt: revision_prompt,
         original_report_url: report_url,
         original_execution_id: original_execution_id,
-        revision_type: 'backend_ai'
+        revision_type: 'backend_ai',
+        requireApproval: task.requireApproval || false,
+        slack_channel: task.slackChannel || null
       };
 
       await taskDb.createTaskExecution(revisionExecution);
 
-      // Import the report revision service
-      const { reportRevisionService } = await import('../services/reportRevisionService');
+      try {
+        // Import the report revision service
+        const { reportRevisionService } = await import('../services/reportRevisionService');
 
-      // Start the revision process asynchronously
-      reportRevisionService.createReportRevision(
-        taskId,
-        revisionExecution.executionId,
-        report_url,
-        revision_prompt,
-        userId
-      ).catch(error => {
-        console.error('Error in background report revision:', error);
-      });
+        // Process the revision synchronously
+        const revisionResult = await reportRevisionService.createReportRevision(
+          taskId,
+          revisionExecution.executionId,
+          report_url,
+          revision_prompt,
+          userId
+        );
 
-      res.status(201).json({ 
-        success: true, 
-        execution: revisionExecution,
-        message: 'Report revision started. The revision will be processed in the background.'
-      });
+        if (revisionResult.success) {
+          // Update the execution with the completed result
+          const completedExecution = {
+            ...revisionExecution,
+            status: 'completed',
+            completedAt: new Date().toISOString(),
+            result_files: revisionResult.resultFile ? [revisionResult.resultFile] : []
+          };
+
+          res.status(201).json({ 
+            success: true, 
+            execution: completedExecution,
+            message: 'Report revision completed successfully.',
+            resultFile: revisionResult.resultFile
+          });
+        } else {
+          // Update the execution with the failed result
+          const failedExecution = {
+            ...revisionExecution,
+            status: 'failed',
+            completedAt: new Date().toISOString(),
+            error: revisionResult.error || 'Unknown error'
+          };
+
+          res.status(500).json({ 
+            success: false, 
+            execution: failedExecution,
+            message: 'Report revision failed.',
+            error: revisionResult.error
+          });
+        }
+      } catch (error) {
+        console.error('Error in synchronous report revision:', error);
+        
+        // Update the execution with the error
+        const errorExecution = {
+          ...revisionExecution,
+          status: 'failed',
+          completedAt: new Date().toISOString(),
+          error: error instanceof Error ? error.message : 'Unknown error'
+        };
+
+        res.status(500).json({ 
+          success: false, 
+          execution: errorExecution,
+          message: 'Report revision failed.',
+          error: error instanceof Error ? error.message : 'Unknown error'
+        });
+      }
     } else {
       // Use agent-engine for image revisions (original behavior)
       const execution = {
@@ -1419,13 +1464,23 @@ export const createRevisionExecutionFromSlack = async (
       });
 
       // Update the approval status to 'revision_submitted' to indicate revision is in progress
-      const { approvalDb } = await import('../services/approvalDb');
-      await approvalDb.updateApprovalStatus(
-        originalExecutionId,
-        'revision_submitted',
-        runUserId,
-        revisionExecution.executionId
-      );
+      try {
+        const { approvalDb } = await import('../services/approvalDb');
+        // Get the original execution to find the asset URL
+        const originalExecution = await taskDb.getTaskExecutionById(originalExecutionId);
+        if (originalExecution && originalExecution.result_files && originalExecution.result_files.length > 0) {
+          const originalAssetUrl = originalExecution.result_files[0].url;
+          await approvalDb.updateApprovalStatus(
+            originalAssetUrl,
+            'revision_submitted',
+            runUserId,
+            `Revision execution ${revisionExecution.executionId} started based on feedback: ${revisionPrompt}`
+          );
+        }
+      } catch (error) {
+        console.error('Error updating original approval status:', error);
+        // Don't fail the revision if approval update fails
+      }
 
       return { 
         success: true, 
@@ -1456,13 +1511,23 @@ export const createRevisionExecutionFromSlack = async (
       await taskDb.createTaskExecution(execution);
 
       // Update the approval status to 'revision_submitted' to indicate revision is in progress
-      const { approvalDb } = await import('../services/approvalDb');
-      await approvalDb.updateApprovalStatus(
-        originalExecutionId,
-        'revision_submitted',
-        runUserId,
-        `Revision execution ${execution.executionId} started based on feedback: ${revisionPrompt}`
-      );
+      try {
+        const { approvalDb } = await import('../services/approvalDb');
+        // Get the original execution to find the asset URL
+        const originalExecution = await taskDb.getTaskExecutionById(originalExecutionId);
+        if (originalExecution && originalExecution.result_files && originalExecution.result_files.length > 0) {
+          const originalAssetUrl = originalExecution.result_files[0].url;
+          await approvalDb.updateApprovalStatus(
+            originalAssetUrl,
+            'revision_submitted',
+            runUserId,
+            `Revision execution ${execution.executionId} started based on feedback: ${revisionPrompt}`
+          );
+        }
+      } catch (error) {
+        console.error('Error updating original approval status:', error);
+        // Don't fail the revision if approval update fails
+      }
 
       return { success: true, execution };
     }

@@ -72,6 +72,9 @@ export class ReportRevisionService {
         result_files: [resultFile]
       });
 
+      // Check if approval is required and send Slack approval request
+      await this.handleApprovalIfRequired(taskId, executionId, resultFile, userId);
+
       console.log(`Report revision completed successfully for execution ${executionId}`);
       return { success: true, resultFile };
 
@@ -111,6 +114,60 @@ export class ReportRevisionService {
     } catch (error) {
       console.error(`❌ Error updating execution ${executionId}:`, error);
       throw error;
+    }
+  }
+
+
+  /**
+   * Handle approval request if required
+   */
+  private async handleApprovalIfRequired(
+    taskId: string, 
+    executionId: string, 
+    resultFile: any, 
+    userId: string
+  ): Promise<void> {
+    try {
+      // Get the execution record to check if approval is required
+      const execution = await taskDb.getTaskExecutionById(executionId);
+      if (!execution) {
+        console.log(`Execution ${executionId} not found, skipping approval check`);
+        return;
+      }
+
+      // Check if approval is required
+      const requiresApproval = execution.requireApproval;
+      const slackChannel = execution.slack_channel;
+      
+      if (!requiresApproval || !slackChannel) {
+        console.log(`No approval required for execution ${executionId} (requireApproval: ${requiresApproval}, slackChannel: ${slackChannel})`);
+        return;
+      }
+
+      console.log(`Sending approval request for execution ${executionId} to channel ${slackChannel}`);
+
+      // Import the Slack service
+      const { sendApprovalRequestWithTracking } = await import('./slackService');
+
+      // Ensure filename has .html extension for proper asset type detection
+      const filename = resultFile.filename.endsWith('.html') ? resultFile.filename : `${resultFile.filename}.html`;
+
+      // Send approval request with database tracking
+      // Use the task owner's user ID (from execution.userId) instead of the revision initiator
+      await sendApprovalRequestWithTracking({
+        executionId,
+        imageUrl: resultFile.url,
+        filename: filename,
+        assetType: 'html', // Report revisions are always HTML
+        userId: execution.userId, // Use task owner's user ID, not the revision initiator
+        channel: slackChannel,
+        note: `A revised HTML report has been generated. Please review and approve. Once approved, results will be automatically sent to all task subscribers.`
+      });
+
+      console.log(`Approval request sent successfully for execution ${executionId}`);
+    } catch (error) {
+      console.error(`Error sending approval request for execution ${executionId}:`, error);
+      // Don't throw error - approval failure shouldn't break the revision process
     }
   }
 
