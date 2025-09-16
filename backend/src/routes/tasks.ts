@@ -697,7 +697,8 @@ router.get('/:taskId/subscribers/metrics', authenticateToken, async (req, res) =
         metrics: {
           timeline: [],
           totalEvents: 0,
-          eventTypes: {}
+          eventTypes: {},
+          subjectMetrics: {}
         }
       });
     }
@@ -712,7 +713,8 @@ router.get('/:taskId/subscribers/metrics', authenticateToken, async (req, res) =
         metrics: {
           timeline: [],
           totalEvents: 0,
-          eventTypes: {}
+          eventTypes: {},
+          subjectMetrics: {}
         }
       });
     }
@@ -734,16 +736,62 @@ router.get('/:taskId/subscribers/metrics', authenticateToken, async (req, res) =
     });
 
     // Filter events to only include those with emailIds that match task subscribers' email history
+    // Only process Resend events since SMTP emails don't have webhook events
     const taskEvents = allEvents.filter(event => taskEmailIds.has(event.emailId));
 
     // Process events into metrics data
     const eventTypes: { [eventType: string]: number } = {};
     const dateMap: { [date: string]: { [eventType: string]: number } } = {};
     const clickedEmailsByDate: { [date: string]: string[] } = {};
+    // Track unique recipients by subject for delivered, opened, clicked
+    const subjectDeliveredRecipients: { [subject: string]: Set<string> } = {};
+    const subjectOpenedRecipients: { [subject: string]: Set<string> } = {};
+    const subjectClickedRecipients: { [subject: string]: Set<string> } = {};
+    
+    // Group metrics by email subject
+    const subjectMetrics: { [subject: string]: {
+      sent: number;
+      delivered: number;
+      opened: number;
+      clicked: number;
+      bounced: number;
+      failed: number;
+      openRate: number;
+      clickThroughRate: number;
+      engagedEmails: string[];
+    } } = {};
+    
+    // Create a map of emailId to subject for quick lookup
+    const emailIdToSubject: { [emailId: string]: string } = {};
+    subscribers.forEach(subscriber => {
+      if (subscriber.emailHistory) {
+        subscriber.emailHistory.forEach((email: any) => {
+          if (email.emailId && email.subject) {
+            emailIdToSubject[email.emailId] = email.subject;
+          }
+        });
+      }
+    });
     
     taskEvents.forEach(event => {
       const eventType = event.eventType;
       const date = new Date(event.createdAt).toISOString().split('T')[0];
+      const subject = emailIdToSubject[event.emailId] || 'Unknown Subject';
+      
+      // Initialize subject metrics if not exists
+      if (!subjectMetrics[subject]) {
+        subjectMetrics[subject] = {
+          sent: 0,
+          delivered: 0,
+          opened: 0,
+          clicked: 0,
+          bounced: 0,
+          failed: 0,
+          openRate: 0,
+          clickThroughRate: 0,
+          engagedEmails: []
+        };
+      }
       
       // Count by event type
       eventTypes[eventType] = (eventTypes[eventType] || 0) + 1;
@@ -754,6 +802,52 @@ router.get('/:taskId/subscribers/metrics', authenticateToken, async (req, res) =
       }
       dateMap[date][eventType] = (dateMap[date][eventType] || 0) + 1;
       
+      // Count by subject
+      if (eventType === 'email.delivered') {
+        // Unique delivered recipients per subject
+        if (event.data && event.data.to) {
+          const emails = Array.isArray(event.data.to) ? event.data.to : [event.data.to];
+          if (!subjectDeliveredRecipients[subject]) subjectDeliveredRecipients[subject] = new Set<string>();
+          emails.forEach(email => subjectDeliveredRecipients[subject].add(email));
+        }
+      } else if (eventType === 'email.opened') {
+        // Unique opened recipients per subject
+        if (event.data && event.data.to) {
+          const emails = Array.isArray(event.data.to) ? event.data.to : [event.data.to];
+          if (!subjectOpenedRecipients[subject]) subjectOpenedRecipients[subject] = new Set<string>();
+          emails.forEach(email => subjectOpenedRecipients[subject].add(email));
+        }
+        // Add email to engaged list if not already present
+        if (event.data && event.data.to) {
+          const emails = Array.isArray(event.data.to) ? event.data.to : [event.data.to];
+          emails.forEach(email => {
+            if (!subjectMetrics[subject].engagedEmails.includes(email)) {
+              subjectMetrics[subject].engagedEmails.push(email);
+            }
+          });
+        }
+      } else if (eventType === 'email.clicked') {
+        // Unique clicked recipients per subject
+        if (event.data && event.data.to) {
+          const emails = Array.isArray(event.data.to) ? event.data.to : [event.data.to];
+          if (!subjectClickedRecipients[subject]) subjectClickedRecipients[subject] = new Set<string>();
+          emails.forEach(email => subjectClickedRecipients[subject].add(email));
+        }
+        // Add email to engaged list if not already present
+        if (event.data && event.data.to) {
+          const emails = Array.isArray(event.data.to) ? event.data.to : [event.data.to];
+          emails.forEach(email => {
+            if (!subjectMetrics[subject].engagedEmails.includes(email)) {
+              subjectMetrics[subject].engagedEmails.push(email);
+            }
+          });
+        }
+      } else if (eventType === 'email.bounced') {
+        subjectMetrics[subject].bounced++;
+      } else if (eventType === 'email.complained') {
+        subjectMetrics[subject].failed++;
+      }
+      
       // Collect clicked email addresses by date
       if (eventType === 'email.clicked' && event.data && event.data.to) {
         if (!clickedEmailsByDate[date]) {
@@ -762,6 +856,51 @@ router.get('/:taskId/subscribers/metrics', authenticateToken, async (req, res) =
         const emails = Array.isArray(event.data.to) ? event.data.to : [event.data.to];
         clickedEmailsByDate[date].push(...emails);
       }
+    });
+    
+    // After processing events, set unique counts per subject for delivered/opened/clicked
+    Object.keys(subjectMetrics).forEach(subject => {
+      const deliveredCount = subjectDeliveredRecipients[subject]?.size || 0;
+      const openedCount = subjectOpenedRecipients[subject]?.size || 0;
+      const clickedCount = subjectClickedRecipients[subject]?.size || 0;
+      subjectMetrics[subject].delivered = deliveredCount;
+      subjectMetrics[subject].opened = openedCount;
+      subjectMetrics[subject].clicked = clickedCount;
+    });
+
+    // Calculate sent emails by subject (from email history)
+    subscribers.forEach(subscriber => {
+      if (subscriber.emailHistory) {
+        subscriber.emailHistory.forEach((email: any) => {
+          if (email.subject) {
+            if (!subjectMetrics[email.subject]) {
+              subjectMetrics[email.subject] = {
+                sent: 0,
+                delivered: 0,
+                opened: 0,
+                clicked: 0,
+                bounced: 0,
+                failed: 0,
+                openRate: 0,
+                clickThroughRate: 0,
+                engagedEmails: []
+              };
+            }
+            subjectMetrics[email.subject].sent++;
+          }
+        });
+      }
+    });
+
+    // Debug logging
+    console.log('Subject metrics after processing:', Object.keys(subjectMetrics).length, 'subjects found');
+    console.log('Sample subject metrics:', Object.entries(subjectMetrics).slice(0, 2));
+    
+    // Calculate rates for each subject using unique recipients
+    Object.keys(subjectMetrics).forEach(subject => {
+      const metrics = subjectMetrics[subject];
+      metrics.openRate = metrics.delivered > 0 ? (metrics.opened / metrics.delivered) * 100 : 0;
+      metrics.clickThroughRate = metrics.delivered > 0 ? (metrics.clicked / metrics.delivered) * 100 : 0;
     });
     
     // Convert to timeline array
@@ -787,7 +926,8 @@ router.get('/:taskId/subscribers/metrics', authenticateToken, async (req, res) =
       metrics: {
         timeline,
         totalEvents: taskEvents.length,
-        eventTypes
+        eventTypes,
+        subjectMetrics
       }
     });
   } catch (error: any) {
