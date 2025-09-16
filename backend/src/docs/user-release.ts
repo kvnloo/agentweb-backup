@@ -13,6 +13,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Metrics are grouped by email subject in the Metrics popup',
       '- Definitions: Open Rate = Unique Opens / Delivered; Click-Through Rate = Unique Clicks / Delivered',
       '- Clicking an email opens the same Subscriber Details popup as in Task Details',
+      'Added OpenAI image model from Azure',
+      '- Integrated Azure OpenAI gpt-image-1 model for image generation and editing',
+      '- Supports image generation from text prompts with configurable size and quality',
     ],
   },
   {
