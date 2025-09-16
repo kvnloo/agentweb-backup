@@ -6,7 +6,8 @@ import {
   sendApprovalRequest, 
   sendApprovalRequestWithTracking,
   updateApprovalMessage,
-  openFeedbackModal
+  openFeedbackModal,
+  openTestEmailModal
 } from "../services/slackService";
 import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
 import { taskDb, subscriberDb } from "../services/db";
@@ -308,6 +309,33 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
           text: `❌ Rejected by @${user.username}`
         });
 
+      } else if (action.action_id === 'test_email') {
+        // Get asset type for proper display
+        const approval = await approvalDb.getApproval(assetUrl);
+        const assetType = approval?.assetType || 'asset';
+        
+        // Only allow test email for HTML assets
+        if (assetType !== 'html') {
+          console.log(`❌ Test email not allowed for asset type: ${assetType}`);
+          res.status(200).json({
+            response_type: "ephemeral",
+            text: "❌ Test email is only available for HTML reports."
+          });
+          return;
+        }
+        
+        // Open test email modal
+        await openTestEmailModal(
+          payload.trigger_id,
+          assetUrl,
+          filename,
+          executionId,
+          assetType
+        );
+
+        console.log(`📧 Opened test email modal for: ${assetUrl}`);
+        res.status(200).json({}); // Empty response for modal trigger
+
       } else {
         return res.status(200).json({ text: "Unknown action" });
       }
@@ -388,6 +416,55 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
         }
 
         console.log(`🔶 Changes requested for: ${assetUrl} by ${user.username}`);
+        res.status(200).json({}); // Empty response for successful submission
+      } else if (view.callback_id === 'test_email_modal') {
+        const metadata = JSON.parse(view.private_metadata);
+        const { assetUrl, filename, executionId, assetType } = metadata;
+        
+        // Get email from the modal
+        const emailValue = view.state.values.email_input.email_text.value;
+        
+        console.log("📧 Test email submission received:", {
+          assetUrl,
+          email: emailValue,
+          user: user.username
+        });
+
+        // Send test email using the existing email service
+        try {
+          if (executionId) {
+            // Use the existing sendTaskExecutionEmail function
+            await emailService.sendTaskExecutionEmail(
+              emailValue,
+              executionId
+            );
+            console.log(`✅ Test email sent successfully to: ${emailValue}`);
+          } else {
+            // If no executionId, send a simple notification email
+            const subject = `Test Email - ${filename}`;
+            const text = `This is a test email for the asset: ${filename}\nAsset URL: ${assetUrl}`;
+            const html = `
+              <h2>Test Email - ${filename}</h2>
+              <p>This is a test email for the asset: <strong>${filename}</strong></p>
+              <p><a href="${assetUrl}" target="_blank">View Asset</a></p>
+            `;
+            
+            await emailService.sendEmail(emailValue, subject, text, html);
+            console.log(`✅ Test email sent successfully to: ${emailValue}`);
+          }
+        } catch (error) {
+          console.error('❌ Error sending test email:', error);
+          // Return an error response to Slack
+          res.status(200).json({
+            response_action: "errors",
+            errors: {
+              email_input: "Failed to send test email. Please try again."
+            }
+          });
+          return;
+        }
+
+        console.log(`📧 Test email sent for: ${assetUrl} by ${user.username}`);
         res.status(200).json({}); // Empty response for successful submission
       } else {
         return res.status(200).json({ text: "Unknown modal" });
