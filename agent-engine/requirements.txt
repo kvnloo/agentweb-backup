@@ -25,3 +25,4 @@ runwayml
 Pillow
 cairosvg
 resend
+requests
