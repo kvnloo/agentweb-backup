@@ -386,3 +386,34 @@ export async function openFeedbackModal(
   }
 }
 
+/**
+ * Send approval request to Slack and store in database
+ */
+export async function sendApprovalRequestWithTracking(
+  request: ApprovalRequest & { channelName?: string }
+): Promise<{ messageTs: string | null; approvalId: string }> {
+  // Send to Slack
+  const result = await sendApprovalRequest(request);
+
+  // Store in database for tracking
+  const { approvalDb } = await import('./approvalDb');
+  const approval = await approvalDb.createApproval({
+    assetUrl: request.imageUrl,
+    filename: request.filename,
+    assetType: request.assetType as any, // Cast to any to handle string to AssetType
+    executionId: request.executionId || '',
+    userId: request.userId,
+    slackChannel: request.channel,
+    slackChannelName: request.channelName || request.channel,
+    slackMessageTs: result.messageTs,
+    note: request.note,
+  });
+
+  console.log("✅ Approval request sent to Slack and stored in database");
+  
+  return {
+    messageTs: result.messageTs,
+    approvalId: approval.assetUrl // Use assetUrl as the ID since that's the primary key
+  };
+}
+

@@ -4,6 +4,7 @@ import { AuthenticatedRequest } from "../middleware/auth";
 import { 
   getSlackChannels, 
   sendApprovalRequest, 
+  sendApprovalRequestWithTracking,
   updateApprovalMessage,
   openFeedbackModal
 } from "../services/slackService";
@@ -72,27 +73,15 @@ router.post("/send-approval", authenticateToken, async (req: Request, res: Respo
     console.log("📨 Sending approval request to Slack...");
     console.log("📝 Request details:", { channel, filename, assetUrl, assetType, userId });
 
-    const result = await sendApprovalRequest({
+    const result = await sendApprovalRequestWithTracking({
       executionId: executionId || '', // Keep for backward compatibility
       imageUrl: assetUrl,
       filename,
       assetType,
       userId,
       channel,
+      channelName: authReq.body.channelName || channel, // Use channel name if provided, fallback to channel ID
       note: note // Pass the note to Slack
-    });
-
-    // Store approval request in database for tracking
-    const approval = await approvalDb.createApproval({
-      assetUrl,
-      filename,
-      assetType,
-      executionId,
-      userId,
-      slackChannel: channel,
-      slackChannelName: authReq.body.channelName || channel, // Use channel name if provided, fallback to channel ID
-      slackMessageTs: result.messageTs,
-      note: note, // Store the note in database
     });
 
     console.log("✅ Approval request sent successfully to Slack and stored in database");
@@ -100,7 +89,8 @@ router.post("/send-approval", authenticateToken, async (req: Request, res: Respo
     res.json({ 
       success: true, 
       message: "Approval request sent successfully",
-      messageTs: result.messageTs
+      messageTs: result.messageTs,
+      approvalId: result.approvalId
     });
   } catch (error: any) {
     console.error("❌ Error sending approval request:", error.message);
