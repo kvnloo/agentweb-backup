@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-09-16',
+    changes: [
+      'Added Open Rate and Click Through Rate to Email Metrics',
+      '- Metrics are grouped by email subject in the Metrics popup',
+      '- Definitions: Open Rate = Unique Opens / Delivered; Click-Through Rate = Unique Clicks / Delivered',
+      '- Clicking an email opens the same Subscriber Details popup as in Task Details',
+    ],
+  },
+  {
     date: '2025-09-15',
     changes: [
       'Improved Report Revision to Realtime',
