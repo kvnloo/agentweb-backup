@@ -179,6 +179,21 @@ export async function sendApprovalRequest(
                 executionId: request.executionId,
               }),
             },
+            // Only show Test Email button for HTML assets
+            ...(request.assetType === 'html' ? [{
+              type: "button" as const,
+              text: {
+                type: "plain_text" as const,
+                text: "📧 Test Email",
+                emoji: true,
+              },
+              action_id: "test_email",
+              value: JSON.stringify({
+                assetUrl: request.imageUrl,
+                filename: request.filename,
+                executionId: request.executionId,
+              }),
+            }] : []),
           ],
         },
       ],
@@ -286,6 +301,86 @@ export async function updateApprovalMessage(
     console.log("✅ Approval message updated successfully");
   } catch (error) {
     console.error("Error updating approval message:", error);
+    throw error;
+  }
+}
+
+/**
+ * Open modal dialog for test email input
+ */
+export async function openTestEmailModal(
+  triggerId: string,
+  assetUrl: string,
+  filename: string,
+  executionId?: string,
+  assetType?: string
+): Promise<void> {
+  if (!slackClient) {
+    throw new Error("Slack client not initialized. Check SLACK_BOT_TOKEN environment variable.");
+  }
+
+  try {
+    await slackClient.views.open({
+      trigger_id: triggerId,
+      view: {
+        type: "modal",
+        callback_id: "test_email_modal",
+        title: {
+          type: "plain_text",
+          text: "Send Test Email",
+        },
+        submit: {
+          type: "plain_text",
+          text: "Send Test Email",
+        },
+        close: {
+          type: "plain_text",
+          text: "Cancel",
+        },
+        private_metadata: JSON.stringify({
+          assetUrl,
+          filename,
+          executionId,
+          assetType,
+        }),
+        blocks: [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: `*Asset:* ${filename}\n*Type:* ${assetType ? assetType.charAt(0).toUpperCase() + assetType.slice(1) : 'Unknown'}\n*Action:* Send Test Email`,
+            },
+          },
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: "📧 Enter the email address where you want to send a test email with this asset.",
+            },
+          },
+          {
+            type: "input",
+            block_id: "email_input",
+            element: {
+              type: "email_text_input",
+              action_id: "email_text",
+              placeholder: {
+                type: "plain_text",
+                text: "Enter email address (e.g., test@example.com)",
+              },
+            },
+            label: {
+              type: "plain_text",
+              text: "Email Address",
+            },
+          },
+        ],
+      },
+    });
+
+    console.log("✅ Test email modal opened successfully");
+  } catch (error) {
+    console.error("❌ Error opening test email modal:", error);
     throw error;
   }
 }

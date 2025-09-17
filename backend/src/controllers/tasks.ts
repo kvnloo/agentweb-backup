@@ -45,6 +45,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       description,
       outputAsJson,
       outputAsHtml,
+      emailFriendlyHtml,
       selectedLLMs,
       useSharedBrowser,
       turnOffHeadless,
@@ -98,6 +99,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           extractPageContent: extractPageContent !== undefined ? Boolean(extractPageContent) : template.extractPageContent, // Uses template.extractPageContent if extractPageContent is undefined in req.body
           outputAsJson: outputAsJson !== undefined ? Boolean(outputAsJson) : template.outputAsJson,
           outputAsHtml: outputAsHtml !== undefined ? Boolean(outputAsHtml) : template.outputAsHtml,
+          emailFriendlyHtml: emailFriendlyHtml !== undefined ? Boolean(emailFriendlyHtml) : template.emailFriendlyHtml,
           useSharedBrowser: useSharedBrowser !== undefined ? Boolean(useSharedBrowser) : template.useSharedBrowser,
           turnOffHeadless: turnOffHeadless !== undefined ? Boolean(turnOffHeadless) : template.turnOffHeadless,
           useKnowledgeBase: useKnowledgeBase !== undefined ? Boolean(useKnowledgeBase) : template.useKnowledgeBase,
@@ -143,6 +145,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       extractPageContent: extractPageContent ?? isDeepResearch,  // Convert to boolean
       outputAsJson: Boolean(outputAsJson),
       outputAsHtml: Boolean(outputAsHtml),
+      emailFriendlyHtml: Boolean(emailFriendlyHtml),
       useSharedBrowser: Boolean(useSharedBrowser),
       turnOffHeadless: Boolean(turnOffHeadless),
       useKnowledgeBase: Boolean(useKnowledgeBase),
@@ -328,6 +331,10 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
       if (updates.outputAsHtml) {
         updates.outputAsJson = false; // If HTML is true, JSON must be false
       }
+    }
+
+    if (req.body.emailFriendlyHtml !== undefined) {
+      updates.emailFriendlyHtml = Boolean(req.body.emailFriendlyHtml);
     }
 
     if (req.body.llmName !== undefined) {

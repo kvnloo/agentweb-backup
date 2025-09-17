@@ -15,6 +15,7 @@ export interface Task {
   validateOutput?: boolean;  // Whether to validate output from the agent
   outputAsJson?: boolean;  // Whether the agent should output the result in JSON format
   outputAsHtml?: boolean;
+  emailFriendlyHtml?: boolean;  // Whether to create email-friendly HTML revisions for approval
   llmName?: string;  // The preferred LLM to try first for this task
   useSharedBrowser?: boolean; // Whether the task should use a shared browser session
   turnOffHeadless?: boolean; // Whether to run the browser in visible mode
@@ -52,6 +53,7 @@ export interface TaskUpdate {
   validateOutput?: boolean;
   outputAsJson?: boolean;
   outputAsHtml?: boolean;
+  emailFriendlyHtml?: boolean;
   isAgenticDevMode?: boolean;
   llmName?: string;
   useSharedBrowser?: boolean;
