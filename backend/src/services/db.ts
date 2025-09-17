@@ -749,13 +749,7 @@ export const taskDb = {
         params.ExpressionAttributeValues = expressionAttributeValues;
       }
 
-      console.log(
-        `[db.ts] DynamoDB updateTask params for taskId ${taskId}:`,
-        JSON.stringify(params, null, 2)
-      ); // Added log
-
       const result = await dynamodb.update(params).promise();
-      console.log("[db.ts] DynamoDB updateTask result:", result);
       return result.Attributes;
     } catch (error) {
       console.error(`[db.ts] Error in updateTask for taskId ${taskId}:`, error);
