@@ -37,26 +37,54 @@ export class AgentModeService {
       // Build templates context message
       const templatesContext = this.buildTemplatesContext(availableTemplates);
       
-      const response = await this.openai.chat.completions.create({
-        model: process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'assistant', content: templatesContext },
-          { role: 'user', content: context }
-        ],
-        tools: this.getAvailableTools(),
-        tool_choice: 'auto',
-        max_completion_tokens: 2000
-      });
+      // Build initial messages array
+      const messages: any[] = [
+        { role: 'system', content: systemPrompt },
+        { role: 'assistant', content: templatesContext },
+        { role: 'user', content: context }
+      ];
 
-      const responseMessage = response.choices[0].message;
-      let content = responseMessage.content || '';
+      let content = '';
       const toolCalls: any[] = [];
       const knowledgeBaseQueries: string[] = [];
       const sources: string[] = [];
 
-      // Execute tool calls if any
-      if (responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
+      // Single loop for LLM calls and tool execution
+      let maxIterations = 10; // Prevent infinite loops
+      let iteration = 0;
+      let responseMessage: any = null;
+      
+      while (iteration < maxIterations) {
+        iteration++;
+        console.log(`AgentMode: LLM call iteration ${iteration}`);
+        
+        // Make LLM call
+        const response = await this.openai.chat.completions.create({
+          model: process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
+          messages: messages,
+          tools: this.getAvailableTools(),
+          tool_choice: 'auto',
+          max_completion_tokens: 2000
+        });
+        
+        responseMessage = response.choices[0].message;
+        const responseContent = responseMessage.content || '';
+        
+        // Update content with LLM's response
+        if (responseContent) {
+          content = responseContent;
+        }
+        
+        // If no tool calls, break the loop
+        if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
+          console.log('AgentMode: No tool calls, breaking loop');
+          break;
+        }
+        
+        console.log(`AgentMode: Executing ${responseMessage.tool_calls.length} tool calls`);
+        let hasWebSearch = false;
+        
+        // Execute tool calls
         for (const toolCall of responseMessage.tool_calls) {
           try {
             const functionArgs = JSON.parse(toolCall.function.arguments);
@@ -71,7 +99,7 @@ export class AgentModeService {
               result: result
             });
 
-            // Add status information to the content for the AI to see
+            // Add results to content for LLM to process
             if (result.taskId && result.executionId) {
               const statusMessage = this.getStatusMessage(toolCall.function.name, result.status);
               content += `\n\n${statusMessage}`;
@@ -80,7 +108,8 @@ export class AgentModeService {
               const metricsSummary = this.formatMetricsSummary(result.data);
               content += `\n\n${metricsSummary}`;
             } else if (toolCall.function.name === 'search_web' && result.success) {
-              // Special handling for web search results - provide formatted results for AI analysis
+              // Track web search results
+              hasWebSearch = true;
               const searchSummary = this.formatWebSearchResults(result);
               content += `\n\n${searchSummary}`;
             }
@@ -94,6 +123,22 @@ export class AgentModeService {
             });
           }
         }
+        
+        // Break the loop if no web search was performed in this iteration
+        if (!hasWebSearch) {
+          console.log('AgentMode: No web search in this iteration, breaking loop');
+          break;
+        }
+        
+        // Append the assistant response with tool results to messages for next iteration
+        messages.push({
+          role: 'assistant',
+          content: content
+        });
+      }
+      
+      if (iteration >= maxIterations) {
+        console.warn('AgentMode: Reached maximum tool execution iterations');
       }
 
       return {
@@ -158,6 +203,8 @@ You can help with various marketing tasks including:
 - **Search topics include**: Market trends, industry benchmarks, competitor analysis, recent news, regulatory changes, technology updates, or any current information that would help provide better recommendations
 - **Search strategy**: Use specific, targeted search queries to find the most relevant and recent information
 - **Integration**: Incorporate search results into your analysis and recommendations to provide data-driven insights
+- **Search result presentation**: Always provide a tailored summary of search results that directly answers the user's question
+- **Synthesize findings**: Analyze and synthesize search results to provide actionable insights relevant to the user's specific needs
 
 - **Previous Task Results**: Previous task results are automatically attached by default to provide context
 - This includes the latest HTML results from previous completed tasks in the same conversation
@@ -273,7 +320,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     // Add recent conversation history (excluding system messages)
     if (sessionHistory.length > 0) {
       const nonSystemMessages = sessionHistory.filter(msg => msg.role !== 'system');
-      const recentHistory = nonSystemMessages.slice(-5);
+      const recentHistory = nonSystemMessages.slice(-10);
       context += 'Recent Conversation:\n';
       recentHistory.forEach(msg => {
         context += `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}\n`;
@@ -510,7 +557,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'create_revision':
         return await this.createRevision(args.task_id, args.execution_id, args.revision_prompt, userId, args.target_result_name);
       case 'search_web':
-        return await this.searchWeb(args.query, args.max_results || 5);
+        return await this.searchWeb(args.query, args.max_results || 10);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -1564,29 +1611,30 @@ Use the available tools to create tasks in the agent-engine when complex work is
     return summary;
   }
 
+
   // Helper function to format web search results for AI analysis
   private formatWebSearchResults(searchResult: any): string {
     const { query, results, totalResults } = searchResult;
     
     if (!results || results.length === 0) {
-      return `🔍 **Web Search Results for "${query}"**\n\nNo results found for your search query.`;
+      return `<strong>🔍 Web Search Results for "${query}"</strong><br>No results found for your search query.`;
     }
     
-    let summary = `🔍 **Web Search Results for "${query}"**\n\n`;
-    summary += `I found ${totalResults} relevant search results:\n\n`;
+    let summary = `<strong>🔍 Web Search Results for "${query}"</strong><br>`;
+    summary += `I found ${totalResults} relevant search results:<br><br>`;
     
     results.forEach((result: any, index: number) => {
-      summary += `**${index + 1}. ${result.title}**\n`;
-      summary += `🔗 [${result.url}](${result.url})\n`;
-      summary += `${result.snippet}\n`;
+      summary += `<strong>${index + 1}. ${result.title}</strong><br>`;
+      summary += `🔗 <a href="${result.url}" target="_blank">${result.url}</a><br>`;
+      summary += `<em>${result.snippet}</em><br>`;
       if (result.publishedDate) {
         const date = new Date(result.publishedDate);
-        summary += `📅 Published: ${date.toLocaleDateString()}\n`;
+        summary += `📅 Published: ${date.toLocaleDateString()}<br>`;
       }
-      summary += `\n`;
+      summary += `<br>`;
     });
     
-    summary += `*Use this information to provide accurate, up-to-date responses based on current web data.*`;
+    summary += `<em>💡 I've gathered this current information to provide you with data-driven insights and recommendations.</em>`;
     
     return summary;
   }
