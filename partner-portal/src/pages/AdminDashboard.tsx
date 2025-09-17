@@ -3286,12 +3286,18 @@ const AgentModeSettings = () => {
       setError('');
       setSuccess('');
       
+      // First, delete the custom setting from the database
+      await axios.delete(buildApiUrl('/api/settings/agent_mode_system_prompt'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      
+      // Then load the default system prompt
       const response = await axios.get(buildApiUrl('/api/agent-mode/system-prompt'), {
         headers: { Authorization: `Bearer ${token}` }
       });
       
       setSystemPrompt(response.data);
-      setSuccess('Reset to default system prompt');
+      setSuccess('Reset to default system prompt successfully!');
     } catch (error) {
       console.error('Error resetting system prompt:', error);
       setError('Failed to reset system prompt');

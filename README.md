@@ -427,6 +427,135 @@ If you encounter redirect URL errors:
 
 The backend includes a fallback handler for malformed OAuth URLs, but the proper fix is to configure the correct redirect URI in Google Console.
 
+### Google Custom Search API Configuration
+
+To enable web search functionality in Agent Mode, you need to set up Google Custom Search API.
+
+#### 1. Create a Google Cloud Project
+
+1. **Go to Google Cloud Console**:
+   - Visit [Google Cloud Console](https://console.cloud.google.com/)
+   - Select your existing project or create a new one
+
+2. **Enable Custom Search API**:
+   - Go to "APIs & Services" > "Library"
+   - Search for "Custom Search API" and enable it
+
+#### 2. Create API Credentials
+
+1. **Go to Credentials**:
+   - Navigate to "APIs & Services" > "Credentials"
+   - Click "Create Credentials" > "API Key"
+
+2. **Restrict the API Key** (Recommended):
+   - Click on the created API key
+   - Under "API restrictions", select "Restrict key"
+   - Choose "Custom Search API" from the list
+   - Click "Save"
+
+#### 3. Create a Custom Search Engine
+
+1. **Go to Custom Search Engine**:
+   - Visit [Google Custom Search Engine](https://cse.google.com/cse/)
+   - Click "Add" to create a new search engine
+
+2. **Configure the Search Engine**:
+   - **Sites to search**: Enter `*` to search the entire web, or specify specific domains
+   - **Language**: Select your preferred language
+   - **Name**: Give your search engine a name (e.g., "AgentWeb Search")
+   - Click "Create"
+
+3. **Get the Search Engine ID**:
+   - After creation, click on your search engine
+   - Go to "Setup" > "Basics"
+   - Copy the "Search engine ID" (it looks like: `017576662512468239146:omuauf_lfve`)
+
+#### 4. Store Credentials in AWS Secrets Manager
+
+Store your Google Search API credentials in AWS Secrets Manager:
+
+**For Development:**
+- Secret Name: `dev/AgentWeb/Google/Search`
+- Secret Value (JSON format):
+```json
+{
+  "apiKey": "your_google_api_key_here",
+  "searchEngineId": "your_search_engine_id_here"
+}
+```
+
+**For Production:**
+- Secret Name: `prod/AgentWeb/Google/Search`
+- Secret Value (JSON format):
+```json
+{
+  "apiKey": "your_google_api_key_here",
+  "searchEngineId": "your_search_engine_id_here"
+}
+```
+
+**Steps to add secrets:**
+1. Go to AWS Secrets Manager in your AWS Console
+2. Click "Store a new secret"
+3. Choose "Other type of secret"
+4. Add the JSON with your credentials
+5. Name the secret according to your environment
+6. Click "Store"
+
+#### 5. Test the Configuration
+
+1. **Install Dependencies**:
+   ```bash
+   cd backend
+   npm install
+   ```
+
+2. **Restart the Backend**:
+   ```bash
+   npm run dev
+   ```
+
+3. **Test Web Search**:
+   - Go to Agent Mode in your application
+   - Ask a question that requires current information (e.g., "What are the latest marketing trends?")
+   - The agent should now use real Google search results
+
+#### 6. API Quotas and Limits
+
+- **Free Tier**: 100 searches per day
+- **Paid Tier**: Up to 10,000 searches per day for $5
+- **Rate Limits**: 10 requests per second
+
+#### 7. Troubleshooting
+
+**Common Issues:**
+
+1. **"API key not valid"**:
+   - Check that the API key is correct in AWS Secrets Manager
+   - Ensure Custom Search API is enabled in Google Cloud Console
+   - Verify API key restrictions
+
+2. **"Search engine not found"**:
+   - Verify the Search Engine ID is correct in AWS Secrets Manager
+   - Check that the search engine is active in Google Custom Search Engine
+
+3. **"Secrets Manager access denied"**:
+   - Ensure your AWS credentials have permissions to access Secrets Manager
+   - Check that the secret names match exactly: `dev/AgentWeb/Google/Search` or `prod/AgentWeb/Google/Search`
+   - Verify the secret contains valid JSON with `apiKey` and `searchEngineId` fields
+
+4. **"Quota exceeded"**:
+   - Check your daily quota usage in Google Cloud Console
+   - Consider upgrading to paid tier if needed
+
+5. **No search results**:
+   - The system will fall back to mock results if the API fails
+   - Check the backend logs for error messages
+
+**Fallback Behavior:**
+- If Google Search API credentials are not found in Secrets Manager or the API fails, the system automatically falls back to mock search results
+- This ensures Agent Mode continues to work even without the API configured
+
 ## Deployment to AWS Elastic Beanstalk
 
 ### Prerequisites

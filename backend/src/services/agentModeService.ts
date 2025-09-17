@@ -1,7 +1,9 @@
 import OpenAI from 'openai';
+import { google } from 'googleapis';
 import { chatbotDb, ChatMessage } from './chatbotService';
 import { taskDb, taskTemplateDb } from './db';
 import { settingsService } from './settingsService';
+import { getSecret } from '../utils/secretsManager';
 
 export class AgentModeService {
   private openai: OpenAI;
@@ -77,6 +79,10 @@ export class AgentModeService {
               // Special handling for metrics data - provide summary for AI analysis
               const metricsSummary = this.formatMetricsSummary(result.data);
               content += `\n\n${metricsSummary}`;
+            } else if (toolCall.function.name === 'search_web' && result.success) {
+              // Special handling for web search results - provide formatted results for AI analysis
+              const searchSummary = this.formatWebSearchResults(result);
+              content += `\n\n${searchSummary}`;
             }
           } catch (error) {
             console.error(`AgentMode: Tool execution error for ${toolCall.function.name}:`, error);
@@ -125,8 +131,11 @@ You can help with various marketing tasks including:
 - Performance analysis and optimization
 - Meta ads metrics analysis and insights
 - Social media listening and brand monitoring
+- Web search for current information and real-time data
 
 ## Task Creation Approach
+- **IMPORTANT**: Always confirm with the user before creating any task, as tasks can take a few minutes to complete
+- **Confirmation required**: Explain what the task will do and get explicit approval before proceeding
 - **Primary Method**: Use the 'create_task_from_template' tool with a specific template_id and parameters_json string
 - All available templates are provided in the context above - select the most appropriate one based on the user's request
 - Extract the required parameters from the user's message and pass them as a JSON string where keys are parameter names and values are the actual values
@@ -142,6 +151,14 @@ You can help with various marketing tasks including:
 - Compare metrics against industry benchmarks and identify specific optimization opportunities
 - If a user asks about a specific ad that doesn't appear in the metrics data, explain that the ad may be disabled, paused, or have no activity in the selected timeframe
 - **Important**: You cannot pull metrics for individual ads by name - the metrics function returns all active ads in the timeframe. If a user asks for specific ad metrics, explain that you can only analyze the ads that appear in the current data set
+- **Web Search**: Use 'search_web' proactively to gather current information before asking users for clarification
+- **Automatic and fast**: Web search does NOT require user confirmation - use it automatically to improve your responses
+- **When to search**: Before asking users for more details, search for current market data, industry trends, competitor information, or recent developments
+- **Search first, ask second**: Use web search to gather background information and context before requesting additional details from users
+- **Search topics include**: Market trends, industry benchmarks, competitor analysis, recent news, regulatory changes, technology updates, or any current information that would help provide better recommendations
+- **Search strategy**: Use specific, targeted search queries to find the most relevant and recent information
+- **Integration**: Incorporate search results into your analysis and recommendations to provide data-driven insights
+
 - **Previous Task Results**: Previous task results are automatically attached by default to provide context
 - This includes the latest HTML results from previous completed tasks in the same conversation
 - Set attach_previous_task_results to false only if you don't want previous results included
@@ -162,13 +179,19 @@ You can help with various marketing tasks including:
 
 ## Communication Style
 - Be helpful, professional, and conversational
-- Ask clarifying questions when needed
-- Provide clear explanations of what you're doing
+- **Research before asking**: Use web search to gather current information before asking users for clarification
+- **Proactive information gathering**: Search for market data, trends, and context to provide more informed recommendations
+- **Data-driven approach**: Base your advice on current, real-world data rather than general knowledge
+- Ask clarifying questions only after you've searched for available information
+- **Web search is automatic**: Use web search proactively without asking for permission - it's fast and helps provide better answers
+- **Task confirmation required**: Always explain what a task will do and ask for confirmation before creating it (tasks take time to complete)
+- **Example confirmation**: "I'd like to create a market research task that will analyze your competitors and industry trends. This task may take a few minutes to complete. Would you like me to proceed?"
+- Provide clear explanations of what you're doing and what information you've found
 - Keep responses concise but informative
 - Always confirm task creation and provide relevant details
 - When using templates, explain which template was selected and why
 - When analyzing metrics data, provide insights and recommendations rather than just repeating the numbers
-- Focus on actionable insights and strategic guidance based on the conversation context
+- Focus on actionable insights and strategic guidance based on current data and conversation context
 - If a user asks about a specific ad that doesn't appear in the metrics data, simply explain that the ad may be disabled, paused, or have no activity in the selected timeframe
 - **Never offer to pull metrics for individual ads by name** - you can only analyze the ads that appear in the current metrics data set
 
@@ -207,7 +230,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
       'create_task_from_template': 'template-based task',
       'create_task_from_prompt': 'custom prompt task',
       'create_image_task_from_prompt': 'image generation task',
-      'get_meta_ads_metrics': 'Meta ads metrics analysis'
+      'get_meta_ads_metrics': 'Meta ads metrics analysis',
+      'search_web': 'web search',
+      'create_revision': 'task revision'
     };
 
     const toolDescription = toolDescriptions[toolName] || 'task';
@@ -432,6 +457,28 @@ Use the available tools to create tasks in the agent-engine when complex work is
             required: ['task_id', 'execution_id', 'revision_prompt']
           }
         }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'search_web',
+          description: 'Search the web for current information when you need up-to-date data or real-time information',
+          parameters: {
+            type: 'object',
+            properties: {
+              query: {
+                type: 'string',
+                description: 'The search query to find relevant information on the web'
+              },
+              max_results: {
+                type: 'number',
+                description: 'Maximum number of search results to return (default: 5, max: 10)',
+                default: 5
+              }
+            },
+            required: ['query']
+          }
+        }
       }
     ];
   }
@@ -462,6 +509,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.getMetaAdsMetrics(args.timeframe || '7d', userId);
       case 'create_revision':
         return await this.createRevision(args.task_id, args.execution_id, args.revision_prompt, userId, args.target_result_name);
+      case 'search_web':
+        return await this.searchWeb(args.query, args.max_results || 5);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -1513,6 +1562,167 @@ Use the available tools to create tasks in the agent-engine when complex work is
     summary += `**Please provide your analysis and recommendations based on this performance data and our conversation context.**`;
     
     return summary;
+  }
+
+  // Helper function to format web search results for AI analysis
+  private formatWebSearchResults(searchResult: any): string {
+    const { query, results, totalResults } = searchResult;
+    
+    if (!results || results.length === 0) {
+      return `🔍 **Web Search Results for "${query}"**\n\nNo results found for your search query.`;
+    }
+    
+    let summary = `🔍 **Web Search Results for "${query}"**\n\n`;
+    summary += `I found ${totalResults} relevant search results:\n\n`;
+    
+    results.forEach((result: any, index: number) => {
+      summary += `**${index + 1}. ${result.title}**\n`;
+      summary += `🔗 [${result.url}](${result.url})\n`;
+      summary += `${result.snippet}\n`;
+      if (result.publishedDate) {
+        const date = new Date(result.publishedDate);
+        summary += `📅 Published: ${date.toLocaleDateString()}\n`;
+      }
+      summary += `\n`;
+    });
+    
+    summary += `*Use this information to provide accurate, up-to-date responses based on current web data.*`;
+    
+    return summary;
+  }
+
+  // Web search functionality
+  private async searchWeb(query: string, maxResults: number = 10): Promise<any> {
+    try {
+      console.log('AgentMode: Searching web for query:', query, 'maxResults:', maxResults);
+      
+      // Limit max results to 10
+      const limitedMaxResults = Math.min(maxResults, 10);
+      
+      // Use a simple web search API - you can replace this with your preferred search service
+      // For now, we'll use a mock implementation that returns structured results
+      // In production, you might want to use Google Custom Search API, Bing Search API, or similar
+      
+      const searchResults = await this.performWebSearch(query, limitedMaxResults);
+      
+      return {
+        success: true,
+        message: `Found ${searchResults.length} web search results for "${query}"`,
+        query,
+        results: searchResults,
+        totalResults: searchResults.length
+      };
+    } catch (error) {
+      console.error('AgentMode: Error searching web:', error);
+      return {
+        success: false,
+        message: 'Failed to search the web. Please try again.',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // Get Google Search API credentials from AWS Secrets Manager
+  private async getGoogleSearchCredentials(): Promise<{ apiKey: string; searchEngineId: string } | null> {
+    try {
+      const secretName = process.env.NODE_ENV === 'development' 
+        ? 'dev/AgentWeb/Google/Search' 
+        : 'prod/AgentWeb/Google/Search';
+      
+      const secretJson = await getSecret(secretName);
+      const credentials = JSON.parse(secretJson);
+      
+      if (!credentials.apiKey || !credentials.searchEngineId) {
+        console.error('Google Search API credentials missing required fields');
+        return null;
+      }
+      
+      return {
+        apiKey: credentials.apiKey,
+        searchEngineId: credentials.searchEngineId
+      };
+    } catch (error) {
+      console.error('Error fetching Google Search API credentials from Secrets Manager:', error);
+      return null;
+    }
+  }
+
+  // Perform actual web search using Google Custom Search API
+  private async performWebSearch(query: string, maxResults: number): Promise<any[]> {
+    try {
+      // Get credentials from Secrets Manager
+      const credentials = await this.getGoogleSearchCredentials();
+      
+      if (!credentials) {
+        throw new Error('Google Search API not configured in Secrets Manager');
+      }
+      
+      // Initialize Google Custom Search API
+      const customsearch = google.customsearch('v1');
+      
+      // Perform the search
+      const response = await customsearch.cse.list({
+        auth: credentials.apiKey,
+        cx: credentials.searchEngineId,
+        q: query,
+        num: Math.min(maxResults, 10), // Google API max is 10
+        safe: 'medium', // Safe search level
+        fields: 'items(title,link,snippet,pagemap/metatags,pagemap/cse_thumbnail)'
+      });
+      
+      if (!response.data.items || response.data.items.length === 0) {
+        throw new Error('No search results found');
+      }
+      
+      // Transform Google API results to our format
+      const searchResults = response.data.items.map((item: any) => ({
+        title: item.title || 'No title',
+        url: item.link || '#',
+        snippet: item.snippet || 'No description available',
+        publishedDate: this.extractPublishedDate(item.pagemap?.metatags?.[0]) || new Date().toISOString(),
+        thumbnail: item.pagemap?.cse_thumbnail?.[0]?.src || null
+      }));
+      
+      console.log(`Google Search API returned ${searchResults.length} results for query: "${query}"`);
+      return searchResults;
+      
+    } catch (error) {
+      console.error('Error performing Google web search:', error);
+      throw error;
+    }
+  }
+
+
+  // Extract published date from page metadata
+  private extractPublishedDate(metatags: any): string | null {
+    if (!metatags) return null;
+    
+    // Try different common meta tag formats for publication date
+    const dateFields = [
+      'article:published_time',
+      'pubdate',
+      'date',
+      'dc.date',
+      'dc.date.issued',
+      'og:article:published_time',
+      'article:published',
+      'publication_date'
+    ];
+    
+    for (const field of dateFields) {
+      if (metatags[field]) {
+        try {
+          const date = new Date(metatags[field]);
+          if (!isNaN(date.getTime())) {
+            return date.toISOString();
+          }
+        } catch (e) {
+          // Continue to next field
+        }
+      }
+    }
+    
+    return null;
   }
 }
 
