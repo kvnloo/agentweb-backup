@@ -254,7 +254,7 @@ export class ReportRevisionService {
               },
               filename: {
                 type: 'string',
-                description: 'The filename for the revised report (e.g., revised_report.html)'
+                description: 'The filename for the revised report (e.g., <topic>_revised_report.html)'
               }
             },
             required: ['revised_content', 'filename']
