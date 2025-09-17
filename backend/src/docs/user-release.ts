@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-09-17',
+    changes: [
+      'Supported Test Email',
+      '- Added "📧 Test Email" button in Slack approval messages for HTML assets',
+      'Supported Email Friendly HTML',
+      '- New Email-Friendly option under Output as HTML5 in Partner Portal (Task Details)',
+      '- Email HTML conversion inlines CSS and JavaScript charts for compatibility',
+    ],
+  },
+  {
     date: '2025-09-16',
     changes: [
       'Added Open Rate and Click Through Rate to Email Metrics',
