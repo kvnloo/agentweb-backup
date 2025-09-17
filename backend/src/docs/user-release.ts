@@ -9,6 +9,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2025-09-17',
     changes: [
+      'Supported web search in Agent Mode',
+      '- Agent can now search the web for current information and real-time data',
+      '- Proactive web search automatically gathers information before asking users for clarification',
+      '- Multiple search iterations allow agent to refine research based on findings',
+      '- Search results are synthesized into tailored responses rather than raw data dumps',
       'Supported Test Email',
       '- Added "📧 Test Email" button in Slack approval messages for HTML assets',
       'Supported Email Friendly HTML',
