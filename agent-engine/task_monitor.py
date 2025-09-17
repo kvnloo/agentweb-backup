@@ -30,7 +30,7 @@ from email_utils import get_task_subscribers
 import requests
 from google.cloud import storage
 from openai import AzureOpenAI
-from task_utils import get_azure_openai_llm2
+from task_utils import get_azure_openai_llm2, create_jwt_token
 from knowledge_base_utils import get_knowledge_base_manager
 
 # Increase file descriptor limit
@@ -86,6 +86,73 @@ logger = logging.getLogger(__name__)
 
 # Set environment variable for browser-use logging level
 os.environ['BROWSER_USE_LOGGING_LEVEL'] = 'info'
+
+def create_email_friendly_html_revision(task_id, execution_id, html_asset_url, user_id):
+    """
+    Create an email-friendly HTML revision using the backend revision endpoint.
+    
+    Args:
+        task_id: The ID of the task
+        execution_id: The ID of the execution
+        html_asset_url: The URL of the HTML asset
+        user_id: The ID of the user who owns the task
+        
+    Returns:
+        dict: Result with success status and revised asset URL if successful
+    """
+    try:
+        # Get backend URL from environment
+        backend_url = os.getenv('BACKEND_URL', 'http://localhost:3001')
+        
+        # Create JWT token for the user
+        jwt_token = create_jwt_token(user_id)
+        if not jwt_token:
+            logger.error(f"Failed to create JWT token for user {user_id}")
+            return {'success': False, 'error': 'Failed to create JWT token'}
+        
+        # Prepare the revision request data
+        revision_data = {
+            'revision_prompt': 'Make this HTML report email-friendly by ensuring it uses inline CSS styles, avoids JavaScript dependencies, and is optimized for email clients.',
+            'report_url': html_asset_url,
+            'original_execution_id': execution_id
+        }
+        
+        logger.info(f"🔄 REVISION REQUEST: Creating email-friendly revision for task {task_id}")
+        logger.info(f"📄 Original HTML URL: {html_asset_url}")
+        logger.info(f"🎯 Revision prompt: {revision_data['revision_prompt']}")
+        
+        # Send the revision request to the backend using JWT authentication
+        response = requests.post(
+            f'{backend_url}/api/tasks/{task_id}/executions/revision',
+            json=revision_data,
+            headers={
+                'Authorization': f'Bearer {jwt_token}',
+                'Content-Type': 'application/json'
+            },
+            timeout=60  # Longer timeout for AI processing
+        )
+        
+        if response.status_code == 201:
+            result = response.json()
+            if result.get('success') and result.get('resultFile'):
+                logger.info(f"✅ REVISION SUCCESS: Email-friendly HTML revision created for task {task_id}")
+                logger.info(f"📄 Revised file: {result['resultFile']['filename']}")
+                logger.info(f"🔗 Revised URL: {result['resultFile']['url']}")
+                return {
+                    'success': True, 
+                    'revised_asset_url': result['resultFile']['url'],
+                    'revised_filename': result['resultFile']['filename']
+                }
+            else:
+                logger.error(f"❌ REVISION ERROR: Backend returned error for HTML revision: {result.get('message', 'Unknown error')}")
+                return {'success': False, 'error': result.get('message', 'Unknown error')}
+        else:
+            logger.error(f"❌ REVISION FAILED: HTTP {response.status_code}, Response: {response.text}")
+            return {'success': False, 'error': f'HTTP {response.status_code}: {response.text}'}
+            
+    except Exception as e:
+        logger.error(f"Error creating HTML revision: {e}")
+        return {'success': False, 'error': str(e)}
 
 # Initialize DynamoDB client
 dynamodb = get_dynamodb_resource()
@@ -292,7 +359,7 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                 # Get task details
                 task = tasks_table.get_item(
                     Key={'taskId': execution['taskId']},
-                    ProjectionExpression='userId, #n, emailNotification, requireApproval, slackChannel',
+                    ProjectionExpression='userId, #n, emailNotification, requireApproval, slackChannel, emailFriendlyHtml',
                     ExpressionAttributeNames={'#n': 'name'}
                 ).get('Item')
                 
@@ -390,19 +457,43 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                                             break
                             
                             if asset_file:
-                                # Send Slack approval request
-                                from slack_utils import send_task_approval_request
-                                send_task_approval_request(
-                                    task_id=execution['taskId'],
-                                    task_name=task['name'],
-                                    execution_id=execution_id,
-                                    asset_url=asset_file['url'],
-                                    filename=asset_file['filename'],
-                                    asset_type=asset_type,
-                                    slack_channel=slack_channel,
-                                    user_id=task['userId']
-                                )
-                                logger.info(f"Slack approval request sent for task {execution['taskId']} to channel {slack_channel} for {asset_type} asset (expected: {expected_asset_type or 'auto-detect'})")
+                                revisionDone = False
+                                
+                                # For HTML assets, create an email-friendly revision before sending approval request
+                                # Only if the task has emailFriendlyHtml enabled
+                                if asset_type == 'html' and task.get('emailFriendlyHtml', False):
+                                    logger.info(f"📧 EMAIL-FRIENDLY MODE: Creating email-friendly HTML revision for task {execution['taskId']} (emailFriendlyHtml={task.get('emailFriendlyHtml', False)})")
+                                    revision_result = create_email_friendly_html_revision(
+                                        task_id=execution['taskId'],
+                                        execution_id=execution_id,
+                                        html_asset_url=asset_file['url'],
+                                        user_id=task['userId']
+                                    )
+                                    
+                                    if revision_result['success']:
+                                        # Revision was successful and already sent approval request, skip sending another one
+                                        logger.info(f"✅ EMAIL-FRIENDLY SUCCESS: Revision created and approval request already sent: {revision_result['revised_filename']}")
+                                        logger.info(f"⏭️  SKIPPING: No approval request sent for original HTML (emailFriendlyHtml mode)")
+                                        revisionDone = True
+                                    else:
+                                        logger.warning(f"❌ EMAIL-FRIENDLY FAILED: {revision_result['error']}. Falling back to original HTML for approval.")
+                                        # revisionDone remains False, will send approval below
+                                
+                                # Send Slack approval request if no revision was done or revision failed
+                                if not revisionDone:
+                                    logger.info(f"📤 APPROVAL MODE: Sending approval request for {asset_type} asset (emailFriendlyHtml={task.get('emailFriendlyHtml', False)}, revisionDone={revisionDone})")
+                                    from slack_utils import send_task_approval_request
+                                    send_task_approval_request(
+                                        task_id=execution['taskId'],
+                                        task_name=task['name'],
+                                        execution_id=execution_id,
+                                        asset_url=asset_file['url'],
+                                        filename=asset_file['filename'],
+                                        asset_type=asset_type,
+                                        slack_channel=slack_channel,
+                                        user_id=task['userId']
+                                    )
+                                    logger.info(f"📤 APPROVAL SENT: For task {execution['taskId']} to channel {slack_channel} for {asset_type} asset")
                             else:
                                 expected_msg = f" (expected: {expected_asset_type})" if expected_asset_type else ""
                                 logger.warning(f"No {expected_asset_type or 'HTML report'} found for task {execution['taskId']} that requires approval{expected_msg}")

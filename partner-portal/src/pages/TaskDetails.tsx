@@ -82,6 +82,7 @@ interface Task {
   validateOutput?: boolean; // Flag for validating agent output
   outputAsJson?: boolean; // Flag for outputting result as JSON
   outputAsHtml?: boolean; // New flag for outputting result as HTML5
+  emailFriendlyHtml?: boolean; // Flag for creating email-friendly HTML revisions
   isAgenticDevMode?: boolean; // Flag for enabling agentic dev mode
   llmName?: string;
   attachments?: TaskAttachment[];
@@ -463,6 +464,7 @@ export default function TaskDetails() {
   const [isLeadListDialogOpen, setIsLeadListDialogOpen] = useState(false);
   const [leadListIdentifier, setLeadListIdentifier] = useState("");
   const [leadListIdentifierError, setLeadListIdentifierError] = useState("");
+  const [isEmailFriendlyDialogOpen, setIsEmailFriendlyDialogOpen] = useState(false);
   const [isVideoModelDialogOpen, setIsVideoModelDialogOpen] = useState(false);
   const [selectedVideoModel, setSelectedVideoModel] = useState("");
 
@@ -1249,32 +1251,39 @@ export default function TaskDetails() {
   const handleOutputAsHtmlToggle = async () => {
     if (!task) return;
 
-    try {
-      const newOutputAsHtml = !task.outputAsHtml;
-      const updates: any = { outputAsHtml: newOutputAsHtml };
-      // If turning HTML on, turn JSON off
-      if (newOutputAsHtml && task.outputAsJson) {
-        updates.outputAsJson = false;
+    const newOutputAsHtml = !task.outputAsHtml;
+
+    if (newOutputAsHtml) {
+      // If enabling HTML, show popup to ask about email-friendly option
+      setIsEmailFriendlyDialogOpen(true);
+    } else {
+      // If disabling HTML, just update the toggle and disable email-friendly
+      try {
+        const updates: any = { 
+          outputAsHtml: false,
+          emailFriendlyHtml: false // Also disable email-friendly when disabling HTML
+        };
+
+        await axios.put(buildApiUrl(`/api/tasks/${taskId}`), updates, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+
+        // Update the task state with the response
+        const taskResponse = await axios.get(
+          buildApiUrl(`/api/tasks/${taskId}`),
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+
+        setTask(taskResponse.data);
+      } catch (error: any) {
+        console.error("Error updating HTML output mode:", error);
+        setError(
+          error.response?.data?.message || "Failed to update HTML output mode"
+        );
       }
-
-      await axios.put(buildApiUrl(`/api/tasks/${taskId}`), updates, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-
-      // Update the task state with the response
-      const taskResponse = await axios.get(
-        buildApiUrl(`/api/tasks/${taskId}`),
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-
-      setTask(taskResponse.data);
-    } catch (error: any) {
-      console.error("Error updating HTML output mode:", error);
-      setError(
-        error.response?.data?.message || "Failed to update HTML output mode"
-      );
     }
   };
+
 
   // Add the Agentic Dev Mode toggle handler
   const handleAgenticDevModeToggle = async () => {
@@ -1602,6 +1611,37 @@ export default function TaskDetails() {
     setIsLeadListDialogOpen(false);
     setLeadListIdentifier("");
     setLeadListIdentifierError("");
+  };
+
+  const handleEmailFriendlyDialogClose = () => {
+    setIsEmailFriendlyDialogOpen(false);
+  };
+
+  const handleEmailFriendlyDialogConfirm = async (enableEmailFriendly: boolean) => {
+    try {
+      const updates: any = { 
+        outputAsHtml: true,
+        emailFriendlyHtml: enableEmailFriendly
+      };
+      
+      // If enabling email-friendly, turn JSON off
+      if (enableEmailFriendly && task?.outputAsJson) {
+        updates.outputAsJson = false;
+      }
+
+      await axios.put(
+        buildApiUrl(`/api/tasks/${taskId}`),
+        updates,
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      await fetchTask();
+      handleEmailFriendlyDialogClose();
+    } catch (error) {
+      console.error("Error updating HTML output settings:", error);
+      toast.error("Failed to update HTML output settings");
+    }
   };
 
   const handleLeadListDialogConfirm = async () => {
@@ -2036,7 +2076,21 @@ export default function TaskDetails() {
                           disabled={Boolean(task.isDeepResearch)}
                         />
                       }
-                      label="Output as HTML5"
+                      label={
+                        <Box
+                          sx={{ display: "flex", alignItems: "center", gap: 1 }}
+                        >
+                          <Typography>Output as HTML5</Typography>
+                          {task?.emailFriendlyHtml && (
+                            <Chip
+                              label="Email Friendly"
+                              size="small"
+                              color="primary"
+                              variant="outlined"
+                            />
+                          )}
+                        </Box>
+                      }
                       sx={{ opacity: Boolean(task.isDeepResearch) ? 0.5 : 1 }}
                     />
                   </Tooltip>
@@ -3068,6 +3122,43 @@ export default function TaskDetails() {
         </DialogActions>
       </Dialog>
 
+      {/* Email-Friendly HTML Dialog */}
+      <Dialog
+        open={isEmailFriendlyDialogOpen}
+        onClose={handleEmailFriendlyDialogClose}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>Enable HTML Output</DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ mb: 2 }}>
+            You're enabling HTML output for this task. Would you like to also enable email-friendly HTML?
+            <Box
+              component="span"
+              sx={{ color: "info.main", display: "block", mt: 1 }}
+            >
+              ℹ️ Email-friendly HTML creates optimized version for email rendering.
+            </Box>
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleEmailFriendlyDialogClose}>Cancel</Button>
+          <Button
+            onClick={() => handleEmailFriendlyDialogConfirm(false)}
+            variant="outlined"
+            color="primary"
+          >
+            Just HTML
+          </Button>
+          <Button
+            onClick={() => handleEmailFriendlyDialogConfirm(true)}
+            variant="contained"
+            color="primary"
+          >
+            HTML + Email-Friendly
+          </Button>
+        </DialogActions>
+      </Dialog>
 
     </Container>
   );
