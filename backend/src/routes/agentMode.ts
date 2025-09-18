@@ -1,8 +1,10 @@
 import express, { Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest, requireAdmin } from '../middleware/auth';
 import { agentModeController } from '../controllers/agentModeController';
+import multer from 'multer';
 
 const router = express.Router();
+const upload = multer({ storage: multer.memoryStorage() });
 
 // Helper function to wrap async handlers
 const asyncHandler = (fn: (req: Request, res: Response, next: express.NextFunction) => Promise<any>) => {
@@ -44,6 +46,10 @@ router.get('/session/:sessionId', asyncHandler(agentModeController.getSession));
 // POST /api/agent-mode/generate
 // Generate AI response for marketing conversation
 router.post('/generate', asyncHandler(agentModeController.generateResponse));
+
+// POST /api/agent-mode/upload
+// Upload file attachment for Agent Mode
+router.post('/upload', upload.single('file'), asyncHandler(agentModeController.uploadAttachment));
 
 // GET /api/agent-mode/system-prompt
 // Get current system prompt (admin only)
