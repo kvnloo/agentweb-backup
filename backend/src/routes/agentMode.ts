@@ -16,6 +16,14 @@ const asyncHandler = (fn: (req: Request, res: Response, next: express.NextFuncti
 // Get shared conversation (public)
 router.get('/share/:shareId', asyncHandler(agentModeController.getSharedConversation));
 
+// GET /api/agent-mode/public/welcome-message
+// Get current welcome message (public)
+router.get('/public/welcome-message', asyncHandler(agentModeController.getWelcomeMessage));
+
+// GET /api/agent-mode/public/conversation-starters
+// Get current conversation starters (public)
+router.get('/public/conversation-starters', asyncHandler(agentModeController.getConversationStarters));
+
 // All other routes require authentication
 router.use(authenticateToken);
 
@@ -40,6 +48,14 @@ router.post('/generate', asyncHandler(agentModeController.generateResponse));
 // GET /api/agent-mode/system-prompt
 // Get current system prompt (admin only)
 router.get('/system-prompt', requireAdmin, asyncHandler(agentModeController.getSystemPrompt));
+
+// GET /api/agent-mode/welcome-message
+// Get current welcome message (admin only)
+router.get('/welcome-message', requireAdmin, asyncHandler(agentModeController.getWelcomeMessage));
+
+// GET /api/agent-mode/conversation-starters
+// Get current conversation starters (admin only)
+router.get('/conversation-starters', requireAdmin, asyncHandler(agentModeController.getConversationStarters));
 
 // DELETE /api/agent-mode/session/:sessionId
 // Archive a chat session

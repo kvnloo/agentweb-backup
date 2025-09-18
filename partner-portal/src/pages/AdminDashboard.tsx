@@ -3213,21 +3213,44 @@ export default function AdminDashboard() {
 // Agent Mode Settings Component
 const AgentModeSettings = () => {
   const [systemPrompt, setSystemPrompt] = useState('');
+  const [welcomeMessage, setWelcomeMessage] = useState('');
+  const [, setConversationStarters] = useState<string[]>([]);
+  const [conversationStartersText, setConversationStartersText] = useState('');
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
+  const [savingSystemPrompt, setSavingSystemPrompt] = useState(false);
+  const [savingWelcomeMessage, setSavingWelcomeMessage] = useState(false);
+  const [savingConversationStarters, setSavingConversationStarters] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const { token } = useAuth();
 
   useEffect(() => {
-    loadSystemPrompt();
+    loadAllSettings();
   }, []);
 
-  const loadSystemPrompt = async () => {
+  const loadAllSettings = async () => {
     try {
       setLoading(true);
       setError('');
       
+      // Load system prompt
+      await loadSystemPrompt();
+      
+      // Load welcome message
+      await loadWelcomeMessage();
+      
+      // Load conversation starters
+      await loadConversationStarters();
+    } catch (error) {
+      console.error('Error loading settings:', error);
+      setError('Failed to load settings');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadSystemPrompt = async () => {
+    try {
       try {
         // Try to get custom system prompt from settings
         const response = await axios.get(buildApiUrl('/api/settings/agent_mode_system_prompt'), {
@@ -3252,15 +3275,76 @@ const AgentModeSettings = () => {
       setSystemPrompt(defaultResponse.data);
     } catch (error) {
       console.error('Error loading system prompt:', error);
-      setError('Failed to load system prompt');
-    } finally {
-      setLoading(false);
+      throw error;
+    }
+  };
+
+  const loadWelcomeMessage = async () => {
+    try {
+      try {
+        // Try to get custom welcome message from settings
+        const response = await axios.get(buildApiUrl('/api/settings/agent_mode_welcome_message'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        
+        if (response.data && response.data.settingValue) {
+          setWelcomeMessage(response.data.settingValue);
+          return;
+        }
+      } catch (settingsError: any) {
+        // If setting doesn't exist (404) or other error, fall back to default
+        if (settingsError.response?.status !== 404) {
+          console.error('Error loading custom welcome message:', settingsError);
+        }
+      }
+      
+      // Load default welcome message
+      const defaultResponse = await axios.get(buildApiUrl('/api/agent-mode/welcome-message'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setWelcomeMessage(defaultResponse.data);
+    } catch (error) {
+      console.error('Error loading welcome message:', error);
+      throw error;
+    }
+  };
+
+  const loadConversationStarters = async () => {
+    try {
+      try {
+        // Try to get custom conversation starters from settings
+        const response = await axios.get(buildApiUrl('/api/settings/agent_mode_conversation_starters'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        
+        if (response.data && response.data.settingValue) {
+          const starters = JSON.parse(response.data.settingValue);
+          setConversationStarters(starters);
+          setConversationStartersText(starters.join('\n'));
+          return;
+        }
+      } catch (settingsError: any) {
+        // If setting doesn't exist (404) or other error, fall back to default
+        if (settingsError.response?.status !== 404) {
+          console.error('Error loading custom conversation starters:', settingsError);
+        }
+      }
+      
+      // Load default conversation starters
+      const defaultResponse = await axios.get(buildApiUrl('/api/agent-mode/conversation-starters'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setConversationStarters(defaultResponse.data);
+      setConversationStartersText(defaultResponse.data.join('\n'));
+    } catch (error) {
+      console.error('Error loading conversation starters:', error);
+      throw error;
     }
   };
 
   const saveSystemPrompt = async () => {
     try {
-      setSaving(true);
+      setSavingSystemPrompt(true);
       setError('');
       setSuccess('');
       
@@ -3276,33 +3360,121 @@ const AgentModeSettings = () => {
       console.error('Error saving system prompt:', error);
       setError('Failed to save system prompt');
     } finally {
-      setSaving(false);
+      setSavingSystemPrompt(false);
     }
   };
 
-  const resetToDefault = async () => {
+  const saveWelcomeMessage = async () => {
     try {
-      setSaving(true);
+      setSavingWelcomeMessage(true);
       setError('');
       setSuccess('');
       
-      // First, delete the custom setting from the database
-      await axios.delete(buildApiUrl('/api/settings/agent_mode_system_prompt'), {
+      await axios.put(buildApiUrl('/api/settings/agent_mode_welcome_message'), {
+        settingValue: welcomeMessage,
+        description: 'Agent Mode welcome message for Emma AI assistant'
+      }, {
         headers: { Authorization: `Bearer ${token}` }
       });
       
-      // Then load the default system prompt
-      const response = await axios.get(buildApiUrl('/api/agent-mode/system-prompt'), {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      
-      setSystemPrompt(response.data);
-      setSuccess('Reset to default system prompt successfully!');
+      setSuccess('Welcome message updated successfully!');
     } catch (error) {
-      console.error('Error resetting system prompt:', error);
-      setError('Failed to reset system prompt');
+      console.error('Error saving welcome message:', error);
+      setError('Failed to save welcome message');
     } finally {
-      setSaving(false);
+      setSavingWelcomeMessage(false);
+    }
+  };
+
+  const saveConversationStarters = async () => {
+    try {
+      setSavingConversationStarters(true);
+      setError('');
+      setSuccess('');
+      
+      // Parse the text input into an array
+      const starters = conversationStartersText
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => line.length > 0);
+      
+      await axios.put(buildApiUrl('/api/settings/agent_mode_conversation_starters'), {
+        settingValue: JSON.stringify(starters),
+        description: 'Agent Mode conversation starters for Emma AI assistant'
+      }, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      
+      setConversationStarters(starters);
+      setSuccess('Conversation starters updated successfully!');
+    } catch (error) {
+      console.error('Error saving conversation starters:', error);
+      setError('Failed to save conversation starters');
+    } finally {
+      setSavingConversationStarters(false);
+    }
+  };
+
+  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters') => {
+    try {
+      setError('');
+      setSuccess('');
+      
+      if (type === 'systemPrompt') {
+        setSavingSystemPrompt(true);
+        // First, delete the custom setting from the database
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_system_prompt'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        
+        // Then load the default system prompt
+        const response = await axios.get(buildApiUrl('/api/agent-mode/system-prompt'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        
+        setSystemPrompt(response.data);
+        setSuccess('Reset to default system prompt successfully!');
+      } else if (type === 'welcomeMessage') {
+        setSavingWelcomeMessage(true);
+        // First, delete the custom setting from the database
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_welcome_message'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        
+        // Then load the default welcome message
+        const response = await axios.get(buildApiUrl('/api/agent-mode/welcome-message'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        
+        setWelcomeMessage(response.data);
+        setSuccess('Reset to default welcome message successfully!');
+      } else if (type === 'conversationStarters') {
+        setSavingConversationStarters(true);
+        // First, delete the custom setting from the database
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_conversation_starters'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        
+        // Then load the default conversation starters
+        const response = await axios.get(buildApiUrl('/api/agent-mode/conversation-starters'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        
+        setConversationStarters(response.data);
+        setConversationStartersText(response.data.join('\n'));
+        setSuccess('Reset to default conversation starters successfully!');
+      }
+    } catch (error) {
+      console.error('Error resetting setting:', error);
+      setError('Failed to reset setting');
+    } finally {
+      if (type === 'systemPrompt') {
+        setSavingSystemPrompt(false);
+      } else if (type === 'welcomeMessage') {
+        setSavingWelcomeMessage(false);
+      } else if (type === 'conversationStarters') {
+        setSavingConversationStarters(false);
+      }
     }
   };
 
@@ -3317,12 +3489,11 @@ const AgentModeSettings = () => {
   return (
     <Box>
       <Typography variant="h6" gutterBottom>
-        Agent Mode System Prompt Configuration
+        Agent Mode Configuration
       </Typography>
       <Typography variant="body2" color="text.secondary" paragraph>
-        Customize the system prompt for Emma, the AI assistant in Agent Mode. 
-        Changes will apply to new chat sessions. The system prompt version is 
-        automatically tracked in chat history.
+        Customize Emma's behavior, welcome message, and conversation starters in Agent Mode. 
+        Changes will apply to new chat sessions.
       </Typography>
 
       {error && (
@@ -3337,7 +3508,8 @@ const AgentModeSettings = () => {
         </Alert>
       )}
 
-      <Card>
+      {/* System Prompt */}
+      <Card sx={{ mb: 3 }}>
         <CardContent>
           <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
             <Typography variant="h6">
@@ -3346,8 +3518,8 @@ const AgentModeSettings = () => {
             <Box>
               <Button
                 variant="outlined"
-                onClick={resetToDefault}
-                disabled={saving}
+                onClick={() => resetToDefault('systemPrompt')}
+                disabled={savingSystemPrompt}
                 sx={{ mr: 1 }}
               >
                 Reset to Default
@@ -3355,9 +3527,9 @@ const AgentModeSettings = () => {
               <Button
                 variant="contained"
                 onClick={saveSystemPrompt}
-                disabled={saving}
+                disabled={savingSystemPrompt}
               >
-                {saving ? <CircularProgress size={20} /> : 'Save Changes'}
+                {savingSystemPrompt ? <CircularProgress size={20} /> : 'Save Changes'}
               </Button>
             </Box>
           </Box>
@@ -3365,7 +3537,7 @@ const AgentModeSettings = () => {
           <TextField
             fullWidth
             multiline
-            rows={20}
+            rows={15}
             value={systemPrompt}
             onChange={(e) => setSystemPrompt(e.target.value)}
             placeholder="Enter the system prompt for Emma..."
@@ -3376,6 +3548,101 @@ const AgentModeSettings = () => {
           <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
             The system prompt defines Emma's behavior, capabilities, and response format. 
             Use HTML formatting for responses. Changes will be versioned and tracked in chat history.
+          </Typography>
+        </CardContent>
+      </Card>
+
+      {/* Welcome Message */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">
+              Welcome Message
+            </Typography>
+            <Box>
+              <Button
+                variant="outlined"
+                onClick={() => resetToDefault('welcomeMessage')}
+                disabled={savingWelcomeMessage}
+                sx={{ mr: 1 }}
+              >
+                Reset to Default
+              </Button>
+              <Button
+                variant="contained"
+                onClick={saveWelcomeMessage}
+                disabled={savingWelcomeMessage}
+              >
+                {savingWelcomeMessage ? <CircularProgress size={20} /> : 'Save Changes'}
+              </Button>
+            </Box>
+          </Box>
+          
+          <TextField
+            fullWidth
+            multiline
+            rows={4}
+            value={welcomeMessage}
+            onChange={(e) => setWelcomeMessage(e.target.value)}
+            placeholder="Enter the welcome message for Emma... (supports HTML formatting like &lt;strong&gt;bold&lt;/strong&gt;, &lt;ul&gt;&lt;li&gt;lists&lt;/li&gt;&lt;/ul&gt;, etc.)"
+            variant="outlined"
+          />
+          
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            The welcome message appears when users start a new chat session with Emma. 
+            Supports HTML formatting: <strong>&lt;strong&gt;</strong>, <em>&lt;em&gt;</em>, 
+            <code>&lt;ul&gt;</code>, <code>&lt;li&gt;</code>, <code>&lt;br&gt;</code>, etc.
+            <br /><br />
+            <strong>Example:</strong><br />
+            <code>
+              I'm Emma, your team's new CMO 😎&lt;br&gt;&lt;br&gt;<br />
+              &lt;strong&gt;I can help you with:&lt;/strong&gt;&lt;br&gt;<br />
+              • Market research and analysis&lt;br&gt;<br />
+              • Ad campaign optimization&lt;br&gt;<br />
+              • Content strategy development
+            </code>
+          </Typography>
+        </CardContent>
+      </Card>
+
+      {/* Conversation Starters */}
+      <Card>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">
+              Conversation Starters
+            </Typography>
+            <Box>
+              <Button
+                variant="outlined"
+                onClick={() => resetToDefault('conversationStarters')}
+                disabled={savingConversationStarters}
+                sx={{ mr: 1 }}
+              >
+                Reset to Default
+              </Button>
+              <Button
+                variant="contained"
+                onClick={saveConversationStarters}
+                disabled={savingConversationStarters}
+              >
+                {savingConversationStarters ? <CircularProgress size={20} /> : 'Save Changes'}
+              </Button>
+            </Box>
+          </Box>
+          
+          <TextField
+            fullWidth
+            multiline
+            rows={6}
+            value={conversationStartersText}
+            onChange={(e) => setConversationStartersText(e.target.value)}
+            placeholder="Enter conversation starters, one per line..."
+            variant="outlined"
+          />
+          
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            Enter one conversation starter per line. These will appear as quick-start buttons in the Agent Mode interface.
           </Typography>
         </CardContent>
       </Card>
