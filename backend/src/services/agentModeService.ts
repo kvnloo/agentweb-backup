@@ -2206,7 +2206,16 @@ Use the available tools to create tasks in the agent-engine when complex work is
         }
         
         if (value !== undefined && value !== null) {
-          if (Array.isArray(value)) {
+          if (field === 'brandAssets' && Array.isArray(value) && value.length > 0) {
+            formattedSummary += `• <strong>Brand Assets:</strong> Updated ${value.length} asset(s)<br>`;
+            value.forEach((asset: any) => {
+              const assetType = asset.type === 'logo' ? 'Primary Logo' : 
+                              asset.type === 'secondaryLogo' ? 'Secondary Logo' :
+                              asset.type === 'brandGuide' ? 'Brand Guide' : 
+                              asset.type === 'additionalAsset' ? 'Additional Asset' : asset.type;
+              formattedSummary += `  - ${assetType}: ${asset.filename}<br>`;
+            });
+          } else if (Array.isArray(value)) {
             formattedSummary += `• <strong>${field}:</strong> ${value.join(', ')}<br>`;
           } else {
             formattedSummary += `• <strong>${field}:</strong> ${value}<br>`;
