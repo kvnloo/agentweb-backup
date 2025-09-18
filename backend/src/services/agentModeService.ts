@@ -476,7 +476,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'update_brand_guidelines',
-          description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. Do not include unchanged fields in the update.',
+          description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. Can update both brand data and brand assets (logos, brand guides, etc.).',
           parameters: {
             type: 'object',
             properties: {
@@ -505,9 +505,21 @@ Use the available tools to create tasks in the agent-engine when complex work is
                   },
                   isGradient: { type: 'boolean', description: 'Whether primary color uses gradient' }
                 }
+              },
+              brandAssets: {
+                type: 'array',
+                description: 'Brand assets to update (logos, brand guides, etc.) - array of asset objects with type, url, filename',
+                items: {
+                  type: 'object',
+                  properties: {
+                    type: { type: 'string', enum: ['logo', 'secondaryLogo', 'brandGuide', 'additionalAsset'], description: 'Type of brand asset' },
+                    url: { type: 'string', description: 'URL of the brand asset' },
+                    filename: { type: 'string', description: 'Original filename of the brand asset' }
+                  }
+                }
               }
             },
-            required: ['brandData']
+            required: []
           }
         }
       },
@@ -677,7 +689,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'read_brand_guidelines':
         return await this.readBrandGuidelines(userId);
       case 'update_brand_guidelines':
-        return await this.updateBrandGuidelines(args.brandData, userId);
+        return await this.updateBrandGuidelines(args, userId);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -809,8 +821,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
-  // Update user's brand guidelines
-  private async updateBrandGuidelines(brandData: any, userId: string): Promise<any> {
+  // Update user's brand guidelines (supports both brandData and attachments)
+  private async updateBrandGuidelines(updateData: any, userId: string): Promise<any> {
     try {
       const { userDb } = await import('./db');
       const user = await userDb.getUserById(userId);
@@ -832,26 +844,64 @@ Use the available tools to create tasks in the agent-engine when complex work is
         };
       }
 
-      // Merge with existing data - only update provided fields
+      // Extract brandData and brandAssets from updateData
+      const { brandData, brandAssets, ...otherFields } = updateData;
+      
+      // Merge with existing brandData - only update provided fields
       const updatedBrandData = {
         ...existingBrand.brandData,
         ...brandData
       };
+
+      // Handle brandAssets update - merge by type to preserve existing assets
+      let updatedAttachments = [...(existingBrand.attachments || [])];
+      if (brandAssets !== undefined) {
+        if (Array.isArray(brandAssets)) {
+          // Merge by type: replace assets of the same type, keep others
+          brandAssets.forEach(newAsset => {
+            const existingIndex = updatedAttachments.findIndex(existing => existing.type === newAsset.type);
+            if (existingIndex >= 0) {
+              // Replace existing asset of the same type
+              updatedAttachments[existingIndex] = newAsset;
+            } else {
+              // Add new asset type
+              updatedAttachments.push(newAsset);
+            }
+          });
+        } else if (typeof brandAssets === 'object' && brandAssets !== null) {
+          // Single asset - merge by type
+          const existingIndex = updatedAttachments.findIndex(existing => existing.type === brandAssets.type);
+          if (existingIndex >= 0) {
+            // Replace existing asset of the same type
+            updatedAttachments[existingIndex] = brandAssets;
+          } else {
+            // Add new asset type
+            updatedAttachments.push(brandAssets);
+          }
+        }
+      }
 
       // Update the user's brand guidelines
       await userDb.updateUser(userId, {
         brandGuidelines: {
           ...existingBrand,
           brandData: updatedBrandData,
+          attachments: updatedAttachments,
           updatedAt: new Date().toISOString()
         }
       });
 
+      const updatedFields = [];
+      if (brandData) updatedFields.push(...Object.keys(brandData));
+      if (brandAssets !== undefined) updatedFields.push('brandAssets');
+      updatedFields.push(...Object.keys(otherFields));
+
       return {
         success: true,
         message: 'Brand guidelines updated successfully',
-        updatedFields: Object.keys(brandData),
-        brandData: updatedBrandData
+        updatedFields,
+        brandData: updatedBrandData,
+        attachments: updatedAttachments
       };
     } catch (error) {
       console.error('AgentMode: Error updating brand guidelines:', error);
