@@ -21,7 +21,7 @@ export class AgentModeService {
 
   // Generate AI response for marketing conversation
   async generateMarketingResponse(
-    userMessage: string,
+    messageContent: string,
     sessionHistory: ChatMessage[],
     userId: string,
     sessionId: string
@@ -32,7 +32,7 @@ export class AgentModeService {
       const systemPrompt = await this.getMarketingSystemPrompt();
       const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
       const availableTemplates = await this.getAvailableTemplates();
-      const context = this.buildMarketingContext(userMessage, sessionHistory, currentTaskStatuses);
+      const context = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses);
       
       // Build templates context message
       const templatesContext = this.buildTemplatesContext(availableTemplates);
@@ -189,6 +189,13 @@ You can help with various marketing tasks including:
 - Meta ads metrics analysis and insights
 - Social media listening and brand monitoring
 - Web search for current information and real-time data
+- Analysis of attached files and documents
+
+## File Attachments
+When users attach files to their messages, you will receive:
+- **Attached Files**: Clickable markdown links with filenames, file types, and sizes
+- You can reference these files by their URLs and analyze their content
+- Use the file URLs to understand what the user has shared and provide relevant assistance
 
 ## Task Creation Approach
 - **IMPORTANT**: Always confirm with the user before creating any task, as tasks can take a few minutes to complete
@@ -345,8 +352,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
-  private buildMarketingContext(userMessage: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = []): string {
-    let context = `User Message: ${userMessage}\n\n`;
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = []): string {
+    let context = `User Message: ${messageContent}\n\n`;
     
     // Add current task statuses if any
     if (currentTaskStatuses.length > 0) {
@@ -370,7 +377,17 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const recentHistory = nonSystemMessages.slice(-10);
       context += 'Recent Conversation:\n';
       recentHistory.forEach(msg => {
-        context += `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}\n`;
+        let messageContent = msg.content;
+        
+        // If this is a user message with attachments, include them
+        if (msg.role === 'user' && msg.metadata?.attachments && msg.metadata.attachments.length > 0) {
+          const attachmentUrls = msg.metadata.attachments.map((attachment: any) => {
+            return `[${attachment.filename || 'Attachment'}](${attachment.url})`;
+          }).join('\n');
+          messageContent = `${msg.content}\n\n**Attached Files:**\n${attachmentUrls}`;
+        }
+        
+        context += `${msg.role === 'user' ? 'User' : 'Assistant'}: ${messageContent}\n`;
       });
       context += '\n';
     }

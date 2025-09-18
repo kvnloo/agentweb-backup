@@ -91,15 +91,9 @@ export const agentModeController = {
           return `[${attachment.filename || 'Attachment'}](${attachment.url})`;
         }).join('\n');
         messageContent = `${userMessage}\n\n**Attached Files:**\n${attachmentUrls}`;
-        
-        // Also add structured attachment information for LLM processing
-        const structuredAttachments = attachments.map((attachment: any) => {
-          return `- **${attachment.filename}**: ${attachment.url} (${attachment.mimetype}, ${(attachment.size / 1024).toFixed(1)} KB)`;
-        }).join('\n');
-        messageContent += `\n\n**Attachment Details for Processing:**\n${structuredAttachments}`;
       }
 
-      // Create user message object - store original content, not processed content
+      // Create user message object - store processed content with attachments
       const userMessageObj = {
         role: 'user' as const,
         content: userMessage, // Store original user message, not processed content
