@@ -30,7 +30,7 @@ export class AgentModeService {
       console.log('AgentMode: Generating marketing response');
       
       const systemPrompt = await this.getMarketingSystemPrompt();
-      const currentTaskStatuses = await this.getCurrentTaskStatuses(userId);
+      const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
       const availableTemplates = await this.getAvailableTemplates();
       const context = this.buildMarketingContext(userMessage, sessionHistory, currentTaskStatuses);
       
@@ -842,6 +842,47 @@ Use the available tools to create tasks in the agent-engine when complex work is
         message: 'Failed to update brand guidelines',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
+    }
+  }
+
+  private getCurrentTaskStatusesInSession(sessionHistory: ChatMessage[]): any[] {
+    try {
+      const taskStatuses: any[] = [];
+      
+      // Extract task statuses from session history
+      sessionHistory.forEach(message => {
+        if (message.metadata?.toolCalls) {
+          message.metadata.toolCalls.forEach((toolCall: any) => {
+            // Check if this is a task creation tool call
+            if ((toolCall.name === 'create_task_from_template' || toolCall.name === 'create_task_from_prompt' || toolCall.name === 'create_image_task_from_prompt') && toolCall.result) {
+              const result = toolCall.result;
+              if (result.taskId && result.executionId) {
+                taskStatuses.push({
+                  taskId: result.taskId,
+                  executionId: result.executionId,
+                  taskName: result.taskName || `Task ${result.taskId}`,
+                  status: result.status || 'pending',
+                  createdAt: new Date().toISOString()
+                });
+              }
+            }
+          });
+        }
+      });
+      
+      // Remove duplicates and return unique task statuses
+      const uniqueTaskStatuses = new Map();
+      taskStatuses.forEach(task => {
+        const key = `${task.taskId}-${task.executionId}`;
+        if (!uniqueTaskStatuses.has(key)) {
+          uniqueTaskStatuses.set(key, task);
+        }
+      });
+      
+      return Array.from(uniqueTaskStatuses.values());
+    } catch (error) {
+      console.error('AgentMode: Error getting task statuses from session:', error);
+      return [];
     }
   }
 
