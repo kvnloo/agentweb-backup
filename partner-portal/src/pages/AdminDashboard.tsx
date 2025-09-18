@@ -3217,7 +3217,9 @@ const AgentModeSettings = () => {
   const [, setConversationStarters] = useState<string[]>([]);
   const [conversationStartersText, setConversationStartersText] = useState('');
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
+  const [savingSystemPrompt, setSavingSystemPrompt] = useState(false);
+  const [savingWelcomeMessage, setSavingWelcomeMessage] = useState(false);
+  const [savingConversationStarters, setSavingConversationStarters] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const { token } = useAuth();
@@ -3342,7 +3344,7 @@ const AgentModeSettings = () => {
 
   const saveSystemPrompt = async () => {
     try {
-      setSaving(true);
+      setSavingSystemPrompt(true);
       setError('');
       setSuccess('');
       
@@ -3358,13 +3360,13 @@ const AgentModeSettings = () => {
       console.error('Error saving system prompt:', error);
       setError('Failed to save system prompt');
     } finally {
-      setSaving(false);
+      setSavingSystemPrompt(false);
     }
   };
 
   const saveWelcomeMessage = async () => {
     try {
-      setSaving(true);
+      setSavingWelcomeMessage(true);
       setError('');
       setSuccess('');
       
@@ -3380,13 +3382,13 @@ const AgentModeSettings = () => {
       console.error('Error saving welcome message:', error);
       setError('Failed to save welcome message');
     } finally {
-      setSaving(false);
+      setSavingWelcomeMessage(false);
     }
   };
 
   const saveConversationStarters = async () => {
     try {
-      setSaving(true);
+      setSavingConversationStarters(true);
       setError('');
       setSuccess('');
       
@@ -3409,17 +3411,17 @@ const AgentModeSettings = () => {
       console.error('Error saving conversation starters:', error);
       setError('Failed to save conversation starters');
     } finally {
-      setSaving(false);
+      setSavingConversationStarters(false);
     }
   };
 
   const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters') => {
     try {
-      setSaving(true);
       setError('');
       setSuccess('');
       
       if (type === 'systemPrompt') {
+        setSavingSystemPrompt(true);
         // First, delete the custom setting from the database
         await axios.delete(buildApiUrl('/api/settings/agent_mode_system_prompt'), {
           headers: { Authorization: `Bearer ${token}` }
@@ -3433,6 +3435,7 @@ const AgentModeSettings = () => {
         setSystemPrompt(response.data);
         setSuccess('Reset to default system prompt successfully!');
       } else if (type === 'welcomeMessage') {
+        setSavingWelcomeMessage(true);
         // First, delete the custom setting from the database
         await axios.delete(buildApiUrl('/api/settings/agent_mode_welcome_message'), {
           headers: { Authorization: `Bearer ${token}` }
@@ -3446,6 +3449,7 @@ const AgentModeSettings = () => {
         setWelcomeMessage(response.data);
         setSuccess('Reset to default welcome message successfully!');
       } else if (type === 'conversationStarters') {
+        setSavingConversationStarters(true);
         // First, delete the custom setting from the database
         await axios.delete(buildApiUrl('/api/settings/agent_mode_conversation_starters'), {
           headers: { Authorization: `Bearer ${token}` }
@@ -3464,7 +3468,13 @@ const AgentModeSettings = () => {
       console.error('Error resetting setting:', error);
       setError('Failed to reset setting');
     } finally {
-      setSaving(false);
+      if (type === 'systemPrompt') {
+        setSavingSystemPrompt(false);
+      } else if (type === 'welcomeMessage') {
+        setSavingWelcomeMessage(false);
+      } else if (type === 'conversationStarters') {
+        setSavingConversationStarters(false);
+      }
     }
   };
 
@@ -3509,7 +3519,7 @@ const AgentModeSettings = () => {
               <Button
                 variant="outlined"
                 onClick={() => resetToDefault('systemPrompt')}
-                disabled={saving}
+                disabled={savingSystemPrompt}
                 sx={{ mr: 1 }}
               >
                 Reset to Default
@@ -3517,9 +3527,9 @@ const AgentModeSettings = () => {
               <Button
                 variant="contained"
                 onClick={saveSystemPrompt}
-                disabled={saving}
+                disabled={savingSystemPrompt}
               >
-                {saving ? <CircularProgress size={20} /> : 'Save Changes'}
+                {savingSystemPrompt ? <CircularProgress size={20} /> : 'Save Changes'}
               </Button>
             </Box>
           </Box>
@@ -3553,7 +3563,7 @@ const AgentModeSettings = () => {
               <Button
                 variant="outlined"
                 onClick={() => resetToDefault('welcomeMessage')}
-                disabled={saving}
+                disabled={savingWelcomeMessage}
                 sx={{ mr: 1 }}
               >
                 Reset to Default
@@ -3561,9 +3571,9 @@ const AgentModeSettings = () => {
               <Button
                 variant="contained"
                 onClick={saveWelcomeMessage}
-                disabled={saving}
+                disabled={savingWelcomeMessage}
               >
-                {saving ? <CircularProgress size={20} /> : 'Save Changes'}
+                {savingWelcomeMessage ? <CircularProgress size={20} /> : 'Save Changes'}
               </Button>
             </Box>
           </Box>
@@ -3595,7 +3605,7 @@ const AgentModeSettings = () => {
               <Button
                 variant="outlined"
                 onClick={() => resetToDefault('conversationStarters')}
-                disabled={saving}
+                disabled={savingConversationStarters}
                 sx={{ mr: 1 }}
               >
                 Reset to Default
@@ -3603,9 +3613,9 @@ const AgentModeSettings = () => {
               <Button
                 variant="contained"
                 onClick={saveConversationStarters}
-                disabled={saving}
+                disabled={savingConversationStarters}
               >
-                {saving ? <CircularProgress size={20} /> : 'Save Changes'}
+                {savingConversationStarters ? <CircularProgress size={20} /> : 'Save Changes'}
               </Button>
             </Box>
           </Box>
