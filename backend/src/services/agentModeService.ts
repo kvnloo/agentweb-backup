@@ -21,7 +21,7 @@ export class AgentModeService {
 
   // Generate AI response for marketing conversation
   async generateMarketingResponse(
-    userMessage: string,
+    messageContent: string,
     sessionHistory: ChatMessage[],
     userId: string,
     sessionId: string
@@ -30,9 +30,9 @@ export class AgentModeService {
       console.log('AgentMode: Generating marketing response');
       
       const systemPrompt = await this.getMarketingSystemPrompt();
-      const currentTaskStatuses = await this.getCurrentTaskStatuses(userId);
+      const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
       const availableTemplates = await this.getAvailableTemplates();
-      const context = this.buildMarketingContext(userMessage, sessionHistory, currentTaskStatuses);
+      const context = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses);
       
       // Build templates context message
       const templatesContext = this.buildTemplatesContext(availableTemplates);
@@ -48,6 +48,7 @@ export class AgentModeService {
       const toolCalls: any[] = [];
       const knowledgeBaseQueries: string[] = [];
       const sources: string[] = [];
+      let shouldFeedbackToLLM = false;
 
       // Single loop for LLM calls and tool execution
       let maxIterations = 10; // Prevent infinite loops
@@ -82,7 +83,9 @@ export class AgentModeService {
         }
         
         console.log(`AgentMode: Executing ${responseMessage.tool_calls.length} tool calls`);
-        let hasWebSearch = false;
+        
+        // Reset feedback flag for this iteration
+        shouldFeedbackToLLM = false;
         
         // Execute tool calls
         for (const toolCall of responseMessage.tool_calls) {
@@ -109,9 +112,18 @@ export class AgentModeService {
               content += `\n\n${metricsSummary}`;
             } else if (toolCall.function.name === 'search_web' && result.success) {
               // Track web search results
-              hasWebSearch = true;
+              shouldFeedbackToLLM = true;
               const searchSummary = this.formatWebSearchResults(result);
               content += `\n\n${searchSummary}`;
+            } else if (toolCall.function.name === 'read_brand_guidelines' && result.success) {
+              // Special handling for brand guidelines - provide formatted brand data for AI analysis
+              shouldFeedbackToLLM = true;
+              const brandSummary = this.formatBrandGuidelines(result);
+              content += `\n\n${brandSummary}`;
+            } else if (toolCall.function.name === 'update_brand_guidelines' && result.success) {
+              // Special handling for brand guidelines update - provide feedback to LLM
+              const updateSummary = this.formatBrandGuidelinesUpdate(result);
+              content += `\n\n${updateSummary}`;
             }
           } catch (error) {
             console.error(`AgentMode: Tool execution error for ${toolCall.function.name}:`, error);
@@ -124,9 +136,9 @@ export class AgentModeService {
           }
         }
         
-        // Break the loop if no web search was performed in this iteration
-        if (!hasWebSearch) {
-          console.log('AgentMode: No web search in this iteration, breaking loop');
+        // Break the loop if no tools provided feedback in this iteration
+        if (!shouldFeedbackToLLM) {
+          console.log('AgentMode: No tools provided feedback in this iteration, breaking loop');
           break;
         }
         
@@ -177,6 +189,14 @@ You can help with various marketing tasks including:
 - Meta ads metrics analysis and insights
 - Social media listening and brand monitoring
 - Web search for current information and real-time data
+- Analysis of attached files and documents
+
+## File Attachments
+When users attach files to their messages, you will receive:
+- **Attached Files**: Clickable markdown links in the format \`[filename](url)\`
+- You can reference these files by their URLs and analyze their content
+- Use the file URLs to understand what the user has shared and provide relevant assistance
+- **IMPORTANT**: When creating tasks that are related to the attached files, you MUST include the attachment details (URLs and filenames) in the task prompt, otherwise the task execution won't have access to the files
 
 ## Task Creation Approach
 - **IMPORTANT**: Always confirm with the user before creating any task, as tasks can take a few minutes to complete
@@ -333,8 +353,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
-  private buildMarketingContext(userMessage: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = []): string {
-    let context = `User Message: ${userMessage}\n\n`;
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = []): string {
+    let context = `User Message: ${messageContent}\n\n`;
     
     // Add current task statuses if any
     if (currentTaskStatuses.length > 0) {
@@ -358,7 +378,17 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const recentHistory = nonSystemMessages.slice(-10);
       context += 'Recent Conversation:\n';
       recentHistory.forEach(msg => {
-        context += `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}\n`;
+        let messageContent = msg.content;
+        
+        // If this is a user message with attachments, include them
+        if (msg.role === 'user' && msg.metadata?.attachments && msg.metadata.attachments.length > 0) {
+          const attachmentUrls = msg.metadata.attachments.map((attachment: any) => {
+            return `[${attachment.filename || 'Attachment'}](${attachment.url})`;
+          }).join('\n');
+          messageContent = `${msg.content}\n\n**Attached Files:**\n${attachmentUrls}`;
+        }
+        
+        context += `${msg.role === 'user' ? 'User' : 'Assistant'}: ${messageContent}\n`;
       });
       context += '\n';
     }
@@ -427,6 +457,69 @@ Use the available tools to create tasks in the agent-engine when complex work is
               }
             },
             required: ['template_id', 'parameters_json']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'read_brand_guidelines',
+          description: 'Read the current user\'s brand guidelines (brand data and attachments). Returns exists=false if not set.',
+          parameters: {
+            type: 'object',
+            properties: {},
+            required: []
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'update_brand_guidelines',
+          description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. Can update both brand data and brand assets (logos, brand guides, etc.).',
+          parameters: {
+            type: 'object',
+            properties: {
+              brandData: {
+                type: 'object',
+                description: 'Brand data object with only the fields that need to be updated',
+                properties: {
+                  brandName: { type: 'string', description: 'Brand name' },
+                  tagline: { type: 'string', description: 'Brand tagline or slogan' },
+                  primaryColor: { type: 'string', description: 'Primary brand color (hex code)' },
+                  primaryColorEnd: { type: 'string', description: 'End color for gradient (hex code)' },
+                  secondaryColor: { type: 'string', description: 'Secondary brand color (hex code)' },
+                  fontFamily: { type: 'string', description: 'Primary font family' },
+                  toneOfVoice: { type: 'string', description: 'Brand tone of voice' },
+                  brandPersonality: { type: 'string', description: 'Brand personality description' },
+                  targetAudience: { type: 'string', description: 'Target audience description' },
+                  keyMessages: { 
+                    type: 'array', 
+                    items: { type: 'string' },
+                    description: 'Array of key brand messages' 
+                  },
+                  brandValues: { 
+                    type: 'array', 
+                    items: { type: 'string' },
+                    description: 'Array of brand values' 
+                  },
+                  isGradient: { type: 'boolean', description: 'Whether primary color uses gradient' }
+                }
+              },
+              brandAssets: {
+                type: 'array',
+                description: 'Brand assets to update (logos, brand guides, etc.) - array of asset objects with type, url, filename',
+                items: {
+                  type: 'object',
+                  properties: {
+                    type: { type: 'string', enum: ['logo', 'secondaryLogo', 'brandGuide', 'additionalAsset'], description: 'Type of brand asset' },
+                    url: { type: 'string', description: 'URL of the brand asset' },
+                    filename: { type: 'string', description: 'Original filename of the brand asset' }
+                  }
+                }
+              }
+            },
+            required: []
           }
         }
       },
@@ -593,6 +686,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.createRevision(args.task_id, args.execution_id, args.revision_prompt, userId, args.target_result_name);
       case 'search_web':
         return await this.searchWeb(args.query, args.max_results || 10);
+      case 'read_brand_guidelines':
+        return await this.readBrandGuidelines(userId);
+      case 'update_brand_guidelines':
+        return await this.updateBrandGuidelines(args, userId);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -676,6 +773,191 @@ Use the available tools to create tasks in the agent-engine when complex work is
     } catch (error) {
       console.error('Error fetching previous task results:', error);
       return '';
+    }
+  }
+
+  // Read current user's brand guidelines
+  private async readBrandGuidelines(userId: string): Promise<any> {
+    try {
+      const { userDb } = await import('./db');
+      const user = await userDb.getUserById(userId);
+      if (!user) {
+        return { 
+          success: false, 
+          message: 'User not found', 
+          exists: false,
+          error: 'User not found'
+        };
+      }
+
+      const brand = user.brandGuidelines;
+      if (!brand) {
+        return { 
+          success: true, 
+          exists: false, 
+          message: 'No brand guidelines found',
+          brandData: {},
+          attachments: []
+        };
+      }
+
+      // Return structured response similar to web_search
+      return {
+        success: true,
+        message: `Brand guidelines retrieved successfully`,
+        exists: true,
+        brandData: brand.brandData || {},
+        attachments: brand.attachments || [],
+        createdAt: brand.createdAt,
+        updatedAt: brand.updatedAt
+      };
+    } catch (error) {
+      console.error('AgentMode: Error reading brand guidelines:', error);
+      return { 
+        success: false, 
+        message: 'Failed to read brand guidelines',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // Update user's brand guidelines (supports both brandData and attachments)
+  private async updateBrandGuidelines(updateData: any, userId: string): Promise<any> {
+    try {
+      const { userDb } = await import('./db');
+      const user = await userDb.getUserById(userId);
+      if (!user) {
+        return {
+          success: false,
+          message: 'User not found',
+          error: 'User not found'
+        };
+      }
+
+      // Get existing brand guidelines
+      const existingBrand = user.brandGuidelines;
+      if (!existingBrand) {
+        return {
+          success: false,
+          message: 'No existing brand guidelines found. Please create brand guidelines first.',
+          error: 'No existing brand guidelines'
+        };
+      }
+
+      // Extract brandData and brandAssets from updateData
+      const { brandData, brandAssets, ...otherFields } = updateData;
+      
+      // Merge with existing brandData - only update provided fields
+      const updatedBrandData = {
+        ...existingBrand.brandData,
+        ...brandData
+      };
+
+      // Handle brandAssets update - merge by type to preserve existing assets
+      let updatedAttachments = [...(existingBrand.attachments || [])];
+      const updatedAssets: any[] = []; // Track which assets were actually updated
+      
+      if (brandAssets !== undefined) {
+        if (Array.isArray(brandAssets)) {
+          // Merge by type: replace assets of the same type, keep others
+          brandAssets.forEach(newAsset => {
+            const existingIndex = updatedAttachments.findIndex(existing => existing.type === newAsset.type);
+            if (existingIndex >= 0) {
+              // Replace existing asset of the same type
+              updatedAttachments[existingIndex] = newAsset;
+              updatedAssets.push(newAsset); // Track as updated
+            } else {
+              // Add new asset type
+              updatedAttachments.push(newAsset);
+              updatedAssets.push(newAsset); // Track as added
+            }
+          });
+        } else if (typeof brandAssets === 'object' && brandAssets !== null) {
+          // Single asset - merge by type
+          const existingIndex = updatedAttachments.findIndex(existing => existing.type === brandAssets.type);
+          if (existingIndex >= 0) {
+            // Replace existing asset of the same type
+            updatedAttachments[existingIndex] = brandAssets;
+            updatedAssets.push(brandAssets); // Track as updated
+          } else {
+            // Add new asset type
+            updatedAttachments.push(brandAssets);
+            updatedAssets.push(brandAssets); // Track as added
+          }
+        }
+      }
+
+      // Update the user's brand guidelines
+      await userDb.updateUser(userId, {
+        brandGuidelines: {
+          ...existingBrand,
+          brandData: updatedBrandData,
+          attachments: updatedAttachments,
+          updatedAt: new Date().toISOString()
+        }
+      });
+
+      const updatedFields = [];
+      if (brandData) updatedFields.push(...Object.keys(brandData));
+      if (brandAssets !== undefined) updatedFields.push('brandAssets');
+      updatedFields.push(...Object.keys(otherFields));
+
+      return {
+        success: true,
+        message: 'Brand guidelines updated successfully',
+        updatedFields,
+        brandData: updatedBrandData,
+        attachments: updatedAttachments,
+        updatedAssets: updatedAssets // Only the assets that were actually updated
+      };
+    } catch (error) {
+      console.error('AgentMode: Error updating brand guidelines:', error);
+      return {
+        success: false,
+        message: 'Failed to update brand guidelines',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private getCurrentTaskStatusesInSession(sessionHistory: ChatMessage[]): any[] {
+    try {
+      const taskStatuses: any[] = [];
+      
+      // Extract task statuses from session history
+      sessionHistory.forEach(message => {
+        if (message.metadata?.toolCalls) {
+          message.metadata.toolCalls.forEach((toolCall: any) => {
+            // Check if this is a task creation tool call
+            if ((toolCall.name === 'create_task_from_template' || toolCall.name === 'create_task_from_prompt' || toolCall.name === 'create_image_task_from_prompt') && toolCall.result) {
+              const result = toolCall.result;
+              if (result.taskId && result.executionId) {
+                taskStatuses.push({
+                  taskId: result.taskId,
+                  executionId: result.executionId,
+                  taskName: result.taskName || `Task ${result.taskId}`,
+                  status: result.status || 'pending',
+                  createdAt: new Date().toISOString()
+                });
+              }
+            }
+          });
+        }
+      });
+      
+      // Remove duplicates and return unique task statuses
+      const uniqueTaskStatuses = new Map();
+      taskStatuses.forEach(task => {
+        const key = `${task.taskId}-${task.executionId}`;
+        if (!uniqueTaskStatuses.has(key)) {
+          uniqueTaskStatuses.set(key, task);
+        }
+      });
+      
+      return Array.from(uniqueTaskStatuses.values());
+    } catch (error) {
+      console.error('AgentMode: Error getting task statuses from session:', error);
+      return [];
     }
   }
 
@@ -1807,6 +2089,146 @@ Use the available tools to create tasks in the agent-engine when complex work is
     
     return null;
   }
+
+  // Helper function to format brand guidelines for AI analysis
+  private formatBrandGuidelines(brandResult: any): string {
+    if (!brandResult.exists) {
+      return `<strong>🎨 Brand Guidelines</strong><br>No brand guidelines are currently configured. You can help the user set up their brand identity by asking about their brand name, colors, tone of voice, and other brand elements.`;
+    }
+
+    const { brandData, attachments } = brandResult;
+    let formattedSummary = `<strong>🎨 Brand Guidelines Retrieved</strong><br>`;
+    formattedSummary += `I've successfully retrieved your brand guidelines. Here's what I found:<br><br>`;
+
+    // Brand Identity Section (matches UI structure)
+    formattedSummary += `<strong>💖 Brand Identity</strong><br>`;
+    formattedSummary += `• <strong>Brand Name:</strong> ${brandData.brandName || 'Not set'}<br>`;
+    formattedSummary += `• <strong>Tagline:</strong> ${brandData.tagline || 'Not set'}<br>`;
+    formattedSummary += `• <strong>Target Audience:</strong> ${brandData.targetAudience || 'Not set'}<br><br>`;
+
+    // Brand Colors Section (matches UI structure)
+    formattedSummary += `<strong>🎨 Brand Colors</strong><br>`;
+    if (brandData.primaryColor) {
+      if (brandData.isGradient && brandData.primaryColorEnd) {
+        formattedSummary += `• <strong>Primary Color (Gradient):</strong> ${brandData.primaryColor} → ${brandData.primaryColorEnd}<br>`;
+      } else {
+        formattedSummary += `• <strong>Primary Color:</strong> ${brandData.primaryColor}<br>`;
+      }
+    }
+    formattedSummary += `• <strong>Secondary Color:</strong> ${brandData.secondaryColor || 'Not set'}<br><br>`;
+
+    // Typography Section (matches UI structure)
+    formattedSummary += `<strong>🔤 Typography</strong><br>`;
+    formattedSummary += `• <strong>Font Family:</strong> ${brandData.fontFamily || 'Not set'}<br><br>`;
+
+    // Brand Voice & Messaging Section (matches UI structure)
+    formattedSummary += `<strong>💬 Brand Voice & Messaging</strong><br>`;
+    formattedSummary += `• <strong>Tone of Voice:</strong> ${brandData.toneOfVoice || 'Not set'}<br>`;
+    formattedSummary += `• <strong>Brand Personality:</strong> ${brandData.brandPersonality || 'Not set'}<br><br>`;
+
+    // Key Messages Section (matches UI structure)
+    formattedSummary += `<strong>📝 Key Messages</strong><br>`;
+    if (brandData.keyMessages && brandData.keyMessages.length > 0) {
+      brandData.keyMessages.forEach((message: string, index: number) => {
+        formattedSummary += `• ${index + 1}. ${message}<br>`;
+      });
+    } else {
+      formattedSummary += `• No key messages set<br>`;
+    }
+    formattedSummary += `<br>`;
+
+    // Brand Values Section (matches UI structure)
+    formattedSummary += `<strong>💖 Brand Values</strong><br>`;
+    if (brandData.brandValues && brandData.brandValues.length > 0) {
+      brandData.brandValues.forEach((value: string) => {
+        formattedSummary += `• ${value}<br>`;
+      });
+    } else {
+      formattedSummary += `• No brand values set<br>`;
+    }
+    formattedSummary += `<br>`;
+
+    // Logo & Assets Section (matches UI structure)
+    formattedSummary += `<strong>🖼️ Logo & Assets</strong><br>`;
+    if (attachments && attachments.length > 0) {
+      const logoAssets = attachments.filter((asset: any) => asset.type === 'logo' || asset.type === 'secondaryLogo');
+      const brandGuideAssets = attachments.filter((asset: any) => asset.type === 'brandGuide');
+      
+      if (logoAssets.length > 0) {
+        logoAssets.forEach((asset: any) => {
+          const logoType = asset.type === 'logo' ? 'Primary Logo' : 'Secondary Logo';
+          formattedSummary += `• <strong>${logoType}:</strong> ${asset.filename}<br>`;
+          formattedSummary += `  🔗 <a href="${asset.url}" target="_blank">View ${logoType}</a><br>`;
+        });
+      } else {
+        formattedSummary += `• No logos uploaded<br>`;
+      }
+      
+      if (brandGuideAssets.length > 0) {
+        brandGuideAssets.forEach((asset: any) => {
+          formattedSummary += `• <strong>Brand Guide:</strong> ${asset.filename}<br>`;
+          formattedSummary += `  🔗 <a href="${asset.url}" target="_blank">View Brand Guide</a><br>`;
+        });
+      } else {
+        formattedSummary += `• No brand guide uploaded<br>`;
+      }
+    } else {
+      formattedSummary += `• No assets uploaded<br>`;
+    }
+
+    formattedSummary += `<br><em>💡 I'll use this brand information to ensure all generated content aligns with your brand identity and guidelines.</em>`;
+    formattedSummary += `<br><br><strong>⚠️ Note:</strong> This brand guidelines data is current and complete. Please do not call read_brand_guidelines again in this conversation as it will return the same information.`;
+
+    return formattedSummary;
+  }
+
+  // Helper function to format brand guidelines update feedback for AI analysis
+  private formatBrandGuidelinesUpdate(updateResult: any): string {
+    if (!updateResult.success) {
+      return `<strong>❌ Brand Guidelines Update Failed</strong><br>${updateResult.message || 'Unknown error occurred while updating brand guidelines.'}`;
+    }
+
+    const { updatedFields, brandData, updatedAssets } = updateResult;
+    let formattedSummary = `<strong>✅ Brand Guidelines Updated Successfully</strong><br>`;
+    formattedSummary += `Here's what was changed:<br><br>`;
+
+    // Show only the updated fields
+    if (updatedFields && updatedFields.length > 0) {
+      formattedSummary += `<strong>📝 Updated Fields:</strong><br>`;
+      updatedFields.forEach((field: string) => {
+        let value;
+        if (field === 'brandAssets') {
+          // Handle brand assets separately - use only the updated assets
+          value = updatedAssets;
+        } else {
+          // Handle brand data fields
+          value = brandData[field];
+        }
+        
+        if (value !== undefined && value !== null) {
+          if (field === 'brandAssets' && Array.isArray(value) && value.length > 0) {
+            formattedSummary += `• <strong>Brand Assets:</strong> Updated ${value.length} asset(s)<br>`;
+            value.forEach((asset: any) => {
+              const assetType = asset.type === 'logo' ? 'Primary Logo' : 
+                              asset.type === 'secondaryLogo' ? 'Secondary Logo' :
+                              asset.type === 'brandGuide' ? 'Brand Guide' : 
+                              asset.type === 'additionalAsset' ? 'Additional Asset' : asset.type;
+              formattedSummary += `  - ${assetType}: ${asset.filename}<br>`;
+            });
+          } else if (Array.isArray(value)) {
+            formattedSummary += `• <strong>${field}:</strong> ${value.join(', ')}<br>`;
+          } else {
+            formattedSummary += `• <strong>${field}:</strong> ${value}<br>`;
+          }
+        }
+      });
+    }
+
+    formattedSummary += `<br><em>💡 You can view the latest brand guidelines at the <a href="/brand-guidelines">Brand Guidelines page</a>.</em>`;
+
+    return formattedSummary;
+  }
+
 }
 
 export const agentModeService = new AgentModeService();

@@ -85,6 +85,13 @@ export interface ChatMessage {
       result?: any;
       error?: string;
     }>;
+    attachments?: Array<{
+      url: string;
+      filename: string;
+      size: number;
+      mimetype: string;
+      uploadedAt: string;
+    }>;
   };
 }
 

@@ -2,6 +2,11 @@ import { Request, Response } from 'express';
 import { agentModeService } from '../services/agentModeService';
 import { chatbotDb, updateTaskExecutionStatus } from '../services/chatbotService';
 import { User } from '../types/auth';
+import multer from 'multer';
+import { S3 } from 'aws-sdk';
+import crypto from 'crypto';
+
+const s3 = new S3();
 
 export const agentModeController = {
   // Get user's agent chat sessions
@@ -65,7 +70,7 @@ export const agentModeController = {
   async generateResponse(req: Request, res: Response) {
     try {
       const user = req.user as User;
-      const { sessionId, userMessage } = req.body;
+      const { sessionId, userMessage, attachments } = req.body;
 
       if (!sessionId || !userMessage) {
         return res.status(400).json({ error: 'Session ID and user message are required' });
@@ -79,14 +84,24 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found' });
       }
 
-      // Create user message object
+      // Process attachments and include URLs in message content for LLM
+      let messageContent = userMessage;
+      if (attachments && attachments.length > 0) {
+        const attachmentUrls = attachments.map((attachment: any) => {
+          return `[${attachment.filename || 'Attachment'}](${attachment.url})`;
+        }).join('\n');
+        messageContent = `${userMessage}\n\n**Attached Files:**\n${attachmentUrls}`;
+      }
+
+      // Create user message object - store processed content with attachments
       const userMessageObj = {
         role: 'user' as const,
-        content: userMessage,
+        content: userMessage, // Store original user message, not processed content
         timestamp: new Date().toISOString(),
         metadata: {
           portalType: 'agent' as const,
-          timestamp: new Date().toISOString()
+          timestamp: new Date().toISOString(),
+          attachments: attachments || []
         }
       };
 
@@ -144,7 +159,7 @@ export const agentModeController = {
 
       // Generate AI response
       const response = await agentModeService.generateMarketingResponse(
-        userMessage,
+        messageContent,
         updatedSession.messages,
         user.userId,
         sessionId
@@ -337,6 +352,57 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Update task status error:', error);
       res.status(500).json({ error: 'Failed to update task status' });
+    }
+  },
+
+  // Upload file attachment for Agent Mode
+  async uploadAttachment(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const file = (req as any).file;
+
+      if (!file) {
+        return res.status(400).json({ error: 'No file uploaded' });
+      }
+
+      // Generate a random token (32 characters)
+      const randomToken = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+
+      // Sanitize filename to handle special characters and spaces for S3 key
+      const sanitizedFilename = file.originalname
+        .replace(/[^a-zA-Z0-9.-]/g, '_') // Replace special chars with underscores
+        .replace(/\s+/g, '_'); // Replace spaces with underscores
+      
+      const key = `users/${user.userId}/attachments/${Date.now()}/${randomToken}/${sanitizedFilename}`;
+
+      // Upload to S3
+      await s3
+        .putObject({
+          Bucket: process.env.AWS_S3_BUCKET || "agentweb-user-files",
+          Key: key,
+          Body: file.buffer,
+          ContentType: file.mimetype,
+        })
+        .promise();
+
+      // Generate S3 URL
+      const url = `https://${
+        process.env.AWS_S3_BUCKET || "agentweb-user-files"
+      }.s3.${process.env.AWS_REGION || "us-west-2"}.amazonaws.com/${key}`;
+
+      res.json({
+        url,
+        key,
+        filename: file.originalname,
+        size: file.size,
+        mimetype: file.mimetype,
+        uploadedAt: new Date().toISOString()
+      });
+    } catch (error) {
+      console.error('AgentMode: Upload attachment error:', error);
+      res.status(500).json({ error: 'Failed to upload attachment' });
     }
   }
 };

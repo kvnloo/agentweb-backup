@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-09-18',
+    changes: [
+      'Supported to read and update brand guidelines in Agent Mode',
+      '- Agent can now read current brand guidelines including brand data (colors, fonts, messaging) and brand assets (logos, brand guides)',
+      '- Agent can update brand guidelines through natural conversation, supporting both text-based brand data and visual brand assets',
+      '- Also supported attachments in Agent Mode',
+    ],
+  },
+  {
     date: '2025-09-17',
     changes: [
       'Supported web search in Agent Mode',
