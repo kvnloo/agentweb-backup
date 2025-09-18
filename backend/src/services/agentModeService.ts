@@ -193,9 +193,10 @@ You can help with various marketing tasks including:
 
 ## File Attachments
 When users attach files to their messages, you will receive:
-- **Attached Files**: Clickable markdown links with filenames, file types, and sizes
+- **Attached Files**: Clickable markdown links in the format \`[filename](url)\`
 - You can reference these files by their URLs and analyze their content
 - Use the file URLs to understand what the user has shared and provide relevant assistance
+- **IMPORTANT**: When creating tasks that are related to the attached files, you MUST include the attachment details (URLs and filenames) in the task prompt, otherwise the task execution won't have access to the files
 
 ## Task Creation Approach
 - **IMPORTANT**: Always confirm with the user before creating any task, as tasks can take a few minutes to complete
