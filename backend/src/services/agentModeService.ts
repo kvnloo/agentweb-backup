@@ -855,6 +855,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Handle brandAssets update - merge by type to preserve existing assets
       let updatedAttachments = [...(existingBrand.attachments || [])];
+      const updatedAssets: any[] = []; // Track which assets were actually updated
+      
       if (brandAssets !== undefined) {
         if (Array.isArray(brandAssets)) {
           // Merge by type: replace assets of the same type, keep others
@@ -863,9 +865,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
             if (existingIndex >= 0) {
               // Replace existing asset of the same type
               updatedAttachments[existingIndex] = newAsset;
+              updatedAssets.push(newAsset); // Track as updated
             } else {
               // Add new asset type
               updatedAttachments.push(newAsset);
+              updatedAssets.push(newAsset); // Track as added
             }
           });
         } else if (typeof brandAssets === 'object' && brandAssets !== null) {
@@ -874,9 +878,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
           if (existingIndex >= 0) {
             // Replace existing asset of the same type
             updatedAttachments[existingIndex] = brandAssets;
+            updatedAssets.push(brandAssets); // Track as updated
           } else {
             // Add new asset type
             updatedAttachments.push(brandAssets);
+            updatedAssets.push(brandAssets); // Track as added
           }
         }
       }
@@ -901,7 +907,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         message: 'Brand guidelines updated successfully',
         updatedFields,
         brandData: updatedBrandData,
-        attachments: updatedAttachments
+        attachments: updatedAttachments,
+        updatedAssets: updatedAssets // Only the assets that were actually updated
       };
     } catch (error) {
       console.error('AgentMode: Error updating brand guidelines:', error);
@@ -2181,7 +2188,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       return `<strong>❌ Brand Guidelines Update Failed</strong><br>${updateResult.message || 'Unknown error occurred while updating brand guidelines.'}`;
     }
 
-    const { updatedFields, brandData } = updateResult;
+    const { updatedFields, brandData, updatedAssets } = updateResult;
     let formattedSummary = `<strong>✅ Brand Guidelines Updated Successfully</strong><br>`;
     formattedSummary += `Here's what was changed:<br><br>`;
 
@@ -2189,7 +2196,15 @@ Use the available tools to create tasks in the agent-engine when complex work is
     if (updatedFields && updatedFields.length > 0) {
       formattedSummary += `<strong>📝 Updated Fields:</strong><br>`;
       updatedFields.forEach((field: string) => {
-        const value = brandData[field];
+        let value;
+        if (field === 'brandAssets') {
+          // Handle brand assets separately - use only the updated assets
+          value = updatedAssets;
+        } else {
+          // Handle brand data fields
+          value = brandData[field];
+        }
+        
         if (value !== undefined && value !== null) {
           if (Array.isArray(value)) {
             formattedSummary += `• <strong>${field}:</strong> ${value.join(', ')}<br>`;
