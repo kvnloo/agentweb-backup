@@ -276,7 +276,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
     
     // Fallback to default welcome message
-    return "I'm Emma, your team's new CMO 😎. I'll help you research, build, deploy, and measure Meta campaign insights in a blink of an eye. To get started, can you share your website URL?";
+    return "I'm Emma, your team's new CMO 😎. I'll help you research, build, deploy, and measure Meta campaign insights in a blink of an eye.<br><br><strong>To get started, can you share your website URL?</strong>";
   }
 
   async getConversationStarters(): Promise<string[]> {

@@ -3584,12 +3584,23 @@ const AgentModeSettings = () => {
             rows={4}
             value={welcomeMessage}
             onChange={(e) => setWelcomeMessage(e.target.value)}
-            placeholder="Enter the welcome message for Emma..."
+            placeholder="Enter the welcome message for Emma... (supports HTML formatting like &lt;strong&gt;bold&lt;/strong&gt;, &lt;ul&gt;&lt;li&gt;lists&lt;/li&gt;&lt;/ul&gt;, etc.)"
             variant="outlined"
           />
           
           <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
-            The welcome message appears when users start a new chat session with Emma.
+            The welcome message appears when users start a new chat session with Emma. 
+            Supports HTML formatting: <strong>&lt;strong&gt;</strong>, <em>&lt;em&gt;</em>, 
+            <code>&lt;ul&gt;</code>, <code>&lt;li&gt;</code>, <code>&lt;br&gt;</code>, etc.
+            <br /><br />
+            <strong>Example:</strong><br />
+            <code>
+              I'm Emma, your team's new CMO 😎&lt;br&gt;&lt;br&gt;<br />
+              &lt;strong&gt;I can help you with:&lt;/strong&gt;&lt;br&gt;<br />
+              • Market research and analysis&lt;br&gt;<br />
+              • Ad campaign optimization&lt;br&gt;<br />
+              • Content strategy development
+            </code>
           </Typography>
         </CardContent>
       </Card>
