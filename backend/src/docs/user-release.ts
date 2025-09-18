@@ -19,6 +19,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Supported Email Friendly HTML',
       '- New Email-Friendly option under Output as HTML5 in Partner Portal (Task Details)',
       '- Email HTML conversion inlines CSS and JavaScript charts for compatibility',
+      'Supported customization of Welcome message and Starter items for Agent Mode',
+      '- Admins can now customize Emma\'s welcome message with rich HTML formatting (bold, lists, links, etc.)',
+      '- Conversation starter buttons can be customized to match specific business needs',
     ],
   },
   {
