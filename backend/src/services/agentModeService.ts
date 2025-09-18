@@ -264,6 +264,41 @@ Important formatting rules:
 Use the available tools to create tasks in the agent-engine when complex work is required. Guide users through marketing flows naturally through conversation.`;
   }
 
+  async getWelcomeMessage(): Promise<string> {
+    // Try to get custom welcome message from settings
+    try {
+      const setting = await settingsService.getSetting('agent_mode_welcome_message');
+      if (setting && setting.settingValue) {
+        return setting.settingValue;
+      }
+    } catch (error) {
+      console.error('Error getting custom welcome message:', error);
+    }
+    
+    // Fallback to default welcome message
+    return "I'm Emma, your team's new CMO 😎. I'll help you research, build, deploy, and measure Meta campaign insights in a blink of an eye. To get started, can you share your website URL?";
+  }
+
+  async getConversationStarters(): Promise<string[]> {
+    // Try to get custom conversation starters from settings
+    try {
+      const setting = await settingsService.getSetting('agent_mode_conversation_starters');
+      if (setting && setting.settingValue) {
+        return JSON.parse(setting.settingValue);
+      }
+    } catch (error) {
+      console.error('Error getting custom conversation starters:', error);
+    }
+    
+    // Fallback to default conversation starters
+    return [
+      "Formulate marketing strategy for my product",
+      "Create social media content calendar",
+      "Develop my personal brand on Linkedin or x.com",
+      "Create automated newsletter for my company"
+    ];
+  }
+
   private getStatusMessage(toolName: string, status: string): string {
     const statusEmoji: Record<string, string> = {
       'pending': '⏳',

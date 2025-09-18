@@ -188,6 +188,28 @@ export const agentModeController = {
     }
   },
 
+  // Get welcome message
+  async getWelcomeMessage(req: Request, res: Response) {
+    try {
+      const welcomeMessage = await agentModeService.getWelcomeMessage();
+      res.json(welcomeMessage);
+    } catch (error) {
+      console.error('AgentMode: Get welcome message error:', error);
+      res.status(500).json({ error: 'Failed to get welcome message' });
+    }
+  },
+
+  // Get conversation starters
+  async getConversationStarters(req: Request, res: Response) {
+    try {
+      const conversationStarters = await agentModeService.getConversationStarters();
+      res.json(conversationStarters);
+    } catch (error) {
+      console.error('AgentMode: Get conversation starters error:', error);
+      res.status(500).json({ error: 'Failed to get conversation starters' });
+    }
+  },
+
   // Create shareable link for conversation
   async createShareLink(req: Request, res: Response) {
     try {
