@@ -84,6 +84,9 @@ export class AgentModeService {
         
         console.log(`AgentMode: Executing ${responseMessage.tool_calls.length} tool calls`);
         
+        // Reset feedback flag for this iteration
+        shouldFeedbackToLLM = false;
+        
         // Execute tool calls
         for (const toolCall of responseMessage.tool_calls) {
           try {
@@ -117,6 +120,10 @@ export class AgentModeService {
               shouldFeedbackToLLM = true;
               const brandSummary = this.formatBrandGuidelines(result);
               content += `\n\n${brandSummary}`;
+            } else if (toolCall.function.name === 'update_brand_guidelines' && result.success) {
+              // Special handling for brand guidelines update - provide feedback to LLM
+              const updateSummary = this.formatBrandGuidelinesUpdate(result);
+              content += `\n\n${updateSummary}`;
             }
           } catch (error) {
             console.error(`AgentMode: Tool execution error for ${toolCall.function.name}:`, error);
@@ -450,6 +457,45 @@ Use the available tools to create tasks in the agent-engine when complex work is
       {
         type: 'function' as const,
         function: {
+          name: 'update_brand_guidelines',
+          description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. Do not include unchanged fields in the update.',
+          parameters: {
+            type: 'object',
+            properties: {
+              brandData: {
+                type: 'object',
+                description: 'Brand data object with only the fields that need to be updated',
+                properties: {
+                  brandName: { type: 'string', description: 'Brand name' },
+                  tagline: { type: 'string', description: 'Brand tagline or slogan' },
+                  primaryColor: { type: 'string', description: 'Primary brand color (hex code)' },
+                  primaryColorEnd: { type: 'string', description: 'End color for gradient (hex code)' },
+                  secondaryColor: { type: 'string', description: 'Secondary brand color (hex code)' },
+                  fontFamily: { type: 'string', description: 'Primary font family' },
+                  toneOfVoice: { type: 'string', description: 'Brand tone of voice' },
+                  brandPersonality: { type: 'string', description: 'Brand personality description' },
+                  targetAudience: { type: 'string', description: 'Target audience description' },
+                  keyMessages: { 
+                    type: 'array', 
+                    items: { type: 'string' },
+                    description: 'Array of key brand messages' 
+                  },
+                  brandValues: { 
+                    type: 'array', 
+                    items: { type: 'string' },
+                    description: 'Array of brand values' 
+                  },
+                  isGradient: { type: 'boolean', description: 'Whether primary color uses gradient' }
+                }
+              }
+            },
+            required: ['brandData']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
           name: 'create_task_from_prompt',
           description: 'Create a task using a raw prompt when no suitable template is available',
           parameters: {
@@ -612,6 +658,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.searchWeb(args.query, args.max_results || 10);
       case 'read_brand_guidelines':
         return await this.readBrandGuidelines(userId);
+      case 'update_brand_guidelines':
+        return await this.updateBrandGuidelines(args.brandData, userId);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -738,6 +786,60 @@ Use the available tools to create tasks in the agent-engine when complex work is
       return { 
         success: false, 
         message: 'Failed to read brand guidelines',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // Update user's brand guidelines
+  private async updateBrandGuidelines(brandData: any, userId: string): Promise<any> {
+    try {
+      const { userDb } = await import('./db');
+      const user = await userDb.getUserById(userId);
+      if (!user) {
+        return {
+          success: false,
+          message: 'User not found',
+          error: 'User not found'
+        };
+      }
+
+      // Get existing brand guidelines
+      const existingBrand = user.brandGuidelines;
+      if (!existingBrand) {
+        return {
+          success: false,
+          message: 'No existing brand guidelines found. Please create brand guidelines first.',
+          error: 'No existing brand guidelines'
+        };
+      }
+
+      // Merge with existing data - only update provided fields
+      const updatedBrandData = {
+        ...existingBrand.brandData,
+        ...brandData
+      };
+
+      // Update the user's brand guidelines
+      await userDb.updateUser(userId, {
+        brandGuidelines: {
+          ...existingBrand,
+          brandData: updatedBrandData,
+          updatedAt: new Date().toISOString()
+        }
+      });
+
+      return {
+        success: true,
+        message: 'Brand guidelines updated successfully',
+        updatedFields: Object.keys(brandData),
+        brandData: updatedBrandData
+      };
+    } catch (error) {
+      console.error('AgentMode: Error updating brand guidelines:', error);
+      return {
+        success: false,
+        message: 'Failed to update brand guidelines',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
@@ -1960,6 +2062,36 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
     formattedSummary += `<br><em>💡 I'll use this brand information to ensure all generated content aligns with your brand identity and guidelines.</em>`;
     formattedSummary += `<br><br><strong>⚠️ Note:</strong> This brand guidelines data is current and complete. Please do not call read_brand_guidelines again in this conversation as it will return the same information.`;
+
+    return formattedSummary;
+  }
+
+  // Helper function to format brand guidelines update feedback for AI analysis
+  private formatBrandGuidelinesUpdate(updateResult: any): string {
+    if (!updateResult.success) {
+      return `<strong>❌ Brand Guidelines Update Failed</strong><br>${updateResult.message || 'Unknown error occurred while updating brand guidelines.'}`;
+    }
+
+    const { updatedFields, brandData } = updateResult;
+    let formattedSummary = `<strong>✅ Brand Guidelines Updated Successfully</strong><br>`;
+    formattedSummary += `Here's what was changed:<br><br>`;
+
+    // Show only the updated fields
+    if (updatedFields && updatedFields.length > 0) {
+      formattedSummary += `<strong>📝 Updated Fields:</strong><br>`;
+      updatedFields.forEach((field: string) => {
+        const value = brandData[field];
+        if (value !== undefined && value !== null) {
+          if (Array.isArray(value)) {
+            formattedSummary += `• <strong>${field}:</strong> ${value.join(', ')}<br>`;
+          } else {
+            formattedSummary += `• <strong>${field}:</strong> ${value}<br>`;
+          }
+        }
+      });
+    }
+
+    formattedSummary += `<br><em>💡 You can view the latest brand guidelines at the <a href="/brand-guidelines">Brand Guidelines page</a>.</em>`;
 
     return formattedSummary;
   }
