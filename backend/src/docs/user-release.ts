@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-09-19',
+    changes: [
+      'Supported updating Market Strategy in Agent Mode',
+      '- Agent can now read current market strategy including business overview, competitors, and ideal customer profiles (ICPs)',
+      '- Agent can update market strategy through natural conversation, supporting business overview, competitor analysis, and ICP management',
+      '- Smart merging preserves existing entries when updating competitors (by name) and ICPs (by title)',
+    ],
+  },
+  {
     date: '2025-09-18',
     changes: [
       'Supported to read and update brand guidelines in Agent Mode',
