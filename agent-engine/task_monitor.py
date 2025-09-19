@@ -112,7 +112,7 @@ def create_email_friendly_html_revision(task_id, execution_id, html_asset_url, u
         
         # Prepare the revision request data
         revision_data = {
-            'revision_prompt': 'Make this HTML report email-friendly by ensuring it uses inline CSS styles and contains no JavaScript. If any charts rely on JavaScript (e.g., Chart.js), convert them to static, email-safe charts using Charts.css (pure CSS). Choose chart types that render well in email (prefer bar charts; avoid pie charts when labels/segments are small). If a chart will not read well in email, replace it with a clear HTML table of the underlying data, or remove the chart. Preserve all existing hyperlinks and their destinations (anchor text and href) exactly; do not strip or alter links. Do not reference or rely on any web version.',
+            'revision_prompt': 'Make this HTML report email-friendly and mobile-friendly by ensuring it uses inline CSS styles and contains no JavaScript. If any charts rely on JavaScript (e.g., Chart.js), convert them to static, email-safe charts using Charts.css (pure CSS). Choose chart types that render well in email (prefer bar charts; avoid pie charts when labels/segments are small). If a chart will not read well in email, replace it with a clear HTML table of the underlying data, or remove the chart. Preserve all existing hyperlinks and their destinations (anchor text and href) exactly; do not strip or alter links. Do not reference or rely on any web version. Ensure the layout is responsive and mobile-friendly with appropriate font sizes, spacing, and table layouts that work well on small screens.',
             'report_url': html_asset_url,
             'original_execution_id': execution_id
         }
