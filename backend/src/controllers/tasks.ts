@@ -337,6 +337,10 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
       updates.emailFriendlyHtml = Boolean(req.body.emailFriendlyHtml);
     }
 
+    if (req.body.repairImageEmbedding !== undefined) {
+      updates.repairImageEmbedding = Boolean(req.body.repairImageEmbedding);
+    }
+
     if (req.body.llmName !== undefined) {
       updates.llmName = req.body.llmName || null;  // Convert empty string to null
     }
