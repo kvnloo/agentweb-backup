@@ -94,6 +94,7 @@ export interface User {
     icp: Array<{
       title: string;
       description: string;
+      valueProposition: string;
     }>;
     createdAt: string;
     updatedAt: string;

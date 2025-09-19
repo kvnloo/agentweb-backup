@@ -570,12 +570,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
               },
               icp: {
                 type: 'array',
-                description: 'Array of Ideal Customer Profile objects with title and description',
+                description: 'Array of Ideal Customer Profile objects with title, description, and value proposition',
                 items: {
                   type: 'object',
                   properties: {
                     title: { type: 'string', description: 'ICP title or name' },
-                    description: { type: 'string', description: 'ICP description or characteristics' }
+                    description: { type: 'string', description: 'ICP description or characteristics' },
+                    valueProposition: { type: 'string', description: 'Value proposition for this customer type' }
                   },
                   required: ['title']
                 }
@@ -2504,6 +2505,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
       marketData.icp.forEach((icp: any, index: number) => {
         if (typeof icp === 'object' && icp.title) {
           formattedSummary += `• <strong>${icp.title}:</strong> ${icp.description || 'No description provided'}<br>`;
+          if (icp.valueProposition) {
+            formattedSummary += `  <em>Value Proposition:</em> ${icp.valueProposition}<br>`;
+          }
         } else {
           formattedSummary += `• ${icp}<br>`;
         }
