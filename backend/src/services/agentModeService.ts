@@ -124,6 +124,15 @@ export class AgentModeService {
               // Special handling for brand guidelines update - provide feedback to LLM
               const updateSummary = this.formatBrandGuidelinesUpdate(result);
               content += `\n\n${updateSummary}`;
+            } else if (toolCall.function.name === 'read_market_strategy' && result.success) {
+              // Special handling for market strategy - provide formatted market data for AI analysis
+              shouldFeedbackToLLM = true;
+              const marketSummary = this.formatMarketStrategy(result);
+              content += `\n\n${marketSummary}`;
+            } else if (toolCall.function.name === 'update_market_strategy' && result.success) {
+              // Special handling for market strategy update - provide feedback to LLM
+              const updateSummary = this.formatMarketStrategyUpdate(result);
+              content += `\n\n${updateSummary}`;
             }
           } catch (error) {
             console.error(`AgentMode: Tool execution error for ${toolCall.function.name}:`, error);
@@ -526,6 +535,60 @@ Use the available tools to create tasks in the agent-engine when complex work is
       {
         type: 'function' as const,
         function: {
+          name: 'read_market_strategy',
+          description: 'Read the current user\'s market strategy (business overview, competitors, and ideal customer profiles). Returns exists=false if not set.',
+          parameters: {
+            type: 'object',
+            properties: {},
+            required: []
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'update_market_strategy',
+          description: 'Update the user\'s market strategy. IMPORTANT: Use read_market_strategy first to fetch the latest data, then only update the fields that need to be changed. Can update business overview, competitors, and ideal customer profiles.',
+          parameters: {
+            type: 'object',
+            properties: {
+              businessOverview: {
+                type: 'string',
+                description: 'Comprehensive business overview including mission, vision, and value propositions'
+              },
+              competitors: {
+                type: 'array',
+                description: 'Array of competitor objects with name and description',
+                items: {
+                  type: 'object',
+                  properties: {
+                    name: { type: 'string', description: 'Competitor name' },
+                    description: { type: 'string', description: 'Competitor description or analysis' }
+                  },
+                  required: ['name']
+                }
+              },
+              icp: {
+                type: 'array',
+                description: 'Array of Ideal Customer Profile objects with title, description, and value proposition',
+                items: {
+                  type: 'object',
+                  properties: {
+                    title: { type: 'string', description: 'ICP title or name' },
+                    description: { type: 'string', description: 'ICP description or characteristics' },
+                    valueProposition: { type: 'string', description: 'Value proposition for this customer type' }
+                  },
+                  required: ['title']
+                }
+              }
+            },
+            required: []
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
           name: 'create_task_from_prompt',
           description: 'Create a task using a raw prompt when no suitable template is available',
           parameters: {
@@ -690,6 +753,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.readBrandGuidelines(userId);
       case 'update_brand_guidelines':
         return await this.updateBrandGuidelines(args, userId);
+      case 'read_market_strategy':
+        return await this.readMarketStrategy(userId);
+      case 'update_market_strategy':
+        return await this.updateMarketStrategy(args, userId);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -816,6 +883,176 @@ Use the available tools to create tasks in the agent-engine when complex work is
       return { 
         success: false, 
         message: 'Failed to read brand guidelines',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // Read current user's market strategy
+  private async readMarketStrategy(userId: string): Promise<any> {
+    try {
+      const { userDb } = await import('./db');
+      const user = await userDb.getUserById(userId);
+      if (!user) {
+        return { 
+          success: false, 
+          message: 'User not found', 
+          exists: false,
+          error: 'User not found'
+        };
+      }
+
+      const marketStrategy = user.marketStrategy;
+      if (!marketStrategy) {
+        return { 
+          success: true, 
+          exists: false, 
+          message: 'No market strategy found',
+          marketData: {
+            businessOverview: '',
+            competitors: [],
+            icp: []
+          }
+        };
+      }
+
+      // Return structured response similar to readBrandGuidelines
+      return {
+        success: true,
+        message: `Market strategy retrieved successfully`,
+        exists: true,
+        marketData: marketStrategy,
+        createdAt: marketStrategy.createdAt,
+        updatedAt: marketStrategy.updatedAt
+      };
+    } catch (error) {
+      console.error('AgentMode: Error reading market strategy:', error);
+      return { 
+        success: false, 
+        message: 'Failed to read market strategy',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // Update user's market strategy
+  private async updateMarketStrategy(updateData: any, userId: string): Promise<any> {
+    try {
+      const { userDb } = await import('./db');
+      const user = await userDb.getUserById(userId);
+      if (!user) {
+        return {
+          success: false,
+          message: 'User not found',
+          error: 'User not found'
+        };
+      }
+
+      // Get existing market strategy
+      const existingMarketStrategy = user.marketStrategy;
+      
+      // Extract market strategy fields from updateData
+      const { businessOverview, competitors, icp, ...otherFields } = updateData;
+      
+      // Merge competitors by name - preserve existing entries, update or add new ones
+      let mergedCompetitors = [...(existingMarketStrategy?.competitors || [])];
+      if (competitors !== undefined && Array.isArray(competitors)) {
+        competitors.forEach(newCompetitor => {
+          const existingIndex = mergedCompetitors.findIndex(existing => 
+            existing.name === newCompetitor.name
+          );
+          if (existingIndex >= 0) {
+            // Update existing competitor
+            mergedCompetitors[existingIndex] = {
+              ...mergedCompetitors[existingIndex],
+              ...newCompetitor
+            };
+          } else {
+            // Add new competitor
+            mergedCompetitors.push(newCompetitor);
+          }
+        });
+      }
+      
+      // Merge ICPs by title - preserve existing entries, update or add new ones
+      let mergedICP = [...(existingMarketStrategy?.icp || [])];
+      if (icp !== undefined && Array.isArray(icp)) {
+        icp.forEach(newICP => {
+          const existingIndex = mergedICP.findIndex(existing => 
+            existing.title === newICP.title
+          );
+          if (existingIndex >= 0) {
+            // Update existing ICP
+            mergedICP[existingIndex] = {
+              ...mergedICP[existingIndex],
+              ...newICP
+            };
+          } else {
+            // Add new ICP
+            mergedICP.push(newICP);
+          }
+        });
+      }
+      
+      // Prepare market strategy data - merge with existing if available
+      const marketStrategyData = {
+        businessOverview: businessOverview !== undefined ? businessOverview : (existingMarketStrategy?.businessOverview || ''),
+        competitors: mergedCompetitors,
+        icp: mergedICP,
+        createdAt: existingMarketStrategy?.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+
+      // Update user record with market strategy data
+      await userDb.updateUser(userId, {
+        marketStrategy: marketStrategyData
+      });
+
+      // Track what was updated vs added
+      const updatedEntries: string[] = [];
+      const addedEntries: string[] = [];
+      
+      if (competitors !== undefined && Array.isArray(competitors)) {
+        competitors.forEach(competitor => {
+          const wasExisting = existingMarketStrategy?.competitors?.some((existing: any) => 
+            existing.name === competitor.name
+          );
+          if (wasExisting) {
+            updatedEntries.push(`Competitor: ${competitor.name}`);
+          } else {
+            addedEntries.push(`Competitor: ${competitor.name}`);
+          }
+        });
+      }
+      
+      if (icp !== undefined && Array.isArray(icp)) {
+        icp.forEach(profile => {
+          const wasExisting = existingMarketStrategy?.icp?.some((existing: any) => 
+            existing.title === profile.title
+          );
+          if (wasExisting) {
+            updatedEntries.push(`ICP: ${profile.title}`);
+          } else {
+            addedEntries.push(`ICP: ${profile.title}`);
+          }
+        });
+      }
+
+      return {
+        success: true,
+        message: 'Market strategy updated successfully',
+        marketData: marketStrategyData,
+        updatedFields: Object.keys(updateData).filter(key => updateData[key] !== undefined),
+        updatedEntries,
+        addedEntries,
+        totalCompetitors: mergedCompetitors.length,
+        totalICPs: mergedICP.length
+      };
+    } catch (error) {
+      console.error('AgentMode: Error updating market strategy:', error);
+      return {
+        success: false,
+        message: 'Failed to update market strategy',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
@@ -2225,6 +2462,110 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
 
     formattedSummary += `<br><em>💡 You can view the latest brand guidelines at the <a href="/brand-guidelines">Brand Guidelines page</a>.</em>`;
+
+    return formattedSummary;
+  }
+
+  // Helper function to format market strategy for AI analysis
+  private formatMarketStrategy(marketResult: any): string {
+    if (!marketResult.exists) {
+      return `<strong>📊 Market Strategy</strong><br>No market strategy is currently configured. You can help the user set up their market strategy by asking about their business overview, competitors, and ideal customer profiles.`;
+    }
+
+    const { marketData } = marketResult;
+    let formattedSummary = `<strong>📊 Market Strategy Retrieved</strong><br>`;
+    formattedSummary += `I've successfully retrieved your market strategy. Here's what I found:<br><br>`;
+
+    // Business Overview Section (matches UI structure)
+    formattedSummary += `<strong>🏢 Business Overview</strong><br>`;
+    if (marketData.businessOverview) {
+      formattedSummary += `${marketData.businessOverview}<br><br>`;
+    } else {
+      formattedSummary += `No business overview provided yet.<br><br>`;
+    }
+
+    // Competitors Section (matches UI structure)
+    formattedSummary += `<strong>🏆 Competitors</strong><br>`;
+    if (marketData.competitors && marketData.competitors.length > 0) {
+      marketData.competitors.forEach((competitor: any, index: number) => {
+        if (typeof competitor === 'object' && competitor.name) {
+          formattedSummary += `• <strong>${competitor.name}:</strong> ${competitor.description || 'No description provided'}<br>`;
+        } else {
+          formattedSummary += `• ${competitor}<br>`;
+        }
+      });
+    } else {
+      formattedSummary += `• No competitors identified yet<br>`;
+    }
+    formattedSummary += `<br>`;
+
+    // Ideal Customer Profile (ICP) Section (matches UI structure)
+    formattedSummary += `<strong>🎯 Ideal Customer Profile (ICP)</strong><br>`;
+    if (marketData.icp && marketData.icp.length > 0) {
+      marketData.icp.forEach((icp: any, index: number) => {
+        if (typeof icp === 'object' && icp.title) {
+          formattedSummary += `• <strong>${icp.title}:</strong> ${icp.description || 'No description provided'}<br>`;
+          if (icp.valueProposition) {
+            formattedSummary += `  <em>Value Proposition:</em> ${icp.valueProposition}<br>`;
+          }
+        } else {
+          formattedSummary += `• ${icp}<br>`;
+        }
+      });
+    } else {
+      formattedSummary += `• No ideal customer profiles defined yet<br>`;
+    }
+
+    formattedSummary += `<br><em>💡 I'll use this market strategy information to inform marketing campaigns, content strategy, and business development decisions.</em>`;
+    formattedSummary += `<br><br><strong>⚠️ Note:</strong> This market strategy data is current and complete. Please do not call read_market_strategy again in this conversation as it will return the same information.`;
+
+    return formattedSummary;
+  }
+
+  // Helper function to format market strategy update feedback for AI analysis
+  private formatMarketStrategyUpdate(updateResult: any): string {
+    if (!updateResult.success) {
+      return `<strong>❌ Market Strategy Update Failed</strong><br>${updateResult.message || 'Unknown error occurred while updating market strategy.'}`;
+    }
+
+    const { updatedFields, marketData, updatedEntries, addedEntries, totalCompetitors, totalICPs } = updateResult;
+    let formattedSummary = `<strong>✅ Market Strategy Updated Successfully</strong><br>`;
+    formattedSummary += `Here's what was changed:<br><br>`;
+
+    // Show updated fields
+    if (updatedFields && updatedFields.length > 0) {
+      formattedSummary += `<strong>📝 Updated Fields:</strong><br>`;
+      updatedFields.forEach((field: string) => {
+        if (field === 'businessOverview') {
+          formattedSummary += `• <strong>Business Overview:</strong> Updated<br>`;
+        } else if (field === 'competitors') {
+          const updatedCount = updatedEntries.filter((entry: string) => entry.startsWith('Competitor:')).length;
+          const addedCount = addedEntries.filter((entry: string) => entry.startsWith('Competitor:')).length;
+          formattedSummary += `• <strong>Competitors:</strong> ${updatedCount} updated, ${addedCount} added (${totalCompetitors} total)<br>`;
+        } else if (field === 'icp') {
+          const updatedCount = updatedEntries.filter((entry: string) => entry.startsWith('ICP:')).length;
+          const addedCount = addedEntries.filter((entry: string) => entry.startsWith('ICP:')).length;
+          formattedSummary += `• <strong>Ideal Customer Profiles:</strong> ${updatedCount} updated, ${addedCount} added (${totalICPs} total)<br>`;
+        }
+      });
+    }
+
+    // Show specific entries that were updated vs added
+    if (updatedEntries && updatedEntries.length > 0) {
+      formattedSummary += `<br><strong>🔄 Updated Entries:</strong><br>`;
+      updatedEntries.forEach((entry: string) => {
+        formattedSummary += `• ${entry}<br>`;
+      });
+    }
+
+    if (addedEntries && addedEntries.length > 0) {
+      formattedSummary += `<br><strong>➕ Added Entries:</strong><br>`;
+      addedEntries.forEach((entry: string) => {
+        formattedSummary += `• ${entry}<br>`;
+      });
+    }
+
+    formattedSummary += `<br><em>💡 You can view the latest market strategy at the <a href="/market-strategy">Market Strategy page</a>.</em>`;
 
     return formattedSummary;
   }

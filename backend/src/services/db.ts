@@ -85,6 +85,20 @@ export interface User {
     createdAt: string;
     updatedAt: string;
   };
+  marketStrategy?: {
+    businessOverview: string;
+    competitors: Array<{
+      name: string;
+      description: string;
+    }>;
+    icp: Array<{
+      title: string;
+      description: string;
+      valueProposition: string;
+    }>;
+    createdAt: string;
+    updatedAt: string;
+  };
   startupProfiles?: Array<{
     id: string;
     companyName: string;
