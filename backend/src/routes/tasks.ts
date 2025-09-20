@@ -1,5 +1,5 @@
 import express, { Request, RequestHandler, Response } from 'express';
-import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction, getTaskExecution, getExecutionLog, generateShareToken, getExecutionWithToken, sendExecutionEmail, uploadFileToExecution, getPlacidEditorToken, generateFromTemplateToExecution, listPlacidTemplates, createRevisionExecution, getTaskExecutionPublic } from '../controllers/tasks';
+import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction, getTaskExecution, getExecutionLog, generateShareToken, getExecutionWithToken, sendExecutionEmail, uploadFileToExecution, getPlacidEditorToken, generateFromTemplateToExecution, listPlacidTemplates, createRevisionExecution, updateReport, getTaskExecutionPublic } from '../controllers/tasks';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { taskDb, subscriberDb } from '../services/db';
 import multer from 'multer';
@@ -309,6 +309,9 @@ router.post('/:id/upload-file', upload.single('file'), uploadFileToExecution);
 
 // Create revision execution
 router.post('/:id/executions/revision', authenticateToken, createRevisionExecution);
+
+// Update existing report
+router.post('/executions/update-report', authenticateToken, updateReport);
 
 // Placid Editor SDK token
 router.get('/:id/placid/editor-token', authenticateToken, getPlacidEditorToken);
