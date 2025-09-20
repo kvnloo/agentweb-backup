@@ -8,6 +8,16 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-09-20",
+    changes: [
+      "Supported Repair Image Embedding for HTML reports",
+      "- Added Repair Image Embedding option to Task Details page alongside Email Friendly HTML",
+      "- Automatically detects and fixes broken image links in HTML reports",
+      "- Replaces relative image paths with full file paths from available assets",
+      "- Ensures all available image files are properly referenced in HTML output",
+    ],
+  },
+  {
     date: "2025-09-02",
     changes: [
       "Fixed issue with header color issue with subscriber emails",

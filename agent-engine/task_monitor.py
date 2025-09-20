@@ -112,7 +112,7 @@ def create_email_friendly_html_revision(task_id, execution_id, html_asset_url, u
         
         # Prepare the revision request data
         revision_data = {
-            'revision_prompt': 'Make this HTML report email-friendly by ensuring it uses inline CSS styles and contains no JavaScript. If any charts rely on JavaScript (e.g., Chart.js), convert them to static, email-safe charts using Charts.css (pure CSS). Choose chart types that render well in email (prefer bar charts; avoid pie charts when labels/segments are small). If a chart will not read well in email, replace it with a clear HTML table of the underlying data, or remove the chart. Preserve all existing hyperlinks and their destinations (anchor text and href) exactly; do not strip or alter links. Do not reference or rely on any web version.',
+            'revision_prompt': 'Make this HTML report email-friendly and mobile-friendly by ensuring it uses inline CSS styles and contains no JavaScript. If any charts rely on JavaScript (e.g., Chart.js), convert them to static, email-safe charts using Charts.css (pure CSS). Choose chart types that render well in email (prefer bar charts; avoid pie charts when labels/segments are small). If a chart will not read well in email, replace it with a clear HTML table of the underlying data, or remove the chart. Preserve all existing hyperlinks and their destinations (anchor text and href) exactly; do not strip or alter links. Do not reference or rely on any web version. Ensure the layout is responsive and mobile-friendly with appropriate font sizes, spacing, and table layouts that work well on small screens.',
             'report_url': html_asset_url,
             'original_execution_id': execution_id
         }
@@ -152,6 +152,80 @@ def create_email_friendly_html_revision(task_id, execution_id, html_asset_url, u
             
     except Exception as e:
         logger.error(f"Error creating HTML revision: {e}")
+        return {'success': False, 'error': str(e)}
+
+def repair_image_embedding(task_id, execution_id, html_asset_url, user_id):
+    """
+    Repair image embeddings in HTML using the backend update-report endpoint.
+    First checks if repair is needed by looking for relative image paths.
+    
+    Args:
+        task_id: The ID of the task
+        execution_id: The ID of the execution
+        html_asset_url: The URL of the HTML asset
+        user_id: The ID of the user who owns the task
+        
+    Returns:
+        dict: Result with success status and updated asset URL if successful
+    """
+    try:
+        # Check if repair is needed by checking for broken references
+        execution = executions_table.get_item(
+            Key={'executionId': execution_id},
+            ProjectionExpression='result_files'
+        ).get('Item', {})
+        
+        result_files = execution.get('result_files', [])
+        result_urls = [file.get('url') for file in result_files if file.get('url') and file.get('url') != html_asset_url and file.get('file_type') == 'image']
+        
+        # Use the utility function to check if page is broken
+        from task_utils import is_page_broken
+        is_broken = is_page_broken(html_asset_url, result_urls)
+        
+        if not is_broken:
+            logger.info(f"✅ NO REPAIR NEEDED: No broken references found in HTML for task {task_id}")
+            return {'success': True, 'resultFile': {'url': html_asset_url}, 'no_repair_needed': True}
+        
+        logger.info(f"🔧 REPAIR NEEDED: Found broken references in HTML for task {task_id}")
+        
+        # Get backend URL from environment
+        backend_url = os.getenv('BACKEND_URL', 'http://localhost:3001')
+        
+        # Create JWT token for the user
+        jwt_token = create_jwt_token(user_id)
+        if not jwt_token:
+            logger.error(f"Failed to create JWT token for user {user_id}")
+            return {'success': False, 'error': 'Failed to create JWT token'}
+        
+        # Prepare the update request data
+        update_data = {
+            'revision_prompt': 'Repair broken references in this HTML report. Fix two types of issues: 1) Broken image links that use relative paths (e.g., "./image.png", "images/chart.jpg", "/assets/logo.png") - replace these with full file paths from the available files list. 2) Missing references to available files - ensure all files in the available files list are properly referenced in the HTML using appropriate img src or a href attributes. If a matching file is not found in the available files list, it is fine to keep the broken reference as-is. Do not modify any other content, styling, or structure. Only fix src attributes of img tags and href attributes of a tags.',
+            'report_url': html_asset_url,
+            'execution_id': execution_id,
+            'task_id': task_id
+        }
+        
+        # Send the update request to the backend using JWT authentication
+        response = requests.post(
+            f"{backend_url}/api/tasks/executions/update-report",
+            json=update_data,
+            headers={
+                'Authorization': f'Bearer {jwt_token}',
+                'Content-Type': 'application/json'
+            },
+            timeout=300  # 5 minutes timeout
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            logger.info(f"✅ REPAIR SUCCESS: Image embeddings repaired for task {task_id}")
+            return {'success': True, 'resultFile': result.get('resultFile')}
+        else:
+            logger.error(f"❌ REPAIR FAILED: HTTP {response.status_code}, Response: {response.text}")
+            return {'success': False, 'error': f'HTTP {response.status_code}: {response.text}'}
+            
+    except Exception as e:
+        logger.error(f"Error repairing image embeddings: {e}")
         return {'success': False, 'error': str(e)}
 
 # Initialize DynamoDB client
@@ -359,7 +433,7 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                 # Get task details
                 task = tasks_table.get_item(
                     Key={'taskId': execution['taskId']},
-                    ProjectionExpression='userId, #n, emailNotification, requireApproval, slackChannel, emailFriendlyHtml',
+                    ProjectionExpression='userId, #n, emailNotification, requireApproval, slackChannel, emailFriendlyHtml, repairImageEmbedding',
                     ExpressionAttributeNames={'#n': 'name'}
                 ).get('Item')
                 
@@ -425,80 +499,103 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                         else:
                             logger.error(f"User email not found for userId: {task['userId']}")
                     
+                    # Process HTML assets for repair and email-friendly features (independent of approval requirements)
+                    # Determine the expected asset type from execution record
+                    expected_asset_type = execution.get('approvalAssetType')
+                    
+                    # Find the asset matching the expected type in result_files
+                    asset_file = None
+                    asset_type = None
+                    if execution.get('result_files'):
+                        for file_info in execution['result_files']:
+                            # If we have an expected asset type, look for that specific type
+                            if expected_asset_type:
+                                if file_info.get('view_type') == expected_asset_type:
+                                    asset_file = file_info
+                                    asset_type = expected_asset_type
+                                    break
+                            else:
+                                # Fallback: Check if file is HTML using view_type
+                                if file_info.get('view_type') == 'html':
+                                    asset_file = file_info
+                                    asset_type = 'html'
+                                    break
+                    
+                    if asset_file:
+                        revisionDone = False
+                        
+                        # For HTML assets, repair image embeddings first if enabled
+                        # This updates the current HTML before any other processing
+                        if asset_type == 'html' and task.get('repairImageEmbedding', False):
+                            logger.info(f"🔧 REPAIR IMAGE EMBEDDING MODE: Repairing image embeddings for task {execution['taskId']} (repairImageEmbedding={task.get('repairImageEmbedding', False)})")
+                            repair_result = repair_image_embedding(
+                                task_id=execution['taskId'],
+                                execution_id=execution_id,
+                                html_asset_url=asset_file['url'],
+                                user_id=task['userId']
+                            )
+                            
+                            if repair_result['success']:
+                                if repair_result.get('no_repair_needed'):
+                                    # No repair was needed, continue with original HTML
+                                    logger.info(f"✅ NO REPAIR NEEDED: HTML already has proper image links for task {execution['taskId']}")
+                                else:
+                                    # Repair was successful, update the asset_file URL to the repaired version
+                                    asset_file['url'] = repair_result['resultFile']['url']
+                            else:
+                                logger.warning(f"❌ REPAIR FAILED: {repair_result['error']}. Continuing with original HTML.")
+                        
+                        # For HTML assets, create an email-friendly revision after repair
+                        # Only if the task has emailFriendlyHtml enabled
+                        if asset_type == 'html' and task.get('emailFriendlyHtml', False):
+                            logger.info(f"📧 EMAIL-FRIENDLY MODE: Creating email-friendly HTML revision for task {execution['taskId']}")
+                            revision_result = create_email_friendly_html_revision(
+                                task_id=execution['taskId'],
+                                execution_id=execution_id,
+                                html_asset_url=asset_file['url'],  # This will be the repaired URL if repair was successful
+                                user_id=task['userId']
+                            )
+                            
+                            if revision_result['success']:
+                                # Revision was successful and already sent approval request, skip sending another one
+                                logger.info(f"✅ EMAIL-FRIENDLY SUCCESS: Revision created and approval request already sent")
+                                revisionDone = True
+                            else:
+                                logger.warning(f"❌ EMAIL-FRIENDLY FAILED: {revision_result['error']}. Falling back to original HTML for approval.")
+                                # revisionDone remains False, will send approval below
+                    
                     # Check if task requires approval (regardless of subscribers)
                     # This ensures approval requests are sent even for tasks with no subscribers
                     # Use execution-level channel info if available (for revisions), otherwise use task-level
                     slack_channel = execution.get('slack_channel') or task.get('slackChannel')
                     # Use execution-level requireApproval if available (for revisions), otherwise use task-level
                     requires_approval = execution.get('requireApproval') if execution.get('requireApproval') is not None else task.get('requireApproval')
-                    if requires_approval and slack_channel:
+                    if requires_approval and slack_channel and asset_file:
                         # Send Slack approval request instead of emails
                         logger.info(f"Task {execution['taskId']} requires approval. Sending Slack approval request.")
                         try:
-                            # Determine the expected asset type from execution record
-                            expected_asset_type = execution.get('approvalAssetType')
-                            
-                            # Find the asset matching the expected type in result_files
-                            asset_file = None
-                            asset_type = None
-                            if execution.get('result_files'):
-                                for file_info in execution['result_files']:
-                                    # If we have an expected asset type, look for that specific type
-                                    if expected_asset_type:
-                                        if file_info.get('view_type') == expected_asset_type:
-                                            asset_file = file_info
-                                            asset_type = expected_asset_type
-                                            break
-                                    else:
-                                        # Fallback: Check if file is HTML using view_type
-                                        if file_info.get('view_type') == 'html':
-                                            asset_file = file_info
-                                            asset_type = 'html'
-                                            break
-                            
-                            if asset_file:
-                                revisionDone = False
-                                
-                                # For HTML assets, create an email-friendly revision before sending approval request
-                                # Only if the task has emailFriendlyHtml enabled
-                                if asset_type == 'html' and task.get('emailFriendlyHtml', False):
-                                    logger.info(f"📧 EMAIL-FRIENDLY MODE: Creating email-friendly HTML revision for task {execution['taskId']} (emailFriendlyHtml={task.get('emailFriendlyHtml', False)})")
-                                    revision_result = create_email_friendly_html_revision(
-                                        task_id=execution['taskId'],
-                                        execution_id=execution_id,
-                                        html_asset_url=asset_file['url'],
-                                        user_id=task['userId']
-                                    )
-                                    
-                                    if revision_result['success']:
-                                        # Revision was successful and already sent approval request, skip sending another one
-                                        logger.info(f"✅ EMAIL-FRIENDLY SUCCESS: Revision created and approval request already sent: {revision_result['revised_filename']}")
-                                        logger.info(f"⏭️  SKIPPING: No approval request sent for original HTML (emailFriendlyHtml mode)")
-                                        revisionDone = True
-                                    else:
-                                        logger.warning(f"❌ EMAIL-FRIENDLY FAILED: {revision_result['error']}. Falling back to original HTML for approval.")
-                                        # revisionDone remains False, will send approval below
-                                
-                                # Send Slack approval request if no revision was done or revision failed
-                                if not revisionDone:
-                                    logger.info(f"📤 APPROVAL MODE: Sending approval request for {asset_type} asset (emailFriendlyHtml={task.get('emailFriendlyHtml', False)}, revisionDone={revisionDone})")
-                                    from slack_utils import send_task_approval_request
-                                    send_task_approval_request(
-                                        task_id=execution['taskId'],
-                                        task_name=task['name'],
-                                        execution_id=execution_id,
-                                        asset_url=asset_file['url'],
-                                        filename=asset_file['filename'],
-                                        asset_type=asset_type,
-                                        slack_channel=slack_channel,
-                                        user_id=task['userId']
-                                    )
-                                    logger.info(f"📤 APPROVAL SENT: For task {execution['taskId']} to channel {slack_channel} for {asset_type} asset")
-                            else:
-                                expected_msg = f" (expected: {expected_asset_type})" if expected_asset_type else ""
-                                logger.warning(f"No {expected_asset_type or 'HTML report'} found for task {execution['taskId']} that requires approval{expected_msg}")
+                            # Send Slack approval request if no revision was done or revision failed
+                            if not revisionDone:
+                                from slack_utils import send_task_approval_request
+                                send_task_approval_request(
+                                    task_id=execution['taskId'],
+                                    task_name=task['name'],
+                                    execution_id=execution_id,
+                                    asset_url=asset_file['url'],
+                                    filename=asset_file['filename'],
+                                    asset_type=asset_type,
+                                    slack_channel=slack_channel,
+                                    user_id=task['userId']
+                                )
+                                logger.info(f"📤 APPROVAL SENT: For task {execution['taskId']} to channel {slack_channel}")
                         except Exception as e:
                             logger.error(f"Failed to send Slack approval request for task {execution['taskId']}: {e}")
+                    else:
+                        if requires_approval and not slack_channel:
+                            logger.warning(f"Task {execution['taskId']} requires approval but no Slack channel configured")
+                        elif requires_approval and not asset_file:
+                            expected_msg = f" (expected: {expected_asset_type})" if expected_asset_type else ""
+                            logger.warning(f"No {expected_asset_type or 'HTML report'} found for task {execution['taskId']} that requires approval{expected_msg}")
                     
                     # Send detailed results to all subscribers (if any and not requiring approval)
                     if has_subscribers and not (requires_approval and slack_channel):

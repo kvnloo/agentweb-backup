@@ -26,6 +26,8 @@ import asyncio
 import datetime
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+import re
+import requests
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -658,6 +660,16 @@ def upload_task_result_files(downloads_path: str, execution_id: str) -> List[Dic
                         # Add view type flag if this is a viewable file
                         if file_ext in viewable_types:
                             file_info['view_type'] = viewable_types[file_ext]['view_type']
+                            # Also set file_type based on view_type
+                            view_type = viewable_types[file_ext]['view_type']
+                            if view_type == 'image':
+                                file_info['file_type'] = 'image'
+                            elif view_type == 'html':
+                                file_info['file_type'] = 'html'
+                            elif view_type == 'pdf':
+                                file_info['file_type'] = 'pdf'
+                            elif view_type == 'text':
+                                file_info['file_type'] = 'text'
                             
                         result_files.append(file_info)
                         logger.info(f"Uploaded result file to S3: {url}")
@@ -1953,6 +1965,73 @@ def parse_json(text: str) -> Optional[Dict[str, Any]]:
     # No valid JSON found
     return None
 
+def is_page_broken(file_url: str, result_urls: list = None, timeout: int = 30) -> bool:
+    """
+    Check if an HTML page is broken by looking for relative image paths and missing referenced URLs.
+    
+    Args:
+        file_url: URL of the HTML file to check
+        result_urls: List of available URLs that should be referenced in the page
+        timeout: Request timeout in seconds (default: 30)
+        
+    Returns:
+        bool: True if the page is broken (has relative images or missing references), False otherwise
+    """
+    try:
+        logger.info(f"🔍 Checking if page is broken: {file_url}")
+        
+        # Fetch the HTML content
+        response = requests.get(file_url, timeout=timeout)
+        if response.status_code != 200:
+            logger.warning(f"⚠️  Could not fetch file to check for broken references: HTTP {response.status_code}")
+            return True  # Consider it broken if we can't fetch it
+        
+        html_content = response.text
+        
+        # Check for relative image paths using regex
+        relative_image_patterns = [
+            r'src=["\'](?!https?://|data:)([^"\']*\.(?:png|jpg|jpeg|gif|svg|webp|bmp|ico))["\']',  # src="image.png" or src='image.png'
+            r'src=["\'](?!https?://|data:)([^"\']*\.(?:png|jpg|jpeg|gif|svg|webp|bmp|ico))["\']',  # src="./image.png" or src='./image.png'
+            r'src=["\'](?!https?://|data:)([^"\']*\.(?:png|jpg|jpeg|gif|svg|webp|bmp|ico))["\']',  # src="/assets/image.png" or src='/assets/image.png'
+        ]
+        
+        has_relative_images = False
+        for pattern in relative_image_patterns:
+            if re.search(pattern, html_content, re.IGNORECASE):
+                has_relative_images = True
+                break
+        
+        # Check if any available URLs are not referenced in the HTML
+        has_missing_references = False
+        if result_urls:
+            # Extract all URLs referenced in the HTML (src, href attributes)
+            url_patterns = [
+                r'src=["\']([^"\']+)["\']',  # src="url"
+                r'href=["\']([^"\']+)["\']',  # href="url"
+            ]
+            
+            referenced_urls = set()
+            for pattern in url_patterns:
+                matches = re.findall(pattern, html_content, re.IGNORECASE)
+                for match in matches:
+                    referenced_urls.add(match)
+            
+            # Check if any available URLs are not referenced in the HTML
+            if result_urls:
+                available_urls = set(result_urls)
+                unreferenced_urls = available_urls - referenced_urls
+                if unreferenced_urls:
+                    has_missing_references = True
+                    logger.info(f"🔍 Unreferenced available URLs: {list(unreferenced_urls)}")
+        
+        is_broken = has_relative_images or has_missing_references
+        logger.info(f"🔍 Page broken: {is_broken} (relative_images: {has_relative_images}, missing_references: {has_missing_references})")
+        return is_broken
+        
+    except Exception as e:
+        logger.error(f"Error checking if page is broken in {file_url}: {e}")
+        return True  # Consider it broken if we can't check it
+
 # List of functions to be exported from this module
 __all__ = [
     'get_downloads_path',
@@ -1967,5 +2046,6 @@ __all__ = [
     'decrypt_password',
     'fetch_api_credentials',
     'get_all_configs',
-    'parse_json'
+    'parse_json',
+    'is_page_broken'
 ] 

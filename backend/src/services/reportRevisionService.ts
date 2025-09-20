@@ -44,7 +44,8 @@ export class ReportRevisionService {
     executionId: string,
     originalReportUrl: string,
     revisionPrompt: string,
-    userId: string
+    userId: string,
+    originalExecutionId?: string
   ): Promise<{ success: boolean; resultFile?: any; error?: string }> {
     try {
       console.log(`Creating report revision for task ${taskId}, execution ${executionId}`);
@@ -57,10 +58,38 @@ export class ReportRevisionService {
         throw new Error('Failed to download original report');
       }
 
+      // Get the original execution to find image files for context
+      let enhancedRevisionPrompt = revisionPrompt;
+      
+      if (originalExecutionId) {
+        const { taskDb } = await import('./db');
+        const originalExecution = await taskDb.getTaskExecutionById(originalExecutionId);
+        
+        if (originalExecution && originalExecution.result_files) {
+          const imageFiles = originalExecution.result_files.filter((file: any) => file.file_type === 'image');
+          console.log(`📸 Found ${imageFiles.length} image files in original execution ${originalExecutionId}`);
+          
+          if (imageFiles.length > 0) {
+            const imageContext = imageFiles.map((file: any) => 
+              `- ${file.filename || 'unnamed'}: ${file.url}`
+            ).join('\n');
+            
+            enhancedRevisionPrompt = `${revisionPrompt}\n\nAvailable image files that you can reference:\n${imageContext}`;
+            console.log(`📸 Added ${imageFiles.length} image files as context to revision prompt`);
+          } else {
+            console.log(`📸 No image files found in original execution ${originalExecutionId}`);
+          }
+        } else {
+          console.log(`📸 No result files found in original execution ${originalExecutionId}`);
+        }
+      } else {
+        console.log(`📸 No original execution ID provided, skipping image context`);
+      }
+
       // Generate the revised report using AI
       const { revisedContent, resultFile } = await this.generateRevisedReport(
         originalReport, 
-        revisionPrompt, 
+        enhancedRevisionPrompt, 
         taskId, 
         executionId
       );
@@ -331,6 +360,78 @@ export class ReportRevisionService {
     // This should never be reached due to the throw in the loop, but TypeScript needs it
     throw new Error('Unexpected error in retry loop');
   }
+
+  /**
+   * Update an existing report by replacing its content (for repair image embedding)
+   */
+  async updateReport(
+    reportUrl: string,
+    executionId: string,
+    revisionPrompt: string,
+    taskId: string
+  ): Promise<{ success: boolean; resultFile?: any; error?: string }> {
+    try {
+      console.log(`Updating report for execution ${executionId}`);
+
+      // Get the current execution to get context about other files
+      const { taskDb } = await import('./db');
+      const execution = await taskDb.getTaskExecutionById(executionId);
+      if (!execution) {
+        throw new Error('Execution not found');
+      }
+
+      // Download the original report
+      const originalReport = await this.fetchContentFromUrl(reportUrl);
+      if (!originalReport) {
+        throw new Error('Failed to download original report');
+      }
+
+      // Add context about other files in result_files to the revision prompt
+      const resultFiles = execution.result_files || [];
+      const otherFiles = resultFiles.filter((file: any) => file.url !== reportUrl);
+      
+      let enhancedRevisionPrompt = revisionPrompt;
+      if (otherFiles.length > 0) {
+        const fileContext = otherFiles.map((file: any) => 
+          `- ${file.filename || 'unnamed'}: ${file.url}`
+        ).join('\n');
+        
+        enhancedRevisionPrompt = `${revisionPrompt}\n\nAvailable files that you can reference:\n${fileContext}`;
+      }
+
+      // Generate the updated report using AI
+      const { revisedContent, resultFile } = await this.generateRevisedReport(
+        originalReport, 
+        enhancedRevisionPrompt, 
+        taskId,
+        executionId
+      );
+
+      // Update the result_files array, replacing the old report with the new one
+      const updatedResultFiles = resultFiles.map((file: any) => {
+        if (file.url === reportUrl) {
+          return resultFile;
+        }
+        return file;
+      });
+
+      // Update the execution with the merged result_files
+      await this.updateExecutionDirect(executionId, {
+        result_files: updatedResultFiles
+      });
+
+      console.log(`Report update completed successfully for execution ${executionId}`);
+      return { success: true, resultFile };
+
+    } catch (error) {
+      console.error('Error updating report:', error);
+      return { 
+        success: false, 
+        error: error instanceof Error ? error.message : 'Unknown error' 
+      };
+    }
+  }
+
 
   /**
    * Upload the revised report to S3

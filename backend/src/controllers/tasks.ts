@@ -9,6 +9,7 @@ import crypto from 'crypto';
 import { S3 } from 'aws-sdk';
 import axios from 'axios';
 import jwt from 'jsonwebtoken';
+import { getAssetTypeFromFilename } from '../services/approvalDb';
 
 const s3 = new S3();
 
@@ -335,6 +336,10 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
 
     if (req.body.emailFriendlyHtml !== undefined) {
       updates.emailFriendlyHtml = Boolean(req.body.emailFriendlyHtml);
+    }
+
+    if (req.body.repairImageEmbedding !== undefined) {
+      updates.repairImageEmbedding = Boolean(req.body.repairImageEmbedding);
     }
 
     if (req.body.llmName !== undefined) {
@@ -1035,7 +1040,8 @@ export const uploadFileToExecution = async (req: AuthRequest, res: Response) => 
       url,
       filename: file.originalname,
       token: randomToken,
-      is_html: false
+      is_html: false,
+      file_type: getAssetTypeFromFilename(file.originalname)
     };
 
     // Get current result_files and append the new file
@@ -1214,6 +1220,7 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
       filename: `${filenameBase}.${ext}`,
       token: randomToken,
       is_html: false,
+      file_type: 'image',
       placid_config: {
         template_uuid: tplUuid,
         layers: layers || {},
@@ -1309,6 +1316,7 @@ export const createRevisionExecution = async (req: AuthRequest, res: Response) =
         run_user_id: userId !== task.userId ? userId : undefined,
         status: 'running',
         startTime: new Date().toISOString(),
+        prompt: revision_prompt,
         revision_prompt: revision_prompt,
         original_report_url: report_url,
         original_execution_id: original_execution_id,
@@ -1329,7 +1337,8 @@ export const createRevisionExecution = async (req: AuthRequest, res: Response) =
           revisionExecution.executionId,
           report_url,
           revision_prompt,
-          userId
+          userId,
+          original_execution_id
         );
 
         if (revisionResult.success) {
@@ -1408,6 +1417,76 @@ export const createRevisionExecution = async (req: AuthRequest, res: Response) =
 
 
 // Function that can be called from Slack without Express request/response objects
+export const updateReport = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { report_url, execution_id, revision_prompt, task_id } = req.body;
+    
+    if (!report_url || !execution_id || !revision_prompt) {
+      return res.status(400).json({ 
+        message: 'Missing required fields: report_url, execution_id, revision_prompt' 
+      });
+    }
+
+    // Get the execution to verify ownership
+    const execution = await taskDb.getTaskExecutionById(execution_id);
+    if (!execution) {
+      return res.status(404).json({ message: 'Execution not found' });
+    }
+
+    // Get the task to verify ownership
+    const task = await taskDb.getTaskById(execution.taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Get user to check if admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    // Verify task belongs to user or user is admin
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Import the report revision service
+    const { reportRevisionService } = await import('../services/reportRevisionService');
+
+    // Update the report
+    const result = await reportRevisionService.updateReport(
+      report_url,
+      execution_id,
+      revision_prompt,
+      task_id || task.taskId
+    );
+
+    if (result.success) {
+      return res.status(200).json({ 
+        message: 'Report updated successfully',
+        resultFile: result.resultFile
+      });
+    } else {
+      return res.status(500).json({ 
+        message: 'Failed to update report',
+        error: result.error
+      });
+    }
+
+  } catch (error) {
+    console.error('Error updating report:', error);
+    return res.status(500).json({ 
+      message: 'Internal server error',
+      error: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+};
+
 export const createRevisionExecutionFromSlack = async (
   taskId: string,
   revisionPrompt: string,
@@ -1444,6 +1523,7 @@ export const createRevisionExecutionFromSlack = async (
         run_user_id: runUserId,
         status: 'running',
         startTime: new Date().toISOString(),
+        prompt: revisionPrompt,
         revision_prompt: revisionPrompt,
         original_report_url: assetUrl,
         original_execution_id: originalExecutionId,
@@ -1465,7 +1545,8 @@ export const createRevisionExecutionFromSlack = async (
         revisionExecution.executionId,
         assetUrl,
         revisionPrompt,
-        runUserId
+        runUserId,
+        originalExecutionId
       ).catch(error => {
         console.error('Error in background report revision from Slack:', error);
       });

@@ -83,6 +83,7 @@ interface Task {
   outputAsJson?: boolean; // Flag for outputting result as JSON
   outputAsHtml?: boolean; // New flag for outputting result as HTML5
   emailFriendlyHtml?: boolean; // Flag for creating email-friendly HTML revisions
+  repairImageEmbedding?: boolean; // Flag for repairing image embeddings in HTML
   isAgenticDevMode?: boolean; // Flag for enabling agentic dev mode
   llmName?: string;
   attachments?: TaskAttachment[];
@@ -467,6 +468,8 @@ export default function TaskDetails() {
   const [isEmailFriendlyDialogOpen, setIsEmailFriendlyDialogOpen] = useState(false);
   const [isVideoModelDialogOpen, setIsVideoModelDialogOpen] = useState(false);
   const [selectedVideoModel, setSelectedVideoModel] = useState("");
+  const [tempEmailFriendly, setTempEmailFriendly] = useState(false);
+  const [tempRepairImageEmbedding, setTempRepairImageEmbedding] = useState(false);
 
   const isAdminRoute = location.pathname.startsWith("/admin/");
   const showActions =
@@ -1254,14 +1257,17 @@ export default function TaskDetails() {
     const newOutputAsHtml = !task.outputAsHtml;
 
     if (newOutputAsHtml) {
-      // If enabling HTML, show popup to ask about email-friendly option
+      // If enabling HTML, show popup to ask about email-friendly and repair image embedding options
+      setTempEmailFriendly(task?.emailFriendlyHtml || false);
+      setTempRepairImageEmbedding(task?.repairImageEmbedding || false);
       setIsEmailFriendlyDialogOpen(true);
     } else {
-      // If disabling HTML, just update the toggle and disable email-friendly
+      // If disabling HTML, just update the toggle and disable email-friendly and repair image embedding
       try {
         const updates: any = { 
           outputAsHtml: false,
-          emailFriendlyHtml: false // Also disable email-friendly when disabling HTML
+          emailFriendlyHtml: false, // Also disable email-friendly when disabling HTML
+          repairImageEmbedding: false // Also disable repair image embedding when disabling HTML
         };
 
         await axios.put(buildApiUrl(`/api/tasks/${taskId}`), updates, {
@@ -1617,18 +1623,19 @@ export default function TaskDetails() {
     setIsEmailFriendlyDialogOpen(false);
   };
 
-  const handleEmailFriendlyDialogConfirm = async (enableEmailFriendly: boolean) => {
+  const handleEmailFriendlyDialogConfirm = async () => {
     try {
       const updates: any = { 
         outputAsHtml: true,
-        emailFriendlyHtml: enableEmailFriendly
+        emailFriendlyHtml: tempEmailFriendly,
+        repairImageEmbedding: tempRepairImageEmbedding
       };
       
       // If enabling email-friendly, turn JSON off
-      if (enableEmailFriendly && task?.outputAsJson) {
+      if (tempEmailFriendly && task?.outputAsJson) {
         updates.outputAsJson = false;
       }
-
+      
       await axios.put(
         buildApiUrl(`/api/tasks/${taskId}`),
         updates,
@@ -1643,6 +1650,7 @@ export default function TaskDetails() {
       toast.error("Failed to update HTML output settings");
     }
   };
+
 
   const handleLeadListDialogConfirm = async () => {
     const error = validateLeadListIdentifier(leadListIdentifier);
@@ -2086,6 +2094,14 @@ export default function TaskDetails() {
                               label="Email Friendly"
                               size="small"
                               color="primary"
+                              variant="outlined"
+                            />
+                          )}
+                          {task?.repairImageEmbedding && (
+                            <Chip
+                              label="Repair Image Embedding"
+                              size="small"
+                              color="secondary"
                               variant="outlined"
                             />
                           )}
@@ -3132,33 +3148,61 @@ export default function TaskDetails() {
         <DialogTitle>Enable HTML Output</DialogTitle>
         <DialogContent>
           <DialogContentText sx={{ mb: 2 }}>
-            You're enabling HTML output for this task. Would you like to also enable email-friendly HTML?
-            <Box
-              component="span"
-              sx={{ color: "info.main", display: "block", mt: 1 }}
-            >
-              ℹ️ Email-friendly HTML creates optimized version for email rendering.
-            </Box>
+            You're enabling HTML output for this task. Select any additional HTML features you'd like to enable:
           </DialogContentText>
+          <Box sx={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={tempEmailFriendly}
+                  onChange={(e) => setTempEmailFriendly(e.target.checked)}
+                  color="primary"
+                />
+              }
+              label={
+                <Box>
+                  <Typography variant="body1" sx={{ fontWeight: 'medium' }}>
+                    Email-Friendly HTML
+                  </Typography>
+                  <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                    Creates optimized version for email rendering with inline CSS and no JavaScript
+                  </Typography>
+                </Box>
+              }
+            />
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={tempRepairImageEmbedding}
+                  onChange={(e) => setTempRepairImageEmbedding(e.target.checked)}
+                  color="secondary"
+                />
+              }
+              label={
+                <Box>
+                  <Typography variant="body1" sx={{ fontWeight: 'medium' }}>
+                    Repair Image Embedding
+                  </Typography>
+                  <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                    Automatically fixes broken image references in HTML output
+                  </Typography>
+                </Box>
+              }
+            />
+          </Box>
         </DialogContent>
         <DialogActions>
           <Button onClick={handleEmailFriendlyDialogClose}>Cancel</Button>
           <Button
-            onClick={() => handleEmailFriendlyDialogConfirm(false)}
-            variant="outlined"
-            color="primary"
-          >
-            Just HTML
-          </Button>
-          <Button
-            onClick={() => handleEmailFriendlyDialogConfirm(true)}
+            onClick={handleEmailFriendlyDialogConfirm}
             variant="contained"
             color="primary"
           >
-            HTML + Email-Friendly
+            Enable HTML
           </Button>
         </DialogActions>
       </Dialog>
+
 
     </Container>
   );

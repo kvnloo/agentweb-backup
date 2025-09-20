@@ -16,6 +16,7 @@ export interface Task {
   outputAsJson?: boolean;  // Whether the agent should output the result in JSON format
   outputAsHtml?: boolean;
   emailFriendlyHtml?: boolean;  // Whether to create email-friendly HTML revisions for approval
+  repairImageEmbedding?: boolean;  // Whether to repair image embeddings in HTML output
   llmName?: string;  // The preferred LLM to try first for this task
   useSharedBrowser?: boolean; // Whether the task should use a shared browser session
   turnOffHeadless?: boolean; // Whether to run the browser in visible mode
@@ -54,6 +55,7 @@ export interface TaskUpdate {
   outputAsJson?: boolean;
   outputAsHtml?: boolean;
   emailFriendlyHtml?: boolean;
+  repairImageEmbedding?: boolean;
   isAgenticDevMode?: boolean;
   llmName?: string;
   useSharedBrowser?: boolean;
