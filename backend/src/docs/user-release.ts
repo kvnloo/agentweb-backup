@@ -7,6 +7,12 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-09-22',
+    changes: [
+      'Route error to agent for better error handling in Agent Mode',
+    ],
+  },
+  {
     date: '2025-09-19',
     changes: [
       'Supported updating Market Strategy in Agent Mode',

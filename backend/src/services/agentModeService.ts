@@ -133,6 +133,11 @@ export class AgentModeService {
               // Special handling for market strategy update - provide feedback to LLM
               const updateSummary = this.formatMarketStrategyUpdate(result);
               content += `\n\n${updateSummary}`;
+            } else if (result && result.success === false) {
+              // Feed tool error back to LLM so it can recover
+              shouldFeedbackToLLM = true;
+              const errorSummary = this.formatToolError(toolCall.function.name, result.error || result.message || 'Unknown error');
+              content += `\n\n${errorSummary}`;
             }
           } catch (error) {
             console.error(`AgentMode: Tool execution error for ${toolCall.function.name}:`, error);
@@ -142,6 +147,10 @@ export class AgentModeService {
               arguments: JSON.parse(toolCall.function.arguments),
               error: error instanceof Error ? error.message : 'Unknown error'
             });
+            // Ensure LLM receives the error to adjust its plan
+            shouldFeedbackToLLM = true;
+            const errMsg = error instanceof Error ? error.message : String(error);
+            content += `\n\n${this.formatToolError(toolCall.function.name, errMsg)}`;
           }
         }
         
@@ -2191,6 +2200,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
     summary += `<em>💡 I've gathered this current information to provide you with data-driven insights and recommendations.</em>`;
     
     return summary;
+  }
+
+  // Helper to format tool error for LLM feedback
+  private formatToolError(toolName: string, errorMessage: string): string {
+    const safeMessage = typeof errorMessage === 'string' ? errorMessage : 'Unknown error';
+    return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nNext: Adjust the plan or ask the user for missing info.`;
   }
 
   // Web search functionality
