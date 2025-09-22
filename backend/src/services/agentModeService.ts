@@ -108,6 +108,7 @@ export class AgentModeService {
               content += `\n\n${statusMessage}`;
             } else if (toolCall.function.name === 'get_meta_ads_metrics' && result.success) {
               // Special handling for metrics data - provide summary for AI analysis
+              shouldFeedbackToLLM = true;
               const metricsSummary = this.formatMetricsSummary(result.data);
               content += `\n\n${metricsSummary}`;
             } else if (toolCall.function.name === 'search_web' && result.success) {
@@ -2156,56 +2157,58 @@ Use the available tools to create tasks in the agent-engine when complex work is
   private formatMetricsSummary(data: any): string {
     const { adPerformance, adSetsData, adsData, campaignSummary } = data;
     
-    // Create a structured data summary for the AI to analyze contextually
-    let summary = `📊 **Meta Ads Performance Data Retrieved**\n\n`;
-    summary += `I've successfully pulled your latest Meta ads performance data. Here's what I found:\n\n`;
+    let summary = `📊 **Meta Ads Performance Data**\n\n`;
     
-    // Provide key metrics in a conversational format
+    // Campaign Summary Table
     if (campaignSummary) {
-      summary += `**Performance Summary:**\n`;
-      summary += `• You have ${campaignSummary.totalCampaigns} active campaign${campaignSummary.totalCampaigns > 1 ? 's' : ''} running\n`;
-      summary += `• Total investment: $${campaignSummary.totalSpend.toFixed(2)}\n`;
-      summary += `• Reached ${campaignSummary.totalImpressions.toLocaleString()} people with ${campaignSummary.totalClicks.toLocaleString()} clicks\n`;
-      summary += `• Your CTR is ${campaignSummary.averageCtr.toFixed(2)}% (industry average is ~1-2%)\n`;
-      summary += `• Cost per click: $${campaignSummary.averageCpc.toFixed(2)}\n\n`;
+      summary += `**Campaign Summary**\n`;
+      summary += `| Metric | Value |\n`;
+      summary += `|--------|-------|\n`;
+      summary += `| Total Campaigns | ${campaignSummary.totalCampaigns} |\n`;
+      summary += `| Total Spend | $${campaignSummary.totalSpend.toFixed(2)} |\n`;
+      summary += `| Impressions | ${campaignSummary.totalImpressions.toLocaleString()} |\n`;
+      summary += `| Clicks | ${campaignSummary.totalClicks.toLocaleString()} |\n`;
+      summary += `| CTR | ${campaignSummary.averageCtr.toFixed(2)}% |\n`;
+      summary += `| CPC | $${campaignSummary.averageCpc.toFixed(2)} |\n\n`;
     }
     
-    // Highlight top performers
-    if (adsData && adsData.length > 0) {
-      const topAds = adsData
-        .sort((a: any, b: any) => b.clicks - a.clicks)
-        .slice(0, 3);
+    // Campaign Performance Table
+    if (adPerformance && adPerformance.length > 0) {
+      summary += `**Campaign Performance**\n`;
+      summary += `| Campaign Name | Spend | Impressions | Clicks | CTR | CPC |\n`;
+      summary += `|---------------|-------|-------------|--------|-----|-----|\n`;
       
-      summary += `**Top Performing Ads:**\n`;
-      topAds.forEach((ad: any, index: number) => {
-        summary += `${index + 1}. "${ad.name}" - ${ad.clicks} clicks (${ad.ctr.toFixed(2)}% CTR, $${ad.cpc.toFixed(2)} CPC)\n`;
+      adPerformance.forEach((campaign: any) => {
+        summary += `| ${campaign.name} | $${campaign.spend.toFixed(2)} | ${campaign.impressions.toLocaleString()} | ${campaign.clicks.toLocaleString()} | ${campaign.ctr.toFixed(2)}% | $${campaign.cpc.toFixed(2)} |\n`;
       });
       summary += `\n`;
     }
     
-    // Add performance context
-    if (campaignSummary) {
-      summary += `**Performance Context:**\n`;
-      if (campaignSummary.averageCtr > 2.0) {
-        summary += `• Your CTR of ${campaignSummary.averageCtr.toFixed(2)}% is performing well above industry standards\n`;
-      } else if (campaignSummary.averageCtr < 1.0) {
-        summary += `• Your CTR of ${campaignSummary.averageCtr.toFixed(2)}% is below industry average and could be improved\n`;
-      } else {
-        summary += `• Your CTR of ${campaignSummary.averageCtr.toFixed(2)}% is performing at industry standard levels\n`;
-      }
+    // Ad Sets Performance Table
+    if (adSetsData && adSetsData.length > 0) {
+      summary += `**Ad Sets Performance**\n`;
+      summary += `| Ad Set Name | Campaign | Spend | Impressions | Clicks | CTR | CPC |\n`;
+      summary += `|-------------|----------|-------|-------------|--------|-----|-----|\n`;
       
-      if (campaignSummary.averageCpc < 0.50) {
-        summary += `• Your CPC of $${campaignSummary.averageCpc.toFixed(2)} is excellent - very cost efficient\n`;
-      } else if (campaignSummary.averageCpc > 2.0) {
-        summary += `• Your CPC of $${campaignSummary.averageCpc.toFixed(2)} is high and may need optimization\n`;
-      } else {
-        summary += `• Your CPC of $${campaignSummary.averageCpc.toFixed(2)} is reasonable for your industry\n`;
-      }
+      adSetsData.forEach((adSet: any) => {
+        summary += `| ${adSet.name} | ${adSet.campaignName} | $${adSet.spend.toFixed(2)} | ${adSet.impressions.toLocaleString()} | ${adSet.clicks.toLocaleString()} | ${adSet.ctr.toFixed(2)}% | $${adSet.cpc.toFixed(2)} |\n`;
+      });
+      summary += `\n`;
     }
     
-    summary += `\n*Based on ${adPerformance?.length || 0} campaigns, ${adSetsData?.length || 0} ad sets, and ${adsData?.length || 0} individual ads.*\n`;
-    summary += `*Note: Only ads with activity in the selected timeframe are included. Disabled, paused, or inactive ads won't appear in this data.*\n\n`;
-    summary += `**Please provide your analysis and recommendations based on this performance data and our conversation context.**`;
+    // Individual Ads Performance Table
+    if (adsData && adsData.length > 0) {
+      summary += `**Individual Ads Performance**\n`;
+      summary += `| Ad Name | Ad Set | Campaign | Spend | Impressions | Clicks | CTR | CPC |\n`;
+      summary += `|---------|--------|----------|-------|-------------|--------|-----|-----|\n`;
+      
+      adsData.forEach((ad: any) => {
+        summary += `| ${ad.name} | ${ad.adSetName} | ${ad.campaignName} | $${ad.spend.toFixed(2)} | ${ad.impressions.toLocaleString()} | ${ad.clicks.toLocaleString()} | ${ad.ctr.toFixed(2)}% | $${ad.cpc.toFixed(2)} |\n`;
+      });
+      summary += `\n`;
+    }
+    
+    summary += `*Data includes ${adPerformance?.length || 0} campaigns, ${adSetsData?.length || 0} ad sets, and ${adsData?.length || 0} individual ads.*\n`;
     
     return summary;
   }
