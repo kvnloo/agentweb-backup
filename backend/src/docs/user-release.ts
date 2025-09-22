@@ -12,6 +12,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Route error to agent for better error handling in Agent Mode',
       'Added inline task name editing in Customer Portal',
       '- Users can now edit task names directly on the Task Details page',
+      'Updated Emma chat panel default behavior in Customer Portal',
+      '- Emma chat window now starts collapsed by default for better user experience',
+      '- Added configurable setting to control default chat panel state',
     ],
   },
   {
