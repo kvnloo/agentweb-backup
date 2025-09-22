@@ -10,6 +10,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
     date: '2025-09-22',
     changes: [
       'Route error to agent for better error handling in Agent Mode',
+      'Added inline task name editing in Customer Portal',
+      '- Users can now edit task names directly on the Task Details page',
     ],
   },
   {
