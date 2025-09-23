@@ -1,0 +1,174 @@
+name: Deploy (backend & partner-portal)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'backend/**'
+      - 'partner-portal/**'
+
+jobs:
+  detect-changes:
+    name: Detect changed projects
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+      partner: ${{ steps.filter.outputs.partner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Paths filter
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          filters: |
+            backend:
+              - 'backend/**'
+            partner:
+              - 'partner-portal/**'
+
+  backend-deploy:
+    name: Backend deploy (only if version increased)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Check version bump vs previous commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          CURRENT_VERSION=$(jq -r .version backend/package.json)
+          PREV_SHA=$(git rev-parse HEAD^)
+          if git cat-file -e "$PREV_SHA"^{commit} 2>/dev/null; then
+            if git show "$PREV_SHA:backend/package.json" >/dev/null 2>&1; then
+              PREV_VERSION=$(git show "$PREV_SHA:backend/package.json" | jq -r .version)
+            else
+              PREV_VERSION="0.0.0"
+            fi
+          else
+            PREV_VERSION="0.0.0"
+          fi
+          if [[ "$PREV_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$CURRENT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            if npx --yes semver -r "> $PREV_VERSION" "$CURRENT_VERSION" >/dev/null; then
+              echo "should_deploy=true" >> $GITHUB_ENV
+            else
+              echo "should_deploy=false" >> $GITHUB_ENV
+            fi
+          else
+            echo "::warning::Invalid semver detected; skipping deploy"
+            echo "should_deploy=false" >> $GITHUB_ENV
+          fi
+
+      - name: Install dependencies
+        if: env.should_deploy == 'true'
+        working-directory: backend
+        run: npm ci
+
+      - name: Build
+        if: env.should_deploy == 'true'
+        working-directory: backend
+        run: npm run build --if-present
+
+      - name: Package artifact
+        if: env.should_deploy == 'true'
+        working-directory: backend
+        run: |
+          VERSION=$(jq -r .version package.json)
+          mkdir -p builds
+          zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json .env.example .platform || zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json
+
+      - name: Upload artifact
+        if: env.should_deploy == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-build
+          path: backend/builds/*.zip
+
+      # TODO: Add your actual deploy step (e.g., AWS EB CLI or API)
+
+  partner-deploy:
+    name: Partner portal deploy (only if version increased)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.partner == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          cache: 'npm'
+          cache-dependency-path: partner-portal/package-lock.json
+
+      - name: Check version bump vs previous commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          CURRENT_VERSION=$(jq -r .version partner-portal/package.json)
+          PREV_SHA=$(git rev-parse HEAD^)
+          if git cat-file -e "$PREV_SHA"^{commit} 2>/dev/null; then
+            if git show "$PREV_SHA:partner-portal/package.json" >/dev/null 2>&1; then
+              PREV_VERSION=$(git show "$PREV_SHA:partner-portal/package.json" | jq -r .version)
+            else
+              PREV_VERSION="0.0.0"
+            fi
+          else
+            PREV_VERSION="0.0.0"
+          fi
+          if [[ "$PREV_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$CURRENT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            if npx --yes semver -r "> $PREV_VERSION" "$CURRENT_VERSION" >/dev/null; then
+              echo "should_deploy=true" >> $GITHUB_ENV
+            else
+              echo "should_deploy=false" >> $GITHUB_ENV
+            fi
+          else
+            echo "::warning::Invalid semver detected; skipping deploy"
+            echo "should_deploy=false" >> $GITHUB_ENV
+          fi
+
+      - name: Install dependencies
+        if: env.should_deploy == 'true'
+        working-directory: partner-portal
+        run: npm ci
+
+      - name: Build
+        if: env.should_deploy == 'true'
+        working-directory: partner-portal
+        run: npm run build --if-present
+
+      - name: Package artifact
+        if: env.should_deploy == 'true'
+        working-directory: partner-portal
+        run: |
+          VERSION=$(jq -r .version package.json)
+          mkdir -p builds
+          zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json || true
+
+      - name: Upload artifact
+        if: env.should_deploy == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: partner-portal-build
+          path: partner-portal/builds/*.zip
+
+      # TODO: Add your actual deploy step (e.g., AWS EB upload)
+
+

@@ -1,0 +1,118 @@
+name: Tests (backend & partner-portal)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'backend/**'
+      - 'partner-portal/**'
+
+jobs:
+  detect-changes:
+    name: Detect changed projects
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+      partner: ${{ steps.filter.outputs.partner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Paths filter
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          filters: |
+            backend:
+              - 'backend/**'
+            partner:
+              - 'partner-portal/**'
+
+  backend-tests:
+    name: Backend tests + version check
+    needs: detect-changes
+    if: needs.detect-changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Verify version is same or higher than base
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_BRANCH="${GITHUB_BASE_REF}"
+          CURRENT_VERSION=$(jq -r .version backend/package.json)
+          git fetch origin "$BASE_BRANCH" --depth=1
+          BASE_VERSION=$(git show "origin/$BASE_BRANCH:backend/package.json" | jq -r .version)
+          echo "Base version: $BASE_VERSION | PR version: $CURRENT_VERSION"
+          if [[ "$BASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$CURRENT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            npx --yes semver -r ">=$BASE_VERSION" "$CURRENT_VERSION" >/dev/null || { echo "::error::PR version ($CURRENT_VERSION) must be same or higher than base ($BASE_VERSION)."; exit 1; }
+          else
+            echo "::warning::One of the versions is not valid semver; skipping enforcement"
+          fi
+
+      - name: Install dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Build
+        working-directory: backend
+        run: npm run build --if-present
+
+      - name: Test
+        working-directory: backend
+        run: npm test --if-present
+
+  partner-tests:
+    name: Partner portal build + version check
+    needs: detect-changes
+    if: needs.detect-changes.outputs.partner == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          cache: 'npm'
+          cache-dependency-path: partner-portal/package-lock.json
+
+      - name: Verify version is same or higher than base
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_BRANCH="${GITHUB_BASE_REF}"
+          CURRENT_VERSION=$(jq -r .version partner-portal/package.json)
+          git fetch origin "$BASE_BRANCH" --depth=1
+          BASE_VERSION=$(git show "origin/$BASE_BRANCH:partner-portal/package.json" | jq -r .version)
+          echo "Base version: $BASE_VERSION | PR version: $CURRENT_VERSION"
+          if [[ "$BASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$CURRENT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            npx --yes semver -r ">=$BASE_VERSION" "$CURRENT_VERSION" >/dev/null || { echo "::error::PR version ($CURRENT_VERSION) must be same or higher than base ($BASE_VERSION)."; exit 1; }
+          else
+            echo "::warning::One of the versions is not valid semver; skipping enforcement"
+          fi
+
+      - name: Install dependencies
+        working-directory: partner-portal
+        run: npm ci
+
+      - name: Build
+        working-directory: partner-portal
+        run: npm run build --if-present
+
+
