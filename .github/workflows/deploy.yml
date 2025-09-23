@@ -14,6 +14,7 @@ jobs:
   detect-changes:
     name: Detect changed projects
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
     outputs:
       backend: ${{ steps.filter.outputs.backend }}
       partner: ${{ steps.filter.outputs.partner }}
@@ -37,7 +38,7 @@ jobs:
   backend-deploy:
     name: Backend deploy (only if version increased)
     needs: detect-changes
-    if: needs.detect-changes.outputs.backend == 'true'
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
     runs-on: ubuntu-latest
     environment: prod
     steps:
@@ -148,7 +149,7 @@ jobs:
   partner-deploy:
     name: Partner portal deploy (only if version increased)
     needs: detect-changes
-    if: needs.detect-changes.outputs.partner == 'true'
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
     runs-on: ubuntu-latest
     environment: prod
     steps:
