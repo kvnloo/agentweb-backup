@@ -65,7 +65,7 @@ export class AgentModeService {
           messages: messages,
           tools: this.getAvailableTools(),
           tool_choice: 'auto',
-          max_completion_tokens: 2000
+          max_completion_tokens: 12384
         });
         
         responseMessage = response.choices[0].message;
