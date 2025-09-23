@@ -7,6 +7,10 @@ on:
       - 'backend/**'
       - 'partner-portal/**'
 
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   detect-changes:
     name: Detect changed projects
