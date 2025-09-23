@@ -109,7 +109,7 @@ export class AgentModeService {
             } else if (toolCall.function.name === 'get_meta_ads_metrics' && result.success) {
               // Special handling for metrics data - provide summary for AI analysis
               shouldFeedbackToLLM = true;
-              const metricsSummary = this.formatMetricsSummary(result.data);
+              const metricsSummary = this.formatMetricsSummary({ ...result.data, timeframe: result.timeframe });
               content += `\n\n${metricsSummary}`;
             } else if (toolCall.function.name === 'search_web' && result.success) {
               // Track web search results
@@ -1739,7 +1739,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
       } else if (timeframe === "90d") {
         startDate.setDate(endDate.getDate() - 90);
       }
-      console.log('AgentMode: Date range:', startDate.toISOString().split('T')[0], 'to', endDate.toISOString().split('T')[0]);
+      const sinceStr = startDate.toISOString().split('T')[0];
+      const untilStr = endDate.toISOString().split('T')[0];
+      const attributionDays = Math.max(1, Math.ceil((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24)));
+      console.log('AgentMode: Date range:', sinceStr, 'to', untilStr);
 
       // Get campaigns, ad sets, ads, and insights using Graph API
       console.log('AgentMode: Making parallel API calls to Meta Graph API...');
@@ -1747,13 +1750,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
         fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`),
         fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting&access_token=${accessToken}`),
         fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}&access_token=${accessToken}`),
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=ad&access_token=${accessToken}`),
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad&access_token=${accessToken}`),
         // Demographics breakdown (age/gender)
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach&breakdowns=age,gender&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=ad&access_token=${accessToken}`),
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach&breakdowns=age,gender&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad&access_token=${accessToken}`),
         // Placement breakdown (publisher platform and position)
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach&breakdowns=publisher_platform,platform_position&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=ad&access_token=${accessToken}`),
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach&breakdowns=publisher_platform,platform_position&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad&access_token=${accessToken}`),
         // Device breakdown (mobile/desktop, etc.)
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach&breakdowns=impression_device&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=ad&access_token=${accessToken}`)
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad&access_token=${accessToken}`)
       ]);
 
       console.log('AgentMode: API calls completed, parsing responses...');
@@ -1821,7 +1824,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       
       console.log('AgentMode: Generating campaign summary...');
       const campaignSummary = this.generateCampaignSummary(adPerformance);
-      console.log('AgentMode: Campaign summary:', campaignSummary);
+      console.log('AgentMode: Campaign summary:', JSON.stringify(campaignSummary, null, 2));
       
       const result = {
         success: true,
@@ -1834,7 +1837,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
           campaignSummary,
           demographicsBreakdown: (insightsDemographicsData && insightsDemographicsData.data) ? insightsDemographicsData.data : [],
           placementBreakdown: (insightsPlacementData && insightsPlacementData.data) ? insightsPlacementData.data : [],
-          deviceBreakdown: (insightsDeviceData && insightsDeviceData.data) ? insightsDeviceData.data : []
+          deviceBreakdown: (insightsDeviceData && insightsDeviceData.data) ? insightsDeviceData.data : [],
+          attributionWindow: { start: sinceStr, end: untilStr, days: attributionDays }
         }
       };
       
@@ -2218,9 +2222,17 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
   // Helper function to format metrics summary for AI analysis
   private formatMetricsSummary(data: any): string {
-    const { adPerformance, adSetsData, adsData, campaignSummary, demographicsBreakdown, placementBreakdown, deviceBreakdown } = data;
+    const { adPerformance, adSetsData, adsData, campaignSummary, demographicsBreakdown, placementBreakdown, deviceBreakdown, attributionWindow } = data;
     
     let summary = `📊 **Meta Ads Performance Data**\n\n`;
+    
+    // Attribution Window Information (start, end, number of days)
+    if (attributionWindow && attributionWindow.start && attributionWindow.end) {
+      summary += `**Attribution Window**\n`;
+      summary += `| Start | End | Days |\n`;
+      summary += `|-------|-----|------|\n`;
+      summary += `| ${attributionWindow.start} | ${attributionWindow.end} | ${attributionWindow.days} |\n\n`;
+    }
     
     // Campaign Summary Table
     if (campaignSummary) {
