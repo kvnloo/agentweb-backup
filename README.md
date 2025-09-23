@@ -1277,3 +1277,65 @@ Some AgentWeb features require GUI access for browser automation. To enable GUI 
 - Display `:1` uses port `5901`
 - Display `:99` uses port `5999`
 - General rule: Display `:N` uses port `5900 + N`
+
+## Repository CI/CD (GitHub Actions)
+
+This repository includes CI (tests) and CD (deploy) workflows for `backend` and `partner-portal` in `.github/workflows/`:
+
+- `tests.yml` — Runs on Pull Requests touching `backend/**` or `partner-portal/**`
+  - Detects which project changed and runs only the relevant jobs
+  - Version rule for PRs: the `package.json` version in the PR must be the same or higher than the base branch
+  - Backend tests are skipped if the test script is the default placeholder
+  - Uses the runner's default Node version (no explicit `node-version`)
+
+- `deploy.yml` — Runs on push to `main` touching `backend/**` or `partner-portal/**`
+  - Detects which project changed and runs only the relevant jobs
+  - Version rule for deploys: deploys only if the new version is strictly higher than the previous commit
+  - Builds production bundles using the same commands documented below
+  - Packages versioned zip files and deploys to AWS Elastic Beanstalk (mirrors customer-portal flow)
+
+### Required GitHub configuration for deployments
+
+Configure the following for GitHub Actions (Settings → Secrets and variables → Actions):
+
+- Secrets (sensitive):
+  - `AWS_ACCESS_KEY_ID`
+  - `AWS_SECRET_ACCESS_KEY`
+
+- Variables (non-sensitive, easier to manage):
+  - `EB_BACKEND_APPLICATION_NAME` — Elastic Beanstalk application name for backend
+  - `EB_BACKEND_ENVIRONMENT_NAME` — Elastic Beanstalk environment name for backend
+  - `EB_PARTNER_APPLICATION_NAME` — Elastic Beanstalk application name for partner-portal
+  - `EB_PARTNER_ENVIRONMENT_NAME` — Elastic Beanstalk environment name for partner-portal
+
+The workflows use region `us-west-2` by default. Update `AWS_REGION` in the workflow if needed, or add a repository variable `AWS_REGION` to override.
+
+### Production build and packaging (used by workflows)
+
+- Partner Portal build mirrors the manual steps:
+  - Environment variables set at build time via the workflow
+  - Package contents: `dist`, `package.json`, `package-lock.json`
+
+- Backend build mirrors the manual steps:
+  - `npm run build`
+  - Package contents: `dist`, `package.json`, `package-lock.json`, `.env.example`, `.platform` (if present)
+
+### Deployment behavior
+
+- Version labels in Elastic Beanstalk:
+  - Backend: `backend_v<package.json version>`
+  - Partner Portal: `partner_v<package.json version>`
+- Artifacts uploaded to S3 bucket: `elasticbeanstalk-<region>-992382574572/builds/*`
+- The deploy job will no-op if the version is the same or lower than the previous commit
+
+### PRs from forks
+
+The tests workflow requests minimal permissions so forked PRs can read PR metadata:
+
+```
+permissions:
+  contents: read
+  pull-requests: read
+```
+
+No additional configuration is needed in most cases.

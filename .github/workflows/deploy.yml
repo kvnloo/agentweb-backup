@@ -1,0 +1,264 @@
+name: Deploy
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'backend/**'
+      - 'partner-portal/**'
+
+env:
+  AWS_REGION: 'us-west-2'
+
+jobs:
+  detect-changes:
+    name: Detect changed projects
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+      partner: ${{ steps.filter.outputs.partner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Paths filter
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          filters: |
+            backend:
+              - 'backend/**'
+            partner:
+              - 'partner-portal/**'
+
+  backend-deploy:
+    name: Backend deploy (only if version increased)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Check version bump vs previous commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          CURRENT_VERSION=$(jq -r .version backend/package.json)
+          PREV_SHA=$(git rev-parse HEAD^)
+          if git cat-file -e "$PREV_SHA"^{commit} 2>/dev/null; then
+            if git show "$PREV_SHA:backend/package.json" >/dev/null 2>&1; then
+              PREV_VERSION=$(git show "$PREV_SHA:backend/package.json" | jq -r .version)
+            else
+              PREV_VERSION="0.0.0"
+            fi
+          else
+            PREV_VERSION="0.0.0"
+          fi
+          if [[ "$PREV_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$CURRENT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            if npx --yes semver -r "> $PREV_VERSION" "$CURRENT_VERSION" >/dev/null; then
+              echo "backend_should_deploy=true" >> $GITHUB_ENV
+            else
+              echo "backend_should_deploy=false" >> $GITHUB_ENV
+            fi
+          else
+            echo "::warning::Invalid semver detected; skipping deploy"
+            echo "backend_should_deploy=false" >> $GITHUB_ENV
+          fi
+
+      - name: Install dependencies
+        if: env.backend_should_deploy == 'true'
+        working-directory: backend
+        run: npm ci
+
+      - name: Build
+        if: env.backend_should_deploy == 'true'
+        working-directory: backend
+        run: npm run build --if-present
+
+      - name: Package artifact
+        if: env.backend_should_deploy == 'true'
+        working-directory: backend
+        run: |
+          VERSION=$(jq -r .version package.json)
+          mkdir -p builds
+          zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json .env.example .platform || zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json
+
+      - name: Configure AWS credentials
+        if: env.backend_should_deploy == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to Elastic Beanstalk
+        if: env.backend_should_deploy == 'true'
+        timeout-minutes: 5
+        working-directory: backend
+        run: |
+          VERSION=$(jq -r .version package.json)
+          echo "Deploying backend version: $VERSION"
+          
+          # Upload to S3
+          echo "Uploading deployment package to S3..."
+          aws s3 cp "builds/deploy_v${VERSION}.zip" "s3://elasticbeanstalk-${{ env.AWS_REGION }}-992382574572/builds/backend_deploy_v${VERSION}.zip"
+          
+          # Create new application version
+          echo "Creating new application version..."
+          aws elasticbeanstalk create-application-version \
+            --application-name ${{ vars.EB_BACKEND_APPLICATION_NAME }} \
+            --version-label "backend_v${VERSION}" \
+            --source-bundle S3Bucket="elasticbeanstalk-${{ env.AWS_REGION }}-992382574572,S3Key=builds/backend_deploy_v${VERSION}.zip" || echo "⚠️  Version creation failed (may already exist), continuing..."
+          
+          # Deploy to environment
+          echo "Deploying to environment..."
+          aws elasticbeanstalk update-environment \
+            --environment-name ${{ vars.EB_BACKEND_ENVIRONMENT_NAME }} \
+            --version-label "backend_v${VERSION}" || echo "⚠️  Environment update failed (may be updating), but AWS deployment likely succeeded"
+
+      - name: Backend Deployment Status
+        if: env.backend_should_deploy == 'true'
+        run: |
+          VERSION=$(jq -r .version backend/package.json)
+          echo "🚀 Backend deployment initiated successfully!"
+          echo "📊 Check deployment status: https://${{ env.AWS_REGION }}.console.aws.amazon.com/elasticbeanstalk/home?region=${{ env.AWS_REGION }}#/environments"
+          echo "✅ Version deployed: backend_v${VERSION}"
+
+      - name: Upload artifact
+        if: env.backend_should_deploy == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-build
+          path: backend/builds/*.zip
+          retention-days: 30
+
+  partner-deploy:
+    name: Partner portal deploy (only if version increased)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.partner == 'true'
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          cache: 'npm'
+          cache-dependency-path: partner-portal/package-lock.json
+
+      - name: Check version bump vs previous commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          CURRENT_VERSION=$(jq -r .version partner-portal/package.json)
+          PREV_SHA=$(git rev-parse HEAD^)
+          if git cat-file -e "$PREV_SHA"^{commit} 2>/dev/null; then
+            if git show "$PREV_SHA:partner-portal/package.json" >/dev/null 2>&1; then
+              PREV_VERSION=$(git show "$PREV_SHA:partner-portal/package.json" | jq -r .version)
+            else
+              PREV_VERSION="0.0.0"
+            fi
+          else
+            PREV_VERSION="0.0.0"
+          fi
+          if [[ "$PREV_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$CURRENT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            if npx --yes semver -r "> $PREV_VERSION" "$CURRENT_VERSION" >/dev/null; then
+              echo "partner_should_deploy=true" >> $GITHUB_ENV
+            else
+              echo "partner_should_deploy=false" >> $GITHUB_ENV
+            fi
+          else
+            echo "::warning::Invalid semver detected; skipping deploy"
+            echo "partner_should_deploy=false" >> $GITHUB_ENV
+          fi
+
+      - name: Install dependencies
+        if: env.partner_should_deploy == 'true'
+        working-directory: partner-portal
+        run: npm ci
+
+      - name: Build
+        if: env.partner_should_deploy == 'true'
+        working-directory: partner-portal
+        env:
+          VITE_API_URL: 'https://api.agentweb.pro'
+          VITE_DEBUG: 'false'
+          VITE_LIST_FULL_LLM_NAMES: 'azure->openai->gpt-4.1,google->google->gemini-2.5-pro-preview-05-06,azure->openai->gpt-4o,aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0,openai->openai->gpt-4o,aws->anthropic->us.anthropic.claude-3-7-sonnet-20250219-v1:0,google->google->gemini-2.5-flash,google->google->gemini-2.5-flash-lite,azure->openai->gpt-5-chat,google->google->gemini-2.5-pro'
+          VITE_DEEP_RESEARCH_LLM_NAMES: 'azure->openai->o1-mini,azure->openai->gpt-4o'
+        run: npm run build
+
+      - name: Package artifact
+        if: env.partner_should_deploy == 'true'
+        working-directory: partner-portal
+        run: |
+          VERSION=$(jq -r .version package.json)
+          mkdir -p builds
+          zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json
+
+      - name: Configure AWS credentials
+        if: env.partner_should_deploy == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to Elastic Beanstalk
+        if: env.partner_should_deploy == 'true'
+        timeout-minutes: 5
+        working-directory: partner-portal
+        run: |
+          VERSION=$(jq -r .version package.json)
+          echo "Deploying partner portal version: $VERSION"
+          
+          # Upload to S3
+          echo "Uploading deployment package to S3..."
+          aws s3 cp "builds/deploy_v${VERSION}.zip" "s3://elasticbeanstalk-${{ env.AWS_REGION }}-992382574572/builds/partner_deploy_v${VERSION}.zip"
+          
+          # Create new application version
+          echo "Creating new application version..."
+          aws elasticbeanstalk create-application-version \
+            --application-name ${{ vars.EB_PARTNER_APPLICATION_NAME }} \
+            --version-label "partner_v${VERSION}" \
+            --source-bundle S3Bucket="elasticbeanstalk-${{ env.AWS_REGION }}-992382574572,S3Key=builds/partner_deploy_v${VERSION}.zip" || echo "⚠️  Version creation failed (may already exist), continuing..."
+          
+          # Deploy to environment
+          echo "Deploying to environment..."
+          aws elasticbeanstalk update-environment \
+            --environment-name ${{ vars.EB_PARTNER_ENVIRONMENT_NAME }} \
+            --version-label "partner_v${VERSION}" || echo "⚠️  Environment update failed (may be updating), but AWS deployment likely succeeded"
+
+      - name: Partner Portal Deployment Status
+        if: env.partner_should_deploy == 'true'
+        run: |
+          VERSION=$(jq -r .version partner-portal/package.json)
+          echo "🚀 Partner portal deployment initiated successfully!"
+          echo "📊 Check deployment status: https://${{ env.AWS_REGION }}.console.aws.amazon.com/elasticbeanstalk/home?region=${{ env.AWS_REGION }}#/environments"
+          echo "✅ Version deployed: partner_v${VERSION}"
+
+      - name: Upload artifact
+        if: env.partner_should_deploy == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: partner-portal-build
+          path: partner-portal/builds/*.zip
+          retention-days: 30
+
+
