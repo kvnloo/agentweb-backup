@@ -36,7 +36,7 @@ jobs:
               - 'partner-portal/**'
 
   backend-tests:
-    name: Backend tests + version check
+    name: Backend tests
     needs: detect-changes
     if: needs.detect-changes.outputs.backend == 'true'
     runs-on: ubuntu-latest
@@ -88,7 +88,7 @@ jobs:
           npm test --silent
 
   partner-tests:
-    name: Partner portal test + version check
+    name: Partner portal tests
     needs: detect-changes
     if: needs.detect-changes.outputs.partner == 'true'
     runs-on: ubuntu-latest
