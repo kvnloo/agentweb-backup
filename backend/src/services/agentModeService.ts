@@ -134,6 +134,14 @@ export class AgentModeService {
               // Special handling for market strategy update - provide feedback to LLM
               const updateSummary = this.formatMarketStrategyUpdate(result);
               content += `\n\n${updateSummary}`;
+            } else if (toolCall.function.name === 'save_file' && result.success) {
+              // Special handling for file saves - provide file URL for sharing
+              shouldFeedbackToLLM = true;
+              content += `\n\n📁 **File Saved Successfully**\n`;
+              content += `File: ${result.file_name}\n`;
+              content += `Size: ${result.file_size} bytes\n`;
+              content += `URL: ${result.file_url}\n`;
+              content += `\nThe file has been uploaded to S3 and is ready for sharing or reference.`;
             } else if (result && result.success === false) {
               // Feed tool error back to LLM so it can recover
               shouldFeedbackToLLM = true;
@@ -353,7 +361,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       'create_image_task_from_prompt': 'image generation task',
       'get_meta_ads_metrics': 'Meta ads metrics analysis',
       'search_web': 'web search',
-      'create_revision': 'task revision'
+      'create_revision': 'task revision',
+      'save_file': 'file save'
     };
 
     const toolDescription = toolDescriptions[toolName] || 'task';
@@ -739,6 +748,27 @@ Use the available tools to create tasks in the agent-engine when complex work is
             required: ['query']
           }
         }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'save_file',
+          description: 'Create and save a file with the provided content to S3, then return the file URL for sharing or reference',
+          parameters: {
+            type: 'object',
+            properties: {
+              file_name: {
+                type: 'string',
+                description: 'Name of the file to create (include appropriate extension like .txt, .md, .json, .csv, etc.)'
+              },
+              file_content: {
+                type: 'string',
+                description: 'Content of the file to save'
+              }
+            },
+            required: ['file_name', 'file_content']
+          }
+        }
       }
     ];
   }
@@ -781,6 +811,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.readMarketStrategy(userId);
       case 'update_market_strategy':
         return await this.updateMarketStrategy(args, userId);
+      case 'save_file':
+        return await this.saveFile(args.file_name, args.file_content, userId, sessionId);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -2622,6 +2654,65 @@ Use the available tools to create tasks in the agent-engine when complex work is
     formattedSummary += `<br><em>💡 You can view the latest market strategy at the <a href="/market-strategy">Market Strategy page</a>.</em>`;
 
     return formattedSummary;
+  }
+
+  // Save file to S3 and return URL
+  private async saveFile(fileName: string, fileContent: string, userId: string, sessionId: string): Promise<any> {
+    try {
+      console.log('AgentMode: Saving file:', fileName, 'for user:', userId, 'session:', sessionId);
+      
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      
+      // Determine content type based on file extension
+      const extension = fileName.split('.').pop()?.toLowerCase();
+      const contentTypes: { [key: string]: string } = {
+        'txt': 'text/plain',
+        'md': 'text/markdown',
+        'json': 'application/json',
+        'csv': 'text/csv',
+        'html': 'text/html',
+        'xml': 'application/xml',
+        'pdf': 'application/pdf',
+        'doc': 'application/msword',
+        'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'xls': 'application/vnd.ms-excel',
+        'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'ppt': 'application/vnd.ms-powerpoint',
+        'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+      };
+      const contentType = contentTypes[extension || ''] || 'application/octet-stream';
+      
+      // Upload to S3 using common utility
+      const uploadResult = await uploadFileToS3(
+        fileContent,
+        fileName,
+        userId,
+        contentType
+      );
+      
+      if (uploadResult.success) {
+        return {
+          success: true,
+          message: `File "${fileName}" has been saved successfully.`,
+          file_url: uploadResult.url,
+          file_name: fileName,
+          file_size: fileContent.length
+        };
+      } else {
+        return {
+          success: false,
+          message: 'Failed to save file to S3. Please try again.',
+          error: uploadResult.error
+        };
+      }
+    } catch (error) {
+      console.error('AgentMode: Error saving file:', error);
+      return {
+        success: false,
+        message: 'Failed to save file. Please try again.',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
   }
 
 }

@@ -3,10 +3,8 @@ import { agentModeService } from '../services/agentModeService';
 import { chatbotDb, updateTaskExecutionStatus } from '../services/chatbotService';
 import { User } from '../types/auth';
 import multer from 'multer';
-import { S3 } from 'aws-sdk';
 import crypto from 'crypto';
-
-const s3 = new S3();
+import { uploadFileToS3 } from '../utils/s3Utils';
 
 export const agentModeController = {
   // Get user's agent chat sessions
@@ -365,36 +363,21 @@ export const agentModeController = {
         return res.status(400).json({ error: 'No file uploaded' });
       }
 
-      // Generate a random token (32 characters)
-      const randomToken = Array.from(crypto.getRandomValues(new Uint8Array(16)))
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join("");
+      // Upload to S3 using common utility
+      const uploadResult = await uploadFileToS3(
+        file.buffer,
+        file.originalname,
+        user.userId,
+        file.mimetype
+      );
 
-      // Sanitize filename to handle special characters and spaces for S3 key
-      const sanitizedFilename = file.originalname
-        .replace(/[^a-zA-Z0-9.-]/g, '_') // Replace special chars with underscores
-        .replace(/\s+/g, '_'); // Replace spaces with underscores
-      
-      const key = `users/${user.userId}/attachments/${Date.now()}/${randomToken}/${sanitizedFilename}`;
-
-      // Upload to S3
-      await s3
-        .putObject({
-          Bucket: process.env.AWS_S3_BUCKET || "agentweb-user-files",
-          Key: key,
-          Body: file.buffer,
-          ContentType: file.mimetype,
-        })
-        .promise();
-
-      // Generate S3 URL
-      const url = `https://${
-        process.env.AWS_S3_BUCKET || "agentweb-user-files"
-      }.s3.${process.env.AWS_REGION || "us-west-2"}.amazonaws.com/${key}`;
+      if (!uploadResult.success) {
+        return res.status(500).json({ error: 'Failed to upload file to S3' });
+      }
 
       res.json({
-        url,
-        key,
+        url: uploadResult.url,
+        key: uploadResult.key,
         filename: file.originalname,
         size: file.size,
         mimetype: file.mimetype,
