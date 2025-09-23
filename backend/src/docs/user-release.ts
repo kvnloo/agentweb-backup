@@ -15,6 +15,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Updated Emma chat panel default behavior in Customer Portal',
       '- Emma chat window now starts collapsed by default for better user experience',
       '- Added configurable setting to control default chat panel state',
+      'Supported performance insight tasks in Agent Mode',
+      '- Agent can now fetch and analyze Meta ads performance data with 7d, 14d, 30d, and 90d timeframes',
+      '- Added 14-day timeframe option to Meta Campaigns page for more granular analysis',
+      '- Agent can create and save files using save_file function for sharing reports and insights',
     ],
   },
   {

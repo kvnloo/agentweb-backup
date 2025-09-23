@@ -108,6 +108,7 @@ export class AgentModeService {
               content += `\n\n${statusMessage}`;
             } else if (toolCall.function.name === 'get_meta_ads_metrics' && result.success) {
               // Special handling for metrics data - provide summary for AI analysis
+              shouldFeedbackToLLM = true;
               const metricsSummary = this.formatMetricsSummary(result.data);
               content += `\n\n${metricsSummary}`;
             } else if (toolCall.function.name === 'search_web' && result.success) {
@@ -133,6 +134,14 @@ export class AgentModeService {
               // Special handling for market strategy update - provide feedback to LLM
               const updateSummary = this.formatMarketStrategyUpdate(result);
               content += `\n\n${updateSummary}`;
+            } else if (toolCall.function.name === 'save_file' && result.success) {
+              // Special handling for file saves - provide file URL for sharing
+              shouldFeedbackToLLM = true;
+              content += `\n\n📁 **File Saved Successfully**\n`;
+              content += `File: ${result.file_name}\n`;
+              content += `Size: ${result.file_size} bytes\n`;
+              content += `URL: ${result.file_url}\n`;
+              content += `\nThe file has been uploaded to S3 and is ready for sharing or reference.`;
             } else if (result && result.success === false) {
               // Feed tool error back to LLM so it can recover
               shouldFeedbackToLLM = true;
@@ -352,7 +361,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       'create_image_task_from_prompt': 'image generation task',
       'get_meta_ads_metrics': 'Meta ads metrics analysis',
       'search_web': 'web search',
-      'create_revision': 'task revision'
+      'create_revision': 'task revision',
+      'save_file': 'file save'
     };
 
     const toolDescription = toolDescriptions[toolName] || 'task';
@@ -472,6 +482,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 type: 'boolean',
                 description: 'Whether to attach previous task results to this task. Set to true for follow-up tasks that need to reference previous work.',
                 default: true
+              },
+              attached_file_urls: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Array of file URLs to attach to this task. These should be URLs from files uploaded in the current conversation.',
+                default: []
               }
             },
             required: ['template_id', 'parameters_json']
@@ -619,6 +635,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 type: 'boolean',
                 description: 'Whether to attach previous task results to this task. Set to true for follow-up tasks that need to reference previous work.',
                 default: true
+              },
+              attached_file_urls: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Array of file URLs to attach to this task. These should be URLs from files uploaded in the current conversation.',
+                default: []
               }
             },
             required: ['task_name', 'prompt', 'category']
@@ -666,8 +688,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
             properties: {
               timeframe: {
                 type: 'string',
-                description: 'Time period for metrics (7d, 30d, 90d)',
-                enum: ['7d', '30d', '90d'],
+                description: 'Time period for metrics (7d, 14d, 30d, 90d)',
+                enum: ['7d', '14d', '30d', '90d'],
                 default: '7d'
               }
             },
@@ -726,6 +748,27 @@ Use the available tools to create tasks in the agent-engine when complex work is
             required: ['query']
           }
         }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'save_file',
+          description: 'Create and save a file with the provided content to S3, then return the file URL for sharing or reference',
+          parameters: {
+            type: 'object',
+            properties: {
+              file_name: {
+                type: 'string',
+                description: 'Name of the file to create (include appropriate extension like .txt, .md, .json, .csv, etc.)'
+              },
+              file_content: {
+                type: 'string',
+                description: 'Content of the file to save'
+              }
+            },
+            required: ['file_name', 'file_content']
+          }
+        }
       }
     ];
   }
@@ -737,7 +780,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         try {
           const parameters = JSON.parse(args.parameters_json || '{}');
           const attachPreviousTaskResults = args.attach_previous_task_results !== false;
-          return await this.createTaskFromTemplate(args.template_id, parameters, userId, sessionId, attachPreviousTaskResults);
+          const attachedFileUrls = args.attached_file_urls || [];
+          return await this.createTaskFromTemplate(args.template_id, parameters, userId, sessionId, attachPreviousTaskResults, attachedFileUrls);
         } catch (parseError) {
           console.error('AgentMode: Error parsing parameters JSON:', parseError);
           return {
@@ -748,7 +792,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         }
       case 'create_task_from_prompt':
         const attachPreviousTaskResults = args.attach_previous_task_results !== false;
-        return await this.createTaskFromPrompt(args.task_name, args.prompt, args.category, userId, sessionId, attachPreviousTaskResults);
+        const attachedFileUrls = args.attached_file_urls || [];
+        return await this.createTaskFromPrompt(args.task_name, args.prompt, args.category, userId, sessionId, attachPreviousTaskResults, attachedFileUrls);
       case 'create_image_task_from_prompt':
         const attachPreviousTaskResultsForImage = args.attach_previous_task_results !== false;
         return await this.createImageTaskFromPrompt(args.task_name, args.prompt, args.category || 'Creatives', userId, sessionId, attachPreviousTaskResultsForImage);
@@ -766,6 +811,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.readMarketStrategy(userId);
       case 'update_market_strategy':
         return await this.updateMarketStrategy(args, userId);
+      case 'save_file':
+        return await this.saveFile(args.file_name, args.file_content, userId, sessionId);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -1262,8 +1309,22 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
 
 
+  // Helper method to convert file URLs to TaskAttachment objects
+  private convertUrlsToAttachments(fileUrls: string[]): any[] {
+    return fileUrls.map(url => {
+      // Extract filename from URL (last part after the last slash)
+      const filename = url.split('/').pop() || 'unknown_file';
+      return {
+        url: url,
+        key: url, // Use URL as key for now
+        filename: filename,
+        uploadedAt: new Date().toISOString()
+      };
+    });
+  }
+
   // Create task from template
-  private async createTaskFromTemplate(templateId: string, parameters: Record<string, string>, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true): Promise<any> {
+  private async createTaskFromTemplate(templateId: string, parameters: Record<string, string>, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true, attachedFileUrls: string[] = []): Promise<any> {
     try {
       console.log('AgentMode: Creating task from template ID:', templateId, 'with parameters:', parameters);
 
@@ -1361,6 +1422,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
         taskName = `${templateData.name} - ${parameters[templateData.nameParameter]}`;
       }
 
+      // Convert file URLs to attachments
+      const attachments = this.convertUrlsToAttachments(attachedFileUrls);
+
       // Create task using template
       const task = {
         taskId: Date.now().toString(),
@@ -1388,6 +1452,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         description: templateData.description,
         templateId: templateData.templateId,
         parameterValues: parameters,
+        attachments: attachments,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       };
@@ -1426,7 +1491,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   // Create task from raw prompt
-  private async createTaskFromPrompt(taskName: string, prompt: string, category: string, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true): Promise<any> {
+  private async createTaskFromPrompt(taskName: string, prompt: string, category: string, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true, attachedFileUrls: string[] = []): Promise<any> {
     try {
       console.log('AgentMode: Creating task from prompt:', taskName);
 
@@ -1438,6 +1503,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
           finalPrompt += previousResults;
         }
       }
+
+      // Convert file URLs to attachments
+      const attachments = this.convertUrlsToAttachments(attachedFileUrls);
 
       // Create task using raw prompt
       const task = {
@@ -1463,6 +1531,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         imageModel: undefined,
         category: category,
         description: `Custom task created from prompt: ${taskName}`,
+        attachments: attachments,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       };
@@ -1661,6 +1730,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const startDate = new Date();
       if (timeframe === "7d") {
         startDate.setDate(endDate.getDate() - 7);
+      } else if (timeframe === "14d") {
+        startDate.setDate(endDate.getDate() - 14);
       } else if (timeframe === "30d") {
         startDate.setDate(endDate.getDate() - 30);
       } else if (timeframe === "90d") {
@@ -2120,56 +2191,58 @@ Use the available tools to create tasks in the agent-engine when complex work is
   private formatMetricsSummary(data: any): string {
     const { adPerformance, adSetsData, adsData, campaignSummary } = data;
     
-    // Create a structured data summary for the AI to analyze contextually
-    let summary = `📊 **Meta Ads Performance Data Retrieved**\n\n`;
-    summary += `I've successfully pulled your latest Meta ads performance data. Here's what I found:\n\n`;
+    let summary = `📊 **Meta Ads Performance Data**\n\n`;
     
-    // Provide key metrics in a conversational format
+    // Campaign Summary Table
     if (campaignSummary) {
-      summary += `**Performance Summary:**\n`;
-      summary += `• You have ${campaignSummary.totalCampaigns} active campaign${campaignSummary.totalCampaigns > 1 ? 's' : ''} running\n`;
-      summary += `• Total investment: $${campaignSummary.totalSpend.toFixed(2)}\n`;
-      summary += `• Reached ${campaignSummary.totalImpressions.toLocaleString()} people with ${campaignSummary.totalClicks.toLocaleString()} clicks\n`;
-      summary += `• Your CTR is ${campaignSummary.averageCtr.toFixed(2)}% (industry average is ~1-2%)\n`;
-      summary += `• Cost per click: $${campaignSummary.averageCpc.toFixed(2)}\n\n`;
+      summary += `**Campaign Summary**\n`;
+      summary += `| Metric | Value |\n`;
+      summary += `|--------|-------|\n`;
+      summary += `| Total Campaigns | ${campaignSummary.totalCampaigns} |\n`;
+      summary += `| Total Spend | $${campaignSummary.totalSpend.toFixed(2)} |\n`;
+      summary += `| Impressions | ${campaignSummary.totalImpressions.toLocaleString()} |\n`;
+      summary += `| Clicks | ${campaignSummary.totalClicks.toLocaleString()} |\n`;
+      summary += `| CTR | ${campaignSummary.averageCtr.toFixed(2)}% |\n`;
+      summary += `| CPC | $${campaignSummary.averageCpc.toFixed(2)} |\n\n`;
     }
     
-    // Highlight top performers
-    if (adsData && adsData.length > 0) {
-      const topAds = adsData
-        .sort((a: any, b: any) => b.clicks - a.clicks)
-        .slice(0, 3);
+    // Campaign Performance Table
+    if (adPerformance && adPerformance.length > 0) {
+      summary += `**Campaign Performance**\n`;
+      summary += `| Campaign Name | Spend | Impressions | Clicks | CTR | CPC |\n`;
+      summary += `|---------------|-------|-------------|--------|-----|-----|\n`;
       
-      summary += `**Top Performing Ads:**\n`;
-      topAds.forEach((ad: any, index: number) => {
-        summary += `${index + 1}. "${ad.name}" - ${ad.clicks} clicks (${ad.ctr.toFixed(2)}% CTR, $${ad.cpc.toFixed(2)} CPC)\n`;
+      adPerformance.forEach((campaign: any) => {
+        summary += `| ${campaign.name} | $${campaign.spend.toFixed(2)} | ${campaign.impressions.toLocaleString()} | ${campaign.clicks.toLocaleString()} | ${campaign.ctr.toFixed(2)}% | $${campaign.cpc.toFixed(2)} |\n`;
       });
       summary += `\n`;
     }
     
-    // Add performance context
-    if (campaignSummary) {
-      summary += `**Performance Context:**\n`;
-      if (campaignSummary.averageCtr > 2.0) {
-        summary += `• Your CTR of ${campaignSummary.averageCtr.toFixed(2)}% is performing well above industry standards\n`;
-      } else if (campaignSummary.averageCtr < 1.0) {
-        summary += `• Your CTR of ${campaignSummary.averageCtr.toFixed(2)}% is below industry average and could be improved\n`;
-      } else {
-        summary += `• Your CTR of ${campaignSummary.averageCtr.toFixed(2)}% is performing at industry standard levels\n`;
-      }
+    // Ad Sets Performance Table
+    if (adSetsData && adSetsData.length > 0) {
+      summary += `**Ad Sets Performance**\n`;
+      summary += `| Ad Set Name | Campaign | Spend | Impressions | Clicks | CTR | CPC |\n`;
+      summary += `|-------------|----------|-------|-------------|--------|-----|-----|\n`;
       
-      if (campaignSummary.averageCpc < 0.50) {
-        summary += `• Your CPC of $${campaignSummary.averageCpc.toFixed(2)} is excellent - very cost efficient\n`;
-      } else if (campaignSummary.averageCpc > 2.0) {
-        summary += `• Your CPC of $${campaignSummary.averageCpc.toFixed(2)} is high and may need optimization\n`;
-      } else {
-        summary += `• Your CPC of $${campaignSummary.averageCpc.toFixed(2)} is reasonable for your industry\n`;
-      }
+      adSetsData.forEach((adSet: any) => {
+        summary += `| ${adSet.name} | ${adSet.campaignName} | $${adSet.spend.toFixed(2)} | ${adSet.impressions.toLocaleString()} | ${adSet.clicks.toLocaleString()} | ${adSet.ctr.toFixed(2)}% | $${adSet.cpc.toFixed(2)} |\n`;
+      });
+      summary += `\n`;
     }
     
-    summary += `\n*Based on ${adPerformance?.length || 0} campaigns, ${adSetsData?.length || 0} ad sets, and ${adsData?.length || 0} individual ads.*\n`;
-    summary += `*Note: Only ads with activity in the selected timeframe are included. Disabled, paused, or inactive ads won't appear in this data.*\n\n`;
-    summary += `**Please provide your analysis and recommendations based on this performance data and our conversation context.**`;
+    // Individual Ads Performance Table
+    if (adsData && adsData.length > 0) {
+      summary += `**Individual Ads Performance**\n`;
+      summary += `| Ad Name | Ad Set | Campaign | Spend | Impressions | Clicks | CTR | CPC |\n`;
+      summary += `|---------|--------|----------|-------|-------------|--------|-----|-----|\n`;
+      
+      adsData.forEach((ad: any) => {
+        summary += `| ${ad.name} | ${ad.adSetName} | ${ad.campaignName} | $${ad.spend.toFixed(2)} | ${ad.impressions.toLocaleString()} | ${ad.clicks.toLocaleString()} | ${ad.ctr.toFixed(2)}% | $${ad.cpc.toFixed(2)} |\n`;
+      });
+      summary += `\n`;
+    }
+    
+    summary += `*Data includes ${adPerformance?.length || 0} campaigns, ${adSetsData?.length || 0} ad sets, and ${adsData?.length || 0} individual ads.*\n`;
     
     return summary;
   }
@@ -2583,6 +2656,65 @@ Use the available tools to create tasks in the agent-engine when complex work is
     formattedSummary += `<br><em>💡 You can view the latest market strategy at the <a href="/market-strategy">Market Strategy page</a>.</em>`;
 
     return formattedSummary;
+  }
+
+  // Save file to S3 and return URL
+  private async saveFile(fileName: string, fileContent: string, userId: string, sessionId: string): Promise<any> {
+    try {
+      console.log('AgentMode: Saving file:', fileName, 'for user:', userId, 'session:', sessionId);
+      
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      
+      // Determine content type based on file extension
+      const extension = fileName.split('.').pop()?.toLowerCase();
+      const contentTypes: { [key: string]: string } = {
+        'txt': 'text/plain',
+        'md': 'text/markdown',
+        'json': 'application/json',
+        'csv': 'text/csv',
+        'html': 'text/html',
+        'xml': 'application/xml',
+        'pdf': 'application/pdf',
+        'doc': 'application/msword',
+        'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'xls': 'application/vnd.ms-excel',
+        'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'ppt': 'application/vnd.ms-powerpoint',
+        'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+      };
+      const contentType = contentTypes[extension || ''] || 'application/octet-stream';
+      
+      // Upload to S3 using common utility
+      const uploadResult = await uploadFileToS3(
+        fileContent,
+        fileName,
+        userId,
+        contentType
+      );
+      
+      if (uploadResult.success) {
+        return {
+          success: true,
+          message: `File "${fileName}" has been saved successfully.`,
+          file_url: uploadResult.url,
+          file_name: fileName,
+          file_size: fileContent.length
+        };
+      } else {
+        return {
+          success: false,
+          message: 'Failed to save file to S3. Please try again.',
+          error: uploadResult.error
+        };
+      }
+    } catch (error) {
+      console.error('AgentMode: Error saving file:', error);
+      return {
+        success: false,
+        message: 'Failed to save file. Please try again.',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
   }
 
 }

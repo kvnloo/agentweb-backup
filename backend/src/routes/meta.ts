@@ -106,6 +106,8 @@ router.get("/ad-performance", async (req, res) => {
     const startDate = new Date();
     if (timeframe === "7d") {
       startDate.setDate(endDate.getDate() - 7);
+    } else if (timeframe === "14d") {
+      startDate.setDate(endDate.getDate() - 14);
     } else if (timeframe === "30d") {
       startDate.setDate(endDate.getDate() - 30);
     } else if (timeframe === "90d") {
