@@ -3,9 +3,9 @@ name: Deploy
 on:
   push:
     branches: [ main ]
-    paths:
-      - 'backend/**'
-      - 'partner-portal/**'
+  pull_request:
+    types: [closed]
+    branches: [ main ]
 
 env:
   AWS_REGION: 'us-west-2'
