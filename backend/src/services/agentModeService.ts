@@ -774,7 +774,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   private async executeTool(toolName: string, args: any, userId: string, sessionId: string): Promise<any> {
-    console.log('AgentMode: Executing tool:', toolName, 'with args:', JSON.stringify(args, null, 2));
+    const argsStr = JSON.stringify(args, null, 2);
+    const truncatedArgs = argsStr.length > 500 ? argsStr.substring(0, 500) + '...' : argsStr;
+    console.log('AgentMode: Executing tool:', toolName, 'with args:', truncatedArgs);
     switch (toolName) {
       case 'create_task_from_template':
         try {
@@ -1741,19 +1743,28 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Get campaigns, ad sets, ads, and insights using Graph API
       console.log('AgentMode: Making parallel API calls to Meta Graph API...');
-      const [campaignsResponse, adSetsResponse, adsResponse, insightsResponse] = await Promise.all([
+      const [campaignsResponse, adSetsResponse, adsResponse, insightsResponse, insightsDemographicsResponse, insightsPlacementResponse, insightsDeviceResponse] = await Promise.all([
         fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`),
         fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting&access_token=${accessToken}`),
         fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}&access_token=${accessToken}`),
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=ad&access_token=${accessToken}`)
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=ad&access_token=${accessToken}`),
+        // Demographics breakdown (age/gender)
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach&breakdowns=age,gender&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=ad&access_token=${accessToken}`),
+        // Placement breakdown (publisher platform and position)
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach&breakdowns=publisher_platform,platform_position&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=ad&access_token=${accessToken}`),
+        // Device breakdown (mobile/desktop, etc.)
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach&breakdowns=impression_device&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=ad&access_token=${accessToken}`)
       ]);
 
       console.log('AgentMode: API calls completed, parsing responses...');
-      const [campaignsData, adSetsData, adsData, insightsData] = await Promise.all([
+      const [campaignsData, adSetsData, adsData, insightsData, insightsDemographicsData, insightsPlacementData, insightsDeviceData] = await Promise.all([
         campaignsResponse.json(),
         adSetsResponse.json(),
         adsResponse.json(),
-        insightsResponse.json()
+        insightsResponse.json(),
+        insightsDemographicsResponse.json(),
+        insightsPlacementResponse.json(),
+        insightsDeviceResponse.json()
       ]);
 
       console.log('AgentMode: API responses parsed:');
@@ -1761,6 +1772,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
       console.log('- Ad Sets response status:', adSetsResponse.status, 'data length:', adSetsData.data?.length || 0);
       console.log('- Ads response status:', adsResponse.status, 'data length:', adsData.data?.length || 0);
       console.log('- Insights response status:', insightsResponse.status, 'data length:', insightsData.data?.length || 0);
+      console.log('- Demographics insights status:', insightsDemographicsResponse.status, 'data length:', insightsDemographicsData.data?.length || 0);
+      console.log('- Placement insights status:', insightsPlacementResponse.status, 'data length:', insightsPlacementData.data?.length || 0);
+      console.log('- Device insights status:', insightsDeviceResponse.status, 'data length:', insightsDeviceData.data?.length || 0);
 
       // Check for errors in any of the responses
       if (campaignsData.error) {
@@ -1778,6 +1792,18 @@ Use the available tools to create tasks in the agent-engine when complex work is
       if (insightsData.error) {
         console.error('AgentMode: Insights API Error:', insightsData.error);
         throw new Error(`Insights API Error: ${insightsData.error.message}`);
+      }
+      if (insightsDemographicsData.error) {
+        console.error('AgentMode: Demographics Insights API Error:', insightsDemographicsData.error);
+        // Don't throw; proceed without demographics
+      }
+      if (insightsPlacementData.error) {
+        console.error('AgentMode: Placement Insights API Error:', insightsPlacementData.error);
+        // Don't throw; proceed without placements
+      }
+      if (insightsDeviceData.error) {
+        console.error('AgentMode: Device Insights API Error:', insightsDeviceData.error);
+        // Don't throw; proceed without devices
       }
 
       // Process the data using simplified logic
@@ -1805,7 +1831,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
           adPerformance,
           adSetsData: processedAdSetsData,
           adsData: processedAdsData,
-          campaignSummary
+          campaignSummary,
+          demographicsBreakdown: (insightsDemographicsData && insightsDemographicsData.data) ? insightsDemographicsData.data : [],
+          placementBreakdown: (insightsPlacementData && insightsPlacementData.data) ? insightsPlacementData.data : [],
+          deviceBreakdown: (insightsDeviceData && insightsDeviceData.data) ? insightsDeviceData.data : []
         }
       };
       
@@ -2189,7 +2218,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
   // Helper function to format metrics summary for AI analysis
   private formatMetricsSummary(data: any): string {
-    const { adPerformance, adSetsData, adsData, campaignSummary } = data;
+    const { adPerformance, adSetsData, adsData, campaignSummary, demographicsBreakdown, placementBreakdown, deviceBreakdown } = data;
     
     let summary = `📊 **Meta Ads Performance Data**\n\n`;
     
@@ -2238,6 +2267,118 @@ Use the available tools to create tasks in the agent-engine when complex work is
       
       adsData.forEach((ad: any) => {
         summary += `| ${ad.name} | ${ad.adSetName} | ${ad.campaignName} | $${ad.spend.toFixed(2)} | ${ad.impressions.toLocaleString()} | ${ad.clicks.toLocaleString()} | ${ad.ctr.toFixed(2)}% | $${ad.cpc.toFixed(2)} |\n`;
+      });
+      summary += `\n`;
+    }
+    
+    // Demographics Breakdown
+    if (demographicsBreakdown && demographicsBreakdown.length > 0) {
+      summary += `**Demographics Performance**\n`;
+      summary += `| Age | Gender | Impressions | Clicks | Spend | CTR | CPC |\n`;
+      summary += `|-----|--------|-------------|--------|-------|-----|-----|\n`;
+      
+      // Group by age and gender, then aggregate metrics
+      const demographicsMap = new Map();
+      demographicsBreakdown.forEach((item: any) => {
+        const key = `${item.age || 'Unknown'}-${item.gender || 'Unknown'}`;
+        if (!demographicsMap.has(key)) {
+          demographicsMap.set(key, {
+            age: item.age || 'Unknown',
+            gender: item.gender || 'Unknown',
+            impressions: 0,
+            clicks: 0,
+            spend: 0
+          });
+        }
+        const demo = demographicsMap.get(key);
+        demo.impressions += parseInt(item.impressions) || 0;
+        demo.clicks += parseInt(item.clicks) || 0;
+        demo.spend += parseFloat(item.spend) || 0;
+      });
+      
+      // Sort by spend descending and show top 10
+      const sortedDemographics = Array.from(demographicsMap.values())
+        .sort((a, b) => b.spend - a.spend)
+        .slice(0, 10);
+      
+      sortedDemographics.forEach((demo: any) => {
+        const ctr = demo.impressions > 0 ? (demo.clicks / demo.impressions) * 100 : 0;
+        const cpc = demo.clicks > 0 ? demo.spend / demo.clicks : 0;
+        summary += `| ${demo.age} | ${demo.gender} | ${demo.impressions.toLocaleString()} | ${demo.clicks.toLocaleString()} | $${demo.spend.toFixed(2)} | ${ctr.toFixed(2)}% | $${cpc.toFixed(2)} |\n`;
+      });
+      summary += `\n`;
+    }
+    
+    // Placement Breakdown
+    if (placementBreakdown && placementBreakdown.length > 0) {
+      summary += `**Placement Performance**\n`;
+      summary += `| Platform | Position | Impressions | Clicks | Spend | CTR | CPC |\n`;
+      summary += `|----------|----------|-------------|--------|-------|-----|-----|\n`;
+      
+      // Group by platform and position, then aggregate metrics
+      const placementMap = new Map();
+      placementBreakdown.forEach((item: any) => {
+        const key = `${item.publisher_platform || 'Unknown'}-${item.platform_position || 'Unknown'}`;
+        if (!placementMap.has(key)) {
+          placementMap.set(key, {
+            platform: item.publisher_platform || 'Unknown',
+            position: item.platform_position || 'Unknown',
+            impressions: 0,
+            clicks: 0,
+            spend: 0
+          });
+        }
+        const placement = placementMap.get(key);
+        placement.impressions += parseInt(item.impressions) || 0;
+        placement.clicks += parseInt(item.clicks) || 0;
+        placement.spend += parseFloat(item.spend) || 0;
+      });
+      
+      // Sort by spend descending and show top 10
+      const sortedPlacements = Array.from(placementMap.values())
+        .sort((a, b) => b.spend - a.spend)
+        .slice(0, 10);
+      
+      sortedPlacements.forEach((placement: any) => {
+        const ctr = placement.impressions > 0 ? (placement.clicks / placement.impressions) * 100 : 0;
+        const cpc = placement.clicks > 0 ? placement.spend / placement.clicks : 0;
+        summary += `| ${placement.platform} | ${placement.position} | ${placement.impressions.toLocaleString()} | ${placement.clicks.toLocaleString()} | $${placement.spend.toFixed(2)} | ${ctr.toFixed(2)}% | $${cpc.toFixed(2)} |\n`;
+      });
+      summary += `\n`;
+    }
+    
+    // Device Breakdown
+    if (deviceBreakdown && deviceBreakdown.length > 0) {
+      summary += `**Device Performance**\n`;
+      summary += `| Device | Impressions | Clicks | Spend | CTR | CPC |\n`;
+      summary += `|--------|-------------|--------|-------|-----|-----|\n`;
+      
+      // Group by device, then aggregate metrics
+      const deviceMap = new Map();
+      deviceBreakdown.forEach((item: any) => {
+        const device = item.impression_device || 'Unknown';
+        if (!deviceMap.has(device)) {
+          deviceMap.set(device, {
+            device,
+            impressions: 0,
+            clicks: 0,
+            spend: 0
+          });
+        }
+        const deviceData = deviceMap.get(device);
+        deviceData.impressions += parseInt(item.impressions) || 0;
+        deviceData.clicks += parseInt(item.clicks) || 0;
+        deviceData.spend += parseFloat(item.spend) || 0;
+      });
+      
+      // Sort by spend descending
+      const sortedDevices = Array.from(deviceMap.values())
+        .sort((a, b) => b.spend - a.spend);
+      
+      sortedDevices.forEach((device: any) => {
+        const ctr = device.impressions > 0 ? (device.clicks / device.impressions) * 100 : 0;
+        const cpc = device.clicks > 0 ? device.spend / device.clicks : 0;
+        summary += `| ${device.device} | ${device.impressions.toLocaleString()} | ${device.clicks.toLocaleString()} | $${device.spend.toFixed(2)} | ${ctr.toFixed(2)}% | $${cpc.toFixed(2)} |\n`;
       });
       summary += `\n`;
     }

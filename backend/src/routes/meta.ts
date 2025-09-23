@@ -88,10 +88,6 @@ router.get("/ad-performance", async (req, res) => {
       });
     }
     
-    console.log("Using Graph API for ad account:", user.adAccount);
-    console.log("Ad Account ID type:", typeof user.adAccount);
-    console.log("Ad Account ID length:", user.adAccount?.length);
-    
     // Validate ad account ID format
     if (!user.adAccount || !/^\d+$/.test(user.adAccount)) {
       return res.status(400).json({
@@ -182,7 +178,6 @@ router.get("/ad-performance", async (req, res) => {
       let insights;
       try {
         const insightsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=ad&access_token=${accessToken}`;
-        console.log("Insights URL:", insightsUrl);
         
         const insightsResponse = await fetch(insightsUrl);
         const insightsData = await insightsResponse.json();
