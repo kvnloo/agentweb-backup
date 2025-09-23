@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-09-23',
+    changes: [
+      'Supported fetching more meta metrics data in Agent Mode',
+      '- Added demographics (age, gender), placement (publisher platform, position), and device breakdowns for Meta Ads insights',
+      '- Enhanced metrics summary to include these breakdowns for better analysis',
+      'Fixed bug of Revision request not sent',
+      '- Fixed issue where "Send to Emma" action in Agent Mode was not properly sending revision requests to the backend',
+    ],
+  },
+  {
     date: '2025-09-22',
     changes: [
       'Route error to agent for better error handling in Agent Mode',
