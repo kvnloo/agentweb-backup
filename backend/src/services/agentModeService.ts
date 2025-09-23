@@ -688,8 +688,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
             properties: {
               timeframe: {
                 type: 'string',
-                description: 'Time period for metrics (7d, 30d, 90d)',
-                enum: ['7d', '30d', '90d'],
+                description: 'Time period for metrics (7d, 14d, 30d, 90d)',
+                enum: ['7d', '14d', '30d', '90d'],
                 default: '7d'
               }
             },
@@ -1730,6 +1730,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const startDate = new Date();
       if (timeframe === "7d") {
         startDate.setDate(endDate.getDate() - 7);
+      } else if (timeframe === "14d") {
+        startDate.setDate(endDate.getDate() - 14);
       } else if (timeframe === "30d") {
         startDate.setDate(endDate.getDate() - 30);
       } else if (timeframe === "90d") {
