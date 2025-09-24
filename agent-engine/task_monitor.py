@@ -556,8 +556,20 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                             )
                             
                             if revision_result['success']:
-                                # Revision was successful and already sent approval request, skip sending another one
+                                # Revision was successful; ensure subsequent emails (no-approval flow)
+                                # use the email-friendly revised HTML by updating the asset reference
                                 logger.info(f"✅ EMAIL-FRIENDLY SUCCESS: Revision created and approval request already sent")
+                                try:
+                                    revised_url = revision_result.get('revised_asset_url')
+                                    revised_filename = revision_result.get('revised_filename')
+                                    if revised_url:
+                                        # Update only in-memory reference so email sending uses revised HTML
+                                        asset_file['url'] = revised_url
+                                        if revised_filename:
+                                            asset_file['filename'] = revised_filename
+                                except Exception as ref_err:
+                                    logger.warning(f"Failed to update asset reference to revised HTML: {ref_err}")
+
                                 revisionDone = True
                             else:
                                 logger.warning(f"❌ EMAIL-FRIENDLY FAILED: {revision_result['error']}. Falling back to original HTML for approval.")
@@ -598,7 +610,9 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                     
                     # Send detailed results to all subscribers (if any and not requiring approval)
                     if has_subscribers and not (requires_approval and slack_channel):
-                        # Send regular email notifications
+                        # If an email-friendly revision was created, send only that asset file
+                        files_for_email = [asset_file] if (asset_file and asset_type == 'html' and revisionDone) else (execution.get('result_files', []) or [])
+
                         from email_utils import notify_task_subscribers
                         notify_task_subscribers(
                             task_id=execution['taskId'],
@@ -610,7 +624,7 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                             start_time=start_time,
                             end_time=end_time,
                             new_info_summary=new_info_summary,
-                            result_files=execution.get('result_files', []),
+                            result_files=files_for_email,
                             llm_name=llm_name
                         )
     except ClientError as e:
