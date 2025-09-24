@@ -112,7 +112,7 @@ def create_email_friendly_html_revision(task_id, execution_id, html_asset_url, u
         
         # Prepare the revision request data
         revision_data = {
-            'revision_prompt': 'Make this HTML report email-friendly and mobile-friendly by ensuring it uses inline CSS styles and contains no JavaScript. If any charts rely on JavaScript (e.g., Chart.js), convert them to static, email-safe charts using Charts.css (pure CSS). Choose chart types that render well in email (prefer bar charts; avoid pie charts when labels/segments are small). If a chart will not read well in email, replace it with a clear HTML table of the underlying data, or remove the chart. Preserve all existing hyperlinks and their destinations (anchor text and href) exactly; do not strip or alter links. Do not reference or rely on any web version. Ensure the layout is responsive and mobile-friendly with appropriate font sizes, spacing, and table layouts that work well on small screens.',
+            'revision_prompt': 'Make this HTML report email-friendly and mobile-friendly by ensuring it uses inline CSS styles and contains no JavaScript. If any charts rely on JavaScript (e.g., Chart.js), convert them to static, email-safe charts using Charts.css (pure CSS). Choose chart types that render well in email (prefer bar charts; avoid pie charts when labels/segments are small). If a chart will not read well in email, replace it with a clear HTML table of the underlying data, or remove the chart. Preserve all existing hyperlinks and their destinations (anchor text and href) exactly; do not strip or alter links. Do not reference or rely on any web version. Ensure the layout is responsive and mobile-friendly with appropriate font sizes, spacing, and table layouts that work well on small screens. Additionally, fix email client compatibility issues: replace "display: flex" with tables or "display: inline-block" + "text-align: center", avoid "gap", "box-shadow", "border-radius" properties, use tables for layout structure instead of divs, add explicit widths to tables and images, add "display: block" to images, use absolute URLs for image sources, add "border-collapse: collapse" to table styles, add "target=\'_blank\'" to all links, add xmlns="http://www.w3.org/1999/xhtml" to <html> tag, and use <!DOCTYPE html> declaration.',
             'report_url': html_asset_url,
             'original_execution_id': execution_id
         }
@@ -153,7 +153,6 @@ def create_email_friendly_html_revision(task_id, execution_id, html_asset_url, u
     except Exception as e:
         logger.error(f"Error creating HTML revision: {e}")
         return {'success': False, 'error': str(e)}
-
 def repair_image_embedding(task_id, execution_id, html_asset_url, user_id):
     """
     Repair image embeddings in HTML using the backend update-report endpoint.

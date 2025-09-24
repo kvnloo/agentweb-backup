@@ -181,11 +181,19 @@ export const emailService = {
               
               if (response.ok) {
                 const fetchedHtmlContent = await response.text();
-                htmlContentFromFile = `
+                
+                if (task.sendHtmlReportOnly) {
+                  // For sendHTMLReportOnly, use raw HTML content without enhancement
+                  htmlContentFromFile = fetchedHtmlContent;
+                } else {
+                  // For regular emails, wrap with html-result div
+                  htmlContentFromFile = `
                   <div class="html-result">
                     ${fetchedHtmlContent}
                   </div>
                 `;
+                }
+                
                 htmlContentUrl = file.url; // Capture the URL for email history
                 console.log(`Successfully fetched HTML content from ${file.url}`);
                 break; // Use the first HTML file found
@@ -208,30 +216,21 @@ export const emailService = {
             month: 'short', 
             day: 'numeric' 
           });
-          const simplifiedHtml = `
-            <html>
-            <head>
-              <style>
-                body { font-family: sans-serif; margin: 0; padding: 0; }
-                .container { padding: 20px; }
-                .footer { margin-top: 25px; font-size: 0.9em; padding: 20px; }
-                a { text-decoration: none; }
-                a:hover { text-decoration: underline; }
-              </style>
-            </head>
-            <body>
-              <div class="container">
-                ${htmlContentFromFile}
-                <div class="footer">
-                  ${!task.sendHtmlReportOnly ? `<p>Manage task and history at: <a href="${customerFrontendUrl}/tasks/${task.taskId}">${customerFrontendUrl}/tasks/${task.taskId}</a></p>` : ''}
-                  ${htmlContentUrl && !task.emailFriendlyHtml ? `<p><small><strong>Note:</strong> Some visuals may not display properly in the email. <a href="${htmlContentUrl}">View full report here</a> for the complete experience.</small></p>` : ''}
-                  <hr>
-                  <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>
-                  <p><small><a href="${customerFrontendUrl}/unsubscribe?taskId=${task.taskId}&email=${encodeURIComponent(toEmail)}" style="color: #e74c3c;">Unsubscribe from future updates</a></small></p>
-                </div>
-              </div>
-            </body></html>
+          
+          // Create footer content
+          const footerContent = `
+            <div style="margin-top: 25px; font-size: 0.9em; padding: 20px; text-align: center;">
+              ${!task.sendHtmlReportOnly ? `<p>Manage task and history at: <a href="${customerFrontendUrl}/tasks/${task.taskId}">${customerFrontendUrl}/tasks/${task.taskId}</a></p>` : ''}
+              ${htmlContentUrl && !task.emailFriendlyHtml ? `<p><small><strong>Note:</strong> Some visuals may not display properly in the email. <a href="${htmlContentUrl}">View full report here</a> for the complete experience.</small></p>` : ''}
+              <hr>
+              <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>
+              <p><small><a href="${customerFrontendUrl}/unsubscribe?taskId=${task.taskId}&email=${encodeURIComponent(toEmail)}" style="color: #e74c3c;">Unsubscribe from future updates</a></small></p>
+            </div>
           `;
+          
+          // For sendHTMLReportOnly, inject footer before closing </body> tag
+          // For regular emails, inject before closing </body> tag
+          const simplifiedHtml = htmlContentFromFile.replace('</body>', `${footerContent}</body>`);
 
           const subject = `${task.name} - ${currentDate}`;
           const text = `Task Report: ${task.name}\n\nView the HTML report in the email body.${!task.sendHtmlReportOnly ? `\n\nManage task and history at: ${customerFrontendUrl}/tasks/${task.taskId}` : ''}`;

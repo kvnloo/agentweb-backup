@@ -258,9 +258,16 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
                         response = requests.get(file_info['url'], timeout=10)
                         response.raise_for_status()
                         fetched_html_content = response.text
-                        html_content_from_file_section = f"""<div class="html-result">
+                        
+                        if send_html_report_only:
+                            # For send_html_report_only, use raw HTML content without enhancement
+                            html_content_from_file_section = fetched_html_content
+                        else:
+                            # For regular emails, wrap with html-result div
+                            html_content_from_file_section = f"""<div class="html-result">
     {fetched_html_content}
 </div>"""
+                        
                         html_content_url = file_info['url']  # Capture the URL for email history
                         logger.info(f"Successfully fetched HTML content from {file_info['url']}")
                         break
@@ -277,29 +284,18 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
                 current_date = datetime.now().strftime("%b %d, %Y")
                 subject = f"{task_name} - {current_date}"  # Task name with date
 
-                simplified_html = f"""<html>
-<head>
-  <style>
-    body {{ font-family: sans-serif; margin: 0; padding: 0; }}
-    .container {{ padding: 20px; }}
-    .header {{ font-size: 1.5em; font-weight: bold; margin-bottom: 15px; }}
-    .footer {{ margin-top: 25px; font-size: 0.9em; padding: 20px; }}
-    a {{ text-decoration: none; }}
-    a:hover {{ text-decoration: underline; }}
-  </style>
-</head>
-<body>
-  <div class="container">
-    {html_content_from_file_section}
-    <div class="footer">
-      {f'<p>Manage task and history at: <a href="{os.getenv("CUSTOMER_FRONTEND_URL", "http://localhost:5174")}/tasks/{task_id}">{os.getenv("CUSTOMER_FRONTEND_URL", "http://localhost:5174")}/tasks/{task_id}</a></p>' if not send_html_report_only else ''}
-      {f'<p><small><strong>Note:</strong> Some visuals may not display properly in the email. <a href="{html_content_url}">View full report here</a> for the complete experience.</small></p>' if html_content_url else ''}
-      <hr>
-      <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>
-      <p><small><a href="{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/unsubscribe?taskId={task_id}&email={to_email}" style="color: #e74c3c;">Unsubscribe from future updates</a></small></p>
-    </div>
-  </div>
-</body></html>"""
+                # Create footer content
+                footer_content = f"""
+<div style="margin-top: 25px; font-size: 0.9em; padding: 20px; text-align: center;">
+  {f'<p>Manage task and history at: <a href="{os.getenv("CUSTOMER_FRONTEND_URL", "http://localhost:5174")}/tasks/{task_id}">{os.getenv("CUSTOMER_FRONTEND_URL", "http://localhost:5174")}/tasks/{task_id}</a></p>' if not send_html_report_only else ''}
+  {f'<p><small><strong>Note:</strong> Some visuals may not display properly in the email. <a href="{html_content_url}">View full report here</a> for the complete experience.</small></p>' if html_content_url else ''}
+  <hr>
+  <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>
+  <p><small><a href="{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/unsubscribe?taskId={task_id}&email={to_email}" style="color: #e74c3c;">Unsubscribe from future updates</a></small></p>
+</div>"""
+                
+                # Inject footer before closing </body> tag
+                simplified_html = html_content_from_file_section.replace('</body>', f'{footer_content}</body>')
 
                 # Determine sender type and email ID
                 sender_type = 'SMTP'
