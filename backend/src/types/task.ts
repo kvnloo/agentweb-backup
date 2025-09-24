@@ -17,6 +17,7 @@ export interface Task {
   outputAsHtml?: boolean;
   emailFriendlyHtml?: boolean;  // Whether to create email-friendly HTML revisions for approval
   repairImageEmbedding?: boolean;  // Whether to repair image embeddings in HTML output
+  htmlFormatInstructions?: string; // custom instructions to format HTML output
   llmName?: string;  // The preferred LLM to try first for this task
   useSharedBrowser?: boolean; // Whether the task should use a shared browser session
   turnOffHeadless?: boolean; // Whether to run the browser in visible mode
@@ -56,6 +57,7 @@ export interface TaskUpdate {
   outputAsHtml?: boolean;
   emailFriendlyHtml?: boolean;
   repairImageEmbedding?: boolean;
+  htmlFormatInstructions?: string | null;
   isAgenticDevMode?: boolean;
   llmName?: string;
   useSharedBrowser?: boolean;

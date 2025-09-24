@@ -342,6 +342,12 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
       updates.repairImageEmbedding = Boolean(req.body.repairImageEmbedding);
     }
 
+    if (req.body.htmlFormatInstructions !== undefined) {
+      // allow empty string to clear or keep instruction text
+      const val = req.body.htmlFormatInstructions;
+      updates.htmlFormatInstructions = val === null ? null : String(val);
+    }
+
     if (req.body.llmName !== undefined) {
       updates.llmName = req.body.llmName || null;  // Convert empty string to null
     }

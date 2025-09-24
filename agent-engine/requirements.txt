@@ -1,4 +1,4 @@
-browser-use[memory]
+browser-use[memory]==0.1.48
 aiohttp
 beautifulsoup4
 python-dotenv

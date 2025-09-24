@@ -13,6 +13,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Ensured raw HTML is used when Send HTML Report Only is enabled',
       '- Fixed non-approval path to use email-friendly revised HTML for subscribers',
       '- Added guidance to ensure clean left/right edges, full width layout, and white background in emails',
+      'Supported Format Instructions for HTML Report',
+      '- Added clickable "Format Instructions" badge on Task Details page for easy access',
+      '- Users can now add or edit custom HTML format instructions for consistent report styling',
+      '- Format instructions are automatically applied during HTML report generation in agent-engine',
+      '- Instructions can be used in Report Preview revision workflow for quick formatting updates',
     ],
   },
   {

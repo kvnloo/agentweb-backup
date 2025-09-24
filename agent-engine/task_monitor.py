@@ -153,6 +153,7 @@ def create_email_friendly_html_revision(task_id, execution_id, html_asset_url, u
     except Exception as e:
         logger.error(f"Error creating HTML revision: {e}")
         return {'success': False, 'error': str(e)}
+
 def repair_image_embedding(task_id, execution_id, html_asset_url, user_id):
     """
     Repair image embeddings in HTML using the backend update-report endpoint.
@@ -432,7 +433,7 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                 # Get task details
                 task = tasks_table.get_item(
                     Key={'taskId': execution['taskId']},
-                    ProjectionExpression='userId, #n, emailNotification, requireApproval, slackChannel, emailFriendlyHtml, repairImageEmbedding',
+                    ProjectionExpression='userId, #n, emailNotification, requireApproval, slackChannel, emailFriendlyHtml, repairImageEmbedding, htmlFormatInstructions',
                     ExpressionAttributeNames={'#n': 'name'}
                 ).get('Item')
                 
@@ -574,6 +575,47 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                             else:
                                 logger.warning(f"❌ EMAIL-FRIENDLY FAILED: {revision_result['error']}. Falling back to original HTML for approval.")
                                 # revisionDone remains False, will send approval below
+
+                        # For HTML assets, apply instruction-based revision after prior steps
+                        # Only if htmlFormatInstructions is present (non-empty)
+                        if asset_type == 'html' and task.get('htmlFormatInstructions'):
+                            instructions = task.get('htmlFormatInstructions') or ''
+                            try:
+                                backend_url = os.getenv('BACKEND_URL', 'http://localhost:3001')
+                                jwt_token = create_jwt_token(task['userId'])
+                                if jwt_token:
+                                    revision_data = {
+                                        'revision_prompt': f"Apply the following formatting instructions to the current HTML. Keep links and core content unchanged. Avoid JavaScript. Ensure responsiveness.\n\n--- INSTRUCTIONS START ---\n{instructions}\n--- INSTRUCTIONS END ---\n",
+                                        'report_url': asset_file['url'],
+                                        'original_execution_id': execution_id
+                                    }
+                                    response = requests.post(
+                                        f"{backend_url}/api/tasks/{execution['taskId']}/executions/revision",
+                                        json=revision_data,
+                                        headers={
+                                            'Authorization': f'Bearer {jwt_token}',
+                                            'Content-Type': 'application/json'
+                                        },
+                                        timeout=60
+                                    )
+                                    if response.status_code == 201:
+                                        result = response.json()
+                                        if result.get('success') and result.get('resultFile'):
+                                            revised_url = result['resultFile'].get('url')
+                                            revised_filename = result['resultFile'].get('filename')
+                                            if revised_url:
+                                                asset_file['url'] = revised_url
+                                            if revised_filename:
+                                                asset_file['filename'] = revised_filename
+                                            logger.info("✅ FORMAT INSTRUCTIONS APPLY SUCCESS: Revised HTML created")
+                                        else:
+                                            logger.warning(f"❌ FORMAT INSTRUCTIONS APPLY ERROR: {result.get('message', 'Unknown error')}")
+                                    else:
+                                        logger.warning(f"❌ FORMAT INSTRUCTIONS APPLY FAILED HTTP {response.status_code}: {response.text}")
+                                else:
+                                    logger.error("Failed to create JWT token for instruction-based revision")
+                            except Exception as e:
+                                logger.warning(f"Failed to apply htmlFormatInstructions: {e}")
                     
                     # Check if task requires approval (regardless of subscribers)
                     # This ensures approval requests are sent even for tasks with no subscribers

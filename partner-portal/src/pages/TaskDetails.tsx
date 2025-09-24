@@ -84,6 +84,7 @@ interface Task {
   outputAsHtml?: boolean; // New flag for outputting result as HTML5
   emailFriendlyHtml?: boolean; // Flag for creating email-friendly HTML revisions
   repairImageEmbedding?: boolean; // Flag for repairing image embeddings in HTML
+  htmlFormatInstructions?: string; // custom instruction for formatting HTML
   isAgenticDevMode?: boolean; // Flag for enabling agentic dev mode
   llmName?: string;
   attachments?: TaskAttachment[];
@@ -470,6 +471,7 @@ export default function TaskDetails() {
   const [selectedVideoModel, setSelectedVideoModel] = useState("");
   const [tempEmailFriendly, setTempEmailFriendly] = useState(false);
   const [tempRepairImageEmbedding, setTempRepairImageEmbedding] = useState(false);
+  const [tempHtmlFormatInstructions, setTempHtmlFormatInstructions] = useState<string>("");
 
   const isAdminRoute = location.pathname.startsWith("/admin/");
   const showActions =
@@ -1260,6 +1262,7 @@ export default function TaskDetails() {
       // If enabling HTML, show popup to ask about email-friendly and repair image embedding options
       setTempEmailFriendly(task?.emailFriendlyHtml || false);
       setTempRepairImageEmbedding(task?.repairImageEmbedding || false);
+      setTempHtmlFormatInstructions(task?.htmlFormatInstructions || "");
       setIsEmailFriendlyDialogOpen(true);
     } else {
       // If disabling HTML, just update the toggle and disable email-friendly and repair image embedding
@@ -1630,6 +1633,8 @@ export default function TaskDetails() {
         emailFriendlyHtml: tempEmailFriendly,
         repairImageEmbedding: tempRepairImageEmbedding
       };
+      // Persist instructions even if empty (do not auto-clear on disabling HTML)
+      updates.htmlFormatInstructions = tempHtmlFormatInstructions;
       
       // If enabling email-friendly, turn JSON off
       if (tempEmailFriendly && task?.outputAsJson) {
@@ -2086,9 +2091,18 @@ export default function TaskDetails() {
                       }
                       label={
                         <Box
-                          sx={{ display: "flex", alignItems: "center", gap: 1 }}
+                          component="span"
+                          sx={{ display: "inline-flex", alignItems: "center", gap: 1 }}
                         >
                           <Typography>Output as HTML5</Typography>
+                          {task?.htmlFormatInstructions && (
+                            <Chip
+                              label="Format Instructions"
+                              size="small"
+                              color="default"
+                              variant="outlined"
+                            />
+                          )}
                           {task?.emailFriendlyHtml && (
                             <Chip
                               label="Email Friendly"
@@ -3189,6 +3203,27 @@ export default function TaskDetails() {
                 </Box>
               }
             />
+
+            {/* HTML Template selection from attachments */}
+            <Box>
+              <Typography variant="body1" sx={{ fontWeight: 'medium', mb: 1 }}>
+                HTML Template (optional)
+              </Typography>
+              <FormControl fullWidth>
+                <TextField
+                  label="HTML Format Instructions"
+                  value={tempHtmlFormatInstructions}
+                  onChange={(e) => setTempHtmlFormatInstructions(e.target.value)}
+                  placeholder="e.g., Use this header/footer and inline CSS rules..."
+                  fullWidth
+                  multiline
+                  minRows={3}
+                />
+              </FormControl>
+              <Typography variant="body2" sx={{ color: 'text.secondary', mt: 1 }}>
+                Choose one of the uploaded attachments to use as the HTML template.
+              </Typography>
+            </Box>
           </Box>
         </DialogContent>
         <DialogActions>

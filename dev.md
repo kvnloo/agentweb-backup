@@ -18,6 +18,15 @@ When restoring a previous good version of browser-use, an issue about old_histor
 `pip uninstall -y mem0ai`
 To reinstall it, run
 `pip install "browser-use[memory]"`
+# Update September 24, 2025: got the error again but realized we are using python3 at dev which seems not an issue until Rui's MacBook Pro accidentally crashed and probably crashed the python3 install. The issue has been fixed with a reinstall of all dependencies with requirements.txt and playwright reinstall. No prod change should be made. It was purely a dev issue.
+To fix browser-use version - 
+pip install "browser-use[memory]==0.1.48"
+Force to install on dev
+python3 -m pip install "browser-use[memory]==0.1.48" --break-system-packages
+python3 -m pip install -r requirements.txt --break-system-packages
+python3 -m playwright install chromium
+## Test playwright afterwards
+python3 -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); browser = p.chromium.launch(); print('✅ Chromium browser launched successfully'); browser.close(); p.stop()"
 
 Issue with reverted PRs: when there are reverted PRs, there is risk that changes may mess up, possibly due to accumulated changes are too many that github seems may start truncate. We encountered such issue when deploying the data analysis PR. A resolution was to start clean which causes much less confusion.
 
