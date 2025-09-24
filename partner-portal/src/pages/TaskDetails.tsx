@@ -84,6 +84,7 @@ interface Task {
   outputAsHtml?: boolean; // New flag for outputting result as HTML5
   emailFriendlyHtml?: boolean; // Flag for creating email-friendly HTML revisions
   repairImageEmbedding?: boolean; // Flag for repairing image embeddings in HTML
+  htmlTemplateFilename?: string; // filename of selected HTML template attachment
   isAgenticDevMode?: boolean; // Flag for enabling agentic dev mode
   llmName?: string;
   attachments?: TaskAttachment[];
@@ -470,6 +471,7 @@ export default function TaskDetails() {
   const [selectedVideoModel, setSelectedVideoModel] = useState("");
   const [tempEmailFriendly, setTempEmailFriendly] = useState(false);
   const [tempRepairImageEmbedding, setTempRepairImageEmbedding] = useState(false);
+  const [tempHtmlTemplateFilename, setTempHtmlTemplateFilename] = useState<string | null>(null);
 
   const isAdminRoute = location.pathname.startsWith("/admin/");
   const showActions =
@@ -1260,6 +1262,7 @@ export default function TaskDetails() {
       // If enabling HTML, show popup to ask about email-friendly and repair image embedding options
       setTempEmailFriendly(task?.emailFriendlyHtml || false);
       setTempRepairImageEmbedding(task?.repairImageEmbedding || false);
+      setTempHtmlTemplateFilename(task?.htmlTemplateFilename || null);
       setIsEmailFriendlyDialogOpen(true);
     } else {
       // If disabling HTML, just update the toggle and disable email-friendly and repair image embedding
@@ -1267,7 +1270,8 @@ export default function TaskDetails() {
         const updates: any = { 
           outputAsHtml: false,
           emailFriendlyHtml: false, // Also disable email-friendly when disabling HTML
-          repairImageEmbedding: false // Also disable repair image embedding when disabling HTML
+          repairImageEmbedding: false, // Also disable repair image embedding when disabling HTML
+          htmlTemplateFilename: null
         };
 
         await axios.put(buildApiUrl(`/api/tasks/${taskId}`), updates, {
@@ -1630,6 +1634,9 @@ export default function TaskDetails() {
         emailFriendlyHtml: tempEmailFriendly,
         repairImageEmbedding: tempRepairImageEmbedding
       };
+      if (tempHtmlTemplateFilename) {
+        updates.htmlTemplateFilename = tempHtmlTemplateFilename;
+      }
       
       // If enabling email-friendly, turn JSON off
       if (tempEmailFriendly && task?.outputAsJson) {
@@ -2086,9 +2093,18 @@ export default function TaskDetails() {
                       }
                       label={
                         <Box
-                          sx={{ display: "flex", alignItems: "center", gap: 1 }}
+                          component="span"
+                          sx={{ display: "inline-flex", alignItems: "center", gap: 1 }}
                         >
                           <Typography>Output as HTML5</Typography>
+                          {task?.htmlTemplateFilename && (
+                            <Chip
+                              label={`Template: ${task.htmlTemplateFilename}`}
+                              size="small"
+                              color="default"
+                              variant="outlined"
+                            />
+                          )}
                           {task?.emailFriendlyHtml && (
                             <Chip
                               label="Email Friendly"
@@ -3189,6 +3205,32 @@ export default function TaskDetails() {
                 </Box>
               }
             />
+
+            {/* HTML Template selection from attachments */}
+            <Box>
+              <Typography variant="body1" sx={{ fontWeight: 'medium', mb: 1 }}>
+                HTML Template (optional)
+              </Typography>
+              <FormControl fullWidth>
+                <InputLabel id="html-template-label">Template</InputLabel>
+                <Select
+                  labelId="html-template-label"
+                  value={tempHtmlTemplateFilename || ''}
+                  label="Template"
+                  onChange={(e) => setTempHtmlTemplateFilename(e.target.value ? String(e.target.value) : null)}
+                >
+                  <MenuItem value="">None</MenuItem>
+                  {(task?.attachments || []).map((att) => (
+                    <MenuItem key={att.key} value={att.filename}>
+                      {att.filename}
+                    </MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+              <Typography variant="body2" sx={{ color: 'text.secondary', mt: 1 }}>
+                Choose one of the uploaded attachments to use as the HTML template.
+              </Typography>
+            </Box>
           </Box>
         </DialogContent>
         <DialogActions>
