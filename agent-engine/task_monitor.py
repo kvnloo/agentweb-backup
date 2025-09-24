@@ -153,6 +153,103 @@ def create_email_friendly_html_revision(task_id, execution_id, html_asset_url, u
     except Exception as e:
         logger.error(f"Error creating HTML revision: {e}")
         return {'success': False, 'error': str(e)}
+
+def create_template_based_html_revision(task_id, execution_id, html_asset_url, template_url, user_id):
+    """
+    Create a template-based HTML revision using the backend revision endpoint, providing both
+    the original HTML URL and the template HTML URL so the backend can merge/apply the template.
+
+    Args:
+        task_id: The ID of the task
+        execution_id: The ID of the execution
+        html_asset_url: The URL of the current HTML asset (post-repair/email-friendly)
+        template_url: The URL of the chosen template HTML attachment
+        user_id: The ID of the user who owns the task
+
+    Returns:
+        dict: Result with success status and revised asset URL if successful
+    """
+    try:
+        backend_url = os.getenv('BACKEND_URL', 'http://localhost:3001')
+
+        # Create JWT token for the user
+        jwt_token = create_jwt_token(user_id)
+        if not jwt_token:
+            logger.error(f"Failed to create JWT token for user {user_id}")
+            return {'success': False, 'error': 'Failed to create JWT token'}
+
+        # Fetch template content to include verbatim in the prompt for higher fidelity
+        template_content_snippet = ''
+        try:
+            resp = requests.get(template_url, timeout=30)
+            if resp.status_code == 200:
+                text = resp.text or ''
+                # Cap template content to avoid excessively large prompts
+                max_chars = int(os.getenv('TEMPLATE_MAX_CHARS', '120000'))
+                template_content_snippet = text[:max_chars]
+            else:
+                logger.warning(f"Failed to fetch template content (HTTP {resp.status_code}). Proceeding without embedding template content in prompt.")
+        except Exception as e:
+            logger.warning(f"Error fetching template content from {template_url}: {e}")
+
+        # Prepare the revision request data with embedded template content
+        base_instruction = (
+            'Apply the provided HTML template to the current HTML. Preserve all dynamic content from the current HTML '
+            'while using the template for structure, header, footer, and styles. Ensure links remain unchanged and '
+            'content sections map cleanly into the template placeholders. Avoid introducing JavaScript. Keep the result '
+            'responsive and email-safe if possible.'
+        )
+
+        if template_content_snippet:
+            revision_prompt = (
+                f"{base_instruction}\n\n"
+                f"--- TEMPLATE HTML START ---\n{template_content_snippet}\n--- TEMPLATE HTML END ---\n"
+                f"Instructions: Use the TEMPLATE HTML as the layout shell and insert the current HTML content into appropriate sections."
+            )
+        else:
+            revision_prompt = base_instruction
+
+        revision_data = {
+            'revision_prompt': revision_prompt,
+            'report_url': html_asset_url,
+            'template_url': template_url,
+            'original_execution_id': execution_id
+        }
+
+        logger.info(f"🔄 TEMPLATE REVISION REQUEST: Applying template to HTML for task {task_id}")
+        logger.info(f"📄 Current HTML URL: {html_asset_url}")
+        logger.info(f"📑 Template URL: {template_url}")
+
+        # Send the revision request to the backend using JWT authentication
+        response = requests.post(
+            f'{backend_url}/api/tasks/{task_id}/executions/revision',
+            json=revision_data,
+            headers={
+                'Authorization': f'Bearer {jwt_token}',
+                'Content-Type': 'application/json'
+            },
+            timeout=60
+        )
+
+        if response.status_code == 201:
+            result = response.json()
+            if result.get('success') and result.get('resultFile'):
+                logger.info(f"✅ TEMPLATE REVISION SUCCESS: Template-based HTML revision created for task {task_id}")
+                return {
+                    'success': True,
+                    'revised_asset_url': result['resultFile']['url'],
+                    'revised_filename': result['resultFile'].get('filename')
+                }
+            else:
+                logger.error(f"❌ TEMPLATE REVISION ERROR: {result.get('message', 'Unknown error')}")
+                return {'success': False, 'error': result.get('message', 'Unknown error')}
+        else:
+            logger.error(f"❌ TEMPLATE REVISION FAILED: HTTP {response.status_code}, Response: {response.text}")
+            return {'success': False, 'error': f'HTTP {response.status_code}: {response.text}'}
+
+    except Exception as e:
+        logger.error(f"Error creating template-based HTML revision: {e}")
+        return {'success': False, 'error': str(e)}
 def repair_image_embedding(task_id, execution_id, html_asset_url, user_id):
     """
     Repair image embeddings in HTML using the backend update-report endpoint.
@@ -432,7 +529,7 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                 # Get task details
                 task = tasks_table.get_item(
                     Key={'taskId': execution['taskId']},
-                    ProjectionExpression='userId, #n, emailNotification, requireApproval, slackChannel, emailFriendlyHtml, repairImageEmbedding',
+                    ProjectionExpression='userId, #n, emailNotification, requireApproval, slackChannel, emailFriendlyHtml, repairImageEmbedding, htmlTemplateFilename, attachments',
                     ExpressionAttributeNames={'#n': 'name'}
                 ).get('Item')
                 
@@ -574,6 +671,40 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                             else:
                                 logger.warning(f"❌ EMAIL-FRIENDLY FAILED: {revision_result['error']}. Falling back to original HTML for approval.")
                                 # revisionDone remains False, will send approval below
+
+                        # For HTML assets, apply template-based revision after prior steps
+                        # Only if htmlTemplateFilename is present and an attachment with that name exists
+                        if asset_type == 'html' and task.get('htmlTemplateFilename'):
+                            template_filename = task.get('htmlTemplateFilename')
+                            template_url = None
+                            try:
+                                for att in (task.get('attachments') or []):
+                                    if att.get('filename') == template_filename:
+                                        template_url = att.get('url')
+                                        break
+                            except Exception:
+                                template_url = None
+
+                            if template_url:
+                                logger.info(f"🧩 TEMPLATE MODE: Applying template '{template_filename}' to HTML for task {execution['taskId']}")
+                                template_rev_result = create_template_based_html_revision(
+                                    task_id=execution['taskId'],
+                                    execution_id=execution_id,
+                                    html_asset_url=asset_file['url'],
+                                    template_url=template_url,
+                                    user_id=task['userId']
+                                )
+
+                                if template_rev_result.get('success'):
+                                    revised_url = template_rev_result.get('revised_asset_url')
+                                    revised_filename = template_rev_result.get('revised_filename')
+                                    if revised_url:
+                                        asset_file['url'] = revised_url
+                                    if revised_filename:
+                                        asset_file['filename'] = revised_filename
+                                    logger.info("✅ TEMPLATE APPLY SUCCESS: Revised HTML created using template")
+                                else:
+                                    logger.warning(f"❌ TEMPLATE APPLY FAILED: {template_rev_result.get('error')} - continuing with previous HTML")
                     
                     # Check if task requires approval (regardless of subscribers)
                     # This ensures approval requests are sent even for tasks with no subscribers
