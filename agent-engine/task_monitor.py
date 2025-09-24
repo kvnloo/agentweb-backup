@@ -112,7 +112,7 @@ def create_email_friendly_html_revision(task_id, execution_id, html_asset_url, u
         
         # Prepare the revision request data
         revision_data = {
-            'revision_prompt': 'Make this HTML report email-friendly and mobile-friendly by ensuring it uses inline CSS styles and contains no JavaScript. If any charts rely on JavaScript (e.g., Chart.js), convert them to static, email-safe charts using Charts.css (pure CSS). Choose chart types that render well in email (prefer bar charts; avoid pie charts when labels/segments are small). If a chart will not read well in email, replace it with a clear HTML table of the underlying data, or remove the chart. Preserve all existing hyperlinks and their destinations (anchor text and href) exactly; do not strip or alter links. Do not reference or rely on any web version. Ensure the layout is responsive and mobile-friendly with appropriate font sizes, spacing, and table layouts that work well on small screens.',
+            'revision_prompt': 'Make this HTML report email-friendly and mobile-friendly by ensuring it uses inline CSS styles and contains no JavaScript. If any charts rely on JavaScript (e.g., Chart.js), convert them to static, email-safe charts using Charts.css (pure CSS). Choose chart types that render well in email (prefer bar charts; avoid pie charts when labels/segments are small). If a chart will not read well in email, replace it with a clear HTML table of the underlying data, or remove the chart. Preserve all existing hyperlinks and their destinations (anchor text and href) exactly; do not strip or alter links. Do not reference or rely on any web version. Ensure the layout is responsive and mobile-friendly with appropriate font sizes, spacing, and table layouts that work well on small screens. Additionally, fix email client compatibility issues: replace "display: flex" with tables or "display: inline-block" + "text-align: center", avoid "gap", "box-shadow", "border-radius" properties, use tables for layout structure instead of divs, add explicit widths to tables and images, add "display: block" to images, use absolute URLs for image sources, add "border-collapse: collapse" to table styles, add "target=\'_blank\'" to all links, add xmlns="http://www.w3.org/1999/xhtml" to <html> tag, and use <!DOCTYPE html> declaration. Ensure good left and right edges by using proper table alignment, consistent margins, and avoiding content that extends beyond the container boundaries.',
             'report_url': html_asset_url,
             'original_execution_id': execution_id
         }
@@ -153,7 +153,6 @@ def create_email_friendly_html_revision(task_id, execution_id, html_asset_url, u
     except Exception as e:
         logger.error(f"Error creating HTML revision: {e}")
         return {'success': False, 'error': str(e)}
-
 def repair_image_embedding(task_id, execution_id, html_asset_url, user_id):
     """
     Repair image embeddings in HTML using the backend update-report endpoint.
@@ -557,8 +556,20 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                             )
                             
                             if revision_result['success']:
-                                # Revision was successful and already sent approval request, skip sending another one
+                                # Revision was successful; ensure subsequent emails (no-approval flow)
+                                # use the email-friendly revised HTML by updating the asset reference
                                 logger.info(f"✅ EMAIL-FRIENDLY SUCCESS: Revision created and approval request already sent")
+                                try:
+                                    revised_url = revision_result.get('revised_asset_url')
+                                    revised_filename = revision_result.get('revised_filename')
+                                    if revised_url:
+                                        # Update only in-memory reference so email sending uses revised HTML
+                                        asset_file['url'] = revised_url
+                                        if revised_filename:
+                                            asset_file['filename'] = revised_filename
+                                except Exception as ref_err:
+                                    logger.warning(f"Failed to update asset reference to revised HTML: {ref_err}")
+
                                 revisionDone = True
                             else:
                                 logger.warning(f"❌ EMAIL-FRIENDLY FAILED: {revision_result['error']}. Falling back to original HTML for approval.")
@@ -599,7 +610,9 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                     
                     # Send detailed results to all subscribers (if any and not requiring approval)
                     if has_subscribers and not (requires_approval and slack_channel):
-                        # Send regular email notifications
+                        # If an email-friendly revision was created, send only that asset file
+                        files_for_email = [asset_file] if (asset_file and asset_type == 'html' and revisionDone) else (execution.get('result_files', []) or [])
+
                         from email_utils import notify_task_subscribers
                         notify_task_subscribers(
                             task_id=execution['taskId'],
@@ -611,7 +624,7 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                             start_time=start_time,
                             end_time=end_time,
                             new_info_summary=new_info_summary,
-                            result_files=execution.get('result_files', []),
+                            result_files=files_for_email,
                             llm_name=llm_name
                         )
     except ClientError as e:
