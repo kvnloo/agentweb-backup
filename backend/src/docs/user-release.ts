@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-09-24',
+    changes: [
+      'Improved email friendly HTML',
+      '- Ensured raw HTML is used when Send HTML Report Only is enabled',
+      '- Fixed non-approval path to use email-friendly revised HTML for subscribers',
+      '- Added guidance to ensure clean left/right edges, full width layout, and white background in emails',
+    ],
+  },
+  {
     date: '2025-09-23',
     changes: [
       'Supported fetching more meta metrics data in Agent Mode',
