@@ -18,6 +18,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Users can now add or edit custom HTML format instructions for consistent report styling',
       '- Format instructions are automatically applied during HTML report generation in agent-engine',
       '- Instructions can be used in Report Preview revision workflow for quick formatting updates',
+      'Added read_file_content function call in Agent Mode',
+      '- Agent can now read and extract content from file URLs including PDFs, text files, HTML, Markdown, CSV, and other common formats',
+      '- Supports automatic file type detection and content extraction with proper error handling',
     ],
   },
   {
