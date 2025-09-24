@@ -529,7 +529,7 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                 # Get task details
                 task = tasks_table.get_item(
                     Key={'taskId': execution['taskId']},
-                    ProjectionExpression='userId, #n, emailNotification, requireApproval, slackChannel, emailFriendlyHtml, repairImageEmbedding, htmlTemplateFilename, attachments',
+                    ProjectionExpression='userId, #n, emailNotification, requireApproval, slackChannel, emailFriendlyHtml, repairImageEmbedding, htmlFormatInstructions',
                     ExpressionAttributeNames={'#n': 'name'}
                 ).get('Item')
                 
@@ -672,39 +672,46 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                                 logger.warning(f"❌ EMAIL-FRIENDLY FAILED: {revision_result['error']}. Falling back to original HTML for approval.")
                                 # revisionDone remains False, will send approval below
 
-                        # For HTML assets, apply template-based revision after prior steps
-                        # Only if htmlTemplateFilename is present and an attachment with that name exists
-                        if asset_type == 'html' and task.get('htmlTemplateFilename'):
-                            template_filename = task.get('htmlTemplateFilename')
-                            template_url = None
+                        # For HTML assets, apply instruction-based revision after prior steps
+                        # Only if htmlFormatInstructions is present (non-empty)
+                        if asset_type == 'html' and task.get('htmlFormatInstructions'):
+                            instructions = task.get('htmlFormatInstructions') or ''
                             try:
-                                for att in (task.get('attachments') or []):
-                                    if att.get('filename') == template_filename:
-                                        template_url = att.get('url')
-                                        break
-                            except Exception:
-                                template_url = None
-
-                            if template_url:
-                                logger.info(f"🧩 TEMPLATE MODE: Applying template '{template_filename}' to HTML for task {execution['taskId']}")
-                                template_rev_result = create_template_based_html_revision(
-                                    task_id=execution['taskId'],
-                                    execution_id=execution_id,
-                                    html_asset_url=asset_file['url'],
-                                    template_url=template_url,
-                                    user_id=task['userId']
-                                )
-
-                                if template_rev_result.get('success'):
-                                    revised_url = template_rev_result.get('revised_asset_url')
-                                    revised_filename = template_rev_result.get('revised_filename')
-                                    if revised_url:
-                                        asset_file['url'] = revised_url
-                                    if revised_filename:
-                                        asset_file['filename'] = revised_filename
-                                    logger.info("✅ TEMPLATE APPLY SUCCESS: Revised HTML created using template")
+                                backend_url = os.getenv('BACKEND_URL', 'http://localhost:3001')
+                                jwt_token = create_jwt_token(task['userId'])
+                                if jwt_token:
+                                    revision_data = {
+                                        'revision_prompt': f"Apply the following formatting instructions to the current HTML. Keep links and core content unchanged. Avoid JavaScript. Ensure responsiveness.\n\n--- INSTRUCTIONS START ---\n{instructions}\n--- INSTRUCTIONS END ---\n",
+                                        'report_url': asset_file['url'],
+                                        'original_execution_id': execution_id
+                                    }
+                                    response = requests.post(
+                                        f"{backend_url}/api/tasks/{execution['taskId']}/executions/revision",
+                                        json=revision_data,
+                                        headers={
+                                            'Authorization': f'Bearer {jwt_token}',
+                                            'Content-Type': 'application/json'
+                                        },
+                                        timeout=60
+                                    )
+                                    if response.status_code == 201:
+                                        result = response.json()
+                                        if result.get('success') and result.get('resultFile'):
+                                            revised_url = result['resultFile'].get('url')
+                                            revised_filename = result['resultFile'].get('filename')
+                                            if revised_url:
+                                                asset_file['url'] = revised_url
+                                            if revised_filename:
+                                                asset_file['filename'] = revised_filename
+                                            logger.info("✅ FORMAT INSTRUCTIONS APPLY SUCCESS: Revised HTML created")
+                                        else:
+                                            logger.warning(f"❌ FORMAT INSTRUCTIONS APPLY ERROR: {result.get('message', 'Unknown error')}")
+                                    else:
+                                        logger.warning(f"❌ FORMAT INSTRUCTIONS APPLY FAILED HTTP {response.status_code}: {response.text}")
                                 else:
-                                    logger.warning(f"❌ TEMPLATE APPLY FAILED: {template_rev_result.get('error')} - continuing with previous HTML")
+                                    logger.error("Failed to create JWT token for instruction-based revision")
+                            except Exception as e:
+                                logger.warning(f"Failed to apply htmlFormatInstructions: {e}")
                     
                     # Check if task requires approval (regardless of subscribers)
                     # This ensures approval requests are sent even for tasks with no subscribers
