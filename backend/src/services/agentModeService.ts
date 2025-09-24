@@ -1,9 +1,20 @@
+import axios from 'axios';
 import OpenAI from 'openai';
 import { google } from 'googleapis';
 import { chatbotDb, ChatMessage } from './chatbotService';
 import { taskDb, taskTemplateDb } from './db';
 import { settingsService } from './settingsService';
 import { getSecret } from '../utils/secretsManager';
+
+// Type declaration for pdf-parse module
+interface PDFData {
+  text: string;
+  numpages: number;
+  numrender: number;
+  info: any;
+  metadata: any;
+  version: string;
+}
 
 export class AgentModeService {
   private openai: OpenAI;
@@ -142,6 +153,11 @@ export class AgentModeService {
               content += `Size: ${result.file_size} bytes\n`;
               content += `URL: ${result.file_url}\n`;
               content += `\nThe file has been uploaded to S3 and is ready for sharing or reference.`;
+            } else if (toolCall.function.name === 'read_file_content' && result.success) {
+              // Special handling for file content reading - provide extracted content for AI analysis
+              shouldFeedbackToLLM = true;
+              const fileContentSummary = this.formatFileContent(result);
+              content += `\n\n${fileContentSummary}`;
             } else if (result && result.success === false) {
               // Feed tool error back to LLM so it can recover
               shouldFeedbackToLLM = true;
@@ -769,6 +785,23 @@ Use the available tools to create tasks in the agent-engine when complex work is
             required: ['file_name', 'file_content']
           }
         }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'read_file_content',
+          description: 'Read and extract content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, and other common formats. Returns the raw text content for analysis.',
+          parameters: {
+            type: 'object',
+            properties: {
+              file_url: {
+                type: 'string',
+                description: 'The URL of the file to read and extract content from'
+              }
+            },
+            required: ['file_url']
+          }
+        }
       }
     ];
   }
@@ -815,6 +848,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.updateMarketStrategy(args, userId);
       case 'save_file':
         return await this.saveFile(args.file_name, args.file_content, userId, sessionId);
+      case 'read_file_content':
+        return await this.readFileContent(args.file_url);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -2811,6 +2846,29 @@ Use the available tools to create tasks in the agent-engine when complex work is
     return formattedSummary;
   }
 
+  // Helper function to format file content for AI analysis
+  private formatFileContent(fileResult: any): string {
+    if (!fileResult.success) {
+      return `❌ File Reading Failed: ${fileResult.message || 'Unknown error occurred while reading the file.'}`;
+    }
+
+    const { content, file_type, file_size, content_length, file_url } = fileResult;
+    
+    let formattedContent = `📄 File Content Read Successfully\n`;
+    formattedContent += `File Type: ${file_type}\n`;
+    formattedContent += `File Size: ${file_size} bytes\n`;
+    formattedContent += `Content Length: ${content_length} characters\n`;
+    formattedContent += `Source URL: ${file_url}\n\n`;
+    
+    // Add the actual content
+    formattedContent += `📝 Extracted Content:\n`;
+    formattedContent += `---\n`;
+    formattedContent += content;
+    formattedContent += `\n---`;
+    
+    return formattedContent;
+  }
+
   // Save file to S3 and return URL
   private async saveFile(fileName: string, fileContent: string, userId: string, sessionId: string): Promise<any> {
     try {
@@ -2866,6 +2924,132 @@ Use the available tools to create tasks in the agent-engine when complex work is
         success: false,
         message: 'Failed to save file. Please try again.',
         error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // Read file content from URL with support for various file types
+  private async readFileContent(fileUrl: string): Promise<any> {
+    try {
+      console.log('AgentMode: Reading file content from URL:', fileUrl);
+      
+      // Validate URL format
+      if (!fileUrl.startsWith('http://') && !fileUrl.startsWith('https://')) {
+        return {
+          success: false,
+          message: 'Invalid URL format. Must be HTTP or HTTPS.',
+          error: 'Invalid URL format'
+        };
+      }
+
+      // Determine file type from URL
+      const urlPath = new URL(fileUrl).pathname;
+      const extension = urlPath.split('.').pop()?.toLowerCase() || '';
+      
+      // Fetch the file content
+      const response = await axios.get(fileUrl, {
+        timeout: 30000, // 30 seconds timeout for larger files
+        responseType: 'arraybuffer', // Use arraybuffer to handle binary files
+        headers: {
+          'User-Agent': 'AgentWeb-Backend/1.0',
+        },
+      });
+
+      const buffer = Buffer.from(response.data as ArrayBuffer);
+      const contentType = response.headers['content-type'] || '';
+
+      console.log(`AgentMode: Successfully fetched file, size: ${buffer.length} bytes, type: ${contentType}`);
+
+      // Process content based on file type
+      let extractedContent = '';
+      let fileType = 'unknown';
+
+      if (extension === 'pdf' || contentType.includes('application/pdf')) {
+        // Handle PDF files
+        try {
+          // Use require for dynamic loading to avoid TypeScript module resolution issues
+          const pdfParse = require('pdf-parse');
+          const pdfData: PDFData = await pdfParse(buffer);
+          extractedContent = pdfData.text;
+          fileType = 'pdf';
+          console.log(`AgentMode: Successfully parsed PDF, extracted ${extractedContent.length} characters`);
+        } catch (pdfError) {
+          console.error('AgentMode: Error parsing PDF:', pdfError);
+          return {
+            success: false,
+            message: 'Failed to parse PDF file. The file may be corrupted or password-protected.',
+            error: pdfError instanceof Error ? pdfError.message : 'PDF parsing failed'
+          };
+        }
+      } else if (['txt', 'md', 'csv', 'json', 'xml', 'html', 'htm', 'js', 'css', 'log', 'yml', 'yaml'].includes(extension)) {
+        // Handle text-based files
+        try {
+          extractedContent = buffer.toString('utf-8');
+          fileType = 'text';
+          console.log(`AgentMode: Successfully read text file, extracted ${extractedContent.length} characters`);
+        } catch (textError) {
+          console.error('AgentMode: Error reading text file:', textError);
+          return {
+            success: false,
+            message: 'Failed to read text file. The file may contain invalid characters.',
+            error: textError instanceof Error ? textError.message : 'Text file reading failed'
+          };
+        }
+      } else {
+        // For other file types, try to read as text but with a warning
+        try {
+          extractedContent = buffer.toString('utf-8');
+          fileType = 'text';
+          console.log(`AgentMode: Attempted to read unknown file type as text, extracted ${extractedContent.length} characters`);
+        } catch (textError) {
+          console.error('AgentMode: Error reading file as text:', textError);
+          return {
+            success: false,
+            message: `Unsupported file type (${extension}). Only text files, PDFs, and common document formats are supported.`,
+            error: 'Unsupported file type'
+          };
+        }
+      }
+
+      // Limit content size to prevent overwhelming the LLM
+      const maxContentLength = 100000; // 100KB limit
+      if (extractedContent.length > maxContentLength) {
+        extractedContent = extractedContent.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]';
+        console.log(`AgentMode: Content truncated to ${maxContentLength} characters`);
+      }
+
+      return {
+        success: true,
+        content: extractedContent,
+        file_type: fileType,
+        file_size: buffer.length,
+        content_length: extractedContent.length,
+        file_url: fileUrl,
+        message: `Successfully read ${fileType} file content (${extractedContent.length} characters)`
+      };
+
+    } catch (error: any) {
+      console.error('AgentMode: Error reading file content:', error);
+      
+      let errorMessage = 'Failed to read file content';
+      let statusCode = 500;
+
+      if (error.response) {
+        statusCode = error.response.status;
+        errorMessage = `HTTP ${error.response.status}: ${error.response.statusText}`;
+      } else if (error.code === 'ENOTFOUND') {
+        statusCode = 404;
+        errorMessage = 'File not found or URL is unreachable';
+      } else if (error.code === 'ETIMEDOUT') {
+        statusCode = 408;
+        errorMessage = 'Request timeout while fetching file';
+      }
+
+      return {
+        success: false,
+        message: errorMessage,
+        error: error.message,
+        file_url: fileUrl
       };
     }
   }
