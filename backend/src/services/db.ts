@@ -317,29 +317,72 @@ class UserDB {
 
   async getUserAnalytics(startDate: string, endDate: string) {
     try {
+      console.log(`Getting user analytics for date range: ${startDate} to ${endDate}`);
+      
       const params = {
         TableName: this.tableName,
       };
 
       const result = await this.docClient.scan(params).promise();
       const users = result.Items || [];
+      
+      console.log(`Found ${users.length} total users`);
 
-      return {
+      // Convert dates to ISO strings for proper comparison
+      const startDateISO = new Date(startDate).toISOString();
+      const endDateISO = new Date(endDate).toISOString();
+
+      const newUsers = users.filter((u) => {
+        if (!u.createdAt) return false;
+        const userCreatedAt = new Date(u.createdAt).toISOString();
+        return userCreatedAt >= startDateISO && userCreatedAt <= endDateISO;
+      });
+
+      const oauthUsers = users.filter((u) => u.isOAuthUser === true);
+      const newOauthUsers = oauthUsers.filter((u) => {
+        if (!u.createdAt) return false;
+        const userCreatedAt = new Date(u.createdAt).toISOString();
+        return userCreatedAt >= startDateISO && userCreatedAt <= endDateISO;
+      });
+
+      const adminUsers = users.filter((u) => u.isAdmin === true);
+
+      const analytics = {
         totalUsers: users.length,
-        newUsers: users.filter(
-          (u) => u.createdAt >= startDate && u.createdAt <= endDate
-        ).length,
-        oauthUsers: users.filter((u) => u.isOAuthUser).length,
-        newOauthUsers: users.filter(
-          (u) =>
-            u.isOAuthUser && u.createdAt >= startDate && u.createdAt <= endDate
-        ).length,
-        adminUsers: users.filter((u) => u.isAdmin).length,
+        newUsers: newUsers.length,
+        oauthUsers: oauthUsers.length,
+        newOauthUsers: newOauthUsers.length,
+        adminUsers: adminUsers.length,
       };
+
+      console.log('User analytics result:', analytics);
+      return analytics;
     } catch (error) {
       console.error("Error in getUserAnalytics:", error);
       throw error;
     }
+  }
+
+  // Helper function to scan all items with pagination
+  async scanAllItems(tableName: string) {
+    const items: any[] = [];
+    let lastEvaluatedKey: any = undefined;
+
+    do {
+      const params: any = {
+        TableName: tableName,
+      };
+
+      if (lastEvaluatedKey) {
+        params.ExclusiveStartKey = lastEvaluatedKey;
+      }
+
+      const result = await this.docClient.scan(params).promise();
+      items.push(...(result.Items || []));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+
+    return items;
   }
 
   async deactivateUser(userId: string) {
@@ -950,151 +993,120 @@ export const taskDb = {
 
   async getTaskAnalytics(startDate: string, endDate: string) {
     try {
-      // Get all tasks (no date filter)
-      const taskParams = {
-        TableName: `${TABLE_PREFIX}AW-Tasks`,
+      console.log(`Getting task analytics for date range: ${startDate} to ${endDate}`);
+      
+      // Convert dates to ISO strings for proper comparison
+      const startDateISO = new Date(startDate).toISOString();
+      const endDateISO = new Date(endDate).toISOString();
+
+      // Get all tasks with pagination
+      const tasks = await this.scanAllItems(`${TABLE_PREFIX}AW-Tasks`);
+      console.log(`Found ${tasks.length} total tasks`);
+
+      // Get all executions with pagination
+      const executions = await this.scanAllItems(`${TABLE_PREFIX}AW-TaskExecutions`);
+      console.log(`Found ${executions.length} total executions`);
+
+      // Get all other data with pagination
+      const schedules = await this.scanAllItems(`${TABLE_PREFIX}AW-TaskSchedules`);
+      const templates = await this.scanAllItems(`${TABLE_PREFIX}AW-TaskTemplates`);
+      const configs = await this.scanAllItems(`${TABLE_PREFIX}AW-Configs`);
+      const workflows = await this.scanAllItems(`${TABLE_PREFIX}AW-Workflows`);
+      const workflowExecutions = await this.scanAllItems(`${TABLE_PREFIX}AW-WorkflowExecutions`);
+
+      // Helper function to check if date is within range
+      const isDateInRange = (dateStr: string) => {
+        if (!dateStr) return false;
+        const date = new Date(dateStr).toISOString();
+        return date >= startDateISO && date <= endDateISO;
       };
 
-      const taskResult = await dynamodb.scan(taskParams).promise();
-      const tasks = taskResult.Items || [];
+      const newTasks = tasks.filter((t) => isDateInRange(t.createdAt));
+      const newExecutions = executions.filter((e) => isDateInRange(e.startTime));
+      const newScheduledTasks = schedules.filter((s) => isDateInRange(s.createdAt));
+      const newTemplates = templates.filter((t) => isDateInRange(t.createdAt));
+      const newWebsiteConfigs = configs.filter(
+        (c) => !c.isApiConfig && isDateInRange(c.createdAt)
+      );
+      const newApiConfigs = configs.filter(
+        (c) => c.isApiConfig === true && isDateInRange(c.createdAt)
+      );
+      const newWorkflows = workflows.filter((w) => isDateInRange(w.createdAt));
+      const newWorkflowExecutions = workflowExecutions.filter((e) => isDateInRange(e.startTime));
 
-      // Get total count of executions using a separate count operation
-      const executionCountParams = {
-        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
-        Select: "COUNT",
-      };
-
-      const executionCountResult = await dynamodb
-        .scan(executionCountParams)
-        .promise();
-      const totalExecutions = executionCountResult.Count || 0;
-
-      // Get executions for status counts (limited to 1000 for performance)
-      const executionParams = {
-        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
-      };
-
-      const executionResult = await dynamodb.scan(executionParams).promise();
-      const executions = executionResult.Items || [];
-
-      // Get all schedules (no date filter)
-      const scheduleParams = {
-        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-      };
-
-      const scheduleResult = await dynamodb.scan(scheduleParams).promise();
-      const schedules = scheduleResult.Items || [];
-
-      // Get all templates (no date filter)
-      const templateParams = {
-        TableName: `${TABLE_PREFIX}AW-TaskTemplates`,
-      };
-
-      const templateResult = await dynamodb.scan(templateParams).promise();
-      const templates = templateResult.Items || [];
-
-      // Get all configurations (no date filter)
-      const configParams = {
-        TableName: `${TABLE_PREFIX}AW-Configs`,
-      };
-
-      const configResult = await dynamodb.scan(configParams).promise();
-      const configs = configResult.Items || [];
-
-      // Get all workflows (no date filter)
-      const workflowParams = {
-        TableName: `${TABLE_PREFIX}AW-Workflows`,
-      };
-
-      const workflowResult = await dynamodb.scan(workflowParams).promise();
-      const workflows = workflowResult.Items || [];
-
-      // Get all workflow executions (no date filter)
-      const workflowExecParams = {
-        TableName: `${TABLE_PREFIX}AW-WorkflowExecutions`,
-      };
-
-      const workflowExecResult = await dynamodb
-        .scan(workflowExecParams)
-        .promise();
-      const workflowExecutions = workflowExecResult.Items || [];
-
-      return {
+      const analytics = {
         totalTasks: tasks.length,
-        newTasks: tasks.filter(
-          (t) => t.createdAt >= startDate && t.createdAt <= endDate
-        ).length,
+        newTasks: newTasks.length,
         totalExecutions: executions.length,
-        successfulExecutions: executions.filter((e) => e.status === "completed")
-          .length,
-        failedExecutions: executions.filter((e) => e.status === "failed")
-          .length,
-        newExecutions: executions.filter(
-          (e) => e.startTime >= startDate && e.startTime <= endDate
-        ).length,
+        successfulExecutions: executions.filter((e) => e.status === "completed").length,
+        failedExecutions: executions.filter((e) => e.status === "failed").length,
+        newExecutions: newExecutions.length,
         scheduledTasks: schedules.length,
-        newScheduledTasks: schedules.filter(
-          (s) => s.createdAt >= startDate && s.createdAt <= endDate
-        ).length,
+        newScheduledTasks: newScheduledTasks.length,
         templates: templates.length,
-        newTemplates: templates.filter(
-          (t) => t.createdAt >= startDate && t.createdAt <= endDate
-        ).length,
+        newTemplates: newTemplates.length,
         websiteConfigs: configs.filter((c) => !c.isApiConfig).length,
-        newWebsiteConfigs: configs.filter(
-          (c) =>
-            !c.isApiConfig && c.createdAt >= startDate && c.createdAt <= endDate
-        ).length,
+        newWebsiteConfigs: newWebsiteConfigs.length,
         apiConfigs: configs.filter((c) => c.isApiConfig === true).length,
-        newApiConfigs: configs.filter(
-          (c) =>
-            c.isApiConfig === true &&
-            c.createdAt >= startDate &&
-            c.createdAt <= endDate
-        ).length,
-        sharedConfigs: configs.filter((c) => c.sharedBy || c.sharedConfigIds)
-          .length,
+        newApiConfigs: newApiConfigs.length,
+        sharedConfigs: configs.filter((c) => c.sharedBy || c.sharedConfigIds).length,
         totalWorkflows: workflows.length,
-        newWorkflows: workflows.filter(
-          (w) => w.createdAt >= startDate && w.createdAt <= endDate
-        ).length,
+        newWorkflows: newWorkflows.length,
         workflowExecutions: workflowExecutions.length,
-        newWorkflowExecutions: workflowExecutions.filter(
-          (e) => e.startTime >= startDate && e.startTime <= endDate
-        ).length,
+        newWorkflowExecutions: newWorkflowExecutions.length,
         successfulWorkflowExecutions: workflowExecutions.filter(
           (e) => e.status === "success" || e.status === "completed"
         ).length,
-        failedWorkflowExecutions: workflowExecutions.filter(
-          (e) => e.status === "failed"
-        ).length,
+        failedWorkflowExecutions: workflowExecutions.filter((e) => e.status === "failed").length,
         pendingWorkflowExecutions: workflowExecutions.filter(
           (e) => e.status === "pending" || e.status === "running"
         ).length,
         workflowExecutionStatusBreakdown: Object.entries(
           workflowExecutions.reduce<Record<string, number>>((acc, exec) => {
-            acc[exec.status || "unknown"] =
-              (acc[exec.status || "unknown"] || 0) + 1;
+            acc[exec.status || "unknown"] = (acc[exec.status || "unknown"] || 0) + 1;
             return acc;
           }, {})
         ),
-        averageExecutionTime:
-          executions
-            .filter((e) => e.status === "completed" && e.completedAt)
-            .reduce((acc, e) => {
-              return (
-                acc +
-                (new Date(e.completedAt!).getTime() -
-                  new Date(e.startTime).getTime())
-              );
-            }, 0) /
-          (executions.filter((e) => e.status === "completed" && e.completedAt)
-            .length || 1),
+        averageExecutionTime: (() => {
+          const completedExecutions = executions.filter((e) => e.status === "completed" && e.completedAt);
+          if (completedExecutions.length === 0) return null;
+          
+          const totalTime = completedExecutions.reduce((acc, e) => {
+            return acc + (new Date(e.completedAt!).getTime() - new Date(e.startTime).getTime());
+          }, 0);
+          
+          return totalTime / completedExecutions.length;
+        })(),
       };
+
+      console.log('Task analytics result:', analytics);
+      return analytics;
     } catch (error) {
       console.error("Error in getTaskAnalytics:", error);
       throw error;
     }
+  },
+
+  // Helper function to scan all items with pagination
+  async scanAllItems(tableName: string) {
+    const items: any[] = [];
+    let lastEvaluatedKey: any = undefined;
+
+    do {
+      const params: any = {
+        TableName: tableName,
+      };
+
+      if (lastEvaluatedKey) {
+        params.ExclusiveStartKey = lastEvaluatedKey;
+      }
+
+      const result = await dynamodb.scan(params).promise();
+      items.push(...(result.Items || []));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+
+    return items;
   },
 
   async addAttachment(
