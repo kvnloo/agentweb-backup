@@ -10,6 +10,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
     date: '2025-09-25',
     changes: [
       'Fixed bug that screenshot files cannot be uploaded in Agent Mode',
+      'Supported account-level Email Sender configuration',
+      '- Users can now set up default email sender configuration at the account level in Admin Dashboard',
+      '- Configure email domain, default sender username (e.g., noreply), and from name for all tasks',
+      '- Task emails automatically use account-level configuration when no task-specific sender is set',
+      '- Provides consistent branding, professional email appearance and tracking for all user communications',
     ],
   },
   {

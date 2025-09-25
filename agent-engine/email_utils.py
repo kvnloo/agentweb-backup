@@ -16,8 +16,8 @@ from resend_service import resend_service
 load_dotenv()
 
 # Get table prefix based on NODE_ENV
-TABLE_PREFIX = 'Dev-' if os.getenv('NODE_ENV') == 'development' else ''
-
+NODE_ENV = os.getenv('NODE_ENV', 'production')
+TABLE_PREFIX = 'Dev-' if NODE_ENV == 'development' else ''
 logger = logging.getLogger(__name__)
 
 # Initialize DynamoDB client with credentials
@@ -45,6 +45,88 @@ def get_task_subscribers(task_id):
     except Exception as e:
         logger.error(f"Failed to get task subscribers: {e}")
         return []
+
+def get_effective_email_sender_config(task_id):
+    """
+    Get the effective email sender configuration with account-level fallback.
+    Returns (email_sender, from_name, sender_type)
+    """
+    try:
+        # Validate task_id
+        if not task_id:
+            logger.error("task_id is None or empty")
+            return None, None, 'default'
+        
+        if not isinstance(task_id, str):
+            logger.error(f"task_id is not a string: {type(task_id)}")
+            return None, None, 'default'
+        
+        # Get task details
+        try:
+            task_response = dynamodb.Table(f'{TABLE_PREFIX}AW-Tasks').get_item(
+                Key={'taskId': task_id}
+            )
+            task = task_response.get('Item', {})
+            
+            if not task:
+                logger.warning(f"Task not found: {task_id}")
+                return None, None, 'default'
+                
+        except Exception as db_error:
+            logger.error(f"DynamoDB error getting task {task_id}: {db_error}")
+            return None, None, 'default'
+        
+        # Priority 1: Task-level configuration
+        task_email_sender = task.get('emailSender')
+        task_from_name = task.get('fromName')
+        
+        if task_email_sender and task_from_name:
+            return task_email_sender, task_from_name, 'task'
+        
+        # Priority 2: Account-level configuration
+        user_id = task.get('userId')
+        
+        if user_id:
+            try:
+                # Use UserIdIndex to query by userId (same as backend)
+                user_response = dynamodb.Table(f'{TABLE_PREFIX}AW-Users').query(
+                    IndexName='UserIdIndex',
+                    KeyConditionExpression='userId = :userId',
+                    ExpressionAttributeValues={
+                        ':userId': user_id
+                    }
+                )
+                users = user_response.get('Items', [])
+                
+                if not users:
+                    logger.warning(f"User not found: {user_id}")
+                    return None, None, 'default'
+                
+                user = users[0]  # Get the first (and should be only) user
+                    
+            except Exception as db_error:
+                logger.error(f"DynamoDB error getting user {user_id}: {db_error}")
+                return None, None, 'default'
+            
+            user_email_domain = user.get('emailDomain')
+            user_default_sender_username = user.get('defaultSenderUsername')
+            user_from_name = user.get('fromName')
+            
+            if user_email_domain and user_default_sender_username and user_from_name:
+                account_email_sender = f"{user_default_sender_username}@{user_email_domain}"
+                return account_email_sender, user_from_name, 'account'
+        
+        # Priority 3: Default SMTP
+        return None, None, 'default'
+        
+    except Exception as e:
+        logger.error(f"Error getting effective email sender config: {e}")
+        import traceback
+        try:
+            logger.error(traceback.format_exc())
+        except Exception as tb_error:
+            logger.error(f"Could not format traceback: {tb_error}")
+        return None, None, 'default'
 
 def add_email_history(task_id, email, subject, execution_id=None, html_content_url=None, sender_type='SMTP', email_id=None):
     """
@@ -114,6 +196,9 @@ def send_task_notification(to_email, task_name, task_id, execution_status, execu
     Send an email notification about task completion.
     """
     try:
+        # Get effective email sender configuration (task-level or account-level fallback)
+        email_sender, from_name, sender_source = get_effective_email_sender_config(task_id)
+        
         smtp_host = os.getenv('SMTP_HOST', 'smtp.gmail.com')
         smtp_port = int(os.getenv('SMTP_PORT', '587'))
         smtp_user = os.getenv('SMTP_USER')
@@ -126,7 +211,11 @@ def send_task_notification(to_email, task_name, task_id, execution_status, execu
             return False
 
         msg = MIMEMultipart()
-        msg['From'] = from_email
+        # Use effective email sender if available, otherwise use default
+        if email_sender and from_name:
+            msg['From'] = f"{from_name} <{email_sender}>"
+        else:
+            msg['From'] = from_email
         msg['Reply-To'] = 'support@agentweb.pro'
         msg['To'] = to_email
         # Modify subject if new information was found
@@ -148,18 +237,40 @@ def send_task_notification(to_email, task_name, task_id, execution_status, execu
         if error:
             body += f"\nError:\n{error}"
 
-        msg.attach(MIMEText(body, 'plain'))
-
-        # Send email
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.starttls()
-            server.login(smtp_user, smtp_pass)
-            server.send_message(msg)
-
-        logger.info(f"Sent task completion notification to {to_email}")
+        # Send email using appropriate service
+        email_id = None
+        sender_type = 'SMTP'
+        
+        if email_sender and from_name:
+            # Use Resend service for custom email sender
+            from resend_service import ResendService
+            resend_service = ResendService()
+            
+            resend_result = resend_service.send_email(
+                from_email=f"{from_name} <{email_sender}>",
+                to_email=to_email,
+                subject=msg['Subject'],
+                text=body
+            )
+            
+            if resend_result and 'id' in resend_result:
+                email_id = resend_result['id']
+                sender_type = 'resend'
+                logger.info(f"Sent task completion notification via Resend to {to_email} (ID: {email_id})")
+            else:
+                logger.error("Resend failed, email not sent")
+                return False
+        else:
+            # Use default SMTP service
+            msg.attach(MIMEText(body, 'plain'))
+            with smtplib.SMTP(smtp_host, smtp_port) as server:
+                server.starttls()
+                server.login(smtp_user, smtp_pass)
+                server.send_message(msg)
+            logger.info(f"Sent task completion notification via SMTP to {to_email}")
         
         # Add email history to subscriber
-        add_email_history(task_id, to_email, msg['Subject'], execution_id)
+        add_email_history(task_id, to_email, msg['Subject'], execution_id, None, sender_type, email_id)
         
         return True
 
@@ -174,15 +285,8 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
     Includes HTML content if available in result_files.
     """
     try:
-        # Get task details to check for custom email sender
-        task_response = dynamodb.Table(f'{TABLE_PREFIX}AW-Tasks').get_item(
-            Key={'taskId': task_id}
-        )
-        task = task_response.get('Item', {})
-        
-        # Check if task has custom email sender configured
-        email_sender = task.get('emailSender')
-        from_name = task.get('fromName')
+        # Get effective email sender configuration (task-level or account-level fallback)
+        email_sender, from_name, sender_source = get_effective_email_sender_config(task_id)
         
         smtp_host = os.getenv('SMTP_HOST', 'smtp.gmail.com')
         smtp_port = int(os.getenv('SMTP_PORT', '587'))

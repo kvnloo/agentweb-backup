@@ -160,6 +160,14 @@ export const emailService = {
         throw new Error(`Task not found: ${execution.taskId}`);
       }
 
+      // Fetch user data for account-level email configuration
+      const { userDb } = require('../services/db');
+      const user = await userDb.getUserById(task.userId);
+      if (!user) {
+        throw new Error(`User not found: ${task.userId}`);
+      }
+      
+
       // If sendHtmlReportOnly is enabled, try to find HTML content and send only that
       if (task.sendHtmlReportOnly) {
         if (!execution.result_files || execution.result_files.length === 0) {
@@ -239,9 +247,21 @@ export const emailService = {
           let resendEmailId = null;
           let senderType: 'SMTP' | 'resend' = 'SMTP';
           
-          if (task.emailSender && task.fromName) {
-            // Use Resend service for custom email sender
-            const from = `${task.fromName} <${task.emailSender}>`;
+          // Determine email sender configuration with fallback to account-level
+          let emailSender = task.emailSender;
+          let fromName = task.fromName;
+          
+          // If task doesn't have custom email sender, use account-level configuration
+          if (!emailSender || !fromName) {
+            if (user.emailDomain && user.defaultSenderUsername && user.fromName) {
+              emailSender = `${user.defaultSenderUsername}@${user.emailDomain}`;
+              fromName = user.fromName;
+            }
+          }
+          
+          if (emailSender && fromName) {
+            // Use Resend service for custom email sender (task-level or account-level)
+            const from = `${fromName} <${emailSender}>`;
             const resendResult = await resendService.sendEmail({
               from,
               to: toEmail,
@@ -420,9 +440,21 @@ export const emailService = {
     let resendEmailId = null;
     let senderType: 'SMTP' | 'resend' = 'SMTP';
     
-    if (task.emailSender && task.fromName) {
-      // Use Resend service for custom email sender
-      const from = `${task.fromName} <${task.emailSender}>`;
+    // Determine email sender configuration with fallback to account-level
+    let emailSender = task.emailSender;
+    let fromName = task.fromName;
+    
+    // If task doesn't have custom email sender, use account-level configuration
+    if (!emailSender || !fromName) {
+      if (user.emailDomain && user.defaultSenderUsername && user.fromName) {
+        emailSender = `${user.defaultSenderUsername}@${user.emailDomain}`;
+        fromName = user.fromName;
+      }
+    }
+    
+    if (emailSender && fromName) {
+      // Use Resend service for custom email sender (task-level or account-level)
+      const from = `${fromName} <${emailSender}>`;
       const resendResult = await resendService.sendEmail({
         from,
         to: toEmail,

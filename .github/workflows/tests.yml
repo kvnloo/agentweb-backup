@@ -129,6 +129,14 @@ jobs:
 
       - name: Test
         working-directory: partner-portal
-        run: npm test --silent
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_SCRIPT=$(jq -r '.scripts.test // ""' package.json)
+          if [ -z "$TEST_SCRIPT" ] || [[ "$TEST_SCRIPT" == 'echo "Error: no test specified" && exit 1' ]]; then
+            echo "Skipping tests (no real test script)."
+            exit 0
+          fi
+          npm test --silent
 
 

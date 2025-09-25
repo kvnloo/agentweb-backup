@@ -59,6 +59,8 @@ export interface User {
   stripe_customer_id?: string;
   adAccount?: string; // Meta ad account ID
   emailDomain?: string; // Email sender domain
+  defaultSenderUsername?: string; // Default sender username (e.g., noreply)
+  fromName?: string; // From name for emails
   companyName?: string;
   useCaseCategories?: string[];
   brandGuidelines?: {
