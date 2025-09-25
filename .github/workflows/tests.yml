@@ -127,4 +127,8 @@ jobs:
         working-directory: partner-portal
         run: npm run build --if-present
 
+      - name: Test
+        working-directory: partner-portal
+        run: npm test --silent
+
 
