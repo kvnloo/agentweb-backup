@@ -556,7 +556,7 @@ export const taskDb = {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Tasks`,
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, createVideo, videoModel, imageModel, requireApproval, slackChannel, emailSender, fromName",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt, createVideo, videoModel, imageModel, requireApproval, slackChannel, emailSender, fromName",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",

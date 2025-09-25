@@ -2578,7 +2578,6 @@ export default function AdminDashboard() {
                       <TableHead>
                         <TableRow>
                           <TableCell>Category</TableCell>
-                          <TableCell>Total Tasks</TableCell>
                           <TableCell>Tasks with Knowledge Base</TableCell>
                           <TableCell>Total Size</TableCell>
                           <TableCell>Average Size</TableCell>
@@ -2589,9 +2588,6 @@ export default function AdminDashboard() {
                           <>
                             <TableRow>
                               <TableCell>Overall</TableCell>
-                              <TableCell>
-                                {knowledgeBaseMetrics.totalTasks}
-                              </TableCell>
                               <TableCell>
                                 {knowledgeBaseMetrics.tasksWithKnowledgeBase}
                               </TableCell>
@@ -2613,9 +2609,6 @@ export default function AdminDashboard() {
                             <TableRow>
                               <TableCell>Public</TableCell>
                               <TableCell>
-                                {knowledgeBaseMetrics.public.tasks}
-                              </TableCell>
-                              <TableCell>
                                 {
                                   knowledgeBaseMetrics.public
                                     .tasksWithKnowledgeBase
@@ -2636,9 +2629,6 @@ export default function AdminDashboard() {
                             </TableRow>
                             <TableRow>
                               <TableCell>Private</TableCell>
-                              <TableCell>
-                                {knowledgeBaseMetrics.private.tasks}
-                              </TableCell>
                               <TableCell>
                                 {
                                   knowledgeBaseMetrics.private

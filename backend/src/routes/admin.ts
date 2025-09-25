@@ -934,32 +934,60 @@ router.get("/knowledge-base-metrics", async (req, res) => {
     
     // Calculate overall metrics
     const totalTasks = tasks.length;
-    const tasksWithKnowledgeBase = tasks.filter(task => task.knowledgeBaseSize && task.knowledgeBaseSize > 0).length;
-    const totalKnowledgeBaseSize = tasks.reduce((sum, task) => sum + (task.knowledgeBaseSize || 0), 0);
+    
+    // Handle both string and number knowledgeBaseSize values - only count if size > 0
+    const tasksWithKnowledgeBase = tasks.filter(task => {
+      const size = typeof task.knowledgeBaseSize === 'string' ? parseInt(task.knowledgeBaseSize) : task.knowledgeBaseSize;
+      return size && size > 0;
+    }).length;
+    
+    const totalKnowledgeBaseSize = tasks.reduce((sum, task) => {
+      const size = typeof task.knowledgeBaseSize === 'string' ? parseInt(task.knowledgeBaseSize) : (task.knowledgeBaseSize || 0);
+      return sum + size;
+    }, 0);
+    
     const averageKnowledgeBaseSize = tasksWithKnowledgeBase > 0 ? totalKnowledgeBaseSize / tasksWithKnowledgeBase : 0;
     
     // Calculate public knowledge base metrics
     const publicTasks = tasks.filter(task => task.knowledgeBaseType === 'public');
-    const publicTasksWithKnowledgeBase = publicTasks.filter(task => task.knowledgeBaseSize && task.knowledgeBaseSize > 0).length;
-    const totalPublicKnowledgeBaseSize = publicTasks.reduce((sum, task) => sum + (task.knowledgeBaseSize || 0), 0);
+    const publicTasksWithKnowledgeBase = publicTasks.filter(task => {
+      const size = typeof task.knowledgeBaseSize === 'string' ? parseInt(task.knowledgeBaseSize) : task.knowledgeBaseSize;
+      return size && size > 0;
+    }).length;
+    const totalPublicKnowledgeBaseSize = publicTasks.reduce((sum, task) => {
+      const size = typeof task.knowledgeBaseSize === 'string' ? parseInt(task.knowledgeBaseSize) : (task.knowledgeBaseSize || 0);
+      return sum + size;
+    }, 0);
     const averagePublicKnowledgeBaseSize = publicTasksWithKnowledgeBase > 0 ? totalPublicKnowledgeBaseSize / publicTasksWithKnowledgeBase : 0;
     
     // Calculate private knowledge base metrics
     const privateTasks = tasks.filter(task => task.knowledgeBaseType === 'private');
-    const privateTasksWithKnowledgeBase = privateTasks.filter(task => task.knowledgeBaseSize && task.knowledgeBaseSize > 0).length;
-    const totalPrivateKnowledgeBaseSize = privateTasks.reduce((sum, task) => sum + (task.knowledgeBaseSize || 0), 0);
+    const privateTasksWithKnowledgeBase = privateTasks.filter(task => {
+      const size = typeof task.knowledgeBaseSize === 'string' ? parseInt(task.knowledgeBaseSize) : task.knowledgeBaseSize;
+      return size && size > 0;
+    }).length;
+    const totalPrivateKnowledgeBaseSize = privateTasks.reduce((sum, task) => {
+      const size = typeof task.knowledgeBaseSize === 'string' ? parseInt(task.knowledgeBaseSize) : (task.knowledgeBaseSize || 0);
+      return sum + size;
+    }, 0);
     const averagePrivateKnowledgeBaseSize = privateTasksWithKnowledgeBase > 0 ? totalPrivateKnowledgeBaseSize / privateTasksWithKnowledgeBase : 0;
     
-    // Get tasks with knowledge base details
+    // Get tasks with knowledge base details (only those with size > 0)
     const tasksWithDetails = tasks
-      .filter(task => task.knowledgeBaseSize && task.knowledgeBaseSize > 0)
-      .map(task => ({
-        taskId: task.taskId,
-        name: task.name,
-        knowledgeBaseSize: task.knowledgeBaseSize || 0,
-        owner: task.userId,
-        type: task.knowledgeBaseType || 'private'
-      }));
+      .filter(task => {
+        const size = typeof task.knowledgeBaseSize === 'string' ? parseInt(task.knowledgeBaseSize) : task.knowledgeBaseSize;
+        return size && size > 0;
+      })
+      .map(task => {
+        const size = typeof task.knowledgeBaseSize === 'string' ? parseInt(task.knowledgeBaseSize) : (task.knowledgeBaseSize || 0);
+        return {
+          taskId: task.taskId,
+          name: task.name,
+          knowledgeBaseSize: size,
+          owner: task.userId,
+          type: task.knowledgeBaseType || 'private'
+        };
+      });
 
     res.json({
       totalTasks,
