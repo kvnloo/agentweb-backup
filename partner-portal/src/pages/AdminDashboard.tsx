@@ -525,13 +525,19 @@ export default function AdminDashboard() {
   const [userTasksDialogUserId, setUserTasksDialogUserId] = useState<string | null>(null);
   const [userTasksDialogUserEmail, setUserTasksDialogUserEmail] = useState<string | null>(null);
 
+  // Load users data only when Users tab (2) is selected
   useEffect(() => {
-    const loadData = async () => {
-      await loadUsers();
-      await loadWaitlist();
-    };
-    loadData();
-  }, []);
+    if (tabValue === 2) {
+      loadUsers();
+    }
+  }, [tabValue]);
+
+  // Load waitlist data only when Waitlist tab (3) is selected
+  useEffect(() => {
+    if (tabValue === 3) {
+      loadWaitlist();
+    }
+  }, [tabValue]);
 
   // Handle URL parameter changes
   useEffect(() => {
@@ -564,11 +570,11 @@ export default function AdminDashboard() {
       }
     };
 
-    // Only load tasks when Tasks tab (4) is selected
+    // Only load tasks when Tasks tab (4) is selected and we haven't loaded them yet
     if (tabValue === 4 && tasks.length === 0) {
       loadTasks();
     }
-  }, [tabValue, token, tasks.length]);
+  }, [tabValue, token]);
 
   useEffect(() => {
     const loadWorkflows = async () => {
@@ -584,11 +590,11 @@ export default function AdminDashboard() {
       }
     };
 
-    // Only load workflows when Workflows tab (5) is selected
+    // Only load workflows when Workflows tab (5) is selected and we haven't loaded them yet
     if (tabValue === 5 && workflows.length === 0) {
       loadWorkflows();
     }
-  }, [tabValue, token, workflows.length]);
+  }, [tabValue, token]);
 
   useEffect(() => {
     const loadChatSessions = async () => {
@@ -607,11 +613,11 @@ export default function AdminDashboard() {
       }
     };
 
-    // Only load chat sessions when Chat History tab (6) is selected
+    // Only load chat sessions when Chat History tab (6) is selected and we haven't loaded them yet
     if (tabValue === 6 && chatSessions.length === 0) {
       loadChatSessions();
     }
-  }, [tabValue, token, chatSessions.length]);
+  }, [tabValue, token]);
 
   useEffect(() => {
     const loadKnowledgeBaseMetrics = async () => {
@@ -630,11 +636,11 @@ export default function AdminDashboard() {
       }
     };
 
-    // Only load knowledge base metrics when Knowledge Base tab (7) is selected
+    // Only load knowledge base metrics when Knowledge Base tab (7) is selected and we haven't loaded them yet
     if (tabValue === 7 && !knowledgeBaseMetrics) {
       loadKnowledgeBaseMetrics();
     }
-  }, [tabValue, token, knowledgeBaseMetrics]);
+  }, [tabValue, token]);
 
   const handleTabChange = (_event: React.SyntheticEvent, newValue: number) => {
     setTabValue(newValue);
