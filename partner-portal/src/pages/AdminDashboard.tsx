@@ -45,6 +45,7 @@ import { useAuth } from "../contexts/AuthContext";
 import { buildApiUrl } from "../config";
 import DOMPurify from "dompurify";
 import ImageModelsSettings from "../components/admin/ImageModelsSettings";
+import DefaultPromptsSettings from "../components/admin/DefaultPromptsSettings";
 import {
   UserGrowthChart,
   TaskGrowthChart,
@@ -423,6 +424,7 @@ export default function AdminDashboard() {
     'knowledge-base': 7,
     'agent-mode': 8,
     'image-models': 9,
+    'default-prompts': 10,
   };
   
   // Get initial tab value from URL or default to 0
@@ -523,13 +525,19 @@ export default function AdminDashboard() {
   const [userTasksDialogUserId, setUserTasksDialogUserId] = useState<string | null>(null);
   const [userTasksDialogUserEmail, setUserTasksDialogUserEmail] = useState<string | null>(null);
 
+  // Load users data only when Users tab (2) is selected
   useEffect(() => {
-    const loadData = async () => {
-      await loadUsers();
-      await loadWaitlist();
-    };
-    loadData();
-  }, []);
+    if (tabValue === 2) {
+      loadUsers();
+    }
+  }, [tabValue]);
+
+  // Load waitlist data only when Waitlist tab (3) is selected
+  useEffect(() => {
+    if (tabValue === 3) {
+      loadWaitlist();
+    }
+  }, [tabValue]);
 
   // Handle URL parameter changes
   useEffect(() => {
@@ -562,11 +570,11 @@ export default function AdminDashboard() {
       }
     };
 
-    // Only load tasks when Tasks tab (4) is selected
+    // Only load tasks when Tasks tab (4) is selected and we haven't loaded them yet
     if (tabValue === 4 && tasks.length === 0) {
       loadTasks();
     }
-  }, [tabValue, token, tasks.length]);
+  }, [tabValue, token]);
 
   useEffect(() => {
     const loadWorkflows = async () => {
@@ -582,11 +590,11 @@ export default function AdminDashboard() {
       }
     };
 
-    // Only load workflows when Workflows tab (5) is selected
+    // Only load workflows when Workflows tab (5) is selected and we haven't loaded them yet
     if (tabValue === 5 && workflows.length === 0) {
       loadWorkflows();
     }
-  }, [tabValue, token, workflows.length]);
+  }, [tabValue, token]);
 
   useEffect(() => {
     const loadChatSessions = async () => {
@@ -605,11 +613,11 @@ export default function AdminDashboard() {
       }
     };
 
-    // Only load chat sessions when Chat History tab (6) is selected
+    // Only load chat sessions when Chat History tab (6) is selected and we haven't loaded them yet
     if (tabValue === 6 && chatSessions.length === 0) {
       loadChatSessions();
     }
-  }, [tabValue, token, chatSessions.length]);
+  }, [tabValue, token]);
 
   useEffect(() => {
     const loadKnowledgeBaseMetrics = async () => {
@@ -628,11 +636,11 @@ export default function AdminDashboard() {
       }
     };
 
-    // Only load knowledge base metrics when Knowledge Base tab (7) is selected
+    // Only load knowledge base metrics when Knowledge Base tab (7) is selected and we haven't loaded them yet
     if (tabValue === 7 && !knowledgeBaseMetrics) {
       loadKnowledgeBaseMetrics();
     }
-  }, [tabValue, token, knowledgeBaseMetrics]);
+  }, [tabValue, token]);
 
   const handleTabChange = (_event: React.SyntheticEvent, newValue: number) => {
     setTabValue(newValue);
@@ -1170,6 +1178,8 @@ export default function AdminDashboard() {
             value={tabValue}
             onChange={handleTabChange}
             aria-label="admin tabs"
+            variant="scrollable"
+            scrollButtons="auto"
           >
             <Tab label="Overview" {...a11yProps(0)} />
             <Tab label="Announcements" {...a11yProps(1)} />
@@ -1181,6 +1191,7 @@ export default function AdminDashboard() {
             <Tab label="Knowledge Base" {...a11yProps(7)} />
             <Tab label="Agent Mode" {...a11yProps(8)} />
             <Tab label="Image Models" {...a11yProps(9)} />
+            <Tab label="Default Prompts" {...a11yProps(10)} />
           </Tabs>
         </Box>
 
@@ -2567,7 +2578,6 @@ export default function AdminDashboard() {
                       <TableHead>
                         <TableRow>
                           <TableCell>Category</TableCell>
-                          <TableCell>Total Tasks</TableCell>
                           <TableCell>Tasks with Knowledge Base</TableCell>
                           <TableCell>Total Size</TableCell>
                           <TableCell>Average Size</TableCell>
@@ -2578,9 +2588,6 @@ export default function AdminDashboard() {
                           <>
                             <TableRow>
                               <TableCell>Overall</TableCell>
-                              <TableCell>
-                                {knowledgeBaseMetrics.totalTasks}
-                              </TableCell>
                               <TableCell>
                                 {knowledgeBaseMetrics.tasksWithKnowledgeBase}
                               </TableCell>
@@ -2602,9 +2609,6 @@ export default function AdminDashboard() {
                             <TableRow>
                               <TableCell>Public</TableCell>
                               <TableCell>
-                                {knowledgeBaseMetrics.public.tasks}
-                              </TableCell>
-                              <TableCell>
                                 {
                                   knowledgeBaseMetrics.public
                                     .tasksWithKnowledgeBase
@@ -2625,9 +2629,6 @@ export default function AdminDashboard() {
                             </TableRow>
                             <TableRow>
                               <TableCell>Private</TableCell>
-                              <TableCell>
-                                {knowledgeBaseMetrics.private.tasks}
-                              </TableCell>
                               <TableCell>
                                 {
                                   knowledgeBaseMetrics.private
@@ -2752,6 +2753,10 @@ export default function AdminDashboard() {
 
         <TabPanel value={tabValue} index={9}>
           <ImageModelsSettings />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={10}>
+          <DefaultPromptsSettings />
         </TabPanel>
       </Paper>
 

@@ -2,6 +2,7 @@ import AWS from 'aws-sdk';
 import { taskDb } from './db';
 import OpenAI from 'openai';
 import axios from 'axios';
+import { settingsService } from './settingsService';
 
 // Configure AWS SDK
 AWS.config.update({
@@ -238,6 +239,34 @@ export class ReportRevisionService {
   }
 
   /**
+   * Get the configurable system instruction for report revision
+   */
+  private async getReportRevisionSystemInstruction(): Promise<string> {
+    try {
+      const setting = await settingsService.getSetting('report_revision_system_instruction');
+      if (setting && setting.settingValue) {
+        return setting.settingValue;
+      }
+    } catch (error) {
+      console.error('Error getting custom report revision system instruction:', error);
+    }
+    
+    // Fallback to default system instruction
+    return `You are an expert web developer and content editor. You will be given an HTML report and revision instructions. 
+Your task is to revise the report according to the instructions, which may include content changes, style modifications, or both.
+
+Guidelines:
+- Follow the revision instructions exactly - they may ask for content changes, style changes, etc.
+- Maintain professional formatting and readability
+- Preserve data tables, charts, and structured content unless specifically asked to modify them
+- Keep the overall HTML structure intact unless specifically asked to change it
+- If adding new styles, use appropriate CSS classes or inline styles
+- Ensure any new styles are consistent with the existing design
+
+You MUST use the write_revised_report function to provide the complete revised HTML report with a filename.`;
+  }
+
+  /**
    * Generate revised report using AI with function calls
    */
   private async generateRevisedReport(
@@ -246,18 +275,7 @@ export class ReportRevisionService {
     taskId: string,
     executionId: string
   ): Promise<{ revisedContent: string; resultFile: any }> {
-    const systemPrompt = `You are an expert web developer and content editor. You will be given an HTML report and revision instructions. 
-    Your task is to revise the report according to the instructions, which may include content changes, style modifications, or both.
-    
-    Guidelines:
-    - Follow the revision instructions exactly - they may ask for content changes, style changes, etc.
-    - Maintain professional formatting and readability
-    - Preserve data tables, charts, and structured content unless specifically asked to modify them
-    - Keep the overall HTML structure intact unless specifically asked to change it
-    - If adding new styles, use appropriate CSS classes or inline styles
-    - Ensure any new styles are consistent with the existing design
-    
-    You MUST use the write_revised_report function to provide the complete revised HTML report with a filename.`;
+    const systemPrompt = await this.getReportRevisionSystemInstruction();
 
     const userPrompt = `Please revise the HTML report according to these instructions: ${revisionPrompt}
 

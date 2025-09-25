@@ -16,6 +16,9 @@ const releases: Release[] = [
       "- Implemented DynamoDB pagination to handle large datasets properly",
       "- Added proper error handling and logging for better debugging",
       "- Enhanced admin dashboard with interactive charts using Chart.js",
+      "Supported configuring report revision system prompt in Default Prompts tab of Admin page",
+      "- Added new Default Prompts tab to admin dashboard for managing AI system instructions",
+      "- Fixed knowledge base metrics data issue",
     ],
   },
   {
