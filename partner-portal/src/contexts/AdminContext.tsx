@@ -129,6 +129,8 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
     async (startDate: string, endDate: string) => {
       try {
         setLoading(true);
+        setError(null);
+        
         const [taskResponse, userResponse] = await Promise.all([
           api.get("/api/admin/analytics/tasks", {
             params: { startDate, endDate },
@@ -137,11 +139,49 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
             params: { startDate, endDate },
           }),
         ]);
+        
         setTaskAnalytics(taskResponse.data);
         setUserAnalytics(userResponse.data);
         setError(null);
       } catch (err: any) {
-        setError(err.response?.data?.message || "Failed to load analytics");
+        console.error('Error loading analytics:', err);
+        const errorMessage = err.response?.data?.message || err.message || "Failed to load analytics";
+        setError(errorMessage);
+        
+        // Set fallback data to prevent UI crashes
+        setTaskAnalytics({
+          totalTasks: 0,
+          newTasks: 0,
+          totalExecutions: 0,
+          successfulExecutions: 0,
+          failedExecutions: 0,
+          newExecutions: 0,
+          scheduledTasks: 0,
+          newScheduledTasks: 0,
+          templates: 0,
+          newTemplates: 0,
+          websiteConfigs: 0,
+          newWebsiteConfigs: 0,
+          apiConfigs: 0,
+          newApiConfigs: 0,
+          sharedConfigs: 0,
+          totalWorkflows: 0,
+          newWorkflows: 0,
+          workflowExecutions: 0,
+          newWorkflowExecutions: 0,
+          successfulWorkflowExecutions: 0,
+          failedWorkflowExecutions: 0,
+          pendingWorkflowExecutions: 0,
+          averageExecutionTime: null,
+        });
+        
+        setUserAnalytics({
+          totalUsers: 0,
+          newUsers: 0,
+          oauthUsers: 0,
+          newOauthUsers: 0,
+          adminUsers: 0,
+        });
       } finally {
         setLoading(false);
       }

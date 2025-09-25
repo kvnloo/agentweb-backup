@@ -46,6 +46,13 @@ import { buildApiUrl } from "../config";
 import DOMPurify from "dompurify";
 import ImageModelsSettings from "../components/admin/ImageModelsSettings";
 import {
+  UserGrowthChart,
+  TaskGrowthChart,
+  ExecutionTrendsChart,
+  ExecutionStatusChart,
+  UserTypeChart,
+} from "../components/admin/AdminCharts";
+import {
   Info as InfoIcon,
   Close as CloseIcon,
   Handshake as HandshakeIcon,
@@ -1209,193 +1216,222 @@ export default function AdminDashboard() {
             </Grid>
           </Box>
 
+          {adminError && (
+            <Alert severity="error" sx={{ mb: 3 }}>
+              {adminError}
+            </Alert>
+          )}
+
           {adminLoading ? (
-            <CircularProgress />
+            <Box sx={{ display: 'flex', justifyContent: 'center', p: 4 }}>
+              <CircularProgress />
+            </Box>
           ) : (
-            <Grid container spacing={3}>
-              <Grid item xs={12} md={6}>
-                <Card>
-                  <CardContent>
-                    <Typography variant="h6" gutterBottom>
-                      User Analytics
-                    </Typography>
-                    {userAnalytics && (
-                      <>
-                        <Typography>
-                          Total Users: {userAnalytics.totalUsers}
-                          <Box
-                            component="span"
-                            sx={{ color: "success.main", ml: 1 }}
-                          >
-                            +{userAnalytics.newUsers} new
-                          </Box>
-                        </Typography>
-                        <Typography>
-                          OAuth Users: {userAnalytics.oauthUsers}
-                          <Box
-                            component="span"
-                            sx={{ color: "success.main", ml: 1 }}
-                          >
-                            +{userAnalytics.newOauthUsers} new
-                          </Box>
-                        </Typography>
-                        <Typography>
-                          Admin Users: {userAnalytics.adminUsers}
-                        </Typography>
-                      </>
-                    )}
-                  </CardContent>
-                </Card>
+            <Box>
+              {/* Key Metrics Cards */}
+              <Grid container spacing={3} sx={{ mb: 4 }}>
+                <Grid item xs={12} md={3}>
+                  <Card>
+                    <CardContent>
+                      <Typography variant="h6" gutterBottom>
+                        User Analytics
+                      </Typography>
+                      {userAnalytics && (
+                        <>
+                          <Typography variant="h4" color="primary">
+                            {userAnalytics.totalUsers}
+                          </Typography>
+                          <Typography variant="body2" color="text.secondary">
+                            Total Users
+                            <Box
+                              component="span"
+                              sx={{ color: "success.main", ml: 1 }}
+                            >
+                              +{userAnalytics.newUsers} new
+                            </Box>
+                          </Typography>
+                          <Typography variant="body2" color="text.secondary">
+                            OAuth: {userAnalytics.oauthUsers} (+{userAnalytics.newOauthUsers})
+                          </Typography>
+                          <Typography variant="body2" color="text.secondary">
+                            Admin: {userAnalytics.adminUsers}
+                          </Typography>
+                        </>
+                      )}
+                    </CardContent>
+                  </Card>
+                </Grid>
+                <Grid item xs={12} md={3}>
+                  <Card>
+                    <CardContent>
+                      <Typography variant="h6" gutterBottom>
+                        Task Analytics
+                      </Typography>
+                      {taskAnalytics && (
+                        <>
+                          <Typography variant="h4" color="primary">
+                            {taskAnalytics.totalTasks}
+                          </Typography>
+                          <Typography variant="body2" color="text.secondary">
+                            Total Tasks
+                            <Box
+                              component="span"
+                              sx={{ color: "success.main", ml: 1 }}
+                            >
+                              +{taskAnalytics.newTasks} new
+                            </Box>
+                          </Typography>
+                          <Typography variant="body2" color="text.secondary">
+                            Templates: {taskAnalytics.templates} (+{taskAnalytics.newTemplates})
+                          </Typography>
+                          <Typography variant="body2" color="text.secondary">
+                            Scheduled: {taskAnalytics.scheduledTasks} (+{taskAnalytics.newScheduledTasks})
+                          </Typography>
+                        </>
+                      )}
+                    </CardContent>
+                  </Card>
+                </Grid>
+                <Grid item xs={12} md={3}>
+                  <Card>
+                    <CardContent>
+                      <Typography variant="h6" gutterBottom>
+                        Execution Analytics
+                      </Typography>
+                      {taskAnalytics && (
+                        <>
+                          <Typography variant="h4" color="primary">
+                            {taskAnalytics.totalExecutions}
+                          </Typography>
+                          <Typography variant="body2" color="text.secondary">
+                            Total Executions
+                            <Box
+                              component="span"
+                              sx={{ color: "success.main", ml: 1 }}
+                            >
+                              +{taskAnalytics.newExecutions} new
+                            </Box>
+                          </Typography>
+                          <Typography variant="body2" color="success.main">
+                            ✓ {taskAnalytics.successfulExecutions} successful
+                          </Typography>
+                          <Typography variant="body2" color="error.main">
+                            ✗ {taskAnalytics.failedExecutions} failed
+                          </Typography>
+                        </>
+                      )}
+                    </CardContent>
+                  </Card>
+                </Grid>
+                <Grid item xs={12} md={3}>
+                  <Card>
+                    <CardContent>
+                      <Typography variant="h6" gutterBottom>
+                        Performance
+                      </Typography>
+                      {taskAnalytics && (
+                        <>
+                          <Typography variant="h4" color="primary">
+                            {taskAnalytics.averageExecutionTime != null
+                              ? `${(taskAnalytics.averageExecutionTime / 1000).toFixed(1)}s`
+                              : "N/A"}
+                          </Typography>
+                          <Typography variant="body2" color="text.secondary">
+                            Avg Execution Time
+                          </Typography>
+                          <Typography variant="body2" color="text.secondary">
+                            Pending: {taskAnalytics.totalExecutions - taskAnalytics.successfulExecutions - taskAnalytics.failedExecutions}
+                          </Typography>
+                        </>
+                      )}
+                    </CardContent>
+                  </Card>
+                </Grid>
               </Grid>
-              <Grid item xs={12} md={6}>
-                <Card>
-                  <CardContent>
-                    <Typography variant="h6" gutterBottom>
-                      Task Analytics
-                    </Typography>
-                    {taskAnalytics && (
-                      <>
-                        <Typography>
-                          Total Tasks: {taskAnalytics.totalTasks}
-                          <Box
-                            component="span"
-                            sx={{ color: "success.main", ml: 1 }}
-                          >
-                            +{taskAnalytics.newTasks} new
-                          </Box>
-                        </Typography>
-                        <Typography>
-                          Total Executions: {taskAnalytics.totalExecutions}
-                          <Box
-                            component="span"
-                            sx={{ color: "success.main", ml: 1 }}
-                          >
-                            +{taskAnalytics.newExecutions} new
-                          </Box>
-                        </Typography>
-                        <Typography>
-                          Successful Executions:{" "}
-                          {taskAnalytics.successfulExecutions}
-                        </Typography>
-                        <Typography>
-                          Failed Executions: {taskAnalytics.failedExecutions}
-                        </Typography>
-                        <Typography>
-                          Pending/Running Executions:{" "}
-                          {taskAnalytics.totalExecutions -
-                            taskAnalytics.successfulExecutions -
-                            taskAnalytics.failedExecutions}
-                        </Typography>
-                        <Typography>
-                          Scheduled Tasks: {taskAnalytics.scheduledTasks}
-                          <Box
-                            component="span"
-                            sx={{ color: "success.main", ml: 1 }}
-                          >
-                            +{taskAnalytics.newScheduledTasks} new
-                          </Box>
-                        </Typography>
-                        <Typography>
-                          Templates: {taskAnalytics.templates}
-                          <Box
-                            component="span"
-                            sx={{ color: "success.main", ml: 1 }}
-                          >
-                            +{taskAnalytics.newTemplates} new
-                          </Box>
-                        </Typography>
-                        <Typography>
-                          Average Execution Time:{" "}
-                          {taskAnalytics.averageExecutionTime != null
-                            ? `${(
-                                taskAnalytics.averageExecutionTime / 1000
-                              ).toFixed(1)}s`
-                            : "N/A"}
-                        </Typography>
-                      </>
-                    )}
-                  </CardContent>
-                </Card>
+
+              {/* Growth Charts */}
+              <Grid container spacing={3} sx={{ mb: 4 }}>
+                <Grid item xs={12} md={6}>
+                  {userAnalytics && (
+                    <UserGrowthChart
+                      data={userAnalytics}
+                      startDate={startDate ? format(startDate, "yyyy-MM-dd") : ""}
+                      endDate={endDate ? format(endDate, "yyyy-MM-dd") : ""}
+                    />
+                  )}
+                </Grid>
+                <Grid item xs={12} md={6}>
+                  {taskAnalytics && (
+                    <TaskGrowthChart
+                      data={taskAnalytics}
+                      startDate={startDate ? format(startDate, "yyyy-MM-dd") : ""}
+                      endDate={endDate ? format(endDate, "yyyy-MM-dd") : ""}
+                    />
+                  )}
+                </Grid>
               </Grid>
-              <Grid item xs={12} md={6}>
-                <Card>
-                  <CardContent>
-                    <Typography variant="h6" gutterBottom>
-                      Config Analytics
-                    </Typography>
-                    {taskAnalytics && (
-                      <>
-                        <Typography>
-                          Website Credentials: {taskAnalytics.websiteConfigs}
-                          <Box
-                            component="span"
-                            sx={{ color: "success.main", ml: 1 }}
-                          >
-                            +{taskAnalytics.newWebsiteConfigs} new
-                          </Box>
-                        </Typography>
-                        <Typography>
-                          API Credentials: {taskAnalytics.apiConfigs}
-                          <Box
-                            component="span"
-                            sx={{ color: "success.main", ml: 1 }}
-                          >
-                            +{taskAnalytics.newApiConfigs} new
-                          </Box>
-                        </Typography>
-                        <Typography>
-                          Shared Credentials: {taskAnalytics.sharedConfigs}
-                        </Typography>
-                      </>
-                    )}
-                  </CardContent>
-                </Card>
+
+              {/* Execution Trends and Distribution Charts */}
+              <Grid container spacing={3} sx={{ mb: 4 }}>
+                <Grid item xs={12} md={8}>
+                  {taskAnalytics && (
+                    <ExecutionTrendsChart
+                      data={taskAnalytics}
+                      startDate={startDate ? format(startDate, "yyyy-MM-dd") : ""}
+                      endDate={endDate ? format(endDate, "yyyy-MM-dd") : ""}
+                    />
+                  )}
+                </Grid>
+                <Grid item xs={12} md={4}>
+                  {taskAnalytics && (
+                    <ExecutionStatusChart data={taskAnalytics} />
+                  )}
+                </Grid>
               </Grid>
-              <Grid item xs={12} md={6}>
-                <Card>
-                  <CardContent>
-                    <Typography variant="h6" gutterBottom>
-                      Workflow Analytics
-                    </Typography>
-                    {taskAnalytics && (
-                      <>
-                        <Typography>
-                          Total Workflows: {taskAnalytics.totalWorkflows}
-                          <Box
-                            component="span"
-                            sx={{ color: "success.main", ml: 1 }}
-                          >
-                            +{taskAnalytics.newWorkflows} new
-                          </Box>
-                        </Typography>
-                        <Typography>
-                          Workflow Executions:{" "}
-                          {taskAnalytics.workflowExecutions}
-                          <Box
-                            component="span"
-                            sx={{ color: "success.main", ml: 1 }}
-                          >
-                            +{taskAnalytics.newWorkflowExecutions} new
-                          </Box>
-                        </Typography>
-                        <Typography>
-                          Successful Workflow Executions:{" "}
-                          {taskAnalytics.successfulWorkflowExecutions}
-                        </Typography>
-                        <Typography>
-                          Failed Workflow Executions:{" "}
-                          {taskAnalytics.failedWorkflowExecutions}
-                        </Typography>
-                        <Typography>
-                          Pending/Running Workflow Executions:{" "}
-                          {taskAnalytics.pendingWorkflowExecutions}
-                        </Typography>
-                      </>
-                    )}
-                  </CardContent>
-                </Card>
+
+              {/* User Type Distribution */}
+              <Grid container spacing={3}>
+                <Grid item xs={12} md={6}>
+                  {userAnalytics && (
+                    <UserTypeChart data={userAnalytics} />
+                  )}
+                </Grid>
+                <Grid item xs={12} md={6}>
+                  <Card>
+                    <CardContent>
+                      <Typography variant="h6" gutterBottom>
+                        Config Analytics
+                      </Typography>
+                      {taskAnalytics && (
+                        <>
+                          <Typography>
+                            Website Credentials: {taskAnalytics.websiteConfigs}
+                            <Box
+                              component="span"
+                              sx={{ color: "success.main", ml: 1 }}
+                            >
+                              +{taskAnalytics.newWebsiteConfigs} new
+                            </Box>
+                          </Typography>
+                          <Typography>
+                            API Credentials: {taskAnalytics.apiConfigs}
+                            <Box
+                              component="span"
+                              sx={{ color: "success.main", ml: 1 }}
+                            >
+                              +{taskAnalytics.newApiConfigs} new
+                            </Box>
+                          </Typography>
+                          <Typography>
+                            Shared Credentials: {taskAnalytics.sharedConfigs}
+                          </Typography>
+                        </>
+                      )}
+                    </CardContent>
+                  </Card>
+                </Grid>
               </Grid>
-            </Grid>
+            </Box>
           )}
         </TabPanel>
 
