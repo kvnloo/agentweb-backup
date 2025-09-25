@@ -1,20 +1,9 @@
 import React, { useEffect, useRef } from 'react';
-import { Box, Paper, Typography, Grid } from '@mui/material';
+import { Box, Paper } from '@mui/material';
 import { Chart, ChartConfiguration, registerables } from 'chart.js';
 
 // Register Chart.js components
 Chart.register(...registerables);
-
-interface ChartData {
-  labels: string[];
-  datasets: {
-    label: string;
-    data: number[];
-    borderColor?: string;
-    backgroundColor?: string;
-    fill?: boolean;
-  }[];
-}
 
 interface UserGrowthChartProps {
   data: {
