@@ -541,7 +541,6 @@ export default function AdminDashboard() {
 
   useEffect(() => {
     if (startDate && endDate && tabValue === 0 && !adminLoading) {
-      console.log('Loading analytics for Overview tab');
       loadAnalytics(
         format(startDate, "yyyy-MM-dd"),
         format(endDate, "yyyy-MM-dd")

@@ -8,6 +8,17 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-09-25",
+    changes: [
+      "Added visualizations and fixed bugs in metrics data for admin page",
+      "- Added comprehensive chart visualizations to admin Overview tab including user growth, task growth, and execution trends",
+      "- Fixed critical date comparison logic in analytics functions that was causing inaccurate metrics",
+      "- Implemented DynamoDB pagination to handle large datasets properly",
+      "- Added proper error handling and logging for better debugging",
+      "- Enhanced admin dashboard with interactive charts using Chart.js",
+    ],
+  },
+  {
     date: "2025-09-20",
     changes: [
       "Supported Repair Image Embedding for HTML reports",

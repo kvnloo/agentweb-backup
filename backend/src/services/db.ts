@@ -317,16 +317,12 @@ class UserDB {
 
   async getUserAnalytics(startDate: string, endDate: string) {
     try {
-      console.log(`Getting user analytics for date range: ${startDate} to ${endDate}`);
-      
       const params = {
         TableName: this.tableName,
       };
 
       const result = await this.docClient.scan(params).promise();
       const users = result.Items || [];
-      
-      console.log(`Found ${users.length} total users`);
 
       // Convert dates to ISO strings for proper comparison
       const startDateISO = new Date(startDate).toISOString();
@@ -355,7 +351,6 @@ class UserDB {
         adminUsers: adminUsers.length,
       };
 
-      console.log('User analytics result:', analytics);
       return analytics;
     } catch (error) {
       console.error("Error in getUserAnalytics:", error);
@@ -993,19 +988,15 @@ export const taskDb = {
 
   async getTaskAnalytics(startDate: string, endDate: string) {
     try {
-      console.log(`Getting task analytics for date range: ${startDate} to ${endDate}`);
-      
       // Convert dates to ISO strings for proper comparison
       const startDateISO = new Date(startDate).toISOString();
       const endDateISO = new Date(endDate).toISOString();
 
       // Get all tasks with pagination
       const tasks = await this.scanAllItems(`${TABLE_PREFIX}AW-Tasks`);
-      console.log(`Found ${tasks.length} total tasks`);
 
       // Get all executions with pagination
       const executions = await this.scanAllItems(`${TABLE_PREFIX}AW-TaskExecutions`);
-      console.log(`Found ${executions.length} total executions`);
 
       // Get all other data with pagination
       const schedules = await this.scanAllItems(`${TABLE_PREFIX}AW-TaskSchedules`);
@@ -1079,7 +1070,6 @@ export const taskDb = {
         })(),
       };
 
-      console.log('Task analytics result:', analytics);
       return analytics;
     } catch (error) {
       console.error("Error in getTaskAnalytics:", error);

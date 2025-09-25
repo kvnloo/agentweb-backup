@@ -128,7 +128,6 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
   const loadAnalytics = useCallback(
     async (startDate: string, endDate: string) => {
       try {
-        console.log(`Loading analytics for date range: ${startDate} to ${endDate}`);
         setLoading(true);
         setError(null);
         
@@ -140,9 +139,6 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
             params: { startDate, endDate },
           }),
         ]);
-        
-        console.log('Task analytics response:', taskResponse.data);
-        console.log('User analytics response:', userResponse.data);
         
         setTaskAnalytics(taskResponse.data);
         setUserAnalytics(userResponse.data);
