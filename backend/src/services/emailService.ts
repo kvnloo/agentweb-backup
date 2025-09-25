@@ -167,11 +167,6 @@ export const emailService = {
         throw new Error(`User not found: ${task.userId}`);
       }
       
-      console.log(`DEBUG: User data for ${task.userId}:`, {
-        emailDomain: user.emailDomain,
-        defaultSenderUsername: user.defaultSenderUsername,
-        fromName: user.fromName
-      });
 
       // If sendHtmlReportOnly is enabled, try to find HTML content and send only that
       if (task.sendHtmlReportOnly) {
@@ -256,20 +251,12 @@ export const emailService = {
           let emailSender = task.emailSender;
           let fromName = task.fromName;
           
-          console.log(`HTML-only: Task email sender config: ${emailSender}, ${fromName}`);
-          console.log(`HTML-only: User account config: domain=${user.emailDomain}, username=${user.defaultSenderUsername}, fromName=${user.fromName}`);
-          
           // If task doesn't have custom email sender, use account-level configuration
           if (!emailSender || !fromName) {
             if (user.emailDomain && user.defaultSenderUsername && user.fromName) {
               emailSender = `${user.defaultSenderUsername}@${user.emailDomain}`;
               fromName = user.fromName;
-              console.log(`HTML-only: Using account-level email configuration: ${emailSender} (${fromName})`);
-            } else {
-              console.log(`HTML-only: No account-level email configuration found, using default SMTP`);
             }
-          } else {
-            console.log(`HTML-only: Using task-level email configuration: ${emailSender} (${fromName})`);
           }
           
           if (emailSender && fromName) {
@@ -457,20 +444,12 @@ export const emailService = {
     let emailSender = task.emailSender;
     let fromName = task.fromName;
     
-    console.log(`Task email sender config: ${emailSender}, ${fromName}`);
-    console.log(`User account config: domain=${user.emailDomain}, username=${user.defaultSenderUsername}, fromName=${user.fromName}`);
-    
     // If task doesn't have custom email sender, use account-level configuration
     if (!emailSender || !fromName) {
       if (user.emailDomain && user.defaultSenderUsername && user.fromName) {
         emailSender = `${user.defaultSenderUsername}@${user.emailDomain}`;
         fromName = user.fromName;
-        console.log(`Using account-level email configuration: ${emailSender} (${fromName})`);
-      } else {
-        console.log(`No account-level email configuration found, using default SMTP`);
       }
-    } else {
-      console.log(`Using task-level email configuration: ${emailSender} (${fromName})`);
     }
     
     if (emailSender && fromName) {

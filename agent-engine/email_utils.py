@@ -19,7 +19,6 @@ load_dotenv()
 NODE_ENV = os.getenv('NODE_ENV', 'production')
 TABLE_PREFIX = 'Dev-' if NODE_ENV == 'development' else ''
 logger = logging.getLogger(__name__)
-logger.info(f"Agent-engine email_utils initialized with NODE_ENV={NODE_ENV}, TABLE_PREFIX='{TABLE_PREFIX}'")
 
 # Initialize DynamoDB client with credentials
 dynamodb = get_dynamodb_resource()
@@ -53,8 +52,6 @@ def get_effective_email_sender_config(task_id):
     Returns (email_sender, from_name, sender_type)
     """
     try:
-        logger.info(f"Getting effective email sender config for task: {task_id}")
-        
         # Validate task_id
         if not task_id:
             logger.error("task_id is None or empty")
@@ -63,9 +60,6 @@ def get_effective_email_sender_config(task_id):
         if not isinstance(task_id, str):
             logger.error(f"task_id is not a string: {type(task_id)}")
             return None, None, 'default'
-        
-        logger.info(f"Using table: {TABLE_PREFIX}AW-Tasks")
-        logger.info(f"Looking up task with key: {{'taskId': '{task_id}'}}")
         
         # Get task details
         try:
@@ -80,23 +74,17 @@ def get_effective_email_sender_config(task_id):
                 
         except Exception as db_error:
             logger.error(f"DynamoDB error getting task {task_id}: {db_error}")
-            logger.error(f"Table name: {TABLE_PREFIX}AW-Tasks")
-            logger.error(f"Key: {{'taskId': '{task_id}'}}")
             return None, None, 'default'
         
         # Priority 1: Task-level configuration
         task_email_sender = task.get('emailSender')
         task_from_name = task.get('fromName')
         
-        logger.info(f"Task-level config: emailSender={task_email_sender}, fromName={task_from_name}")
-        
         if task_email_sender and task_from_name:
-            logger.info(f"Using task-level email configuration: {task_email_sender} ({task_from_name})")
             return task_email_sender, task_from_name, 'task'
         
         # Priority 2: Account-level configuration
         user_id = task.get('userId')
-        logger.info(f"Task userId: {user_id}")
         
         if user_id:
             try:
@@ -118,28 +106,17 @@ def get_effective_email_sender_config(task_id):
                     
             except Exception as db_error:
                 logger.error(f"DynamoDB error getting user {user_id}: {db_error}")
-                logger.error(f"Table name: {TABLE_PREFIX}AW-Users")
-                logger.error(f"Index: UserIdIndex")
-                logger.error(f"Key condition: userId = {user_id}")
                 return None, None, 'default'
             
             user_email_domain = user.get('emailDomain')
             user_default_sender_username = user.get('defaultSenderUsername')
             user_from_name = user.get('fromName')
             
-            logger.info(f"Account-level config: domain={user_email_domain}, username={user_default_sender_username}, fromName={user_from_name}")
-            
             if user_email_domain and user_default_sender_username and user_from_name:
                 account_email_sender = f"{user_default_sender_username}@{user_email_domain}"
-                logger.info(f"Using account-level email configuration: {account_email_sender} ({user_from_name})")
                 return account_email_sender, user_from_name, 'account'
-            else:
-                logger.info("Account-level email configuration incomplete")
-        else:
-            logger.info("No userId found in task")
         
         # Priority 3: Default SMTP
-        logger.info("Using default SMTP configuration")
         return None, None, 'default'
         
     except Exception as e:
@@ -281,14 +258,8 @@ def send_task_notification(to_email, task_name, task_id, execution_status, execu
                 sender_type = 'resend'
                 logger.info(f"Sent task completion notification via Resend to {to_email} (ID: {email_id})")
             else:
-                logger.error("Resend failed, falling back to SMTP")
-                # Fallback to SMTP
-                msg.attach(MIMEText(body, 'plain'))
-                with smtplib.SMTP(smtp_host, smtp_port) as server:
-                    server.starttls()
-                    server.login(smtp_user, smtp_pass)
-                    server.send_message(msg)
-                logger.info(f"Sent task completion notification via SMTP to {to_email}")
+                logger.error("Resend failed, email not sent")
+                return False
         else:
             # Use default SMTP service
             msg.attach(MIMEText(body, 'plain'))
