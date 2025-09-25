@@ -45,6 +45,7 @@ import { useAuth } from "../contexts/AuthContext";
 import { buildApiUrl } from "../config";
 import DOMPurify from "dompurify";
 import ImageModelsSettings from "../components/admin/ImageModelsSettings";
+import DefaultPromptsSettings from "../components/admin/DefaultPromptsSettings";
 import {
   UserGrowthChart,
   TaskGrowthChart,
@@ -423,6 +424,7 @@ export default function AdminDashboard() {
     'knowledge-base': 7,
     'agent-mode': 8,
     'image-models': 9,
+    'default-prompts': 10,
   };
   
   // Get initial tab value from URL or default to 0
@@ -1170,6 +1172,8 @@ export default function AdminDashboard() {
             value={tabValue}
             onChange={handleTabChange}
             aria-label="admin tabs"
+            variant="scrollable"
+            scrollButtons="auto"
           >
             <Tab label="Overview" {...a11yProps(0)} />
             <Tab label="Announcements" {...a11yProps(1)} />
@@ -1181,6 +1185,7 @@ export default function AdminDashboard() {
             <Tab label="Knowledge Base" {...a11yProps(7)} />
             <Tab label="Agent Mode" {...a11yProps(8)} />
             <Tab label="Image Models" {...a11yProps(9)} />
+            <Tab label="Default Prompts" {...a11yProps(10)} />
           </Tabs>
         </Box>
 
@@ -2752,6 +2757,10 @@ export default function AdminDashboard() {
 
         <TabPanel value={tabValue} index={9}>
           <ImageModelsSettings />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={10}>
+          <DefaultPromptsSettings />
         </TabPanel>
       </Paper>
 
