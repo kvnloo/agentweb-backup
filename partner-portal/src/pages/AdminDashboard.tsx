@@ -135,6 +135,8 @@ interface User {
   stripe_customer_id?: string; // Added stripe_customer_id
   adAccount?: string; // Meta ad account ID
   emailDomain?: string; // Email sender domain
+  defaultSenderUsername?: string; // Default sender username (e.g., noreply)
+  fromName?: string; // From name for emails
 }
 
 // Define an interface for the task data shown in the admin tasks tab
@@ -456,9 +458,12 @@ export default function AdminDashboard() {
   const [editingAdAccountUserId, setEditingAdAccountUserId] = useState<string | null>(null);
   const [currentAdAccountText, setCurrentAdAccountText] = useState("");
   const [adAccountEditLoading, setAdAccountEditLoading] = useState(false);
-  const [editingEmailDomainUserId, setEditingEmailDomainUserId] = useState<string | null>(null);
-  const [currentEmailDomainText, setCurrentEmailDomainText] = useState("");
-  const [emailDomainEditLoading, setEmailDomainEditLoading] = useState(false);
+  const [emailSenderDialogOpen, setEmailSenderDialogOpen] = useState(false);
+  const [editingEmailSenderUserId, setEditingEmailSenderUserId] = useState<string | null>(null);
+  const [emailDomain, setEmailDomain] = useState("");
+  const [defaultSenderUsername, setDefaultSenderUsername] = useState("");
+  const [fromName, setFromName] = useState("");
+  const [emailSenderEditLoading, setEmailSenderEditLoading] = useState(false);
   const [delegateAccessLoading, setDelegateAccessLoading] = useState<string | null>(null);
   const [emailToDelete, setEmailToDelete] = useState<string | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -1018,20 +1023,27 @@ export default function AdminDashboard() {
     }
   };
 
-  const handleSaveEmailDomain = async (userId: string) => {
+
+  const handleSaveEmailSender = async () => {
+    if (!editingEmailSenderUserId) return;
+    
     try {
-      setEmailDomainEditLoading(true);
+      setEmailSenderEditLoading(true);
       
       // Validate email domain format - allow empty domain or valid format
-      const emailDomain = currentEmailDomainText.trim();
-      if (emailDomain && !/^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/.test(emailDomain)) {
+      const domain = emailDomain.trim();
+      if (domain && !/^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/.test(domain)) {
         setError("Please enter a valid email domain (e.g., example.com)");
         return;
       }
       
       const response = await axios.put(
-        buildApiUrl(`/api/admin/users/${userId}/email-domain`),
-        { emailDomain: emailDomain },
+        buildApiUrl(`/api/admin/users/${editingEmailSenderUserId}/email-sender`),
+        { 
+          emailDomain: domain,
+          defaultSenderUsername: defaultSenderUsername.trim(),
+          fromName: fromName.trim()
+        },
         {
           headers: { Authorization: `Bearer ${token}` }
         }
@@ -1040,15 +1052,18 @@ export default function AdminDashboard() {
       if (response.status === 200) {
         // Update the user in the context
         await loadUsers();
-        setSuccess("Email domain updated successfully!");
-        setEditingEmailDomainUserId(null);
-        setCurrentEmailDomainText("");
+        setSuccess("Email sender configuration updated successfully!");
+        setEmailSenderDialogOpen(false);
+        setEditingEmailSenderUserId(null);
+        setEmailDomain("");
+        setDefaultSenderUsername("");
+        setFromName("");
       }
     } catch (error: any) {
-      console.error("Error updating email domain:", error);
-      setError(error.response?.data?.message || "Failed to update email domain");
+      console.error("Error updating email sender configuration:", error);
+      setError(error.response?.data?.message || "Failed to update email sender configuration");
     } finally {
-      setEmailDomainEditLoading(false);
+      setEmailSenderEditLoading(false);
     }
   };
 
@@ -1447,7 +1462,7 @@ export default function AdminDashboard() {
                   <TableCell>User ID</TableCell>
                   <TableCell>Stripe Customer ID</TableCell>
                   <TableCell>Ad Account</TableCell>
-                  <TableCell>Email Domain</TableCell>
+                  <TableCell>Email Sender</TableCell>
                   <TableCell>Created</TableCell>
                   <TableCell>Last Login</TableCell>
                   <TableCell>Support Note</TableCell>
@@ -1531,60 +1546,33 @@ export default function AdminDashboard() {
                           )}
                         </TableCell>
                         <TableCell>
-                          {editingEmailDomainUserId === user.userId ? (
-                            <>
-                              <TextField
-                                size="small"
-                                value={currentEmailDomainText}
-                                onChange={(e) => setCurrentEmailDomainText(e.target.value)}
-                                placeholder="Enter email domain (e.g., example.com)..."
-                                sx={{ minWidth: 200 }}
-                                disabled={emailDomainEditLoading}
-                                helperText="Email sender domain for this user"
-                              />
-                              <IconButton
-                                type="button"
-                                size="small"
-                                onClick={(e) => {
-                                  e.preventDefault();
-                                  e.stopPropagation();
-                                  handleSaveEmailDomain(user.userId);
-                                }}
-                                disabled={emailDomainEditLoading}
-                                color="primary"
-                              >
-                                <CheckIcon />
-                              </IconButton>
-                              <IconButton
-                                type="button"
-                                size="small"
-                                onClick={() => {
-                                  setEditingEmailDomainUserId(null);
-                                  setCurrentEmailDomainText("");
-                                }}
-                                disabled={emailDomainEditLoading}
-                              >
-                                <CloseIcon />
-                              </IconButton>
-                            </>
-                          ) : (
-                            <>
-                              <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
-                                {user.emailDomain || "-"}
-                              </Typography>
-                              <IconButton
-                                type="button"
-                                size="small"
-                                onClick={() => {
-                                  setEditingEmailDomainUserId(user.userId);
-                                  setCurrentEmailDomainText(user.emailDomain || "");
-                                }}
-                                disabled={emailDomainEditLoading}
-                              >
-                                <EditIcon />
-                              </IconButton>
-                            </>
-                          )}
+                          <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
+                            {user.emailDomain ? (
+                              <div>
+                                <div><strong>Domain:</strong> {user.emailDomain}</div>
+                                {user.defaultSenderUsername && (
+                                  <div><strong>Username:</strong> {user.defaultSenderUsername}</div>
+                                )}
+                                {user.fromName && (
+                                  <div><strong>From:</strong> {user.fromName}</div>
+                                )}
+                              </div>
+                            ) : "-"}
+                          </Typography>
+                          <IconButton
+                            type="button"
+                            size="small"
+                            onClick={() => {
+                              setEditingEmailSenderUserId(user.userId);
+                              setEmailDomain(user.emailDomain || "");
+                              setDefaultSenderUsername(user.defaultSenderUsername || "");
+                              setFromName(user.fromName || "");
+                              setEmailSenderDialogOpen(true);
+                            }}
+                            disabled={emailSenderEditLoading}
+                          >
+                            <EditIcon />
+                          </IconButton>
                         </TableCell>
                         <TableCell>
                           {new Date(user.createdAt).toLocaleDateString()}
@@ -3203,6 +3191,101 @@ export default function AdminDashboard() {
         <DialogActions>
           <Button onClick={() => setUserTasksDialogOpen(false)} color="primary" variant="contained">
             Close
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Email Sender Configuration Dialog */}
+      <Dialog
+        open={emailSenderDialogOpen}
+        onClose={() => {
+          setEmailSenderDialogOpen(false);
+          setEditingEmailSenderUserId(null);
+          setEmailDomain("");
+          setDefaultSenderUsername("");
+          setFromName("");
+        }}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>
+          Configure Email Sender
+          <IconButton
+            aria-label="close"
+            onClick={() => {
+              setEmailSenderDialogOpen(false);
+              setEditingEmailSenderUserId(null);
+              setEmailDomain("");
+              setDefaultSenderUsername("");
+              setFromName("");
+            }}
+            sx={{
+              position: 'absolute',
+              right: 8,
+              top: 8,
+            }}
+          >
+            <CloseIcon />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent dividers>
+          <Grid container spacing={2}>
+            <Grid item xs={12}>
+              <TextField
+                autoFocus
+                fullWidth
+                label="Email Domain"
+                value={emailDomain}
+                onChange={(e) => setEmailDomain(e.target.value)}
+                placeholder="example.com"
+                helperText="The domain for sending emails (e.g., example.com)"
+                disabled={emailSenderEditLoading}
+              />
+            </Grid>
+            <Grid item xs={12}>
+              <TextField
+                fullWidth
+                label="Default Sender Username"
+                value={defaultSenderUsername}
+                onChange={(e) => setDefaultSenderUsername(e.target.value)}
+                placeholder="noreply"
+                helperText="The username part of the sender email (e.g., noreply)"
+                disabled={emailSenderEditLoading}
+              />
+            </Grid>
+            <Grid item xs={12}>
+              <TextField
+                fullWidth
+                label="From Name"
+                value={fromName}
+                onChange={(e) => setFromName(e.target.value)}
+                placeholder="Your Company Name"
+                helperText="The display name for the sender (e.g., Your Company Name)"
+                disabled={emailSenderEditLoading}
+              />
+            </Grid>
+          </Grid>
+        </DialogContent>
+        <DialogActions>
+          <Button 
+            onClick={() => {
+              setEmailSenderDialogOpen(false);
+              setEditingEmailSenderUserId(null);
+              setEmailDomain("");
+              setDefaultSenderUsername("");
+              setFromName("");
+            }}
+            disabled={emailSenderEditLoading}
+          >
+            Cancel
+          </Button>
+          <Button
+            onClick={handleSaveEmailSender}
+            color="primary"
+            variant="contained"
+            disabled={emailSenderEditLoading}
+          >
+            {emailSenderEditLoading ? "Saving..." : "Save"}
           </Button>
         </DialogActions>
       </Dialog>

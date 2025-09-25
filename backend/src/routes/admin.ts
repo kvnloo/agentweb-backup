@@ -112,11 +112,11 @@ router.put("/users/:userId/ad-account", async (req, res) => {
   }
 });
 
-// Update user email domain
-router.put("/users/:userId/email-domain", async (req, res) => {
+// Update user email sender configuration
+router.put("/users/:userId/email-sender", async (req, res) => {
   try {
     const { userId } = req.params;
-    const { emailDomain } = req.body;
+    const { emailDomain, defaultSenderUsername, fromName } = req.body;
 
     // Check if user exists
     const user = await userDb.getUserById(userId);
@@ -124,12 +124,16 @@ router.put("/users/:userId/email-domain", async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Update the user's email domain
-    const updatedUser = await userDb.updateUser(userId, { emailDomain });
+    // Update the user's email sender configuration
+    const updatedUser = await userDb.updateUser(userId, { 
+      emailDomain, 
+      defaultSenderUsername, 
+      fromName 
+    });
     res.json(updatedUser);
   } catch (error) {
-    console.error("Error updating user email domain:", error);
-    res.status(500).json({ message: "Error updating email domain" });
+    console.error("Error updating user email sender:", error);
+    res.status(500).json({ message: "Error updating email sender" });
   }
 });
 
