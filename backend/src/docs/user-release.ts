@@ -21,6 +21,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Added read_file_content function call in Agent Mode',
       '- Agent can now read and extract content from file URLs including PDFs, text files, HTML, Markdown, CSV, and other common formats',
       '- Supports automatic file type detection and content extraction with proper error handling',
+      'Added lead generation metrics for Agent Mode',
+      '- Agent can now fetch and analyze website leads and cost per lead data from Meta Ads',
     ],
   },
   {
