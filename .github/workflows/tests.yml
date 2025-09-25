@@ -73,7 +73,7 @@ jobs:
 
       - name: Build
         working-directory: backend
-        run: npm run build --if-present
+        run: NODE_OPTIONS="--max-old-space-size=4096" npm run build --if-present
 
       - name: Test
         working-directory: backend
@@ -125,6 +125,10 @@ jobs:
 
       - name: Build
         working-directory: partner-portal
-        run: npm run build --if-present
+        run: NODE_OPTIONS="--max-old-space-size=4096" npm run build --if-present
+
+      - name: Test
+        working-directory: partner-portal
+        run: npm test --silent
 
 
