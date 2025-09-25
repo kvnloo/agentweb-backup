@@ -30,15 +30,32 @@ export async function uploadFileToS3(
   contentType: string
 ): Promise<S3UploadResult> {
   try {
+    // Normalize and sanitize filename to reduce risk of signature issues from non-ASCII chars
+    const normalizedFilename = (filename || "")
+      .normalize("NFKD")
+      // remove combining diacritical marks
+      .replace(/[\u0300-\u036f]/g, "");
+
     // Generate random token for uniqueness
     const randomToken = Array.from(crypto.getRandomValues(new Uint8Array(16)))
       .map((b) => b.toString(16).padStart(2, '0'))
       .join('');
 
-    // Sanitize filename for S3 key
-    const sanitizedFilename = filename
+    // Sanitize filename for S3 key (ASCII-only, safe chars)
+    const sanitizedFilename = normalizedFilename
       .replace(/[^a-zA-Z0-9.-]/g, '_')
       .replace(/\s+/g, '_');
+
+    // S3 object metadata values must be US-ASCII. Prepare a safe metadata value.
+    const asciiMetadataFilename = normalizedFilename
+      // remove non-ASCII characters
+      .replace(/[^\x20-\x7E]/g, '')
+      // collapse whitespace/newlines
+      .replace(/[\r\n\t]+/g, ' ')
+      .trim()
+      // ensure non-empty
+      || sanitizedFilename
+      || 'file';
 
     // Generate S3 key: users/{userId}/files/{timestamp}/{token}/{filename}
     const key = `users/${userId}/files/${Date.now()}/${randomToken}/${sanitizedFilename}`;
@@ -51,7 +68,7 @@ export async function uploadFileToS3(
       Body: content,
       ContentType: contentType,
       Metadata: {
-        'original-filename': filename,
+        'original-filename': asciiMetadataFilename,
         'uploaded-by': 'agent-mode',
         'upload-timestamp': new Date().toISOString()
       }
