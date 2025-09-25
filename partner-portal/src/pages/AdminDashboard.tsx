@@ -489,6 +489,7 @@ export default function AdminDashboard() {
     deleteWaitlistEntry,
     deleteUser,
     addToWaitlist,
+    setUsers,
   } = useAdmin();
 
   // Manual invite modal state
@@ -884,7 +885,14 @@ export default function AdminDashboard() {
         { headers: { Authorization: `Bearer ${token}` } }
       );
 
-      await loadUsers();
+      // Update the user in the local state without reloading
+      setUsers((prevUsers: User[]) => 
+        prevUsers.map((user: User) => 
+          user.userId === selectedUser?.userId 
+            ? { ...user, roles: selectedUserRoles }
+            : user
+        )
+      );
 
       setSuccess("User roles updated successfully");
       setRoleDialogOpen(false);
@@ -975,8 +983,14 @@ export default function AdminDashboard() {
       );
 
       if (response.status === 200) {
-        // Update the user in the context
-        await loadUsers();
+        // Update the user in the local state without reloading
+        setUsers((prevUsers: User[]) => 
+          prevUsers.map((user: User) => 
+            user.userId === userId 
+              ? { ...user, supportNote: response.data.supportNote }
+              : user
+          )
+        );
         setSuccess("Support note updated successfully!");
         setEditingSupportNoteUserId(null);
         setCurrentSupportNoteText("");
@@ -1009,8 +1023,14 @@ export default function AdminDashboard() {
       );
 
       if (response.status === 200) {
-        // Update the user in the context
-        await loadUsers();
+        // Update the user in the local state without reloading
+        setUsers((prevUsers: User[]) => 
+          prevUsers.map((user: User) => 
+            user.userId === userId 
+              ? { ...user, adAccount: response.data.adAccount }
+              : user
+          )
+        );
         setSuccess("Ad account updated successfully!");
         setEditingAdAccountUserId(null);
         setCurrentAdAccountText("");
@@ -1050,8 +1070,19 @@ export default function AdminDashboard() {
       );
 
       if (response.status === 200) {
-        // Update the user in the context
-        await loadUsers();
+        // Update the user in the local state without reloading
+        setUsers((prevUsers: User[]) => 
+          prevUsers.map((user: User) => 
+            user.userId === editingEmailSenderUserId 
+              ? { 
+                  ...user, 
+                  emailDomain: response.data.emailDomain,
+                  defaultSenderUsername: response.data.defaultSenderUsername,
+                  fromName: response.data.fromName
+                }
+              : user
+          )
+        );
         setSuccess("Email sender configuration updated successfully!");
         setEmailSenderDialogOpen(false);
         setEditingEmailSenderUserId(null);
