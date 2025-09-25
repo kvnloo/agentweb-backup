@@ -132,6 +132,16 @@ export async function sendApprovalRequest(
           }),
         },
         {
+          type: "divider"
+        },
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: " " // Empty space for better mobile spacing
+          }
+        },
+        {
           type: "actions",
           elements: [
             {
