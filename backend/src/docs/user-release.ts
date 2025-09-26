@@ -11,6 +11,7 @@ export const userReleaseNotes: UserReleaseNote[] = [
     changes: [
       'Updated Subscribed Email Footer',
       'Added lead gen breakdown to Demographics, Placement and Device metrics in Agent Mode',
+      'Added clear indicator when there is no task running for Agent Mode',
     ],
   },
   {
