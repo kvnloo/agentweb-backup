@@ -1787,11 +1787,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
         fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}&access_token=${accessToken}`),
         fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad&access_token=${accessToken}`),
         // Demographics breakdown (age/gender)
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach&breakdowns=age,gender&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad&access_token=${accessToken}`),
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type&breakdowns=age,gender&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad&access_token=${accessToken}`),
         // Placement breakdown (publisher platform and position)
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach&breakdowns=publisher_platform,platform_position&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad&access_token=${accessToken}`),
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type&breakdowns=publisher_platform,platform_position&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad&access_token=${accessToken}`),
         // Device breakdown (mobile/desktop, etc.)
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad&access_token=${accessToken}`)
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad&access_token=${accessToken}`)
       ]);
 
       console.log('AgentMode: API calls completed, parsing responses...');
@@ -1861,6 +1861,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const campaignSummary = this.generateCampaignSummary(adPerformance);
       console.log('AgentMode: Campaign summary:', JSON.stringify(campaignSummary, null, 2));
       
+      console.log('AgentMode: Processing breakdown data with lead generation metrics...');
+      const processedDemographicsBreakdown = this.processBreakdownData(insightsDemographicsData?.data || []);
+      const processedPlacementBreakdown = this.processBreakdownData(insightsPlacementData?.data || []);
+      const processedDeviceBreakdown = this.processBreakdownData(insightsDeviceData?.data || []);
+      
       const result = {
         success: true,
         message: `Meta ads metrics loaded for ${timeframe} timeframe`,
@@ -1870,9 +1875,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
           adSetsData: processedAdSetsData,
           adsData: processedAdsData,
           campaignSummary,
-          demographicsBreakdown: (insightsDemographicsData && insightsDemographicsData.data) ? insightsDemographicsData.data : [],
-          placementBreakdown: (insightsPlacementData && insightsPlacementData.data) ? insightsPlacementData.data : [],
-          deviceBreakdown: (insightsDeviceData && insightsDeviceData.data) ? insightsDeviceData.data : [],
+          demographicsBreakdown: processedDemographicsBreakdown,
+          placementBreakdown: processedPlacementBreakdown,
+          deviceBreakdown: processedDeviceBreakdown,
           attributionWindow: { start: sinceStr, end: untilStr, days: attributionDays }
         }
       };
@@ -2327,6 +2332,41 @@ Use the available tools to create tasks in the agent-engine when complex work is
     };
   }
 
+  // Helper function to process breakdown data with lead generation metrics
+  private processBreakdownData(breakdownData: any[]): any[] {
+    return breakdownData.map(item => {
+      const processedItem = {
+        ...item,
+        websiteLeads: 0,
+        costPerWebsiteLead: 0
+      };
+
+      // Process lead generation metrics from actions and cost_per_action_type
+      if (item.actions && Array.isArray(item.actions)) {
+        for (const action of item.actions) {
+          if (action.action_type === 'lead' || action.action_type === 'website_lead') {
+            processedItem.websiteLeads += parseInt(action.value) || 0;
+          }
+        }
+      }
+      
+      if (item.cost_per_action_type && Array.isArray(item.cost_per_action_type)) {
+        for (const costAction of item.cost_per_action_type) {
+          if (costAction.action_type === 'lead' || costAction.action_type === 'website_lead') {
+            processedItem.costPerWebsiteLead = parseFloat(costAction.value) || 0;
+          }
+        }
+      }
+
+      // Calculate cost per lead if we have leads but no cost_per_action_type data
+      if (processedItem.websiteLeads > 0 && processedItem.costPerWebsiteLead === 0 && item.spend) {
+        processedItem.costPerWebsiteLead = parseFloat(item.spend) / processedItem.websiteLeads;
+      }
+
+      return processedItem;
+    });
+  }
+
   // Helper function to format metrics summary for AI analysis
   private formatMetricsSummary(data: any): string {
     const { adPerformance, adSetsData, adsData, campaignSummary, demographicsBreakdown, placementBreakdown, deviceBreakdown, attributionWindow } = data;
@@ -2395,8 +2435,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
     // Demographics Breakdown
     if (demographicsBreakdown && demographicsBreakdown.length > 0) {
       summary += `**Demographics Performance**\n`;
-      summary += `| Age | Gender | Impressions | Clicks | Spend | CTR | CPC |\n`;
-      summary += `|-----|--------|-------------|--------|-------|-----|-----|\n`;
+      summary += `| Age | Gender | Impressions | Clicks | Spend | CTR | CPC | Website Leads | Cost/Lead |\n`;
+      summary += `|-----|--------|-------------|--------|-------|-----|-----|---------------|----------|\n`;
       
       // Group by age and gender, then aggregate metrics
       const demographicsMap = new Map();
@@ -2408,13 +2448,15 @@ Use the available tools to create tasks in the agent-engine when complex work is
             gender: item.gender || 'Unknown',
             impressions: 0,
             clicks: 0,
-            spend: 0
+            spend: 0,
+            websiteLeads: 0
           });
         }
         const demo = demographicsMap.get(key);
         demo.impressions += parseInt(item.impressions) || 0;
         demo.clicks += parseInt(item.clicks) || 0;
         demo.spend += parseFloat(item.spend) || 0;
+        demo.websiteLeads += parseInt(item.websiteLeads) || 0;
       });
       
       // Sort by spend descending and show top 10
@@ -2425,7 +2467,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       sortedDemographics.forEach((demo: any) => {
         const ctr = demo.impressions > 0 ? (demo.clicks / demo.impressions) * 100 : 0;
         const cpc = demo.clicks > 0 ? demo.spend / demo.clicks : 0;
-        summary += `| ${demo.age} | ${demo.gender} | ${demo.impressions.toLocaleString()} | ${demo.clicks.toLocaleString()} | $${demo.spend.toFixed(2)} | ${ctr.toFixed(2)}% | $${cpc.toFixed(2)} |\n`;
+        const costPerLead = demo.websiteLeads > 0 ? demo.spend / demo.websiteLeads : 0;
+        summary += `| ${demo.age} | ${demo.gender} | ${demo.impressions.toLocaleString()} | ${demo.clicks.toLocaleString()} | $${demo.spend.toFixed(2)} | ${ctr.toFixed(2)}% | $${cpc.toFixed(2)} | ${demo.websiteLeads.toLocaleString()} | $${costPerLead.toFixed(2)} |\n`;
       });
       summary += `\n`;
     }
@@ -2433,8 +2476,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
     // Placement Breakdown
     if (placementBreakdown && placementBreakdown.length > 0) {
       summary += `**Placement Performance**\n`;
-      summary += `| Platform | Position | Impressions | Clicks | Spend | CTR | CPC |\n`;
-      summary += `|----------|----------|-------------|--------|-------|-----|-----|\n`;
+      summary += `| Platform | Position | Impressions | Clicks | Spend | CTR | CPC | Website Leads | Cost/Lead |\n`;
+      summary += `|----------|----------|-------------|--------|-------|-----|-----|---------------|----------|\n`;
       
       // Group by platform and position, then aggregate metrics
       const placementMap = new Map();
@@ -2446,13 +2489,15 @@ Use the available tools to create tasks in the agent-engine when complex work is
             position: item.platform_position || 'Unknown',
             impressions: 0,
             clicks: 0,
-            spend: 0
+            spend: 0,
+            websiteLeads: 0
           });
         }
         const placement = placementMap.get(key);
         placement.impressions += parseInt(item.impressions) || 0;
         placement.clicks += parseInt(item.clicks) || 0;
         placement.spend += parseFloat(item.spend) || 0;
+        placement.websiteLeads += parseInt(item.websiteLeads) || 0;
       });
       
       // Sort by spend descending and show top 10
@@ -2463,7 +2508,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       sortedPlacements.forEach((placement: any) => {
         const ctr = placement.impressions > 0 ? (placement.clicks / placement.impressions) * 100 : 0;
         const cpc = placement.clicks > 0 ? placement.spend / placement.clicks : 0;
-        summary += `| ${placement.platform} | ${placement.position} | ${placement.impressions.toLocaleString()} | ${placement.clicks.toLocaleString()} | $${placement.spend.toFixed(2)} | ${ctr.toFixed(2)}% | $${cpc.toFixed(2)} |\n`;
+        const costPerLead = placement.websiteLeads > 0 ? placement.spend / placement.websiteLeads : 0;
+        summary += `| ${placement.platform} | ${placement.position} | ${placement.impressions.toLocaleString()} | ${placement.clicks.toLocaleString()} | $${placement.spend.toFixed(2)} | ${ctr.toFixed(2)}% | $${cpc.toFixed(2)} | ${placement.websiteLeads.toLocaleString()} | $${costPerLead.toFixed(2)} |\n`;
       });
       summary += `\n`;
     }
@@ -2471,8 +2517,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
     // Device Breakdown
     if (deviceBreakdown && deviceBreakdown.length > 0) {
       summary += `**Device Performance**\n`;
-      summary += `| Device | Impressions | Clicks | Spend | CTR | CPC |\n`;
-      summary += `|--------|-------------|--------|-------|-----|-----|\n`;
+      summary += `| Device | Impressions | Clicks | Spend | CTR | CPC | Website Leads | Cost/Lead |\n`;
+      summary += `|--------|-------------|--------|-------|-----|-----|---------------|----------|\n`;
       
       // Group by device, then aggregate metrics
       const deviceMap = new Map();
@@ -2483,13 +2529,15 @@ Use the available tools to create tasks in the agent-engine when complex work is
             device,
             impressions: 0,
             clicks: 0,
-            spend: 0
+            spend: 0,
+            websiteLeads: 0
           });
         }
         const deviceData = deviceMap.get(device);
         deviceData.impressions += parseInt(item.impressions) || 0;
         deviceData.clicks += parseInt(item.clicks) || 0;
         deviceData.spend += parseFloat(item.spend) || 0;
+        deviceData.websiteLeads += parseInt(item.websiteLeads) || 0;
       });
       
       // Sort by spend descending
@@ -2499,7 +2547,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       sortedDevices.forEach((device: any) => {
         const ctr = device.impressions > 0 ? (device.clicks / device.impressions) * 100 : 0;
         const cpc = device.clicks > 0 ? device.spend / device.clicks : 0;
-        summary += `| ${device.device} | ${device.impressions.toLocaleString()} | ${device.clicks.toLocaleString()} | $${device.spend.toFixed(2)} | ${ctr.toFixed(2)}% | $${cpc.toFixed(2)} |\n`;
+        const costPerLead = device.websiteLeads > 0 ? device.spend / device.websiteLeads : 0;
+        summary += `| ${device.device} | ${device.impressions.toLocaleString()} | ${device.clicks.toLocaleString()} | $${device.spend.toFixed(2)} | ${ctr.toFixed(2)}% | $${cpc.toFixed(2)} | ${device.websiteLeads.toLocaleString()} | $${costPerLead.toFixed(2)} |\n`;
       });
       summary += `\n`;
     }
