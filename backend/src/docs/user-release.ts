@@ -10,6 +10,7 @@ export const userReleaseNotes: UserReleaseNote[] = [
     date: '2025-09-26',
     changes: [
       'Updated Subscribed Email Footer',
+      'Added lead gen breakdown to Demographics, Placement and Device metrics in Agent Mode',
     ],
   },
   {
