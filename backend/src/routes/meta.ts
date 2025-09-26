@@ -173,29 +173,56 @@ router.get("/ad-performance", async (req, res) => {
         throw new Error(`Failed to fetch ads: ${adsError.message || 'Unknown error'}`);
       }
 
-      // Get insights using Graph API
+      // Get insights using Graph API - fetch at multiple levels
       console.log("Fetching insights for timeframe:", timeframe);
-      let insights;
+      let insights, adSetInsights, campaignInsights;
       try {
-        const insightsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=ad&access_token=${accessToken}`;
+        // Fetch ad-level insights for ads processing
+        const adInsightsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=ad&access_token=${accessToken}`;
         
-        const insightsResponse = await fetch(insightsUrl);
-        const insightsData = await insightsResponse.json();
+        const adInsightsResponse = await fetch(adInsightsUrl);
+        const adInsightsData = await adInsightsResponse.json();
         
-        if (insightsData.error) {
-          throw new Error(`Graph API Error: ${insightsData.error.message}`);
+        if (adInsightsData.error) {
+          throw new Error(`Graph API Error: ${adInsightsData.error.message}`);
         }
         
-        insights = insightsData.data || [];
-        console.log("Insights fetched successfully:", insights.length);
+        insights = adInsightsData.data || [];
+        console.log("Ad-level insights fetched successfully:", insights.length);
+
+        // Fetch adset-level insights for ad sets processing
+        const adSetInsightsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=adset&access_token=${accessToken}`;
+        
+        const adSetInsightsResponse = await fetch(adSetInsightsUrl);
+        const adSetInsightsData = await adSetInsightsResponse.json();
+        
+        if (adSetInsightsData.error) {
+          throw new Error(`Graph API Error: ${adSetInsightsData.error.message}`);
+        }
+        
+        adSetInsights = adSetInsightsData.data || [];
+        console.log("Adset-level insights fetched successfully:", adSetInsights.length);
+
+        // Fetch campaign-level insights for campaigns processing
+        const campaignInsightsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=campaign&access_token=${accessToken}`;
+        
+        const campaignInsightsResponse = await fetch(campaignInsightsUrl);
+        const campaignInsightsData = await campaignInsightsResponse.json();
+        
+        if (campaignInsightsData.error) {
+          throw new Error(`Graph API Error: ${campaignInsightsData.error.message}`);
+        }
+        
+        campaignInsights = campaignInsightsData.data || [];
+        console.log("Campaign-level insights fetched successfully:", campaignInsights.length);
       } catch (insightsError: any) {
         console.error("Error fetching insights:", insightsError);
         throw new Error(`Failed to fetch insights: ${insightsError.message || 'Unknown error'}`);
       }
 
     // Process the data
-    const adPerformance = await processCampaignData(campaigns, insights, adSets);
-    const adSetsData = await processAdSetsData(adSets, insights, campaigns);
+    const adPerformance = await processCampaignData(campaigns, campaignInsights, adSets);
+    const adSetsData = await processAdSetsData(adSets, adSetInsights, campaigns);
     const adsData = await processAdsData(ads, insights, adSets, campaigns);
     const campaignSummary = generateCampaignSummary(adPerformance);
     
@@ -255,19 +282,18 @@ async function processCampaignData(campaigns: any, insights: any, adSets: any): 
     });
   }
   
-  // Aggregate insights data by campaign
+  // Process campaign-level insights directly
   for (const insight of insights) {
-    const adSetId = insight.adset_id;
-    const campaignId = adSetToCampaignMap.get(adSetId);
+    const campaignId = insight.campaign_id;
     
-    if (campaignId && campaignMap.has(campaignId)) {
+    if (campaignMap.has(campaignId)) {
       const campaign = campaignMap.get(campaignId);
       
-      // Sum up metrics from all ad sets in this campaign
-      campaign.impressions += parseInt(insight.impressions) || 0;
-      campaign.clicks += parseInt(insight.clicks) || 0;
-      campaign.spend += parseFloat(insight.spend) || 0;
-      campaign.reach += parseInt(insight.reach) || 0;
+      // Use campaign-level metrics directly
+      campaign.impressions = parseInt(insight.impressions) || 0;
+      campaign.clicks = parseInt(insight.clicks) || 0;
+      campaign.spend = parseFloat(insight.spend) || 0;
+      campaign.reach = parseInt(insight.reach) || 0;
       
       // Calculate weighted averages for CTR and CPC
       // CTR = total clicks / total impressions
@@ -288,10 +314,8 @@ async function processCampaignData(campaigns: any, insights: any, adSets: any): 
     }
   }
   
-  // Filter out campaigns with no activity in the selected timeframe
-  return Array.from(campaignMap.values()).filter(campaign => 
-    campaign.impressions > 0 || campaign.clicks > 0 || campaign.spend > 0
-  );
+  // Return all campaigns regardless of activity
+  return Array.from(campaignMap.values());
 }
 
 // Helper function to generate campaign summary
@@ -323,7 +347,9 @@ async function processAdSetsData(adSets: any, insights: any, campaigns: any): Pr
   }
   
   // Process ad sets
+  console.log("Processing ad sets:", adSets.length);
   for (const adSet of adSets) {
+    console.log(`AdSet: ${adSet.id} - ${adSet.name} (${adSet.status})`);
     adSetsMap.set(adSet.id, {
       id: adSet.id,
       name: adSet.name,
@@ -343,8 +369,12 @@ async function processAdSetsData(adSets: any, insights: any, campaigns: any): Pr
   }
   
   // Process insights and merge with ad sets
+  console.log("Processing adset insights:", insights.length);
   for (const insight of insights) {
+    // For adset-level insights, the adset_id is directly available
     const adSetId = insight.adset_id;
+    console.log(`Processing insight for adset ${adSetId}: spend=${insight.spend}, impressions=${insight.impressions}`);
+    
     if (adSetsMap.has(adSetId)) {
       const adSet = adSetsMap.get(adSetId);
       adSet.impressions = parseInt(insight.impressions) || 0;
@@ -354,13 +384,14 @@ async function processAdSetsData(adSets: any, insights: any, campaigns: any): Pr
       adSet.cpc = parseFloat(insight.cpc) || 0;
       adSet.reach = parseInt(insight.reach) || 0;
       adSet.frequency = parseFloat(insight.frequency) || 0;
+      console.log(`Updated adset ${adSetId} with spend: ${adSet.spend}`);
+    } else {
+      console.log(`Adset ${adSetId} not found in adSetsMap`);
     }
   }
   
-  // Filter out ad sets with no activity in the selected timeframe
-  return Array.from(adSetsMap.values()).filter(adSet => 
-    adSet.impressions > 0 || adSet.clicks > 0 || adSet.spend > 0
-  );
+  // Return all ad sets regardless of activity
+  return Array.from(adSetsMap.values());
 }
 
 // Helper function to process ads data from Meta API
@@ -415,10 +446,8 @@ async function processAdsData(ads: any, insights: any, adSets: any, campaigns: a
     }
   }
   
-  // Filter out ads with no activity in the selected timeframe
-  return Array.from(adsMap.values()).filter(ad => 
-    ad.impressions > 0 || ad.clicks > 0 || ad.spend > 0
-  );
+  // Return all ads regardless of activity
+  return Array.from(adsMap.values());
 }
 
 // Get campaigns and ad sets for ad creation

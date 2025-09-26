@@ -1781,13 +1781,18 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const attributionDays = Math.max(1, Math.ceil((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24)));
       console.log('AgentMode: Date range:', sinceStr, 'to', untilStr);
 
-      // Get campaigns, ad sets, ads, and insights using Graph API
+      // Get campaigns, ad sets, ads, and insights using Graph API - fetch at multiple levels
       console.log('AgentMode: Making parallel API calls to Meta Graph API...');
-      const [campaignsResponse, adSetsResponse, adsResponse, insightsResponse, insightsDemographicsResponse, insightsPlacementResponse, insightsDeviceResponse] = await Promise.all([
+      const [campaignsResponse, adSetsResponse, adsResponse, adInsightsResponse, adSetInsightsResponse, campaignInsightsResponse, insightsDemographicsResponse, insightsPlacementResponse, insightsDeviceResponse] = await Promise.all([
         fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`),
         fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting&access_token=${accessToken}`),
         fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}&access_token=${accessToken}`),
+        // Ad-level insights for ads processing
         fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad&access_token=${accessToken}`),
+        // Adset-level insights for ad sets processing
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=adset&access_token=${accessToken}`),
+        // Campaign-level insights for campaigns processing
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign&access_token=${accessToken}`),
         // Demographics breakdown (age/gender)
         fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type&breakdowns=age,gender&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad&access_token=${accessToken}`),
         // Placement breakdown (publisher platform and position)
@@ -1797,11 +1802,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
       ]);
 
       console.log('AgentMode: API calls completed, parsing responses...');
-      const [campaignsData, adSetsData, adsData, insightsData, insightsDemographicsData, insightsPlacementData, insightsDeviceData] = await Promise.all([
+      const [campaignsData, adSetsData, adsData, adInsightsData, adSetInsightsData, campaignInsightsData, insightsDemographicsData, insightsPlacementData, insightsDeviceData] = await Promise.all([
         campaignsResponse.json(),
         adSetsResponse.json(),
         adsResponse.json(),
-        insightsResponse.json(),
+        adInsightsResponse.json(),
+        adSetInsightsResponse.json(),
+        campaignInsightsResponse.json(),
         insightsDemographicsResponse.json(),
         insightsPlacementResponse.json(),
         insightsDeviceResponse.json()
@@ -1811,7 +1818,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
       console.log('- Campaigns response status:', campaignsResponse.status, 'data length:', campaignsData.data?.length || 0);
       console.log('- Ad Sets response status:', adSetsResponse.status, 'data length:', adSetsData.data?.length || 0);
       console.log('- Ads response status:', adsResponse.status, 'data length:', adsData.data?.length || 0);
-      console.log('- Insights response status:', insightsResponse.status, 'data length:', insightsData.data?.length || 0);
+      console.log('- Ad-level insights status:', adInsightsResponse.status, 'data length:', adInsightsData.data?.length || 0);
+      console.log('- Adset-level insights status:', adSetInsightsResponse.status, 'data length:', adSetInsightsData.data?.length || 0);
+      console.log('- Campaign-level insights status:', campaignInsightsResponse.status, 'data length:', campaignInsightsData.data?.length || 0);
       console.log('- Demographics insights status:', insightsDemographicsResponse.status, 'data length:', insightsDemographicsData.data?.length || 0);
       console.log('- Placement insights status:', insightsPlacementResponse.status, 'data length:', insightsPlacementData.data?.length || 0);
       console.log('- Device insights status:', insightsDeviceResponse.status, 'data length:', insightsDeviceData.data?.length || 0);
@@ -1829,9 +1838,17 @@ Use the available tools to create tasks in the agent-engine when complex work is
         console.error('AgentMode: Ads API Error:', adsData.error);
         throw new Error(`Ads API Error: ${adsData.error.message}`);
       }
-      if (insightsData.error) {
-        console.error('AgentMode: Insights API Error:', insightsData.error);
-        throw new Error(`Insights API Error: ${insightsData.error.message}`);
+      if (adInsightsData.error) {
+        console.error('AgentMode: Ad-level Insights API Error:', adInsightsData.error);
+        throw new Error(`Ad-level Insights API Error: ${adInsightsData.error.message}`);
+      }
+      if (adSetInsightsData.error) {
+        console.error('AgentMode: Adset-level Insights API Error:', adSetInsightsData.error);
+        throw new Error(`Adset-level Insights API Error: ${adSetInsightsData.error.message}`);
+      }
+      if (campaignInsightsData.error) {
+        console.error('AgentMode: Campaign-level Insights API Error:', campaignInsightsData.error);
+        throw new Error(`Campaign-level Insights API Error: ${campaignInsightsData.error.message}`);
       }
       if (insightsDemographicsData.error) {
         console.error('AgentMode: Demographics Insights API Error:', insightsDemographicsData.error);
@@ -1848,15 +1865,15 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Process the data using simplified logic
       console.log('AgentMode: Processing campaign data...');
-      const adPerformance = this.processCampaignData(campaignsData.data || [], insightsData.data || [], adSetsData.data || []);
+      const adPerformance = this.processCampaignData(campaignsData.data || [], campaignInsightsData.data || [], adSetsData.data || []);
       console.log('AgentMode: Processed campaigns:', adPerformance.length);
       
       console.log('AgentMode: Processing ad sets data...');
-      const processedAdSetsData = this.processAdSetsData(adSetsData.data || [], insightsData.data || [], campaignsData.data || []);
+      const processedAdSetsData = this.processAdSetsData(adSetsData.data || [], adSetInsightsData.data || [], campaignsData.data || []);
       console.log('AgentMode: Processed ad sets:', processedAdSetsData.length);
       
       console.log('AgentMode: Processing ads data...');
-      const processedAdsData = this.processAdsData(adsData.data || [], insightsData.data || [], adSetsData.data || [], campaignsData.data || []);
+      const processedAdsData = this.processAdsData(adsData.data || [], adInsightsData.data || [], adSetsData.data || [], campaignsData.data || []);
       console.log('AgentMode: Processed ads:', processedAdsData.length);
       
       console.log('AgentMode: Generating campaign summary...');
@@ -2077,19 +2094,18 @@ Use the available tools to create tasks in the agent-engine when complex work is
       });
     }
     
-    // Aggregate insights data by campaign
+    // Process campaign-level insights directly
     for (const insight of insights) {
-      const adSetId = insight.adset_id;
-      const campaignId = adSetToCampaignMap.get(adSetId);
+      const campaignId = insight.campaign_id;
       
-      if (campaignId && campaignMap.has(campaignId)) {
+      if (campaignMap.has(campaignId)) {
         const campaign = campaignMap.get(campaignId);
         
-        // Sum up metrics from all ad sets in this campaign
-        campaign.impressions += parseInt(insight.impressions) || 0;
-        campaign.clicks += parseInt(insight.clicks) || 0;
-        campaign.spend += parseFloat(insight.spend) || 0;
-        campaign.reach += parseInt(insight.reach) || 0;
+        // Use campaign-level metrics directly
+        campaign.impressions = parseInt(insight.impressions) || 0;
+        campaign.clicks = parseInt(insight.clicks) || 0;
+        campaign.spend = parseFloat(insight.spend) || 0;
+        campaign.reach = parseInt(insight.reach) || 0;
         
         // Process lead generation metrics from actions and cost_per_action_type
         if (insight.actions && Array.isArray(insight.actions)) {
@@ -2128,10 +2144,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       }
     }
     
-    // Filter out campaigns with no activity in the selected timeframe
-    return Array.from(campaignMap.values()).filter(campaign => 
-      campaign.impressions > 0 || campaign.clicks > 0 || campaign.spend > 0
-    );
+    // Return all campaigns regardless of activity
+    return Array.from(campaignMap.values());
   }
 
   // Helper function to process ad sets data
@@ -2166,15 +2180,15 @@ Use the available tools to create tasks in the agent-engine when complex work is
       });
     }
     
-    // Aggregate insights data by ad set
+    // Process adset-level insights directly
     for (const insight of insights) {
       const adSetId = insight.adset_id;
       if (adSetMap.has(adSetId)) {
         const adSet = adSetMap.get(adSetId);
-        adSet.impressions += parseInt(insight.impressions) || 0;
-        adSet.clicks += parseInt(insight.clicks) || 0;
-        adSet.spend += parseFloat(insight.spend) || 0;
-        adSet.reach += parseInt(insight.reach) || 0;
+        adSet.impressions = parseInt(insight.impressions) || 0;
+        adSet.clicks = parseInt(insight.clicks) || 0;
+        adSet.spend = parseFloat(insight.spend) || 0;
+        adSet.reach = parseInt(insight.reach) || 0;
         
         // Process lead generation metrics from actions and cost_per_action_type
         if (insight.actions && Array.isArray(insight.actions)) {
@@ -2211,9 +2225,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       }
     }
     
-    return Array.from(adSetMap.values()).filter(adSet => 
-      adSet.impressions > 0 || adSet.clicks > 0 || adSet.spend > 0
-    );
+    // Return all ad sets regardless of activity
+    return Array.from(adSetMap.values());
   }
 
   // Helper function to process ads data
@@ -2302,9 +2315,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       }
     }
     
-    return Array.from(adMap.values()).filter(ad => 
-      ad.impressions > 0 || ad.clicks > 0 || ad.spend > 0
-    );
+    // Return all ads regardless of activity
+    return Array.from(adMap.values());
   }
 
   // Helper function to generate campaign summary
