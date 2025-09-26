@@ -400,7 +400,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = []): string {
     let context = `User Message: ${messageContent}\n\n`;
     
-    // Add current task statuses if any
+    // Add current task statuses
     if (currentTaskStatuses.length > 0) {
       context += 'Current Task Statuses:\n';
       currentTaskStatuses.forEach(task => {
@@ -414,6 +414,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         context += `${emoji} ${task.taskName} (${task.status}) - Task ID: ${task.taskId}, Execution ID: ${task.executionId}\n`;
       });
       context += '\n';
+    } else {
+      context += '📋 **Task Status**: No tasks have been run in this session yet.\n\n';
     }
     
     // Add recent conversation history (excluding system messages)
