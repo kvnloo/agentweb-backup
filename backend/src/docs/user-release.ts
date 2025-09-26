@@ -7,6 +7,12 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-09-26',
+    changes: [
+      'Updated Subscribed Email Footer',
+    ],
+  },
+  {
     date: '2025-09-25',
     changes: [
       'Fixed bug that screenshot files cannot be uploaded in Agent Mode',

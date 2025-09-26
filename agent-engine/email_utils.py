@@ -394,7 +394,7 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
   {f'<p>Manage task and history at: <a href="{os.getenv("CUSTOMER_FRONTEND_URL", "http://localhost:5174")}/tasks/{task_id}">{os.getenv("CUSTOMER_FRONTEND_URL", "http://localhost:5174")}/tasks/{task_id}</a></p>' if not send_html_report_only else ''}
   {f'<p><small><strong>Note:</strong> Some visuals may not display properly in the email. <a href="{html_content_url}">View full report here</a> for the complete experience.</small></p>' if html_content_url else ''}
   <hr>
-  <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>
+  <p><small>You're receiving this automated email because you're subscribed to the email updates</small></p>
   <p><small><a href="{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/unsubscribe?taskId={task_id}&email={to_email}" style="color: #e74c3c;">Unsubscribe from future updates</a></small></p>
 </div>"""
                 
@@ -494,7 +494,7 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
       {f'<p>Manage task and history at: <a href="{os.getenv("CUSTOMER_FRONTEND_URL", "http://localhost:5174")}/tasks/{task_id}">{os.getenv("CUSTOMER_FRONTEND_URL", "http://localhost:5174")}/tasks/{task_id}</a></p>' if not send_html_report_only else ''}
       {f'<p><small><strong>Note:</strong> Some visuals may not display properly in the email. <a href="{html_content_url}">View full report here</a> for the complete experience.</small></p>' if html_content_url else ''}
       <hr>
-      <p><small>This is an automated message from AgentWeb. You are receiving this email because you are subscribed to updates for this task.</small></p>
+      <p><small>You're receiving this automated email because you're subscribed to the email updates</small></p>
       <p><small><a href="{os.getenv('CUSTOMER_FRONTEND_URL', 'http://localhost:5174')}/unsubscribe?taskId={task_id}&email={to_email}" style="color: #e74c3c;">Unsubscribe from future updates</a></small></p>
     </div>
   </div>
