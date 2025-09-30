@@ -46,6 +46,7 @@ import { buildApiUrl } from "../config";
 import DOMPurify from "dompurify";
 import ImageModelsSettings from "../components/admin/ImageModelsSettings";
 import DefaultPromptsSettings from "../components/admin/DefaultPromptsSettings";
+import BenchmarksTab from "../components/admin/BenchmarksTab";
 import {
   UserGrowthChart,
   TaskGrowthChart,
@@ -425,6 +426,7 @@ export default function AdminDashboard() {
     'agent-mode': 8,
     'image-models': 9,
     'default-prompts': 10,
+    'benchmarks': 11,
   };
   
   // Get initial tab value from URL or default to 0
@@ -1192,6 +1194,7 @@ export default function AdminDashboard() {
             <Tab label="Agent Mode" {...a11yProps(8)} />
             <Tab label="Image Models" {...a11yProps(9)} />
             <Tab label="Default Prompts" {...a11yProps(10)} />
+            <Tab label="Benchmarks" {...a11yProps(11)} />
           </Tabs>
         </Box>
 
@@ -2757,6 +2760,10 @@ export default function AdminDashboard() {
 
         <TabPanel value={tabValue} index={10}>
           <DefaultPromptsSettings />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={11}>
+          <BenchmarksTab />
         </TabPanel>
       </Paper>
 

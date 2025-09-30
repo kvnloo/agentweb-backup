@@ -1,0 +1,81 @@
+export interface BenchmarkTest {
+  testId: string;
+  createdBy: string; // Admin user ID who created the test
+  sessionId: string; // Source session ID
+  userId: string; // Target user ID whose session was used
+  testName: string;
+  description?: string;
+  conversationHistory: {
+    messages: Array<{
+      role: 'user' | 'assistant' | 'system';
+      content: string;
+      metadata?: {
+        timestamp: string;
+        toolCalls?: any[];
+        knowledgeBaseQueries?: string[];
+        sources?: string[];
+        attachments?: Array<{
+          url: string;
+          filename: string;
+          size: number;
+          mimetype: string;
+          uploadedAt: string;
+        }>;
+      };
+    }>;
+  };
+  expectedOutput: {
+    keywords: string[]; // Expected keywords in response
+    functionCalls?: string[]; // Expected function calls
+    responseType?: 'text' | 'html' | 'json' | 'image';
+    minResponseLength?: number;
+    maxResponseLength?: number;
+    additionalCriteria?: string; // Free text criteria
+  };
+  status: 'draft' | 'active' | 'archived';
+  createdAt: string;
+  updatedAt: string;
+  lastRunAt?: string;
+  runCount: number;
+  successCount: number;
+  failureCount: number;
+  averageScore?: number; // 0-100 score based on criteria matching
+}
+
+export interface BenchmarkTestResult {
+  testId: string;
+  runId: string;
+  status: 'success' | 'failure' | 'partial';
+  score: number; // 0-100
+  actualResponse: string;
+  actualFunctionCalls?: string[];
+  keywordMatches: string[];
+  keywordMisses: string[];
+  functionCallMatches?: string[];
+  functionCallMisses?: string[];
+  executionTime: number; // milliseconds
+  errorMessage?: string;
+  createdAt: string;
+}
+
+export interface CreateBenchmarkTestRequest {
+  sessionId: string;
+  testName: string;
+  description?: string;
+  expectedOutput: {
+    keywords: string[];
+    functionCalls?: string[];
+    responseType?: 'text' | 'html' | 'json' | 'image';
+    minResponseLength?: number;
+    maxResponseLength?: number;
+    additionalCriteria?: string;
+  };
+}
+
+export interface RunBenchmarkTestRequest {
+  testId: string;
+  llmName?: string; // Optional LLM override
+}
+
+
+

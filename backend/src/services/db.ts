@@ -2023,3 +2023,178 @@ class TaskTemplateDB {
 
 export const taskTemplateDb = new TaskTemplateDB();
 
+// Benchmark Tests Database
+class BenchmarkTestDB {
+  private docClient: AWS.DynamoDB.DocumentClient;
+  private tableName: string;
+
+  constructor() {
+    this.docClient = new AWS.DynamoDB.DocumentClient();
+    this.tableName = `${TABLE_PREFIX}AW-BenchmarkTests`;
+  }
+
+  async createBenchmarkTest(benchmarkTest: any) {
+    const params = {
+      TableName: this.tableName,
+      Item: {
+        ...benchmarkTest,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        runCount: 0,
+        successCount: 0,
+        failureCount: 0,
+      },
+    };
+
+    try {
+      await this.docClient.put(params).promise();
+      return benchmarkTest;
+    } catch (error) {
+      handleDynamoDbError(error, "createBenchmarkTest");
+      throw error;
+    }
+  }
+
+  async getBenchmarkTest(testId: string) {
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        testId,
+      },
+    };
+
+    try {
+      const result = await this.docClient.get(params).promise();
+      return result.Item;
+    } catch (error) {
+      handleDynamoDbError(error, "getBenchmarkTest");
+      throw error;
+    }
+  }
+
+  async getBenchmarkTestsByCreator(createdBy: string, limit: number = 50) {
+    const params = {
+      TableName: this.tableName,
+      IndexName: "CreatedByIndex",
+      KeyConditionExpression: "createdBy = :createdBy",
+      ExpressionAttributeValues: {
+        ":createdBy": createdBy,
+      },
+      ScanIndexForward: false, // Sort by createdAt descending
+      Limit: limit,
+    };
+
+    try {
+      const result = await this.docClient.query(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, "getBenchmarkTestsByCreator");
+      throw error;
+    }
+  }
+
+  async getAllBenchmarkTests(limit: number = 100) {
+    const params = {
+      TableName: this.tableName,
+      Limit: limit,
+    };
+
+    try {
+      const result = await this.docClient.scan(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, "getAllBenchmarkTests");
+      throw error;
+    }
+  }
+
+  async updateBenchmarkTest(testId: string, updates: any) {
+    const updateExpression = [];
+    const expressionAttributeNames: any = {};
+    const expressionAttributeValues: any = {};
+
+    // Build dynamic update expression
+    Object.keys(updates).forEach((key, index) => {
+      if (key !== 'testId') { // Don't update the key
+        updateExpression.push(`#${key} = :val${index}`);
+        expressionAttributeNames[`#${key}`] = key;
+        expressionAttributeValues[`:val${index}`] = updates[key];
+      }
+    });
+
+    updateExpression.push('#updatedAt = :updatedAt');
+    expressionAttributeNames['#updatedAt'] = 'updatedAt';
+    expressionAttributeValues[':updatedAt'] = new Date().toISOString();
+
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        testId,
+      },
+      UpdateExpression: `SET ${updateExpression.join(', ')}`,
+      ExpressionAttributeNames: expressionAttributeNames,
+      ExpressionAttributeValues: expressionAttributeValues,
+      ReturnValues: 'ALL_NEW',
+    };
+
+    try {
+      const result = await this.docClient.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "updateBenchmarkTest");
+      throw error;
+    }
+  }
+
+  async deleteBenchmarkTest(testId: string) {
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        testId,
+      },
+    };
+
+    try {
+      await this.docClient.delete(params).promise();
+      return { success: true };
+    } catch (error) {
+      handleDynamoDbError(error, "deleteBenchmarkTest");
+      throw error;
+    }
+  }
+
+  async incrementRunCount(testId: string, success: boolean) {
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        testId,
+      },
+      UpdateExpression: 'ADD runCount :inc, #successCount :successInc, #failureCount :failureInc SET #lastRunAt = :lastRunAt, #updatedAt = :updatedAt',
+      ExpressionAttributeNames: {
+        '#successCount': 'successCount',
+        '#failureCount': 'failureCount',
+        '#lastRunAt': 'lastRunAt',
+        '#updatedAt': 'updatedAt',
+      },
+      ExpressionAttributeValues: {
+        ':inc': 1,
+        ':successInc': success ? 1 : 0,
+        ':failureInc': success ? 0 : 1,
+        ':lastRunAt': new Date().toISOString(),
+        ':updatedAt': new Date().toISOString(),
+      },
+      ReturnValues: 'ALL_NEW',
+    };
+
+    try {
+      const result = await this.docClient.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "incrementRunCount");
+      throw error;
+    }
+  }
+}
+
+export const benchmarkTestDb = new BenchmarkTestDB();
+

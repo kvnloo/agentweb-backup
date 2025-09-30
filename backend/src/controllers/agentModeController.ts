@@ -50,11 +50,22 @@ export const agentModeController = {
   async getSession(req: Request, res: Response) {
     try {
       const { sessionId } = req.params;
+      const user = req.user as any; // Should have user from auth middleware
       console.log(`AgentMode: Getting session ${sessionId}`);
 
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
         return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Allow admin users to access any session for benchmark creation
+      if (user && user.isAdmin) {
+        return res.json(session);
+      }
+
+      // For non-admin users, check if they own the session
+      if (session.userId !== user?.userId) {
+        return res.status(403).json({ error: 'Unauthorized access to session' });
       }
 
       res.json(session);

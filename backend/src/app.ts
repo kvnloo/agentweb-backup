@@ -22,6 +22,7 @@ import agentModeRoutes from "./routes/agentMode";
 import settingsRoutes from "./routes/settings";
 import imageModelsRoutes from "./routes/image-models";
 import webhookRoutes from "./routes/webhooks";
+import benchmarkRoutes from "./routes/benchmark";
 
 // Import the new controller
 import {
@@ -101,6 +102,7 @@ app.use("/api/agent-mode", agentModeRoutes);
 app.use("/api/settings", settingsRoutes);
 app.use("/api/image-models", imageModelsRoutes);
 app.use("/api/webhooks", webhookRoutes);
+app.use("/api/benchmark", benchmarkRoutes);
 
 // Health check endpoint
 app.get("/", (req, res) => {
