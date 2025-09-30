@@ -32,6 +32,7 @@ interface User {
   isOAuthUser?: boolean;
   stripe_customer_id?: string;
   adAccount?: string; // Meta ad account ID
+  facebookPageId?: string; // Default Facebook Page ID
   emailDomain?: string; // Email sender domain
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
   fromName?: string; // From name for emails

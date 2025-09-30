@@ -91,11 +91,11 @@ router.put("/users/:userId/support-note", async (req, res) => {
   }
 });
 
-// Update user ad account
+// Update user ad account and default Facebook Page ID
 router.put("/users/:userId/ad-account", async (req, res) => {
   try {
     const { userId } = req.params;
-    const { adAccount } = req.body;
+    const { adAccount, facebookPageId } = req.body;
 
     // Check if user exists
     const user = await userDb.getUserById(userId);
@@ -103,8 +103,8 @@ router.put("/users/:userId/ad-account", async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Update the user's ad account
-    const updatedUser = await userDb.updateUser(userId, { adAccount });
+    // Update the user's ad account and optional page id
+    const updatedUser = await userDb.updateUser(userId, { adAccount, facebookPageId });
     res.json(updatedUser);
   } catch (error) {
     console.error("Error updating user ad account:", error);

@@ -573,11 +573,11 @@ router.get("/campaigns-and-adsets", async (req, res) => {
 // Create Meta ad
 router.post("/create-ad", async (req, res) => {
   const userId = (req as any).user.userId;
-  const { imageUrl, campaignId, adSetId, adName, adText, adHeadline, adDescription, adCallToAction, pageId, taskId, executionId } = req.body;
+  const { imageUrl, campaignId, adSetId, adName, adText, adHeadline, adDescription, adCallToAction, taskId, executionId } = req.body;
   
   try {
-    // Validate required fields
-    if (!imageUrl || !campaignId || !adSetId || !adName || !pageId) {
+    // Validate required fields (pageId will come from stored user config)
+    if (!imageUrl || !campaignId || !adSetId || !adName) {
       return res.status(400).json({ message: "Missing required fields" });
     }
 
@@ -607,7 +607,16 @@ router.post("/create-ad", async (req, res) => {
     const apiVersion = process.env.META_API_VERSION || 'v18.0';
     
     console.log("=== Creating Meta Ad ===");
-    console.log("Received pageId:", pageId);
+    const pageId = user.facebookPageId;
+    console.log("Using stored pageId:", pageId);
+    if (!pageId) {
+      return res.status(400).json({
+        message: "Facebook Page ID is not configured for this user.",
+        error: "Facebook Page is Missing",
+        resolution:
+          "Please set a valid Facebook Page ID in the Admin Users tab (Ad Account dialog).",
+      });
+    }
     console.log("Received adName:", adName);
     console.log("Received adSetId:", adSetId);
     console.log("Received imageUrl:", imageUrl);
@@ -629,6 +638,7 @@ router.post("/create-ad", async (req, res) => {
     
     console.log("Account verified:", accountData.name, "Status:", accountData.account_status);
     
+
     // Try uploading image to the ad account
     console.log("=== Uploading Image ===");
     const uploadUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adimages`;
@@ -742,6 +752,13 @@ router.post("/create-ad", async (req, res) => {
       // Check if it's a Dynamic Creative Ad Set issue
       if (creativeResult.error.error_subcode === 2446391) {
         throw new Error(`Creative API Error: This ad set is configured for Dynamic Creative, which has been deprecated. Please use a different ad set or create a new one without Dynamic Creative enabled. (Code: ${creativeResult.error.code})`);
+      }
+      // Specific handling: Missing Facebook Page
+      if (creativeResult.error.error_subcode === 1443121) {
+        return res.status(400).json({
+          message: "Facebook Page is Missing",
+          error: "Please contact your administrator to configure a default Facebook Page ID for your account."
+        });
       }
       
       throw new Error(`Creative API Error: ${creativeResult.error.message} (Code: ${creativeResult.error.code})`);

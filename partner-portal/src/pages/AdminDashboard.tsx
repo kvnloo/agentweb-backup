@@ -142,6 +142,7 @@ interface User {
   isOAuthUser?: boolean; // Ensured from API structure
   stripe_customer_id?: string; // Added stripe_customer_id
   adAccount?: string; // Meta ad account ID
+  facebookPageId?: string; // Default Facebook Page ID
   emailDomain?: string; // Email sender domain
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
   fromName?: string; // From name for emails
@@ -467,6 +468,8 @@ export default function AdminDashboard() {
   const [editingAdAccountUserId, setEditingAdAccountUserId] = useState<string | null>(null);
   const [currentAdAccountText, setCurrentAdAccountText] = useState("");
   const [adAccountEditLoading, setAdAccountEditLoading] = useState(false);
+  const [currentFacebookPageIdText, setCurrentFacebookPageIdText] = useState("");
+  const [adAccountDialogOpen, setAdAccountDialogOpen] = useState(false);
   const [emailSenderDialogOpen, setEmailSenderDialogOpen] = useState(false);
   const [editingEmailSenderUserId, setEditingEmailSenderUserId] = useState<string | null>(null);
   const [emailDomain, setEmailDomain] = useState("");
@@ -1028,10 +1031,15 @@ export default function AdminDashboard() {
         setError("Meta Ad Account ID must be a numeric value (e.g., 123456789012345)");
         return;
       }
+      const facebookPageId = currentFacebookPageIdText.trim();
+      if (facebookPageId && !/^\d+$/.test(facebookPageId)) {
+        setError("Facebook Page ID must be a numeric value (e.g., 123456789012345)");
+        return;
+      }
       
       const response = await axios.put(
         buildApiUrl(`/api/admin/users/${userId}/ad-account`),
-        { adAccount: adAccountId },
+        { adAccount: adAccountId, facebookPageId },
         {
           headers: { Authorization: `Bearer ${token}` }
         }
@@ -1042,13 +1050,14 @@ export default function AdminDashboard() {
         setUsers((prevUsers: User[]) => 
           prevUsers.map((user: User) => 
             user.userId === userId 
-              ? { ...user, adAccount: response.data.adAccount }
+              ? { ...user, adAccount: response.data.adAccount, facebookPageId: response.data.facebookPageId }
               : user
           )
         );
         setSuccess("Ad account updated successfully!");
         setEditingAdAccountUserId(null);
         setCurrentAdAccountText("");
+        setCurrentFacebookPageIdText("");
       }
     } catch (error: any) {
       console.error("Error updating ad account:", error);
@@ -1575,53 +1584,32 @@ export default function AdminDashboard() {
                         <TableCell>{user.userId}</TableCell>
                         <TableCell>{user.stripe_customer_id || "-"}</TableCell>
                         <TableCell>
-                          {editingAdAccountUserId === user.userId ? (
-                            <>
-                                                              <TextField
-                                  size="small"
-                                  value={currentAdAccountText}
-                                  onChange={(e) => setCurrentAdAccountText(e.target.value)}
-                                  placeholder="Enter Meta Ad Account ID (e.g., 123456789012345)..."
-                                  sx={{ minWidth: 250 }}
-                                  disabled={adAccountEditLoading}
-                                  helperText="Meta Ad Account ID from business.facebook.com"
-                                />
-                              <IconButton
-                                size="small"
-                                onClick={() => handleSaveAdAccount(user.userId)}
-                                disabled={adAccountEditLoading}
-                                color="primary"
-                              >
-                                <CheckIcon />
-                              </IconButton>
-                              <IconButton
-                                size="small"
-                                onClick={() => {
-                                  setEditingAdAccountUserId(null);
-                                  setCurrentAdAccountText("");
-                                }}
-                                disabled={adAccountEditLoading}
-                              >
-                                <CloseIcon />
-                              </IconButton>
-                            </>
-                          ) : (
-                            <>
-                              <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
-                                {user.adAccount || "-"}
-                              </Typography>
-                              <IconButton
-                                size="small"
-                                onClick={() => {
-                                  setEditingAdAccountUserId(user.userId);
-                                  setCurrentAdAccountText(user.adAccount || "");
-                                }}
-                                disabled={adAccountEditLoading}
-                              >
-                                <EditIcon />
-                              </IconButton>
-                            </>
-                          )}
+                          <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
+                            {user.adAccount || user.facebookPageId ? (
+                              <div>
+                                {user.adAccount && (
+                                  <div><strong>Ad Account:</strong> {user.adAccount}</div>
+                                )}
+                                {user.facebookPageId && (
+                                  <div><strong>Page ID:</strong> {user.facebookPageId}</div>
+                                )}
+                              </div>
+                            ) : (
+                              "-"
+                            )}
+                          </Typography>
+                          <IconButton
+                            size="small"
+                            onClick={() => {
+                              setEditingAdAccountUserId(user.userId);
+                              setCurrentAdAccountText(user.adAccount || "");
+                              setCurrentFacebookPageIdText(user.facebookPageId || "");
+                              setAdAccountDialogOpen(true);
+                            }}
+                            disabled={adAccountEditLoading}
+                          >
+                            <EditIcon />
+                          </IconButton>
                         </TableCell>
                         <TableCell>
                           <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
@@ -2787,6 +2775,88 @@ export default function AdminDashboard() {
             disabled={loading}
           >
             {loading ? <CircularProgress size={24} /> : "Deactivate"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Ad Account & Facebook Page Configuration Dialog */}
+      <Dialog
+        open={adAccountDialogOpen}
+        onClose={() => {
+          setAdAccountDialogOpen(false);
+          setEditingAdAccountUserId(null);
+          setCurrentAdAccountText("");
+          setCurrentFacebookPageIdText("");
+        }}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>
+          Configure Meta Ad Account
+          <IconButton
+            aria-label="close"
+            onClick={() => {
+              setAdAccountDialogOpen(false);
+              setEditingAdAccountUserId(null);
+              setCurrentAdAccountText("");
+              setCurrentFacebookPageIdText("");
+            }}
+            sx={{ position: 'absolute', right: 8, top: 8 }}
+          >
+            <CloseIcon />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent dividers>
+          <Grid container spacing={2}>
+            <Grid item xs={12}>
+              <TextField
+                autoFocus
+                fullWidth
+                label="Meta Ad Account ID"
+                value={currentAdAccountText}
+                onChange={(e) => setCurrentAdAccountText(e.target.value)}
+                placeholder="123456789012345"
+                helperText="Numeric Ad Account ID from business.facebook.com"
+                disabled={adAccountEditLoading}
+              />
+            </Grid>
+            <Grid item xs={12}>
+              <TextField
+                fullWidth
+                label="Facebook Page ID"
+                value={currentFacebookPageIdText}
+                onChange={(e) => setCurrentFacebookPageIdText(e.target.value)}
+                placeholder="123456789012345"
+                helperText="Default Page ID to use when creating ads"
+                disabled={adAccountEditLoading}
+              />
+            </Grid>
+          </Grid>
+        </DialogContent>
+        <DialogActions>
+          <Button 
+            onClick={() => {
+              setAdAccountDialogOpen(false);
+              setEditingAdAccountUserId(null);
+              setCurrentAdAccountText("");
+              setCurrentFacebookPageIdText("");
+            }}
+            disabled={adAccountEditLoading}
+          >
+            Cancel
+          </Button>
+          <Button
+            onClick={() => {
+              if (editingAdAccountUserId) {
+                handleSaveAdAccount(editingAdAccountUserId);
+                setAdAccountDialogOpen(false);
+              }
+            }}
+            color="primary"
+            variant="contained"
+            disabled={adAccountEditLoading}
+          >
+            {adAccountEditLoading ? "Saving..." : "Save"}
           </Button>
         </DialogActions>
       </Dialog>
