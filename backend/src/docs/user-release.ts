@@ -7,6 +7,12 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-09-30',
+    changes: [
+      'Added Authorization checkbox for creating meta ad',
+    ],
+  },
+  {
     date: '2025-09-26',
     changes: [
       'Updated Subscribed Email Footer',
