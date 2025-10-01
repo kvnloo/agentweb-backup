@@ -322,7 +322,9 @@ export async function runBenchmarkTest(req: AuthenticatedRequest, res: Response)
       console.log(`Benchmark: Agent response generated in ${executionTime}ms`);
 
       // Extract function calls from the response
-      const actualFunctionCalls = agentResponse.toolCalls?.map((call: any) => call.function?.name).filter(Boolean) || [];
+      const actualFunctionCalls = agentResponse.toolCalls?.map((call: any) => call.name).filter(Boolean) || [];
+      console.log(`Benchmark: Extracted function calls:`, actualFunctionCalls);
+      console.log(`Benchmark: Raw toolCalls:`, agentResponse.toolCalls);
 
       // Evaluate the response against expected criteria
       const evaluation = evaluateBenchmarkResponse(

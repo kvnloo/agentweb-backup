@@ -36,6 +36,7 @@ import {
   PlayArrow as PlayIcon,
   Refresh as RefreshIcon,
   History as HistoryIcon,
+  Stop as StopIcon,
 } from '@mui/icons-material';
 import { useSearchParams } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
@@ -456,6 +457,7 @@ const BenchmarksTab: React.FC = () => {
   const [editDialogOpen, setEditDialogOpen] = useState(false);
   const [historyDialogOpen, setHistoryDialogOpen] = useState(false);
   const [selectedBenchmark, setSelectedBenchmark] = useState<BenchmarkTest | null>(null);
+  const [runningTests, setRunningTests] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     loadBenchmarks();
@@ -522,15 +524,25 @@ const BenchmarksTab: React.FC = () => {
 
   const handleRun = async (testId: string) => {
     try {
+      // Add test to running set
+      setRunningTests(prev => new Set(prev).add(testId));
+      
       await axios.post(buildApiUrl(`/api/benchmark/${testId}/run`), {}, {
         headers: { Authorization: `Bearer ${token}` },
       });
       
       // Refresh the list to get updated stats
-      loadBenchmarks();
+      await loadBenchmarks();
     } catch (err: any) {
       console.error('Error running benchmark:', err);
       setError(err.response?.data?.message || 'Failed to run benchmark test');
+    } finally {
+      // Remove test from running set
+      setRunningTests(prev => {
+        const newSet = new Set(prev);
+        newSet.delete(testId);
+        return newSet;
+      });
     }
   };
 
@@ -643,23 +655,27 @@ const BenchmarksTab: React.FC = () => {
                     })()}
                   </TableCell>
                   <TableCell>
-                    {new Date(benchmark.createdAt).toLocaleDateString()}
+                    {new Date(benchmark.createdAt).toLocaleString()}
                   </TableCell>
                   <TableCell>
                     {benchmark.lastRunAt
-                      ? new Date(benchmark.lastRunAt).toLocaleDateString()
+                      ? new Date(benchmark.lastRunAt).toLocaleString()
                       : 'Never'
                     }
                   </TableCell>
                   <TableCell>
                     <Box sx={{ display: 'flex', gap: 1 }}>
-                      <Tooltip title="Run Test">
+                      <Tooltip title={runningTests.has(benchmark.testId) ? "Running..." : "Run Test"}>
                         <IconButton
                           size="small"
                           onClick={() => handleRun(benchmark.testId)}
-                          disabled={benchmark.status !== 'active'}
+                          disabled={benchmark.status !== 'active' || runningTests.has(benchmark.testId)}
                         >
-                          <PlayIcon />
+                          {runningTests.has(benchmark.testId) ? (
+                            <CircularProgress size={16} />
+                          ) : (
+                            <PlayIcon />
+                          )}
                         </IconButton>
                       </Tooltip>
                       <Tooltip title="Edit">
