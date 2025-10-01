@@ -36,19 +36,20 @@ export interface BenchmarkTest {
   successCount: number;
   failureCount: number;
   averageScore?: number; // 0-100 score based on criteria matching
+  testHistory?: BenchmarkTestResult[]; // Array of test execution results
 }
 
 export interface BenchmarkTestResult {
   testId: string;
   runId: string;
-  status: 'success' | 'failure' | 'partial';
-  score: number; // 0-100
+  status: 'success' | 'failure';
+  passed: boolean;
   actualResponse: string;
-  actualFunctionCalls?: string[];
+  actualFunctionCalls: string[];
   keywordMatches: string[];
   keywordMisses: string[];
-  functionCallMatches?: string[];
-  functionCallMisses?: string[];
+  functionCallMatches: string[];
+  functionCallMisses: string[];
   executionTime: number; // milliseconds
   errorMessage?: string;
   createdAt: string;

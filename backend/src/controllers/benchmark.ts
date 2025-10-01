@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { benchmarkTestDb } from '../services/db';
 import { chatbotDb } from '../services/chatbotService';
+import { agentModeService } from '../services/agentModeService';
 import { AuthenticatedRequest } from '../middleware/auth';
 import { BenchmarkTest, CreateBenchmarkTestRequest, RunBenchmarkTestRequest } from '../types/benchmark';
 import { v4 as uuidv4 } from 'uuid';
@@ -209,6 +210,59 @@ export async function deleteBenchmarkTest(req: AuthenticatedRequest, res: Respon
   }
 }
 
+// Evaluate benchmark response against expected criteria
+function evaluateBenchmarkResponse(
+  actualResponse: string,
+  actualFunctionCalls: string[],
+  expectedOutput: any
+): {
+  passed: boolean;
+  keywordMatches: string[];
+  keywordMisses: string[];
+  functionCallMatches: string[];
+  functionCallMisses: string[];
+} {
+  const expectedKeywords = expectedOutput.keywords || [];
+  const expectedFunctionCalls = expectedOutput.functionCalls || [];
+
+  // Evaluate keywords
+  const keywordMatches: string[] = [];
+  const keywordMisses: string[] = [];
+  
+  expectedKeywords.forEach((keyword: string) => {
+    if (actualResponse.toLowerCase().includes(keyword.toLowerCase())) {
+      keywordMatches.push(keyword);
+    } else {
+      keywordMisses.push(keyword);
+    }
+  });
+
+  // Evaluate function calls
+  const functionCallMatches: string[] = [];
+  const functionCallMisses: string[] = [];
+  
+  expectedFunctionCalls.forEach((expectedCall: string) => {
+    if (actualFunctionCalls.includes(expectedCall)) {
+      functionCallMatches.push(expectedCall);
+    } else {
+      functionCallMisses.push(expectedCall);
+    }
+  });
+
+  // Pass only if ALL expected keywords and ALL expected function calls are present
+  const allKeywordsPresent = expectedKeywords.length === 0 || keywordMisses.length === 0;
+  const allFunctionCallsPresent = expectedFunctionCalls.length === 0 || functionCallMisses.length === 0;
+  const passed = allKeywordsPresent && allFunctionCallsPresent;
+
+  return {
+    passed,
+    keywordMatches,
+    keywordMisses,
+    functionCallMatches,
+    functionCallMisses
+  };
+}
+
 // Run a benchmark test
 export async function runBenchmarkTest(req: AuthenticatedRequest, res: Response) {
   try {
@@ -236,40 +290,103 @@ export async function runBenchmarkTest(req: AuthenticatedRequest, res: Response)
       });
     }
 
-    // TODO: Implement actual benchmark test execution
-    // This would involve:
-    // 1. Running the conversation through the agent
-    // 2. Analyzing the response against expected criteria
-    // 3. Calculating a score
-    // 4. Storing the results
-    // 5. Updating the test statistics
-
     const runId = uuidv4();
     const startTime = Date.now();
 
-    // For now, return a mock result
-    const mockResult = {
-      testId,
-      runId,
-      status: 'success' as const,
-      score: 85,
-      actualResponse: 'Mock response from agent',
-      actualFunctionCalls: ['create_task_from_prompt'],
-      keywordMatches: ['marketing', 'strategy'],
-      keywordMisses: ['budget'],
-      functionCallMatches: ['create_task_from_prompt'],
-      functionCallMisses: [],
-      executionTime: Date.now() - startTime,
-      createdAt: new Date().toISOString()
-    };
+    try {
+      // Prepare input for benchmark execution
+      const messages = test.conversationHistory.messages;
+      if (messages.length === 0) {
+        throw new Error('No conversation history available for benchmark test');
+      }
 
-    // Update test statistics
-    await benchmarkTestDb.incrementRunCount(testId, mockResult.status === 'success');
+      // Use the last message as the current message content
+      const lastMessage = messages[messages.length - 1];
+      const messageContent = lastMessage.content;
 
-    res.json({
-      message: 'Benchmark test executed successfully',
-      result: mockResult
-    });
+      // Use all messages except the last one as session history
+      const sessionHistory = messages.slice(0, -1);
+
+      console.log(`Benchmark: Running test ${testId} with ${sessionHistory.length} history messages`);
+
+      // Call the agent to generate response with mock mode enabled
+      const agentResponse = await agentModeService.generateMarketingResponse(
+        messageContent,
+        sessionHistory,
+        test.userId, // Use the original user's ID
+        test.sessionId, // Use the original session ID
+        true // Enable mock mode for benchmark testing
+      );
+
+      const executionTime = Date.now() - startTime;
+      console.log(`Benchmark: Agent response generated in ${executionTime}ms`);
+
+      // Extract function calls from the response
+      const actualFunctionCalls = agentResponse.toolCalls?.map((call: any) => call.function?.name).filter(Boolean) || [];
+
+      // Evaluate the response against expected criteria
+      const evaluation = evaluateBenchmarkResponse(
+        agentResponse.content,
+        actualFunctionCalls,
+        test.expectedOutput
+      );
+
+      // Determine overall status based on pass/fail
+      const status = evaluation.passed ? 'success' : 'failure';
+
+      const result = {
+        testId,
+        runId,
+        status,
+        passed: evaluation.passed,
+        actualResponse: agentResponse.content,
+        actualFunctionCalls,
+        keywordMatches: evaluation.keywordMatches,
+        keywordMisses: evaluation.keywordMisses,
+        functionCallMatches: evaluation.functionCallMatches,
+        functionCallMisses: evaluation.functionCallMisses,
+        executionTime,
+        createdAt: new Date().toISOString()
+      };
+
+      // Update test statistics and save result to history
+      await benchmarkTestDb.incrementRunCount(testId, status === 'success');
+      await benchmarkTestDb.addTestResult(testId, result);
+
+      res.json({
+        message: 'Benchmark test executed successfully',
+        result
+      });
+
+    } catch (executionError) {
+      console.error('Error during benchmark execution:', executionError);
+      
+      const executionTime = Date.now() - startTime;
+      const errorResult = {
+        testId,
+        runId,
+        status: 'failure' as const,
+        passed: false,
+        actualResponse: '',
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: test.expectedOutput.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: test.expectedOutput.functionCalls || [],
+        executionTime,
+        errorMessage: executionError instanceof Error ? executionError.message : 'Unknown execution error',
+        createdAt: new Date().toISOString()
+      };
+
+      // Update test statistics and save result to history (count as failure)
+      await benchmarkTestDb.incrementRunCount(testId, false);
+      await benchmarkTestDb.addTestResult(testId, errorResult);
+
+      res.json({
+        message: 'Benchmark test execution failed',
+        result: errorResult
+      });
+    }
   } catch (error) {
     console.error('Error running benchmark test:', error);
     res.status(500).json({ 

@@ -2194,6 +2194,34 @@ class BenchmarkTestDB {
       throw error;
     }
   }
+
+  async addTestResult(testId: string, testResult: any) {
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        testId,
+      },
+      UpdateExpression: 'SET #testHistory = list_append(if_not_exists(#testHistory, :emptyList), :testResult), #updatedAt = :updatedAt',
+      ExpressionAttributeNames: {
+        '#testHistory': 'testHistory',
+        '#updatedAt': 'updatedAt',
+      },
+      ExpressionAttributeValues: {
+        ':testResult': [testResult],
+        ':emptyList': [],
+        ':updatedAt': new Date().toISOString(),
+      },
+      ReturnValues: 'ALL_NEW',
+    };
+
+    try {
+      const result = await this.docClient.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "addTestResult");
+      throw error;
+    }
+  }
 }
 
 export const benchmarkTestDb = new BenchmarkTestDB();

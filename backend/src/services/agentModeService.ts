@@ -35,7 +35,8 @@ export class AgentModeService {
     messageContent: string,
     sessionHistory: ChatMessage[],
     userId: string,
-    sessionId: string
+    sessionId: string,
+    mockMode: boolean = false
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[] }> {
     try {
       console.log('AgentMode: Generating marketing response');
@@ -104,7 +105,7 @@ export class AgentModeService {
             const functionArgs = JSON.parse(toolCall.function.arguments);
             console.log(`AgentMode: Executing tool ${toolCall.function.name}`);
             
-            const result = await this.executeTool(toolCall.function.name, functionArgs, userId, sessionId);
+            const result = await this.executeTool(toolCall.function.name, functionArgs, userId, sessionId, mockMode);
             
             toolCalls.push({
               id: toolCall.id,
@@ -808,10 +809,144 @@ Use the available tools to create tasks in the agent-engine when complex work is
     ];
   }
 
-  private async executeTool(toolName: string, args: any, userId: string, sessionId: string): Promise<any> {
+  private getMockToolResult(toolName: string, args: any): any {
+    // Return realistic mock data for different tool types
+    switch (toolName) {
+      case 'create_task_from_template':
+        return {
+          success: true,
+          taskId: `mock-task-${Date.now()}`,
+          message: `Mock task created from template ${args.template_id}`,
+          status: 'created'
+        };
+      
+      case 'create_task_from_prompt':
+        return {
+          success: true,
+          taskId: `mock-task-${Date.now()}`,
+          message: `Mock task created: ${args.task_name}`,
+          status: 'created'
+        };
+      
+      case 'create_image_task_from_prompt':
+        return {
+          success: true,
+          taskId: `mock-image-task-${Date.now()}`,
+          message: `Mock image task created: ${args.task_name}`,
+          status: 'created'
+        };
+      
+      case 'get_meta_ads_metrics':
+        return {
+          success: true,
+          metrics: {
+            impressions: 12500,
+            clicks: 450,
+            spend: 125.50,
+            conversions: 23,
+            ctr: 3.6,
+            cpc: 0.28,
+            cpm: 10.04
+          },
+          timeframe: args.timeframe || '7d'
+        };
+      
+      case 'search_web':
+        return {
+          success: true,
+          results: [
+            {
+              title: `Mock search result for "${args.query}"`,
+              url: 'https://example.com/mock-result-1',
+              snippet: 'This is a mock search result snippet that would contain relevant information.'
+            },
+            {
+              title: `Another mock result for "${args.query}"`,
+              url: 'https://example.com/mock-result-2',
+              snippet: 'Another mock search result with different information.'
+            }
+          ]
+        };
+      
+      case 'read_brand_guidelines':
+        return {
+          success: true,
+          exists: true,
+          brandData: {
+            brandName: 'Mock Brand',
+            tagline: 'Mock tagline for testing',
+            primaryColor: '#FF6B6B',
+            toneOfVoice: 'Professional and friendly'
+          },
+          brandAssets: []
+        };
+      
+      case 'update_brand_guidelines':
+        return {
+          success: true,
+          message: 'Mock brand guidelines updated successfully'
+        };
+      
+      case 'read_market_strategy':
+        return {
+          success: true,
+          exists: true,
+          businessOverview: 'Mock business overview for testing purposes',
+          competitors: [
+            { name: 'Mock Competitor 1', description: 'A mock competitor description' }
+          ],
+          icp: [
+            { title: 'Mock ICP', description: 'Mock ideal customer profile', valueProposition: 'Mock value prop' }
+          ]
+        };
+      
+      case 'update_market_strategy':
+        return {
+          success: true,
+          message: 'Mock market strategy updated successfully'
+        };
+      
+      case 'create_revision':
+        return {
+          success: true,
+          revisionId: `mock-revision-${Date.now()}`,
+          message: 'Mock revision created successfully'
+        };
+      
+      case 'save_file':
+        return {
+          success: true,
+          fileUrl: `https://mock-s3-bucket.s3.amazonaws.com/mock-files/${args.file_name}`,
+          message: 'Mock file saved successfully'
+        };
+      
+      case 'read_file_content':
+        return {
+          success: true,
+          content: `Mock file content for ${args.file_url}. This would be the actual content of the file in a real scenario.`,
+          filename: 'mock-file.txt'
+        };
+      
+      default:
+        return {
+          success: true,
+          message: `Mock result for unknown tool: ${toolName}`,
+          data: args
+        };
+    }
+  }
+
+  private async executeTool(toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false): Promise<any> {
     const argsStr = JSON.stringify(args, null, 2);
     const truncatedArgs = argsStr.length > 500 ? argsStr.substring(0, 500) + '...' : argsStr;
     console.log('AgentMode: Executing tool:', toolName, 'with args:', truncatedArgs);
+    
+    // Return mock data if in mock mode
+    if (mockMode) {
+      console.log('AgentMode: Mock mode enabled, returning mock data for tool:', toolName);
+      return this.getMockToolResult(toolName, args);
+    }
+    
     switch (toolName) {
       case 'create_task_from_template':
         try {
