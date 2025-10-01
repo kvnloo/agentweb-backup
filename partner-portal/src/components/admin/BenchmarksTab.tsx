@@ -35,6 +35,7 @@ import {
   Delete as DeleteIcon,
   PlayArrow as PlayIcon,
   Refresh as RefreshIcon,
+  History as HistoryIcon,
 } from '@mui/icons-material';
 import { useSearchParams } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
@@ -67,6 +68,21 @@ interface BenchmarkTest {
   successCount: number;
   failureCount: number;
   averageScore?: number;
+  testHistory?: Array<{
+    testId: string;
+    runId: string;
+    status: 'success' | 'failure';
+    passed: boolean;
+    actualResponse: string;
+    actualFunctionCalls: string[];
+    keywordMatches: string[];
+    keywordMisses: string[];
+    functionCallMatches: string[];
+    functionCallMisses: string[];
+    executionTime: number;
+    errorMessage?: string;
+    createdAt: string;
+  }>;
 }
 
 interface CreateBenchmarkDialogProps {
@@ -438,6 +454,7 @@ const BenchmarksTab: React.FC = () => {
   const [error, setError] = useState('');
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [editDialogOpen, setEditDialogOpen] = useState(false);
+  const [historyDialogOpen, setHistoryDialogOpen] = useState(false);
   const [selectedBenchmark, setSelectedBenchmark] = useState<BenchmarkTest | null>(null);
 
   useEffect(() => {
@@ -483,6 +500,11 @@ const BenchmarksTab: React.FC = () => {
     setEditDialogOpen(true);
   };
 
+  const handleViewHistory = (benchmark: BenchmarkTest) => {
+    setSelectedBenchmark(benchmark);
+    setHistoryDialogOpen(true);
+  };
+
   const handleDelete = async (testId: string) => {
     if (!window.confirm('Are you sure you want to delete this benchmark test?')) return;
     
@@ -524,6 +546,14 @@ const BenchmarksTab: React.FC = () => {
   const getSuccessRate = (benchmark: BenchmarkTest) => {
     if (benchmark.runCount === 0) return 'N/A';
     return `${Math.round((benchmark.successCount / benchmark.runCount) * 100)}%`;
+  };
+
+  const getLastRunResult = (benchmark: BenchmarkTest) => {
+    if (!benchmark.testHistory || benchmark.testHistory.length === 0) {
+      return null;
+    }
+    // Get the last (most recent) test result
+    return benchmark.testHistory[benchmark.testHistory.length - 1];
   };
 
   return (
@@ -569,6 +599,7 @@ const BenchmarksTab: React.FC = () => {
                 <TableCell>Status</TableCell>
                 <TableCell>Runs</TableCell>
                 <TableCell>Success Rate</TableCell>
+                <TableCell>Last Run Result</TableCell>
                 <TableCell>Created</TableCell>
                 <TableCell>Last Run</TableCell>
                 <TableCell>Actions</TableCell>
@@ -597,6 +628,21 @@ const BenchmarksTab: React.FC = () => {
                   <TableCell>{benchmark.runCount}</TableCell>
                   <TableCell>{getSuccessRate(benchmark)}</TableCell>
                   <TableCell>
+                    {(() => {
+                      const lastRun = getLastRunResult(benchmark);
+                      if (!lastRun) {
+                        return <Typography variant="body2" color="text.secondary">Never run</Typography>;
+                      }
+                      return (
+                        <Chip
+                          label={lastRun.passed ? 'PASSED' : 'FAILED'}
+                          color={lastRun.passed ? 'success' : 'error'}
+                          size="small"
+                        />
+                      );
+                    })()}
+                  </TableCell>
+                  <TableCell>
                     {new Date(benchmark.createdAt).toLocaleDateString()}
                   </TableCell>
                   <TableCell>
@@ -624,6 +670,15 @@ const BenchmarksTab: React.FC = () => {
                           <EditIcon />
                         </IconButton>
                       </Tooltip>
+                      <Tooltip title="View History">
+                        <IconButton
+                          size="small"
+                          onClick={() => handleViewHistory(benchmark)}
+                          disabled={!benchmark.testHistory || benchmark.testHistory.length === 0}
+                        >
+                          <HistoryIcon />
+                        </IconButton>
+                      </Tooltip>
                       <Tooltip title="Delete">
                         <IconButton
                           size="small"
@@ -639,7 +694,7 @@ const BenchmarksTab: React.FC = () => {
               ))}
               {(!Array.isArray(benchmarks) || benchmarks.length === 0) && (
                 <TableRow>
-                  <TableCell colSpan={7} align="center">
+                  <TableCell colSpan={8} align="center">
                     <Typography color="text.secondary">
                       No benchmark tests found. Create your first one!
                     </Typography>
@@ -667,6 +722,157 @@ const BenchmarksTab: React.FC = () => {
         editTest={selectedBenchmark}
         onSuccess={loadBenchmarks}
       />
+
+      {/* History Dialog */}
+      <Dialog open={historyDialogOpen} onClose={() => setHistoryDialogOpen(false)} maxWidth="lg" fullWidth>
+        <DialogTitle>
+          Test Execution History
+          {selectedBenchmark && (
+            <Typography variant="subtitle2" color="text.secondary" sx={{ mt: 1 }}>
+              {selectedBenchmark.testName}
+            </Typography>
+          )}
+        </DialogTitle>
+        <DialogContent>
+          {selectedBenchmark?.testHistory && selectedBenchmark.testHistory.length > 0 ? (
+            <Box>
+              {selectedBenchmark.testHistory
+                .slice()
+                .reverse() // Show most recent first
+                .map((result, index) => (
+                  <Card key={result.runId} sx={{ mb: 2 }}>
+                    <CardContent>
+                      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+                          <Chip
+                            label={result.passed ? 'PASSED' : 'FAILED'}
+                            color={result.passed ? 'success' : 'error'}
+                            size="small"
+                          />
+                          <Typography variant="body2" color="text.secondary">
+                            Run #{selectedBenchmark.testHistory!.length - index}
+                          </Typography>
+                          <Typography variant="body2" color="text.secondary">
+                            {new Date(result.createdAt).toLocaleString()}
+                          </Typography>
+                        </Box>
+                        <Typography variant="body2" color="text.secondary">
+                          {result.executionTime}ms
+                        </Typography>
+                      </Box>
+
+                      {result.actualResponse && (
+                        <Box sx={{ mb: 2 }}>
+                          <Typography variant="subtitle2" gutterBottom>
+                            Response:
+                          </Typography>
+                          <Paper sx={{ p: 2, bgcolor: 'grey.50', maxHeight: 200, overflow: 'auto' }}>
+                            <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
+                              {result.actualResponse}
+                            </Typography>
+                          </Paper>
+                        </Box>
+                      )}
+
+                      {result.actualFunctionCalls && result.actualFunctionCalls.length > 0 && (
+                        <Box sx={{ mb: 2 }}>
+                          <Typography variant="subtitle2" gutterBottom>
+                            Function Calls:
+                          </Typography>
+                          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
+                            {result.actualFunctionCalls.map((call, callIndex) => (
+                              <Chip key={callIndex} label={call} size="small" variant="outlined" />
+                            ))}
+                          </Box>
+                        </Box>
+                      )}
+
+                      <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2 }}>
+                        <Box>
+                          <Typography variant="subtitle2" gutterBottom>
+                            Keyword Matches:
+                          </Typography>
+                          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
+                            {result.keywordMatches.map((keyword, keywordIndex) => (
+                              <Chip key={keywordIndex} label={keyword} size="small" color="success" />
+                            ))}
+                            {result.keywordMatches.length === 0 && (
+                              <Typography variant="body2" color="text.secondary">None</Typography>
+                            )}
+                          </Box>
+                        </Box>
+
+                        <Box>
+                          <Typography variant="subtitle2" gutterBottom>
+                            Keyword Misses:
+                          </Typography>
+                          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
+                            {result.keywordMisses.map((keyword, keywordIndex) => (
+                              <Chip key={keywordIndex} label={keyword} size="small" color="error" />
+                            ))}
+                            {result.keywordMisses.length === 0 && (
+                              <Typography variant="body2" color="text.secondary">None</Typography>
+                            )}
+                          </Box>
+                        </Box>
+
+                        <Box>
+                          <Typography variant="subtitle2" gutterBottom>
+                            Function Call Matches:
+                          </Typography>
+                          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
+                            {result.functionCallMatches.map((call, callIndex) => (
+                              <Chip key={callIndex} label={call} size="small" color="success" />
+                            ))}
+                            {result.functionCallMatches.length === 0 && (
+                              <Typography variant="body2" color="text.secondary">None</Typography>
+                            )}
+                          </Box>
+                        </Box>
+
+                        <Box>
+                          <Typography variant="subtitle2" gutterBottom>
+                            Function Call Misses:
+                          </Typography>
+                          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
+                            {result.functionCallMisses.map((call, callIndex) => (
+                              <Chip key={callIndex} label={call} size="small" color="error" />
+                            ))}
+                            {result.functionCallMisses.length === 0 && (
+                              <Typography variant="body2" color="text.secondary">None</Typography>
+                            )}
+                          </Box>
+                        </Box>
+                      </Box>
+
+                      {result.errorMessage && (
+                        <Box sx={{ mt: 2 }}>
+                          <Typography variant="subtitle2" gutterBottom color="error">
+                            Error:
+                          </Typography>
+                          <Typography variant="body2" color="error">
+                            {result.errorMessage}
+                          </Typography>
+                        </Box>
+                      )}
+                    </CardContent>
+                  </Card>
+                ))}
+            </Box>
+          ) : (
+            <Box sx={{ textAlign: 'center', py: 4 }}>
+              <Typography color="text.secondary">
+                No execution history available for this test.
+              </Typography>
+            </Box>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setHistoryDialogOpen(false)}>
+            Close
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 };
