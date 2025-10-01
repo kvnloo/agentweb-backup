@@ -25,12 +25,8 @@ export interface BenchmarkTest {
     }>;
   };
   expectedOutput: {
-    keywords: string[]; // Expected keywords in response
+    keywords?: string[]; // Expected keywords in response
     functionCalls?: string[]; // Expected function calls
-    responseType?: 'text' | 'html' | 'json' | 'image';
-    minResponseLength?: number;
-    maxResponseLength?: number;
-    additionalCriteria?: string; // Free text criteria
   };
   status: 'draft' | 'active' | 'archived';
   createdAt: string;
@@ -63,12 +59,8 @@ export interface CreateBenchmarkTestRequest {
   testName: string;
   description?: string;
   expectedOutput: {
-    keywords: string[];
+    keywords?: string[];
     functionCalls?: string[];
-    responseType?: 'text' | 'html' | 'json' | 'image';
-    minResponseLength?: number;
-    maxResponseLength?: number;
-    additionalCriteria?: string;
   };
 }
 

@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { agentModeService } from '../services/agentModeService';
+import { agentModeService, AgentModeService } from '../services/agentModeService';
 import { chatbotDb, updateTaskExecutionStatus } from '../services/chatbotService';
 import { User } from '../types/auth';
 import multer from 'multer';
@@ -72,6 +72,25 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Get session error:', error);
       res.status(500).json({ error: 'Failed to get session' });
+    }
+  },
+
+  // Get available function calls for benchmark tests
+  async getAvailableFunctionCalls(req: Request, res: Response) {
+    try {
+      const agentModeService = new AgentModeService();
+      const tools = agentModeService.getAvailableTools();
+      
+      // Extract function names and descriptions
+      const functionCalls = tools.map((tool: any) => ({
+        name: tool.function.name,
+        description: tool.function.description
+      }));
+
+      res.json({ functionCalls });
+    } catch (error) {
+      console.error('AgentMode: Get function calls error:', error);
+      res.status(500).json({ error: 'Failed to get function calls' });
     }
   },
 

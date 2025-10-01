@@ -28,7 +28,6 @@ import {
   MenuItem,
   FormControlLabel,
   Checkbox,
-  Divider,
 } from '@mui/material';
 import {
   Add as AddIcon,
@@ -57,12 +56,8 @@ interface BenchmarkTest {
     }>;
   };
   expectedOutput: {
-    keywords: string[];
+    keywords?: string[];
     functionCalls?: string[];
-    responseType?: 'text' | 'html' | 'json' | 'image';
-    minResponseLength?: number;
-    maxResponseLength?: number;
-    additionalCriteria?: string;
   };
   status: 'draft' | 'active' | 'archived';
   createdAt: string;
@@ -78,6 +73,7 @@ interface CreateBenchmarkDialogProps {
   open: boolean;
   onClose: () => void;
   sessionId?: string;
+  editTest?: BenchmarkTest | null;
   onSuccess: () => void;
 }
 
@@ -85,30 +81,60 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
   open,
   onClose,
   sessionId,
+  editTest,
   onSuccess,
 }) => {
   const { token } = useAuth();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [sessionMessages, setSessionMessages] = useState<any[]>([]);
+  const [availableFunctionCalls, setAvailableFunctionCalls] = useState<Array<{name: string; description: string}>>([]);
   const [formData, setFormData] = useState({
     testName: '',
     description: '',
     keywords: [] as string[],
     functionCalls: [] as string[],
-    responseType: 'text' as 'text' | 'html' | 'json' | 'image',
-    minResponseLength: '',
-    maxResponseLength: '',
-    additionalCriteria: '',
   });
   const [newKeyword, setNewKeyword] = useState('');
-  const [newFunctionCall, setNewFunctionCall] = useState('');
 
   useEffect(() => {
-    if (open && sessionId) {
-      loadSessionMessages();
+    if (open) {
+      loadAvailableFunctionCalls();
+      if (editTest) {
+        // Populate form with existing test data
+        setFormData({
+          testName: editTest.testName,
+          description: editTest.description || '',
+          keywords: editTest.expectedOutput.keywords || [],
+          functionCalls: editTest.expectedOutput.functionCalls || [],
+        });
+        // Load session messages if available
+        if (editTest.conversationHistory?.messages) {
+          setSessionMessages(editTest.conversationHistory.messages);
+        }
+      } else if (sessionId) {
+        loadSessionMessages();
+      }
     }
-  }, [open, sessionId]);
+  }, [open, sessionId, editTest]);
+
+  const loadAvailableFunctionCalls = async () => {
+    if (!token) return;
+    
+    try {
+      const response = await axios.get(
+        buildApiUrl('/api/agent-mode/function-calls'),
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      
+      if (response.data?.functionCalls) {
+        setAvailableFunctionCalls(response.data.functionCalls);
+      }
+    } catch (err: any) {
+      console.error('Error loading function calls:', err);
+      // Don't show error for function calls as it's not critical
+    }
+  };
 
   const loadSessionMessages = async () => {
     if (!sessionId || !token) return;
@@ -122,10 +148,6 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
       
       if (response.data?.messages) {
         setSessionMessages(response.data.messages);
-        setFormData(prev => ({
-          ...prev,
-          testName: `Benchmark from Session ${sessionId.slice(-6)}`,
-        }));
       }
     } catch (err: any) {
       console.error('Error loading session messages:', err);
@@ -152,20 +174,12 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
     }));
   };
 
-  const addFunctionCall = () => {
-    if (newFunctionCall.trim() && !formData.functionCalls.includes(newFunctionCall.trim())) {
-      setFormData(prev => ({
-        ...prev,
-        functionCalls: [...prev.functionCalls, newFunctionCall.trim()],
-      }));
-      setNewFunctionCall('');
-    }
-  };
-
-  const removeFunctionCall = (index: number) => {
+  const handleFunctionCallChange = (functionName: string, checked: boolean) => {
     setFormData(prev => ({
       ...prev,
-      functionCalls: prev.functionCalls.filter((_, i) => i !== index),
+      functionCalls: checked
+        ? [...prev.functionCalls, functionName]
+        : prev.functionCalls.filter(name => name !== functionName),
     }));
   };
 
@@ -174,39 +188,54 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
       setError('Test name is required');
       return;
     }
-    if (formData.keywords.length === 0) {
-      setError('At least one expected keyword is required');
-      return;
-    }
 
     try {
       setLoading(true);
       setError('');
 
       const payload = {
-        sessionId,
         testName: formData.testName.trim(),
         description: formData.description.trim() || undefined,
         expectedOutput: {
-          keywords: formData.keywords,
+          keywords: formData.keywords.length > 0 ? formData.keywords : undefined,
           functionCalls: formData.functionCalls.length > 0 ? formData.functionCalls : undefined,
-          responseType: formData.responseType,
-          minResponseLength: formData.minResponseLength ? Number(formData.minResponseLength) : undefined,
-          maxResponseLength: formData.maxResponseLength ? Number(formData.maxResponseLength) : undefined,
-          additionalCriteria: formData.additionalCriteria.trim() || undefined,
         },
       };
 
-      await axios.post(buildApiUrl('/api/benchmark'), payload, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      if (editTest) {
+        // Update existing test
+        await axios.put(buildApiUrl(`/api/benchmark/${editTest.testId}`), payload, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+      } else {
+        // Create new test
+        // Filter out the last message if it's from assistant for the conversation history
+        const filteredMessages = sessionMessages.filter((message, index) => {
+          if (index === sessionMessages.length - 1 && message.role === 'assistant') {
+            return false;
+          }
+          return true;
+        });
+
+        const createPayload = {
+          ...payload,
+          sessionId,
+          conversationHistory: {
+            messages: filteredMessages
+          },
+        };
+
+        await axios.post(buildApiUrl('/api/benchmark'), createPayload, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+      }
 
       onSuccess();
       onClose();
       resetForm();
     } catch (err: any) {
-      console.error('Error creating benchmark test:', err);
-      setError(err.response?.data?.message || 'Failed to create benchmark test');
+      console.error('Error saving benchmark test:', err);
+      setError(err.response?.data?.message || `Failed to ${editTest ? 'update' : 'create'} benchmark test`);
     } finally {
       setLoading(false);
     }
@@ -218,13 +247,8 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
       description: '',
       keywords: [],
       functionCalls: [],
-      responseType: 'text',
-      minResponseLength: '',
-      maxResponseLength: '',
-      additionalCriteria: '',
     });
     setNewKeyword('');
-    setNewFunctionCall('');
     setError('');
   };
 
@@ -237,7 +261,7 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
 
   return (
     <Dialog open={open} onClose={handleClose} maxWidth="md" fullWidth>
-      <DialogTitle>Create Benchmark Test</DialogTitle>
+      <DialogTitle>{editTest ? 'Edit Benchmark Test' : 'Create Benchmark Test'}</DialogTitle>
       <DialogContent>
         {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
         
@@ -272,7 +296,7 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
           {/* Expected Keywords */}
           <Box>
             <Typography variant="subtitle2" gutterBottom>
-              Expected Keywords in Response *
+              Expected Keywords in Response
             </Typography>
             <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
               <TextField
@@ -304,75 +328,39 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
             <Typography variant="subtitle2" gutterBottom>
               Expected Function Calls
             </Typography>
-            <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
-              <TextField
-                value={newFunctionCall}
-                onChange={(e) => setNewFunctionCall(e.target.value)}
-                placeholder="Enter function call name"
-                size="small"
-                onKeyPress={(e) => e.key === 'Enter' && addFunctionCall()}
-                disabled={loading}
-              />
-              <Button onClick={addFunctionCall} disabled={!newFunctionCall.trim() || loading}>
-                Add
-              </Button>
-            </Box>
-            <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
-              {formData.functionCalls.map((functionCall, index) => (
-                <Chip
-                  key={index}
-                  label={functionCall}
-                  onDelete={() => removeFunctionCall(index)}
-                  disabled={loading}
-                  variant="outlined"
+            <Paper sx={{ p: 2, maxHeight: 200, overflow: 'auto' }}>
+              {availableFunctionCalls.map((func) => (
+                <FormControlLabel
+                  key={func.name}
+                  control={
+                    <Checkbox
+                      checked={formData.functionCalls.includes(func.name)}
+                      onChange={(e) => handleFunctionCallChange(func.name, e.target.checked)}
+                      disabled={loading}
+                    />
+                  }
+                  label={
+                    <Box>
+                      <Typography variant="body2" fontWeight="medium">
+                        {func.name}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        {func.description}
+                      </Typography>
+                    </Box>
+                  }
                 />
               ))}
-            </Box>
+              {availableFunctionCalls.length === 0 && (
+                <Typography variant="body2" color="text.secondary">
+                  Loading function calls...
+                </Typography>
+              )}
+            </Paper>
           </Box>
 
-          {/* Response Type */}
-          <FormControl fullWidth>
-            <InputLabel>Expected Response Type</InputLabel>
-            <Select
-              value={formData.responseType}
-              onChange={(e) => setFormData(prev => ({ ...prev, responseType: e.target.value as any }))}
-              disabled={loading}
-            >
-              <MenuItem value="text">Text</MenuItem>
-              <MenuItem value="html">HTML</MenuItem>
-              <MenuItem value="json">JSON</MenuItem>
-              <MenuItem value="image">Image</MenuItem>
-            </Select>
-          </FormControl>
 
-          {/* Response Length Constraints */}
-          <Box sx={{ display: 'flex', gap: 2 }}>
-            <TextField
-              label="Min Response Length"
-              type="number"
-              value={formData.minResponseLength}
-              onChange={(e) => setFormData(prev => ({ ...prev, minResponseLength: e.target.value }))}
-              disabled={loading}
-            />
-            <TextField
-              label="Max Response Length"
-              type="number"
-              value={formData.maxResponseLength}
-              onChange={(e) => setFormData(prev => ({ ...prev, maxResponseLength: e.target.value }))}
-              disabled={loading}
-            />
-          </Box>
 
-          {/* Additional Criteria */}
-          <TextField
-            label="Additional Criteria"
-            value={formData.additionalCriteria}
-            onChange={(e) => setFormData(prev => ({ ...prev, additionalCriteria: e.target.value }))}
-            fullWidth
-            multiline
-            rows={3}
-            disabled={loading}
-          />
 
           {/* Session Messages Preview */}
           {sessionMessages.length > 0 && (
@@ -381,17 +369,24 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
                 Session Messages ({sessionMessages.length})
               </Typography>
               <Paper sx={{ maxHeight: 200, overflow: 'auto', p: 2 }}>
-                {sessionMessages.map((message, index) => (
-                  <Box key={index} sx={{ mb: 1 }}>
-                    <Typography variant="caption" color="text.secondary">
-                      {message.role}:
-                    </Typography>
-                    <Typography variant="body2" sx={{ ml: 1 }}>
-                      {message.content.substring(0, 100)}
-                      {message.content.length > 100 && '...'}
-                    </Typography>
-                  </Box>
-                ))}
+                {sessionMessages
+                  .filter((message, index) => {
+                    // Remove the last message if it's from assistant
+                    if (index === sessionMessages.length - 1 && message.role === 'assistant') {
+                      return false;
+                    }
+                    return true;
+                  })
+                  .map((message, index) => (
+                    <Box key={index} sx={{ mb: 1 }}>
+                      <Typography variant="caption" color="text.secondary">
+                        {message.role}:
+                      </Typography>
+                      <Typography variant="body2" sx={{ ml: 1 }}>
+                        {message.content}
+                      </Typography>
+                    </Box>
+                  ))}
               </Paper>
             </Box>
           )}
@@ -404,9 +399,9 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
         <Button
           onClick={handleSubmit}
           variant="contained"
-          disabled={loading || !formData.testName.trim() || formData.keywords.length === 0}
+          disabled={loading || !formData.testName.trim()}
         >
-          {loading ? 'Creating...' : 'Create Benchmark Test'}
+          {loading ? (editTest ? 'Updating...' : 'Creating...') : (editTest ? 'Update Benchmark Test' : 'Create Benchmark Test')}
         </Button>
       </DialogActions>
     </Dialog>
@@ -420,6 +415,7 @@ const BenchmarksTab: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
+  const [editDialogOpen, setEditDialogOpen] = useState(false);
   const [selectedBenchmark, setSelectedBenchmark] = useState<BenchmarkTest | null>(null);
 
   useEffect(() => {
@@ -437,17 +433,32 @@ const BenchmarksTab: React.FC = () => {
       setLoading(true);
       setError('');
       
-      const response = await axios.get(buildApiUrl('/api/benchmark/my'), {
+      const response = await axios.get(buildApiUrl('/api/benchmark'), {
         headers: { Authorization: `Bearer ${token}` },
       });
       
-      setBenchmarks(response.data.tests || []);
+      // The API returns { tests: [...], count: ... }
+      const benchmarksData = response.data;
+      if (benchmarksData && Array.isArray(benchmarksData.tests)) {
+        setBenchmarks(benchmarksData.tests);
+      } else if (Array.isArray(benchmarksData)) {
+        setBenchmarks(benchmarksData);
+      } else {
+        console.warn('Unexpected API response format:', benchmarksData);
+        setBenchmarks([]);
+      }
     } catch (err: any) {
       console.error('Error loading benchmarks:', err);
       setError(err.response?.data?.message || 'Failed to load benchmark tests');
+      setBenchmarks([]); // Ensure benchmarks is always an array
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleEdit = (benchmark: BenchmarkTest) => {
+    setSelectedBenchmark(benchmark);
+    setEditDialogOpen(true);
   };
 
   const handleDelete = async (testId: string) => {
@@ -542,7 +553,7 @@ const BenchmarksTab: React.FC = () => {
               </TableRow>
             </TableHead>
             <TableBody>
-              {benchmarks.map((benchmark) => (
+              {Array.isArray(benchmarks) && benchmarks.map((benchmark) => (
                 <TableRow key={benchmark.testId}>
                   <TableCell>
                     <Box>
@@ -586,7 +597,7 @@ const BenchmarksTab: React.FC = () => {
                       <Tooltip title="Edit">
                         <IconButton
                           size="small"
-                          onClick={() => setSelectedBenchmark(benchmark)}
+                          onClick={() => handleEdit(benchmark)}
                         >
                           <EditIcon />
                         </IconButton>
@@ -604,7 +615,7 @@ const BenchmarksTab: React.FC = () => {
                   </TableCell>
                 </TableRow>
               ))}
-              {benchmarks.length === 0 && (
+              {(!Array.isArray(benchmarks) || benchmarks.length === 0) && (
                 <TableRow>
                   <TableCell colSpan={7} align="center">
                     <Typography color="text.secondary">
@@ -622,6 +633,16 @@ const BenchmarksTab: React.FC = () => {
         open={createDialogOpen}
         onClose={() => setCreateDialogOpen(false)}
         sessionId={searchParams.get('createFromSession') || undefined}
+        onSuccess={loadBenchmarks}
+      />
+
+      <CreateBenchmarkDialog
+        open={editDialogOpen}
+        onClose={() => {
+          setEditDialogOpen(false);
+          setSelectedBenchmark(null);
+        }}
+        editTest={selectedBenchmark}
         onSuccess={loadBenchmarks}
       />
     </Box>

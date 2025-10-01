@@ -18,13 +18,18 @@ export async function createBenchmarkTest(req: AuthenticatedRequest, res: Respon
       });
     }
 
-    // Get the session to extract conversation history
+    // Get the session to extract conversation history and user info
     const session = await chatbotDb.getChatSession(sessionId);
     if (!session) {
       return res.status(404).json({ 
         message: 'Session not found' 
       });
     }
+
+    // Use custom conversation history if provided, otherwise use session messages
+    const conversationHistory = req.body.conversationHistory || {
+      messages: session.messages || []
+    };
 
     // Create the benchmark test
     const testId = uuidv4();
@@ -35,9 +40,7 @@ export async function createBenchmarkTest(req: AuthenticatedRequest, res: Respon
       userId: session.userId,
       testName,
       description,
-      conversationHistory: {
-        messages: session.messages || []
-      },
+      conversationHistory,
       expectedOutput,
       status: 'draft',
       createdAt: new Date().toISOString(),

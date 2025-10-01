@@ -478,7 +478,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     return context;
   }
 
-  private getAvailableTools() {
+  public getAvailableTools() {
     return [
       {
         type: 'function' as const,
