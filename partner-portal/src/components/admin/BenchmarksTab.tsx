@@ -94,6 +94,7 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
     description: '',
     keywords: [] as string[],
     functionCalls: [] as string[],
+    status: 'draft' as 'draft' | 'active' | 'archived',
   });
   const [newKeyword, setNewKeyword] = useState('');
 
@@ -107,6 +108,7 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
           description: editTest.description || '',
           keywords: editTest.expectedOutput.keywords || [],
           functionCalls: editTest.expectedOutput.functionCalls || [],
+          status: editTest.status || 'draft',
         });
         // Load session messages if available
         if (editTest.conversationHistory?.messages) {
@@ -196,6 +198,7 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
       const payload = {
         testName: formData.testName.trim(),
         description: formData.description.trim() || undefined,
+        status: formData.status,
         expectedOutput: {
           keywords: formData.keywords.length > 0 ? formData.keywords : undefined,
           functionCalls: formData.functionCalls.length > 0 ? formData.functionCalls : undefined,
@@ -247,6 +250,7 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
       description: '',
       keywords: [],
       functionCalls: [],
+      status: 'draft',
     });
     setNewKeyword('');
     setError('');
@@ -292,6 +296,24 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
             rows={2}
             disabled={loading}
           />
+
+          {/* Status - Only show in edit mode */}
+          {editTest && (
+            <FormControl fullWidth variant="outlined">
+              <InputLabel id="status-label">Status</InputLabel>
+              <Select
+                labelId="status-label"
+                value={formData.status}
+                onChange={(e) => setFormData(prev => ({ ...prev, status: e.target.value as 'draft' | 'active' | 'archived' }))}
+                disabled={loading}
+                label="Status"
+              >
+                <MenuItem value="draft">Draft</MenuItem>
+                <MenuItem value="active">Live (Ready for Running)</MenuItem>
+                <MenuItem value="archived">Archived</MenuItem>
+              </Select>
+            </FormControl>
+          )}
 
           {/* Expected Keywords */}
           <Box>
