@@ -90,6 +90,9 @@ export class AgentModeService {
           content = responseContent;
         }
         
+        // Append the model's message to conversation before handling tool calls
+        (messages as any[]).push(responseMessage);
+        
         // If no tool calls, break the loop
         if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
           console.log('AgentMode: No tool calls, breaking loop');
@@ -115,6 +118,26 @@ export class AgentModeService {
               arguments: functionArgs,
               result: result
             });
+
+            // Append the tool call result as a tool message for the model to consume next
+            try {
+              const toolResponse = typeof result === 'string' ? result : JSON.stringify(result);
+              (messages as any[]).push({
+                tool_call_id: toolCall.id,
+                role: 'tool',
+                name: toolCall.function.name,
+                content: toolResponse
+              });
+              shouldFeedbackToLLM = true;
+            } catch (e) {
+              (messages as any[]).push({
+                tool_call_id: toolCall.id,
+                role: 'tool',
+                name: toolCall.function.name,
+                content: String(result)
+              });
+              shouldFeedbackToLLM = true;
+            }
 
             // Add results to content for LLM to process
             if (result.taskId && result.executionId) {
@@ -188,11 +211,7 @@ export class AgentModeService {
           break;
         }
         
-        // Append the assistant response with tool results to messages for next iteration
-        messages.push({
-          role: 'assistant',
-          content: content
-        });
+        // Do not append an assistant message; tool messages above are sufficient for model continuation
       }
       
       if (iteration >= maxIterations) {
