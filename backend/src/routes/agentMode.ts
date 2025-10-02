@@ -43,6 +43,10 @@ router.post('/sessions', asyncHandler(agentModeController.createSession));
 // Get specific chat session
 router.get('/session/:sessionId', asyncHandler(agentModeController.getSession));
 
+// GET /api/agent-mode/function-calls
+// Get available function calls for benchmark tests
+router.get('/function-calls', asyncHandler(agentModeController.getAvailableFunctionCalls));
+
 // POST /api/agent-mode/generate
 // Generate AI response for marketing conversation
 router.post('/generate', asyncHandler(agentModeController.generateResponse));

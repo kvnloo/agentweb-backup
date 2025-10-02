@@ -1,20 +1,43 @@
 import { Request, Response } from 'express';
-import { agentModeService } from '../services/agentModeService';
+import { agentModeService, AgentModeService } from '../services/agentModeService';
 import { chatbotDb, updateTaskExecutionStatus } from '../services/chatbotService';
 import { User } from '../types/auth';
 import multer from 'multer';
 import crypto from 'crypto';
 import { uploadFileToS3 } from '../utils/s3Utils';
 
+// Common function to filter messages for client display
+const filterMessagesForClient = (messages: any[]) => {
+  return messages.filter(message => {
+    // Remove tool messages
+    if (message.role === 'tool') {
+      return false;
+    }
+    
+    // Remove assistant messages that have tool calls
+    if (message.role === 'assistant' && message.tool_calls && message.tool_calls.length > 0) {
+      return false;
+    }
+    
+    return true;
+  });
+};
+
 export const agentModeController = {
   // Get user's agent chat sessions
   async getSessions(req: Request, res: Response) {
     try {
       const user = req.user as User;
-      console.log(`AgentMode: Getting sessions for user ${user.userId}`);
 
       const sessions = await chatbotDb.getUserSessions(user.userId, 'agent');
-      res.json(sessions);
+      
+      // Filter out tool messages and assistant messages with tool calls for user display
+      const filteredSessions = sessions.map(session => ({
+        ...session,
+        messages: filterMessagesForClient(session.messages)
+      }));
+      
+      res.json(filteredSessions);
     } catch (error) {
       console.error('AgentMode: Get sessions error:', error);
       res.status(500).json({ error: 'Failed to get sessions' });
@@ -27,7 +50,6 @@ export const agentModeController = {
       const user = req.user as User;
       const { portalType = 'agent', pageIdentifier = 'agent-mode' } = req.body;
 
-      console.log(`AgentMode: Creating new session for user ${user.userId}`);
 
       const session = await chatbotDb.createChatSession(
         user.userId,
@@ -50,17 +72,46 @@ export const agentModeController = {
   async getSession(req: Request, res: Response) {
     try {
       const { sessionId } = req.params;
-      console.log(`AgentMode: Getting session ${sessionId}`);
+      const user = req.user as any; // Should have user from auth middleware
 
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
         return res.status(404).json({ error: 'Session not found' });
       }
 
+      // Allow admin users to access any session for benchmark creation
+      if (user && user.isAdmin) {
+        return res.json(session);
+      }
+
+      // For non-admin users, check if they own the session
+      if (session.userId !== user?.userId) {
+        return res.status(403).json({ error: 'Unauthorized access to session' });
+      }
+
       res.json(session);
     } catch (error) {
       console.error('AgentMode: Get session error:', error);
       res.status(500).json({ error: 'Failed to get session' });
+    }
+  },
+
+  // Get available function calls for benchmark tests
+  async getAvailableFunctionCalls(req: Request, res: Response) {
+    try {
+      const agentModeService = new AgentModeService();
+      const tools = agentModeService.getAvailableTools();
+      
+      // Extract function names and descriptions
+      const functionCalls = tools.map((tool: any) => ({
+        name: tool.function.name,
+        description: tool.function.description
+      }));
+
+      res.json({ functionCalls });
+    } catch (error) {
+      console.error('AgentMode: Get function calls error:', error);
+      res.status(500).json({ error: 'Failed to get function calls' });
     }
   },
 
@@ -74,7 +125,6 @@ export const agentModeController = {
         return res.status(400).json({ error: 'Session ID and user message are required' });
       }
 
-      console.log(`AgentMode: Generating marketing response for session ${sessionId}`);
 
       // Get session
       const session = await chatbotDb.getChatSession(sessionId);
@@ -126,23 +176,17 @@ export const agentModeController = {
           };
           
           await chatbotDb.addMessageToSession(sessionId, systemMessage);
-          console.log('AgentMode: Added system message with version:', systemPromptHash);
         } catch (error) {
           console.error('AgentMode: Failed to add system message:', error);
           // Continue with the message processing even if this fails
         }
       }
 
-      // Add user message to session in database
-      await chatbotDb.addMessageToSession(sessionId, userMessageObj);
-
       // If this is the first message, generate session title
       if (isFirstMessage) {
         try {
-          console.log('AgentMode: First message detected, generating session title');
           const title = await agentModeService.generateSessionTitle(userMessage);
           await chatbotDb.updateSessionTitle(sessionId, title);
-          console.log('AgentMode: Session title updated to:', title);
         } catch (error) {
           console.error('AgentMode: Failed to update session title:', error);
           // Continue with the message processing even if this fails
@@ -155,6 +199,9 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found after update' });
       }
 
+      // Add user message to session in database
+      await chatbotDb.addMessageToSession(sessionId, userMessageObj);
+
       // Generate AI response
       const response = await agentModeService.generateMarketingResponse(
         messageContent,
@@ -163,20 +210,8 @@ export const agentModeController = {
         sessionId
       );
 
-      // Add assistant message to session
-      const assistantMessage = {
-        role: 'assistant' as const,
-        content: response.content,
-        metadata: {
-          timestamp: new Date().toISOString(),
-          portalType: 'agent' as const,
-          toolCalls: response.toolCalls,
-          knowledgeBaseQueries: response.knowledgeBaseQueries,
-          sources: response.sources
-        }
-      };
-
-      await chatbotDb.addMessageToSession(sessionId, assistantMessage);
+      // Add all response messages to session (includes assistant responses and tool calls)
+      await chatbotDb.addMessagesToSession(sessionId, response.responseMessages);
 
       res.json({
         content: response.content,
@@ -308,7 +343,7 @@ export const agentModeController = {
         session: {
           sessionId: session.sessionId,
           title: session.title,
-          messages: session.messages,
+          messages: filterMessagesForClient(session.messages),
           createdAt: session.createdAt,
           updatedAt: session.updatedAt,
           shareMetadata: session.shareMetadata
@@ -326,7 +361,6 @@ export const agentModeController = {
       const { sessionId } = req.params;
       const user = req.user as User;
 
-      console.log(`AgentMode: Archiving session ${sessionId} for user ${user.userId}`);
 
       await chatbotDb.archiveSession(sessionId);
       res.json({ message: 'Session archived successfully' });
@@ -343,7 +377,6 @@ export const agentModeController = {
       const { status } = req.body;
       const user = req.user as User;
       
-      console.log(`AgentMode: Updating task status for session ${sessionId}, task ${taskId}, execution ${executionId} to ${status}`);
 
       await updateTaskExecutionStatus(sessionId, taskId, executionId, status);
       res.json({ message: 'Task status updated successfully' });

@@ -1,6 +1,7 @@
 import axios from 'axios';
 import OpenAI from 'openai';
 import { google } from 'googleapis';
+import { createHash } from 'crypto';
 import { chatbotDb, ChatMessage } from './chatbotService';
 import { taskDb, taskTemplateDb } from './db';
 import { settingsService } from './settingsService';
@@ -18,6 +19,7 @@ interface PDFData {
 
 export class AgentModeService {
   private openai: OpenAI;
+  private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number }> = new Map();
   
   constructor() {
     this.openai = new OpenAI({
@@ -35,31 +37,33 @@ export class AgentModeService {
     messageContent: string,
     sessionHistory: ChatMessage[],
     userId: string,
-    sessionId: string
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[] }> {
+    sessionId: string,
+    mockMode: boolean = false
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[] }> {
     try {
-      console.log('AgentMode: Generating marketing response');
       
       const systemPrompt = await this.getMarketingSystemPrompt();
       const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
       const availableTemplates = await this.getAvailableTemplates();
-      const context = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses);
+      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses);
       
       // Build templates context message
       const templatesContext = this.buildTemplatesContext(availableTemplates);
       
-      // Build initial messages array
+      // Build initial messages array (preserve structured history and tool messages)
       const messages: any[] = [
         { role: 'system', content: systemPrompt },
         { role: 'assistant', content: templatesContext },
-        { role: 'user', content: context }
+        ...marketingMessages
       ];
 
       let content = '';
       const toolCalls: any[] = [];
       const knowledgeBaseQueries: string[] = [];
       const sources: string[] = [];
-      let shouldFeedbackToLLM = false;
+      
+      // Remember initial message count to slice response messages later
+      const initialMessageCount = messages.length;
 
       // Single loop for LLM calls and tool execution
       let maxIterations = 10; // Prevent infinite loops
@@ -68,7 +72,6 @@ export class AgentModeService {
       
       while (iteration < maxIterations) {
         iteration++;
-        console.log(`AgentMode: LLM call iteration ${iteration}`);
         
         // Make LLM call
         const response = await this.openai.chat.completions.create({
@@ -87,24 +90,21 @@ export class AgentModeService {
           content = responseContent;
         }
         
+        // Append the model's message to conversation before handling tool calls
+        (messages as any[]).push(responseMessage);
+        
         // If no tool calls, break the loop
         if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
-          console.log('AgentMode: No tool calls, breaking loop');
           break;
         }
         
-        console.log(`AgentMode: Executing ${responseMessage.tool_calls.length} tool calls`);
-        
-        // Reset feedback flag for this iteration
-        shouldFeedbackToLLM = false;
         
         // Execute tool calls
         for (const toolCall of responseMessage.tool_calls) {
           try {
             const functionArgs = JSON.parse(toolCall.function.arguments);
-            console.log(`AgentMode: Executing tool ${toolCall.function.name}`);
             
-            const result = await this.executeTool(toolCall.function.name, functionArgs, userId, sessionId);
+            const result = await this.executeTool(toolCall.function.name, functionArgs, userId, sessionId, mockMode);
             
             toolCalls.push({
               id: toolCall.id,
@@ -113,57 +113,16 @@ export class AgentModeService {
               result: result
             });
 
-            // Add results to content for LLM to process
-            if (result.taskId && result.executionId) {
-              const statusMessage = this.getStatusMessage(toolCall.function.name, result.status);
-              content += `\n\n${statusMessage}`;
-            } else if (toolCall.function.name === 'get_meta_ads_metrics' && result.success) {
-              // Special handling for metrics data - provide summary for AI analysis
-              shouldFeedbackToLLM = true;
-              const metricsSummary = this.formatMetricsSummary({ ...result.data, timeframe: result.timeframe });
-              content += `\n\n${metricsSummary}`;
-            } else if (toolCall.function.name === 'search_web' && result.success) {
-              // Track web search results
-              shouldFeedbackToLLM = true;
-              const searchSummary = this.formatWebSearchResults(result);
-              content += `\n\n${searchSummary}`;
-            } else if (toolCall.function.name === 'read_brand_guidelines' && result.success) {
-              // Special handling for brand guidelines - provide formatted brand data for AI analysis
-              shouldFeedbackToLLM = true;
-              const brandSummary = this.formatBrandGuidelines(result);
-              content += `\n\n${brandSummary}`;
-            } else if (toolCall.function.name === 'update_brand_guidelines' && result.success) {
-              // Special handling for brand guidelines update - provide feedback to LLM
-              const updateSummary = this.formatBrandGuidelinesUpdate(result);
-              content += `\n\n${updateSummary}`;
-            } else if (toolCall.function.name === 'read_market_strategy' && result.success) {
-              // Special handling for market strategy - provide formatted market data for AI analysis
-              shouldFeedbackToLLM = true;
-              const marketSummary = this.formatMarketStrategy(result);
-              content += `\n\n${marketSummary}`;
-            } else if (toolCall.function.name === 'update_market_strategy' && result.success) {
-              // Special handling for market strategy update - provide feedback to LLM
-              const updateSummary = this.formatMarketStrategyUpdate(result);
-              content += `\n\n${updateSummary}`;
-            } else if (toolCall.function.name === 'save_file' && result.success) {
-              // Special handling for file saves - provide file URL for sharing
-              shouldFeedbackToLLM = true;
-              content += `\n\n📁 **File Saved Successfully**\n`;
-              content += `File: ${result.file_name}\n`;
-              content += `Size: ${result.file_size} bytes\n`;
-              content += `URL: ${result.file_url}\n`;
-              content += `\nThe file has been uploaded to S3 and is ready for sharing or reference.`;
-            } else if (toolCall.function.name === 'read_file_content' && result.success) {
-              // Special handling for file content reading - provide extracted content for AI analysis
-              shouldFeedbackToLLM = true;
-              const fileContentSummary = this.formatFileContent(result);
-              content += `\n\n${fileContentSummary}`;
-            } else if (result && result.success === false) {
-              // Feed tool error back to LLM so it can recover
-              shouldFeedbackToLLM = true;
-              const errorSummary = this.formatToolError(toolCall.function.name, result.error || result.message || 'Unknown error');
-              content += `\n\n${errorSummary}`;
-            }
+            // Append the tool call result as a tool message for the model to consume next
+            const toolContent = result.formattedContent || (typeof result === 'string' ? result : JSON.stringify(result));
+            (messages as any[]).push({
+              tool_call_id: toolCall.id,
+              role: 'tool',
+              name: toolCall.function.name,
+              content: toolContent
+            });
+
+            // Tool results are now included in the tool message content above
           } catch (error) {
             console.error(`AgentMode: Tool execution error for ${toolCall.function.name}:`, error);
             toolCalls.push({
@@ -173,34 +132,44 @@ export class AgentModeService {
               error: error instanceof Error ? error.message : 'Unknown error'
             });
             // Ensure LLM receives the error to adjust its plan
-            shouldFeedbackToLLM = true;
             const errMsg = error instanceof Error ? error.message : String(error);
-            content += `\n\n${this.formatToolError(toolCall.function.name, errMsg)}`;
+            const errorContent = this.formatToolError(toolCall.function.name, errMsg);
+            
+            // Append error as tool message
+            messages.push({
+              tool_call_id: toolCall.id,
+              role: 'tool',
+              name: toolCall.function.name,
+              content: errorContent
+            });
           }
         }
         
-        // Break the loop if no tools provided feedback in this iteration
-        if (!shouldFeedbackToLLM) {
-          console.log('AgentMode: No tools provided feedback in this iteration, breaking loop');
-          break;
-        }
-        
-        // Append the assistant response with tool results to messages for next iteration
-        messages.push({
-          role: 'assistant',
-          content: content
-        });
+        // Do not append an assistant message; tool messages above are sufficient for model continuation
       }
       
       if (iteration >= maxIterations) {
         console.warn('AgentMode: Reached maximum tool execution iterations');
       }
 
+      // Add tool calls data to the last message for frontend display
+      if (toolCalls.length > 0 && messages.length > 0) {
+        const lastMessage = messages[messages.length - 1];
+        if (lastMessage.role === 'assistant') {
+          lastMessage.metadata = {
+            ...lastMessage.metadata,
+            toolCalls: toolCalls,
+            timestamp: new Date().toISOString(),
+          };
+        }
+      }
+
       return {
         content,
         toolCalls,
         knowledgeBaseQueries,
-        sources
+        sources,
+        responseMessages: messages.slice(initialMessageCount)
       };
     } catch (error) {
       console.error('AgentMode: Response generation failed:', error);
@@ -397,49 +366,65 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
-  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = []): string {
-    let context = `User Message: ${messageContent}\n\n`;
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = []): any[] {
+    // Build structured messages preserving roles (assume the first is system) and including tool messages
+    const messages: any[] = [];
     
-    // Add current task statuses
-    if (currentTaskStatuses.length > 0) {
-      context += 'Current Task Statuses:\n';
-      currentTaskStatuses.forEach(task => {
-        const statusEmoji: Record<string, string> = {
-          'pending': '⏳',
-          'running': '🔄',
-          'completed': '✅',
-          'failed': '❌'
-        };
-        const emoji = statusEmoji[task.status] || '⏳';
-        context += `${emoji} ${task.taskName} (${task.status}) - Task ID: ${task.taskId}, Execution ID: ${task.executionId}\n`;
-      });
-      context += '\n';
-    } else {
-      context += '📋 **Task Status**: No tasks have been run in this session yet.\n\n';
-    }
-    
-    // Add recent conversation history (excluding system messages)
-    if (sessionHistory.length > 0) {
-      const nonSystemMessages = sessionHistory.filter(msg => msg.role !== 'system');
-      const recentHistory = nonSystemMessages.slice(-10);
-      context += 'Recent Conversation:\n';
-      recentHistory.forEach(msg => {
-        let messageContent = msg.content;
-        
-        // If this is a user message with attachments, include them
-        if (msg.role === 'user' && msg.metadata?.attachments && msg.metadata.attachments.length > 0) {
-          const attachmentUrls = msg.metadata.attachments.map((attachment: any) => {
-            return `[${attachment.filename || 'Attachment'}](${attachment.url})`;
-          }).join('\n');
-          messageContent = `${msg.content}\n\n**Attached Files:**\n${attachmentUrls}`;
+    // Determine slice starting at the 10th most recent user message over full history
+    let userCount = 0;
+    let startIdx = 1; // Assume the first message is the system message
+    for (let i = sessionHistory.length - 1; i >= 0; i--) {
+      if (sessionHistory[i].role === 'user') {
+        userCount++;
+        if (userCount === 10) {
+          startIdx = i;
+          break;
         }
-        
-        context += `${msg.role === 'user' ? 'User' : 'Assistant'}: ${messageContent}\n`;
-      });
-      context += '\n';
+      }
+    }
+    const sliced = sessionHistory.slice(startIdx);
+    
+    // Copy all sliced messages as-is
+    for (const msg of sliced) {
+      const messageObj: any = { role: msg.role, content: msg.content };
+      
+      // Add optional properties based on message type
+      if ((msg as any).name) {
+        messageObj.name = (msg as any).name;
+      }
+      if ((msg as any).tool_call_id) {
+        messageObj.tool_call_id = (msg as any).tool_call_id;
+      }
+      if ((msg as any).tool_calls) {
+        messageObj.tool_calls = (msg as any).tool_calls;
+      }
+      
+      messages.push(messageObj);
     }
     
-    return context;
+    // Insert current task statuses as an assistant message before the final user message
+    const statusEmoji: Record<string, string> = {
+      pending: '⏳',
+      running: '🔄',
+      completed: '✅',
+      failed: '❌'
+    };
+    let statusesContent = '';
+    if (currentTaskStatuses && currentTaskStatuses.length > 0) {
+      statusesContent += 'Current Task Statuses:\n';
+      currentTaskStatuses.forEach(task => {
+        const emoji = statusEmoji[task.status] || '⏳';
+        statusesContent += `${emoji} ${task.taskName} (${task.status}) - Task ID: ${task.taskId}, Execution ID: ${task.executionId}\n`;
+      });
+    } else {
+      statusesContent = '📋 **Task Status**: No tasks have been run in this session yet.';
+    }
+    messages.push({ role: 'assistant', content: statusesContent });
+
+    // Append the current user message at the end
+    messages.push({ role: 'user', content: messageContent });
+    
+    return messages;
   }
 
   private buildTemplatesContext(templates: any[]): string {
@@ -478,7 +463,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     return context;
   }
 
-  private getAvailableTools() {
+  public getAvailableTools() {
     return [
       {
         type: 'function' as const,
@@ -808,10 +793,331 @@ Use the available tools to create tasks in the agent-engine when complex work is
     ];
   }
 
-  private async executeTool(toolName: string, args: any, userId: string, sessionId: string): Promise<any> {
+  private getMockToolResult(toolName: string, args: any): any {
+    // Return realistic mock data for different tool types
+    switch (toolName) {
+      case 'create_task_from_template':
+        return {
+          success: true,
+          taskId: `mock-task-${Date.now()}`,
+          message: `Mock task created from template ${args.template_id}`,
+          status: 'created'
+        };
+      
+      case 'create_task_from_prompt':
+        return {
+          success: true,
+          taskId: `mock-task-${Date.now()}`,
+          message: `Mock task created: ${args.task_name}`,
+          status: 'created'
+        };
+      
+      case 'create_image_task_from_prompt':
+        return {
+          success: true,
+          taskId: `mock-image-task-${Date.now()}`,
+          message: `Mock image task created: ${args.task_name}`,
+          status: 'created'
+        };
+      
+      case 'get_meta_ads_metrics':
+        // Calculate attribution window based on timeframe
+        const timeframe = args.timeframe || '7d';
+        const now = new Date();
+        const endDate = new Date(now);
+        let startDate = new Date(now);
+        let days = 7;
+        
+        // Parse timeframe - only valid values are 7d, 14d, 30d, 90d
+        switch (timeframe) {
+          case '7d':
+            days = 7;
+            startDate.setDate(now.getDate() - 7);
+            break;
+          case '14d':
+            days = 14;
+            startDate.setDate(now.getDate() - 14);
+            break;
+          case '30d':
+            days = 30;
+            startDate.setDate(now.getDate() - 30);
+            break;
+          case '90d':
+            days = 90;
+            startDate.setDate(now.getDate() - 90);
+            break;
+          default:
+            // Fallback to 7d if invalid timeframe provided
+            days = 7;
+            startDate.setDate(now.getDate() - 7);
+            break;
+        }
+        
+        // Format dates as YYYY-MM-DD
+        const formatDate = (date: Date) => date.toISOString().split('T')[0];
+        
+        return {
+          success: true,
+          data: {
+            attributionWindow: {
+              start: formatDate(startDate),
+              end: formatDate(endDate),
+              days: days
+            },
+            campaignSummary: {
+              totalCampaigns: 3,
+              totalSpend: 1250.75,
+              totalImpressions: 125000,
+              totalClicks: 4500,
+              averageCtr: 3.6,
+              averageCpc: 0.28,
+              totalWebsiteLeads: 23,
+              averageCostPerWebsiteLead: 54.38
+            },
+            adPerformance: [
+              {
+                name: 'Holiday Campaign 2023',
+                spend: 750.25,
+                impressions: 75000,
+                clicks: 2700,
+                ctr: 3.6,
+                cpc: 0.28,
+                websiteLeads: 14,
+                costPerWebsiteLead: 53.59
+              },
+              {
+                name: 'Brand Awareness Campaign',
+                spend: 350.50,
+                impressions: 35000,
+                clicks: 1260,
+                ctr: 3.6,
+                cpc: 0.28,
+                websiteLeads: 6,
+                costPerWebsiteLead: 58.42
+              },
+              {
+                name: 'Retargeting Campaign',
+                spend: 150.00,
+                impressions: 15000,
+                clicks: 540,
+                ctr: 3.6,
+                cpc: 0.28,
+                websiteLeads: 3,
+                costPerWebsiteLead: 50.00
+              }
+            ],
+            adSetsData: [
+              {
+                name: 'Holiday - Lookalike Audience',
+                campaignName: 'Holiday Campaign 2023',
+                spend: 450.15,
+                impressions: 45000,
+                clicks: 1620,
+                ctr: 3.6,
+                cpc: 0.28,
+                websiteLeads: 8,
+                costPerWebsiteLead: 56.27
+              },
+              {
+                name: 'Holiday - Interest Targeting',
+                campaignName: 'Holiday Campaign 2023',
+                spend: 300.10,
+                impressions: 30000,
+                clicks: 1080,
+                ctr: 3.6,
+                cpc: 0.28,
+                websiteLeads: 6,
+                costPerWebsiteLead: 50.02
+              },
+              {
+                name: 'Brand - Broad Targeting',
+                campaignName: 'Brand Awareness Campaign',
+                spend: 350.50,
+                impressions: 35000,
+                clicks: 1260,
+                ctr: 3.6,
+                cpc: 0.28,
+                websiteLeads: 6,
+                costPerWebsiteLead: 58.42
+              },
+              {
+                name: 'Retargeting - Website Visitors',
+                campaignName: 'Retargeting Campaign',
+                spend: 150.00,
+                impressions: 15000,
+                clicks: 540,
+                ctr: 3.6,
+                cpc: 0.28,
+                websiteLeads: 3,
+                costPerWebsiteLead: 50.00
+              }
+            ],
+            adsData: [
+              {
+                name: 'Holiday Sale - Creative A',
+                adSetName: 'Holiday - Lookalike Audience',
+                campaignName: 'Holiday Campaign 2023',
+                spend: 225.08,
+                impressions: 22500,
+                clicks: 810,
+                ctr: 3.6,
+                cpc: 0.28,
+                websiteLeads: 4,
+                costPerWebsiteLead: 56.27
+              },
+              {
+                name: 'Holiday Sale - Creative B',
+                adSetName: 'Holiday - Lookalike Audience',
+                campaignName: 'Holiday Campaign 2023',
+                spend: 225.07,
+                impressions: 22500,
+                clicks: 810,
+                ctr: 3.6,
+                cpc: 0.28,
+                websiteLeads: 4,
+                costPerWebsiteLead: 56.27
+              },
+              {
+                name: 'Brand Awareness - Video',
+                adSetName: 'Brand - Broad Targeting',
+                campaignName: 'Brand Awareness Campaign',
+                spend: 350.50,
+                impressions: 35000,
+                clicks: 1260,
+                ctr: 3.6,
+                cpc: 0.28,
+                websiteLeads: 6,
+                costPerWebsiteLead: 58.42
+              },
+              {
+                name: 'Retargeting - Special Offer',
+                adSetName: 'Retargeting - Website Visitors',
+                campaignName: 'Retargeting Campaign',
+                spend: 150.00,
+                impressions: 15000,
+                clicks: 540,
+                ctr: 3.6,
+                cpc: 0.28,
+                websiteLeads: 3,
+                costPerWebsiteLead: 50.00
+              }
+            ],
+            demographicsBreakdown: [
+              { age: '25-34', gender: 'female', impressions: '45000', clicks: '1620', spend: '450.15', websiteLeads: '8' },
+              { age: '35-44', gender: 'male', impressions: '35000', clicks: '1260', spend: '350.10', websiteLeads: '6' },
+              { age: '25-34', gender: 'male', impressions: '30000', clicks: '1080', spend: '300.10', websiteLeads: '5' },
+              { age: '45-54', gender: 'female', impressions: '15000', clicks: '540', spend: '150.40', websiteLeads: '4' }
+            ],
+            placementBreakdown: [
+              { publisher_platform: 'facebook', platform_position: 'feed', impressions: '75000', clicks: '2700', spend: '750.25', websiteLeads: '14' },
+              { publisher_platform: 'instagram', platform_position: 'feed', impressions: '35000', clicks: '1260', spend: '350.50', websiteLeads: '6' },
+              { publisher_platform: 'facebook', platform_position: 'stories', impressions: '15000', clicks: '540', spend: '150.00', websiteLeads: '3' }
+            ],
+            deviceBreakdown: [
+              { device_platform: 'mobile', impressions: '80000', clicks: '2880', spend: '800.40', websiteLeads: '15' },
+              { device_platform: 'desktop', impressions: '30000', clicks: '1080', spend: '300.20', websiteLeads: '6' },
+              { device_platform: 'tablet', impressions: '15000', clicks: '540', spend: '150.15', websiteLeads: '2' }
+            ]
+          },
+          timeframe: args.timeframe || '7d'
+        };
+      
+      case 'search_web':
+        return {
+          success: true,
+          results: [
+            {
+              title: `Mock search result for "${args.query}"`,
+              url: 'https://example.com/mock-result-1',
+              snippet: 'This is a mock search result snippet that would contain relevant information.'
+            },
+            {
+              title: `Another mock result for "${args.query}"`,
+              url: 'https://example.com/mock-result-2',
+              snippet: 'Another mock search result with different information.'
+            }
+          ]
+        };
+      
+      case 'read_brand_guidelines':
+        return {
+          success: true,
+          exists: true,
+          brandData: {
+            brandName: 'Mock Brand',
+            tagline: 'Mock tagline for testing',
+            primaryColor: '#FF6B6B',
+            toneOfVoice: 'Professional and friendly'
+          },
+          brandAssets: []
+        };
+      
+      case 'update_brand_guidelines':
+        return {
+          success: true,
+          message: 'Mock brand guidelines updated successfully'
+        };
+      
+      case 'read_market_strategy':
+        return {
+          success: true,
+          exists: true,
+          businessOverview: 'Mock business overview for testing purposes',
+          competitors: [
+            { name: 'Mock Competitor 1', description: 'A mock competitor description' }
+          ],
+          icp: [
+            { title: 'Mock ICP', description: 'Mock ideal customer profile', valueProposition: 'Mock value prop' }
+          ]
+        };
+      
+      case 'update_market_strategy':
+        return {
+          success: true,
+          message: 'Mock market strategy updated successfully'
+        };
+      
+      case 'create_revision':
+        return {
+          success: true,
+          revisionId: `mock-revision-${Date.now()}`,
+          message: 'Mock revision created successfully'
+        };
+      
+      case 'save_file':
+        return {
+          success: true,
+          message: `File "${args.file_name}" has been saved successfully.`,
+          file_url: `https://agentweb-files.s3.us-east-1.amazonaws.com/files/${Date.now()}-${args.file_name}`,
+          file_name: args.file_name,
+          file_size: args.file_content.length
+        };
+      
+      case 'read_file_content':
+        return {
+          success: true,
+          content: `Mock file content for ${args.file_url}. This would be the actual content of the file in a real scenario.`,
+          filename: 'mock-file.txt'
+        };
+      
+      default:
+        return {
+          success: true,
+          message: `Mock result for unknown tool: ${toolName}`,
+          data: args
+        };
+    }
+  }
+
+  private async executeTool(toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false): Promise<any> {
     const argsStr = JSON.stringify(args, null, 2);
     const truncatedArgs = argsStr.length > 500 ? argsStr.substring(0, 500) + '...' : argsStr;
-    console.log('AgentMode: Executing tool:', toolName, 'with args:', truncatedArgs);
+    
+    // Return mock data if in mock mode
+    if (mockMode) {
+      return this.getMockToolResult(toolName, args);
+    }
+    
     switch (toolName) {
       case 'create_task_from_template':
         try {
@@ -963,6 +1269,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
         };
       }
 
+      // Format the brand guidelines for LLM consumption
+      const formattedContent = this.formatBrandGuidelines({
+        exists: true,
+        brandData: brand.brandData || {},
+        attachments: brand.attachments || []
+      });
+
       // Return structured response similar to web_search
       return {
         success: true,
@@ -971,7 +1284,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         brandData: brand.brandData || {},
         attachments: brand.attachments || [],
         createdAt: brand.createdAt,
-        updatedAt: brand.updatedAt
+        updatedAt: brand.updatedAt,
+        formattedContent
       };
     } catch (error) {
       console.error('AgentMode: Error reading brand guidelines:', error);
@@ -1011,6 +1325,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
         };
       }
 
+      // Format the market strategy for LLM consumption
+      const formattedContent = this.formatMarketStrategy({
+        exists: true,
+        marketData: marketStrategy
+      });
+
       // Return structured response similar to readBrandGuidelines
       return {
         success: true,
@@ -1018,7 +1338,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         exists: true,
         marketData: marketStrategy,
         createdAt: marketStrategy.createdAt,
-        updatedAt: marketStrategy.updatedAt
+        updatedAt: marketStrategy.updatedAt,
+        formattedContent
       };
     } catch (error) {
       console.error('AgentMode: Error reading market strategy:', error);
@@ -1133,7 +1454,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         });
       }
 
-      return {
+      // Format the update result for LLM consumption
+      const formattedContent = this.formatMarketStrategyUpdate({
         success: true,
         message: 'Market strategy updated successfully',
         marketData: marketStrategyData,
@@ -1142,6 +1464,18 @@ Use the available tools to create tasks in the agent-engine when complex work is
         addedEntries,
         totalCompetitors: mergedCompetitors.length,
         totalICPs: mergedICP.length
+      });
+
+      return {
+        success: true,
+        message: 'Market strategy updated successfully',
+        marketData: marketStrategyData,
+        updatedFields: Object.keys(updateData).filter(key => updateData[key] !== undefined),
+        updatedEntries,
+        addedEntries,
+        totalCompetitors: mergedCompetitors.length,
+        totalICPs: mergedICP.length,
+        formattedContent
       };
     } catch (error) {
       console.error('AgentMode: Error updating market strategy:', error);
@@ -1234,13 +1568,24 @@ Use the available tools to create tasks in the agent-engine when complex work is
       if (brandAssets !== undefined) updatedFields.push('brandAssets');
       updatedFields.push(...Object.keys(otherFields));
 
+      // Format the update result for LLM consumption
+      const formattedContent = this.formatBrandGuidelinesUpdate({
+        success: true,
+        message: 'Brand guidelines updated successfully',
+        updatedFields,
+        brandData: updatedBrandData,
+        attachments: updatedAttachments,
+        updatedAssets: updatedAssets
+      });
+
       return {
         success: true,
         message: 'Brand guidelines updated successfully',
         updatedFields,
         brandData: updatedBrandData,
         attachments: updatedAttachments,
-        updatedAssets: updatedAssets // Only the assets that were actually updated
+        updatedAssets: updatedAssets, // Only the assets that were actually updated
+        formattedContent
       };
     } catch (error) {
       console.error('AgentMode: Error updating brand guidelines:', error);
@@ -1365,7 +1710,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
   // Create task from template
   private async createTaskFromTemplate(templateId: string, parameters: Record<string, string>, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true, attachedFileUrls: string[] = []): Promise<any> {
     try {
-      console.log('AgentMode: Creating task from template ID:', templateId, 'with parameters:', parameters);
 
       // Validate parameters
       if (!parameters || typeof parameters !== 'object') {
@@ -1395,7 +1739,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
         };
       }
 
-      console.log('AgentMode: Using template:', template.name);
 
       // Map template to the expected format
       const templateData = {
@@ -1508,7 +1851,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
         startTime: new Date().toISOString()
       });
 
-      console.log('AgentMode: Task created successfully:', task.taskId);
 
       return {
         success: true,
@@ -1532,7 +1874,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
   // Create task from raw prompt
   private async createTaskFromPrompt(taskName: string, prompt: string, category: string, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true, attachedFileUrls: string[] = []): Promise<any> {
     try {
-      console.log('AgentMode: Creating task from prompt:', taskName);
 
       // Attach previous task results if requested
       let finalPrompt = prompt;
@@ -1587,7 +1928,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
         startTime: new Date().toISOString()
       });
 
-      console.log('AgentMode: Task created successfully:', task.taskId);
 
       return {
         success: true,
@@ -1610,7 +1950,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
   // Create image generation task from raw prompt
   private async createImageTaskFromPrompt(taskName: string, prompt: string, category: string, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true): Promise<any> {
     try {
-      console.log('AgentMode: Creating image task from prompt:', taskName);
 
       // Format the prompt using the same format as handleCreateAdImageTask
       let formattedPrompt = "Please create high-quality ad images that align with the below context and target the specified audience. The images should be professional, engaging, and suitable for various marketing channels. Use download_image to download reference images and generate_image to create the result images. Valid size values for generate_image include \"1024x1024\", \"1536x1024\", \"1024x1536\", \"auto\". Valid quality values for generate_image include \"low\", \"medium\", \"high\", \"auto\". DO NOT browse the internet for other images.\n\n";
@@ -1666,7 +2005,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
         startTime: new Date().toISOString()
       });
 
-      console.log('AgentMode: Image task created successfully:', task.taskId);
 
       return {
         success: true,
@@ -1688,7 +2026,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
   async generateSessionTitle(userMessage: string): Promise<string> {
     try {
-      console.log('AgentMode: Generating session title for message:', userMessage);
       
       const response = await this.openai.chat.completions.create({
         model: process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
@@ -1703,7 +2040,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
       });
 
       const title = response.choices[0]?.message?.content?.trim();
-      console.log('AgentMode: Generated title:', title);
       
       return title || 'Marketing Task';
     } catch (error) {
@@ -1716,28 +2052,23 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
   private async getMetaAdsMetrics(timeframe: string, userId: string): Promise<any> {
     try {
-      console.log('AgentMode: Getting Meta ads metrics for timeframe:', timeframe, 'userId:', userId);
       
       // Import the Meta API functions directly to reuse the same logic
       const { getMetaAccessToken } = await import('../utils/secretsManager');
       const { userDb } = await import('./db');
       
       // Get user from database
-      console.log('AgentMode: Fetching user from database...');
       const user = await userDb.getUserById(userId);
       if (!user) {
-        console.log('AgentMode: User not found in database');
         return {
           success: false,
           message: 'User not found',
           error: 'User not found'
         };
       }
-      console.log('AgentMode: User found, adAccount:', user.adAccount);
 
       // Check if user has ad account configured
       if (!user.adAccount || user.adAccount.trim() === "") {
-        console.log('AgentMode: User ad account not configured');
         return {
           success: false,
           message: 'Ad account not configured. Please configure your Meta ad account first.',
@@ -1748,9 +2079,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       // Get Meta API access token from Secrets Manager
       let accessToken: string;
       try {
-        console.log('AgentMode: Fetching Meta access token from Secrets Manager...');
         accessToken = await getMetaAccessToken();
-        console.log('AgentMode: Meta access token retrieved successfully from Secrets Manager');
       } catch (error: any) {
         console.error('AgentMode: Error fetching Meta access token:', error);
         return {
@@ -1762,7 +2091,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Get API version from environment or default to v18.0
       const apiVersion = process.env.META_API_VERSION || 'v18.0';
-      console.log('AgentMode: Using Meta API version:', apiVersion);
       
       // Calculate date range based on timeframe
       const endDate = new Date();
@@ -1779,10 +2107,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const sinceStr = startDate.toISOString().split('T')[0];
       const untilStr = endDate.toISOString().split('T')[0];
       const attributionDays = Math.max(1, Math.ceil((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24)));
-      console.log('AgentMode: Date range:', sinceStr, 'to', untilStr);
 
       // Get campaigns, ad sets, ads, and insights using Graph API - fetch at multiple levels
-      console.log('AgentMode: Making parallel API calls to Meta Graph API...');
       const [campaignsResponse, adSetsResponse, adsResponse, adInsightsResponse, adSetInsightsResponse, campaignInsightsResponse, insightsDemographicsResponse, insightsPlacementResponse, insightsDeviceResponse] = await Promise.all([
         fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`),
         fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting&access_token=${accessToken}`),
@@ -1801,7 +2127,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
         fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad&access_token=${accessToken}`)
       ]);
 
-      console.log('AgentMode: API calls completed, parsing responses...');
       const [campaignsData, adSetsData, adsData, adInsightsData, adSetInsightsData, campaignInsightsData, insightsDemographicsData, insightsPlacementData, insightsDeviceData] = await Promise.all([
         campaignsResponse.json(),
         adSetsResponse.json(),
@@ -1814,16 +2139,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
         insightsDeviceResponse.json()
       ]);
 
-      console.log('AgentMode: API responses parsed:');
-      console.log('- Campaigns response status:', campaignsResponse.status, 'data length:', campaignsData.data?.length || 0);
-      console.log('- Ad Sets response status:', adSetsResponse.status, 'data length:', adSetsData.data?.length || 0);
-      console.log('- Ads response status:', adsResponse.status, 'data length:', adsData.data?.length || 0);
-      console.log('- Ad-level insights status:', adInsightsResponse.status, 'data length:', adInsightsData.data?.length || 0);
-      console.log('- Adset-level insights status:', adSetInsightsResponse.status, 'data length:', adSetInsightsData.data?.length || 0);
-      console.log('- Campaign-level insights status:', campaignInsightsResponse.status, 'data length:', campaignInsightsData.data?.length || 0);
-      console.log('- Demographics insights status:', insightsDemographicsResponse.status, 'data length:', insightsDemographicsData.data?.length || 0);
-      console.log('- Placement insights status:', insightsPlacementResponse.status, 'data length:', insightsPlacementData.data?.length || 0);
-      console.log('- Device insights status:', insightsDeviceResponse.status, 'data length:', insightsDeviceData.data?.length || 0);
 
       // Check for errors in any of the responses
       if (campaignsData.error) {
@@ -1864,27 +2179,27 @@ Use the available tools to create tasks in the agent-engine when complex work is
       }
 
       // Process the data using simplified logic
-      console.log('AgentMode: Processing campaign data...');
       const adPerformance = this.processCampaignData(campaignsData.data || [], campaignInsightsData.data || [], adSetsData.data || []);
-      console.log('AgentMode: Processed campaigns:', adPerformance.length);
-      
-      console.log('AgentMode: Processing ad sets data...');
       const processedAdSetsData = this.processAdSetsData(adSetsData.data || [], adSetInsightsData.data || [], campaignsData.data || []);
-      console.log('AgentMode: Processed ad sets:', processedAdSetsData.length);
-      
-      console.log('AgentMode: Processing ads data...');
       const processedAdsData = this.processAdsData(adsData.data || [], adInsightsData.data || [], adSetsData.data || [], campaignsData.data || []);
-      console.log('AgentMode: Processed ads:', processedAdsData.length);
-      
-      console.log('AgentMode: Generating campaign summary...');
       const campaignSummary = this.generateCampaignSummary(adPerformance);
-      console.log('AgentMode: Campaign summary:', JSON.stringify(campaignSummary, null, 2));
-      
-      console.log('AgentMode: Processing breakdown data with lead generation metrics...');
       const processedDemographicsBreakdown = this.processBreakdownData(insightsDemographicsData?.data || []);
       const processedPlacementBreakdown = this.processBreakdownData(insightsPlacementData?.data || []);
       const processedDeviceBreakdown = this.processBreakdownData(insightsDeviceData?.data || []);
       
+      // Format the data for LLM consumption
+      const formattedContent = this.formatMetricsSummary({
+        adPerformance,
+        adSetsData: processedAdSetsData,
+        adsData: processedAdsData,
+        campaignSummary,
+        demographicsBreakdown: processedDemographicsBreakdown,
+        placementBreakdown: processedPlacementBreakdown,
+        deviceBreakdown: processedDeviceBreakdown,
+        attributionWindow: { start: sinceStr, end: untilStr, days: attributionDays },
+        timeframe
+      });
+
       const result = {
         success: true,
         message: `Meta ads metrics loaded for ${timeframe} timeframe`,
@@ -1898,10 +2213,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
           placementBreakdown: processedPlacementBreakdown,
           deviceBreakdown: processedDeviceBreakdown,
           attributionWindow: { start: sinceStr, end: untilStr, days: attributionDays }
-        }
+        },
+        formattedContent
       };
       
-      console.log('AgentMode: Returning result with', adPerformance.length, 'campaigns,', processedAdSetsData.length, 'ad sets,', processedAdsData.length, 'ads');
       return result;
     } catch (error) {
       console.error('AgentMode: Error fetching Meta ads metrics:', error);
@@ -2620,12 +2935,20 @@ Use the available tools to create tasks in the agent-engine when complex work is
       
       const searchResults = await this.performWebSearch(query, limitedMaxResults);
       
+      // Format the results for LLM consumption
+      const formattedContent = this.formatWebSearchResults({
+        query,
+        results: searchResults,
+        totalResults: searchResults.length
+      });
+      
       return {
         success: true,
         message: `Found ${searchResults.length} web search results for "${query}"`,
         query,
         results: searchResults,
-        totalResults: searchResults.length
+        totalResults: searchResults.length,
+        formattedContent
       };
     } catch (error) {
       console.error('AgentMode: Error searching web:', error);
@@ -3006,10 +3329,30 @@ Use the available tools to create tasks in the agent-engine when complex work is
     return formattedContent;
   }
 
-  // Save file to S3 and return URL
+  // Save file to S3 and return URL with content-based deduplication
   private async saveFile(fileName: string, fileContent: string, userId: string, sessionId: string): Promise<any> {
     try {
       console.log('AgentMode: Saving file:', fileName, 'for user:', userId, 'session:', sessionId);
+      
+      // Generate content hash for deduplication
+      const contentHash = createHash('sha256').update(fileContent).digest('hex');
+      
+      // Check if we already have this content cached
+      const cachedFile = this.fileContentCache.get(contentHash);
+      if (cachedFile) {
+        console.log('AgentMode: File content already exists, returning cached URL:', cachedFile.file_url);
+        // Format the save result for LLM consumption
+        const formattedContent = `📁 **File Saved Successfully**\nFile: ${fileName}\nSize: ${fileContent.length} bytes\nURL: ${cachedFile.file_url}\n\nThe file has been uploaded to S3 and is ready for sharing or reference.`;
+
+        return {
+          success: true,
+          message: `File "${fileName}" has been saved successfully.`,
+          file_url: cachedFile.file_url,
+          file_name: fileName,
+          file_size: fileContent.length,
+          formattedContent
+        };
+      }
       
       const { uploadFileToS3 } = await import('../utils/s3Utils');
       
@@ -3041,12 +3384,25 @@ Use the available tools to create tasks in the agent-engine when complex work is
       );
       
       if (uploadResult.success) {
+        // Cache the file content hash to URL mapping
+        this.fileContentCache.set(contentHash, {
+          file_url: uploadResult.url || '',
+          file_name: fileName || 'unknown',
+          file_size: fileContent.length
+        });
+        
+        console.log('AgentMode: File uploaded and cached with hash:', contentHash);
+        
+        // Format the save result for LLM consumption
+        const formattedContent = `📁 **File Saved Successfully**\nFile: ${fileName}\nSize: ${fileContent.length} bytes\nURL: ${uploadResult.url}\n\nThe file has been uploaded to S3 and is ready for sharing or reference.`;
+
         return {
           success: true,
           message: `File "${fileName}" has been saved successfully.`,
           file_url: uploadResult.url,
           file_name: fileName,
-          file_size: fileContent.length
+          file_size: fileContent.length,
+          formattedContent
         };
       } else {
         return {
@@ -3155,6 +3511,16 @@ Use the available tools to create tasks in the agent-engine when complex work is
         console.log(`AgentMode: Content truncated to ${maxContentLength} characters`);
       }
 
+      // Format the file content for LLM consumption
+      const formattedContent = this.formatFileContent({
+        success: true,
+        content: extractedContent,
+        file_type: fileType,
+        file_size: buffer.length,
+        content_length: extractedContent.length,
+        file_url: fileUrl
+      });
+
       return {
         success: true,
         content: extractedContent,
@@ -3162,7 +3528,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         file_size: buffer.length,
         content_length: extractedContent.length,
         file_url: fileUrl,
-        message: `Successfully read ${fileType} file content (${extractedContent.length} characters)`
+        message: `Successfully read ${fileType} file content (${extractedContent.length} characters)`,
+        formattedContent
       };
 
     } catch (error: any) {

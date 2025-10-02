@@ -7,6 +7,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-10-02',
+    changes: [
+      'Supported benchmark tests for Agent Mode',
+      '- Admins can now create benchmark tests from Agent Mode conversations to evaluate Emma\'s performance',
+      '- "Add to Benchmark" button appears in Agent Mode when admins access customer accounts via delegate access',
+      '- Benchmark tests capture conversation history and allow setting expected keywords and function calls',
+      '- Tests can be run individually or in bulk to measure pass/fail rates and execution times',
+      '- Comprehensive test history tracking with detailed execution results and response analysis',
+    ],
+  },
+  {
     date: '2025-10-01',
     changes: [
       'Made Changelog page publicly accessible',
