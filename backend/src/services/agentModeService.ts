@@ -152,6 +152,17 @@ export class AgentModeService {
         console.warn('AgentMode: Reached maximum tool execution iterations');
       }
 
+      // Add tool calls data to the last message for frontend display
+      if (toolCalls.length > 0 && messages.length > 0) {
+        const lastMessage = messages[messages.length - 1];
+        if (lastMessage.role === 'assistant') {
+          lastMessage.metadata = {
+            ...lastMessage.metadata,
+            toolCalls: toolCalls,
+          };
+        }
+      }
+
       return {
         content,
         toolCalls,
