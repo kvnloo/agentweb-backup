@@ -166,7 +166,22 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
       );
       
       if (response.data?.messages) {
-        setSessionMessages(response.data.messages);
+        // Apply the same filtering logic as when creating the test
+        // Find the last user message and strip everything after it
+        let lastUserMessageIndex = -1;
+        for (let i = response.data.messages.length - 1; i >= 0; i--) {
+          if (response.data.messages[i].role === 'user') {
+            lastUserMessageIndex = i;
+            break;
+          }
+        }
+        
+        // If we found a user message, only include messages up to and including that user message
+        const filteredMessages = lastUserMessageIndex >= 0 
+          ? response.data.messages.slice(0, lastUserMessageIndex + 1)
+          : response.data.messages;
+          
+        setSessionMessages(filteredMessages);
       }
     } catch (err: any) {
       console.error('Error loading session messages:', err);
@@ -229,13 +244,19 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
         });
       } else {
         // Create new test
-        // Filter out the last message if it's from assistant for the conversation history
-        const filteredMessages = sessionMessages.filter((message, index) => {
-          if (index === sessionMessages.length - 1 && message.role === 'assistant') {
-            return false;
+        // Find the last user message and strip everything after it
+        let lastUserMessageIndex = -1;
+        for (let i = sessionMessages.length - 1; i >= 0; i--) {
+          if (sessionMessages[i].role === 'user') {
+            lastUserMessageIndex = i;
+            break;
           }
-          return true;
-        });
+        }
+        
+        // If we found a user message, only include messages up to and including that user message
+        const filteredMessages = lastUserMessageIndex >= 0 
+          ? sessionMessages.slice(0, lastUserMessageIndex + 1)
+          : sessionMessages;
 
         const createPayload = {
           ...payload,
@@ -611,6 +632,52 @@ const BenchmarksTab: React.FC = () => {
     return benchmark.testHistory[benchmark.testHistory.length - 1];
   };
 
+  const getTestSummary = () => {
+    if (benchmarks.length === 0) return null;
+
+    const testResults = benchmarks.map(benchmark => {
+      const lastRun = getLastRunResult(benchmark);
+      
+      return {
+        testId: benchmark.testId,
+        testName: benchmark.testName,
+        lastRun: lastRun,
+        passed: lastRun ? lastRun.passed : false,
+        executionTime: lastRun ? lastRun.executionTime : 0,
+        hasRun: !!lastRun
+      };
+    });
+
+    const runTests = testResults.filter(result => result.hasRun);
+    const passedTests = runTests.filter(result => result.passed);
+    const failedTests = runTests.filter(result => !result.passed);
+    
+    const executionTimes = runTests.map(result => result.executionTime).sort((a, b) => a - b);
+    
+    const passRate = runTests.length > 0 ? (passedTests.length / runTests.length) * 100 : 0;
+    const averageRunTime = executionTimes.length > 0 
+      ? executionTimes.reduce((sum, time) => sum + time, 0) / executionTimes.length 
+      : 0;
+    const medianRunTime = executionTimes.length > 0 
+      ? executionTimes[Math.floor(executionTimes.length / 2)] 
+      : 0;
+    const minRunTime = executionTimes.length > 0 ? Math.min(...executionTimes) : 0;
+    const maxRunTime = executionTimes.length > 0 ? Math.max(...executionTimes) : 0;
+
+    return {
+      totalTests: benchmarks.length,
+      runTests: runTests.length,
+      passedTests: passedTests.length,
+      failedTests: failedTests.length,
+      passRate: Math.round(passRate * 100) / 100,
+      averageRunTime: Math.round(averageRunTime),
+      medianRunTime: Math.round(medianRunTime),
+      minRunTime: Math.round(minRunTime),
+      maxRunTime: Math.round(maxRunTime),
+      executionTimes
+    };
+  };
+
   return (
     <Box>
       <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 3 }}>
@@ -656,6 +723,98 @@ const BenchmarksTab: React.FC = () => {
         <Alert severity="error" sx={{ mb: 2 }}>
           {error}
         </Alert>
+      )}
+
+      {getTestSummary() && (
+        <Card sx={{ mb: 3, bgcolor: 'grey.50' }}>
+          <CardContent>
+            <Typography variant="h6" gutterBottom>
+              Test Summary (Last Run Analysis)
+            </Typography>
+            <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 2 }}>
+              <Box>
+                <Typography variant="body2" color="text.secondary">
+                  Total Tests
+                </Typography>
+                <Typography variant="h4" color="primary">
+                  {getTestSummary()?.totalTests}
+                </Typography>
+              </Box>
+              <Box>
+                <Typography variant="body2" color="text.secondary">
+                  Tests Run
+                </Typography>
+                <Typography variant="h4" color="info.main">
+                  {getTestSummary()?.runTests}
+                </Typography>
+              </Box>
+              <Box>
+                <Typography variant="body2" color="text.secondary">
+                  Pass Rate
+                </Typography>
+                <Typography variant="h4" color={getTestSummary()?.passRate && getTestSummary()!.passRate >= 80 ? 'success.main' : getTestSummary()?.passRate && getTestSummary()!.passRate >= 60 ? 'warning.main' : 'error.main'}>
+                  {getTestSummary()?.passRate}%
+                </Typography>
+              </Box>
+              <Box>
+                <Typography variant="body2" color="text.secondary">
+                  Passed
+                </Typography>
+                <Typography variant="h4" color="success.main">
+                  {getTestSummary()?.passedTests}
+                </Typography>
+              </Box>
+              <Box>
+                <Typography variant="body2" color="text.secondary">
+                  Failed
+                </Typography>
+                <Typography variant="h4" color="error.main">
+                  {getTestSummary()?.failedTests}
+                </Typography>
+              </Box>
+            </Box>
+            
+            <Box sx={{ mt: 3 }}>
+              <Typography variant="h6" gutterBottom>
+                Execution Time Statistics (ms)
+              </Typography>
+              <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 2 }}>
+                <Box>
+                  <Typography variant="body2" color="text.secondary">
+                    Average
+                  </Typography>
+                  <Typography variant="h5">
+                    {getTestSummary()?.averageRunTime}ms
+                  </Typography>
+                </Box>
+                <Box>
+                  <Typography variant="body2" color="text.secondary">
+                    Median
+                  </Typography>
+                  <Typography variant="h5">
+                    {getTestSummary()?.medianRunTime}ms
+                  </Typography>
+                </Box>
+                <Box>
+                  <Typography variant="body2" color="text.secondary">
+                    Min
+                  </Typography>
+                  <Typography variant="h5" color="success.main">
+                    {getTestSummary()?.minRunTime}ms
+                  </Typography>
+                </Box>
+                <Box>
+                  <Typography variant="body2" color="text.secondary">
+                    Max
+                  </Typography>
+                  <Typography variant="h5" color="error.main">
+                    {getTestSummary()?.maxRunTime}ms
+                  </Typography>
+                </Box>
+              </Box>
+            </Box>
+          </CardContent>
+        </Card>
       )}
 
       {loading ? (
