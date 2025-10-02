@@ -62,7 +62,6 @@ export class AgentModeService {
       const toolCalls: any[] = [];
       const knowledgeBaseQueries: string[] = [];
       const sources: string[] = [];
-      let shouldFeedbackToLLM = false;
       
       // Remember initial message count to slice response messages later
       const initialMessageCount = messages.length;
@@ -104,9 +103,6 @@ export class AgentModeService {
         
         console.log(`AgentMode: Executing ${responseMessage.tool_calls.length} tool calls`);
         
-        // Reset feedback flag for this iteration
-        shouldFeedbackToLLM = false;
-        
         // Execute tool calls
         for (const toolCall of responseMessage.tool_calls) {
           try {
@@ -131,7 +127,6 @@ export class AgentModeService {
                 name: toolCall.function.name,
                 content: toolResponse
               });
-              shouldFeedbackToLLM = true;
             } catch (e) {
               (messages as any[]).push({
                 tool_call_id: toolCall.id,
@@ -139,7 +134,6 @@ export class AgentModeService {
                 name: toolCall.function.name,
                 content: String(result)
               });
-              shouldFeedbackToLLM = true;
             }
 
             // Add results to content for LLM to process
@@ -148,17 +142,14 @@ export class AgentModeService {
               content += `\n\n${statusMessage}`;
             } else if (toolCall.function.name === 'get_meta_ads_metrics' && result.success) {
               // Special handling for metrics data - provide summary for AI analysis
-              shouldFeedbackToLLM = true;
               const metricsSummary = this.formatMetricsSummary({ ...result.data, timeframe: result.timeframe });
               content += `\n\n${metricsSummary}`;
             } else if (toolCall.function.name === 'search_web' && result.success) {
               // Track web search results
-              shouldFeedbackToLLM = true;
               const searchSummary = this.formatWebSearchResults(result);
               content += `\n\n${searchSummary}`;
             } else if (toolCall.function.name === 'read_brand_guidelines' && result.success) {
               // Special handling for brand guidelines - provide formatted brand data for AI analysis
-              shouldFeedbackToLLM = true;
               const brandSummary = this.formatBrandGuidelines(result);
               content += `\n\n${brandSummary}`;
             } else if (toolCall.function.name === 'update_brand_guidelines' && result.success) {
@@ -167,7 +158,6 @@ export class AgentModeService {
               content += `\n\n${updateSummary}`;
             } else if (toolCall.function.name === 'read_market_strategy' && result.success) {
               // Special handling for market strategy - provide formatted market data for AI analysis
-              shouldFeedbackToLLM = true;
               const marketSummary = this.formatMarketStrategy(result);
               content += `\n\n${marketSummary}`;
             } else if (toolCall.function.name === 'update_market_strategy' && result.success) {
@@ -176,7 +166,6 @@ export class AgentModeService {
               content += `\n\n${updateSummary}`;
             } else if (toolCall.function.name === 'save_file' && result.success) {
               // Special handling for file saves - provide file URL for sharing
-              shouldFeedbackToLLM = true;
               content += `\n\n📁 **File Saved Successfully**\n`;
               content += `File: ${result.file_name}\n`;
               content += `Size: ${result.file_size} bytes\n`;
@@ -184,12 +173,10 @@ export class AgentModeService {
               content += `\nThe file has been uploaded to S3 and is ready for sharing or reference.`;
             } else if (toolCall.function.name === 'read_file_content' && result.success) {
               // Special handling for file content reading - provide extracted content for AI analysis
-              shouldFeedbackToLLM = true;
               const fileContentSummary = this.formatFileContent(result);
               content += `\n\n${fileContentSummary}`;
             } else if (result && result.success === false) {
               // Feed tool error back to LLM so it can recover
-              shouldFeedbackToLLM = true;
               const errorSummary = this.formatToolError(toolCall.function.name, result.error || result.message || 'Unknown error');
               content += `\n\n${errorSummary}`;
             }
@@ -202,16 +189,9 @@ export class AgentModeService {
               error: error instanceof Error ? error.message : 'Unknown error'
             });
             // Ensure LLM receives the error to adjust its plan
-            shouldFeedbackToLLM = true;
             const errMsg = error instanceof Error ? error.message : String(error);
             content += `\n\n${this.formatToolError(toolCall.function.name, errMsg)}`;
           }
-        }
-        
-        // Break the loop if no tools provided feedback in this iteration
-        if (!shouldFeedbackToLLM) {
-          console.log('AgentMode: No tools provided feedback in this iteration, breaking loop');
-          break;
         }
         
         // Do not append an assistant message; tool messages above are sufficient for model continuation
