@@ -1,6 +1,7 @@
 import axios from 'axios';
 import OpenAI from 'openai';
 import { google } from 'googleapis';
+import { createHash } from 'crypto';
 import { chatbotDb, ChatMessage } from './chatbotService';
 import { taskDb, taskTemplateDb } from './db';
 import { settingsService } from './settingsService';
@@ -18,6 +19,7 @@ interface PDFData {
 
 export class AgentModeService {
   private openai: OpenAI;
+  private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number }> = new Map();
   
   constructor() {
     this.openai = new OpenAI({
@@ -837,16 +839,203 @@ Use the available tools to create tasks in the agent-engine when complex work is
         };
       
       case 'get_meta_ads_metrics':
+        // Calculate attribution window based on timeframe
+        const timeframe = args.timeframe || '7d';
+        const now = new Date();
+        const endDate = new Date(now);
+        let startDate = new Date(now);
+        let days = 7;
+        
+        // Parse timeframe - only valid values are 7d, 14d, 30d, 90d
+        switch (timeframe) {
+          case '7d':
+            days = 7;
+            startDate.setDate(now.getDate() - 7);
+            break;
+          case '14d':
+            days = 14;
+            startDate.setDate(now.getDate() - 14);
+            break;
+          case '30d':
+            days = 30;
+            startDate.setDate(now.getDate() - 30);
+            break;
+          case '90d':
+            days = 90;
+            startDate.setDate(now.getDate() - 90);
+            break;
+          default:
+            // Fallback to 7d if invalid timeframe provided
+            days = 7;
+            startDate.setDate(now.getDate() - 7);
+            break;
+        }
+        
+        // Format dates as YYYY-MM-DD
+        const formatDate = (date: Date) => date.toISOString().split('T')[0];
+        
         return {
           success: true,
-          metrics: {
-            impressions: 12500,
-            clicks: 450,
-            spend: 125.50,
-            conversions: 23,
-            ctr: 3.6,
-            cpc: 0.28,
-            cpm: 10.04
+          data: {
+            attributionWindow: {
+              start: formatDate(startDate),
+              end: formatDate(endDate),
+              days: days
+            },
+            campaignSummary: {
+              totalCampaigns: 3,
+              totalSpend: 1250.75,
+              totalImpressions: 125000,
+              totalClicks: 4500,
+              averageCtr: 3.6,
+              averageCpc: 0.28,
+              totalWebsiteLeads: 23,
+              averageCostPerWebsiteLead: 54.38
+            },
+            adPerformance: [
+              {
+                name: 'Holiday Campaign 2023',
+                spend: 750.25,
+                impressions: 75000,
+                clicks: 2700,
+                ctr: 3.6,
+                cpc: 0.28,
+                websiteLeads: 14,
+                costPerWebsiteLead: 53.59
+              },
+              {
+                name: 'Brand Awareness Campaign',
+                spend: 350.50,
+                impressions: 35000,
+                clicks: 1260,
+                ctr: 3.6,
+                cpc: 0.28,
+                websiteLeads: 6,
+                costPerWebsiteLead: 58.42
+              },
+              {
+                name: 'Retargeting Campaign',
+                spend: 150.00,
+                impressions: 15000,
+                clicks: 540,
+                ctr: 3.6,
+                cpc: 0.28,
+                websiteLeads: 3,
+                costPerWebsiteLead: 50.00
+              }
+            ],
+            adSetsData: [
+              {
+                name: 'Holiday - Lookalike Audience',
+                campaignName: 'Holiday Campaign 2023',
+                spend: 450.15,
+                impressions: 45000,
+                clicks: 1620,
+                ctr: 3.6,
+                cpc: 0.28,
+                websiteLeads: 8,
+                costPerWebsiteLead: 56.27
+              },
+              {
+                name: 'Holiday - Interest Targeting',
+                campaignName: 'Holiday Campaign 2023',
+                spend: 300.10,
+                impressions: 30000,
+                clicks: 1080,
+                ctr: 3.6,
+                cpc: 0.28,
+                websiteLeads: 6,
+                costPerWebsiteLead: 50.02
+              },
+              {
+                name: 'Brand - Broad Targeting',
+                campaignName: 'Brand Awareness Campaign',
+                spend: 350.50,
+                impressions: 35000,
+                clicks: 1260,
+                ctr: 3.6,
+                cpc: 0.28,
+                websiteLeads: 6,
+                costPerWebsiteLead: 58.42
+              },
+              {
+                name: 'Retargeting - Website Visitors',
+                campaignName: 'Retargeting Campaign',
+                spend: 150.00,
+                impressions: 15000,
+                clicks: 540,
+                ctr: 3.6,
+                cpc: 0.28,
+                websiteLeads: 3,
+                costPerWebsiteLead: 50.00
+              }
+            ],
+            adsData: [
+              {
+                name: 'Holiday Sale - Creative A',
+                adSetName: 'Holiday - Lookalike Audience',
+                campaignName: 'Holiday Campaign 2023',
+                spend: 225.08,
+                impressions: 22500,
+                clicks: 810,
+                ctr: 3.6,
+                cpc: 0.28,
+                websiteLeads: 4,
+                costPerWebsiteLead: 56.27
+              },
+              {
+                name: 'Holiday Sale - Creative B',
+                adSetName: 'Holiday - Lookalike Audience',
+                campaignName: 'Holiday Campaign 2023',
+                spend: 225.07,
+                impressions: 22500,
+                clicks: 810,
+                ctr: 3.6,
+                cpc: 0.28,
+                websiteLeads: 4,
+                costPerWebsiteLead: 56.27
+              },
+              {
+                name: 'Brand Awareness - Video',
+                adSetName: 'Brand - Broad Targeting',
+                campaignName: 'Brand Awareness Campaign',
+                spend: 350.50,
+                impressions: 35000,
+                clicks: 1260,
+                ctr: 3.6,
+                cpc: 0.28,
+                websiteLeads: 6,
+                costPerWebsiteLead: 58.42
+              },
+              {
+                name: 'Retargeting - Special Offer',
+                adSetName: 'Retargeting - Website Visitors',
+                campaignName: 'Retargeting Campaign',
+                spend: 150.00,
+                impressions: 15000,
+                clicks: 540,
+                ctr: 3.6,
+                cpc: 0.28,
+                websiteLeads: 3,
+                costPerWebsiteLead: 50.00
+              }
+            ],
+            demographicsBreakdown: [
+              { age: '25-34', gender: 'female', impressions: '45000', clicks: '1620', spend: '450.15', websiteLeads: '8' },
+              { age: '35-44', gender: 'male', impressions: '35000', clicks: '1260', spend: '350.10', websiteLeads: '6' },
+              { age: '25-34', gender: 'male', impressions: '30000', clicks: '1080', spend: '300.10', websiteLeads: '5' },
+              { age: '45-54', gender: 'female', impressions: '15000', clicks: '540', spend: '150.40', websiteLeads: '4' }
+            ],
+            placementBreakdown: [
+              { publisher_platform: 'facebook', platform_position: 'feed', impressions: '75000', clicks: '2700', spend: '750.25', websiteLeads: '14' },
+              { publisher_platform: 'instagram', platform_position: 'feed', impressions: '35000', clicks: '1260', spend: '350.50', websiteLeads: '6' },
+              { publisher_platform: 'facebook', platform_position: 'stories', impressions: '15000', clicks: '540', spend: '150.00', websiteLeads: '3' }
+            ],
+            deviceBreakdown: [
+              { device_platform: 'mobile', impressions: '80000', clicks: '2880', spend: '800.40', websiteLeads: '15' },
+              { device_platform: 'desktop', impressions: '30000', clicks: '1080', spend: '300.20', websiteLeads: '6' },
+              { device_platform: 'tablet', impressions: '15000', clicks: '540', spend: '150.15', websiteLeads: '2' }
+            ]
           },
           timeframe: args.timeframe || '7d'
         };
@@ -916,8 +1105,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'save_file':
         return {
           success: true,
-          fileUrl: `https://mock-s3-bucket.s3.amazonaws.com/mock-files/${args.file_name}`,
-          message: 'Mock file saved successfully'
+          message: `File "${args.file_name}" has been saved successfully.`,
+          file_url: `https://agentweb-files.s3.us-east-1.amazonaws.com/files/${Date.now()}-${args.file_name}`,
+          file_name: args.file_name,
+          file_size: args.file_content.length
         };
       
       case 'read_file_content':
@@ -3141,10 +3332,26 @@ Use the available tools to create tasks in the agent-engine when complex work is
     return formattedContent;
   }
 
-  // Save file to S3 and return URL
+  // Save file to S3 and return URL with content-based deduplication
   private async saveFile(fileName: string, fileContent: string, userId: string, sessionId: string): Promise<any> {
     try {
       console.log('AgentMode: Saving file:', fileName, 'for user:', userId, 'session:', sessionId);
+      
+      // Generate content hash for deduplication
+      const contentHash = createHash('sha256').update(fileContent).digest('hex');
+      
+      // Check if we already have this content cached
+      const cachedFile = this.fileContentCache.get(contentHash);
+      if (cachedFile) {
+        console.log('AgentMode: File content already exists, returning cached URL:', cachedFile.file_url);
+        return {
+          success: true,
+          message: `File "${fileName}" has been saved successfully.`,
+          file_url: cachedFile.file_url,
+          file_name: fileName,
+          file_size: fileContent.length
+        };
+      }
       
       const { uploadFileToS3 } = await import('../utils/s3Utils');
       
@@ -3176,6 +3383,15 @@ Use the available tools to create tasks in the agent-engine when complex work is
       );
       
       if (uploadResult.success) {
+        // Cache the file content hash to URL mapping
+        this.fileContentCache.set(contentHash, {
+          file_url: uploadResult.url || '',
+          file_name: fileName || 'unknown',
+          file_size: fileContent.length
+        });
+        
+        console.log('AgentMode: File uploaded and cached with hash:', contentHash);
+        
         return {
           success: true,
           message: `File "${fileName}" has been saved successfully.`,
