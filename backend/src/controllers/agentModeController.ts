@@ -28,7 +28,6 @@ export const agentModeController = {
   async getSessions(req: Request, res: Response) {
     try {
       const user = req.user as User;
-      console.log(`AgentMode: Getting sessions for user ${user.userId}`);
 
       const sessions = await chatbotDb.getUserSessions(user.userId, 'agent');
       
@@ -51,7 +50,6 @@ export const agentModeController = {
       const user = req.user as User;
       const { portalType = 'agent', pageIdentifier = 'agent-mode' } = req.body;
 
-      console.log(`AgentMode: Creating new session for user ${user.userId}`);
 
       const session = await chatbotDb.createChatSession(
         user.userId,
@@ -75,7 +73,6 @@ export const agentModeController = {
     try {
       const { sessionId } = req.params;
       const user = req.user as any; // Should have user from auth middleware
-      console.log(`AgentMode: Getting session ${sessionId}`);
 
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -128,7 +125,6 @@ export const agentModeController = {
         return res.status(400).json({ error: 'Session ID and user message are required' });
       }
 
-      console.log(`AgentMode: Generating marketing response for session ${sessionId}`);
 
       // Get session
       const session = await chatbotDb.getChatSession(sessionId);
@@ -180,7 +176,6 @@ export const agentModeController = {
           };
           
           await chatbotDb.addMessageToSession(sessionId, systemMessage);
-          console.log('AgentMode: Added system message with version:', systemPromptHash);
         } catch (error) {
           console.error('AgentMode: Failed to add system message:', error);
           // Continue with the message processing even if this fails
@@ -190,10 +185,8 @@ export const agentModeController = {
       // If this is the first message, generate session title
       if (isFirstMessage) {
         try {
-          console.log('AgentMode: First message detected, generating session title');
           const title = await agentModeService.generateSessionTitle(userMessage);
           await chatbotDb.updateSessionTitle(sessionId, title);
-          console.log('AgentMode: Session title updated to:', title);
         } catch (error) {
           console.error('AgentMode: Failed to update session title:', error);
           // Continue with the message processing even if this fails
@@ -368,7 +361,6 @@ export const agentModeController = {
       const { sessionId } = req.params;
       const user = req.user as User;
 
-      console.log(`AgentMode: Archiving session ${sessionId} for user ${user.userId}`);
 
       await chatbotDb.archiveSession(sessionId);
       res.json({ message: 'Session archived successfully' });
@@ -385,7 +377,6 @@ export const agentModeController = {
       const { status } = req.body;
       const user = req.user as User;
       
-      console.log(`AgentMode: Updating task status for session ${sessionId}, task ${taskId}, execution ${executionId} to ${status}`);
 
       await updateTaskExecutionStatus(sessionId, taskId, executionId, status);
       res.json({ message: 'Task status updated successfully' });

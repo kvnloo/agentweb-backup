@@ -327,7 +327,6 @@ export async function runBenchmarkTest(req: AuthenticatedRequest, res: Response)
       // Use all messages except the last one as session history
       const sessionHistory = messages.slice(0, -1);
 
-      console.log(`Benchmark: Running test ${testId} with ${sessionHistory.length} history messages`);
 
       // Call the agent to generate response with mock mode enabled
       const agentResponse = await agentModeService.generateMarketingResponse(
@@ -339,12 +338,9 @@ export async function runBenchmarkTest(req: AuthenticatedRequest, res: Response)
       );
 
       const executionTime = Date.now() - startTime;
-      console.log(`Benchmark: Agent response generated in ${executionTime}ms`);
 
       // Extract function calls from the response
       const actualFunctionCalls = agentResponse.toolCalls?.map((call: any) => call.name).filter(Boolean) || [];
-      console.log(`Benchmark: Extracted function calls:`, actualFunctionCalls);
-      console.log(`Benchmark: Raw toolCalls:`, agentResponse.toolCalls);
 
       // Evaluate the response against expected criteria
       const evaluation = evaluateBenchmarkResponse(

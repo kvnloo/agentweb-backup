@@ -41,7 +41,6 @@ export class AgentModeService {
     mockMode: boolean = false
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[] }> {
     try {
-      console.log('AgentMode: Generating marketing response');
       
       const systemPrompt = await this.getMarketingSystemPrompt();
       const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
@@ -73,7 +72,6 @@ export class AgentModeService {
       
       while (iteration < maxIterations) {
         iteration++;
-        console.log(`AgentMode: LLM call iteration ${iteration}`);
         
         // Make LLM call
         const response = await this.openai.chat.completions.create({
@@ -97,17 +95,14 @@ export class AgentModeService {
         
         // If no tool calls, break the loop
         if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
-          console.log('AgentMode: No tool calls, breaking loop');
           break;
         }
         
-        console.log(`AgentMode: Executing ${responseMessage.tool_calls.length} tool calls`);
         
         // Execute tool calls
         for (const toolCall of responseMessage.tool_calls) {
           try {
             const functionArgs = JSON.parse(toolCall.function.arguments);
-            console.log(`AgentMode: Executing tool ${toolCall.function.name}`);
             
             const result = await this.executeTool(toolCall.function.name, functionArgs, userId, sessionId, mockMode);
             
@@ -1105,11 +1100,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
   private async executeTool(toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false): Promise<any> {
     const argsStr = JSON.stringify(args, null, 2);
     const truncatedArgs = argsStr.length > 500 ? argsStr.substring(0, 500) + '...' : argsStr;
-    console.log('AgentMode: Executing tool:', toolName, 'with args:', truncatedArgs);
     
     // Return mock data if in mock mode
     if (mockMode) {
-      console.log('AgentMode: Mock mode enabled, returning mock data for tool:', toolName);
       return this.getMockToolResult(toolName, args);
     }
     
@@ -1705,7 +1698,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
   // Create task from template
   private async createTaskFromTemplate(templateId: string, parameters: Record<string, string>, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true, attachedFileUrls: string[] = []): Promise<any> {
     try {
-      console.log('AgentMode: Creating task from template ID:', templateId, 'with parameters:', parameters);
 
       // Validate parameters
       if (!parameters || typeof parameters !== 'object') {
@@ -1735,7 +1727,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
         };
       }
 
-      console.log('AgentMode: Using template:', template.name);
 
       // Map template to the expected format
       const templateData = {
@@ -1848,7 +1839,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
         startTime: new Date().toISOString()
       });
 
-      console.log('AgentMode: Task created successfully:', task.taskId);
 
       return {
         success: true,
@@ -1872,7 +1862,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
   // Create task from raw prompt
   private async createTaskFromPrompt(taskName: string, prompt: string, category: string, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true, attachedFileUrls: string[] = []): Promise<any> {
     try {
-      console.log('AgentMode: Creating task from prompt:', taskName);
 
       // Attach previous task results if requested
       let finalPrompt = prompt;
@@ -1927,7 +1916,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
         startTime: new Date().toISOString()
       });
 
-      console.log('AgentMode: Task created successfully:', task.taskId);
 
       return {
         success: true,
@@ -1950,7 +1938,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
   // Create image generation task from raw prompt
   private async createImageTaskFromPrompt(taskName: string, prompt: string, category: string, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true): Promise<any> {
     try {
-      console.log('AgentMode: Creating image task from prompt:', taskName);
 
       // Format the prompt using the same format as handleCreateAdImageTask
       let formattedPrompt = "Please create high-quality ad images that align with the below context and target the specified audience. The images should be professional, engaging, and suitable for various marketing channels. Use download_image to download reference images and generate_image to create the result images. Valid size values for generate_image include \"1024x1024\", \"1536x1024\", \"1024x1536\", \"auto\". Valid quality values for generate_image include \"low\", \"medium\", \"high\", \"auto\". DO NOT browse the internet for other images.\n\n";
@@ -2006,7 +1993,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
         startTime: new Date().toISOString()
       });
 
-      console.log('AgentMode: Image task created successfully:', task.taskId);
 
       return {
         success: true,
@@ -2028,7 +2014,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
   async generateSessionTitle(userMessage: string): Promise<string> {
     try {
-      console.log('AgentMode: Generating session title for message:', userMessage);
       
       const response = await this.openai.chat.completions.create({
         model: process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
@@ -2043,7 +2028,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
       });
 
       const title = response.choices[0]?.message?.content?.trim();
-      console.log('AgentMode: Generated title:', title);
       
       return title || 'Marketing Task';
     } catch (error) {
@@ -2056,28 +2040,23 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
   private async getMetaAdsMetrics(timeframe: string, userId: string): Promise<any> {
     try {
-      console.log('AgentMode: Getting Meta ads metrics for timeframe:', timeframe, 'userId:', userId);
       
       // Import the Meta API functions directly to reuse the same logic
       const { getMetaAccessToken } = await import('../utils/secretsManager');
       const { userDb } = await import('./db');
       
       // Get user from database
-      console.log('AgentMode: Fetching user from database...');
       const user = await userDb.getUserById(userId);
       if (!user) {
-        console.log('AgentMode: User not found in database');
         return {
           success: false,
           message: 'User not found',
           error: 'User not found'
         };
       }
-      console.log('AgentMode: User found, adAccount:', user.adAccount);
 
       // Check if user has ad account configured
       if (!user.adAccount || user.adAccount.trim() === "") {
-        console.log('AgentMode: User ad account not configured');
         return {
           success: false,
           message: 'Ad account not configured. Please configure your Meta ad account first.',
@@ -2088,9 +2067,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       // Get Meta API access token from Secrets Manager
       let accessToken: string;
       try {
-        console.log('AgentMode: Fetching Meta access token from Secrets Manager...');
         accessToken = await getMetaAccessToken();
-        console.log('AgentMode: Meta access token retrieved successfully from Secrets Manager');
       } catch (error: any) {
         console.error('AgentMode: Error fetching Meta access token:', error);
         return {
@@ -2102,7 +2079,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Get API version from environment or default to v18.0
       const apiVersion = process.env.META_API_VERSION || 'v18.0';
-      console.log('AgentMode: Using Meta API version:', apiVersion);
       
       // Calculate date range based on timeframe
       const endDate = new Date();
@@ -2119,10 +2095,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const sinceStr = startDate.toISOString().split('T')[0];
       const untilStr = endDate.toISOString().split('T')[0];
       const attributionDays = Math.max(1, Math.ceil((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24)));
-      console.log('AgentMode: Date range:', sinceStr, 'to', untilStr);
 
       // Get campaigns, ad sets, ads, and insights using Graph API - fetch at multiple levels
-      console.log('AgentMode: Making parallel API calls to Meta Graph API...');
       const [campaignsResponse, adSetsResponse, adsResponse, adInsightsResponse, adSetInsightsResponse, campaignInsightsResponse, insightsDemographicsResponse, insightsPlacementResponse, insightsDeviceResponse] = await Promise.all([
         fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`),
         fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting&access_token=${accessToken}`),
@@ -2141,7 +2115,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
         fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad&access_token=${accessToken}`)
       ]);
 
-      console.log('AgentMode: API calls completed, parsing responses...');
       const [campaignsData, adSetsData, adsData, adInsightsData, adSetInsightsData, campaignInsightsData, insightsDemographicsData, insightsPlacementData, insightsDeviceData] = await Promise.all([
         campaignsResponse.json(),
         adSetsResponse.json(),
@@ -2154,16 +2127,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
         insightsDeviceResponse.json()
       ]);
 
-      console.log('AgentMode: API responses parsed:');
-      console.log('- Campaigns response status:', campaignsResponse.status, 'data length:', campaignsData.data?.length || 0);
-      console.log('- Ad Sets response status:', adSetsResponse.status, 'data length:', adSetsData.data?.length || 0);
-      console.log('- Ads response status:', adsResponse.status, 'data length:', adsData.data?.length || 0);
-      console.log('- Ad-level insights status:', adInsightsResponse.status, 'data length:', adInsightsData.data?.length || 0);
-      console.log('- Adset-level insights status:', adSetInsightsResponse.status, 'data length:', adSetInsightsData.data?.length || 0);
-      console.log('- Campaign-level insights status:', campaignInsightsResponse.status, 'data length:', campaignInsightsData.data?.length || 0);
-      console.log('- Demographics insights status:', insightsDemographicsResponse.status, 'data length:', insightsDemographicsData.data?.length || 0);
-      console.log('- Placement insights status:', insightsPlacementResponse.status, 'data length:', insightsPlacementData.data?.length || 0);
-      console.log('- Device insights status:', insightsDeviceResponse.status, 'data length:', insightsDeviceData.data?.length || 0);
 
       // Check for errors in any of the responses
       if (campaignsData.error) {
@@ -2204,23 +2167,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
       }
 
       // Process the data using simplified logic
-      console.log('AgentMode: Processing campaign data...');
       const adPerformance = this.processCampaignData(campaignsData.data || [], campaignInsightsData.data || [], adSetsData.data || []);
-      console.log('AgentMode: Processed campaigns:', adPerformance.length);
-      
-      console.log('AgentMode: Processing ad sets data...');
       const processedAdSetsData = this.processAdSetsData(adSetsData.data || [], adSetInsightsData.data || [], campaignsData.data || []);
-      console.log('AgentMode: Processed ad sets:', processedAdSetsData.length);
-      
-      console.log('AgentMode: Processing ads data...');
       const processedAdsData = this.processAdsData(adsData.data || [], adInsightsData.data || [], adSetsData.data || [], campaignsData.data || []);
-      console.log('AgentMode: Processed ads:', processedAdsData.length);
-      
-      console.log('AgentMode: Generating campaign summary...');
       const campaignSummary = this.generateCampaignSummary(adPerformance);
-      console.log('AgentMode: Campaign summary:', JSON.stringify(campaignSummary, null, 2));
-      
-      console.log('AgentMode: Processing breakdown data with lead generation metrics...');
       const processedDemographicsBreakdown = this.processBreakdownData(insightsDemographicsData?.data || []);
       const processedPlacementBreakdown = this.processBreakdownData(insightsPlacementData?.data || []);
       const processedDeviceBreakdown = this.processBreakdownData(insightsDeviceData?.data || []);
@@ -2255,7 +2205,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
         formattedContent
       };
       
-      console.log('AgentMode: Returning result with', adPerformance.length, 'campaigns,', processedAdSetsData.length, 'ad sets,', processedAdsData.length, 'ads');
       return result;
     } catch (error) {
       console.error('AgentMode: Error fetching Meta ads metrics:', error);
