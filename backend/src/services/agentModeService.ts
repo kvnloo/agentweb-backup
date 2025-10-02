@@ -159,6 +159,7 @@ export class AgentModeService {
           lastMessage.metadata = {
             ...lastMessage.metadata,
             toolCalls: toolCalls,
+            timestamp: new Date().toISOString(),
           };
         }
       }
