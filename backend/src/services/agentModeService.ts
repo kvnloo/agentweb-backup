@@ -119,67 +119,15 @@ export class AgentModeService {
             });
 
             // Append the tool call result as a tool message for the model to consume next
-            try {
-              const toolResponse = typeof result === 'string' ? result : JSON.stringify(result);
-              (messages as any[]).push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: toolResponse
-              });
-            } catch (e) {
-              (messages as any[]).push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: String(result)
-              });
-            }
+            const toolContent = result.formattedContent || (typeof result === 'string' ? result : JSON.stringify(result));
+            (messages as any[]).push({
+              tool_call_id: toolCall.id,
+              role: 'tool',
+              name: toolCall.function.name,
+              content: toolContent
+            });
 
-            // Add results to content for LLM to process
-            if (result.taskId && result.executionId) {
-              const statusMessage = this.getStatusMessage(toolCall.function.name, result.status);
-              content += `\n\n${statusMessage}`;
-            } else if (toolCall.function.name === 'get_meta_ads_metrics' && result.success) {
-              // Special handling for metrics data - provide summary for AI analysis
-              const metricsSummary = this.formatMetricsSummary({ ...result.data, timeframe: result.timeframe });
-              content += `\n\n${metricsSummary}`;
-            } else if (toolCall.function.name === 'search_web' && result.success) {
-              // Track web search results
-              const searchSummary = this.formatWebSearchResults(result);
-              content += `\n\n${searchSummary}`;
-            } else if (toolCall.function.name === 'read_brand_guidelines' && result.success) {
-              // Special handling for brand guidelines - provide formatted brand data for AI analysis
-              const brandSummary = this.formatBrandGuidelines(result);
-              content += `\n\n${brandSummary}`;
-            } else if (toolCall.function.name === 'update_brand_guidelines' && result.success) {
-              // Special handling for brand guidelines update - provide feedback to LLM
-              const updateSummary = this.formatBrandGuidelinesUpdate(result);
-              content += `\n\n${updateSummary}`;
-            } else if (toolCall.function.name === 'read_market_strategy' && result.success) {
-              // Special handling for market strategy - provide formatted market data for AI analysis
-              const marketSummary = this.formatMarketStrategy(result);
-              content += `\n\n${marketSummary}`;
-            } else if (toolCall.function.name === 'update_market_strategy' && result.success) {
-              // Special handling for market strategy update - provide feedback to LLM
-              const updateSummary = this.formatMarketStrategyUpdate(result);
-              content += `\n\n${updateSummary}`;
-            } else if (toolCall.function.name === 'save_file' && result.success) {
-              // Special handling for file saves - provide file URL for sharing
-              content += `\n\n📁 **File Saved Successfully**\n`;
-              content += `File: ${result.file_name}\n`;
-              content += `Size: ${result.file_size} bytes\n`;
-              content += `URL: ${result.file_url}\n`;
-              content += `\nThe file has been uploaded to S3 and is ready for sharing or reference.`;
-            } else if (toolCall.function.name === 'read_file_content' && result.success) {
-              // Special handling for file content reading - provide extracted content for AI analysis
-              const fileContentSummary = this.formatFileContent(result);
-              content += `\n\n${fileContentSummary}`;
-            } else if (result && result.success === false) {
-              // Feed tool error back to LLM so it can recover
-              const errorSummary = this.formatToolError(toolCall.function.name, result.error || result.message || 'Unknown error');
-              content += `\n\n${errorSummary}`;
-            }
+            // Tool results are now included in the tool message content above
           } catch (error) {
             console.error(`AgentMode: Tool execution error for ${toolCall.function.name}:`, error);
             toolCalls.push({
@@ -190,7 +138,15 @@ export class AgentModeService {
             });
             // Ensure LLM receives the error to adjust its plan
             const errMsg = error instanceof Error ? error.message : String(error);
-            content += `\n\n${this.formatToolError(toolCall.function.name, errMsg)}`;
+            const errorContent = this.formatToolError(toolCall.function.name, errMsg);
+            
+            // Append error as tool message
+            messages.push({
+              tool_call_id: toolCall.id,
+              role: 'tool',
+              name: toolCall.function.name,
+              content: errorContent
+            });
           }
         }
         
@@ -1308,6 +1264,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
         };
       }
 
+      // Format the brand guidelines for LLM consumption
+      const formattedContent = this.formatBrandGuidelines({
+        exists: true,
+        brandData: brand.brandData || {},
+        attachments: brand.attachments || []
+      });
+
       // Return structured response similar to web_search
       return {
         success: true,
@@ -1316,7 +1279,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         brandData: brand.brandData || {},
         attachments: brand.attachments || [],
         createdAt: brand.createdAt,
-        updatedAt: brand.updatedAt
+        updatedAt: brand.updatedAt,
+        formattedContent
       };
     } catch (error) {
       console.error('AgentMode: Error reading brand guidelines:', error);
@@ -1356,6 +1320,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
         };
       }
 
+      // Format the market strategy for LLM consumption
+      const formattedContent = this.formatMarketStrategy({
+        exists: true,
+        marketData: marketStrategy
+      });
+
       // Return structured response similar to readBrandGuidelines
       return {
         success: true,
@@ -1363,7 +1333,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         exists: true,
         marketData: marketStrategy,
         createdAt: marketStrategy.createdAt,
-        updatedAt: marketStrategy.updatedAt
+        updatedAt: marketStrategy.updatedAt,
+        formattedContent
       };
     } catch (error) {
       console.error('AgentMode: Error reading market strategy:', error);
@@ -1478,7 +1449,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         });
       }
 
-      return {
+      // Format the update result for LLM consumption
+      const formattedContent = this.formatMarketStrategyUpdate({
         success: true,
         message: 'Market strategy updated successfully',
         marketData: marketStrategyData,
@@ -1487,6 +1459,18 @@ Use the available tools to create tasks in the agent-engine when complex work is
         addedEntries,
         totalCompetitors: mergedCompetitors.length,
         totalICPs: mergedICP.length
+      });
+
+      return {
+        success: true,
+        message: 'Market strategy updated successfully',
+        marketData: marketStrategyData,
+        updatedFields: Object.keys(updateData).filter(key => updateData[key] !== undefined),
+        updatedEntries,
+        addedEntries,
+        totalCompetitors: mergedCompetitors.length,
+        totalICPs: mergedICP.length,
+        formattedContent
       };
     } catch (error) {
       console.error('AgentMode: Error updating market strategy:', error);
@@ -1579,13 +1563,24 @@ Use the available tools to create tasks in the agent-engine when complex work is
       if (brandAssets !== undefined) updatedFields.push('brandAssets');
       updatedFields.push(...Object.keys(otherFields));
 
+      // Format the update result for LLM consumption
+      const formattedContent = this.formatBrandGuidelinesUpdate({
+        success: true,
+        message: 'Brand guidelines updated successfully',
+        updatedFields,
+        brandData: updatedBrandData,
+        attachments: updatedAttachments,
+        updatedAssets: updatedAssets
+      });
+
       return {
         success: true,
         message: 'Brand guidelines updated successfully',
         updatedFields,
         brandData: updatedBrandData,
         attachments: updatedAttachments,
-        updatedAssets: updatedAssets // Only the assets that were actually updated
+        updatedAssets: updatedAssets, // Only the assets that were actually updated
+        formattedContent
       };
     } catch (error) {
       console.error('AgentMode: Error updating brand guidelines:', error);
@@ -2230,6 +2225,19 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const processedPlacementBreakdown = this.processBreakdownData(insightsPlacementData?.data || []);
       const processedDeviceBreakdown = this.processBreakdownData(insightsDeviceData?.data || []);
       
+      // Format the data for LLM consumption
+      const formattedContent = this.formatMetricsSummary({
+        adPerformance,
+        adSetsData: processedAdSetsData,
+        adsData: processedAdsData,
+        campaignSummary,
+        demographicsBreakdown: processedDemographicsBreakdown,
+        placementBreakdown: processedPlacementBreakdown,
+        deviceBreakdown: processedDeviceBreakdown,
+        attributionWindow: { start: sinceStr, end: untilStr, days: attributionDays },
+        timeframe
+      });
+
       const result = {
         success: true,
         message: `Meta ads metrics loaded for ${timeframe} timeframe`,
@@ -2243,7 +2251,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
           placementBreakdown: processedPlacementBreakdown,
           deviceBreakdown: processedDeviceBreakdown,
           attributionWindow: { start: sinceStr, end: untilStr, days: attributionDays }
-        }
+        },
+        formattedContent
       };
       
       console.log('AgentMode: Returning result with', adPerformance.length, 'campaigns,', processedAdSetsData.length, 'ad sets,', processedAdsData.length, 'ads');
@@ -2965,12 +2974,20 @@ Use the available tools to create tasks in the agent-engine when complex work is
       
       const searchResults = await this.performWebSearch(query, limitedMaxResults);
       
+      // Format the results for LLM consumption
+      const formattedContent = this.formatWebSearchResults({
+        query,
+        results: searchResults,
+        totalResults: searchResults.length
+      });
+      
       return {
         success: true,
         message: `Found ${searchResults.length} web search results for "${query}"`,
         query,
         results: searchResults,
-        totalResults: searchResults.length
+        totalResults: searchResults.length,
+        formattedContent
       };
     } catch (error) {
       console.error('AgentMode: Error searching web:', error);
@@ -3363,12 +3380,16 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const cachedFile = this.fileContentCache.get(contentHash);
       if (cachedFile) {
         console.log('AgentMode: File content already exists, returning cached URL:', cachedFile.file_url);
+        // Format the save result for LLM consumption
+        const formattedContent = `📁 **File Saved Successfully**\nFile: ${fileName}\nSize: ${fileContent.length} bytes\nURL: ${cachedFile.file_url}\n\nThe file has been uploaded to S3 and is ready for sharing or reference.`;
+
         return {
           success: true,
           message: `File "${fileName}" has been saved successfully.`,
           file_url: cachedFile.file_url,
           file_name: fileName,
-          file_size: fileContent.length
+          file_size: fileContent.length,
+          formattedContent
         };
       }
       
@@ -3411,12 +3432,16 @@ Use the available tools to create tasks in the agent-engine when complex work is
         
         console.log('AgentMode: File uploaded and cached with hash:', contentHash);
         
+        // Format the save result for LLM consumption
+        const formattedContent = `📁 **File Saved Successfully**\nFile: ${fileName}\nSize: ${fileContent.length} bytes\nURL: ${uploadResult.url}\n\nThe file has been uploaded to S3 and is ready for sharing or reference.`;
+
         return {
           success: true,
           message: `File "${fileName}" has been saved successfully.`,
           file_url: uploadResult.url,
           file_name: fileName,
-          file_size: fileContent.length
+          file_size: fileContent.length,
+          formattedContent
         };
       } else {
         return {
@@ -3525,6 +3550,16 @@ Use the available tools to create tasks in the agent-engine when complex work is
         console.log(`AgentMode: Content truncated to ${maxContentLength} characters`);
       }
 
+      // Format the file content for LLM consumption
+      const formattedContent = this.formatFileContent({
+        success: true,
+        content: extractedContent,
+        file_type: fileType,
+        file_size: buffer.length,
+        content_length: extractedContent.length,
+        file_url: fileUrl
+      });
+
       return {
         success: true,
         content: extractedContent,
@@ -3532,7 +3567,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         file_size: buffer.length,
         content_length: extractedContent.length,
         file_url: fileUrl,
-        message: `Successfully read ${fileType} file content (${extractedContent.length} characters)`
+        message: `Successfully read ${fileType} file content (${extractedContent.length} characters)`,
+        formattedContent
       };
 
     } catch (error: any) {
