@@ -28,8 +28,28 @@ export async function createBenchmarkTest(req: AuthenticatedRequest, res: Respon
     }
 
     // Use custom conversation history if provided, otherwise use session messages
-    const conversationHistory = req.body.conversationHistory || {
-      messages: session.messages || []
+    let messages = req.body.conversationHistory?.messages || session.messages || [];
+    
+    // Process messages to include attachments in user messages (same as generateResponse)
+    messages = messages.map((message: any) => {
+      if (message.role === 'user') {
+        // Check for attachments in both message.attachments and message.metadata.attachments
+        const attachments = message.attachments || message.metadata?.attachments || [];
+        if (attachments.length > 0) {
+          const attachmentUrls = attachments.map((attachment: any) => {
+            return `[${attachment.filename || 'Attachment'}](${attachment.url})`;
+          }).join('\n');
+          return {
+            ...message,
+            content: `${message.content}\n\n**Attached Files:**\n${attachmentUrls}`
+          };
+        }
+      }
+      return message;
+    });
+    
+    const conversationHistory = {
+      messages
     };
 
     // Create the benchmark test

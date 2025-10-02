@@ -36,6 +36,7 @@ import {
   PlayArrow as PlayIcon,
   Refresh as RefreshIcon,
   History as HistoryIcon,
+  AttachFile as AttachFileIcon,
 } from '@mui/icons-material';
 import { useSearchParams } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
@@ -438,13 +439,60 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
                     return true;
                   })
                   .map((message, index) => (
-                    <Box key={index} sx={{ mb: 1 }}>
-                      <Typography variant="caption" color="text.secondary">
-                        {message.role}:
+                    <Box key={index} sx={{ mb: 2, p: 1, border: '1px solid #e0e0e0', borderRadius: 1 }}>
+                      <Typography variant="caption" color="text.secondary" sx={{ fontWeight: 'bold' }}>
+                        {message.role?.toUpperCase() || 'UNKNOWN'}:
                       </Typography>
-                      <Typography variant="body2" sx={{ ml: 1 }}>
+                      <Typography variant="body2" sx={{ mt: 1, whiteSpace: 'pre-wrap' }}>
                         {message.content}
                       </Typography>
+                      
+                      {/* Display attachments if present */}
+                      {((message.attachments && message.attachments.length > 0) || (message.metadata?.attachments && message.metadata.attachments.length > 0)) && (
+                        <Box sx={{ mt: 1 }}>
+                          <Typography variant="caption" color="text.secondary" sx={{ fontWeight: 'bold' }}>
+                            Attachments:
+                          </Typography>
+                          <Box sx={{ mt: 0.5, display: 'flex', flexDirection: 'column', gap: 0.5 }}>
+                            {(message.attachments || message.metadata?.attachments || []).map((attachment: any, attachmentIndex: number) => (
+                              <Box 
+                                key={attachmentIndex} 
+                                sx={{ 
+                                  display: 'flex', 
+                                  alignItems: 'center', 
+                                  gap: 1, 
+                                  p: 1, 
+                                  backgroundColor: 'rgba(0, 0, 0, 0.03)', 
+                                  borderRadius: 0.5,
+                                  fontSize: '0.75rem'
+                                }}
+                              >
+                                <AttachFileIcon sx={{ fontSize: '0.875rem', color: 'text.secondary' }} />
+                                <Typography 
+                                  component="a" 
+                                  href={attachment.url} 
+                                  target="_blank" 
+                                  rel="noopener noreferrer"
+                                  sx={{ 
+                                    color: 'primary.main', 
+                                    textDecoration: 'none',
+                                    '&:hover': { textDecoration: 'underline' },
+                                    overflow: 'hidden',
+                                    textOverflow: 'ellipsis',
+                                    whiteSpace: 'nowrap',
+                                    maxWidth: '200px'
+                                  }}
+                                >
+                                  {attachment.filename || 'Attachment'}
+                                </Typography>
+                                <Typography variant="caption" color="text.secondary">
+                                  ({(attachment.size / 1024).toFixed(1)} KB)
+                                </Typography>
+                              </Box>
+                            ))}
+                          </Box>
+                        </Box>
+                      )}
                     </Box>
                   ))}
               </Paper>
