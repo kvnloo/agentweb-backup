@@ -572,23 +572,32 @@ const BenchmarksTab: React.FC = () => {
     <Box>
       <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 3 }}>
         <Typography variant="h6">Benchmark Tests</Typography>
-        <Box>
-          <Button
-            variant="outlined"
-            startIcon={<RefreshIcon />}
-            onClick={loadBenchmarks}
-            disabled={loading}
-            sx={{ mr: 1 }}
-          >
-            Refresh
-          </Button>
-          <Button
-            variant="contained"
-            startIcon={<AddIcon />}
-            onClick={() => setCreateDialogOpen(true)}
-          >
-            Create Benchmark
-          </Button>
+        <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
+          <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+            <Button
+              variant="outlined"
+              startIcon={<RefreshIcon />}
+              onClick={loadBenchmarks}
+              disabled={loading}
+              sx={{ mr: 1 }}
+            >
+              Refresh
+            </Button>
+            <Button
+              variant="contained"
+              startIcon={<AddIcon />}
+              onClick={() => setCreateDialogOpen(true)}
+              disabled={!searchParams.get('createFromSession')}
+            >
+              Create Benchmark
+            </Button>
+          </Box>
+          
+          {!searchParams.get('createFromSession') && (
+            <Typography variant="caption" color="text.secondary" sx={{ textAlign: 'right' }}>
+              💡 Click "Add to Benchmark" in Agent Mode to add a session to benchmark test.
+            </Typography>
+          )}
         </Box>
       </Box>
 
