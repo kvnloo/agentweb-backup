@@ -39,23 +39,23 @@ export class AgentModeService {
     userId: string,
     sessionId: string,
     mockMode: boolean = false
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[] }> {
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[] }> {
     try {
       console.log('AgentMode: Generating marketing response');
       
       const systemPrompt = await this.getMarketingSystemPrompt();
       const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
       const availableTemplates = await this.getAvailableTemplates();
-      const context = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses);
+      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses);
       
       // Build templates context message
       const templatesContext = this.buildTemplatesContext(availableTemplates);
       
-      // Build initial messages array
+      // Build initial messages array (preserve structured history and tool messages)
       const messages: any[] = [
         { role: 'system', content: systemPrompt },
         { role: 'assistant', content: templatesContext },
-        { role: 'user', content: context }
+        ...marketingMessages
       ];
 
       let content = '';
@@ -63,6 +63,9 @@ export class AgentModeService {
       const knowledgeBaseQueries: string[] = [];
       const sources: string[] = [];
       let shouldFeedbackToLLM = false;
+      
+      // Remember initial message count to slice response messages later
+      const initialMessageCount = messages.length;
 
       // Single loop for LLM calls and tool execution
       let maxIterations = 10; // Prevent infinite loops
@@ -222,7 +225,8 @@ export class AgentModeService {
         content,
         toolCalls,
         knowledgeBaseQueries,
-        sources
+        sources,
+        responseMessages: messages.slice(initialMessageCount)
       };
     } catch (error) {
       console.error('AgentMode: Response generation failed:', error);
@@ -419,49 +423,52 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
-  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = []): string {
-    let context = `User Message: ${messageContent}\n\n`;
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = []): any[] {
+    // Build structured messages preserving roles (assume the first is system) and including tool messages
+    const messages: any[] = [];
     
-    // Add current task statuses
-    if (currentTaskStatuses.length > 0) {
-      context += 'Current Task Statuses:\n';
-      currentTaskStatuses.forEach(task => {
-        const statusEmoji: Record<string, string> = {
-          'pending': '⏳',
-          'running': '🔄',
-          'completed': '✅',
-          'failed': '❌'
-        };
-        const emoji = statusEmoji[task.status] || '⏳';
-        context += `${emoji} ${task.taskName} (${task.status}) - Task ID: ${task.taskId}, Execution ID: ${task.executionId}\n`;
-      });
-      context += '\n';
-    } else {
-      context += '📋 **Task Status**: No tasks have been run in this session yet.\n\n';
-    }
-    
-    // Add recent conversation history (excluding system messages)
-    if (sessionHistory.length > 0) {
-      const nonSystemMessages = sessionHistory.filter(msg => msg.role !== 'system');
-      const recentHistory = nonSystemMessages.slice(-10);
-      context += 'Recent Conversation:\n';
-      recentHistory.forEach(msg => {
-        let messageContent = msg.content;
-        
-        // If this is a user message with attachments, include them
-        if (msg.role === 'user' && msg.metadata?.attachments && msg.metadata.attachments.length > 0) {
-          const attachmentUrls = msg.metadata.attachments.map((attachment: any) => {
-            return `[${attachment.filename || 'Attachment'}](${attachment.url})`;
-          }).join('\n');
-          messageContent = `${msg.content}\n\n**Attached Files:**\n${attachmentUrls}`;
+    // Determine slice starting at the 10th most recent user message over full history
+    let userCount = 0;
+    let startIdx = 1; // Assume the first message is the system message
+    for (let i = sessionHistory.length - 1; i >= 0; i--) {
+      if (sessionHistory[i].role === 'user') {
+        userCount++;
+        if (userCount === 10) {
+          startIdx = i;
+          break;
         }
-        
-        context += `${msg.role === 'user' ? 'User' : 'Assistant'}: ${messageContent}\n`;
-      });
-      context += '\n';
+      }
+    }
+    const sliced = sessionHistory.slice(startIdx);
+    
+    // Copy all sliced messages as-is
+    for (const msg of sliced) {
+      messages.push({ role: msg.role, content: msg.content, name: (msg as any).name, tool_call_id: (msg as any).tool_call_id });
     }
     
-    return context;
+    // Insert current task statuses as an assistant message before the final user message
+    const statusEmoji: Record<string, string> = {
+      pending: '⏳',
+      running: '🔄',
+      completed: '✅',
+      failed: '❌'
+    };
+    let statusesContent = '';
+    if (currentTaskStatuses && currentTaskStatuses.length > 0) {
+      statusesContent += 'Current Task Statuses:\n';
+      currentTaskStatuses.forEach(task => {
+        const emoji = statusEmoji[task.status] || '⏳';
+        statusesContent += `${emoji} ${task.taskName} (${task.status}) - Task ID: ${task.taskId}, Execution ID: ${task.executionId}\n`;
+      });
+    } else {
+      statusesContent = '📋 **Task Status**: No tasks have been run in this session yet.';
+    }
+    messages.push({ role: 'assistant', content: statusesContent });
+
+    // Append the current user message at the end
+    messages.push({ role: 'user', content: messageContent });
+    
+    return messages;
   }
 
   private buildTemplatesContext(templates: any[]): string {

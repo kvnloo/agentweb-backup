@@ -258,12 +258,16 @@ const ChatDialog = ({
                           ? "grey.100"
                           : msg.role === "assistant"
                           ? "#e3f2fd"
+                          : msg.role === "tool"
+                          ? "#fff3e0" // Tool messages get a light orange background
                           : "#f3e5f5", // System messages get a light purple background
                       color: "text.primary",
                       border: msg.role !== "user" ? "1px solid" : "none",
                       borderColor:
                         msg.role === "assistant"
                           ? "#90caf9"
+                          : msg.role === "tool"
+                          ? "#ffb74d"
                           : msg.role === "system"
                           ? "#ce93d8"
                           : "transparent",
@@ -319,6 +323,8 @@ const ChatDialog = ({
                         color:
                           msg.role === "assistant"
                             ? "#1976d2"
+                            : msg.role === "tool"
+                            ? "#f57c00"
                             : msg.role === "system"
                             ? "#7b1fa2"
                             : "text.secondary",
@@ -342,26 +348,65 @@ const ChatDialog = ({
                           maxWidth: "100%",
                         },
                       }}
-                      dangerouslySetInnerHTML={{
-                        __html: DOMPurify.sanitize(msg.content, {
-                          ADD_TAGS: [
-                            "strong",
-                            "em",
-                            "code",
-                            "ul",
-                            "li",
-                            "pre",
-                            "a",
-                            "table",
-                            "tr",
-                            "td",
-                            "th",
-                            "p",
-                          ],
-                          ADD_ATTR: ["href", "target"],
-                        }),
-                      }}
-                    />
+                    >
+                      {/* Display content if available */}
+                      {msg.content && (
+                        <div
+                          dangerouslySetInnerHTML={{
+                            __html: DOMPurify.sanitize(msg.content, {
+                              ADD_TAGS: [
+                                "strong",
+                                "em",
+                                "code",
+                                "ul",
+                                "li",
+                                "pre",
+                                "a",
+                                "table",
+                                "tr",
+                                "td",
+                                "th",
+                                "p",
+                              ],
+                              ADD_ATTR: ["href", "target"],
+                            }),
+                          }}
+                        />
+                      )}
+                      
+                      {/* Display tool calls for assistant messages */}
+                      {msg.role === "assistant" && msg.tool_calls && msg.tool_calls.length > 0 && (
+                        <Box sx={{ mt: 1 }}>
+                          <Typography variant="caption" color="text.secondary" sx={{ fontWeight: "bold" }}>
+                            Tool Calls:
+                          </Typography>
+                          {msg.tool_calls.map((toolCall: any, toolIndex: number) => (
+                            <Box key={toolIndex} sx={{ mt: 1, p: 1, backgroundColor: "rgba(0, 0, 0, 0.03)", borderRadius: 1 }}>
+                              <Typography variant="caption" sx={{ fontWeight: "bold" }}>
+                                {toolCall.function?.name || toolCall.name}
+                              </Typography>
+                              {toolCall.function?.arguments && (
+                                <pre style={{ fontSize: "0.75rem", margin: "4px 0 0 0", overflowX: "auto" }}>
+                                  {JSON.stringify(JSON.parse(toolCall.function.arguments), null, 2)}
+                                </pre>
+                              )}
+                            </Box>
+                          ))}
+                        </Box>
+                      )}
+                      
+                      {/* Display tool message content */}
+                      {msg.role === "tool" && (
+                        <Box sx={{ mt: 1 }}>
+                          <Typography variant="caption" color="text.secondary" sx={{ fontWeight: "bold" }}>
+                            Tool Response ({msg.name}):
+                          </Typography>
+                          <pre style={{ fontSize: "0.75rem", margin: "4px 0 0 0", overflowX: "auto", whiteSpace: "pre-wrap" }}>
+                            {msg.content}
+                          </pre>
+                        </Box>
+                      )}
+                    </Box>
                     {msg.metadata && (
                       <Box sx={{ mt: 1 }}>
                         <Typography variant="caption" color="text.secondary">

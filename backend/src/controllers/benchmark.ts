@@ -342,6 +342,7 @@ export async function runBenchmarkTest(req: AuthenticatedRequest, res: Response)
         status,
         passed: evaluation.passed,
         actualResponse: agentResponse.content,
+        responseMessages: agentResponse.responseMessages, // Store the full response messages
         actualFunctionCalls,
         keywordMatches: evaluation.keywordMatches,
         keywordMisses: evaluation.keywordMisses,

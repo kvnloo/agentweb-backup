@@ -6,6 +6,23 @@ import multer from 'multer';
 import crypto from 'crypto';
 import { uploadFileToS3 } from '../utils/s3Utils';
 
+// Common function to filter messages for client display
+const filterMessagesForClient = (messages: any[]) => {
+  return messages.filter(message => {
+    // Remove tool messages
+    if (message.role === 'tool') {
+      return false;
+    }
+    
+    // Remove assistant messages that have tool calls
+    if (message.role === 'assistant' && message.tool_calls && message.tool_calls.length > 0) {
+      return false;
+    }
+    
+    return true;
+  });
+};
+
 export const agentModeController = {
   // Get user's agent chat sessions
   async getSessions(req: Request, res: Response) {
@@ -14,7 +31,14 @@ export const agentModeController = {
       console.log(`AgentMode: Getting sessions for user ${user.userId}`);
 
       const sessions = await chatbotDb.getUserSessions(user.userId, 'agent');
-      res.json(sessions);
+      
+      // Filter out tool messages and assistant messages with tool calls for user display
+      const filteredSessions = sessions.map(session => ({
+        ...session,
+        messages: filterMessagesForClient(session.messages)
+      }));
+      
+      res.json(filteredSessions);
     } catch (error) {
       console.error('AgentMode: Get sessions error:', error);
       res.status(500).json({ error: 'Failed to get sessions' });
@@ -163,9 +187,6 @@ export const agentModeController = {
         }
       }
 
-      // Add user message to session in database
-      await chatbotDb.addMessageToSession(sessionId, userMessageObj);
-
       // If this is the first message, generate session title
       if (isFirstMessage) {
         try {
@@ -185,6 +206,9 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found after update' });
       }
 
+      // Add user message to session in database
+      await chatbotDb.addMessageToSession(sessionId, userMessageObj);
+
       // Generate AI response
       const response = await agentModeService.generateMarketingResponse(
         messageContent,
@@ -193,20 +217,8 @@ export const agentModeController = {
         sessionId
       );
 
-      // Add assistant message to session
-      const assistantMessage = {
-        role: 'assistant' as const,
-        content: response.content,
-        metadata: {
-          timestamp: new Date().toISOString(),
-          portalType: 'agent' as const,
-          toolCalls: response.toolCalls,
-          knowledgeBaseQueries: response.knowledgeBaseQueries,
-          sources: response.sources
-        }
-      };
-
-      await chatbotDb.addMessageToSession(sessionId, assistantMessage);
+      // Add all response messages to session (includes assistant responses and tool calls)
+      await chatbotDb.addMessagesToSession(sessionId, response.responseMessages);
 
       res.json({
         content: response.content,
@@ -338,7 +350,7 @@ export const agentModeController = {
         session: {
           sessionId: session.sessionId,
           title: session.title,
-          messages: session.messages,
+          messages: filterMessagesForClient(session.messages),
           createdAt: session.createdAt,
           updatedAt: session.updatedAt,
           shareMetadata: session.shareMetadata

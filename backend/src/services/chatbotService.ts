@@ -56,9 +56,12 @@ const embeddingsClient = new OpenAI({
 
 // Interface for chat messages
 export interface ChatMessage {
-  role: "system" | "user" | "assistant";
+  role: "system" | "user" | "assistant" | "tool";
   content: string;
   timestamp?: string; // Add direct timestamp field
+  name?: string; // For tool messages
+  tool_call_id?: string; // For tool messages
+  tool_calls?: any[]; // For assistant messages with tool calls
   usage?: {
     prompt_tokens: number;
     completion_tokens: number;
@@ -448,6 +451,33 @@ export class ChatbotDB {
     }
   }
 
+  async addMessagesToSession(
+    sessionId: string,
+    messages: ChatMessage[]
+  ): Promise<ChatSession> {
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression:
+        "SET messages = list_append(messages, :messages), updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":messages": messages,
+        ":updatedAt": new Date().toISOString(),
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error adding messages to session:", error);
+      throw error;
+    }
+  }
+
   async getChatSession(sessionId: string): Promise<ChatSession | null> {
     const params = {
       TableName: this.tableName,
@@ -513,6 +543,7 @@ export class ChatbotDB {
       console.log(
         `Found ${sessions.length} non-archived chat sessions for user: ${userId}`
       );
+
 
       // Sort by updatedAt in memory (DynamoDB UserIdIndex doesn't support updatedAt sorting)
       if (sortDescending) {
@@ -1523,7 +1554,16 @@ export async function generateChatResponse(
     // Generate response using OpenAI
     const response = await openai.chat.completions.create({
       model: `${process.env.AZURE_OPENAI_DEPLOYMENT}`,
-      messages: messages.map(({ role, content }) => ({ role, content })), // Only send role and content to OpenAI
+      messages: messages.map(({ role, content, name, tool_call_id }) => {
+        const message: any = { role, content };
+        if (role === 'tool' && tool_call_id) {
+          message.tool_call_id = tool_call_id;
+        }
+        if (name) {
+          message.name = name;
+        }
+        return message;
+      }), // Send appropriate properties based on message type
     });
 
     // Log and get usage data
