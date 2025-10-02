@@ -423,7 +423,20 @@ Use the available tools to create tasks in the agent-engine when complex work is
     
     // Copy all sliced messages as-is
     for (const msg of sliced) {
-      messages.push({ role: msg.role, content: msg.content, name: (msg as any).name, tool_call_id: (msg as any).tool_call_id });
+      const messageObj: any = { role: msg.role, content: msg.content };
+      
+      // Add optional properties based on message type
+      if ((msg as any).name) {
+        messageObj.name = (msg as any).name;
+      }
+      if ((msg as any).tool_call_id) {
+        messageObj.tool_call_id = (msg as any).tool_call_id;
+      }
+      if ((msg as any).tool_calls) {
+        messageObj.tool_calls = (msg as any).tool_calls;
+      }
+      
+      messages.push(messageObj);
     }
     
     // Insert current task statuses as an assistant message before the final user message
