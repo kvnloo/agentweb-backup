@@ -458,6 +458,7 @@ const BenchmarksTab: React.FC = () => {
   const [historyDialogOpen, setHistoryDialogOpen] = useState(false);
   const [selectedBenchmark, setSelectedBenchmark] = useState<BenchmarkTest | null>(null);
   const [runningTests, setRunningTests] = useState<Set<string>>(new Set());
+  const [runningAllTests, setRunningAllTests] = useState(false);
 
   useEffect(() => {
     loadBenchmarks();
@@ -546,6 +547,48 @@ const BenchmarksTab: React.FC = () => {
     }
   };
 
+  const handleRunAllTests = async () => {
+    if (benchmarks.length === 0) return;
+    
+    setRunningAllTests(true);
+    setError('');
+    
+    try {
+      // Run tests one by one
+      for (const benchmark of benchmarks) {
+        try {
+          // Add test to running set
+          setRunningTests(prev => new Set(prev).add(benchmark.testId));
+          
+          await axios.post(buildApiUrl(`/api/benchmark/${benchmark.testId}/run`), {}, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          
+          // Small delay between tests to avoid overwhelming the system
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        } catch (err: any) {
+          console.error(`Error running benchmark ${benchmark.testId}:`, err);
+          // Continue with next test even if one fails
+        } finally {
+          // Remove test from running set
+          setRunningTests(prev => {
+            const newSet = new Set(prev);
+            newSet.delete(benchmark.testId);
+            return newSet;
+          });
+        }
+      }
+      
+      // Refresh the list to get updated stats for all tests
+      await loadBenchmarks();
+    } catch (err: any) {
+      console.error('Error running all benchmarks:', err);
+      setError('Some tests failed to run. Check individual test results.');
+    } finally {
+      setRunningAllTests(false);
+    }
+  };
+
   const getStatusColor = (status: string) => {
     switch (status) {
       case 'active': return 'success';
@@ -578,10 +621,18 @@ const BenchmarksTab: React.FC = () => {
               variant="outlined"
               startIcon={<RefreshIcon />}
               onClick={loadBenchmarks}
-              disabled={loading}
-              sx={{ mr: 1 }}
+              disabled={loading || runningAllTests}
             >
               Refresh
+            </Button>
+            <Button
+              variant="outlined"
+              startIcon={runningAllTests ? <CircularProgress size={16} /> : <PlayIcon />}
+              onClick={handleRunAllTests}
+              disabled={runningAllTests || benchmarks.length === 0}
+              color="secondary"
+            >
+              {runningAllTests ? 'Running All...' : 'Run All Tests'}
             </Button>
             <Button
               variant="contained"
