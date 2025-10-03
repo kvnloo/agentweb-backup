@@ -178,7 +178,11 @@ export const agentModeController = {
           await chatbotDb.addMessageToSession(sessionId, systemMessage);
         } catch (error) {
           console.error('AgentMode: Failed to add system message:', error);
-          // Continue with the message processing even if this fails
+          // If it's a session size limit error, re-throw it
+          if (error instanceof Error && error.message.includes('SESSION_SIZE_LIMIT_EXCEEDED')) {
+            throw error;
+          }
+          // Continue with the message processing for other errors
         }
       }
 
@@ -221,6 +225,30 @@ export const agentModeController = {
       });
     } catch (error) {
       console.error('AgentMode: Generate response error:', error);
+      
+      // Handle specific error types
+      if (error instanceof Error) {
+        if (error.message.includes('SESSION_SIZE_LIMIT_EXCEEDED')) {
+          res.status(413).json({ 
+            error: 'Session size limit exceeded',
+            message: 'Please start a new session to continue the conversation.',
+            code: 'SESSION_SIZE_LIMIT_EXCEEDED',
+            suggestion: 'start_new_session'
+          });
+          return;
+        }
+        
+        if (error.message.includes('MESSAGE_TOO_LARGE')) {
+          res.status(413).json({ 
+            error: 'Message too large',
+            message: 'The message content is too large to be saved. Please try with shorter content.',
+            code: 'MESSAGE_TOO_LARGE',
+            suggestion: 'shorten_content'
+          });
+          return;
+        }
+      }
+      
       res.status(500).json({ error: 'Failed to generate response' });
     }
   },

@@ -335,6 +335,74 @@ export class ChatbotDB {
     this.tableName = `${TABLE_PREFIX}AW-ChatSessions`;
   }
 
+  // Utility function to calculate DynamoDB item size more accurately
+  private calculateItemSize(item: any): number {
+    // DynamoDB calculates size based on UTF-8 encoding
+    return Buffer.byteLength(JSON.stringify(item), 'utf8');
+  }
+
+  // Common function to validate and truncate messages with total size calculation
+  private async validateAndTruncateMessages(
+    sessionId: string, 
+    messages: ChatMessage[], 
+    maxContentSize: number = 150000, 
+    maxMessageSize: number = 200000,
+    maxSessionSize: number = 350000
+  ): Promise<ChatMessage[]> {
+    // First, truncate all messages
+    const truncatedMessages = messages.map((message, index) => {
+      // Truncate message content if too large
+      if (message.content && message.content.length > maxContentSize) {
+        message.content = message.content.substring(0, maxContentSize) + '\n\n[Message content truncated due to size limit]';
+      }
+      
+      // Check if message itself is too large
+      const messageSize = this.calculateItemSize(message);
+      if (messageSize > maxMessageSize) {
+        console.warn(`Message ${index} size (${messageSize} bytes) exceeds limit (${maxMessageSize} bytes). Skipping message.`);
+        return null; // Skip this message
+      }
+      
+      console.log(`Message ${index}: size ${messageSize} bytes, content length: ${message.content?.length || 0} chars, role: ${message.role}`);
+      return message;
+    }).filter(Boolean) as ChatMessage[];
+
+    if (truncatedMessages.length === 0) {
+      return [];
+    }
+
+    // Get current session to calculate total size
+    try {
+      const currentSession = await this.getChatSession(sessionId);
+      if (!currentSession) {
+        return truncatedMessages;
+      }
+
+      const currentMessages = currentSession.messages || [];
+      const totalMessages = [...currentMessages, ...truncatedMessages];
+      const totalSessionSize = this.calculateItemSize({ ...currentSession, messages: totalMessages });
+      
+      console.log(`ChatbotDB: Current session has ${currentMessages.length} messages, adding ${truncatedMessages.length} new message(s)`);
+      console.log(`ChatbotDB: Total session size would be ${totalSessionSize} bytes`);
+      
+      if (totalSessionSize <= maxSessionSize) {
+        return truncatedMessages;
+      }
+
+      console.error(`Total session size (${totalSessionSize} bytes) would exceed limit (${maxSessionSize} bytes). Session is too large.`);
+      throw new Error('SESSION_SIZE_LIMIT_EXCEEDED: Please start a new session to continue the conversation.');
+      
+    } catch (sessionError) {
+      // Only catch errors from getChatSession, not our intentional SESSION_SIZE_LIMIT_EXCEEDED
+      if (sessionError instanceof Error && sessionError.message.includes('SESSION_SIZE_LIMIT_EXCEEDED')) {
+        throw sessionError; // Re-throw our intentional error
+      }
+      console.warn('Could not check current session size, proceeding with truncated messages:', sessionError);
+      return truncatedMessages;
+    }
+  }
+
+
   async createChatSession(
     userId: string,
     pageContent?: string,
@@ -428,15 +496,29 @@ export class ChatbotDB {
     sessionId: string,
     message: ChatMessage
   ): Promise<ChatSession> {
+    // Validate and truncate the message (wrap single message in array)
+    const validatedMessages = await this.validateAndTruncateMessages(sessionId, [message]);
+    if (validatedMessages.length === 0) {
+      throw new Error('SESSION_SIZE_LIMIT_EXCEEDED: Please start a new session to continue the conversation.');
+    }
+
+    // Check if session exists and has messages
+    const currentSession = await this.getChatSession(sessionId);
+    if (!currentSession) {
+      throw new Error('Session not found');
+    }
+
+    const currentMessages = currentSession.messages || [];
+    const allMessages = [...currentMessages, ...validatedMessages];
+
     const params = {
       TableName: this.tableName,
       Key: {
         sessionId,
       },
-      UpdateExpression:
-        "SET messages = list_append(messages, :message), updatedAt = :updatedAt",
+      UpdateExpression: "SET messages = :messages, updatedAt = :updatedAt",
       ExpressionAttributeValues: {
-        ":message": [message],
+        ":messages": allMessages,
         ":updatedAt": new Date().toISOString(),
       },
       ReturnValues: "ALL_NEW",
@@ -455,15 +537,32 @@ export class ChatbotDB {
     sessionId: string,
     messages: ChatMessage[]
   ): Promise<ChatSession> {
+    // Validate and truncate all messages
+    const validatedMessages = await this.validateAndTruncateMessages(sessionId, messages);
+    
+    console.log(`ChatbotDB: Validated messages: ${validatedMessages.length} out of ${messages.length} messages will be added`);
+
+    if (validatedMessages.length === 0) {
+      throw new Error('SESSION_SIZE_LIMIT_EXCEEDED: Please start a new session to continue the conversation.');
+    }
+
+    // Check if session exists and has messages
+    const currentSession = await this.getChatSession(sessionId);
+    if (!currentSession) {
+      throw new Error('Session not found');
+    }
+
+    const currentMessages = currentSession.messages || [];
+    const allMessages = [...currentMessages, ...validatedMessages];
+
     const params = {
       TableName: this.tableName,
       Key: {
         sessionId,
       },
-      UpdateExpression:
-        "SET messages = list_append(messages, :messages), updatedAt = :updatedAt",
+      UpdateExpression: "SET messages = :messages, updatedAt = :updatedAt",
       ExpressionAttributeValues: {
-        ":messages": messages,
+        ":messages": allMessages,
         ":updatedAt": new Date().toISOString(),
       },
       ReturnValues: "ALL_NEW",
