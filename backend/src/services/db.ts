@@ -77,6 +77,12 @@ export interface User {
       targetAudience: string;
       brandPersonality: string;
       isGradient: boolean;
+      founders: Array<{
+        name: string;
+        jobTitle: string;
+        styleTone: string;
+        signaturePosts: string;
+      }>;
     };
     attachments: Array<{
       type: string;
