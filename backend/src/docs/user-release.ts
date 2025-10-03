@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-10-03',
+    changes: [
+      'Supported Founder Profile in Brand Guidelines',
+      '- Brand Guidelines now support adding and updating founder profiles (name, job title, style & tone, signature posts)',
+      '- Agent Mode can read and update founder profiles; merging uses founder name as key',
+    ],
+  },
+  {
     date: '2025-10-02',
     changes: [
       'Supported benchmark tests for Agent Mode',

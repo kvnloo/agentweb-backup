@@ -163,6 +163,7 @@ router.post(
         brandValues,
         targetAudience,
         brandPersonality,
+        founders,
       } = req.body;
 
       const files = req.files as { [fieldname: string]: Express.Multer.File[] };
@@ -289,6 +290,18 @@ router.post(
         }
       }
 
+      // Parse founders if it's a string; preserve existing if not provided
+      let parsedFounders = existingBrandGuidelines?.brandData?.founders || [];
+      if (typeof founders !== 'undefined') {
+        try {
+          parsedFounders =
+            typeof founders === 'string' ? JSON.parse(founders) : founders;
+        } catch (e) {
+          // If bad payload, keep existing founders
+          parsedFounders = existingBrandGuidelines?.brandData?.founders || [];
+        }
+      }
+
       const brandGuidelinesData = {
         brandData: {
           brandName: brandName || "",
@@ -301,6 +314,7 @@ router.post(
           brandValues: parsedBrandValues,
           targetAudience: targetAudience || "",
           brandPersonality: brandPersonality || "",
+          founders: parsedFounders,
         },
         attachments: [
           ...(existingBrandGuidelines?.attachments || []),

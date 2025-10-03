@@ -540,7 +540,21 @@ Use the available tools to create tasks in the agent-engine when complex work is
                     items: { type: 'string' },
                     description: 'Array of brand values' 
                   },
-                  isGradient: { type: 'boolean', description: 'Whether primary color uses gradient' }
+                  isGradient: { type: 'boolean', description: 'Whether primary color uses gradient' },
+                  founders: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        name: { type: 'string', description: 'Founder name' },
+                        jobTitle: { type: 'string', description: 'Founder job title' },
+                        styleTone: { type: 'string', description: 'Founder communication style and tone' },
+                        signaturePosts: { type: 'string', description: 'Notable posts or content the founder is known for' }
+                      },
+                      required: ['name']
+                    },
+                    description: 'Array of founder profiles'
+                  }
                 }
               },
               brandAssets: {
@@ -1517,7 +1531,39 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const updatedBrandData = {
         ...existingBrand.brandData,
         ...brandData
-      };
+      } as any;
+
+      // Special merge logic for founder profiles (merge by normalized founder name)
+      if (brandData && Array.isArray((brandData as any).founders)) {
+        const normalize = (name: any) =>
+          typeof name === 'string' ? name.trim().toLowerCase() : '';
+
+        const existingFounders: any[] = Array.isArray((existingBrand.brandData as any)?.founders)
+          ? (existingBrand.brandData as any).founders
+          : [];
+        const incomingFounders: any[] = (brandData as any).founders || [];
+
+        const mergedFounders: any[] = [...existingFounders];
+        for (const newFounder of incomingFounders) {
+          if (!newFounder || !newFounder.name) continue;
+          const key = normalize(newFounder.name);
+          if (!key) continue;
+
+          const idx = mergedFounders.findIndex(
+            f => f && normalize(f.name) === key
+          );
+          if (idx >= 0) {
+            // Replace the entire object for that founder name
+            mergedFounders[idx] = newFounder;
+          } else {
+            // Append as new founder
+            mergedFounders.push(newFounder);
+          }
+        }
+
+        // Assign the merged array back
+        updatedBrandData.founders = mergedFounders;
+      }
 
       // Handle brandAssets update - merge by type to preserve existing assets
       let updatedAttachments = [...(existingBrand.attachments || [])];
@@ -3121,6 +3167,27 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
     formattedSummary += `<br>`;
 
+    // Founder Profile Section (matches UI structure)
+    formattedSummary += `<strong>👥 Founder Profile</strong><br>`;
+    if (brandData.founders && brandData.founders.length > 0) {
+      brandData.founders.forEach((founder: any, index: number) => {
+        formattedSummary += `• <strong>Founder ${index + 1}:</strong> ${founder.name}<br>`;
+        if (founder.jobTitle) {
+          formattedSummary += `  📋 <strong>Job Title:</strong> ${founder.jobTitle}<br>`;
+        }
+        if (founder.styleTone) {
+          formattedSummary += `  🎭 <strong>Style & Tone:</strong> ${founder.styleTone}<br>`;
+        }
+        if (founder.signaturePosts) {
+          formattedSummary += `  ✍️ <strong>Signature Posts:</strong> ${founder.signaturePosts}<br>`;
+        }
+        formattedSummary += `<br>`;
+      });
+    } else {
+      formattedSummary += `• No founder profiles added<br>`;
+    }
+    formattedSummary += `<br>`;
+
     // Logo & Assets Section (matches UI structure)
     formattedSummary += `<strong>🖼️ Logo & Assets</strong><br>`;
     if (attachments && attachments.length > 0) {
@@ -3187,6 +3254,20 @@ Use the available tools to create tasks in the agent-engine when complex work is
                               asset.type === 'brandGuide' ? 'Brand Guide' : 
                               asset.type === 'additionalAsset' ? 'Additional Asset' : asset.type;
               formattedSummary += `  - ${assetType}: ${asset.filename}<br>`;
+            });
+          } else if (field === 'founders' && Array.isArray(value)) {
+            formattedSummary += `• <strong>Founder Profiles:</strong> Updated ${value.length} founder(s)<br>`;
+            value.forEach((founder: any, index: number) => {
+              formattedSummary += `  - <strong>Founder ${index + 1}:</strong> ${founder.name}<br>`;
+              if (founder.jobTitle) {
+                formattedSummary += `    📋 Job Title: ${founder.jobTitle}<br>`;
+              }
+              if (founder.styleTone) {
+                formattedSummary += `    🎭 Style & Tone: ${founder.styleTone}<br>`;
+              }
+              if (founder.signaturePosts) {
+                formattedSummary += `    ✍️ Signature Posts: ${founder.signaturePosts}<br>`;
+              }
             });
           } else if (Array.isArray(value)) {
             formattedSummary += `• <strong>${field}:</strong> ${value.join(', ')}<br>`;
