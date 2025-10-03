@@ -106,11 +106,14 @@ export class AgentModeService {
             
             const result = await this.executeTool(toolCall.function.name, functionArgs, userId, sessionId, mockMode);
             
+            // Store only the necessary data for the frontend
+            const minimalResult = this.extractMinimalToolResult(result, toolCall.function.name);
+            
             toolCalls.push({
               id: toolCall.id,
               name: toolCall.function.name,
               arguments: functionArgs,
-              result: result
+              result: minimalResult
             });
 
             // Append the tool call result as a tool message for the model to consume next
@@ -803,8 +806,41 @@ Use the available tools to create tasks in the agent-engine when complex work is
             required: ['file_url']
           }
         }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'read_page_source',
+          description: 'Read and extract the HTML source code from any webpage URL. This is an alternative to read_file_content but specifically designed for web pages. Returns the raw HTML source for analysis.',
+          parameters: {
+            type: 'object',
+            properties: {
+              url: {
+                type: 'string',
+                description: 'The URL of the webpage to read and extract HTML source from'
+              }
+            },
+            required: ['url']
+          }
+        }
       }
     ];
+  }
+
+  // Extract only the necessary data for the frontend to reduce storage size
+  private extractMinimalToolResult(result: any, toolName: string): any {
+    // For task creation tools, only keep the essential fields for TaskExecutionStatus
+    if (toolName === 'create_task_from_template' || toolName === 'create_task_from_prompt' || toolName === 'create_image_task_from_prompt') {
+      return {
+        taskId: result.taskId,
+        executionId: result.executionId,
+        status: result.status || 'pending',
+        message: result.message || 'Task created'
+      };
+    }
+    
+    // For other tools, return empty object to minimize storage
+    return {};
   }
 
   private getMockToolResult(toolName: string, args: any): any {
@@ -1114,6 +1150,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
           filename: 'mock-file.txt'
         };
       
+      case 'read_page_source':
+        return {
+          success: true,
+          content: `Mock page source for ${args.url}. This would be the actual HTML source of the webpage in a real scenario.`,
+          file_type: 'html',
+          file_url: args.url
+        };
+      
       default:
         return {
           success: true,
@@ -1172,6 +1216,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.saveFile(args.file_name, args.file_content, userId, sessionId);
       case 'read_file_content':
         return await this.readFileContent(args.file_url);
+      case 'read_page_source':
+        return await this.readFileContent(args.url);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -3585,8 +3631,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         }
       }
 
-      // Limit content size to prevent overwhelming the LLM
-      const maxContentLength = 100000; // 100KB limit
+      // Limit content size to prevent overwhelming the LLM and session storage
+      const maxContentLength = 50000; // 50KB limit for tool results
       if (extractedContent.length > maxContentLength) {
         extractedContent = extractedContent.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]';
         console.log(`AgentMode: Content truncated to ${maxContentLength} characters`);
@@ -3609,8 +3655,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         file_size: buffer.length,
         content_length: extractedContent.length,
         file_url: fileUrl,
-        message: `Successfully read ${fileType} file content (${extractedContent.length} characters)`,
-        formattedContent
+        message: `Successfully read ${fileType} file content (${extractedContent.length} characters)`
       };
 
     } catch (error: any) {

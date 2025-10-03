@@ -346,7 +346,6 @@ export class ChatbotDB {
     sessionId: string, 
     messages: ChatMessage[], 
     maxContentSize: number = 150000, 
-    maxMessageSize: number = 200000,
     maxSessionSize: number = 350000
   ): Promise<ChatMessage[]> {
     // First, truncate all messages
@@ -356,16 +355,33 @@ export class ChatbotDB {
         message.content = message.content.substring(0, maxContentSize) + '\n\n[Message content truncated due to size limit]';
       }
       
-      // Check if message itself is too large
       const messageSize = this.calculateItemSize(message);
-      if (messageSize > maxMessageSize) {
-        console.warn(`Message ${index} size (${messageSize} bytes) exceeds limit (${maxMessageSize} bytes). Skipping message.`);
-        return null; // Skip this message
+      console.log(`Message ${index}: size ${messageSize} bytes, content length: ${message.content?.length || 0} chars, role: ${message.role}`);
+      
+      // Debug: Break down the message size by component
+      if (messageSize > 50000) { // Only debug large messages
+        console.log(`  Debug - Message ${index} breakdown:`);
+        console.log(`    Content: ${this.calculateItemSize({ content: message.content })} bytes`);
+        console.log(`    Metadata: ${this.calculateItemSize({ metadata: message.metadata })} bytes`);
+        if (message.metadata?.toolCalls) {
+          console.log(`    ToolCalls: ${this.calculateItemSize({ toolCalls: message.metadata.toolCalls })} bytes`);
+          message.metadata.toolCalls.forEach((toolCall: any, i: number) => {
+            console.log(`      ToolCall ${i}: ${this.calculateItemSize(toolCall)} bytes (${toolCall.name})`);
+            if (toolCall.result) {
+              console.log(`        Result: ${this.calculateItemSize(toolCall.result)} bytes`);
+            }
+          });
+        }
+        if ((message.metadata as any)?.knowledgeBaseQueries) {
+          console.log(`    KnowledgeBaseQueries: ${this.calculateItemSize({ knowledgeBaseQueries: (message.metadata as any).knowledgeBaseQueries })} bytes`);
+        }
+        if ((message.metadata as any)?.sources) {
+          console.log(`    Sources: ${this.calculateItemSize({ sources: (message.metadata as any).sources })} bytes`);
+        }
       }
       
-      console.log(`Message ${index}: size ${messageSize} bytes, content length: ${message.content?.length || 0} chars, role: ${message.role}`);
       return message;
-    }).filter(Boolean) as ChatMessage[];
+    });
 
     if (truncatedMessages.length === 0) {
       return [];
@@ -389,8 +405,26 @@ export class ChatbotDB {
         return truncatedMessages;
       }
 
-      console.error(`Total session size (${totalSessionSize} bytes) would exceed limit (${maxSessionSize} bytes). Session is too large.`);
-      throw new Error('SESSION_SIZE_LIMIT_EXCEEDED: Please start a new session to continue the conversation.');
+      console.warn(`Total session size (${totalSessionSize} bytes) would exceed limit (${maxSessionSize} bytes). Checking if last message alone would fit.`);
+      
+      // Check if even the last message alone would exceed the limit
+      const lastMessage = truncatedMessages[truncatedMessages.length - 1];
+      if (lastMessage) {
+        const sessionWithOnlyLastMessage = { ...currentSession, messages: [lastMessage] };
+        const lastMessageSessionSize = this.calculateItemSize(sessionWithOnlyLastMessage);
+        console.log(`ChatbotDB: Last message session size: ${lastMessageSessionSize} bytes`);
+        
+        if (lastMessageSessionSize <= maxSessionSize) {
+          console.log(`ChatbotDB: Appending only the last message (${lastMessage.role}) - fits within limit`);
+          return [lastMessage];
+        } else {
+          console.error(`ChatbotDB: Even the last message alone (${lastMessageSessionSize} bytes) exceeds limit (${maxSessionSize} bytes). Returning empty array.`);
+          return [];
+        }
+      }
+      
+      // If no messages to keep, return empty array
+      return [];
       
     } catch (sessionError) {
       // Only catch errors from getChatSession, not our intentional SESSION_SIZE_LIMIT_EXCEEDED
@@ -502,7 +536,7 @@ export class ChatbotDB {
       throw new Error('SESSION_SIZE_LIMIT_EXCEEDED: Please start a new session to continue the conversation.');
     }
 
-    // Check if session exists and has messages
+    // Check if session exists
     const currentSession = await this.getChatSession(sessionId);
     if (!currentSession) {
       throw new Error('Session not found');
