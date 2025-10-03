@@ -9,6 +9,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2025-10-03',
     changes: [
+      'Fixed message size bug in Agent Mode',
+      '- Resolved DynamoDB session size limit errors that prevented conversation continuation',
+      '- Optimized tool result storage to minimize data size and prevent session overflow',
+      '- Added intelligent session management that preserves conversation history while staying within limits',
+      'Added read_page_source function call',
+      '- Agent can now read HTML page source from any URL using the read_page_source tool',
       'Supported Founder Profile in Brand Guidelines',
       '- Brand Guidelines now support adding and updating founder profiles (name, job title, style & tone, signature posts)',
       '- Agent Mode can read and update founder profiles; merging uses founder name as key',
