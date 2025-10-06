@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-10-06',
+    changes: [
+      'Fixed common failures of generate_image',
+      '- Removed LLM-provided image model from parameters so the LLM will not provide invalid model name',
+      '- When an invalid quality is provided, it now falls back to the default instead of erroring',
+    ],
+  },
+  {
     date: '2025-10-03',
     changes: [
       'Fixed message size bug in Agent Mode',
