@@ -3144,10 +3144,11 @@ class WebAgent:
                     client = OpenAI(api_key=api_key)
 
                 # Validate parameters
-                # Validate quality
+                # Validate quality (fallback to default instead of error)
                 valid_qualities = ["low", "medium", "high", "auto"]
                 if params.quality not in valid_qualities:
-                    return ActionResult(error=f"Invalid quality '{params.quality}'. Must be one of: {', '.join(valid_qualities)}")
+                    logger.warning(f"Invalid quality '{params.quality}' provided. Falling back to 'medium'.")
+                    params.quality = "medium"
                 
                 # Validate size
                 valid_sizes = ["1024x1024", "1536x1024", "1024x1536", "auto"]
