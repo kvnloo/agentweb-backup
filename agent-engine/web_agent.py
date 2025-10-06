@@ -80,7 +80,6 @@ class GenerateImageParams(BaseModel):
     output_file_name: str
     size: str = "1024x1024"
     quality: str = "medium"
-    model: str = os.getenv('DEFAULT_IMAGE_MODEL', "openai-image-1")  # Default from env or OpenAI image model
 
 class VideoAnalysisParams(BaseModel):
     """Parameters for performing video analysis."""
@@ -3068,7 +3067,7 @@ class WebAgent:
               - output_file_name: Name of the output image file to save in downloads folder
               - size: Image size (default: "1024x1024")
               - quality: Image quality (default: "medium")
-              - model: Image model to use (default: "openai-image-1", can also use "FLUX.1-Kontext-pro")
+            
             
             Returns:
             - ActionResult with the generation results or error message
@@ -3081,10 +3080,10 @@ class WebAgent:
                     return ActionResult(error="OpenAI package not installed. Install with: pip install openai")
 
                 # Determine which model to use and get appropriate API key
-                # Use params.model if specified, otherwise use task's imageModel, otherwise default to "openai-image-1"
-                model_to_use = params.model if params.model != "openai-image-1" else (self.image_model or "openai-image-1")
+                # Use the task's imageModel when provided; otherwise default to env or "openai-image-1"
+                model_to_use = self.image_model or os.getenv('DEFAULT_IMAGE_MODEL', "openai-image-1")
                 
-                logger.info(f"Image generation - params.model: {params.model}, task.image_model: {self.image_model}, final model_to_use: {model_to_use}")
+                logger.info(f"Image generation - task.image_model: {self.image_model}, final model_to_use: {model_to_use}")
                 
                 # Initialize variables for Azure AI Services / Google Gemini
                 azure_model_name = None
