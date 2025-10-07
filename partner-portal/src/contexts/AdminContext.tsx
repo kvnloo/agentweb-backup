@@ -26,7 +26,7 @@ interface User {
   createdAt: string;
   lastLoginTime?: string;
   supportNote?: string;
-  roles?: ("partner" | "customer")[];
+  roles?: ("partner" | "customer" | "free")[];
   taskCount?: number;
   workflowCount?: number;
   isOAuthUser?: boolean;

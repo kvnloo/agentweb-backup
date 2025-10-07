@@ -138,8 +138,8 @@ interface User {
   createdAt: string;
   lastLoginTime?: string;
   supportNote?: string;
-  role?: "partner" | "customer"; // For single role from API
-  roles?: ("partner" | "customer")[];
+  role?: "partner" | "customer" | "free"; // For single role from API
+  roles?: ("partner" | "customer" | "free")[];
   taskCount?: number;
   workflowCount?: number;
   isOAuthUser?: boolean; // Ensured from API structure
@@ -505,7 +505,7 @@ export default function AdminDashboard() {
   const [chatDialogOpen, setChatDialogOpen] = useState(false);
   const [roleDialogOpen, setRoleDialogOpen] = useState(false);
   const [selectedUserRoles, setSelectedUserRoles] = useState<
-    ("partner" | "customer")[]
+    ("partner" | "customer" | "free")[]
   >([]);
   const [editingNoteEmail, setEditingNoteEmail] = useState<string | null>(null);
   const [currentNoteText, setCurrentNoteText] = useState("");
@@ -950,7 +950,7 @@ export default function AdminDashboard() {
     setChatDialogOpen(true);
   };
 
-  const handleRoleCheckboxChange = (role: "partner" | "customer") => {
+  const handleRoleCheckboxChange = (role: "partner" | "customer" | "free") => {
     setSelectedUserRoles((prevRoles) =>
       prevRoles.includes(role)
         ? prevRoles.filter((r) => r !== role)
@@ -1686,7 +1686,7 @@ export default function AdminDashboard() {
                 ) : (
                   contextUsers.map((user) => {
                     // Determine roles to display, SOLELY from roles array.
-                    let displayRoles: ("partner" | "customer")[] = [];
+                    let displayRoles: ("partner" | "customer" | "free")[] = [];
                     if (user.roles && user.roles.length > 0) {
                       displayRoles = user.roles; // Use the array if present and not empty
                     }
@@ -1840,7 +1840,7 @@ export default function AdminDashboard() {
                             sx={{ display: "flex", gap: 0.5, flexWrap: "wrap" }}
                           >
                             {displayRoles.map(
-                              (role: "partner" | "customer") => (
+                              (role) => (
                                 <Chip
                                   key={role}
                                   label={
@@ -2977,6 +2977,16 @@ export default function AdminDashboard() {
               />
             }
             label="Customer Portal Access"
+          />
+          <FormControlLabel
+            control={
+              <Checkbox
+                checked={selectedUserRoles.includes("free")}
+                onChange={() => handleRoleCheckboxChange("free")}
+                name="freeRole"
+              />
+            }
+            label="Free Access"
           />
         </DialogContent>
         <DialogActions>
