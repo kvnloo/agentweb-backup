@@ -5,6 +5,19 @@ import { getMetaAccessToken } from "../utils/secretsManager";
 
 const router = express.Router();
 
+// Action type mappings (shared across all processing functions)
+const FORM_ACTIONS = new Set([
+  'leadgen',
+  'on_facebook_lead',
+  'onsite_conversion.lead_form',
+  'offsite_conversion.fb_pixel_custom',
+  'offsite_conversion.fb_pixel_lead'
+]);
+const WEBSITE_ACTIONS = new Set([
+  'website_lead',
+  'lead'
+]);
+
 // Apply authentication middleware to all routes
 router.use(authenticateToken);
 
@@ -257,17 +270,6 @@ router.get("/ad-performance", async (req, res) => {
 // Helper function to process campaign data from Meta API
 async function processCampaignData(campaigns: any, insights: any, adSets: any): Promise<any[]> {
   const campaignMap = new Map();
-  const FORM_ACTIONS = new Set([
-    'leadgen',
-    'on_facebook_lead',
-    'onsite_conversion.lead_form',
-    'offsite_conversion.fb_pixel_custom',
-    'offsite_conversion.fb_pixel_lead'
-  ]);
-  const WEBSITE_ACTIONS = new Set([
-    'website_lead',
-    'lead'
-  ]);
   
   // Create ad set to campaign mapping
   const adSetToCampaignMap = new Map();
@@ -387,17 +389,6 @@ function generateCampaignSummary(adPerformance: any[]): any {
 async function processAdSetsData(adSets: any, insights: any, campaigns: any): Promise<any[]> {
   const adSetsMap = new Map();
   const campaignMap = new Map();
-  const FORM_ACTIONS = new Set([
-    'leadgen',
-    'on_facebook_lead',
-    'onsite_conversion.lead_form',
-    'offsite_conversion.fb_pixel_custom',
-    'offsite_conversion.fb_pixel_lead'
-  ]);
-  const WEBSITE_ACTIONS = new Set([
-    'website_lead',
-    'lead'
-  ]);
   
   // Create campaign lookup map
   for (const campaign of campaigns) {
@@ -488,17 +479,6 @@ async function processAdsData(ads: any, insights: any, adSets: any, campaigns: a
   const adsMap = new Map();
   const adSetMap = new Map();
   const campaignMap = new Map();
-  const FORM_ACTIONS = new Set([
-    'leadgen',
-    'on_facebook_lead',
-    'onsite_conversion.lead_form',
-    'offsite_conversion.fb_pixel_custom',
-    'offsite_conversion.fb_pixel_lead'
-  ]);
-  const WEBSITE_ACTIONS = new Set([
-    'website_lead',
-    'lead'
-  ]);
   
   // Create ad set and campaign lookup maps
   for (const adSet of adSets) {
