@@ -65,6 +65,7 @@ import {
   PersonAdd as PersonAddIcon,
   Check as CheckIcon,
   OpenInNew as OpenInNewIcon,
+  Lock as LockIcon,
 } from "@mui/icons-material";
 
 interface TabPanelProps {
@@ -571,6 +572,13 @@ export default function AdminDashboard() {
   const [userTasksDialogOpen, setUserTasksDialogOpen] = useState(false);
   const [userTasksDialogUserId, setUserTasksDialogUserId] = useState<string | null>(null);
   const [userTasksDialogUserEmail, setUserTasksDialogUserEmail] = useState<string | null>(null);
+
+  // State for password reset dialog
+  const [passwordDialogOpen, setPasswordDialogOpen] = useState(false);
+  const [passwordUserId, setPasswordUserId] = useState<string | null>(null);
+  const [passwordUserEmail, setPasswordUserEmail] = useState<string | null>(null);
+  const [newPassword, setNewPassword] = useState("");
+  const [passwordResetLoading, setPasswordResetLoading] = useState(false);
 
   // Load users data only when Users tab (2) is selected
   useEffect(() => {
@@ -1186,6 +1194,44 @@ export default function AdminDashboard() {
     }
   };
 
+  const handleSetPassword = (userId: string, email: string) => {
+    setPasswordUserId(userId);
+    setPasswordUserEmail(email);
+    setNewPassword("");
+    setPasswordDialogOpen(true);
+  };
+
+  const handlePasswordReset = async () => {
+    if (!passwordUserId || !newPassword.trim()) {
+      setError("Please enter a new password");
+      return;
+    }
+
+    try {
+      setPasswordResetLoading(true);
+      setError("");
+      
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/users/${passwordUserId}/password`),
+        { password: newPassword },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      if (response.status === 200) {
+        setSuccess(`Password updated successfully for ${passwordUserEmail}`);
+        setPasswordDialogOpen(false);
+        setPasswordUserId(null);
+        setPasswordUserEmail(null);
+        setNewPassword("");
+      }
+    } catch (error: any) {
+      console.error("Error updating password:", error);
+      setError(error.response?.data?.message || "Failed to update password");
+    } finally {
+      setPasswordResetLoading(false);
+    }
+  };
+
   const useCaseOptions = [
     "Content Marketing",
     "SEO",
@@ -1672,7 +1718,7 @@ export default function AdminDashboard() {
                           )}
                         </TableCell>
                         <TableCell>
-                          <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
+                          <Box sx={{ flex: 1, minWidth: 100 }}>
                             {user.emailDomain ? (
                               <div>
                                 <div><strong>Domain:</strong> {user.emailDomain}</div>
@@ -1684,7 +1730,7 @@ export default function AdminDashboard() {
                                 )}
                               </div>
                             ) : "-"}
-                          </Typography>
+                          </Box>
                           <IconButton
                             type="button"
                             size="small"
@@ -1888,6 +1934,21 @@ export default function AdminDashboard() {
                                 </IconButton>
                               </Tooltip>
                             )}
+                            
+                            <Tooltip title="Set Password">
+                              <IconButton
+                                size="small"
+                                onClick={() => handleSetPassword(user.userId, user.email)}
+                                color="secondary"
+                                sx={{ 
+                                  border: '1px solid',
+                                  borderColor: 'secondary.main',
+                                  '&:hover': { bgcolor: 'secondary.50' }
+                                }}
+                              >
+                                <LockIcon fontSize="small" />
+                              </IconButton>
+                            </Tooltip>
                             
                             {!user.isAdmin && (
                               <Tooltip title="Delete User">
@@ -2854,9 +2915,9 @@ export default function AdminDashboard() {
       <Dialog open={roleDialogOpen} onClose={handleRoleDialogClose}>
         <DialogTitle>Update User Roles</DialogTitle>
         <DialogContent>
-          <DialogContentText sx={{ mb: 2 }}>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
             Select roles for user: {selectedUser?.email}
-          </DialogContentText>
+          </Typography>
           <FormControlLabel
             control={
               <Checkbox
@@ -3410,6 +3471,43 @@ export default function AdminDashboard() {
             disabled={emailSenderEditLoading}
           >
             {emailSenderEditLoading ? "Saving..." : "Save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Password Reset Dialog */}
+      <Dialog open={passwordDialogOpen} onClose={() => setPasswordDialogOpen(false)}>
+        <DialogTitle>Set Password for {passwordUserEmail}</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            Enter a new password for this user. The user will need to use this password to log in.
+          </Typography>
+          <TextField
+            autoFocus
+            fullWidth
+            type="password"
+            label="New Password"
+            value={newPassword}
+            onChange={(e) => setNewPassword(e.target.value)}
+            placeholder="Enter new password"
+            disabled={passwordResetLoading}
+            helperText="Minimum 6 characters"
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button 
+            onClick={() => setPasswordDialogOpen(false)}
+            disabled={passwordResetLoading}
+          >
+            Cancel
+          </Button>
+          <Button
+            onClick={handlePasswordReset}
+            color="primary"
+            variant="contained"
+            disabled={passwordResetLoading || !newPassword.trim()}
+          >
+            {passwordResetLoading ? <CircularProgress size={24} /> : "Set Password"}
           </Button>
         </DialogActions>
       </Dialog>
