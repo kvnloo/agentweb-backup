@@ -5,6 +5,8 @@ import { userDb } from "../services/db";
 import { Profile } from "passport-google-oauth20";
 import { waitlistDb } from "../services/waitlistDb";
 import { v4 as uuidv4 } from "uuid";
+import { emailService } from "../services/emailService";
+import crypto from "crypto";
 
 export const register = async (req: Request, res: Response) => {
   try {
@@ -374,5 +376,146 @@ export const googleCallback = async (
       };
     }
     done(formattedError, null);
+  }
+};
+
+// Password reset request
+export const forgotPassword = async (req: Request, res: Response) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ message: "Email is required" });
+    }
+
+    const user = await userDb.getUserByEmail(email.toLowerCase());
+    if (!user) {
+      // Don't reveal if user exists or not for security
+      return res.json({ 
+        message: "If an account with that email exists, we've sent a password reset link." 
+      });
+    }
+
+    // Generate reset token
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    const resetTokenExpiry = new Date(Date.now() + 3600000); // 1 hour from now
+
+    // Update user with reset token
+    await userDb.updateUser(user.userId, {
+      resetPasswordToken: resetToken,
+      resetPasswordExpires: resetTokenExpiry.toISOString()
+    });
+
+    // Send reset email
+    const resetUrl = `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/reset-password?token=${resetToken}`;
+    
+    const emailHtml = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+        <div style="text-align: center; margin-bottom: 30px;">
+          <h1 style="color: #1B2549; margin: 0;">AgentWeb</h1>
+          <p style="color: #666; margin: 5px 0;">Customer Portal</p>
+        </div>
+        
+        <div style="background: #f8f9fa; padding: 30px; border-radius: 8px; margin-bottom: 20px;">
+          <h2 style="color: #1B2549; margin-top: 0;">Password Reset Request</h2>
+          <p style="color: #333; line-height: 1.6;">
+            You requested a password reset for your AgentWeb account. Click the button below to reset your password:
+          </p>
+          
+          <div style="text-align: center; margin: 30px 0;">
+            <a href="${resetUrl}" 
+               style="background: linear-gradient(90deg, #643B7E 0%, #6F3DFD 100%); 
+                      color: white; 
+                      padding: 12px 30px; 
+                      text-decoration: none; 
+                      border-radius: 6px; 
+                      display: inline-block;
+                      font-weight: bold;">
+              Reset Password
+            </a>
+          </div>
+          
+          <p style="color: #666; font-size: 14px; margin-top: 20px;">
+            If the button doesn't work, copy and paste this link into your browser:<br>
+            <a href="${resetUrl}" style="color: #643B7E; word-break: break-all;">${resetUrl}</a>
+          </p>
+        </div>
+        
+        <div style="text-align: center; color: #666; font-size: 12px;">
+          <p>This link will expire in 1 hour for security reasons.</p>
+          <p>If you didn't request this password reset, please ignore this email.</p>
+        </div>
+      </div>
+    `;
+
+    const emailText = `
+AgentWeb Customer Portal - Password Reset Request
+
+You requested a password reset for your AgentWeb account.
+
+To reset your password, visit: ${resetUrl}
+
+This link will expire in 1 hour for security reasons.
+
+If you didn't request this password reset, please ignore this email.
+
+Best regards,
+The AgentWeb Team
+    `;
+
+    await emailService.sendEmail(
+      email,
+      'Reset Your AgentWeb Password',
+      emailText,
+      emailHtml
+    );
+
+    res.json({ 
+      message: "If an account with that email exists, we've sent a password reset link." 
+    });
+  } catch (error) {
+    console.error("Error in forgot password:", error);
+    res.status(500).json({ message: "Error processing password reset request" });
+  }
+};
+
+// Password reset with token
+export const resetPassword = async (req: Request, res: Response) => {
+  try {
+    const { token, password } = req.body;
+
+    if (!token || !password) {
+      return res.status(400).json({ message: "Token and password are required" });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ message: "Password must be at least 6 characters long" });
+    }
+
+    // Find user by reset token
+    const user = await userDb.getUserByResetToken(token);
+    if (!user) {
+      return res.status(400).json({ message: "Invalid or expired reset token" });
+    }
+
+    // Check if token is expired
+    if (user.resetPasswordExpires && new Date(user.resetPasswordExpires) < new Date()) {
+      return res.status(400).json({ message: "Reset token has expired" });
+    }
+
+    // Hash new password
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    // Update user password and clear reset token
+    await userDb.updateUser(user.userId, {
+      password: hashedPassword,
+      resetPasswordToken: undefined,
+      resetPasswordExpires: undefined
+    });
+
+    res.json({ message: "Password has been reset successfully" });
+  } catch (error) {
+    console.error("Error in reset password:", error);
+    res.status(500).json({ message: "Error resetting password" });
   }
 };

@@ -118,6 +118,8 @@ export interface User {
     createdAt: string;
     updatedAt: string;
   }>;
+  resetPasswordToken?: string;
+  resetPasswordExpires?: string;
 }
 
 interface UserInteraction {
@@ -503,6 +505,24 @@ class UserDB {
         success: false,
         message: error.message || `Failed to delete user ${userId}.`,
       };
+    }
+  }
+
+  async getUserByResetToken(resetToken: string): Promise<User | null> {
+    try {
+      const params = {
+        TableName: this.tableName,
+        FilterExpression: "resetPasswordToken = :token",
+        ExpressionAttributeValues: {
+          ":token": resetToken,
+        },
+      };
+
+      const result = await this.docClient.scan(params).promise();
+      return result.Items && result.Items.length > 0 ? (result.Items[0] as User) : null;
+    } catch (error) {
+      this.handleError(error, "getUserByResetToken");
+      return null;
     }
   }
 }
