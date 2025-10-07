@@ -906,12 +906,12 @@ router.put("/users/:userId/role", async (req, res) => {
     const { roles } = req.body; // Expect an array of roles
 
     // Validate roles
-    const validRolesSet = new Set(["partner", "customer"]);
+    const validRolesSet = new Set(["partner", "customer", "free"]);
 
     if (!Array.isArray(roles) || roles.some((r) => !validRolesSet.has(r))) {
       return res.status(400).json({
         message:
-          "Invalid roles. Must be an array containing only: partner, customer",
+          "Invalid roles. Must be an array containing only: partner, customer, free",
       });
     }
 
