@@ -66,6 +66,7 @@ import {
   Check as CheckIcon,
   OpenInNew as OpenInNewIcon,
   Lock as LockIcon,
+  Add as AddIcon,
 } from "@mui/icons-material";
 
 interface TabPanelProps {
@@ -529,6 +530,10 @@ export default function AdminDashboard() {
   const [workflows, setWorkflows] = useState<AdminWorkflow[]>([]);
   const [knowledgeBaseMetrics, setKnowledgeBaseMetrics] =
     useState<KnowledgeBaseMetrics | null>(null);
+  const [createUserDialogOpen, setCreateUserDialogOpen] = useState(false);
+  const [userToCreate, setUserToCreate] = useState<string | null>(null);
+  const [createUserRoles, setCreateUserRoles] = useState<string[]>(["customer"]);
+  const [createUserLoading, setCreateUserLoading] = useState(false);
   const { token } = useAuth();
 
   const {
@@ -546,6 +551,7 @@ export default function AdminDashboard() {
     deleteWaitlistEntry,
     deleteUser,
     addToWaitlist,
+    createUserFromWaitlist,
     setUsers,
   } = useAdmin();
 
@@ -716,6 +722,28 @@ export default function AdminDashboard() {
   const handleOpenDeleteConfirm = (email: string) => {
     setEmailToDelete(email);
     setDeleteConfirmOpen(true);
+  };
+
+  const handleCreateUserClick = (email: string) => {
+    setUserToCreate(email);
+    setCreateUserRoles(["customer"]);
+    setCreateUserDialogOpen(true);
+  };
+
+  const handleCreateUser = async () => {
+    if (!userToCreate) return;
+
+    try {
+      setCreateUserLoading(true);
+      const result = await createUserFromWaitlist(userToCreate, createUserRoles);
+      setSuccess(`User created successfully! Temporary password: ${result.temporaryPassword}. A welcome email with login credentials has been sent to ${userToCreate}.`);
+      setCreateUserDialogOpen(false);
+      setUserToCreate(null);
+    } catch (error) {
+      setError("Failed to create user");
+    } finally {
+      setCreateUserLoading(false);
+    }
   };
 
   const handleCloseDeleteConfirm = () => {
@@ -2285,6 +2313,17 @@ export default function AdminDashboard() {
                                 Resend
                               </Button>
                             )}
+                            {!userExists && (
+                              <Tooltip title="Create User">
+                                <IconButton
+                                  size="small"
+                                  onClick={() => handleCreateUserClick(entry.email)}
+                                  sx={{ ml: 1, color: "primary.main" }}
+                                >
+                                  <AddIcon />
+                                </IconButton>
+                              </Tooltip>
+                            )}
                             {userExists && (
                               <Typography
                                 variant="body2"
@@ -3508,6 +3547,52 @@ export default function AdminDashboard() {
             disabled={passwordResetLoading || !newPassword.trim()}
           >
             {passwordResetLoading ? <CircularProgress size={24} /> : "Set Password"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Create User Confirmation Dialog */}
+      <Dialog
+        open={createUserDialogOpen}
+        onClose={() => setCreateUserDialogOpen(false)}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>Create User Account</DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ mb: 2 }}>
+            Are you sure you want to create a user account for <strong>{userToCreate}</strong>?
+            This will create an account with a random password and send a welcome email.
+          </DialogContentText>
+          
+          <FormControl fullWidth sx={{ mt: 2 }}>
+            <InputLabel>User Roles</InputLabel>
+            <Select
+              multiple
+              value={createUserRoles}
+              onChange={(e) => setCreateUserRoles(e.target.value as string[])}
+              renderValue={(selected) => (selected as string[]).join(', ')}
+            >
+              <MenuItem value="customer">Customer</MenuItem>
+              <MenuItem value="partner">Partner</MenuItem>
+              <MenuItem value="free">Free</MenuItem>
+            </Select>
+          </FormControl>
+        </DialogContent>
+        <DialogActions>
+          <Button 
+            onClick={() => setCreateUserDialogOpen(false)}
+            disabled={createUserLoading}
+          >
+            Cancel
+          </Button>
+          <Button 
+            onClick={handleCreateUser}
+            variant="contained"
+            disabled={createUserLoading}
+            startIcon={createUserLoading ? <CircularProgress size={20} /> : <AddIcon />}
+          >
+            {createUserLoading ? 'Creating...' : 'Create User'}
           </Button>
         </DialogActions>
       </Dialog>

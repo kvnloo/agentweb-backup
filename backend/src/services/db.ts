@@ -56,6 +56,7 @@ export interface User {
   lastLoginTime?: string;
   supportNote?: string;
   roles?: ("partner" | "customer" | "free")[];
+  displayName?: string;
   stripe_customer_id?: string;
   adAccount?: string; // Meta ad account ID
   emailDomain?: string; // Email sender domain
