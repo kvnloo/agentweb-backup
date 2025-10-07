@@ -58,6 +58,7 @@ interface AdminContextType {
       sendInvitation?: boolean;
     }
   ) => Promise<void>;
+  createUserFromWaitlist: (email: string, roles?: string[]) => Promise<{ user: any; temporaryPassword: string }>;
   loading: boolean;
   error: string | null;
   isAdmin: boolean;
@@ -286,6 +287,25 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
     [api, loadWaitlist]
   );
 
+  const createUserFromWaitlist = useCallback(
+    async (email: string, roles: string[] = ["customer"]) => {
+      try {
+        setLoading(true);
+        const response = await api.post(`/api/admin/waitlist/${email}/create-user`, { roles });
+        await loadUsers(); // Reload users after creating
+        await loadWaitlist(); // Reload waitlist to update status
+        setError(null);
+        return response.data;
+      } catch (err: any) {
+        setError(err.response?.data?.message || "Failed to create user");
+        throw err; // Re-throw to allow component-level error handling
+      } finally {
+        setLoading(false);
+      }
+    },
+    [api, loadUsers, loadWaitlist]
+  );
+
   const value = {
     users,
     waitlist,
@@ -299,6 +319,7 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
     deleteWaitlistEntry,
     deleteUser,
     addToWaitlist,
+    createUserFromWaitlist,
     loading,
     error,
     isAdmin: user?.isAdmin || false,

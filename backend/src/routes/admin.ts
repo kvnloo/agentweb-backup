@@ -167,6 +167,143 @@ router.put("/users/:userId/password", async (req, res) => {
   }
 });
 
+// Create user from waitlist entry
+router.post("/waitlist/:email/create-user", async (req, res) => {
+  try {
+    const { email } = req.params;
+    const { roles = ["customer"] } = req.body;
+
+    // Check if user already exists
+    const existingUser = await userDb.getUserByEmail(email);
+    if (existingUser) {
+      return res.status(400).json({ message: "User already exists" });
+    }
+
+    // Get waitlist entry
+    const waitlistEntry = await waitlistDb.getByEmail(email);
+    if (!waitlistEntry) {
+      return res.status(404).json({ message: "Waitlist entry not found" });
+    }
+
+    // Generate random password
+    const generateRandomPassword = (length: number = 12) => {
+      const charset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*';
+      let password = '';
+      for (let i = 0; i < length; i++) {
+        password += charset.charAt(Math.floor(Math.random() * charset.length));
+      }
+      return password;
+    };
+    
+    const randomPassword = generateRandomPassword(16);
+    const hashedPassword = await bcrypt.hash(randomPassword, 10);
+
+    // Create user with waitlist data
+    const userId = require('uuid').v4();
+    const newUser = await userDb.createUser(
+      email,
+      userId,
+      hashedPassword,
+      false, // isOAuthUser
+      false, // isAdmin
+      roles,
+      waitlistEntry.fullName || email.split("@")[0], // displayName
+      undefined, // googleId
+      waitlistEntry.stripe_customer_id, // from waitlist
+      waitlistEntry.companyName, // from waitlist
+      waitlistEntry.useCaseCategories // from waitlist
+    );
+
+    if (!newUser) {
+      return res.status(500).json({ message: "Failed to create user" });
+    }
+
+    // Send welcome email with temporary password
+    const welcomeHtml = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+        <div style="text-align: center; margin-bottom: 30px;">
+          <h1 style="color: #1B2549; margin: 0;">AgentWeb</h1>
+          <p style="color: #666; margin: 5px 0;">Customer Portal</p>
+        </div>
+        
+        <div style="background: #f8f9fa; padding: 30px; border-radius: 8px; margin-bottom: 20px;">
+          <h2 style="color: #1B2549; margin-top: 0;">Welcome to AgentWeb!</h2>
+          <p style="color: #333; line-height: 1.6;">
+            Your account has been created successfully. You can now access the AgentWeb Customer Portal.
+          </p>
+          
+          <div style="background: #fff; padding: 20px; border-radius: 6px; border-left: 4px solid #643B7E; margin: 20px 0;">
+            <h3 style="color: #1B2549; margin-top: 0;">Your Login Credentials</h3>
+            <p style="margin: 10px 0;"><strong>Email:</strong> ${email}</p>
+            <p style="margin: 10px 0;"><strong>Temporary Password:</strong> <code style="background: #f0f0f0; padding: 2px 6px; border-radius: 3px;">${randomPassword}</code></p>
+          </div>
+          
+          <div style="text-align: center; margin: 30px 0;">
+            <a href="${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/login" 
+               style="background: linear-gradient(90deg, #643B7E 0%, #6F3DFD 100%); 
+                      color: white; 
+                      padding: 12px 30px; 
+                      text-decoration: none; 
+                      border-radius: 6px; 
+                      display: inline-block;
+                      font-weight: bold;">
+              Sign In Now
+            </a>
+          </div>
+          
+          <p style="color: #666; font-size: 14px; margin-top: 20px;">
+            <strong>Important:</strong> Please change your password after your first login for security reasons.
+          </p>
+        </div>
+        
+        <div style="text-align: center; color: #666; font-size: 12px;">
+          <p>If you have any questions, please contact our support team.</p>
+        </div>
+      </div>
+    `;
+
+    const welcomeText = `
+AgentWeb Customer Portal - Welcome!
+
+Your account has been created successfully. You can now access the AgentWeb Customer Portal.
+
+Your Login Credentials:
+Email: ${email}
+Temporary Password: ${randomPassword}
+
+Sign in at: ${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/login
+
+Important: Please change your password after your first login for security reasons.
+
+If you have any questions, please contact our support team.
+
+Best regards,
+The AgentWeb Team
+    `;
+
+    await emailService.sendEmail(
+      email,
+      'Welcome to AgentWeb - Your Account is Ready!',
+      welcomeText,
+      welcomeHtml
+    );
+
+    res.json({ 
+      message: "User created successfully", 
+      user: {
+        userId: newUser.userId,
+        email: newUser.email,
+        displayName: newUser.displayName,
+        roles: newUser.roles
+      },
+      temporaryPassword: randomPassword
+    });
+  } catch (error) {
+    console.error("Error creating user from waitlist:", error);
+    res.status(500).json({ message: "Error creating user" });
+  }
+});
+
 // Create delegate access token for customer portal
 router.post("/users/:userId/delegate-access", async (req, res) => {
   try {
