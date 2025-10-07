@@ -3567,12 +3567,14 @@ export default function AdminDashboard() {
           </DialogContentText>
           
           <FormControl fullWidth sx={{ mt: 2 }}>
-            <InputLabel>User Roles</InputLabel>
+            <InputLabel id="user-roles-label">User Roles</InputLabel>
             <Select
+              labelId="user-roles-label"
               multiple
               value={createUserRoles}
               onChange={(e) => setCreateUserRoles(e.target.value as string[])}
               renderValue={(selected) => (selected as string[]).join(', ')}
+              label="User Roles"
             >
               <MenuItem value="customer">Customer</MenuItem>
               <MenuItem value="partner">Partner</MenuItem>

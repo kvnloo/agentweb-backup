@@ -9,6 +9,7 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2025-10-07',
     changes: [
+      'Added support for password reset at Login page',
       'Added Form Submission leads to Meta Campaigns page and Agent Mode',
       '- Meta Campaigns page now displays both Website Leads and Form Submissions with Results and Cost/Result columns',
       '- Agent Mode can now fetch and analyze form submission leads alongside website leads',

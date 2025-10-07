@@ -8,6 +8,17 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-10-07",
+    changes: [
+      "Added Create User in Waitlist tab of Admin Page",
+      "- Admins can now create user accounts directly from waitlist entries",
+      "- Generate random secure passwords and send welcome emails to new users",
+      "- Transfer waitlist data (company name, use cases, etc.) to new user accounts",
+      "- Support role assignment (customer, partner, free) during user creation",
+      "- Icon-only Create User button appears only for unregistered waitlist entries",
+    ],
+  },
+  {
     date: "2025-09-25",
     changes: [
       "Added visualizations and fixed bugs in metrics data for admin page",
