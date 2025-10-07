@@ -597,6 +597,7 @@ export default function AdminDashboard() {
   useEffect(() => {
     if (tabValue === 3) {
       loadWaitlist();
+      loadUsers(); // Also load users to check if waitlist entries are registered
     }
   }, [tabValue]);
 
@@ -2313,7 +2314,7 @@ export default function AdminDashboard() {
                                 Resend
                               </Button>
                             )}
-                            {!userExists && (
+                            {!userExists && !adminLoading && (
                               <Tooltip title="Create User">
                                 <IconButton
                                   size="small"
