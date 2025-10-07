@@ -2471,6 +2471,19 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
+  // Action type mappings (shared across all processing functions)
+  private readonly FORM_ACTIONS = new Set([
+    'leadgen',
+    'on_facebook_lead',
+    'onsite_conversion.lead_form',
+    'offsite_conversion.fb_pixel_custom',
+    'offsite_conversion.fb_pixel_lead'
+  ]);
+  private readonly WEBSITE_ACTIONS = new Set([
+    'website_lead',
+    'lead'
+  ]);
+
   // Helper function to process campaign data from Meta API
   private processCampaignData(campaigns: any[], insights: any[], adSets: any[]): any[] {
     const campaignMap = new Map();
@@ -2497,6 +2510,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
         frequency: 0,
         websiteLeads: 0,
         costPerWebsiteLead: 0,
+        formLeads: 0,
+        costPerFormLead: 0,
+        totalLeads: 0,
+        costPerLead: 0,
         lastUpdated: new Date().toISOString(),
       });
     }
@@ -2517,25 +2534,29 @@ Use the available tools to create tasks in the agent-engine when complex work is
         // Process lead generation metrics from actions and cost_per_action_type
         if (insight.actions && Array.isArray(insight.actions)) {
           for (const action of insight.actions) {
-            if (action.action_type === 'lead' || action.action_type === 'website_lead') {
+            if (this.WEBSITE_ACTIONS.has(action.action_type)) {
               campaign.websiteLeads += parseInt(action.value) || 0;
+            }
+            if (this.FORM_ACTIONS.has(action.action_type)) {
+              campaign.formLeads += parseInt(action.value) || 0;
             }
           }
         }
         
         if (insight.cost_per_action_type && Array.isArray(insight.cost_per_action_type)) {
           for (const costAction of insight.cost_per_action_type) {
-            if (costAction.action_type === 'lead' || costAction.action_type === 'website_lead') {
-              // Store the cost per lead for this specific insight
-              // We'll calculate the overall cost per lead after aggregation
+            if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
               campaign.costPerWebsiteLead = parseFloat(costAction.value) || 0;
+            }
+            if (this.FORM_ACTIONS.has(costAction.action_type)) {
+              campaign.costPerFormLead = parseFloat(costAction.value) || 0;
             }
           }
         }
       }
     }
     
-    // Calculate derived metrics (CTR, CPC, Cost per Website Lead) after aggregation
+    // Calculate derived metrics (CTR, CPC, Cost per Lead) after aggregation
     for (const campaign of campaignMap.values()) {
       if (campaign.impressions > 0) {
         campaign.ctr = (campaign.clicks / campaign.impressions) * 100; // Convert to percentage
@@ -2546,8 +2567,19 @@ Use the available tools to create tasks in the agent-engine when complex work is
       if (campaign.reach > 0) {
         campaign.frequency = campaign.impressions / campaign.reach;
       }
+      
+      // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
       if (campaign.websiteLeads > 0) {
-        campaign.costPerWebsiteLead = campaign.spend / campaign.websiteLeads;
+        campaign.formLeads = 0; // Set form submissions to 0 when website leads exist
+        campaign.costPerWebsiteLead = campaign.costPerWebsiteLead || (campaign.spend / campaign.websiteLeads);
+        campaign.costPerFormLead = 0;
+      } else if (campaign.formLeads > 0) {
+        campaign.costPerFormLead = campaign.costPerFormLead || (campaign.spend / campaign.formLeads);
+      }
+      
+      campaign.totalLeads = (campaign.websiteLeads || 0) + (campaign.formLeads || 0);
+      if (campaign.totalLeads > 0) {
+        campaign.costPerLead = campaign.spend / campaign.totalLeads;
       }
     }
     
@@ -2583,6 +2615,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
         frequency: 0,
         websiteLeads: 0,
         costPerWebsiteLead: 0,
+        formLeads: 0,
+        costPerFormLead: 0,
+        totalLeads: 0,
+        costPerLead: 0,
         lastUpdated: new Date().toISOString(),
       });
     }
@@ -2600,16 +2636,22 @@ Use the available tools to create tasks in the agent-engine when complex work is
         // Process lead generation metrics from actions and cost_per_action_type
         if (insight.actions && Array.isArray(insight.actions)) {
           for (const action of insight.actions) {
-            if (action.action_type === 'lead' || action.action_type === 'website_lead') {
+            if (this.WEBSITE_ACTIONS.has(action.action_type)) {
               adSet.websiteLeads += parseInt(action.value) || 0;
+            }
+            if (this.FORM_ACTIONS.has(action.action_type)) {
+              adSet.formLeads += parseInt(action.value) || 0;
             }
           }
         }
         
         if (insight.cost_per_action_type && Array.isArray(insight.cost_per_action_type)) {
           for (const costAction of insight.cost_per_action_type) {
-            if (costAction.action_type === 'lead' || costAction.action_type === 'website_lead') {
+            if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
               adSet.costPerWebsiteLead = parseFloat(costAction.value) || 0;
+            }
+            if (this.FORM_ACTIONS.has(costAction.action_type)) {
+              adSet.costPerFormLead = parseFloat(costAction.value) || 0;
             }
           }
         }
@@ -2627,8 +2669,19 @@ Use the available tools to create tasks in the agent-engine when complex work is
       if (adSet.reach > 0) {
         adSet.frequency = adSet.impressions / adSet.reach;
       }
+      
+      // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
       if (adSet.websiteLeads > 0) {
-        adSet.costPerWebsiteLead = adSet.spend / adSet.websiteLeads;
+        adSet.formLeads = 0; // Set form submissions to 0 when website leads exist
+        adSet.costPerWebsiteLead = adSet.costPerWebsiteLead || (adSet.spend / adSet.websiteLeads);
+        adSet.costPerFormLead = 0;
+      } else if (adSet.formLeads > 0) {
+        adSet.costPerFormLead = adSet.costPerFormLead || (adSet.spend / adSet.formLeads);
+      }
+      
+      adSet.totalLeads = (adSet.websiteLeads || 0) + (adSet.formLeads || 0);
+      if (adSet.totalLeads > 0) {
+        adSet.costPerLead = adSet.spend / adSet.totalLeads;
       }
     }
     
@@ -2673,6 +2726,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
         frequency: 0,
         websiteLeads: 0,
         costPerWebsiteLead: 0,
+        formLeads: 0,
+        costPerFormLead: 0,
+        totalLeads: 0,
+        costPerLead: 0,
         lastUpdated: new Date().toISOString(),
       });
     }
@@ -2690,16 +2747,22 @@ Use the available tools to create tasks in the agent-engine when complex work is
         // Process lead generation metrics from actions and cost_per_action_type
         if (insight.actions && Array.isArray(insight.actions)) {
           for (const action of insight.actions) {
-            if (action.action_type === 'lead' || action.action_type === 'website_lead') {
+            if (this.WEBSITE_ACTIONS.has(action.action_type)) {
               ad.websiteLeads += parseInt(action.value) || 0;
+            }
+            if (this.FORM_ACTIONS.has(action.action_type)) {
+              ad.formLeads += parseInt(action.value) || 0;
             }
           }
         }
         
         if (insight.cost_per_action_type && Array.isArray(insight.cost_per_action_type)) {
           for (const costAction of insight.cost_per_action_type) {
-            if (costAction.action_type === 'lead' || costAction.action_type === 'website_lead') {
+            if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
               ad.costPerWebsiteLead = parseFloat(costAction.value) || 0;
+            }
+            if (this.FORM_ACTIONS.has(costAction.action_type)) {
+              ad.costPerFormLead = parseFloat(costAction.value) || 0;
             }
           }
         }
@@ -2717,8 +2780,19 @@ Use the available tools to create tasks in the agent-engine when complex work is
       if (ad.reach > 0) {
         ad.frequency = ad.impressions / ad.reach;
       }
+      
+      // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
       if (ad.websiteLeads > 0) {
-        ad.costPerWebsiteLead = ad.spend / ad.websiteLeads;
+        ad.formLeads = 0; // Set form submissions to 0 when website leads exist
+        ad.costPerWebsiteLead = ad.costPerWebsiteLead || (ad.spend / ad.websiteLeads);
+        ad.costPerFormLead = 0;
+      } else if (ad.formLeads > 0) {
+        ad.costPerFormLead = ad.costPerFormLead || (ad.spend / ad.formLeads);
+      }
+      
+      ad.totalLeads = (ad.websiteLeads || 0) + (ad.formLeads || 0);
+      if (ad.totalLeads > 0) {
+        ad.costPerLead = ad.spend / ad.totalLeads;
       }
     }
     
@@ -2735,10 +2809,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
     const totalImpressions = adPerformance.reduce((sum, campaign) => sum + campaign.impressions, 0);
     const totalClicks = adPerformance.reduce((sum, campaign) => sum + campaign.clicks, 0);
     const totalWebsiteLeads = adPerformance.reduce((sum, campaign) => sum + (campaign.websiteLeads || 0), 0);
+    const totalFormLeads = adPerformance.reduce((sum, campaign) => sum + (campaign.formLeads || 0), 0);
+    const totalLeads = totalWebsiteLeads + totalFormLeads;
     
     const averageCtr = totalImpressions > 0 ? (totalClicks / totalImpressions) * 100 : 0;
     const averageCpc = totalClicks > 0 ? totalSpend / totalClicks : 0;
     const averageCostPerWebsiteLead = totalWebsiteLeads > 0 ? totalSpend / totalWebsiteLeads : 0;
+    const averageCostPerFormLead = totalFormLeads > 0 ? totalSpend / totalFormLeads : 0;
+    const averageCostPerLead = totalLeads > 0 ? totalSpend / totalLeads : 0;
     
     return {
       totalCampaigns,
@@ -2747,9 +2825,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
       totalImpressions,
       totalClicks,
       totalWebsiteLeads,
+      totalFormLeads,
+      totalLeads,
       averageCtr,
       averageCpc,
-      averageCostPerWebsiteLead
+      averageCostPerWebsiteLead,
+      averageCostPerFormLead,
+      averageCostPerLead
     };
   }
 
@@ -2759,24 +2841,46 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const processedItem = {
         ...item,
         websiteLeads: 0,
-        costPerWebsiteLead: 0
+        costPerWebsiteLead: 0,
+        formLeads: 0,
+        costPerFormLead: 0,
+        totalLeads: 0,
+        costPerLead: 0
       };
 
       // Process lead generation metrics from actions and cost_per_action_type
       if (item.actions && Array.isArray(item.actions)) {
         for (const action of item.actions) {
-          if (action.action_type === 'lead' || action.action_type === 'website_lead') {
+          if (this.WEBSITE_ACTIONS.has(action.action_type)) {
             processedItem.websiteLeads += parseInt(action.value) || 0;
+          }
+          if (this.FORM_ACTIONS.has(action.action_type)) {
+            processedItem.formLeads += parseInt(action.value) || 0;
           }
         }
       }
       
       if (item.cost_per_action_type && Array.isArray(item.cost_per_action_type)) {
         for (const costAction of item.cost_per_action_type) {
-          if (costAction.action_type === 'lead' || costAction.action_type === 'website_lead') {
+          if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
             processedItem.costPerWebsiteLead = parseFloat(costAction.value) || 0;
           }
+          if (this.FORM_ACTIONS.has(costAction.action_type)) {
+            processedItem.costPerFormLead = parseFloat(costAction.value) || 0;
+          }
         }
+      }
+      
+      // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
+      if (processedItem.websiteLeads > 0) {
+        processedItem.formLeads = 0; // Set form submissions to 0 when website leads exist
+        processedItem.costPerFormLead = 0;
+      }
+      
+      // Calculate totals
+      processedItem.totalLeads = (processedItem.websiteLeads || 0) + (processedItem.formLeads || 0);
+      if (processedItem.totalLeads > 0) {
+        processedItem.costPerLead = (processedItem.spend || 0) / processedItem.totalLeads;
       }
 
       // Calculate cost per lead if we have leads but no cost_per_action_type data
@@ -2814,17 +2918,21 @@ Use the available tools to create tasks in the agent-engine when complex work is
       summary += `| CTR | ${campaignSummary.averageCtr.toFixed(2)}% |\n`;
       summary += `| CPC | $${campaignSummary.averageCpc.toFixed(2)} |\n`;
       summary += `| Website Leads | ${campaignSummary.totalWebsiteLeads.toLocaleString()} |\n`;
-      summary += `| Cost per Website Lead | $${campaignSummary.averageCostPerWebsiteLead.toFixed(2)} |\n\n`;
+      summary += `| Form Submissions | ${campaignSummary.totalFormLeads.toLocaleString()} |\n`;
+      summary += `| Total Leads | ${campaignSummary.totalLeads.toLocaleString()} |\n`;
+      summary += `| Cost per Website Lead | $${campaignSummary.averageCostPerWebsiteLead.toFixed(2)} |\n`;
+      summary += `| Cost per Form Lead | $${campaignSummary.averageCostPerFormLead.toFixed(2)} |\n`;
+      summary += `| Cost per Lead | $${campaignSummary.averageCostPerLead.toFixed(2)} |\n\n`;
     }
     
     // Campaign Performance Table
     if (adPerformance && adPerformance.length > 0) {
       summary += `**Campaign Performance**\n`;
-      summary += `| Campaign Name | Spend | Impressions | Clicks | CTR | CPC | Website Leads | Cost/Lead |\n`;
-      summary += `|---------------|-------|-------------|--------|-----|-----|---------------|----------|\n`;
+      summary += `| Campaign Name | Spend | Impressions | Clicks | CTR | CPC | Website Leads | Form Leads | Total Leads | Cost/Lead |\n`;
+      summary += `|---------------|-------|-------------|--------|-----|-----|---------------|------------|-------------|----------|\n`;
       
       adPerformance.forEach((campaign: any) => {
-        summary += `| ${campaign.name} | $${campaign.spend.toFixed(2)} | ${campaign.impressions.toLocaleString()} | ${campaign.clicks.toLocaleString()} | ${campaign.ctr.toFixed(2)}% | $${campaign.cpc.toFixed(2)} | ${(campaign.websiteLeads || 0).toLocaleString()} | $${(campaign.costPerWebsiteLead || 0).toFixed(2)} |\n`;
+        summary += `| ${campaign.name} | $${campaign.spend.toFixed(2)} | ${campaign.impressions.toLocaleString()} | ${campaign.clicks.toLocaleString()} | ${campaign.ctr.toFixed(2)}% | $${campaign.cpc.toFixed(2)} | ${(campaign.websiteLeads || 0).toLocaleString()} | ${(campaign.formLeads || 0).toLocaleString()} | ${(campaign.totalLeads || 0).toLocaleString()} | $${(campaign.costPerLead || 0).toFixed(2)} |\n`;
       });
       summary += `\n`;
     }
@@ -2832,11 +2940,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
     // Ad Sets Performance Table
     if (adSetsData && adSetsData.length > 0) {
       summary += `**Ad Sets Performance**\n`;
-      summary += `| Ad Set Name | Campaign | Spend | Impressions | Clicks | CTR | CPC | Website Leads | Cost/Lead |\n`;
-      summary += `|-------------|----------|-------|-------------|--------|-----|-----|---------------|----------|\n`;
+      summary += `| Ad Set Name | Campaign | Spend | Impressions | Clicks | CTR | CPC | Website Leads | Form Leads | Total Leads | Cost/Lead |\n`;
+      summary += `|-------------|----------|-------|-------------|--------|-----|-----|---------------|------------|-------------|----------|\n`;
       
       adSetsData.forEach((adSet: any) => {
-        summary += `| ${adSet.name} | ${adSet.campaignName} | $${adSet.spend.toFixed(2)} | ${adSet.impressions.toLocaleString()} | ${adSet.clicks.toLocaleString()} | ${adSet.ctr.toFixed(2)}% | $${adSet.cpc.toFixed(2)} | ${(adSet.websiteLeads || 0).toLocaleString()} | $${(adSet.costPerWebsiteLead || 0).toFixed(2)} |\n`;
+        summary += `| ${adSet.name} | ${adSet.campaignName} | $${adSet.spend.toFixed(2)} | ${adSet.impressions.toLocaleString()} | ${adSet.clicks.toLocaleString()} | ${adSet.ctr.toFixed(2)}% | $${adSet.cpc.toFixed(2)} | ${(adSet.websiteLeads || 0).toLocaleString()} | ${(adSet.formLeads || 0).toLocaleString()} | ${(adSet.totalLeads || 0).toLocaleString()} | $${(adSet.costPerLead || 0).toFixed(2)} |\n`;
       });
       summary += `\n`;
     }
@@ -2844,11 +2952,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
     // Individual Ads Performance Table
     if (adsData && adsData.length > 0) {
       summary += `**Individual Ads Performance**\n`;
-      summary += `| Ad Name | Ad Set | Campaign | Spend | Impressions | Clicks | CTR | CPC | Website Leads | Cost/Lead |\n`;
-      summary += `|---------|--------|----------|-------|-------------|--------|-----|-----|---------------|----------|\n`;
+      summary += `| Ad Name | Ad Set | Campaign | Spend | Impressions | Clicks | CTR | CPC | Website Leads | Form Leads | Total Leads | Cost/Lead |\n`;
+      summary += `|---------|--------|----------|-------|-------------|--------|-----|-----|---------------|------------|-------------|----------|\n`;
       
       adsData.forEach((ad: any) => {
-        summary += `| ${ad.name} | ${ad.adSetName} | ${ad.campaignName} | $${ad.spend.toFixed(2)} | ${ad.impressions.toLocaleString()} | ${ad.clicks.toLocaleString()} | ${ad.ctr.toFixed(2)}% | $${ad.cpc.toFixed(2)} | ${(ad.websiteLeads || 0).toLocaleString()} | $${(ad.costPerWebsiteLead || 0).toFixed(2)} |\n`;
+        summary += `| ${ad.name} | ${ad.adSetName} | ${ad.campaignName} | $${ad.spend.toFixed(2)} | ${ad.impressions.toLocaleString()} | ${ad.clicks.toLocaleString()} | ${ad.ctr.toFixed(2)}% | $${ad.cpc.toFixed(2)} | ${(ad.websiteLeads || 0).toLocaleString()} | ${(ad.formLeads || 0).toLocaleString()} | ${(ad.totalLeads || 0).toLocaleString()} | $${(ad.costPerLead || 0).toFixed(2)} |\n`;
       });
       summary += `\n`;
     }
@@ -2856,8 +2964,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
     // Demographics Breakdown
     if (demographicsBreakdown && demographicsBreakdown.length > 0) {
       summary += `**Demographics Performance**\n`;
-      summary += `| Age | Gender | Impressions | Clicks | Spend | CTR | CPC | Website Leads | Cost/Lead |\n`;
-      summary += `|-----|--------|-------------|--------|-------|-----|-----|---------------|----------|\n`;
+      summary += `| Age | Gender | Impressions | Clicks | Spend | CTR | CPC | Website Leads | Form Leads | Total Leads | Cost/Lead |\n`;
+      summary += `|-----|--------|-------------|--------|-------|-----|-----|---------------|------------|-------------|----------|\n`;
       
       // Group by age and gender, then aggregate metrics
       const demographicsMap = new Map();
@@ -2870,7 +2978,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
             impressions: 0,
             clicks: 0,
             spend: 0,
-            websiteLeads: 0
+            websiteLeads: 0,
+            formLeads: 0,
+            totalLeads: 0
           });
         }
         const demo = demographicsMap.get(key);
@@ -2878,6 +2988,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         demo.clicks += parseInt(item.clicks) || 0;
         demo.spend += parseFloat(item.spend) || 0;
         demo.websiteLeads += parseInt(item.websiteLeads) || 0;
+        demo.formLeads += parseInt(item.formLeads) || 0;
+        demo.totalLeads = demo.websiteLeads + demo.formLeads;
       });
       
       // Sort by spend descending and show top 10
@@ -2888,8 +3000,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       sortedDemographics.forEach((demo: any) => {
         const ctr = demo.impressions > 0 ? (demo.clicks / demo.impressions) * 100 : 0;
         const cpc = demo.clicks > 0 ? demo.spend / demo.clicks : 0;
-        const costPerLead = demo.websiteLeads > 0 ? demo.spend / demo.websiteLeads : 0;
-        summary += `| ${demo.age} | ${demo.gender} | ${demo.impressions.toLocaleString()} | ${demo.clicks.toLocaleString()} | $${demo.spend.toFixed(2)} | ${ctr.toFixed(2)}% | $${cpc.toFixed(2)} | ${demo.websiteLeads.toLocaleString()} | $${costPerLead.toFixed(2)} |\n`;
+        const costPerLead = demo.totalLeads > 0 ? demo.spend / demo.totalLeads : 0;
+        summary += `| ${demo.age} | ${demo.gender} | ${demo.impressions.toLocaleString()} | ${demo.clicks.toLocaleString()} | $${demo.spend.toFixed(2)} | ${ctr.toFixed(2)}% | $${cpc.toFixed(2)} | ${demo.websiteLeads.toLocaleString()} | ${demo.formLeads.toLocaleString()} | ${demo.totalLeads.toLocaleString()} | $${costPerLead.toFixed(2)} |\n`;
       });
       summary += `\n`;
     }

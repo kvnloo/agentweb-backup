@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-10-07',
+    changes: [
+      'Added Form Submission leads to Meta Campaigns page and Agent Mode',
+      '- Meta Campaigns page now displays both Website Leads and Form Submissions with Results and Cost/Result columns',
+      '- Agent Mode can now fetch and analyze form submission leads alongside website leads',
+      '- Consistent lead prioritization logic: Website Leads take precedence over Form Submissions when both exist',
+      '- Enhanced lead metrics summary with comprehensive breakdown across campaigns, ad sets, and individual ads',
+    ],
+  },
+  {
     date: '2025-10-06',
     changes: [
       'Fixed common failures of generate_image',

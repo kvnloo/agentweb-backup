@@ -425,7 +425,6 @@ class UserDB {
     const {
       userId: _,
       email: __,
-      password: ___,
       createdAt: ____,
       ...updatableFields
     } = updates;

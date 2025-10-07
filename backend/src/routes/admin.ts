@@ -1,5 +1,6 @@
 import express from "express";
 import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
 import { authenticateToken } from "../middleware/auth";
 import { isAdmin } from "../middleware/admin";
 import { userDb, taskDb, subscriberDb } from "../services/db";
@@ -134,6 +135,35 @@ router.put("/users/:userId/email-sender", async (req, res) => {
   } catch (error) {
     console.error("Error updating user email sender:", error);
     res.status(500).json({ message: "Error updating email sender" });
+  }
+});
+
+// Update user password
+router.put("/users/:userId/password", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { password } = req.body;
+
+    // Validate password
+    if (!password || password.length < 6) {
+      return res.status(400).json({ message: "Password must be at least 6 characters long" });
+    }
+
+    // Check if user exists
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Hash the new password
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    // Update the user's password
+    const updatedUser = await userDb.updateUser(userId, { password: hashedPassword });
+    res.json({ message: "Password updated successfully" });
+  } catch (error) {
+    console.error("Error updating user password:", error);
+    res.status(500).json({ message: "Error updating password" });
   }
 });
 

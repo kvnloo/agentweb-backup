@@ -5,6 +5,19 @@ import { getMetaAccessToken } from "../utils/secretsManager";
 
 const router = express.Router();
 
+// Action type mappings (shared across all processing functions)
+const FORM_ACTIONS = new Set([
+  'leadgen',
+  'on_facebook_lead',
+  'onsite_conversion.lead_form',
+  'offsite_conversion.fb_pixel_custom',
+  'offsite_conversion.fb_pixel_lead'
+]);
+const WEBSITE_ACTIONS = new Set([
+  'website_lead',
+  'lead'
+]);
+
 // Apply authentication middleware to all routes
 router.use(authenticateToken);
 
@@ -178,7 +191,7 @@ router.get("/ad-performance", async (req, res) => {
       let insights, adSetInsights, campaignInsights;
       try {
         // Fetch ad-level insights for ads processing
-        const adInsightsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=ad&access_token=${accessToken}`;
+        const adInsightsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&action_breakdowns=action_type&action_report_time=conversion&action_attribution_windows=default&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=ad&access_token=${accessToken}`;
         
         const adInsightsResponse = await fetch(adInsightsUrl);
         const adInsightsData = await adInsightsResponse.json();
@@ -191,7 +204,7 @@ router.get("/ad-performance", async (req, res) => {
         console.log("Ad-level insights fetched successfully:", insights.length);
 
         // Fetch adset-level insights for ad sets processing
-        const adSetInsightsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=adset&access_token=${accessToken}`;
+        const adSetInsightsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&action_breakdowns=action_type&action_report_time=conversion&action_attribution_windows=default&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=adset&access_token=${accessToken}`;
         
         const adSetInsightsResponse = await fetch(adSetInsightsUrl);
         const adSetInsightsData = await adSetInsightsResponse.json();
@@ -204,7 +217,7 @@ router.get("/ad-performance", async (req, res) => {
         console.log("Adset-level insights fetched successfully:", adSetInsights.length);
 
         // Fetch campaign-level insights for campaigns processing
-        const campaignInsightsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=campaign&access_token=${accessToken}`;
+        const campaignInsightsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&action_breakdowns=action_type&action_report_time=conversion&action_attribution_windows=default&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=campaign&access_token=${accessToken}`;
         
         const campaignInsightsResponse = await fetch(campaignInsightsUrl);
         const campaignInsightsData = await campaignInsightsResponse.json();
@@ -282,22 +295,47 @@ async function processCampaignData(campaigns: any, insights: any, adSets: any): 
     });
   }
   
-  // Process campaign-level insights directly
-  for (const insight of insights) {
-    const campaignId = insight.campaign_id;
-    
-    if (campaignMap.has(campaignId)) {
-      const campaign = campaignMap.get(campaignId);
-      
-      // Use campaign-level metrics directly
-      campaign.impressions = parseInt(insight.impressions) || 0;
-      campaign.clicks = parseInt(insight.clicks) || 0;
-      campaign.spend = parseFloat(insight.spend) || 0;
-      campaign.reach = parseInt(insight.reach) || 0;
-      
-      // Calculate weighted averages for CTR and CPC
-      // CTR = total clicks / total impressions
-      // CPC = total spend / total clicks
+      // Process campaign-level insights directly
+      for (const insight of insights) {
+        const campaignId = insight.campaign_id;
+        
+        if (campaignMap.has(campaignId)) {
+          const campaign = campaignMap.get(campaignId);
+          
+          // Use campaign-level metrics directly
+          campaign.impressions = parseInt(insight.impressions) || 0;
+          campaign.clicks = parseInt(insight.clicks) || 0;
+          campaign.spend = parseFloat(insight.spend) || 0;
+          campaign.reach = parseInt(insight.reach) || 0;
+          
+          // Debug: log actions for Lead Ad Campaign
+          if (campaign.name === "Lead Ad Campaign | Landing Page" && insight.actions) {
+            console.log("Lead Ad Campaign actions:", JSON.stringify(insight.actions, null, 2));
+          }
+          
+          // Leads
+          if (Array.isArray(insight.actions)) {
+            for (const a of insight.actions) {
+              if (WEBSITE_ACTIONS.has(a.action_type)) {
+                campaign.websiteLeads = (campaign.websiteLeads || 0) + (parseInt(a.value) || 0);
+                console.log(`Found website action ${a.action_type}: ${a.value} for campaign ${campaign.name}`);
+              }
+              if (FORM_ACTIONS.has(a.action_type)) {
+                campaign.formLeads = (campaign.formLeads || 0) + (parseInt(a.value) || 0);
+                console.log(`Found form action ${a.action_type}: ${a.value} for campaign ${campaign.name}`);
+              }
+            }
+          }
+      if (Array.isArray(insight.cost_per_action_type)) {
+        for (const c of insight.cost_per_action_type) {
+          if (WEBSITE_ACTIONS.has(c.action_type)) {
+            campaign.costPerWebsiteLead = parseFloat(c.value) || 0;
+          }
+          if (FORM_ACTIONS.has(c.action_type)) {
+            campaign.costPerFormLead = parseFloat(c.value) || 0;
+          }
+        }
+      }
     }
   }
   
@@ -311,6 +349,17 @@ async function processCampaignData(campaigns: any, insights: any, adSets: any): 
     }
     if (campaign.reach > 0) {
       campaign.frequency = campaign.impressions / campaign.reach;
+    }
+    // Derived
+    if (campaign.websiteLeads > 0) {
+      campaign.costPerWebsiteLead = campaign.costPerWebsiteLead || (campaign.spend / campaign.websiteLeads);
+    }
+    if (campaign.formLeads > 0) {
+      campaign.costPerFormLead = campaign.costPerFormLead || (campaign.spend / campaign.formLeads);
+    }
+    campaign.totalLeads = (campaign.websiteLeads || 0) + (campaign.formLeads || 0);
+    if (campaign.totalLeads > 0) {
+      campaign.costPerLead = campaign.spend / campaign.totalLeads;
     }
   }
   
@@ -364,6 +413,12 @@ async function processAdSetsData(adSets: any, insights: any, campaigns: any): Pr
       cpc: 0,
       reach: 0,
       frequency: 0,
+      websiteLeads: 0,
+      costPerWebsiteLead: 0,
+      formLeads: 0,
+      costPerFormLead: 0,
+      totalLeads: 0,
+      costPerLead: 0,
       lastUpdated: new Date().toISOString(),
     });
   }
@@ -384,6 +439,31 @@ async function processAdSetsData(adSets: any, insights: any, campaigns: any): Pr
       adSet.cpc = parseFloat(insight.cpc) || 0;
       adSet.reach = parseInt(insight.reach) || 0;
       adSet.frequency = parseFloat(insight.frequency) || 0;
+      if (Array.isArray(insight.actions)) {
+        for (const a of insight.actions) {
+          if (WEBSITE_ACTIONS.has(a.action_type)) {
+            adSet.websiteLeads += (parseInt(a.value) || 0);
+          }
+          if (FORM_ACTIONS.has(a.action_type)) {
+            adSet.formLeads += (parseInt(a.value) || 0);
+          }
+        }
+      }
+      if (Array.isArray(insight.cost_per_action_type)) {
+        for (const c of insight.cost_per_action_type) {
+          if (WEBSITE_ACTIONS.has(c.action_type)) {
+            adSet.costPerWebsiteLead = parseFloat(c.value) || 0;
+          }
+          if (FORM_ACTIONS.has(c.action_type)) {
+            adSet.costPerFormLead = parseFloat(c.value) || 0;
+          }
+        }
+      }
+      // Derived
+      if (adSet.websiteLeads > 0) adSet.costPerWebsiteLead = adSet.costPerWebsiteLead || (adSet.spend / adSet.websiteLeads);
+      if (adSet.formLeads > 0) adSet.costPerFormLead = adSet.costPerFormLead || (adSet.spend / adSet.formLeads);
+      adSet.totalLeads = (adSet.websiteLeads || 0) + (adSet.formLeads || 0);
+      if (adSet.totalLeads > 0) adSet.costPerLead = adSet.spend / adSet.totalLeads;
       console.log(`Updated adset ${adSetId} with spend: ${adSet.spend}`);
     } else {
       console.log(`Adset ${adSetId} not found in adSetsMap`);
@@ -427,6 +507,12 @@ async function processAdsData(ads: any, insights: any, adSets: any, campaigns: a
       cpc: 0,
       reach: 0,
       frequency: 0,
+      websiteLeads: 0,
+      costPerWebsiteLead: 0,
+      formLeads: 0,
+      costPerFormLead: 0,
+      totalLeads: 0,
+      costPerLead: 0,
       lastUpdated: new Date().toISOString(),
     });
   }
@@ -443,6 +529,30 @@ async function processAdsData(ads: any, insights: any, adSets: any, campaigns: a
       ad.cpc = parseFloat(insight.cpc) || 0;
       ad.reach = parseInt(insight.reach) || 0;
       ad.frequency = parseFloat(insight.frequency) || 0;
+      if (Array.isArray(insight.actions)) {
+        for (const a of insight.actions) {
+          if (WEBSITE_ACTIONS.has(a.action_type)) {
+            ad.websiteLeads += (parseInt(a.value) || 0);
+          }
+          if (FORM_ACTIONS.has(a.action_type)) {
+            ad.formLeads += (parseInt(a.value) || 0);
+          }
+        }
+      }
+      if (Array.isArray(insight.cost_per_action_type)) {
+        for (const c of insight.cost_per_action_type) {
+          if (WEBSITE_ACTIONS.has(c.action_type)) {
+            ad.costPerWebsiteLead = parseFloat(c.value) || 0;
+          }
+          if (FORM_ACTIONS.has(c.action_type)) {
+            ad.costPerFormLead = parseFloat(c.value) || 0;
+          }
+        }
+      }
+      if (ad.websiteLeads > 0) ad.costPerWebsiteLead = ad.costPerWebsiteLead || (ad.spend / ad.websiteLeads);
+      if (ad.formLeads > 0) ad.costPerFormLead = ad.costPerFormLead || (ad.spend / ad.formLeads);
+      ad.totalLeads = (ad.websiteLeads || 0) + (ad.formLeads || 0);
+      if (ad.totalLeads > 0) ad.costPerLead = ad.spend / ad.totalLeads;
     }
   }
   
