@@ -823,7 +823,47 @@ Use the available tools to create tasks in the agent-engine when complex work is
             required: ['url']
           }
         }
-      }
+      },
+        {
+          type: 'function' as const,
+          function: {
+            name: 'generate_image',
+            description: 'Generate or edit images using AI image generation models. Supports both text-to-image generation and image editing with input images.',
+            parameters: {
+              type: 'object',
+              properties: {
+                prompt: {
+                  type: 'string',
+                  description: 'Detailed description of the image to generate or edit, including style, content, and visual specifications'
+                },
+                filename: {
+                  type: 'string',
+                  description: 'Name for the generated image file (should include .png extension)'
+                },
+                size: {
+                  type: 'string',
+                  description: 'Image size in pixels (1024x1024, 1536x1024, 1024x1536, or auto)',
+                  enum: ['1024x1024', '1536x1024', '1024x1536', 'auto'],
+                  default: '1024x1024'
+                },
+                quality: {
+                  type: 'string',
+                  description: 'Image quality setting (low, medium, high, or auto)',
+                  enum: ['low', 'medium', 'high', 'auto'],
+                  default: 'medium'
+                },
+                inputImages: {
+                  type: 'array',
+                  description: 'List of input image URLs to use for image editing. Leave empty for text-to-image generation.',
+                  items: {
+                    type: 'string'
+                  }
+                }
+              },
+              required: ['prompt', 'filename']
+            }
+          }
+        }
     ];
   }
 
@@ -836,6 +876,16 @@ Use the available tools to create tasks in the agent-engine when complex work is
         executionId: result.executionId,
         status: result.status || 'pending',
         message: result.message || 'Task created'
+      };
+    }
+    
+    // For image generation, return the essential fields
+    if (toolName === 'generate_image') {
+      return {
+        success: result.success,
+        message: result.message,
+        imageUrl: result.imageUrl,
+        filename: result.filename
       };
     }
     
@@ -868,6 +918,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
           taskId: `mock-image-task-${Date.now()}`,
           message: `Mock image task created: ${args.task_name}`,
           status: 'created'
+        };
+      
+      case 'generate_image':
+        return {
+          success: true,
+          message: `Mock image "${args.filename}" generated successfully!`,
+          imageUrl: `data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==`,
+          filename: args.filename
         };
       
       case 'get_meta_ads_metrics':
@@ -1218,6 +1276,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.readFileContent(args.file_url);
       case 'read_page_source':
         return await this.readFileContent(args.url);
+      case 'generate_image':
+        return await this.generateImage(args.prompt, args.filename, args.size || '1024x1024', args.quality || 'medium', args.inputImages || [], userId, sessionId);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -3792,6 +3852,95 @@ Use the available tools to create tasks in the agent-engine when complex work is
         message: errorMessage,
         error: error.message,
         file_url: fileUrl
+      };
+    }
+  }
+
+  /**
+   * Generate an image using AI image generation models
+   */
+  private async generateImage(
+    prompt: string,
+    filename: string,
+    size: string,
+    quality: string,
+    inputImages: string[],
+    userId: string,
+    sessionId: string
+  ): Promise<any> {
+    try {
+      console.log('AgentMode: Generating image with prompt:', prompt, 'filename:', filename, 'size:', size, 'quality:', quality, 'inputImages:', inputImages, 'userId:', userId, 'sessionId:', sessionId);
+      
+      // Import the image generation service
+      const { imageService } = await import('./imageGeneration');
+      
+      // Check if the service is available
+      const isAvailable = await imageService.isAvailable();
+      if (!isAvailable) {
+        return {
+          success: false,
+          message: 'Image generation service is not available. Please check API key configuration in AWS Secrets Manager.',
+          error: 'Service unavailable'
+        };
+      }
+
+      // Generate the image
+      const result = await imageService.generateImage({
+        prompt,
+        filename,
+        size,
+        quality,
+        inputImages: inputImages || [],
+        userId
+      });
+
+      if (result.success && result.imageUrl) {
+        // Save the image URL to the session for reference
+        const imageData = {
+          url: result.imageUrl,
+          filename: result.filename,
+          generatedAt: new Date().toISOString(),
+          prompt: prompt,
+          size: size,
+          quality: quality
+        };
+
+        // Store image data in session metadata (optional)
+        try {
+          await chatbotDb.addMessageToSession(sessionId, {
+            role: 'system',
+            content: `Image generated: ${result.filename}`,
+            metadata: {
+              timestamp: new Date().toISOString()
+            }
+          });
+        } catch (error) {
+          console.warn('Failed to store image generation metadata:', error);
+        }
+
+        return {
+          success: true,
+          message: `✅ Image "${result.filename}" generated successfully!`,
+          imageUrl: result.imageUrl,
+          filename: result.filename,
+          prompt: prompt,
+          size: size,
+          quality: quality
+        };
+      } else {
+        return {
+          success: false,
+          message: result.error || 'Failed to generate image',
+          error: result.error
+        };
+      }
+
+    } catch (error: any) {
+      console.error('AgentMode: Error generating image:', error);
+      return {
+        success: false,
+        message: 'Failed to generate image',
+        error: error.message
       };
     }
   }
