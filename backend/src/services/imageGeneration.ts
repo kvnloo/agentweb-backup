@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import axios from "axios";
 import { getSecret } from "../utils/secretsManager";
 import { uploadFileToS3 } from "../utils/s3Utils";
 
@@ -43,8 +44,8 @@ export class ImageService {
       } else {
         // Default to OpenAI
         secretName = process.env.NODE_ENV === "development" 
-          ? "dev/AgentWeb/OpenAI/Image" 
-          : "prod/AgentWeb/OpenAI/Image";
+        ? "dev/AgentWeb/OpenAI/Image" 
+        : "prod/AgentWeb/OpenAI/Image";
       }
       
       const apiKey = await getSecret(secretName);
@@ -78,28 +79,32 @@ export class ImageService {
 
       // Check if we have input images for editing
       const hasInputImages = params.inputImages && params.inputImages.length > 0;
+      const inputImageCount = params.inputImages ? params.inputImages.length : 0;
       
-      if (hasInputImages && params.inputImages!.length > 1) {
-        return {
-          success: false,
-          error: "Only single image editing is currently supported. Please provide only one input image.",
-        };
+      // Determine which model to use
+      let modelToUse: string;
+      if (inputImageCount > 1) {
+        // Multiple input images - use Google Gemini as it supports multiple images
+        modelToUse = "gemini-2.5-flash-image-preview";
+      } else if (inputImageCount === 1) {
+        // Single input image - use Azure AI Services for image editing
+        modelToUse = "gpt-image-1";
+      } else {
+        // No input images - use default model for text-to-image generation
+        modelToUse = "gpt-image-1";
       }
-
-      // Use default model - can be configured later
-      const defaultModel = "gpt-image-1";
       
       // Generate or edit image
       let result: ImageGenerationResult;
       try {
-        if (defaultModel === "gpt-image-1") {
-          result = await this.generateWithAzureAI(params, defaultModel, hasInputImages);
-        } else if (defaultModel === "FLUX.1-Kontext-pro") {
-          result = await this.generateWithAzureAI(params, defaultModel, hasInputImages);
-        } else if (defaultModel === "gemini-2.5-flash-image-preview") {
+        if (modelToUse === "gpt-image-1") {
+          result = await this.generateWithAzureAI(params, modelToUse, hasInputImages);
+        } else if (modelToUse === "FLUX.1-Kontext-pro") {
+          result = await this.generateWithAzureAI(params, modelToUse, hasInputImages);
+        } else if (modelToUse === "gemini-2.5-flash-image-preview") {
           result = await this.generateWithGoogleGemini(params);
         } else {
-          result = await this.generateWithOpenAI(params, defaultModel);
+          result = await this.generateWithOpenAI(params, modelToUse);
         }
         
         // If generation was successful, upload to S3
@@ -140,7 +145,7 @@ export class ImageService {
         return result;
       } catch (apiError: any) {
         console.error("💥 API error details:", {
-          model: defaultModel,
+          model: modelToUse,
           status: apiError.status,
           message: apiError.message,
           error: apiError.error,
@@ -150,7 +155,7 @@ export class ImageService {
         });
         
         // Re-throw the error with more context
-        throw new Error(`${defaultModel} API failed: ${apiError.message || apiError.error || 'Unknown error'}`);
+        throw new Error(`${modelToUse} API failed: ${apiError.message || apiError.error || 'Unknown error'}`);
       }
     } catch (error: any) {
       console.error("Error generating image:", error);
@@ -266,14 +271,296 @@ export class ImageService {
   }
 
   /**
+   * Get MIME type for an image based on file extension or content type
+   */
+  private getImageMimeType(imageUrl: string, contentType?: string): string {
+    // First, try to use the content type from the response
+    if (contentType && contentType.startsWith('image/')) {
+      return contentType;
+    }
+    
+    // Fallback to file extension detection
+    const url = new URL(imageUrl);
+    const pathname = url.pathname.toLowerCase();
+    
+    // Map file extensions to MIME types (same as Python version)
+    const mimeMap: { [key: string]: string } = {
+      '.png': 'image/png',
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.gif': 'image/gif',
+      '.bmp': 'image/bmp',
+      '.webp': 'image/webp',
+      '.svg': 'image/svg+xml'
+    };
+    
+    // Extract file extension
+    const lastDotIndex = pathname.lastIndexOf('.');
+    if (lastDotIndex !== -1) {
+      const extension = pathname.substring(lastDotIndex);
+      const mimeType = mimeMap[extension];
+      if (mimeType) {
+        return mimeType;
+      }
+    }
+    
+    // Default to PNG if we can't determine the type
+    console.warn(`⚠️ Could not determine MIME type for ${imageUrl}, defaulting to image/png`);
+    return 'image/png';
+  }
+
+  /**
+   * Convert SVG to PNG using sharp (similar to Python's cairosvg)
+   */
+  private async convertSvgToPng(svgBuffer: Buffer): Promise<Buffer> {
+    try {
+      const sharp = require('sharp');
+      
+      // Convert SVG to PNG with high quality (similar to Python version with DPI 300, width 2048)
+      const pngBuffer = await sharp(svgBuffer)
+        .resize(2048, null, { // 2048px width, maintain aspect ratio
+          withoutEnlargement: false
+        })
+        .png({
+          quality: 100,
+          compressionLevel: 0
+        })
+        .toBuffer();
+      
+      console.log("✅ SVG converted to PNG successfully");
+      return pngBuffer;
+    } catch (error: any) {
+      console.error("❌ Failed to convert SVG to PNG:", error.message);
+      throw new Error(`SVG conversion failed: ${error.message}`);
+    }
+  }
+
+  /**
+   * Process input image (download, convert SVG if needed, determine MIME type)
+   */
+  private async processInputImage(imageUrl: string): Promise<{ buffer: Buffer; mimeType: string }> {
+    console.log("📥 Downloading input image from:", imageUrl);
+    
+    // Download the image
+    const imageResponse = await axios.get(imageUrl, { 
+      responseType: 'arraybuffer',
+      timeout: 30000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; AgentWeb/1.0)'
+      }
+    });
+    
+    let imageBuffer = Buffer.from(imageResponse.data as ArrayBuffer);
+    let mimeType = this.getImageMimeType(imageUrl, imageResponse.headers['content-type'] as string);
+    
+    // Check if it's an SVG and convert to PNG
+    if (mimeType === 'image/svg+xml') {
+      console.log("🔄 Converting SVG to PNG...");
+      imageBuffer = await this.convertSvgToPng(imageBuffer);
+      mimeType = 'image/png'; // After conversion, it's PNG
+    }
+    
+    console.log("✅ Image processed successfully, size:", imageBuffer.length, "bytes, MIME type:", mimeType);
+    return { buffer: imageBuffer, mimeType };
+  }
+
+  /**
    * Generate image using Google Gemini
    */
   private async generateWithGoogleGemini(params: ImageGenerationParams): Promise<ImageGenerationResult> {
-    // For now, return an error as Google Gemini image generation requires more complex setup
-    return {
-      success: false,
-      error: "Google Gemini image generation is not yet implemented in the TypeScript version. Please use Azure AI Services or OpenAI models.",
-    };
+    try {
+      const { GoogleGenerativeAI } = require('@google/generative-ai');
+      const axios = require('axios');
+      
+      const apiKey = await this.getApiKey("gemini-2.5-flash-image-preview");
+      console.log("🔑 Google API Key retrieved:", apiKey ? "✅ Present" : "❌ Missing");
+      
+      const genAI = new GoogleGenerativeAI(apiKey);
+      const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-image-preview" });
+      console.log("🤖 Google Gemini model initialized:", "gemini-2.5-flash-image-preview");
+      
+      const inputImageCount = params.inputImages ? params.inputImages.length : 0;
+      
+      if (inputImageCount === 0) {
+        // Text-to-image generation
+        console.log("🎨 Generating image from text prompt using Google Gemini...");
+        
+        const result = await model.generateContent({
+          contents: [{
+            role: "user",
+            parts: [{
+              text: params.prompt
+            }]
+          }]
+        });
+        
+        const response = await result.response;
+        console.log("🔍 Google Gemini response:", JSON.stringify(response, null, 2));
+        
+        const imageData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        
+        if (!imageData) {
+          console.error("❌ No image data in Google Gemini response");
+          console.error("Response structure:", {
+            candidates: response.candidates?.length,
+            firstCandidate: response.candidates?.[0],
+            content: response.candidates?.[0]?.content,
+            parts: response.candidates?.[0]?.content?.parts?.length,
+            firstPart: response.candidates?.[0]?.content?.parts?.[0]
+          });
+          return {
+            success: false,
+            error: "No image data received from Google Gemini API. The model may not support image generation or the prompt may not be suitable for image generation."
+          };
+        }
+        
+        // Convert base64 to data URL
+        const imageUrl = `data:image/png;base64,${imageData}`;
+        
+        return {
+          success: true,
+          imageUrl: imageUrl,
+          filename: params.filename
+        };
+        
+      } else if (inputImageCount === 1) {
+        // Single image editing
+        console.log("🎨 Editing single image using Google Gemini...");
+        
+        // Process the input image (download, convert SVG if needed, determine MIME type)
+        let processedImage;
+        try {
+          processedImage = await this.processInputImage(params.inputImages![0]);
+        } catch (error: any) {
+          console.error("❌ Failed to process input image:", error.message);
+          return {
+            success: false,
+            error: `Failed to process input image: ${error.message}. Please check if the image URL is accessible.`
+          };
+        }
+        
+        const imageBase64 = processedImage.buffer.toString('base64');
+        
+        const result = await model.generateContent({
+          contents: [
+            {
+              role: "user",
+              parts: [{
+                inlineData: {
+                  mimeType: processedImage.mimeType,
+                  data: imageBase64
+                }
+              }]
+            },
+            {
+              role: "user", 
+              parts: [{
+                text: params.prompt
+              }]
+            }
+          ]
+        });
+        
+        const response = await result.response;
+        console.log("🔍 Google Gemini response:", JSON.stringify(response, null, 2));
+        
+        const imageData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        
+        if (!imageData) {
+          console.error("❌ No image data in Google Gemini response");
+          console.error("Response structure:", {
+            candidates: response.candidates?.length,
+            firstCandidate: response.candidates?.[0],
+            content: response.candidates?.[0]?.content,
+            parts: response.candidates?.[0]?.content?.parts?.length,
+            firstPart: response.candidates?.[0]?.content?.parts?.[0]
+          });
+          return {
+            success: false,
+            error: "No image data received from Google Gemini API. The model may not support image generation or the prompt may not be suitable for image generation."
+          };
+        }
+        
+        // Convert base64 to data URL
+        const imageUrl = `data:image/png;base64,${imageData}`;
+        
+        return {
+          success: true,
+          imageUrl: imageUrl,
+          filename: params.filename
+        };
+        
+      } else {
+        // Multiple image editing
+        console.log("🎨 Editing multiple images using Google Gemini...");
+        
+        const parts = [];
+        
+        // Add all input images as parts
+        for (let i = 0; i < params.inputImages!.length; i++) {
+          const imageUrl = params.inputImages![i];
+          console.log(`📥 Processing input image ${i + 1}/${params.inputImages!.length} from:`, imageUrl);
+          
+          try {
+            const processedImage = await this.processInputImage(imageUrl);
+            const imageBase64 = processedImage.buffer.toString('base64');
+            
+            parts.push({
+              inlineData: {
+                mimeType: processedImage.mimeType,
+                data: imageBase64
+              }
+            });
+          } catch (error: any) {
+            console.error(`❌ Failed to process input image ${i + 1}:`, error.message);
+            return {
+              success: false,
+              error: `Failed to process input image ${i + 1} (${imageUrl}): ${error.message}. Please check if the image URL is accessible.`
+            };
+          }
+        }
+        
+        // Add the text prompt as the last part
+        parts.push({
+          text: params.prompt
+        });
+        
+        const result = await model.generateContent({
+          contents: [{
+            role: "user",
+            parts: parts
+          }]
+        });
+        
+        const response = await result.response;
+        console.log("🔍 Google Gemini response:", JSON.stringify(response, null, 2));
+        
+        const imageData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        
+        if (!imageData) {
+        return {
+          success: false,
+            error: "No image data received from Google Gemini API"
+          };
+        }
+        
+        // Convert base64 to data URL
+        const imageUrl = `data:image/png;base64,${imageData}`;
+        
+        return {
+          success: true,
+          imageUrl: imageUrl,
+          filename: params.filename
+        };
+      }
+      
+    } catch (error: any) {
+      console.error("Error with Google Gemini image generation:", error);
+      return {
+        success: false,
+        error: `Google Gemini image generation failed: ${error.message || 'Unknown error'}`
+      };
+    }
   }
 
   /**
@@ -289,37 +576,37 @@ export class ImageService {
 
     const result = await client.images.generate({
       model: model,
-      prompt: params.prompt,
-      size: params.size as any,
-      quality: params.quality as any,
-    });
+          prompt: params.prompt,
+          size: params.size as any,
+          quality: params.quality as any,
+        });
 
-    // Return the image URL directly from OpenAI
-    if (result.data && result.data.length > 0) {
-      const imageData = result.data[0];
-      
-      if (imageData.url) {
-        // DALL-E returns URLs
-        return {
-          success: true,
-          imageUrl: imageData.url,
-          filename: params.filename,
-        };
-      } else if (imageData.b64_json) {
-        // GPT Image 1 returns base64 data - convert to data URL
-        const dataUrl = `data:image/png;base64,${imageData.b64_json}`;
-        return {
-          success: true,
-          imageUrl: dataUrl,
-          filename: params.filename,
-        };
-      } else {
-        console.error("❌ No URL or base64 data in image response:", imageData);
-        throw new Error(`No image data in response. Image data keys: ${Object.keys(imageData)}`);
-      }
-    } else {
-      console.error("❌ No data in OpenAI response:", result);
-      throw new Error(`No data in OpenAI response: ${JSON.stringify(result)}`);
+        // Return the image URL directly from OpenAI
+        if (result.data && result.data.length > 0) {
+          const imageData = result.data[0];
+          
+          if (imageData.url) {
+            // DALL-E returns URLs
+            return {
+              success: true,
+              imageUrl: imageData.url,
+              filename: params.filename,
+            };
+          } else if (imageData.b64_json) {
+            // GPT Image 1 returns base64 data - convert to data URL
+            const dataUrl = `data:image/png;base64,${imageData.b64_json}`;
+            return {
+              success: true,
+              imageUrl: dataUrl,
+              filename: params.filename,
+            };
+          } else {
+            console.error("❌ No URL or base64 data in image response:", imageData);
+            throw new Error(`No image data in response. Image data keys: ${Object.keys(imageData)}`);
+          }
+        } else {
+          console.error("❌ No data in OpenAI response:", result);
+          throw new Error(`No data in OpenAI response: ${JSON.stringify(result)}`);
     }
   }
 
