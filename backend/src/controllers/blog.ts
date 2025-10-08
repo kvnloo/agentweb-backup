@@ -4,6 +4,7 @@ import OpenAI from "openai";
 import axios from "axios";
 import AWS from "aws-sdk";
 import { v4 as uuidv4 } from "uuid";
+import { marked } from "marked";
 
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
@@ -73,7 +74,258 @@ interface BlogPostData {
   imagePrompt: string;
 }
 
-// Function to upload image to S3
+// Utility function to generate blog content (extracted from generateBlogPost)
+export async function generateBlogContent(
+  topic: string,
+  keywords: string = "",
+  tone: string = "professional",
+  length: string = "medium",
+  researchContext: string = "",
+  requirements: string = ""
+): Promise<{
+  title: string;
+  description: string;
+  content: string;
+  imagePrompt: string;
+}> {
+  // Generic blog prompt for content generation
+  let blogPrompt = `You are an expert marketing strategist and content writer. Create a high-quality, engaging blog post about: ${topic}
+
+Requirements:
+- Tone: ${tone} (be conversational but professional, avoid overly formal language)
+- Length: ${length} (400-800 words for short, 800-1200 for medium, 1200-2000 for long)
+- Keywords to naturally include: ${keywords || "relevant industry keywords"}
+
+Content Guidelines:
+1. Write in a natural, human voice - avoid AI-generated patterns
+2. Use practical examples and actionable insights
+3. Structure with clear H2 and H3 headings (no H4+)
+4. If research context is provided, use it as a foundation but rewrite in your own voice
+5. Avoid generic AI language - be specific, use real examples, and sound like a human expert
+6. **NO TABLES** - Tables don't render well in our CMS. Use bullet points, numbered lists, or paragraphs instead
+
+Format the response as JSON with this structure:
+{
+  "title": "Compelling, SEO-optimized title",
+  "description": "1-2 sentence meta description for SEO",
+  "content": "Full blog content in markdown format",
+  "imagePrompt": "Detailed visual description for hero image (avoid text, be conceptual)"
+}`;
+
+  // Add custom requirements if provided
+  if (requirements) {
+    blogPrompt += `
+
+Additional Requirements:
+${requirements}`;
+  }
+
+  // Add research context if provided
+  if (researchContext) {
+    blogPrompt += `
+
+Research Context (use as foundation but rewrite naturally):
+${researchContext}`;
+  }
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4",
+      messages: [
+        {
+          role: "system",
+          content: "You are a seasoned marketing strategist and content writer. Write naturally, avoid AI patterns, and focus on providing real value to startup founders. Never create tables - use bullet points, numbered lists, or paragraphs instead. Always respond with valid JSON.",
+        },
+        { role: "user", content: blogPrompt },
+      ],
+      temperature: 0.8,
+      max_tokens: 3000,
+    });
+
+    const responseContent = completion.choices[0].message.content;
+    if (!responseContent) {
+      throw new Error("No content generated from LLM");
+    }
+
+    // Parse the JSON response
+    let blogData;
+    try {
+      const cleanedContent = responseContent.replace(/```json\s*|\s*```/g, "").trim();
+      blogData = JSON.parse(cleanedContent);
+    } catch (parseError) {
+      // Fallback: create a structured response from the raw content
+      blogData = {
+        title: `Insights on ${topic}`,
+        description: `Key insights and strategies for ${topic}, providing valuable information for readers.`,
+        content: `# Insights on ${topic}
+
+This article provides practical insights on ${topic}.
+
+## Key Takeaways
+
+- Understanding the fundamentals of ${topic}
+- Practical strategies for implementation
+- Common pitfalls to avoid
+
+## Conclusion
+
+This guide covers the essential aspects of ${topic} to help you get started.`,
+        imagePrompt: `A modern, professional business illustration representing ${topic}. Clean design with relevant visual elements, suitable for a business blog. No text, conceptual representation.`,
+      };
+    }
+
+    // Validate the response structure
+    if (!blogData.title || !blogData.content) {
+      throw new Error("LLM response missing required fields (title, content)");
+    }
+
+    return blogData;
+  } catch (llmError: any) {
+    // Fallback to placeholder response if LLM fails
+    return {
+      title: `Essential Guide: ${topic}`,
+      description: `A comprehensive guide to ${topic}, covering key strategies and practical implementation tips.`,
+      content: `# Essential Guide: ${topic}
+
+This guide covers the fundamentals of ${topic}.
+
+## Understanding ${topic}
+
+- Core concepts and principles
+- Why it matters
+- Key considerations for implementation
+
+## Practical Strategies
+
+- Step-by-step approach
+- Common challenges and solutions
+- Best practices
+
+## Getting Started
+
+This guide provides the essential information you need to get started with ${topic}.`,
+      imagePrompt: `A professional business illustration representing ${topic}. Clean, modern design with relevant visual elements. No text, conceptual business representation.`,
+    };
+  }
+}
+
+// Utility function to generate blog image (extracted from generateImage)
+export async function generateBlogImage(
+  prompt: string,
+  userId: string,
+  filename?: string
+): Promise<{
+  imageUrl: string;
+  filename: string;
+}> {
+  const isImageServiceAvailable = await imageService.isAvailable();
+
+  if (!isImageServiceAvailable) {
+    throw new Error("Image generation service not available. Please check API key configuration in AWS Secrets Manager.");
+  }
+
+  const result = await imageService.generateImage({
+    prompt: prompt,
+    size: "1536x1024",
+    quality: "medium",
+    filename: filename || `blog-hero-${Date.now()}.png`,
+    userId: userId,
+    inputImages: []
+  });
+
+  if (result.success && result.imageUrl) {
+    return {
+      imageUrl: result.imageUrl,
+      filename: result.filename || filename || `blog-hero-${Date.now()}.png`
+    };
+  } else {
+    throw new Error(result.error || 'Image generation failed');
+  }
+}
+
+// Utility function to generate HTML from blog content
+export function generateBlogHtml(
+  title: string,
+  description: string,
+  content: string,
+  imageUrl: string
+): string {
+  // Configure marked options
+  marked.setOptions({
+    breaks: true, // Convert line breaks to <br>
+    gfm: true, // GitHub Flavored Markdown
+  });
+
+  // Convert markdown content to HTML using marked library
+  const htmlContent = marked(content);
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${title}</title>
+    <meta name="description" content="${description}">
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #fff;
+        }
+        .hero-image {
+            width: 100%;
+            height: 400px;
+            object-fit: cover;
+            border-radius: 8px;
+            margin-bottom: 30px;
+        }
+        h1 {
+            color: #2c3e50;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+        }
+        h2 {
+            color: #34495e;
+            margin-top: 30px;
+        }
+        h3 {
+            color: #7f8c8d;
+        }
+        p {
+            margin-bottom: 20px;
+        }
+        ul, ol {
+            margin-bottom: 20px;
+            padding-left: 20px;
+        }
+        a {
+            color: #3498db;
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+        .meta {
+            color: #7f8c8d;
+            font-size: 14px;
+            margin-bottom: 20px;
+        }
+    </style>
+</head>
+<body>
+    <h1>${title}</h1>
+    <div class="meta">Published on ${new Date().toLocaleDateString()}</div>
+    <img src="${imageUrl}" alt="${title}" class="hero-image">
+    <div class="content">
+        <p>${htmlContent}</p>
+    </div>
+</body>
+</html>`;
+}
 
 export const generateBlogPost = async (req: AuthRequest, res: Response) => {
   try {
@@ -102,107 +354,21 @@ export const generateBlogPost = async (req: AuthRequest, res: Response) => {
     if (researchContext) console.log("📚 Research context provided");
     console.log("---");
 
-    // Improved blog prompt for better content generation
-    let blogPrompt = `You are an expert marketing strategist and content writer for AgentWeb, an AI marketing agency. Your audience is early-stage (pre-seed to Series A) B2B SaaS founders who are technical and product-focused.
-
-    Create a high-quality, engaging blog post about: ${topic}
-    
-    Requirements:
-    - Tone: ${tone} (be conversational but professional, avoid overly formal language)
-    - Length: ${length} (400-800 words for short, 800-1200 for medium, 1200-2000 for long)
-    - Keywords to naturally include: ${keywords || "relevant industry keywords"}
-    
-    Content Guidelines:
-    1. Write in a natural, human voice - avoid AI-generated patterns
-    2. Use practical examples and actionable insights
-    3. Structure with clear H2 and H3 headings (no H4+)
-    4. Include relevant internal links naturally:
-       - Link to https://www.agentweb.pro when discussing done-for-you marketing services
-       - Link to https://www.agentweb.pro/build for self-service options
-       - Link to https://www.agentweb.pro/pricing for cost discussions
-    5. End with this exact CTA: "Ready to put your marketing on autopilot? [Book a call with Harsha](https://calendly.com/harsha-agentweb/30min) to walk through your current marketing workflow and see how AgentWeb can help you scale."
-    6. If research context is provided, use it as a foundation but rewrite in your own voice
-    7. Avoid generic AI language - be specific, use real examples, and sound like a human expert
-    8. **NO TABLES** - Tables don't render well in our CMS. Use bullet points, numbered lists, or paragraphs instead
-
-    Format the response as JSON with this structure:
-    {
-      "title": "Compelling, SEO-optimized title",
-      "description": "1-2 sentence meta description for SEO",
-      "content": "Full blog content in markdown format",
-      "imagePrompt": "Detailed visual description for hero image (avoid text, be conceptual)"
-    }`;
-
-    // Add research context if provided
-    if (researchContext) {
-      blogPrompt += `
-    
-    Research Context (use as foundation but rewrite naturally):
-    ${researchContext}`;
-    }
-
-    // Generate blog post content using LLM
+    // Use the utility function for content generation
     console.log("🧠 Analyzing topic and crafting content strategy...");
     console.log("💭 Generating engaging, founder-focused content...");
 
     try {
-      const completion = await openai.chat.completions.create({
-        model: process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4",
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are a seasoned marketing strategist and content writer. Write naturally, avoid AI patterns, and focus on providing real value to startup founders. Never create tables - use bullet points, numbered lists, or paragraphs instead. Always respond with valid JSON.",
-          },
-          { role: "user", content: blogPrompt },
-        ],
-        temperature: 0.8,
-        max_tokens: 3000,
-      });
+      // AgentWeb-specific requirements
+      const agentWebRequirements = `4. Include relevant internal links naturally:
+   - Link to https://www.agentweb.pro when discussing done-for-you marketing services
+   - Link to https://www.agentweb.pro/build for self-service options
+   - Link to https://www.agentweb.pro/pricing for cost discussions
+5. End with this exact CTA: "Ready to put your marketing on autopilot? [Book a call with Harsha](https://calendly.com/harsha-agentweb/30min) to walk through your current marketing workflow and see how AgentWeb can help you scale."`;
 
-      const responseContent = completion.choices[0].message.content;
-      if (!responseContent) {
-        throw new Error("No content generated from LLM");
-      }
+      const blogData = await generateBlogContent(topic, keywords, tone, length, researchContext, agentWebRequirements);
 
       console.log("✅ Content generation complete! Processing AI response...");
-
-      // Parse the JSON response
-      let blogData;
-      try {
-        const cleanedContent = responseContent
-          .replace(/```json\s*|\s*```/g, "")
-          .trim();
-        blogData = JSON.parse(cleanedContent);
-      } catch (parseError) {
-        // Fallback: create a structured response from the raw content
-        blogData = {
-          title: `Insights on ${topic}`,
-          description: `Key insights and strategies for ${topic}, tailored for early-stage startup founders looking to scale their marketing efforts.`,
-          content: `# Insights on ${topic}
-
-This article provides practical insights on ${topic} for startup founders.
-
-## Key Takeaways
-
-- Understanding the fundamentals of ${topic}
-- Practical strategies for implementation
-- Common pitfalls to avoid
-
-## Conclusion
-
-Ready to put your marketing on autopilot? [Book a call with Harsha](https://calendly.com/harsha-agentweb/30min) to walk through your current marketing workflow and see how AgentWeb can help you scale.`,
-          imagePrompt: `A modern, professional business illustration representing ${topic}. Clean design with relevant visual elements, suitable for a business blog. No text, conceptual representation.`,
-        };
-      }
-
-      // Validate the response structure
-      if (!blogData.title || !blogData.content) {
-        throw new Error(
-          "LLM response missing required fields (title, content)"
-        );
-      }
-
       console.log("✅ Content validation passed!");
       console.log("📰 Title:", blogData.title);
       console.log("📄 Content length:", blogData.content.length, "characters");
