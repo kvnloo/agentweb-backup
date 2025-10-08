@@ -1,5 +1,5 @@
 import { Request, Response } from "express";
-import { openaiImageService } from "../services/imageGeneration";
+import { imageService } from "../services/imageGeneration";
 import OpenAI from "openai";
 import axios from "axios";
 import AWS from "aws-sdk";
@@ -16,32 +16,6 @@ const openai = new OpenAI({
   defaultQuery: { "api-version": process.env.AZURE_OPENAI_API_VERSION },
   defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
 });
-
-// Initialize OpenAI client for DALL-E fallback
-let dalleClient: OpenAI | null = null;
-
-// Initialize DALL-E client when needed using Secrets Manager
-async function initializeDalleClient(): Promise<OpenAI | null> {
-  if (!dalleClient) {
-    try {
-      const secretName = process.env.NODE_ENV === "development" 
-        ? "dev/AgentWeb/OpenAI/Image" 
-        : "prod/AgentWeb/OpenAI/Image";
-      
-      const { getSecret } = await import("../utils/secretsManager");
-      const apiKey = await getSecret(secretName);
-      
-      dalleClient = new OpenAI({
-        apiKey: apiKey,
-      });
-      console.log("✅ DALL-E client initialized successfully");
-    } catch (error) {
-      console.warn("⚠️ Failed to initialize DALL-E client:", error);
-      dalleClient = null;
-    }
-  }
-  return dalleClient;
-}
 
 // Initialize AWS S3
 const s3 = new AWS.S3({
@@ -100,52 +74,6 @@ interface BlogPostData {
 }
 
 // Function to upload image to S3
-async function uploadImageToS3(
-  imageUrl: string,
-  filename: string
-): Promise<string> {
-  try {
-    console.log("📤 Uploading image to S3:", filename);
-
-    // Download the image from the generated URL
-    console.log("⬇️ Downloading image from AI service...");
-    const imageResponse = await axios.get(imageUrl, {
-      responseType: "arraybuffer",
-    });
-    const imageBuffer = Buffer.from(imageResponse.data as ArrayBuffer);
-    console.log("✅ Image downloaded successfully");
-
-    // Determine content type
-    const contentType = filename.endsWith(".png")
-      ? "image/png"
-      : filename.endsWith(".jpg")
-      ? "image/jpeg"
-      : filename.endsWith(".webp")
-      ? "image/webp"
-      : "image/png";
-
-    // Create unique S3 key
-    const s3Key = `blog-images/${Date.now()}-${filename}`;
-    console.log("🔑 S3 Key:", s3Key);
-
-    // Upload to S3
-    console.log("☁️ Uploading to AWS S3...");
-    const uploadResult = await s3
-      .upload({
-        Bucket: process.env.S3_BUCKET_NAME!,
-        Key: s3Key,
-        Body: imageBuffer,
-        ContentType: contentType,
-      })
-      .promise();
-
-    console.log("✅ Image uploaded to S3:", uploadResult.Location);
-    return uploadResult.Location;
-  } catch (error) {
-    console.error("❌ Error uploading image to S3:", error);
-    throw error;
-  }
-}
 
 export const generateBlogPost = async (req: AuthRequest, res: Response) => {
   try {
@@ -363,39 +291,46 @@ export const generateImage = async (req: AuthRequest, res: Response) => {
     console.log("📁 Filename:", filename || "auto-generated");
     console.log("---");
 
-    // Try OpenAI image generation first (uses gpt-image-1)
-    console.log("🤖 Attempting OpenAI GPT Image 1 generation...");
-    const openaiImageAvailable = await openaiImageService.isAvailable();
+    // Generate image using imageService
+    console.log("🤖 Generating image using imageService...");
+    const isImageServiceAvailable = await imageService.isAvailable();
 
-    if (openaiImageAvailable) {
-      console.log("🔧 Using OpenAI API image generation (gpt-image-1)...");
+    if (!isImageServiceAvailable) {
+      console.warn("🚫 Image generation service not available");
+      return res.status(503).json({
+        success: false,
+        message: "Image generation service not available. Please check API key configuration in AWS Secrets Manager.",
+        error: "Service unavailable",
+      });
+    }
 
-      const openaiResult = await openaiImageService.generateImage({
+    console.log("🔧 Using imageService for image generation...");
+
+    const result = await imageService.generateImage({
         prompt: prompt,
         size: "1536x1024",
         quality: "medium",
         filename: filename || "generated-blog-image.png",
+        userId: userId,
+        inputImages: []
       });
 
-      if (openaiResult.success && openaiResult.imageUrl) {
-        console.log("✅ Image generated successfully via OpenAI API");
+    if (result.success && result.imageUrl) {
+      console.log("✅ Image generated successfully via imageService");
         console.log("📤 Initiating S3 upload process...");
 
         // Upload to S3 and return S3 URL
         try {
-          const s3Url = await uploadImageToS3(
-            openaiResult.imageUrl,
-            openaiResult.filename || filename
-          );
+          // Image is already uploaded to S3 by imageService
           console.log("✅ S3 upload completed successfully!");
-          console.log("�� Final image URL:", s3Url);
+          console.log("�� Final image URL:", result.imageUrl);
           console.log("---");
           return res.status(200).json({
             success: true,
             data: {
-              imageUrl: s3Url,
+              imageUrl: result.imageUrl,
               filename:
-                openaiResult.filename || filename || "generated-blog-image.png",
+                result.filename || filename || "generated-blog-image.png",
             },
           });
         } catch (uploadError) {
@@ -406,106 +341,26 @@ export const generateImage = async (req: AuthRequest, res: Response) => {
           return res.status(200).json({
             success: true,
             data: {
-              imageUrl: openaiResult.imageUrl,
+              imageUrl: result.imageUrl,
               filename:
-                openaiResult.filename || filename || "generated-blog-image.png",
+                result.filename || filename || "generated-blog-image.png",
             },
           });
         }
-      } else {
-        console.warn(
-          "⚠️ OpenAI API image generation failed:",
-          openaiResult.error
-        );
-        console.log("🔄 Falling back to alternative generation method...");
-        // Continue to fallback methods
-      }
-    }
-
-    // Fallback to direct DALL-E if OpenAI API fails or isn't available
-    try {
-      dalleClient = await initializeDalleClient();
-      
-      if (!dalleClient) {
-        console.warn("🚫 No image generation methods available");
-        return res.status(503).json({
-          success: false,
-          message:
-            "Image generation service not available. Please configure image key in secrets manager.",
-          error: "No image generation client configured",
-        });
-      }
-
-      console.log("🔄 Falling back to direct DALL-E image generation...");
-      console.log("🎯 Using DALL-E 3 model for high-quality image creation...");
-
-      // Generate image using DALL-E with the dedicated image client
-      const imageResponse = await dalleClient.images.generate({
-        model: "dall-e-3",
-        prompt: prompt,
-        size: "1792x1024",
-        quality: "standard",
-        n: 1,
+    } else {
+      console.error("❌ Image generation failed:", result.error);
+      return res.status(500).json({
+        success: false,
+        message: "Image generation failed",
+        error: result.error,
       });
-
-      const imageUrl = imageResponse.data?.[0]?.url;
-
-      if (!imageUrl) {
-        throw new Error("No image URL returned from DALL-E");
-      }
-
-      console.log("✅ Image generated successfully via DALL-E");
-      console.log("📤 Initiating S3 upload process...");
-
-      // Upload to S3 and return S3 URL
-      try {
-        const s3Url = await uploadImageToS3(
-          imageUrl,
-          filename || "generated-image.jpg"
-        );
-        console.log("✅ S3 upload completed successfully!");
-        console.log("🔗 Final image URL:", s3Url);
-        console.log("---");
-        return res.status(200).json({
-          success: true,
-          data: {
-            imageUrl: s3Url,
-            filename: filename || "generated-image.jpg",
-          },
-        });
-      } catch (uploadError) {
-        console.error("S3 upload failed, returning original URL:", uploadError);
-        return res.status(200).json({
-          success: true,
-          data: {
-            imageUrl,
-            filename: filename || "generated-image.jpg",
-          },
-        });
-      }
-    } catch (dalleError) {
-      console.error("❌ DALL-E fallback failed:", dalleError);
-      // Continue to final fallback
     }
   } catch (error: any) {
-    console.error("❌ All image generation methods failed:", error);
-    console.log(
-      "🆘 Activating emergency fallback: Professional placeholder image..."
-    );
-
-    // Final fallback: Use Picsum placeholder image
-    const placeholderImageUrl = "https://picsum.photos/1200/600?random=1";
-    console.log("✅ Placeholder image activated");
-    console.log("🔗 Placeholder URL:", placeholderImageUrl);
-    console.log("---");
-
-    return res.status(200).json({
-      success: true,
-      data: {
-        imageUrl: placeholderImageUrl,
-        filename: req.body.filename || "placeholder-image.jpg",
-        isPlaceholder: true,
-      },
+    console.error("❌ Image generation failed:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Image generation failed",
+      error: error.message,
     });
   }
 };
