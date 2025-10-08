@@ -327,7 +327,6 @@ export class ImageService {
         })
         .toBuffer();
       
-      console.log("✅ SVG converted to PNG successfully");
       return pngBuffer;
     } catch (error: any) {
       console.error("❌ Failed to convert SVG to PNG:", error.message);
@@ -339,8 +338,6 @@ export class ImageService {
    * Process input image (download, convert SVG if needed, determine MIME type)
    */
   private async processInputImage(imageUrl: string): Promise<{ buffer: Buffer; mimeType: string }> {
-    console.log("📥 Downloading input image from:", imageUrl);
-    
     // Download the image
     const imageResponse = await axios.get(imageUrl, { 
       responseType: 'arraybuffer',
@@ -355,12 +352,10 @@ export class ImageService {
     
     // Check if it's an SVG and convert to PNG
     if (mimeType === 'image/svg+xml') {
-      console.log("🔄 Converting SVG to PNG...");
       imageBuffer = await this.convertSvgToPng(imageBuffer);
       mimeType = 'image/png'; // After conversion, it's PNG
     }
     
-    console.log("✅ Image processed successfully, size:", imageBuffer.length, "bytes, MIME type:", mimeType);
     return { buffer: imageBuffer, mimeType };
   }
 
@@ -373,18 +368,13 @@ export class ImageService {
       const axios = require('axios');
       
       const apiKey = await this.getApiKey("gemini-2.5-flash-image-preview");
-      console.log("🔑 Google API Key retrieved:", apiKey ? "✅ Present" : "❌ Missing");
-      
       const genAI = new GoogleGenerativeAI(apiKey);
       const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-image-preview" });
-      console.log("🤖 Google Gemini model initialized:", "gemini-2.5-flash-image-preview");
       
       const inputImageCount = params.inputImages ? params.inputImages.length : 0;
       
       if (inputImageCount === 0) {
         // Text-to-image generation
-        console.log("🎨 Generating image from text prompt using Google Gemini...");
-        
         const result = await model.generateContent({
           contents: [{
             role: "user",
@@ -395,19 +385,11 @@ export class ImageService {
         });
         
         const response = await result.response;
-        console.log("🔍 Google Gemini response:", JSON.stringify(response, null, 2));
         
         const imageData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
         
         if (!imageData) {
           console.error("❌ No image data in Google Gemini response");
-          console.error("Response structure:", {
-            candidates: response.candidates?.length,
-            firstCandidate: response.candidates?.[0],
-            content: response.candidates?.[0]?.content,
-            parts: response.candidates?.[0]?.content?.parts?.length,
-            firstPart: response.candidates?.[0]?.content?.parts?.[0]
-          });
           return {
             success: false,
             error: "No image data received from Google Gemini API. The model may not support image generation or the prompt may not be suitable for image generation."
@@ -425,8 +407,6 @@ export class ImageService {
         
       } else if (inputImageCount === 1) {
         // Single image editing
-        console.log("🎨 Editing single image using Google Gemini...");
-        
         // Process the input image (download, convert SVG if needed, determine MIME type)
         let processedImage;
         try {
@@ -462,19 +442,11 @@ export class ImageService {
         });
         
         const response = await result.response;
-        console.log("🔍 Google Gemini response:", JSON.stringify(response, null, 2));
         
         const imageData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
         
         if (!imageData) {
           console.error("❌ No image data in Google Gemini response");
-          console.error("Response structure:", {
-            candidates: response.candidates?.length,
-            firstCandidate: response.candidates?.[0],
-            content: response.candidates?.[0]?.content,
-            parts: response.candidates?.[0]?.content?.parts?.length,
-            firstPart: response.candidates?.[0]?.content?.parts?.[0]
-          });
           return {
             success: false,
             error: "No image data received from Google Gemini API. The model may not support image generation or the prompt may not be suitable for image generation."
@@ -492,14 +464,11 @@ export class ImageService {
         
       } else {
         // Multiple image editing
-        console.log("🎨 Editing multiple images using Google Gemini...");
-        
         const parts = [];
         
         // Add all input images as parts
         for (let i = 0; i < params.inputImages!.length; i++) {
           const imageUrl = params.inputImages![i];
-          console.log(`📥 Processing input image ${i + 1}/${params.inputImages!.length} from:`, imageUrl);
           
           try {
             const processedImage = await this.processInputImage(imageUrl);
@@ -533,7 +502,6 @@ export class ImageService {
         });
         
         const response = await result.response;
-        console.log("🔍 Google Gemini response:", JSON.stringify(response, null, 2));
         
         const imageData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
         
