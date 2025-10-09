@@ -233,8 +233,9 @@ When updating HTML files, follow this process:
 - Templates provide structured, proven approaches to common marketing tasks
 - **Fallback Method**: If no suitable template is available, use 'create_task_from_prompt' to create a task with a raw prompt
 - The 'create_task_from_prompt' tool allows you to create custom tasks with specific instructions when templates don't fit
-- **Image Generation**: Use 'create_image_task_from_prompt' to create image generation tasks for visual content like ad creatives, social media images, or marketing visuals
-- **Meta Ads Metrics**: Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data
+ - **Image Generation**: For real-time (~30s) image generation, use 'generate_image'. For longer-running, fully tracked jobs that may take a couple of minutes, use 'create_image_task_from_prompt' to create an image generation task (ad creatives, social media images, marketing visuals).
+ - **Blog Articles**: When creating blog articles, prefer using the 'create_blog_article' tool. It generates the article content, creates a high-quality hero image via imageService, formats the article into clean HTML, uploads it to S3, and returns the final HTML URL. Avoid ad-hoc content + image flows when this tool fits the request.
+ - **Meta Ads Metrics**: Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data
 - When metrics data is loaded, provide contextual analysis based on the conversation history and user's business goals
 - Don't just repeat the numbers - provide meaningful insights, strategic recommendations, and actionable next steps
 - Consider the user's industry, business stage, and previous conversation context when analyzing performance
