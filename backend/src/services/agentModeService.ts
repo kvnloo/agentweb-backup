@@ -66,7 +66,7 @@ export class AgentModeService {
       const initialMessageCount = messages.length;
 
       // Single loop for LLM calls and tool execution
-      let maxIterations = 10; // Prevent infinite loops
+      let maxIterations = 20; // Prevent infinite loops
       let iteration = 0;
       let responseMessage: any = null;
       
