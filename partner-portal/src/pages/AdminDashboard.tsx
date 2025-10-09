@@ -161,6 +161,8 @@ interface AdminTask {
   latestRunTime?: string | null;
   completedRuns?: number;
   totalRuns?: number;
+  preferredLLM?: string;
+  imageModel?: string;
   [key: string]: any; // Allow other properties if necessary
 }
 
@@ -2376,6 +2378,12 @@ export default function AdminDashboard() {
                     <SortLabel property="createdAt" label="Created At" />
                   </TableCell>
                   <TableCell>
+                    Preferred LLM
+                  </TableCell>
+                  <TableCell>
+                    Image Model
+                  </TableCell>
+                  <TableCell>
                     <SortLabel
                       property="latestRunStatus"
                       label="Latest Run Status"
@@ -2416,6 +2424,12 @@ export default function AdminDashboard() {
                       <TableCell>{task.userId}</TableCell>
                       <TableCell>
                         {new Date(task.createdAt).toLocaleDateString()}
+                      </TableCell>
+                      <TableCell>
+                        {task.preferredLLM || task.llmName || '—'}
+                      </TableCell>
+                      <TableCell>
+                        {task.imageModel || task.image_model || '—'}
                       </TableCell>
                       <TableCell>
                         <Chip
