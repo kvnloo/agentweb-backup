@@ -101,7 +101,7 @@ jobs:
         run: |
           VERSION=$(jq -r .version package.json)
           mkdir -p builds
-          zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json .env.example .platform || zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json
+          zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json .env.example .platform .ebextensions || zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json
 
       - name: Configure AWS credentials
         if: env.backend_should_deploy == 'true'
