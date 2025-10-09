@@ -4,7 +4,10 @@ import OpenAI from "openai";
 import axios from "axios";
 import AWS from "aws-sdk";
 import { v4 as uuidv4 } from "uuid";
-import { marked } from "marked";
+import { remark } from 'remark';
+import remarkHtml from 'remark-html';
+import remarkGfm from 'remark-gfm';
+import remarkBreaks from 'remark-breaks';
 
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
@@ -88,12 +91,17 @@ export async function generateBlogContent(
   content: string;
   imagePrompt: string;
 }> {
+  // Map desired length to a concrete target word count
+  const targetWordCounts: Record<string, number> = { short: 600, medium: 1000, long: 1600 };
+  const targetWords = targetWordCounts[length] ?? 1000;
+  const isLongForm = length === 'medium' || length === 'long';
+
   // Generic blog prompt for content generation
   let blogPrompt = `You are an expert marketing strategist and content writer. Create a high-quality, engaging blog post about: ${topic}
 
 Requirements:
 - Tone: ${tone} (be conversational but professional, avoid overly formal language)
-- Length: ${length} (400-800 words for short, 800-1200 for medium, 1200-2000 for long)
+- Target length: approximately ${targetWords} words (±10%)
 - Keywords to naturally include: ${keywords || "relevant industry keywords"}
 
 Content Guidelines:
@@ -102,7 +110,12 @@ Content Guidelines:
 3. Structure with clear H2 and H3 headings (no H4+)
 4. If research context is provided, use it as a foundation but rewrite in your own voice
 5. Avoid generic AI language - be specific, use real examples, and sound like a human expert
-6. **NO TABLES** - Tables don't render well in our CMS. Use bullet points, numbered lists, or paragraphs instead
+ 6. Use tables, bullet points, numbered lists, or paragraphs for data presentation${isLongForm ? `
+ 7. For ${length} articles, focus on clear, well-structured content:
+    - Create markdown tables for structured data when it adds value
+    - Use bullet points, numbered lists, and clear headings for organization
+    - Avoid ASCII art, diagrams, or complex visual elements
+    - Focus on readable, professional content that provides real value` : ''}
 
 Format the response as JSON with this structure:
 {
@@ -243,6 +256,8 @@ export async function generateBlogImage(
   }
 }
 
+
+
 // Utility function to generate HTML from blog content
 export function generateBlogHtml(
   title: string,
@@ -250,14 +265,13 @@ export function generateBlogHtml(
   content: string,
   imageUrl: string
 ): string {
-  // Configure marked options
-  marked.setOptions({
-    breaks: true, // Convert line breaks to <br>
-    gfm: true, // GitHub Flavored Markdown
-  });
+  // Convert markdown content to HTML using remark with enhanced plugins
+  const processor = remark()
+    .use(remarkGfm) // GitHub Flavored Markdown support (tables, strikethrough, etc.)
+    .use(remarkBreaks) // Convert line breaks to <br> tags
+    .use(remarkHtml, { sanitize: false }); // Convert to HTML
 
-  // Convert markdown content to HTML using marked library
-  const htmlContent = marked(content);
+  const htmlContent = processor.processSync(content).toString();
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -314,6 +328,61 @@ export function generateBlogHtml(
             font-size: 14px;
             margin-bottom: 20px;
         }
+                 /* Enhanced table styling */
+                 table {
+                     width: 100%;
+                     border-collapse: collapse;
+                     margin: 20px 0;
+                     background-color: #fff;
+                     border-radius: 8px;
+                     overflow: hidden;
+                     box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                 }
+                 th, td {
+                     padding: 12px 16px;
+                     text-align: left;
+                     border-bottom: 1px solid #e1e5e9;
+                 }
+                 th {
+                     background-color: #3498db;
+                     color: white;
+                     font-weight: 600;
+                     font-size: 14px;
+                 }
+                 tr:nth-child(even) {
+                     background-color: #f8f9fa;
+                 }
+                 tr:hover {
+                     background-color: #e3f2fd;
+                 }
+                 
+                 /* Enhanced code block styling for ASCII art */
+                 pre {
+                     background-color: #f8f9fa;
+                     border: 1px solid #e1e5e9;
+                     border-radius: 8px;
+                     padding: 16px;
+                     margin: 20px 0;
+                     overflow-x: auto;
+                     font-family: 'Courier New', 'Monaco', 'Menlo', monospace;
+                     font-size: 13px;
+                     line-height: 1.5;
+                     white-space: pre;
+                 }
+                 
+                 /* ASCII art specific styling */
+                 pre code {
+                     background: none;
+                     padding: 0;
+                     border: none;
+                     font-family: 'Courier New', 'Monaco', 'Menlo', monospace;
+                     font-size: 12px;
+                     line-height: 1.4;
+                     white-space: pre;
+                     color: #2c3e50;
+                 }
+                 
+                 
     </style>
 </head>
 <body>
@@ -513,10 +582,10 @@ export const generateImage = async (req: AuthRequest, res: Response) => {
             },
           });
         }
-    } else {
+      } else {
       console.error("❌ Image generation failed:", result.error);
       return res.status(500).json({
-        success: false,
+          success: false,
         message: "Image generation failed",
         error: result.error,
       });
