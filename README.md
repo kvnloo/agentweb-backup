@@ -668,7 +668,7 @@ cd backend && \
 npm run build && \
 VERSION="0.21" && \
 mkdir -p builds && \
-zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json .env.example  .platform
+zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json .env.example .platform .ebextensions
 ```
 
 ### AWS Elastic Beanstalk Permissions
