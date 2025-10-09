@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-10-09',
+    changes: [
+      'Supported generate image and create blog article for Agent Mode',
+      '- Agent Mode now supports real-time image generation using generate_image function call',
+      '- Added create_blog_article function call for complete blog post creation with content, images, and HTML',
+      '- Image generation supports multiple AI providers (OpenAI, Azure, Google) with automatic model selection',
+      '- Blog articles include AI-generated content, hero images, and professionally formatted HTML files',
+    ],
+  },
+  {
     date: '2025-10-07',
     changes: [
       'Added support for password reset at Login page',
