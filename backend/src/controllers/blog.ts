@@ -1,9 +1,13 @@
 import { Request, Response } from "express";
-import { openaiImageService } from "../services/imageGeneration";
+import { imageService } from "../services/imageGeneration";
 import OpenAI from "openai";
 import axios from "axios";
 import AWS from "aws-sdk";
 import { v4 as uuidv4 } from "uuid";
+import { remark } from 'remark';
+import remarkHtml from 'remark-html';
+import remarkGfm from 'remark-gfm';
+import remarkBreaks from 'remark-breaks';
 
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
@@ -16,32 +20,6 @@ const openai = new OpenAI({
   defaultQuery: { "api-version": process.env.AZURE_OPENAI_API_VERSION },
   defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
 });
-
-// Initialize OpenAI client for DALL-E fallback
-let dalleClient: OpenAI | null = null;
-
-// Initialize DALL-E client when needed using Secrets Manager
-async function initializeDalleClient(): Promise<OpenAI | null> {
-  if (!dalleClient) {
-    try {
-      const secretName = process.env.NODE_ENV === "development" 
-        ? "dev/AgentWeb/OpenAI/Image" 
-        : "prod/AgentWeb/OpenAI/Image";
-      
-      const { getSecret } = await import("../utils/secretsManager");
-      const apiKey = await getSecret(secretName);
-      
-      dalleClient = new OpenAI({
-        apiKey: apiKey,
-      });
-      console.log("✅ DALL-E client initialized successfully");
-    } catch (error) {
-      console.warn("⚠️ Failed to initialize DALL-E client:", error);
-      dalleClient = null;
-    }
-  }
-  return dalleClient;
-}
 
 // Initialize AWS S3
 const s3 = new AWS.S3({
@@ -99,52 +77,323 @@ interface BlogPostData {
   imagePrompt: string;
 }
 
-// Function to upload image to S3
-async function uploadImageToS3(
-  imageUrl: string,
-  filename: string
-): Promise<string> {
-  try {
-    console.log("📤 Uploading image to S3:", filename);
+// Utility function to generate blog content (extracted from generateBlogPost)
+export async function generateBlogContent(
+  topic: string,
+  keywords: string = "",
+  tone: string = "professional",
+  length: string = "medium",
+  researchContext: string = "",
+  requirements: string = ""
+): Promise<{
+  title: string;
+  description: string;
+  content: string;
+  imagePrompt: string;
+}> {
+  // Map desired length to a concrete target word count
+  const targetWordCounts: Record<string, number> = { short: 600, medium: 1000, long: 1600 };
+  const targetWords = targetWordCounts[length] ?? 1000;
+  const isLongForm = length === 'medium' || length === 'long';
 
-    // Download the image from the generated URL
-    console.log("⬇️ Downloading image from AI service...");
-    const imageResponse = await axios.get(imageUrl, {
-      responseType: "arraybuffer",
-    });
-    const imageBuffer = Buffer.from(imageResponse.data as ArrayBuffer);
-    console.log("✅ Image downloaded successfully");
+  // Generic blog prompt for content generation
+  let blogPrompt = `You are an expert marketing strategist and content writer. Create a high-quality, engaging blog post about: ${topic}
 
-    // Determine content type
-    const contentType = filename.endsWith(".png")
-      ? "image/png"
-      : filename.endsWith(".jpg")
-      ? "image/jpeg"
-      : filename.endsWith(".webp")
-      ? "image/webp"
-      : "image/png";
+Requirements:
+- Tone: ${tone} (be conversational but professional, avoid overly formal language)
+- Target length: approximately ${targetWords} words (±10%)
+- Keywords to naturally include: ${keywords || "relevant industry keywords"}
 
-    // Create unique S3 key
-    const s3Key = `blog-images/${Date.now()}-${filename}`;
-    console.log("🔑 S3 Key:", s3Key);
+Content Guidelines:
+1. Write in a natural, human voice - avoid AI-generated patterns
+2. Use practical examples and actionable insights
+3. Structure with clear H2 and H3 headings (no H4+)
+4. If research context is provided, use it as a foundation but rewrite in your own voice
+5. Avoid generic AI language - be specific, use real examples, and sound like a human expert
+ 6. Use tables, bullet points, numbered lists, or paragraphs for data presentation${isLongForm ? `
+ 7. For ${length} articles, focus on clear, well-structured content:
+    - Create markdown tables for structured data when it adds value
+    - Use bullet points, numbered lists, and clear headings for organization
+    - Avoid ASCII art, diagrams, or complex visual elements
+    - Focus on readable, professional content that provides real value` : ''}
 
-    // Upload to S3
-    console.log("☁️ Uploading to AWS S3...");
-    const uploadResult = await s3
-      .upload({
-        Bucket: process.env.S3_BUCKET_NAME!,
-        Key: s3Key,
-        Body: imageBuffer,
-        ContentType: contentType,
-      })
-      .promise();
+Format the response as JSON with this structure:
+{
+  "title": "Compelling, SEO-optimized title",
+  "description": "1-2 sentence meta description for SEO",
+  "content": "Full blog content in markdown format",
+  "imagePrompt": "Detailed visual description for hero image (avoid text, be conceptual)"
+}`;
 
-    console.log("✅ Image uploaded to S3:", uploadResult.Location);
-    return uploadResult.Location;
-  } catch (error) {
-    console.error("❌ Error uploading image to S3:", error);
-    throw error;
+  // Add custom requirements if provided
+  if (requirements) {
+    blogPrompt += `
+
+Additional Requirements:
+${requirements}`;
   }
+
+  // Add research context if provided
+  if (researchContext) {
+    blogPrompt += `
+
+Research Context (use as foundation but rewrite naturally):
+${researchContext}`;
+  }
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4",
+      messages: [
+        {
+          role: "system",
+          content: "You are a seasoned marketing strategist and content writer. Write naturally, avoid AI patterns, and focus on providing real value to startup founders. Never create tables - use bullet points, numbered lists, or paragraphs instead. Always respond with valid JSON.",
+        },
+        { role: "user", content: blogPrompt },
+      ],
+      temperature: 0.8,
+      max_tokens: 3000,
+    });
+
+    const responseContent = completion.choices[0].message.content;
+    if (!responseContent) {
+      throw new Error("No content generated from LLM");
+    }
+
+    // Parse the JSON response
+    let blogData;
+    try {
+      const cleanedContent = responseContent.replace(/```json\s*|\s*```/g, "").trim();
+      blogData = JSON.parse(cleanedContent);
+    } catch (parseError) {
+      // Fallback: create a structured response from the raw content
+      blogData = {
+        title: `Insights on ${topic}`,
+        description: `Key insights and strategies for ${topic}, providing valuable information for readers.`,
+        content: `# Insights on ${topic}
+
+This article provides practical insights on ${topic}.
+
+## Key Takeaways
+
+- Understanding the fundamentals of ${topic}
+- Practical strategies for implementation
+- Common pitfalls to avoid
+
+## Conclusion
+
+This guide covers the essential aspects of ${topic} to help you get started.`,
+        imagePrompt: `A modern, professional business illustration representing ${topic}. Clean design with relevant visual elements, suitable for a business blog. No text, conceptual representation.`,
+      };
+    }
+
+    // Validate the response structure
+    if (!blogData.title || !blogData.content) {
+      throw new Error("LLM response missing required fields (title, content)");
+    }
+
+    return blogData;
+  } catch (llmError: any) {
+    // Fallback to placeholder response if LLM fails
+    return {
+      title: `Essential Guide: ${topic}`,
+      description: `A comprehensive guide to ${topic}, covering key strategies and practical implementation tips.`,
+      content: `# Essential Guide: ${topic}
+
+This guide covers the fundamentals of ${topic}.
+
+## Understanding ${topic}
+
+- Core concepts and principles
+- Why it matters
+- Key considerations for implementation
+
+## Practical Strategies
+
+- Step-by-step approach
+- Common challenges and solutions
+- Best practices
+
+## Getting Started
+
+This guide provides the essential information you need to get started with ${topic}.`,
+      imagePrompt: `A professional business illustration representing ${topic}. Clean, modern design with relevant visual elements. No text, conceptual business representation.`,
+    };
+  }
+}
+
+// Utility function to generate blog image (extracted from generateImage)
+export async function generateBlogImage(
+  prompt: string,
+  userId: string,
+  filename?: string
+): Promise<{
+  imageUrl: string;
+  filename: string;
+}> {
+  const isImageServiceAvailable = await imageService.isAvailable();
+
+  if (!isImageServiceAvailable) {
+    throw new Error("Image generation service not available. Please check API key configuration in AWS Secrets Manager.");
+  }
+
+  const result = await imageService.generateImage({
+    prompt: prompt,
+    size: "1536x1024",
+    quality: "medium",
+    filename: filename || `blog-hero-${Date.now()}.png`,
+    userId: userId,
+    inputImages: []
+  });
+
+  if (result.success && result.imageUrl) {
+    return {
+      imageUrl: result.imageUrl,
+      filename: result.filename || filename || `blog-hero-${Date.now()}.png`
+    };
+  } else {
+    throw new Error(result.error || 'Image generation failed');
+  }
+}
+
+
+
+// Utility function to generate HTML from blog content
+export function generateBlogHtml(
+  title: string,
+  description: string,
+  content: string,
+  imageUrl: string
+): string {
+  // Convert markdown content to HTML using remark with enhanced plugins
+  const processor = remark()
+    .use(remarkGfm) // GitHub Flavored Markdown support (tables, strikethrough, etc.)
+    .use(remarkBreaks) // Convert line breaks to <br> tags
+    .use(remarkHtml, { sanitize: false }); // Convert to HTML
+
+  const htmlContent = processor.processSync(content).toString();
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${title}</title>
+    <meta name="description" content="${description}">
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #fff;
+        }
+        .hero-image {
+            width: 100%;
+            height: 400px;
+            object-fit: cover;
+            border-radius: 8px;
+            margin-bottom: 30px;
+        }
+        h1 {
+            color: #2c3e50;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+        }
+        h2 {
+            color: #34495e;
+            margin-top: 30px;
+        }
+        h3 {
+            color: #7f8c8d;
+        }
+        p {
+            margin-bottom: 20px;
+        }
+        ul, ol {
+            margin-bottom: 20px;
+            padding-left: 20px;
+        }
+        a {
+            color: #3498db;
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+        .meta {
+            color: #7f8c8d;
+            font-size: 14px;
+            margin-bottom: 20px;
+        }
+                 /* Enhanced table styling */
+                 table {
+                     width: 100%;
+                     border-collapse: collapse;
+                     margin: 20px 0;
+                     background-color: #fff;
+                     border-radius: 8px;
+                     overflow: hidden;
+                     box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                 }
+                 th, td {
+                     padding: 12px 16px;
+                     text-align: left;
+                     border-bottom: 1px solid #e1e5e9;
+                 }
+                 th {
+                     background-color: #3498db;
+                     color: white;
+                     font-weight: 600;
+                     font-size: 14px;
+                 }
+                 tr:nth-child(even) {
+                     background-color: #f8f9fa;
+                 }
+                 tr:hover {
+                     background-color: #e3f2fd;
+                 }
+                 
+                 /* Enhanced code block styling for ASCII art */
+                 pre {
+                     background-color: #f8f9fa;
+                     border: 1px solid #e1e5e9;
+                     border-radius: 8px;
+                     padding: 16px;
+                     margin: 20px 0;
+                     overflow-x: auto;
+                     font-family: 'Courier New', 'Monaco', 'Menlo', monospace;
+                     font-size: 13px;
+                     line-height: 1.5;
+                     white-space: pre;
+                 }
+                 
+                 /* ASCII art specific styling */
+                 pre code {
+                     background: none;
+                     padding: 0;
+                     border: none;
+                     font-family: 'Courier New', 'Monaco', 'Menlo', monospace;
+                     font-size: 12px;
+                     line-height: 1.4;
+                     white-space: pre;
+                     color: #2c3e50;
+                 }
+                 
+                 
+    </style>
+</head>
+<body>
+    <h1>${title}</h1>
+    <div class="meta">Published on ${new Date().toLocaleDateString()}</div>
+    <img src="${imageUrl}" alt="${title}" class="hero-image">
+    <div class="content">
+        <p>${htmlContent}</p>
+    </div>
+</body>
+</html>`;
 }
 
 export const generateBlogPost = async (req: AuthRequest, res: Response) => {
@@ -174,107 +423,21 @@ export const generateBlogPost = async (req: AuthRequest, res: Response) => {
     if (researchContext) console.log("📚 Research context provided");
     console.log("---");
 
-    // Improved blog prompt for better content generation
-    let blogPrompt = `You are an expert marketing strategist and content writer for AgentWeb, an AI marketing agency. Your audience is early-stage (pre-seed to Series A) B2B SaaS founders who are technical and product-focused.
-
-    Create a high-quality, engaging blog post about: ${topic}
-    
-    Requirements:
-    - Tone: ${tone} (be conversational but professional, avoid overly formal language)
-    - Length: ${length} (400-800 words for short, 800-1200 for medium, 1200-2000 for long)
-    - Keywords to naturally include: ${keywords || "relevant industry keywords"}
-    
-    Content Guidelines:
-    1. Write in a natural, human voice - avoid AI-generated patterns
-    2. Use practical examples and actionable insights
-    3. Structure with clear H2 and H3 headings (no H4+)
-    4. Include relevant internal links naturally:
-       - Link to https://www.agentweb.pro when discussing done-for-you marketing services
-       - Link to https://www.agentweb.pro/build for self-service options
-       - Link to https://www.agentweb.pro/pricing for cost discussions
-    5. End with this exact CTA: "Ready to put your marketing on autopilot? [Book a call with Harsha](https://calendly.com/harsha-agentweb/30min) to walk through your current marketing workflow and see how AgentWeb can help you scale."
-    6. If research context is provided, use it as a foundation but rewrite in your own voice
-    7. Avoid generic AI language - be specific, use real examples, and sound like a human expert
-    8. **NO TABLES** - Tables don't render well in our CMS. Use bullet points, numbered lists, or paragraphs instead
-
-    Format the response as JSON with this structure:
-    {
-      "title": "Compelling, SEO-optimized title",
-      "description": "1-2 sentence meta description for SEO",
-      "content": "Full blog content in markdown format",
-      "imagePrompt": "Detailed visual description for hero image (avoid text, be conceptual)"
-    }`;
-
-    // Add research context if provided
-    if (researchContext) {
-      blogPrompt += `
-    
-    Research Context (use as foundation but rewrite naturally):
-    ${researchContext}`;
-    }
-
-    // Generate blog post content using LLM
+    // Use the utility function for content generation
     console.log("🧠 Analyzing topic and crafting content strategy...");
     console.log("💭 Generating engaging, founder-focused content...");
 
     try {
-      const completion = await openai.chat.completions.create({
-        model: process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4",
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are a seasoned marketing strategist and content writer. Write naturally, avoid AI patterns, and focus on providing real value to startup founders. Never create tables - use bullet points, numbered lists, or paragraphs instead. Always respond with valid JSON.",
-          },
-          { role: "user", content: blogPrompt },
-        ],
-        temperature: 0.8,
-        max_tokens: 3000,
-      });
+      // AgentWeb-specific requirements
+      const agentWebRequirements = `4. Include relevant internal links naturally:
+   - Link to https://www.agentweb.pro when discussing done-for-you marketing services
+   - Link to https://www.agentweb.pro/build for self-service options
+   - Link to https://www.agentweb.pro/pricing for cost discussions
+5. End with this exact CTA: "Ready to put your marketing on autopilot? [Book a call with Harsha](https://calendly.com/harsha-agentweb/30min) to walk through your current marketing workflow and see how AgentWeb can help you scale."`;
 
-      const responseContent = completion.choices[0].message.content;
-      if (!responseContent) {
-        throw new Error("No content generated from LLM");
-      }
+      const blogData = await generateBlogContent(topic, keywords, tone, length, researchContext, agentWebRequirements);
 
       console.log("✅ Content generation complete! Processing AI response...");
-
-      // Parse the JSON response
-      let blogData;
-      try {
-        const cleanedContent = responseContent
-          .replace(/```json\s*|\s*```/g, "")
-          .trim();
-        blogData = JSON.parse(cleanedContent);
-      } catch (parseError) {
-        // Fallback: create a structured response from the raw content
-        blogData = {
-          title: `Insights on ${topic}`,
-          description: `Key insights and strategies for ${topic}, tailored for early-stage startup founders looking to scale their marketing efforts.`,
-          content: `# Insights on ${topic}
-
-This article provides practical insights on ${topic} for startup founders.
-
-## Key Takeaways
-
-- Understanding the fundamentals of ${topic}
-- Practical strategies for implementation
-- Common pitfalls to avoid
-
-## Conclusion
-
-Ready to put your marketing on autopilot? [Book a call with Harsha](https://calendly.com/harsha-agentweb/30min) to walk through your current marketing workflow and see how AgentWeb can help you scale.`,
-          imagePrompt: `A modern, professional business illustration representing ${topic}. Clean design with relevant visual elements, suitable for a business blog. No text, conceptual representation.`,
-        };
-      }
-
-      // Validate the response structure
-      if (!blogData.title || !blogData.content) {
-        throw new Error(
-          "LLM response missing required fields (title, content)"
-        );
-      }
-
       console.log("✅ Content validation passed!");
       console.log("📰 Title:", blogData.title);
       console.log("📄 Content length:", blogData.content.length, "characters");
@@ -363,39 +526,46 @@ export const generateImage = async (req: AuthRequest, res: Response) => {
     console.log("📁 Filename:", filename || "auto-generated");
     console.log("---");
 
-    // Try OpenAI image generation first (uses gpt-image-1)
-    console.log("🤖 Attempting OpenAI GPT Image 1 generation...");
-    const openaiImageAvailable = await openaiImageService.isAvailable();
+    // Generate image using imageService
+    console.log("🤖 Generating image using imageService...");
+    const isImageServiceAvailable = await imageService.isAvailable();
 
-    if (openaiImageAvailable) {
-      console.log("🔧 Using OpenAI API image generation (gpt-image-1)...");
+    if (!isImageServiceAvailable) {
+      console.warn("🚫 Image generation service not available");
+      return res.status(503).json({
+        success: false,
+        message: "Image generation service not available. Please check API key configuration in AWS Secrets Manager.",
+        error: "Service unavailable",
+      });
+    }
 
-      const openaiResult = await openaiImageService.generateImage({
+    console.log("🔧 Using imageService for image generation...");
+
+    const result = await imageService.generateImage({
         prompt: prompt,
         size: "1536x1024",
         quality: "medium",
         filename: filename || "generated-blog-image.png",
+        userId: userId,
+        inputImages: []
       });
 
-      if (openaiResult.success && openaiResult.imageUrl) {
-        console.log("✅ Image generated successfully via OpenAI API");
+    if (result.success && result.imageUrl) {
+      console.log("✅ Image generated successfully via imageService");
         console.log("📤 Initiating S3 upload process...");
 
         // Upload to S3 and return S3 URL
         try {
-          const s3Url = await uploadImageToS3(
-            openaiResult.imageUrl,
-            openaiResult.filename || filename
-          );
+          // Image is already uploaded to S3 by imageService
           console.log("✅ S3 upload completed successfully!");
-          console.log("�� Final image URL:", s3Url);
+          console.log("�� Final image URL:", result.imageUrl);
           console.log("---");
           return res.status(200).json({
             success: true,
             data: {
-              imageUrl: s3Url,
+              imageUrl: result.imageUrl,
               filename:
-                openaiResult.filename || filename || "generated-blog-image.png",
+                result.filename || filename || "generated-blog-image.png",
             },
           });
         } catch (uploadError) {
@@ -406,106 +576,26 @@ export const generateImage = async (req: AuthRequest, res: Response) => {
           return res.status(200).json({
             success: true,
             data: {
-              imageUrl: openaiResult.imageUrl,
+              imageUrl: result.imageUrl,
               filename:
-                openaiResult.filename || filename || "generated-blog-image.png",
+                result.filename || filename || "generated-blog-image.png",
             },
           });
         }
       } else {
-        console.warn(
-          "⚠️ OpenAI API image generation failed:",
-          openaiResult.error
-        );
-        console.log("🔄 Falling back to alternative generation method...");
-        // Continue to fallback methods
-      }
-    }
-
-    // Fallback to direct DALL-E if OpenAI API fails or isn't available
-    try {
-      dalleClient = await initializeDalleClient();
-      
-      if (!dalleClient) {
-        console.warn("🚫 No image generation methods available");
-        return res.status(503).json({
+      console.error("❌ Image generation failed:", result.error);
+      return res.status(500).json({
           success: false,
-          message:
-            "Image generation service not available. Please configure image key in secrets manager.",
-          error: "No image generation client configured",
-        });
-      }
-
-      console.log("🔄 Falling back to direct DALL-E image generation...");
-      console.log("🎯 Using DALL-E 3 model for high-quality image creation...");
-
-      // Generate image using DALL-E with the dedicated image client
-      const imageResponse = await dalleClient.images.generate({
-        model: "dall-e-3",
-        prompt: prompt,
-        size: "1792x1024",
-        quality: "standard",
-        n: 1,
+        message: "Image generation failed",
+        error: result.error,
       });
-
-      const imageUrl = imageResponse.data?.[0]?.url;
-
-      if (!imageUrl) {
-        throw new Error("No image URL returned from DALL-E");
-      }
-
-      console.log("✅ Image generated successfully via DALL-E");
-      console.log("📤 Initiating S3 upload process...");
-
-      // Upload to S3 and return S3 URL
-      try {
-        const s3Url = await uploadImageToS3(
-          imageUrl,
-          filename || "generated-image.jpg"
-        );
-        console.log("✅ S3 upload completed successfully!");
-        console.log("🔗 Final image URL:", s3Url);
-        console.log("---");
-        return res.status(200).json({
-          success: true,
-          data: {
-            imageUrl: s3Url,
-            filename: filename || "generated-image.jpg",
-          },
-        });
-      } catch (uploadError) {
-        console.error("S3 upload failed, returning original URL:", uploadError);
-        return res.status(200).json({
-          success: true,
-          data: {
-            imageUrl,
-            filename: filename || "generated-image.jpg",
-          },
-        });
-      }
-    } catch (dalleError) {
-      console.error("❌ DALL-E fallback failed:", dalleError);
-      // Continue to final fallback
     }
   } catch (error: any) {
-    console.error("❌ All image generation methods failed:", error);
-    console.log(
-      "🆘 Activating emergency fallback: Professional placeholder image..."
-    );
-
-    // Final fallback: Use Picsum placeholder image
-    const placeholderImageUrl = "https://picsum.photos/1200/600?random=1";
-    console.log("✅ Placeholder image activated");
-    console.log("🔗 Placeholder URL:", placeholderImageUrl);
-    console.log("---");
-
-    return res.status(200).json({
-      success: true,
-      data: {
-        imageUrl: placeholderImageUrl,
-        filename: req.body.filename || "placeholder-image.jpg",
-        isPlaceholder: true,
-      },
+    console.error("❌ Image generation failed:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Image generation failed",
+      error: error.message,
     });
   }
 };

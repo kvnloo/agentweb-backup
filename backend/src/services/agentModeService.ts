@@ -66,7 +66,7 @@ export class AgentModeService {
       const initialMessageCount = messages.length;
 
       // Single loop for LLM calls and tool execution
-      let maxIterations = 10; // Prevent infinite loops
+      let maxIterations = 20; // Prevent infinite loops
       let iteration = 0;
       let responseMessage: any = null;
       
@@ -213,6 +213,16 @@ When users attach files to their messages, you will receive:
 - Use the file URLs to understand what the user has shared and provide relevant assistance
 - **IMPORTANT**: When creating tasks that are related to the attached files, you MUST include the attachment details (URLs and filenames) in the task prompt, otherwise the task execution won't have access to the files
 
+## HTML File Updates
+When updating HTML files, follow this process:
+1. **First, read the original file**: Use the \`read_file\` tool to get the complete HTML content from the file URL
+2. **Analyze the content**: Review the full HTML structure to understand what needs to be modified
+3. **Make targeted changes**: Update only the specific parts that need modification while preserving the rest
+4. **Save as new file**: Use the \`save_file\` tool to save the updated content to a new file
+5. **Never truncate or use placeholders**: Always include the complete, updated HTML content in the save_file call
+6. **Preserve structure**: Maintain the original HTML structure, DOCTYPE, head, body, and styling
+7. **Complete content only**: Do not use "...", "[content continues]", or any truncation indicators
+
 ## Task Creation Approach
 - **IMPORTANT**: Always confirm with the user before creating any task, as tasks can take a few minutes to complete
 - **Confirmation required**: Explain what the task will do and get explicit approval before proceeding
@@ -223,8 +233,9 @@ When users attach files to their messages, you will receive:
 - Templates provide structured, proven approaches to common marketing tasks
 - **Fallback Method**: If no suitable template is available, use 'create_task_from_prompt' to create a task with a raw prompt
 - The 'create_task_from_prompt' tool allows you to create custom tasks with specific instructions when templates don't fit
-- **Image Generation**: Use 'create_image_task_from_prompt' to create image generation tasks for visual content like ad creatives, social media images, or marketing visuals
-- **Meta Ads Metrics**: Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data
+ - **Image Generation**: For real-time (~30s) image generation, use 'generate_image'. For longer-running, fully tracked jobs that may take a couple of minutes, use 'create_image_task_from_prompt' to create an image generation task (ad creatives, social media images, marketing visuals).
+ - **Blog Articles**: When creating blog articles, prefer using the 'create_blog_article' tool. It generates the article content, creates a high-quality hero image via imageService, formats the article into clean HTML, uploads it to S3, and returns the final HTML URL. Avoid ad-hoc content + image flows when this tool fits the request.
+ - **Meta Ads Metrics**: Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data
 - When metrics data is loaded, provide contextual analysis based on the conversation history and user's business goals
 - Don't just repeat the numbers - provide meaningful insights, strategic recommendations, and actionable next steps
 - Consider the user's industry, business stage, and previous conversation context when analyzing performance
@@ -783,7 +794,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
               },
               file_content: {
                 type: 'string',
-                description: 'Content of the file to save'
+                description: 'Content of the file to save.'
               }
             },
             required: ['file_name', 'file_content']
@@ -823,6 +834,90 @@ Use the available tools to create tasks in the agent-engine when complex work is
             required: ['url']
           }
         }
+      },
+        {
+          type: 'function' as const,
+          function: {
+            name: 'generate_image',
+            description: 'Generate or edit images using AI image generation models. Supports both text-to-image generation and image editing with input images.',
+            parameters: {
+              type: 'object',
+              properties: {
+                prompt: {
+                  type: 'string',
+                  description: 'Detailed description of the image to generate or edit, including style, content, and visual specifications'
+                },
+                filename: {
+                  type: 'string',
+                  description: 'Name for the generated image file (should include .png extension)'
+                },
+                size: {
+                  type: 'string',
+                  description: 'Image size in pixels (1024x1024, 1536x1024, 1024x1536, or auto)',
+                  enum: ['1024x1024', '1536x1024', '1024x1536', 'auto'],
+                  default: '1024x1024'
+                },
+                quality: {
+                  type: 'string',
+                  description: 'Image quality setting (low, medium, high, or auto)',
+                  enum: ['low', 'medium', 'high', 'auto'],
+                  default: 'medium'
+                },
+                inputImages: {
+                  type: 'array',
+                  description: 'List of input image URLs to use for image editing. Leave empty for text-to-image generation.',
+                  items: {
+                    type: 'string'
+                  }
+                }
+              },
+              required: ['prompt', 'filename']
+            }
+          }
+        },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'create_blog_article',
+          description: 'Create a complete blog article with content, images, and HTML file. Generates blog content using AI, creates a hero image, and produces a complete HTML file uploaded to S3.',
+          parameters: {
+            type: 'object',
+            properties: {
+              topic: {
+                type: 'string',
+                description: 'The main topic or subject of the blog article'
+              },
+              keywords: {
+                type: 'string',
+                description: 'Comma-separated keywords to include in the article for SEO',
+                default: ''
+              },
+              tone: {
+                type: 'string',
+                description: 'The tone of voice for the article',
+                enum: ['professional', 'casual', 'friendly', 'authoritative', 'conversational'],
+                default: 'professional'
+              },
+              length: {
+                type: 'string',
+                description: 'The desired length of the article',
+                enum: ['short', 'medium', 'long'],
+                default: 'medium'
+              },
+                researchContext: {
+                  type: 'string',
+                  description: 'Optional research context or background information to include in the article',
+                  default: ''
+                },
+                requirements: {
+                  type: 'string',
+                  description: 'Specific requirements for the blog article (e.g., internal links, CTAs, branding guidelines)',
+                  default: ''
+                }
+            },
+            required: ['topic']
+          }
+        }
       }
     ];
   }
@@ -836,6 +931,16 @@ Use the available tools to create tasks in the agent-engine when complex work is
         executionId: result.executionId,
         status: result.status || 'pending',
         message: result.message || 'Task created'
+      };
+    }
+    
+    // For image generation, return the essential fields
+    if (toolName === 'generate_image') {
+      return {
+        success: result.success,
+        message: result.message,
+        imageUrl: result.imageUrl,
+        filename: result.filename
       };
     }
     
@@ -868,6 +973,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
           taskId: `mock-image-task-${Date.now()}`,
           message: `Mock image task created: ${args.task_name}`,
           status: 'created'
+        };
+      
+      case 'generate_image':
+        return {
+          success: true,
+          message: `Mock image "${args.filename}" generated successfully!`,
+          imageUrl: `data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==`,
+          filename: args.filename
         };
       
       case 'get_meta_ads_metrics':
@@ -1218,6 +1331,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.readFileContent(args.file_url);
       case 'read_page_source':
         return await this.readFileContent(args.url);
+      case 'generate_image':
+        return await this.generateImage(args.prompt, args.filename, args.size || '1024x1024', args.quality || 'medium', args.inputImages || [], userId, sessionId);
+        case 'create_blog_article':
+          return await this.createBlogArticle(args.topic, args.keywords || '', args.tone || 'professional', args.length || 'medium', args.researchContext || '', args.requirements || '', userId, sessionId);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -3795,6 +3912,181 @@ Use the available tools to create tasks in the agent-engine when complex work is
       };
     }
   }
+
+  /**
+   * Generate an image using AI image generation models
+   */
+  private async generateImage(
+    prompt: string,
+    filename: string,
+    size: string,
+    quality: string,
+    inputImages: string[],
+    userId: string,
+    sessionId: string
+  ): Promise<any> {
+    try {
+      console.log('AgentMode: Generating image with prompt:', prompt, 'filename:', filename, 'size:', size, 'quality:', quality, 'inputImages:', inputImages, 'userId:', userId, 'sessionId:', sessionId);
+      
+      // Import the image generation service
+      const { imageService } = await import('./imageGeneration');
+      
+      // Check if the service is available
+      const isAvailable = await imageService.isAvailable();
+      if (!isAvailable) {
+        return {
+          success: false,
+          message: 'Image generation service is not available. Please check API key configuration in AWS Secrets Manager.',
+          error: 'Service unavailable'
+        };
+      }
+
+      // Generate the image
+      const result = await imageService.generateImage({
+        prompt,
+        filename,
+        size,
+        quality,
+        inputImages: inputImages || [],
+        userId
+      });
+
+      if (result.success && result.imageUrl) {
+        // Save the image URL to the session for reference
+        const imageData = {
+          url: result.imageUrl,
+          filename: result.filename,
+          generatedAt: new Date().toISOString(),
+          prompt: prompt,
+          size: size,
+          quality: quality
+        };
+
+        // Store image data in session metadata (optional)
+        try {
+          await chatbotDb.addMessageToSession(sessionId, {
+            role: 'system',
+            content: `Image generated: ${result.filename}`,
+            metadata: {
+              timestamp: new Date().toISOString()
+            }
+          });
+        } catch (error) {
+          console.warn('Failed to store image generation metadata:', error);
+        }
+
+        return {
+          success: true,
+          message: `✅ Image "${result.filename}" generated successfully!`,
+          imageUrl: result.imageUrl,
+          filename: result.filename,
+          prompt: prompt,
+          size: size,
+          quality: quality
+        };
+      } else {
+        return {
+          success: false,
+          message: result.error || 'Failed to generate image',
+          error: result.error
+        };
+      }
+
+    } catch (error: any) {
+      console.error('AgentMode: Error generating image:', error);
+      return {
+        success: false,
+        message: 'Failed to generate image',
+        error: error.message
+      };
+    }
+  }
+
+  private async createBlogArticle(
+    topic: string,
+    keywords: string,
+    tone: string,
+    length: string,
+    researchContext: string,
+    requirements: string,
+    userId: string,
+    sessionId: string
+  ): Promise<any> {
+    try {
+      console.log('AgentMode: Creating blog article for topic:', topic, 'tone:', tone, 'length:', length, 'userId:', userId);
+      
+      // Import required services
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+
+      // Step 1: Generate blog content using existing blog.ts utility function
+      console.log('AgentMode: Generating blog content using existing blog service...');
+      const { generateBlogContent } = await import('../controllers/blog');
+      
+      // Use the requirements passed from the LLM
+      const blogData = await generateBlogContent(topic, keywords, tone, length, researchContext, requirements);
+
+      if (!blogData.title || !blogData.content) {
+        throw new Error("Blog content generation failed");
+      }
+
+      console.log('AgentMode: Blog content generated successfully');
+
+      // Step 2: Generate hero image using existing blog.ts utility function
+      console.log('AgentMode: Generating hero image using existing blog service...');
+      const { generateBlogImage } = await import('../controllers/blog');
+      const imageData = await generateBlogImage(blogData.imagePrompt, userId);
+
+      if (!imageData.imageUrl) {
+        throw new Error('Image generation failed');
+      }
+
+      console.log('AgentMode: Hero image generated successfully');
+
+      // Step 3: Generate HTML file using existing blog.ts utility function
+      console.log('AgentMode: Generating HTML file...');
+      const { generateBlogHtml } = await import('../controllers/blog');
+      const htmlContent = generateBlogHtml(blogData.title, blogData.description, blogData.content, imageData.imageUrl);
+      
+      // Step 4: Upload HTML file to S3
+      console.log('AgentMode: Uploading HTML file to S3...');
+      const htmlFilename = `blog-${Date.now()}.html`;
+      
+      const uploadResult = await uploadFileToS3(
+        htmlContent,
+        htmlFilename,
+        userId,
+        'text/html'
+      );
+
+      if (!uploadResult.success || !uploadResult.url) {
+        throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+      }
+
+      const htmlUrl = uploadResult.url;
+
+      console.log('AgentMode: HTML file uploaded successfully to:', htmlUrl);
+
+      return {
+        success: true,
+        message: 'Blog article created successfully',
+        data: {
+          title: blogData.title,
+          description: blogData.description,
+          imageUrl: imageData.imageUrl,
+          htmlUrl: htmlUrl
+        }
+      };
+
+    } catch (error: any) {
+      console.error('AgentMode: Error creating blog article:', error);
+      return {
+        success: false,
+        message: 'Failed to create blog article',
+        error: error.message
+      };
+    }
+  }
+
 
 }
 
