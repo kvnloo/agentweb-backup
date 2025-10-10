@@ -1,11 +1,12 @@
 import { Request, Response } from 'express';
 import { agentModeService, AgentModeService } from '../services/agentModeService';
 import { chatbotDb, updateTaskExecutionStatus } from '../services/chatbotService';
-import { scheduleDb } from '../services/db';
+import { scheduleDb, userDb } from '../services/db';
 import { User } from '../types/auth';
 import multer from 'multer';
 import crypto from 'crypto';
 import { uploadFileToS3 } from '../utils/s3Utils';
+import { emailService } from '../services/emailService';
 
 // Interface for scheduled chat test results
 interface ScheduledChatTestResult {
@@ -944,18 +945,32 @@ export const agentModeController = {
               nextRunTime.toISOString()
             );
             
-            // Start the scheduled chat run asynchronously (don't await)
-            runScheduledChat(schedule, schedule.userId, false).then((result) => {
-              // Successfully completed
-            }).catch((error) => {
-              console.error(`Error running scheduled chat ${schedule.scheduleName}:`, error);
-              // Log the full error details for debugging
-              console.error('Full error details:', {
-                message: error.message,
-                stack: error.stack,
-                name: error.name
-              });
-            });
+             // Start the scheduled chat run asynchronously (don't await)
+             runScheduledChat(schedule, schedule.userId, false).then(async (result) => {
+               // Send email notification with the result
+               try {
+                 const user = await userDb.getUserById(schedule.userId);
+                 if (user && user.email) {
+                   await emailService.sendScheduledChatResultEmail(
+                     user.email,
+                     schedule.scheduleName,
+                     result,
+                     schedule.scheduleId
+                   );
+                 }
+               } catch (error) {
+                 console.error('Error sending scheduled chat result email:', error);
+                 // Don't throw error - email failure shouldn't break the scheduled chat execution
+               }
+             }).catch((error) => {
+               console.error(`Error running scheduled chat ${schedule.scheduleName}:`, error);
+               // Log the full error details for debugging
+               console.error('Full error details:', {
+                 message: error.message,
+                 stack: error.stack,
+                 name: error.name
+               });
+             });
                 
                 results.push({
                   scheduleId: schedule.scheduleId,

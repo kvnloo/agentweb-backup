@@ -494,5 +494,178 @@ export const emailService = {
       console.error(`Error sending task execution email to ${toEmail}:`, error);
       throw error;
     }
+  },
+
+  async sendScheduledChatResultEmail(
+    toEmail: string,
+    scheduleName: string,
+    result: {
+      passed: boolean;
+      actualResponse: string;
+      keywordMatches: string[];
+      keywordMisses: string[];
+      functionCallMatches: string[];
+      functionCallMisses: string[];
+      executionTime: number;
+      sessionId: string;
+      attempt: number;
+      createdAt: string;
+    },
+    scheduleId: string
+  ) {
+    try {
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      const sessionUrl = `${customerFrontendUrl}/agent-mode/${result.sessionId}`;
+      
+      const statusColor = result.passed ? '#28a745' : '#dc3545';
+      const statusText = result.passed ? 'PASSED' : 'FAILED';
+      const statusIcon = result.passed ? '✅' : '❌';
+      
+      const currentDate = new Date().toLocaleDateString('en-US', { 
+        year: 'numeric', 
+        month: 'short', 
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+
+      const html = `
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa; }
+            .container { max-width: 800px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .header { background-color: #1976d2; color: white; padding: 20px; border-radius: 8px 8px 0 0; }
+            .header h1 { margin: 0; font-size: 24px; }
+            .content { padding: 20px; }
+            .status { display: inline-block; padding: 8px 16px; border-radius: 4px; font-weight: bold; margin: 10px 0; }
+            .status.passed { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+            .status.failed { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+            .section { margin: 20px 0; padding: 15px; border: 1px solid #e9ecef; border-radius: 4px; }
+            .section h3 { margin-top: 0; color: #495057; border-bottom: 2px solid #e9ecef; padding-bottom: 8px; }
+            .criteria { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 15px 0; }
+            .criteria-item { padding: 10px; background-color: #f8f9fa; border-radius: 4px; }
+            .criteria-item h4 { margin: 0 0 8px 0; color: #495057; }
+            .matches { color: #28a745; font-weight: bold; }
+            .misses { color: #dc3545; font-weight: bold; }
+            .response { background-color: #f8f9fa; padding: 15px; border-radius: 4px; border-left: 4px solid #1976d2; white-space: pre-wrap; word-wrap: break-word; }
+            .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; }
+            .button { display: inline-block; background-color: #1976d2; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin: 10px 0; }
+            .button:hover { background-color: #1565c0; }
+            .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin: 15px 0; }
+            .stat { text-align: center; padding: 10px; background-color: #f8f9fa; border-radius: 4px; }
+            .stat-value { font-size: 24px; font-weight: bold; color: #1976d2; }
+            .stat-label { font-size: 12px; color: #6c757d; text-transform: uppercase; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h1>${statusIcon} Scheduled Chat Results</h1>
+              <p style="margin: 5px 0 0 0; opacity: 0.9;">${scheduleName}</p>
+            </div>
+            
+            <div class="content">
+              <div class="status ${result.passed ? 'passed' : 'failed'}">
+                ${statusIcon} Test ${statusText}
+              </div>
+              
+              <div class="stats">
+                <div class="stat">
+                  <div class="stat-value">${result.attempt}</div>
+                  <div class="stat-label">Attempts</div>
+                </div>
+                <div class="stat">
+                  <div class="stat-value">${Math.round(result.executionTime / 1000)}s</div>
+                  <div class="stat-label">Duration</div>
+                </div>
+                <div class="stat">
+                  <div class="stat-value">${result.keywordMatches.length}</div>
+                  <div class="stat-label">Keywords Found</div>
+                </div>
+                <div class="stat">
+                  <div class="stat-value">${result.functionCallMatches.length}</div>
+                  <div class="stat-label">Functions Used</div>
+                </div>
+              </div>
+              
+              <div class="section">
+                <h3>📋 Test Criteria</h3>
+                <div class="criteria">
+                  <div class="criteria-item">
+                    <h4>Keywords Required</h4>
+                    ${result.keywordMatches.length > 0 ? `<div class="matches">✓ Found: ${result.keywordMatches.join(', ')}</div>` : ''}
+                    ${result.keywordMisses.length > 0 ? `<div class="misses">✗ Missing: ${result.keywordMisses.join(', ')}</div>` : ''}
+                    ${result.keywordMatches.length === 0 && result.keywordMisses.length === 0 ? '<div>No keywords required</div>' : ''}
+                  </div>
+                  <div class="criteria-item">
+                    <h4>Function Calls Required</h4>
+                    ${result.functionCallMatches.length > 0 ? `<div class="matches">✓ Used: ${result.functionCallMatches.join(', ')}</div>` : ''}
+                    ${result.functionCallMisses.length > 0 ? `<div class="misses">✗ Missing: ${result.functionCallMisses.join(', ')}</div>` : ''}
+                    ${result.functionCallMatches.length === 0 && result.functionCallMisses.length === 0 ? '<div>No function calls required</div>' : ''}
+                  </div>
+                </div>
+              </div>
+              
+              <div class="section">
+                <h3>💬 AI Response</h3>
+                <div class="response">${this.escapeHtml(result.actualResponse)}</div>
+              </div>
+              
+              <div class="section">
+                <h3>🔗 View Full Conversation</h3>
+                <p>Click the button below to view the complete conversation in Agent Mode:</p>
+                <a href="${sessionUrl}" class="button">Open in Agent Mode</a>
+                <p style="margin-top: 10px; font-size: 14px; color: #6c757d;">
+                  Or copy this link: <a href="${sessionUrl}">${sessionUrl}</a>
+                </p>
+              </div>
+            </div>
+            
+            <div class="footer">
+              <p><strong>Schedule:</strong> ${scheduleName}</p>
+              <p><strong>Run Time:</strong> ${currentDate}</p>
+              <p style="margin-top: 15px; font-size: 12px; color: #6c757d;">
+                This is an automated email from your scheduled chat. 
+                <a href="${customerFrontendUrl}/agent-mode" style="color: #1976d2;">Manage your schedules</a>
+              </p>
+            </div>
+          </div>
+        </body>
+        </html>
+      `;
+
+      const text = `
+Scheduled Chat Results: ${scheduleName}
+
+Status: ${statusText} ${statusIcon}
+Attempts: ${result.attempt}
+Duration: ${Math.round(result.executionTime / 1000)}s
+
+Keywords Found: ${result.keywordMatches.length > 0 ? result.keywordMatches.join(', ') : 'None'}
+Keywords Missing: ${result.keywordMisses.length > 0 ? result.keywordMisses.join(', ') : 'None'}
+
+Function Calls Used: ${result.functionCallMatches.length > 0 ? result.functionCallMatches.join(', ') : 'None'}
+Function Calls Missing: ${result.functionCallMisses.length > 0 ? result.functionCallMisses.join(', ') : 'None'}
+
+AI Response:
+${result.actualResponse}
+
+View full conversation: ${sessionUrl}
+
+---
+This is an automated email from your scheduled chat.
+Manage your schedules: ${customerFrontendUrl}/agent-mode
+      `;
+
+      const subject = `${statusIcon} Scheduled Chat: ${scheduleName} - ${statusText}`;
+      
+      await this.sendEmail(toEmail, subject, text, html);
+      console.log(`Scheduled chat result email sent to: ${toEmail}`);
+      
+    } catch (error) {
+      console.error(`Error sending scheduled chat result email to ${toEmail}:`, error);
+      // Don't throw error - email failure shouldn't break the scheduled chat execution
+    }
   }
 }; 
