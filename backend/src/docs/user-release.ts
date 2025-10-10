@@ -14,6 +14,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Schedule configuration includes starting message, required function calls, and keywords for response validation',
       '- Automated email notifications with results, AI responses, and direct links to view conversations',
       '- Schedule management with pause/resume functionality and comprehensive test history tracking',
+      'Supported account-level Slack channel configuration',
+      '- Admins can now configure a specific Slack channel for each user in the Users tab of the admin page',
+      '- When a user has an account-level Slack channel configured, only that channel is available for selection in approval requests',
+      '- Users without a configured Slack channel can choose from all available channels as before',
+      '- Provides better control over where approval notifications are sent for each user account',
     ],
   },
   {
