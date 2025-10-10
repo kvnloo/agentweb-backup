@@ -351,6 +351,10 @@ const calculateNextRunTime = (frequency: string, fromDate: Date): Date => {
   const nextRun = new Date(fromDate);
   
   switch (frequency) {
+    case 'hourly':
+      nextRun.setHours(nextRun.getHours() + 1);
+      nextRun.setMinutes(0, 0, 0); // Top of the hour
+      break;
     case 'daily':
       nextRun.setDate(nextRun.getDate() + 1);
       nextRun.setHours(9, 0, 0, 0); // 9 AM
@@ -791,7 +795,7 @@ export const agentModeController = {
       // Get all schedules for the user and filter for scheduled chats
       const schedules = await scheduleDb.getSchedulesByUserId(user.userId);
       const scheduledChats = schedules?.filter(schedule => 
-        schedule.type === 'scheduled_chat' && schedule.status === 'active'
+        schedule.type === 'scheduled_chat'
       ) || [];
 
       res.json(scheduledChats);
@@ -872,6 +876,36 @@ export const agentModeController = {
           } catch (error) {
             console.error('AgentMode: Test scheduled chat error:', error);
             res.status(500).json({ error: 'Failed to test scheduled chat' });
+          }
+        },
+
+        async toggleScheduledChatStatus(req: Request, res: Response) {
+          try {
+            const user = req.user as User;
+            const { scheduleId } = req.params;
+            const { status } = req.body;
+
+            if (!status || !['active', 'paused'].includes(status)) {
+              return res.status(400).json({ error: 'Invalid status. Must be "active" or "paused"' });
+            }
+
+            // Verify schedule exists and belongs to user
+            const schedule = await scheduleDb.getScheduleById(scheduleId);
+            if (!schedule || schedule.userId !== user.userId) {
+              return res.status(404).json({ error: 'Scheduled chat not found' });
+            }
+
+            // Update the schedule status
+            await scheduleDb.updateSchedule(scheduleId, { 
+              status,
+              updatedAt: new Date().toISOString()
+            });
+
+            res.json({ message: `Scheduled chat ${status === 'active' ? 'enabled' : 'paused'} successfully` });
+
+          } catch (error) {
+            console.error('AgentMode: Toggle scheduled chat status error:', error);
+            res.status(500).json({ error: 'Failed to toggle scheduled chat status' });
           }
         },
 

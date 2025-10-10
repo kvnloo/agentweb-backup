@@ -103,6 +103,10 @@ router.put('/scheduled-chats/:scheduleId', asyncHandler(agentModeController.upda
 // Test scheduled chat
 router.post('/scheduled-chats/:scheduleId/test', asyncHandler(agentModeController.testScheduledChat));
 
+// PATCH /api/agent-mode/scheduled-chats/:scheduleId/toggle
+// Toggle scheduled chat status (enable/disable)
+router.patch('/scheduled-chats/:scheduleId/toggle', asyncHandler(agentModeController.toggleScheduledChatStatus));
+
 // DELETE /api/agent-mode/scheduled-chats/:scheduleId
 // Delete scheduled chat
 router.delete('/scheduled-chats/:scheduleId', asyncHandler(agentModeController.deleteScheduledChat));
