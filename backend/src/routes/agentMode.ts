@@ -26,6 +26,10 @@ router.get('/public/welcome-message', asyncHandler(agentModeController.getWelcom
 // Get current conversation starters (public)
 router.get('/public/conversation-starters', asyncHandler(agentModeController.getConversationStarters));
 
+// POST /api/agent-mode/run-scheduled-chats
+// Run all scheduled chats that are ready to execute (called by agent-engine)
+router.post('/run-scheduled-chats', asyncHandler(agentModeController.runScheduledChats));
+
 // All other routes require authentication
 router.use(authenticateToken);
 

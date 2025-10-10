@@ -17,19 +17,26 @@ conda activate agent-engine
 
 ### Environment Variables
 
-The agent-engine supports custom email senders via Resend. To enable this feature:
+The agent-engine supports custom email senders via Resend and scheduled chat processing. To enable these features:
 
-1. Set the `RESEND_API_KEY` environment variable:
+1. **Resend Email Integration** - Set the `RESEND_API_KEY` environment variable:
 ```bash
 export RESEND_API_KEY=your_resend_api_key_here
 ```
 
-2. Or add it to your `.env` file:
-```
-RESEND_API_KEY=your_resend_api_key_here
+2. **Scheduled Chat Integration** - Set the `BACKEND_URL` environment variable:
+```bash
+export BACKEND_URL=http://localhost:3001
 ```
 
-Get your API key from [Resend API Keys](https://resend.com/api-keys).
+3. Or add them to your `.env` file:
+```
+RESEND_API_KEY=your_resend_api_key_here
+BACKEND_URL=http://localhost:3001
+```
+
+- Get your Resend API key from [Resend API Keys](https://resend.com/api-keys)
+- The `BACKEND_URL` should point to your AgentWeb backend API server
 
 ### Alternative Setup (pip)
 
@@ -51,6 +58,29 @@ conda activate agent-engine
 
 # Start the agent engine
 python task_monitor.py
+```
+
+## Scheduled Chat Processing
+
+The agent-engine now automatically processes scheduled chats alongside regular task schedules. When the agent-engine detects scheduled chat schedules that are due to run, it will:
+
+1. **Detect Scheduled Chats**: Query the `AW-TaskSchedules` table for schedules with `type = 'scheduled_chat'`
+2. **Trigger Backend Processing**: Make an API call to the backend's `/api/agent-mode/run-scheduled-chats` endpoint
+3. **Log Results**: Display detailed logs of successful and failed scheduled chat executions
+
+### How It Works
+
+- The agent-engine runs every 5 seconds and checks for due schedules
+- Regular task schedules are processed locally by creating task executions
+- Scheduled chat schedules trigger the backend API to handle the chat processing
+- Both types of schedules get their `nextRunTime` updated after processing
+
+### Configuration
+
+Make sure to set the `BACKEND_URL` environment variable to point to your AgentWeb backend:
+
+```bash
+export BACKEND_URL=http://localhost:3001
 ```
 
 ## Testing Gemini Integration

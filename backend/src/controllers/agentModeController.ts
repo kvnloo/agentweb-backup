@@ -98,6 +98,127 @@ const filterMessagesForClient = (messages: any[]) => {
   });
 };
 
+// Common function to run a scheduled chat (used by both test and actual execution)
+async function runScheduledChat(
+  schedule: any,
+  userId: string,
+  isTest: boolean = false
+): Promise<{
+  scheduleId: string;
+  runId: string;
+  status: 'success' | 'failure';
+  passed: boolean;
+  actualResponse: string;
+  actualFunctionCalls: string[];
+  keywordMatches: string[];
+  keywordMisses: string[];
+  functionCallMatches: string[];
+  functionCallMisses: string[];
+  executionTime: number;
+  sessionId: string;
+  attempt: number;
+  createdAt: string;
+}> {
+  const now = new Date();
+  const maxTries = 3;
+  let attempt = 0;
+  let finalResult: {
+    scheduleId: string;
+    runId: string;
+    status: 'success' | 'failure';
+    passed: boolean;
+    actualResponse: string;
+    actualFunctionCalls: string[];
+    keywordMatches: string[];
+    keywordMisses: string[];
+    functionCallMatches: string[];
+    functionCallMisses: string[];
+    executionTime: number;
+    sessionId: string;
+    attempt: number;
+    createdAt: string;
+  } | null = null;
+
+  // Create a session for the run
+  const sessionTitle = isTest ? `Test: ${schedule.scheduleName}` : `Scheduled: ${schedule.scheduleName}`;
+  const testSession = await chatbotDb.createChatSession(userId, undefined, "agent", sessionTitle);
+  const sessionId = testSession.sessionId;
+
+  while (attempt < maxTries) {
+    attempt++;
+    
+    try {
+      // Prepare user message for this attempt
+      const userMessage = attempt === 1 
+        ? schedule.startingMessage 
+        : `Please try again. Make sure to include these keywords: ${finalResult?.keywordMisses?.join(', ') || ''} and use these function calls: ${finalResult?.functionCallMisses?.join(', ') || ''}.`;
+
+      // Generate response using the common function (same as /generateResponse)
+      const response = await generateSessionResponse(
+        sessionId,
+        userMessage,
+        userId
+      );
+
+      // Extract function calls from the response
+      const actualFunctionCalls = response.toolCalls?.map((call: any) => call.name).filter(Boolean) || [];
+
+      // Evaluate the response against expected criteria
+      const evaluation = evaluateScheduleResponse(
+        response.content,
+        actualFunctionCalls,
+        {
+          keywords: schedule.keywords || [],
+          functionCalls: schedule.requiredFunctionCalls || []
+        }
+      );
+
+      finalResult = {
+        scheduleId: schedule.scheduleId,
+        runId: require('uuid').v4(),
+        status: evaluation.passed ? 'success' : 'failure',
+        passed: evaluation.passed,
+        actualResponse: response.content,
+        actualFunctionCalls,
+        keywordMatches: evaluation.keywordMatches,
+        keywordMisses: evaluation.keywordMisses,
+        functionCallMatches: evaluation.functionCallMatches,
+        functionCallMisses: evaluation.functionCallMisses,
+        executionTime: Date.now() - now.getTime(),
+        sessionId: sessionId,
+        attempt,
+        createdAt: new Date().toISOString()
+      };
+
+      // If test passed, break out of loop
+      if (evaluation.passed) {
+        break;
+      }
+
+    } catch (error) {
+      console.error(`Run attempt ${attempt} failed:`, error);
+      if (attempt === maxTries) {
+        throw error;
+      }
+    }
+  }
+
+  // Ensure we always return a result
+  if (!finalResult) {
+    throw new Error('Failed to generate result after all attempts');
+  }
+
+  // Save the result to database
+  try {
+    await scheduleDb.addRunResult(schedule.scheduleId, finalResult);
+  } catch (error) {
+    console.error('Error saving run result:', error);
+    // Continue even if saving fails - we still want to return the result
+  }
+  
+  return finalResult;
+}
+
 // Common function to generate AI response for a session
 async function generateSessionResponse(
   sessionId: string,
@@ -723,86 +844,10 @@ export const agentModeController = {
               return res.status(404).json({ error: 'Scheduled chat not found' });
             }
 
-            // Create a new session for testing
-            const now = new Date();
-            
-            // Create test session
-            const testSession = await chatbotDb.createChatSession(user.userId, undefined, "agent", `Test: ${schedule.scheduleName}`);
-            const testSessionId = testSession.sessionId;
+            // Run the scheduled chat as a test
+            const result = await runScheduledChat(schedule, user.userId, true);
 
-            const maxTries = 3;
-            let attempt = 0;
-            let finalResult = null;
-
-            while (attempt < maxTries) {
-              attempt++;
-              
-              try {
-                // Prepare user message for this attempt
-                const userMessage = attempt === 1 
-                  ? schedule.startingMessage 
-                  : `Please try again. Make sure to include these keywords: ${finalResult?.keywordMisses?.join(', ') || ''} and use these function calls: ${finalResult?.functionCallMisses?.join(', ') || ''}.`;
-
-                // Generate response using the common function (same as /generateResponse)
-                const response = await generateSessionResponse(
-                  testSessionId,
-                  userMessage,
-                  user.userId
-                );
-
-                // Extract function calls from the response
-                const actualFunctionCalls = response.toolCalls?.map((call: any) => call.name).filter(Boolean) || [];
-
-                // Evaluate the response against expected criteria
-                const evaluation = evaluateScheduleResponse(
-                  response.content,
-                  actualFunctionCalls,
-                  {
-                    keywords: schedule.keywords || [],
-                    functionCalls: schedule.requiredFunctionCalls || []
-                  }
-                );
-
-                finalResult = {
-                  scheduleId,
-                  runId: require('uuid').v4(),
-                  status: evaluation.passed ? 'success' : 'failure',
-                  passed: evaluation.passed,
-                  actualResponse: response.content,
-                  actualFunctionCalls,
-                  keywordMatches: evaluation.keywordMatches,
-                  keywordMisses: evaluation.keywordMisses,
-                  functionCallMatches: evaluation.functionCallMatches,
-                  functionCallMisses: evaluation.functionCallMisses,
-                  executionTime: Date.now() - now.getTime(),
-                  sessionId: testSessionId, // Include session ID so user can view the test conversation
-                  attempt,
-                  createdAt: new Date().toISOString()
-                };
-
-                // If test passed, break out of loop
-                if (evaluation.passed) {
-                  break;
-                }
-
-              } catch (error) {
-                console.error(`Test attempt ${attempt} failed:`, error);
-                if (attempt === maxTries) {
-                  throw error;
-                }
-              }
-            }
-
-            // Save test result to database
-            try {
-              await scheduleDb.addRunResult(scheduleId, finalResult);
-            } catch (error) {
-              console.error('Error saving test result:', error);
-              // Continue even if saving fails
-            }
-
-            // Don't delete the test session - let user view the conversation
-            res.json(finalResult);
+            res.json(result);
 
           } catch (error) {
             console.error('AgentMode: Test scheduled chat error:', error);
@@ -849,6 +894,76 @@ export const agentModeController = {
           } catch (error) {
             console.error('AgentMode: Get test history error:', error);
             res.status(500).json({ error: 'Failed to get test history' });
+          }
+        },
+
+        async runScheduledChats(req: Request, res: Response) {
+          try {
+            // Get all scheduled chats that are ready to run
+            const scheduledChats = await scheduleDb.getSchedulesReadyToRun();
+
+            if (scheduledChats.length === 0) {
+              return res.json({ 
+                message: 'No scheduled chats ready to run',
+                processed: 0,
+                results: []
+              });
+            }
+
+            const results = [];
+
+            for (const schedule of scheduledChats) {
+              try {
+                console.log(`Processing scheduled chat: ${schedule.scheduleName} (${schedule.scheduleId})`);
+                
+                // Update the schedule with next run time FIRST (synchronously)
+                // This prevents agent-engine from repeatedly calling the same schedule
+                const now = new Date();
+                const nextRunTime = calculateNextRunTime(schedule.frequency, now);
+                
+                await scheduleDb.updateScheduleAfterRun(
+                  schedule.scheduleId,
+                  now.toISOString(),
+                  nextRunTime.toISOString()
+                );
+                
+                console.log(`Updated next run time for schedule: ${schedule.scheduleName}`);
+                
+                // Start the scheduled chat run asynchronously (don't await)
+                runScheduledChat(schedule, schedule.userId, false).then((result) => {
+                  console.log(`Successfully completed scheduled chat: ${schedule.scheduleName}`);
+                }).catch((error) => {
+                  console.error(`Error running scheduled chat ${schedule.scheduleName}:`, error);
+                });
+                
+                results.push({
+                  scheduleId: schedule.scheduleId,
+                  scheduleName: schedule.scheduleName,
+                  status: 'started',
+                  nextRunTime: nextRunTime.toISOString()
+                });
+                
+              } catch (error) {
+                console.error(`Error processing schedule ${schedule.scheduleName}:`, error);
+                
+                results.push({
+                  scheduleId: schedule.scheduleId,
+                  scheduleName: schedule.scheduleName,
+                  status: 'error',
+                  error: error instanceof Error ? error.message : 'Unknown error'
+                });
+              }
+            }
+
+            res.json({
+              message: `Processed ${scheduledChats.length} scheduled chats`,
+              processed: scheduledChats.length,
+              results: results
+            });
+
+          } catch (error) {
+            console.error('AgentMode: Run scheduled chats error:', error);
+            res.status(500).json({ error: 'Failed to run scheduled chats' });
           }
         }
 };

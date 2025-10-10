@@ -1529,6 +1529,63 @@ export const scheduleDb = {
           }
         },
 
+        async getSchedulesReadyToRun() {
+          try {
+            const now = new Date().toISOString();
+            const params = {
+              TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+              IndexName: 'StatusStartTimeIndex',
+              KeyConditionExpression: '#status = :status AND #nextRunTime <= :now',
+              FilterExpression: '#type = :type',
+              ExpressionAttributeNames: {
+                '#status': 'status',
+                '#nextRunTime': 'nextRunTime',
+                '#type': 'type',
+              },
+              ExpressionAttributeValues: {
+                ':status': 'active',
+                ':now': now,
+                ':type': 'scheduled_chat',
+              },
+            };
+
+            const result = await dynamodb.query(params).promise();
+            return result.Items || [];
+          } catch (error) {
+            handleDynamoDbError(error, "getSchedulesReadyToRun");
+            return [];
+          }
+        },
+
+        async updateScheduleAfterRun(scheduleId: string, lastRunTime: string, nextRunTime: string) {
+          try {
+            const params = {
+              TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+              Key: {
+                scheduleId,
+              },
+              UpdateExpression: 'SET #lastRunTime = :lastRunTime, #nextRunTime = :nextRunTime, #updatedAt = :updatedAt',
+              ExpressionAttributeNames: {
+                '#lastRunTime': 'lastRunTime',
+                '#nextRunTime': 'nextRunTime',
+                '#updatedAt': 'updatedAt',
+              },
+              ExpressionAttributeValues: {
+                ':lastRunTime': lastRunTime,
+                ':nextRunTime': nextRunTime,
+                ':updatedAt': new Date().toISOString(),
+              },
+              ReturnValues: 'ALL_NEW',
+            };
+
+            const result = await dynamodb.update(params).promise();
+            return result.Attributes;
+          } catch (error) {
+            handleDynamoDbError(error, "updateScheduleAfterRun");
+            throw error;
+          }
+        },
+
   async deleteSchedule(scheduleId: string) {
     try {
       const params = {
