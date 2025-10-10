@@ -376,8 +376,12 @@ async def trigger_scheduled_chats():
                 for res in result['results']:
                     if res.get('status') == 'success':
                         logger.info(f"✓ Successfully ran scheduled chat: {res.get('scheduleName', 'Unknown')}")
-                    else:
+                    elif res.get('status') == 'started':
+                        logger.info(f"→ Started scheduled chat: {res.get('scheduleName', 'Unknown')}")
+                    elif res.get('status') == 'error':
                         logger.error(f"✗ Failed to run scheduled chat: {res.get('scheduleName', 'Unknown')} - {res.get('error', 'Unknown error')}")
+                    else:
+                        logger.info(f"→ Scheduled chat {res.get('scheduleName', 'Unknown')} status: {res.get('status', 'unknown')}")
         else:
             logger.error(f"Failed to trigger scheduled chats. Status: {response.status_code}, Response: {response.text}")
             

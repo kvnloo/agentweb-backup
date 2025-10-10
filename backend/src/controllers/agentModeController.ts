@@ -119,6 +119,8 @@ async function runScheduledChat(
   attempt: number;
   createdAt: string;
 }> {
+  console.log(`Starting runScheduledChat for: ${schedule.scheduleName} (${schedule.scheduleId})`);
+  
   const now = new Date();
   const maxTries = 3;
   let attempt = 0;
@@ -139,19 +141,30 @@ async function runScheduledChat(
     createdAt: string;
   } | null = null;
 
-  // Create a session for the run
-  const sessionTitle = isTest ? `Test: ${schedule.scheduleName}` : `Scheduled: ${schedule.scheduleName}`;
-  const testSession = await chatbotDb.createChatSession(userId, undefined, "agent", sessionTitle);
-  const sessionId = testSession.sessionId;
+  try {
+    // Create a session for the run
+    const sessionTitle = isTest ? `Test: ${schedule.scheduleName}` : `Scheduled: ${schedule.scheduleName}`;
+    console.log(`Creating session: ${sessionTitle}`);
+    const testSession = await chatbotDb.createChatSession(userId, undefined, "agent", sessionTitle);
+    const sessionId = testSession.sessionId;
+    console.log(`Created session: ${sessionId}`);
 
   while (attempt < maxTries) {
     attempt++;
     
     try {
       // Prepare user message for this attempt
-      const userMessage = attempt === 1 
-        ? schedule.startingMessage 
-        : `Please try again. Make sure to include these keywords: ${finalResult?.keywordMisses?.join(', ') || ''} and use these function calls: ${finalResult?.functionCallMisses?.join(', ') || ''}.`;
+      let userMessage = schedule.startingMessage;
+      
+            if (attempt > 1) {
+              const missingKeywords = finalResult?.keywordMisses?.filter(k => k.trim()) || [];
+              const missingFunctionCalls = finalResult?.functionCallMisses?.filter(f => f.trim()) || [];
+              
+              const keywordText = missingKeywords.length > 0 ? `include these keywords: ${missingKeywords.join(', ')}` : '';
+              const functionCallText = missingFunctionCalls.length > 0 ? `use these function calls: ${missingFunctionCalls.join(', ')}` : '';
+              
+              userMessage = `Please try again. Make sure to ${keywordText}${keywordText && functionCallText ? ' and ' : ''}${functionCallText}.`;
+            }
 
       // Generate response using the common function (same as /generateResponse)
       const response = await generateSessionResponse(
@@ -211,12 +224,24 @@ async function runScheduledChat(
   // Save the result to database
   try {
     await scheduleDb.addRunResult(schedule.scheduleId, finalResult);
+    console.log(`Saved run result for: ${schedule.scheduleName}`);
   } catch (error) {
     console.error('Error saving run result:', error);
     // Continue even if saving fails - we still want to return the result
   }
   
+  console.log(`Completed runScheduledChat for: ${schedule.scheduleName}`);
   return finalResult;
+  
+  } catch (error) {
+    console.error(`Error in runScheduledChat for ${schedule.scheduleName}:`, error);
+    console.error('Full error details:', {
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      name: error instanceof Error ? error.name : 'Unknown'
+    });
+    throw error;
+  }
 }
 
 // Common function to generate AI response for a session
@@ -934,6 +959,12 @@ export const agentModeController = {
                   console.log(`Successfully completed scheduled chat: ${schedule.scheduleName}`);
                 }).catch((error) => {
                   console.error(`Error running scheduled chat ${schedule.scheduleName}:`, error);
+                  // Log the full error details for debugging
+                  console.error('Full error details:', {
+                    message: error.message,
+                    stack: error.stack,
+                    name: error.name
+                  });
                 });
                 
                 results.push({
