@@ -42,10 +42,12 @@ class DateTimeEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, datetime):
             return obj.isoformat()
+        elif isinstance(obj, Decimal):
+            return float(obj)
         return super().default(obj)
 
-def json_dumps(obj):
-    """Helper function to dump JSON with datetime handling"""
+def safe_json_dumps(obj):
+    """Helper function to dump JSON with datetime and Decimal handling"""
     return json.dumps(obj, cls=DateTimeEncoder, indent=2)
 
 # Load environment variables
@@ -290,7 +292,7 @@ def get_due_schedules():
         )
         items = response.get('Items', [])
         if len(items) > 0:
-            logger.info(f"Found {len(items)} due schedules: {json_dumps(items)}")
+            logger.info(f"Found {len(items)} due schedules")
         return items
     except ClientError as e:
         logger.error(f"Error querying due schedules: {e}")
@@ -348,11 +350,61 @@ def update_schedule_next_run_time(schedule):
     except ClientError as e:
         logger.error(f"Error updating schedule next run time: {e}")
 
+async def trigger_scheduled_chats():
+    """Trigger scheduled chats by calling the backend API."""
+    try:
+        # Get the backend API URL from environment variables
+        backend_url = os.getenv('BACKEND_URL', 'http://localhost:3001')
+        api_url = f"{backend_url}/api/agent-mode/run-scheduled-chats"
+        
+        # Make the API call
+        response = requests.post(
+            api_url,
+            headers={'Content-Type': 'application/json'},
+            timeout=300  # 5 minute timeout for scheduled chat processing
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            processed_count = result.get('processed', 0)
+            if processed_count > 0:
+                logger.info(f"Triggered {processed_count} scheduled chats")
+            
+            # Log individual results if available
+            if 'results' in result:
+                for res in result['results']:
+                    if res.get('status') == 'success':
+                        logger.info(f"✓ Successfully ran scheduled chat: {res.get('scheduleName', 'Unknown')}")
+                    elif res.get('status') == 'started':
+                        logger.info(f"→ Started scheduled chat: {res.get('scheduleName', 'Unknown')}")
+                    elif res.get('status') == 'error':
+                        logger.error(f"✗ Failed to run scheduled chat: {res.get('scheduleName', 'Unknown')} - {res.get('error', 'Unknown error')}")
+                    else:
+                        logger.info(f"→ Scheduled chat {res.get('scheduleName', 'Unknown')} status: {res.get('status', 'unknown')}")
+        else:
+            logger.error(f"Failed to trigger scheduled chats. Status: {response.status_code}, Response: {response.text}")
+            
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request error when triggering scheduled chats: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error when triggering scheduled chats: {e}")
+
 async def process_schedules():
     try:
         due_schedules = get_due_schedules()
         
+        # Separate regular task schedules from scheduled chats
+        task_schedules = []
+        scheduled_chat_schedules = []
+        
         for schedule in due_schedules:
+            if schedule.get('type') == 'scheduled_chat':
+                scheduled_chat_schedules.append(schedule)
+            else:
+                task_schedules.append(schedule)
+        
+        # Process regular task schedules
+        for schedule in task_schedules:
             try:
                 # Create execution for the scheduled task
                 execution_id = create_execution(schedule['taskId'], schedule['userId'])
@@ -363,6 +415,14 @@ async def process_schedules():
                     update_schedule_next_run_time(schedule)
             except Exception as e:
                 logger.error(f"Error processing schedule {schedule['scheduleId']}: {e}")
+        
+        # Process scheduled chat schedules
+        if scheduled_chat_schedules:
+            try:
+                await trigger_scheduled_chats()
+                logger.info(f"Triggered scheduled chats processing for {len(scheduled_chat_schedules)} schedules")
+            except Exception as e:
+                logger.error(f"Error triggering scheduled chats: {e}")
                 
     except Exception as e:
         logger.error(f"Error in process_schedules: {e}")

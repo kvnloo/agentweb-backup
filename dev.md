@@ -88,3 +88,54 @@ We have issues creating new environment in elastic beanstalk. We tested using AW
 
 Sept. 14, 2025
 Debug with full log from Elastic Beanstalk: web.stdout.log has the app log.
+
+October 10, 2025
+## DynamoDB: Add UserIdIndex to AW-TaskSchedules
+
+If you need to add the `UserIdIndex` GSI to the `AW-TaskSchedules` table (used by Scheduled Chats), use these commands.
+
+Prerequisites:
+- AWS CLI configured for the target account/region (`aws configure`)
+- Region: `us-west-2` (override with `--region` if different)
+
+Add index in Development (Dev- prefixed table):
+
+```bash
+aws dynamodb update-table \
+  --table-name Dev-AW-TaskSchedules \
+  --attribute-definitions AttributeName=userId,AttributeType=S \
+  --global-secondary-index-updates '[{"Create":{"IndexName":"UserIdIndex","KeySchema":[{"AttributeName":"userId","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"}}}]' \
+  --region us-west-2
+```
+
+Add index in Production (no prefix):
+
+```bash
+aws dynamodb update-table \
+  --table-name AW-TaskSchedules \
+  --attribute-definitions AttributeName=userId,AttributeType=S \
+  --global-secondary-index-updates '[{"Create":{"IndexName":"UserIdIndex","KeySchema":[{"AttributeName":"userId","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"}}}]' \
+  --region us-west-2
+```
+
+Verify index status (repeat until `IndexStatus` is `ACTIVE`):
+
+```bash
+aws dynamodb describe-table \
+  --table-name Dev-AW-TaskSchedules \
+  --region us-west-2 \
+  --query 'Table.GlobalSecondaryIndexes[?IndexName==`UserIdIndex`].{IndexName:IndexName,IndexStatus:IndexStatus}'
+```
+
+List all GSIs on the table:
+
+```bash
+aws dynamodb describe-table \
+  --table-name Dev-AW-TaskSchedules \
+  --region us-west-2 \
+  --query 'Table.GlobalSecondaryIndexes[].{IndexName:IndexName,IndexStatus:IndexStatus}'
+```
+
+Notes:
+- GSI creation is asynchronous; queries against `UserIdIndex` work after status becomes `ACTIVE`.
+- Replace `Dev-AW-TaskSchedules` with `AW-TaskSchedules` for production.

@@ -26,6 +26,10 @@ router.get('/public/welcome-message', asyncHandler(agentModeController.getWelcom
 // Get current conversation starters (public)
 router.get('/public/conversation-starters', asyncHandler(agentModeController.getConversationStarters));
 
+// POST /api/agent-mode/run-scheduled-chats
+// Run all scheduled chats that are ready to execute (called by agent-engine)
+router.post('/run-scheduled-chats', asyncHandler(agentModeController.runScheduledChats));
+
 // All other routes require authentication
 router.use(authenticateToken);
 
@@ -82,5 +86,33 @@ router.post('/share', asyncHandler(agentModeController.createShareLink));
 // DELETE /api/agent-mode/session/:sessionId/share
 // Stop sharing conversation
 router.delete('/session/:sessionId/share', asyncHandler(agentModeController.stopSharing));
+
+// POST /api/agent-mode/scheduled-chats
+// Create scheduled chat
+router.post('/scheduled-chats', asyncHandler(agentModeController.createScheduledChat));
+
+// GET /api/agent-mode/scheduled-chats
+// Get user's scheduled chats
+router.get('/scheduled-chats', asyncHandler(agentModeController.getScheduledChats));
+
+// PUT /api/agent-mode/scheduled-chats/:scheduleId
+// Update scheduled chat
+router.put('/scheduled-chats/:scheduleId', asyncHandler(agentModeController.updateScheduledChat));
+
+// POST /api/agent-mode/scheduled-chats/:scheduleId/test
+// Test scheduled chat
+router.post('/scheduled-chats/:scheduleId/test', asyncHandler(agentModeController.testScheduledChat));
+
+// PATCH /api/agent-mode/scheduled-chats/:scheduleId/toggle
+// Toggle scheduled chat status (enable/disable)
+router.patch('/scheduled-chats/:scheduleId/toggle', asyncHandler(agentModeController.toggleScheduledChatStatus));
+
+// DELETE /api/agent-mode/scheduled-chats/:scheduleId
+// Delete scheduled chat
+router.delete('/scheduled-chats/:scheduleId', asyncHandler(agentModeController.deleteScheduledChat));
+
+// GET /api/agent-mode/scheduled-chats/:scheduleId/test-history
+// Get test history for a scheduled chat
+router.get('/scheduled-chats/:scheduleId/test-history', asyncHandler(agentModeController.getScheduledChatTestHistory));
 
 export default router;

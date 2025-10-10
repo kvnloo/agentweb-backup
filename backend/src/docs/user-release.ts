@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-10-10',
+    changes: [
+      'Supported Scheduled Chats in Agent Mode',
+      '- Users can now create scheduled chats that automatically run at specified intervals (hourly, daily, weekly, monthly)',
+      '- Schedule configuration includes starting message, required function calls, and keywords for response validation',
+      '- Automated email notifications with results, AI responses, and direct links to view conversations',
+      '- Schedule management with pause/resume functionality and comprehensive test history tracking',
+    ],
+  },
+  {
     date: '2025-10-09',
     changes: [
       'Supported generate image and create blog article for Agent Mode',
