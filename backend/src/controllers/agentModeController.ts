@@ -119,8 +119,6 @@ async function runScheduledChat(
   attempt: number;
   createdAt: string;
 }> {
-  console.log(`Starting runScheduledChat for: ${schedule.scheduleName} (${schedule.scheduleId})`);
-  
   const now = new Date();
   const maxTries = 3;
   let attempt = 0;
@@ -144,10 +142,8 @@ async function runScheduledChat(
   try {
     // Create a session for the run
     const sessionTitle = isTest ? `Test: ${schedule.scheduleName}` : `Scheduled: ${schedule.scheduleName}`;
-    console.log(`Creating session: ${sessionTitle}`);
     const testSession = await chatbotDb.createChatSession(userId, undefined, "agent", sessionTitle);
     const sessionId = testSession.sessionId;
-    console.log(`Created session: ${sessionId}`);
 
   while (attempt < maxTries) {
     attempt++;
@@ -221,17 +217,15 @@ async function runScheduledChat(
     throw new Error('Failed to generate result after all attempts');
   }
 
-  // Save the result to database
-  try {
-    await scheduleDb.addRunResult(schedule.scheduleId, finalResult);
-    console.log(`Saved run result for: ${schedule.scheduleName}`);
-  } catch (error) {
-    console.error('Error saving run result:', error);
-    // Continue even if saving fails - we still want to return the result
-  }
-  
-  console.log(`Completed runScheduledChat for: ${schedule.scheduleName}`);
-  return finalResult;
+    // Save the result to database
+    try {
+      await scheduleDb.addRunResult(schedule.scheduleId, finalResult);
+    } catch (error) {
+      console.error('Error saving run result:', error);
+      // Continue even if saving fails - we still want to return the result
+    }
+    
+    return finalResult;
   
   } catch (error) {
     console.error(`Error in runScheduledChat for ${schedule.scheduleName}:`, error);
@@ -937,35 +931,31 @@ export const agentModeController = {
 
             const results = [];
 
-            for (const schedule of scheduledChats) {
-              try {
-                console.log(`Processing scheduled chat: ${schedule.scheduleName} (${schedule.scheduleId})`);
-                
-                // Update the schedule with next run time FIRST (synchronously)
-                // This prevents agent-engine from repeatedly calling the same schedule
-                const now = new Date();
-                const nextRunTime = calculateNextRunTime(schedule.frequency, now);
-                
-                await scheduleDb.updateScheduleAfterRun(
-                  schedule.scheduleId,
-                  now.toISOString(),
-                  nextRunTime.toISOString()
-                );
-                
-                console.log(`Updated next run time for schedule: ${schedule.scheduleName}`);
-                
-                // Start the scheduled chat run asynchronously (don't await)
-                runScheduledChat(schedule, schedule.userId, false).then((result) => {
-                  console.log(`Successfully completed scheduled chat: ${schedule.scheduleName}`);
-                }).catch((error) => {
-                  console.error(`Error running scheduled chat ${schedule.scheduleName}:`, error);
-                  // Log the full error details for debugging
-                  console.error('Full error details:', {
-                    message: error.message,
-                    stack: error.stack,
-                    name: error.name
-                  });
-                });
+        for (const schedule of scheduledChats) {
+          try {
+            // Update the schedule with next run time FIRST (synchronously)
+            // This prevents agent-engine from repeatedly calling the same schedule
+            const now = new Date();
+            const nextRunTime = calculateNextRunTime(schedule.frequency, now);
+            
+            await scheduleDb.updateScheduleAfterRun(
+              schedule.scheduleId,
+              now.toISOString(),
+              nextRunTime.toISOString()
+            );
+            
+            // Start the scheduled chat run asynchronously (don't await)
+            runScheduledChat(schedule, schedule.userId, false).then((result) => {
+              // Successfully completed
+            }).catch((error) => {
+              console.error(`Error running scheduled chat ${schedule.scheduleName}:`, error);
+              // Log the full error details for debugging
+              console.error('Full error details:', {
+                message: error.message,
+                stack: error.stack,
+                name: error.name
+              });
+            });
                 
                 results.push({
                   scheduleId: schedule.scheduleId,

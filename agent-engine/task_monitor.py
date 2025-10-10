@@ -357,8 +357,6 @@ async def trigger_scheduled_chats():
         backend_url = os.getenv('BACKEND_URL', 'http://localhost:3001')
         api_url = f"{backend_url}/api/agent-mode/run-scheduled-chats"
         
-        logger.info(f"Triggering scheduled chats at {api_url}")
-        
         # Make the API call
         response = requests.post(
             api_url,
@@ -368,8 +366,9 @@ async def trigger_scheduled_chats():
         
         if response.status_code == 200:
             result = response.json()
-            logger.info(f"Scheduled chats triggered successfully: {result.get('message', 'No message')}")
-            logger.info(f"Processed {result.get('processed', 0)} scheduled chats")
+            processed_count = result.get('processed', 0)
+            if processed_count > 0:
+                logger.info(f"Triggered {processed_count} scheduled chats")
             
             # Log individual results if available
             if 'results' in result:
