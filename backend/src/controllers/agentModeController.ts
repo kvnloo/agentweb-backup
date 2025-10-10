@@ -1017,26 +1017,6 @@ export const agentModeController = {
                  console.error('Error sending scheduled chat result email:', error);
                  // Don't throw error - email failure shouldn't break the scheduled chat execution
                }
-
-               // Send Slack notification if user has account-level Slack channel configured
-               try {
-                 const user = await userDb.getUserById(schedule.userId);
-                 if (user && user.slackChannel) {
-                   const { sendScheduledChatNotification } = await import('../services/slackService');
-                   const sessionUrl = `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/agent-mode/${result.sessionId}`;
-                   
-                   await sendScheduledChatNotification(
-                     user.slackChannel,
-                     schedule.scheduleName,
-                     result,
-                     sessionUrl
-                   );
-                   console.log(`Scheduled chat Slack notification sent to channel: ${user.slackChannel}`);
-                 }
-               } catch (error) {
-                 console.error('Error sending scheduled chat Slack notification:', error);
-                 // Don't throw error - Slack failure shouldn't break the scheduled chat execution
-               }
              }).catch((error) => {
                console.error(`Error running scheduled chat ${schedule.scheduleName}:`, error);
                // Log the full error details for debugging
