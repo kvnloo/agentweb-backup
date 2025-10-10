@@ -566,45 +566,12 @@ export const emailService = {
             </div>
             
             <div class="content">
-              <div class="status ${result.passed ? 'passed' : 'failed'}">
-                ${statusIcon} Test ${statusText}
-              </div>
-              
-              <div class="stats">
-                <div class="stat">
-                  <div class="stat-value">${result.attempt}</div>
-                  <div class="stat-label">Attempts</div>
-                </div>
-                <div class="stat">
-                  <div class="stat-value">${Math.round(result.executionTime / 1000)}s</div>
-                  <div class="stat-label">Duration</div>
-                </div>
-                <div class="stat">
-                  <div class="stat-value">${result.keywordMatches.length}</div>
-                  <div class="stat-label">Keywords Found</div>
-                </div>
-                <div class="stat">
-                  <div class="stat-value">${result.functionCallMatches.length}</div>
-                  <div class="stat-label">Functions Used</div>
-                </div>
-              </div>
-              
-              <div class="section">
-                <h3>📋 Test Criteria</h3>
-                <div class="criteria">
-                  <div class="criteria-item">
-                    <h4>Keywords Required</h4>
-                    ${result.keywordMatches.length > 0 ? `<div class="matches">✓ Found: ${result.keywordMatches.join(', ')}</div>` : ''}
-                    ${result.keywordMisses.length > 0 ? `<div class="misses">✗ Missing: ${result.keywordMisses.join(', ')}</div>` : ''}
-                    ${result.keywordMatches.length === 0 && result.keywordMisses.length === 0 ? '<div>No keywords required</div>' : ''}
-                  </div>
-                  <div class="criteria-item">
-                    <h4>Function Calls Required</h4>
-                    ${result.functionCallMatches.length > 0 ? `<div class="matches">✓ Used: ${result.functionCallMatches.join(', ')}</div>` : ''}
-                    ${result.functionCallMisses.length > 0 ? `<div class="misses">✗ Missing: ${result.functionCallMisses.join(', ')}</div>` : ''}
-                    ${result.functionCallMatches.length === 0 && result.functionCallMisses.length === 0 ? '<div>No function calls required</div>' : ''}
-                  </div>
-                </div>
+              <div class="section" style="background-color: ${result.passed ? '#e8f5e8' : '#ffeaea'}; border-left: 4px solid ${result.passed ? '#28a745' : '#dc3545'}; margin: 20px 0;">
+                <p style="margin: 0; font-size: 16px; line-height: 1.5;">
+                  Your scheduled chat <strong>"${scheduleName}"</strong> has been ${result.passed ? 'successfully executed' : 'executed but did not meet all criteria'} and results are ready. 
+                  It ran for <strong>${Math.round(result.executionTime / 1000)} seconds</strong> 
+                  and completed at <strong>${currentDate}</strong>.
+                </p>
               </div>
               
               <div class="section">
@@ -638,15 +605,8 @@ export const emailService = {
       const text = `
 Scheduled Chat Results: ${scheduleName}
 
-Status: ${statusText} ${statusIcon}
-Attempts: ${result.attempt}
-Duration: ${Math.round(result.executionTime / 1000)}s
-
-Keywords Found: ${result.keywordMatches.length > 0 ? result.keywordMatches.join(', ') : 'None'}
-Keywords Missing: ${result.keywordMisses.length > 0 ? result.keywordMisses.join(', ') : 'None'}
-
-Function Calls Used: ${result.functionCallMatches.length > 0 ? result.functionCallMatches.join(', ') : 'None'}
-Function Calls Missing: ${result.functionCallMisses.length > 0 ? result.functionCallMisses.join(', ') : 'None'}
+Your scheduled chat "${scheduleName}" has been ${result.passed ? 'successfully executed' : 'executed but did not meet all criteria'} and results are ready.
+It ran for ${Math.round(result.executionTime / 1000)} seconds and completed at ${currentDate}.
 
 AI Response:
 ${result.actualResponse}
