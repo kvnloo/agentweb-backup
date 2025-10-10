@@ -576,7 +576,7 @@ export const emailService = {
               
               <div class="section">
                 <h3>💬 AI Response</h3>
-                <div class="response">${this.escapeHtml(result.actualResponse)}</div>
+                <div class="response">${result.actualResponse}</div>
               </div>
               
               <div class="section">
@@ -590,8 +590,6 @@ export const emailService = {
             </div>
             
             <div class="footer">
-              <p><strong>Schedule:</strong> ${scheduleName}</p>
-              <p><strong>Run Time:</strong> ${currentDate}</p>
               <p style="margin-top: 15px; font-size: 12px; color: #6c757d;">
                 This is an automated email from your scheduled chat. 
                 <a href="${customerFrontendUrl}/agent-mode" style="color: #1976d2;">Manage your schedules</a>

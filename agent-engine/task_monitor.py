@@ -292,7 +292,7 @@ def get_due_schedules():
         )
         items = response.get('Items', [])
         if len(items) > 0:
-            logger.info(f"Found {len(items)} due schedules: {safe_json_dumps(items)}")
+            logger.info(f"Found {len(items)} due schedules")
         return items
     except ClientError as e:
         logger.error(f"Error querying due schedules: {e}")
