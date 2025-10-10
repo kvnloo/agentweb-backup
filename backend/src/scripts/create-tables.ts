@@ -281,6 +281,7 @@ const createTaskSchedulesTable = async () => {
     AttributeDefinitions: [
       { AttributeName: 'scheduleId', AttributeType: 'S' },
       { AttributeName: 'taskId', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' },
       { AttributeName: 'status', AttributeType: 'S' },
       { AttributeName: 'nextRunTime', AttributeType: 'S' }
     ],
@@ -292,6 +293,15 @@ const createTaskSchedulesTable = async () => {
         IndexName: 'TaskIdIndex',
         KeySchema: [
           { AttributeName: 'taskId', KeyType: 'HASH' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      },
+      {
+        IndexName: 'UserIdIndex',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' }
         ],
         Projection: {
           ProjectionType: 'ALL'

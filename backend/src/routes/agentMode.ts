@@ -83,4 +83,20 @@ router.post('/share', asyncHandler(agentModeController.createShareLink));
 // Stop sharing conversation
 router.delete('/session/:sessionId/share', asyncHandler(agentModeController.stopSharing));
 
+// POST /api/agent-mode/scheduled-chats
+// Create scheduled chat
+router.post('/scheduled-chats', asyncHandler(agentModeController.createScheduledChat));
+
+// GET /api/agent-mode/scheduled-chats
+// Get user's scheduled chats
+router.get('/scheduled-chats', asyncHandler(agentModeController.getScheduledChats));
+
+// PUT /api/agent-mode/scheduled-chats/:scheduleId
+// Update scheduled chat
+router.put('/scheduled-chats/:scheduleId', asyncHandler(agentModeController.updateScheduledChat));
+
+// DELETE /api/agent-mode/scheduled-chats/:scheduleId
+// Delete scheduled chat
+router.delete('/scheduled-chats/:scheduleId', asyncHandler(agentModeController.deleteScheduledChat));
+
 export default router;

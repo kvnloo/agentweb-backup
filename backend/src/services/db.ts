@@ -1447,6 +1447,12 @@ export const scheduleDb = {
       status: string;
       lastRunTime: string;
       timezone: string;
+      scheduleName: string;
+      description: string;
+      startingMessage: string;
+      keywords: string[];
+      requiredFunctionCalls: string[];
+      updatedAt: string;
     }>
   ) {
     try {
@@ -1514,6 +1520,24 @@ export const scheduleDb = {
       return result.Items || [];
     } catch (error) {
       handleDynamoDbError(error, "getPendingSchedules");
+    }
+  },
+
+  async getSchedulesByUserId(userId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+        IndexName: "UserIdIndex",
+        KeyConditionExpression: "userId = :userId",
+        ExpressionAttributeValues: {
+          ":userId": userId,
+        },
+      };
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, "getSchedulesByUserId");
     }
   },
 };

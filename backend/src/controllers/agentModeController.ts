@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { agentModeService, AgentModeService } from '../services/agentModeService';
 import { chatbotDb, updateTaskExecutionStatus } from '../services/chatbotService';
+import { scheduleDb } from '../services/db';
 import { User } from '../types/auth';
 import multer from 'multer';
 import crypto from 'crypto';
@@ -21,6 +22,32 @@ const filterMessagesForClient = (messages: any[]) => {
     
     return true;
   });
+};
+
+// Helper function to calculate next run time based on frequency
+const calculateNextRunTime = (frequency: string, fromDate: Date): Date => {
+  const nextRun = new Date(fromDate);
+  
+  switch (frequency) {
+    case 'daily':
+      nextRun.setDate(nextRun.getDate() + 1);
+      nextRun.setHours(9, 0, 0, 0); // 9 AM
+      break;
+    case 'weekly':
+      nextRun.setDate(nextRun.getDate() + 7);
+      nextRun.setHours(9, 0, 0, 0); // 9 AM
+      break;
+    case 'monthly':
+      nextRun.setMonth(nextRun.getMonth() + 1);
+      nextRun.setHours(9, 0, 0, 0); // 9 AM
+      break;
+    default:
+      // Default to daily
+      nextRun.setDate(nextRun.getDate() + 1);
+      nextRun.setHours(9, 0, 0, 0);
+  }
+  
+  return nextRun;
 };
 
 export const agentModeController = {
@@ -448,5 +475,161 @@ export const agentModeController = {
       console.error('AgentMode: Upload attachment error:', error);
       res.status(500).json({ error: 'Failed to upload attachment' });
     }
-  }
+  },
+
+  // Create scheduled chat
+        async createScheduledChat(req: Request, res: Response) {
+          try {
+            const user = req.user as User;
+            const {
+              sessionId,
+              scheduleName,
+              description,
+              startingMessage,
+              scheduleFrequency,
+              keywords,
+              requiredFunctionCalls
+            } = req.body;
+
+            if (!scheduleName || !startingMessage || !scheduleFrequency) {
+              return res.status(400).json({ error: 'Missing required fields' });
+            }
+
+            // If sessionId is provided, verify it exists and belongs to user
+            if (sessionId) {
+              const session = await chatbotDb.getChatSession(sessionId);
+              if (!session || session.userId !== user.userId) {
+                return res.status(404).json({ error: 'Session not found' });
+              }
+            }
+
+            // Create scheduled chat using the existing scheduleDb
+            const scheduleId = require('uuid').v4();
+            const now = new Date();
+            const nextRunTime = calculateNextRunTime(scheduleFrequency, now);
+
+            const scheduledChat = {
+              scheduleId,
+              taskId: sessionId || 'global', // Use sessionId if provided, otherwise 'global'
+              userId: user.userId,
+              frequency: scheduleFrequency, // Map scheduleFrequency to frequency
+              scheduleName,
+              description: description || '',
+              startingMessage,
+              keywords: keywords || [],
+              requiredFunctionCalls: requiredFunctionCalls || [],
+              status: 'active',
+              nextRunTime: nextRunTime.toISOString(),
+              createdAt: now.toISOString(),
+              updatedAt: now.toISOString(),
+              sessionId: sessionId || null, // Store original sessionId for reference (can be null)
+              type: 'scheduled_chat' // Distinguish from regular task schedules
+            };
+
+            await scheduleDb.createSchedule(scheduledChat);
+
+            res.status(201).json({
+              scheduleId,
+              message: 'Scheduled chat created successfully',
+              nextRunTime: nextRunTime.toISOString()
+            });
+          } catch (error) {
+            console.error('AgentMode: Create scheduled chat error:', error);
+            res.status(500).json({ error: 'Failed to create scheduled chat' });
+          }
+        },
+
+  // Get user's scheduled chats
+  async getScheduledChats(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+
+      // Get all schedules for the user and filter for scheduled chats
+      const schedules = await scheduleDb.getSchedulesByUserId(user.userId);
+      const scheduledChats = schedules?.filter(schedule => 
+        schedule.type === 'scheduled_chat' && schedule.status === 'active'
+      ) || [];
+
+      res.json(scheduledChats);
+    } catch (error) {
+      console.error('AgentMode: Get scheduled chats error:', error);
+      res.status(500).json({ error: 'Failed to get scheduled chats' });
+    }
+  },
+
+  // Delete scheduled chat
+        async updateScheduledChat(req: Request, res: Response) {
+          try {
+            const user = req.user as User;
+            const { scheduleId } = req.params;
+            const {
+              scheduleName,
+              description,
+              startingMessage,
+              scheduleFrequency,
+              keywords,
+              requiredFunctionCalls
+            } = req.body;
+
+            console.log('Update scheduled chat request body:', req.body);
+
+            if (!scheduleName || !startingMessage || !scheduleFrequency) {
+              console.log('Missing required fields:', { scheduleName, startingMessage, scheduleFrequency });
+              return res.status(400).json({ error: 'Missing required fields' });
+            }
+
+            // Verify schedule exists and belongs to user
+            const existingSchedule = await scheduleDb.getScheduleById(scheduleId);
+            if (!existingSchedule || existingSchedule.userId !== user.userId) {
+              return res.status(404).json({ error: 'Scheduled chat not found' });
+            }
+
+            // Calculate next run time based on new frequency
+            const now = new Date();
+            const nextRunTime = calculateNextRunTime(scheduleFrequency, now);
+
+            // Update the schedule
+            const updates = {
+              scheduleName,
+              description: description || '',
+              startingMessage,
+              frequency: scheduleFrequency,
+              keywords: keywords || [],
+              requiredFunctionCalls: requiredFunctionCalls || [],
+              nextRunTime: nextRunTime.toISOString(),
+              updatedAt: now.toISOString()
+            };
+
+            await scheduleDb.updateSchedule(scheduleId, updates);
+
+            res.json({
+              message: 'Scheduled chat updated successfully',
+              nextRunTime: nextRunTime.toISOString()
+            });
+          } catch (error) {
+            console.error('AgentMode: Update scheduled chat error:', error);
+            res.status(500).json({ error: 'Failed to update scheduled chat' });
+          }
+        },
+
+        async deleteScheduledChat(req: Request, res: Response) {
+          try {
+            const user = req.user as User;
+            const { scheduleId } = req.params;
+
+            // Verify schedule exists and belongs to user
+            const schedule = await scheduleDb.getScheduleById(scheduleId);
+            if (!schedule || schedule.userId !== user.userId) {
+              return res.status(404).json({ error: 'Scheduled chat not found' });
+            }
+
+            // Delete the schedule
+            await scheduleDb.deleteSchedule(scheduleId);
+
+            res.json({ message: 'Scheduled chat deleted successfully' });
+          } catch (error) {
+            console.error('AgentMode: Delete scheduled chat error:', error);
+            res.status(500).json({ error: 'Failed to delete scheduled chat' });
+          }
+        }
 };
