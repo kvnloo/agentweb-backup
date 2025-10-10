@@ -148,6 +148,7 @@ interface User {
   emailDomain?: string; // Email sender domain
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
   fromName?: string; // From name for emails
+  slackChannel?: string; // Default Slack channel for this user
 }
 
 // Define an interface for the task data shown in the admin tasks tab
@@ -524,6 +525,10 @@ export default function AdminDashboard() {
   const [defaultSenderUsername, setDefaultSenderUsername] = useState("");
   const [fromName, setFromName] = useState("");
   const [emailSenderEditLoading, setEmailSenderEditLoading] = useState(false);
+  const [slackChannelDialogOpen, setSlackChannelDialogOpen] = useState(false);
+  const [editingSlackChannelUserId, setEditingSlackChannelUserId] = useState<string | null>(null);
+  const [currentSlackChannelText, setCurrentSlackChannelText] = useState("");
+  const [slackChannelEditLoading, setSlackChannelEditLoading] = useState(false);
   const [delegateAccessLoading, setDelegateAccessLoading] = useState<string | null>(null);
   const [emailToDelete, setEmailToDelete] = useState<string | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -1199,6 +1204,47 @@ export default function AdminDashboard() {
     }
   };
 
+  const handleSaveSlackChannel = async () => {
+    if (!editingSlackChannelUserId) return;
+    
+    try {
+      setSlackChannelEditLoading(true);
+      
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/users/${editingSlackChannelUserId}/slack-channel`),
+        { 
+          slackChannel: currentSlackChannelText.trim() || null
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+
+      if (response.status === 200) {
+        // Update the user in the local state without reloading
+        setUsers((prevUsers: User[]) => 
+          prevUsers.map((user: User) => 
+            user.userId === editingSlackChannelUserId 
+              ? { 
+                  ...user, 
+                  slackChannel: response.data.slackChannel
+                }
+              : user
+          )
+        );
+        setSuccess("Slack channel updated successfully!");
+        setSlackChannelDialogOpen(false);
+        setEditingSlackChannelUserId(null);
+        setCurrentSlackChannelText("");
+      }
+    } catch (error: any) {
+      console.error("Error updating slack channel:", error);
+      setError(error.response?.data?.message || "Failed to update slack channel");
+    } finally {
+      setSlackChannelEditLoading(false);
+    }
+  };
+
   const handleAccessCustomerPortal = async (userId: string) => {
     try {
       setDelegateAccessLoading(userId);
@@ -1666,6 +1712,7 @@ export default function AdminDashboard() {
                   <TableCell>Stripe Customer ID</TableCell>
                   <TableCell>Ad Account</TableCell>
                   <TableCell>Email Sender</TableCell>
+                  <TableCell>Slack Channel</TableCell>
                   <TableCell>Created</TableCell>
                   <TableCell>Last Login</TableCell>
                   <TableCell>Support Note</TableCell>
@@ -1681,7 +1728,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={15} align="center">
+                    <TableCell colSpan={16} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -1776,6 +1823,24 @@ export default function AdminDashboard() {
                           >
                             <EditIcon />
                           </IconButton>
+                        </TableCell>
+                        <TableCell>
+                          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+                            <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
+                              {user.slackChannel || "-"}
+                            </Typography>
+                            <IconButton
+                              size="small"
+                              onClick={() => {
+                                setEditingSlackChannelUserId(user.userId);
+                                setCurrentSlackChannelText(user.slackChannel || "");
+                                setSlackChannelDialogOpen(true);
+                              }}
+                              disabled={slackChannelEditLoading}
+                            >
+                              <EditIcon />
+                            </IconButton>
+                          </Box>
                         </TableCell>
                         <TableCell>
                           {new Date(user.createdAt).toLocaleDateString()}
@@ -3535,6 +3600,69 @@ export default function AdminDashboard() {
             disabled={emailSenderEditLoading}
           >
             {emailSenderEditLoading ? "Saving..." : "Save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Slack Channel Configuration Dialog */}
+      <Dialog
+        open={slackChannelDialogOpen}
+        onClose={() => {
+          setSlackChannelDialogOpen(false);
+          setEditingSlackChannelUserId(null);
+          setCurrentSlackChannelText("");
+        }}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>
+          Configure Slack Channel
+          <IconButton
+            aria-label="close"
+            onClick={() => {
+              setSlackChannelDialogOpen(false);
+              setEditingSlackChannelUserId(null);
+              setCurrentSlackChannelText("");
+            }}
+            sx={{
+              position: 'absolute',
+              right: 8,
+              top: 8,
+            }}
+          >
+            <CloseIcon />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent dividers>
+          <TextField
+            autoFocus
+            fullWidth
+            label="Slack Channel ID"
+            value={currentSlackChannelText}
+            onChange={(e) => setCurrentSlackChannelText(e.target.value)}
+            placeholder="C1234567890"
+            helperText="Enter the Slack channel ID where this user's approval requests should be sent. Leave empty to disable account-level Slack channel restriction."
+            disabled={slackChannelEditLoading}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button
+            onClick={() => {
+              setSlackChannelDialogOpen(false);
+              setEditingSlackChannelUserId(null);
+              setCurrentSlackChannelText("");
+            }}
+            disabled={slackChannelEditLoading}
+          >
+            Cancel
+          </Button>
+          <Button
+            onClick={handleSaveSlackChannel}
+            color="primary"
+            variant="contained"
+            disabled={slackChannelEditLoading}
+          >
+            {slackChannelEditLoading ? "Saving..." : "Save"}
           </Button>
         </DialogActions>
       </Dialog>

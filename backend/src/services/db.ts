@@ -62,6 +62,7 @@ export interface User {
   emailDomain?: string; // Email sender domain
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
   fromName?: string; // From name for emails
+  slackChannel?: string; // Default Slack channel for this user
   companyName?: string;
   useCaseCategories?: string[];
   brandGuidelines?: {
