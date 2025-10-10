@@ -140,6 +140,12 @@ async function runScheduledChat(
     createdAt: string;
   } | null = null;
 
+  // Track missing items across all attempts
+  const expectedKeywords = schedule.keywords || [];
+  const expectedFunctionCalls = schedule.requiredFunctionCalls || [];
+  let remainingKeywords = [...expectedKeywords];
+  let remainingFunctionCalls = [...expectedFunctionCalls];
+
   try {
     // Create a session for the run
     const sessionTitle = isTest ? `Test: ${schedule.scheduleName}` : `Scheduled: ${schedule.scheduleName}`;
@@ -154,11 +160,8 @@ async function runScheduledChat(
       let userMessage = schedule.startingMessage;
       
             if (attempt > 1) {
-              const missingKeywords = finalResult?.keywordMisses?.filter(k => k.trim()) || [];
-              const missingFunctionCalls = finalResult?.functionCallMisses?.filter(f => f.trim()) || [];
-              
-              const keywordText = missingKeywords.length > 0 ? `include these keywords: ${missingKeywords.join(', ')}` : '';
-              const functionCallText = missingFunctionCalls.length > 0 ? `use these function calls: ${missingFunctionCalls.join(', ')}` : '';
+              const keywordText = remainingKeywords.length > 0 ? `include these keywords: ${remainingKeywords.join(', ')}` : '';
+              const functionCallText = remainingFunctionCalls.length > 0 ? `use these function calls: ${remainingFunctionCalls.join(', ')}` : '';
               
               userMessage = `Please try again. Make sure to ${keywordText}${keywordText && functionCallText ? ' and ' : ''}${functionCallText}.`;
             }
@@ -178,9 +181,25 @@ async function runScheduledChat(
         response.content,
         actualFunctionCalls,
         {
-          keywords: schedule.keywords || [],
-          functionCalls: schedule.requiredFunctionCalls || []
+          keywords: remainingKeywords,
+          functionCalls: remainingFunctionCalls
         }
+      );
+
+      // Remove found items from remaining lists
+      remainingKeywords = remainingKeywords.filter(keyword => 
+        !evaluation.keywordMatches.includes(keyword)
+      );
+      remainingFunctionCalls = remainingFunctionCalls.filter(funcCall => 
+        !evaluation.functionCallMatches.includes(funcCall)
+      );
+
+      // Calculate cumulative results across all attempts
+      const totalKeywordMatches = expectedKeywords.filter((keyword: string) => 
+        !remainingKeywords.includes(keyword)
+      );
+      const totalFunctionCallMatches = expectedFunctionCalls.filter((funcCall: string) => 
+        !remainingFunctionCalls.includes(funcCall)
       );
 
       finalResult = {
@@ -190,18 +209,20 @@ async function runScheduledChat(
         passed: evaluation.passed,
         actualResponse: response.content,
         actualFunctionCalls,
-        keywordMatches: evaluation.keywordMatches,
-        keywordMisses: evaluation.keywordMisses,
-        functionCallMatches: evaluation.functionCallMatches,
-        functionCallMisses: evaluation.functionCallMisses,
+        keywordMatches: totalKeywordMatches, // Show all keywords found so far
+        keywordMisses: remainingKeywords, // Show what's still missing
+        functionCallMatches: totalFunctionCallMatches, // Show all function calls found so far
+        functionCallMisses: remainingFunctionCalls, // Show what's still missing
         executionTime: Date.now() - now.getTime(),
         sessionId: sessionId,
         attempt,
         createdAt: new Date().toISOString()
       };
 
-      // If test passed, break out of loop
-      if (evaluation.passed) {
+      // If all items found, break out of loop
+      if (remainingKeywords.length === 0 && remainingFunctionCalls.length === 0) {
+        finalResult.passed = true;
+        finalResult.status = 'success';
         break;
       }
 
