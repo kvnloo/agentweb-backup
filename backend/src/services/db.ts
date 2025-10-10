@@ -1439,50 +1439,95 @@ export const scheduleDb = {
     }
   },
 
-  async updateSchedule(
-    scheduleId: string,
-    updates: Partial<{
-      frequency: string;
-      nextRunTime: string;
-      status: string;
-      lastRunTime: string;
-      timezone: string;
-      scheduleName: string;
-      description: string;
-      startingMessage: string;
-      keywords: string[];
-      requiredFunctionCalls: string[];
-      updatedAt: string;
-    }>
-  ) {
-    try {
-      const updateExpressions: string[] = [];
-      const expressionAttributeNames: { [key: string]: string } = {};
-      const expressionAttributeValues: { [key: string]: any } = {};
+        async updateSchedule(
+          scheduleId: string,
+          updates: Partial<{
+            frequency: string;
+            nextRunTime: string;
+            status: string;
+            lastRunTime: string;
+            timezone: string;
+            scheduleName: string;
+            description: string;
+            startingMessage: string;
+            keywords: string[];
+            requiredFunctionCalls: string[];
+            updatedAt: string;
+          }>
+        ) {
+          try {
+            const updateExpressions: string[] = [];
+            const expressionAttributeNames: { [key: string]: string } = {};
+            const expressionAttributeValues: { [key: string]: any } = {};
 
-      Object.entries(updates).forEach(([key, value]) => {
-        updateExpressions.push(`#${key} = :${key}`);
-        expressionAttributeNames[`#${key}`] = key;
-        expressionAttributeValues[`:${key}`] = value;
-      });
+            Object.entries(updates).forEach(([key, value]) => {
+              updateExpressions.push(`#${key} = :${key}`);
+              expressionAttributeNames[`#${key}`] = key;
+              expressionAttributeValues[`:${key}`] = value;
+            });
 
-      const params = {
-        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-        Key: {
-          scheduleId,
+            const params = {
+              TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+              Key: {
+                scheduleId,
+              },
+              UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+              ExpressionAttributeNames: expressionAttributeNames,
+              ExpressionAttributeValues: expressionAttributeValues,
+              ReturnValues: "ALL_NEW",
+            };
+
+            const result = await dynamodb.update(params).promise();
+            return result.Attributes;
+          } catch (error) {
+            handleDynamoDbError(error, "updateSchedule");
+          }
         },
-        UpdateExpression: `SET ${updateExpressions.join(", ")}`,
-        ExpressionAttributeNames: expressionAttributeNames,
-        ExpressionAttributeValues: expressionAttributeValues,
-        ReturnValues: "ALL_NEW",
-      };
 
-      const result = await dynamodb.update(params).promise();
-      return result.Attributes;
-    } catch (error) {
-      handleDynamoDbError(error, "updateSchedule");
-    }
-  },
+        async addRunResult(scheduleId: string, runResult: any) {
+          try {
+            const params = {
+              TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+              Key: {
+                scheduleId,
+              },
+              UpdateExpression: 'SET #runResults = list_append(if_not_exists(#runResults, :emptyList), :runResult), #updatedAt = :updatedAt',
+              ExpressionAttributeNames: {
+                '#runResults': 'runResults',
+                '#updatedAt': 'updatedAt',
+              },
+              ExpressionAttributeValues: {
+                ':runResult': [runResult],
+                ':emptyList': [],
+                ':updatedAt': new Date().toISOString(),
+              },
+              ReturnValues: 'ALL_NEW',
+            };
+
+            const result = await dynamodb.update(params).promise();
+            return result.Attributes;
+          } catch (error) {
+            handleDynamoDbError(error, "addRunResult");
+            throw error;
+          }
+        },
+
+        async getRunResults(scheduleId: string) {
+          try {
+            const params = {
+              TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+              Key: {
+                scheduleId,
+              },
+            };
+
+            const result = await dynamodb.get(params).promise();
+            return result.Item?.runResults || [];
+          } catch (error) {
+            handleDynamoDbError(error, "getRunResults");
+            return [];
+          }
+        },
 
   async deleteSchedule(scheduleId: string) {
     try {
@@ -2275,4 +2320,5 @@ class BenchmarkTestDB {
 }
 
 export const benchmarkTestDb = new BenchmarkTestDB();
+
 

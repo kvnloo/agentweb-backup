@@ -7,6 +7,80 @@ import multer from 'multer';
 import crypto from 'crypto';
 import { uploadFileToS3 } from '../utils/s3Utils';
 
+// Interface for scheduled chat test results
+interface ScheduledChatTestResult {
+  scheduleId: string;
+  runId: string;
+  status: 'success' | 'failure';
+  passed: boolean;
+  actualResponse: string;
+  actualFunctionCalls: string[];
+  keywordMatches: string[];
+  keywordMisses: string[];
+  functionCallMatches: string[];
+  functionCallMisses: string[];
+  executionTime: number; // milliseconds
+  sessionId: string; // Test session ID for viewing conversation
+  attempt: number; // Which attempt this was (1-3)
+  createdAt: string;
+}
+
+// Evaluate schedule response against expected criteria
+function evaluateScheduleResponse(
+  actualResponse: string,
+  actualFunctionCalls: string[],
+  expectedOutput: {
+    keywords: string[];
+    functionCalls: string[];
+  }
+): {
+  passed: boolean;
+  keywordMatches: string[];
+  keywordMisses: string[];
+  functionCallMatches: string[];
+  functionCallMisses: string[];
+} {
+  const expectedKeywords = expectedOutput.keywords || [];
+  const expectedFunctionCalls = expectedOutput.functionCalls || [];
+
+  // Evaluate keywords
+  const keywordMatches: string[] = [];
+  const keywordMisses: string[] = [];
+  
+  expectedKeywords.forEach((keyword: string) => {
+    if (actualResponse.toLowerCase().includes(keyword.toLowerCase())) {
+      keywordMatches.push(keyword);
+    } else {
+      keywordMisses.push(keyword);
+    }
+  });
+
+  // Evaluate function calls
+  const functionCallMatches: string[] = [];
+  const functionCallMisses: string[] = [];
+  
+  expectedFunctionCalls.forEach((expectedCall: string) => {
+    if (actualFunctionCalls.includes(expectedCall)) {
+      functionCallMatches.push(expectedCall);
+    } else {
+      functionCallMisses.push(expectedCall);
+    }
+  });
+
+  // Pass only if ALL expected keywords and ALL expected function calls are present
+  const allKeywordsPresent = expectedKeywords.length === 0 || keywordMisses.length === 0;
+  const allFunctionCallsPresent = expectedFunctionCalls.length === 0 || functionCallMisses.length === 0;
+  const passed = allKeywordsPresent && allFunctionCallsPresent;
+
+  return {
+    passed,
+    keywordMatches,
+    keywordMisses,
+    functionCallMatches,
+    functionCallMisses
+  };
+}
+
 // Common function to filter messages for client display
 const filterMessagesForClient = (messages: any[]) => {
   return messages.filter(message => {
@@ -23,6 +97,113 @@ const filterMessagesForClient = (messages: any[]) => {
     return true;
   });
 };
+
+// Common function to generate AI response for a session
+async function generateSessionResponse(
+  sessionId: string,
+  userMessage: string,
+  userId: string,
+  attachments?: any[]
+): Promise<{
+  content: string;
+  toolCalls: any[];
+  knowledgeBaseQueries: string[];
+  sources: string[];
+  responseMessages: any[];
+}> {
+  // Get session
+  const session = await chatbotDb.getChatSession(sessionId);
+  if (!session) {
+    throw new Error('Session not found');
+  }
+
+  // Process attachments and include URLs in message content for LLM
+  let messageContent = userMessage;
+  if (attachments && attachments.length > 0) {
+    const attachmentUrls = attachments.map((attachment: any) => {
+      return `[${attachment.filename || 'Attachment'}](${attachment.url})`;
+    }).join('\n');
+    messageContent = `${userMessage}\n\n**Attached Files:**\n${attachmentUrls}`;
+  }
+
+  // Create user message object - store processed content with attachments
+  const userMessageObj = {
+    role: 'user' as const,
+    content: userMessage, // Store original user message, not processed content
+    timestamp: new Date().toISOString(),
+    metadata: {
+      portalType: 'agent' as const,
+      timestamp: new Date().toISOString(),
+      attachments: attachments || []
+    }
+  };
+
+  // Check if this is the first user message (excluding system message)
+  const userMessages = session.messages?.filter(msg => msg.role === 'user') || [];
+  const isFirstMessage = userMessages.length === 0;
+
+  // If this is the first message, add system message with version info first
+  if (isFirstMessage) {
+    try {
+      // Get the current system prompt version
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      const systemPromptHash = require('crypto').createHash('md5').update(systemPrompt).digest('hex').substring(0, 8);
+      
+      // Add system message with version info (hash only in metadata)
+      const systemMessage = {
+        role: 'system' as const,
+        content: systemPrompt,
+        metadata: {
+          timestamp: new Date().toISOString(),
+          portalType: 'agent' as const,
+          systemPromptVersion: systemPromptHash
+        }
+      };
+      
+      await chatbotDb.addMessageToSession(sessionId, systemMessage);
+    } catch (error) {
+      console.error('AgentMode: Failed to add system message:', error);
+      // If it's a session size limit error, re-throw it
+      if (error instanceof Error && error.message.includes('SESSION_SIZE_LIMIT_EXCEEDED')) {
+        throw error;
+      }
+      // Continue with the message processing for other errors
+    }
+  }
+
+  // If this is the first message, generate session title
+  if (isFirstMessage) {
+    try {
+      const title = await agentModeService.generateSessionTitle(userMessage);
+      await chatbotDb.updateSessionTitle(sessionId, title);
+    } catch (error) {
+      console.error('AgentMode: Failed to update session title:', error);
+      // Continue with the message processing even if this fails
+    }
+  }
+
+  // Add user message to session in database
+  await chatbotDb.addMessageToSession(sessionId, userMessageObj);
+
+  // Get updated session with the new user message
+  const updatedSession = await chatbotDb.getChatSession(sessionId);
+  if (!updatedSession) {
+    throw new Error('Session not found after update');
+  }
+
+  // Generate AI response
+  const response = await agentModeService.generateMarketingResponse(
+    messageContent,
+    updatedSession.messages,
+    userId,
+    sessionId
+  );
+
+  // Add all response messages to session (includes assistant responses and tool calls)
+  await chatbotDb.addMessagesToSession(sessionId, response.responseMessages);
+
+  return response;
+}
 
 // Helper function to calculate next run time based on frequency
 const calculateNextRunTime = (frequency: string, fromDate: Date): Date => {
@@ -152,97 +333,19 @@ export const agentModeController = {
         return res.status(400).json({ error: 'Session ID and user message are required' });
       }
 
-
       // Get session
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
         return res.status(404).json({ error: 'Session not found' });
       }
 
-      // Process attachments and include URLs in message content for LLM
-      let messageContent = userMessage;
-      if (attachments && attachments.length > 0) {
-        const attachmentUrls = attachments.map((attachment: any) => {
-          return `[${attachment.filename || 'Attachment'}](${attachment.url})`;
-        }).join('\n');
-        messageContent = `${userMessage}\n\n**Attached Files:**\n${attachmentUrls}`;
-      }
-
-      // Create user message object - store processed content with attachments
-      const userMessageObj = {
-        role: 'user' as const,
-        content: userMessage, // Store original user message, not processed content
-        timestamp: new Date().toISOString(),
-        metadata: {
-          portalType: 'agent' as const,
-          timestamp: new Date().toISOString(),
-          attachments: attachments || []
-        }
-      };
-
-      // Check if this is the first user message (excluding system message)
-      const userMessages = session.messages?.filter(msg => msg.role === 'user') || [];
-      const isFirstMessage = userMessages.length === 0;
-
-      // If this is the first message, add system message with version info first
-      if (isFirstMessage) {
-        try {
-          // Get the current system prompt version
-          const systemPrompt = await agentModeService.getMarketingSystemPrompt();
-          const systemPromptHash = require('crypto').createHash('md5').update(systemPrompt).digest('hex').substring(0, 8);
-          
-          // Add system message with version info (hash only in metadata)
-          const systemMessage = {
-            role: 'system' as const,
-            content: systemPrompt,
-            metadata: {
-              timestamp: new Date().toISOString(),
-              portalType: 'agent' as const,
-              systemPromptVersion: systemPromptHash
-            }
-          };
-          
-          await chatbotDb.addMessageToSession(sessionId, systemMessage);
-        } catch (error) {
-          console.error('AgentMode: Failed to add system message:', error);
-          // If it's a session size limit error, re-throw it
-          if (error instanceof Error && error.message.includes('SESSION_SIZE_LIMIT_EXCEEDED')) {
-            throw error;
-          }
-          // Continue with the message processing for other errors
-        }
-      }
-
-      // If this is the first message, generate session title
-      if (isFirstMessage) {
-        try {
-          const title = await agentModeService.generateSessionTitle(userMessage);
-          await chatbotDb.updateSessionTitle(sessionId, title);
-        } catch (error) {
-          console.error('AgentMode: Failed to update session title:', error);
-          // Continue with the message processing even if this fails
-        }
-      }
-
-      // Get updated session with the new user message
-      const updatedSession = await chatbotDb.getChatSession(sessionId);
-      if (!updatedSession) {
-        return res.status(404).json({ error: 'Session not found after update' });
-      }
-
-      // Add user message to session in database
-      await chatbotDb.addMessageToSession(sessionId, userMessageObj);
-
-      // Generate AI response
-      const response = await agentModeService.generateMarketingResponse(
-        messageContent,
-        updatedSession.messages,
+      // Generate AI response using common function
+      const response = await generateSessionResponse(
+        sessionId,
+        userMessage,
         user.userId,
-        sessionId
+        attachments
       );
-
-      // Add all response messages to session (includes assistant responses and tool calls)
-      await chatbotDb.addMessagesToSession(sessionId, response.responseMessages);
 
       res.json({
         content: response.content,
@@ -571,10 +674,7 @@ export const agentModeController = {
               requiredFunctionCalls
             } = req.body;
 
-            console.log('Update scheduled chat request body:', req.body);
-
             if (!scheduleName || !startingMessage || !scheduleFrequency) {
-              console.log('Missing required fields:', { scheduleName, startingMessage, scheduleFrequency });
               return res.status(400).json({ error: 'Missing required fields' });
             }
 
@@ -612,6 +712,104 @@ export const agentModeController = {
           }
         },
 
+        async testScheduledChat(req: Request, res: Response) {
+          try {
+            const user = req.user as User;
+            const { scheduleId } = req.params;
+
+            // Verify schedule exists and belongs to user
+            const schedule = await scheduleDb.getScheduleById(scheduleId);
+            if (!schedule || schedule.userId !== user.userId) {
+              return res.status(404).json({ error: 'Scheduled chat not found' });
+            }
+
+            // Create a new session for testing
+            const now = new Date();
+            
+            // Create test session
+            const testSession = await chatbotDb.createChatSession(user.userId, undefined, "agent", `Test: ${schedule.scheduleName}`);
+            const testSessionId = testSession.sessionId;
+
+            const maxTries = 3;
+            let attempt = 0;
+            let finalResult = null;
+
+            while (attempt < maxTries) {
+              attempt++;
+              
+              try {
+                // Prepare user message for this attempt
+                const userMessage = attempt === 1 
+                  ? schedule.startingMessage 
+                  : `Please try again. Make sure to include these keywords: ${finalResult?.keywordMisses?.join(', ') || ''} and use these function calls: ${finalResult?.functionCallMisses?.join(', ') || ''}.`;
+
+                // Generate response using the common function (same as /generateResponse)
+                const response = await generateSessionResponse(
+                  testSessionId,
+                  userMessage,
+                  user.userId
+                );
+
+                // Extract function calls from the response
+                const actualFunctionCalls = response.toolCalls?.map((call: any) => call.name).filter(Boolean) || [];
+
+                // Evaluate the response against expected criteria
+                const evaluation = evaluateScheduleResponse(
+                  response.content,
+                  actualFunctionCalls,
+                  {
+                    keywords: schedule.keywords || [],
+                    functionCalls: schedule.requiredFunctionCalls || []
+                  }
+                );
+
+                finalResult = {
+                  scheduleId,
+                  runId: require('uuid').v4(),
+                  status: evaluation.passed ? 'success' : 'failure',
+                  passed: evaluation.passed,
+                  actualResponse: response.content,
+                  actualFunctionCalls,
+                  keywordMatches: evaluation.keywordMatches,
+                  keywordMisses: evaluation.keywordMisses,
+                  functionCallMatches: evaluation.functionCallMatches,
+                  functionCallMisses: evaluation.functionCallMisses,
+                  executionTime: Date.now() - now.getTime(),
+                  sessionId: testSessionId, // Include session ID so user can view the test conversation
+                  attempt,
+                  createdAt: new Date().toISOString()
+                };
+
+                // If test passed, break out of loop
+                if (evaluation.passed) {
+                  break;
+                }
+
+              } catch (error) {
+                console.error(`Test attempt ${attempt} failed:`, error);
+                if (attempt === maxTries) {
+                  throw error;
+                }
+              }
+            }
+
+            // Save test result to database
+            try {
+              await scheduleDb.addRunResult(scheduleId, finalResult);
+            } catch (error) {
+              console.error('Error saving test result:', error);
+              // Continue even if saving fails
+            }
+
+            // Don't delete the test session - let user view the conversation
+            res.json(finalResult);
+
+          } catch (error) {
+            console.error('AgentMode: Test scheduled chat error:', error);
+            res.status(500).json({ error: 'Failed to test scheduled chat' });
+          }
+        },
+
         async deleteScheduledChat(req: Request, res: Response) {
           try {
             const user = req.user as User;
@@ -630,6 +828,27 @@ export const agentModeController = {
           } catch (error) {
             console.error('AgentMode: Delete scheduled chat error:', error);
             res.status(500).json({ error: 'Failed to delete scheduled chat' });
+          }
+        },
+
+        async getScheduledChatTestHistory(req: Request, res: Response) {
+          try {
+            const user = req.user as User;
+            const { scheduleId } = req.params;
+
+            // Verify schedule exists and belongs to user
+            const schedule = await scheduleDb.getScheduleById(scheduleId);
+            if (!schedule || schedule.userId !== user.userId) {
+              return res.status(404).json({ error: 'Scheduled chat not found' });
+            }
+
+            // Get test history
+            const testHistory = await scheduleDb.getRunResults(scheduleId);
+
+            res.json(testHistory);
+          } catch (error) {
+            console.error('AgentMode: Get test history error:', error);
+            res.status(500).json({ error: 'Failed to get test history' });
           }
         }
 };

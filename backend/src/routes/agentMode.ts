@@ -95,8 +95,16 @@ router.get('/scheduled-chats', asyncHandler(agentModeController.getScheduledChat
 // Update scheduled chat
 router.put('/scheduled-chats/:scheduleId', asyncHandler(agentModeController.updateScheduledChat));
 
+// POST /api/agent-mode/scheduled-chats/:scheduleId/test
+// Test scheduled chat
+router.post('/scheduled-chats/:scheduleId/test', asyncHandler(agentModeController.testScheduledChat));
+
 // DELETE /api/agent-mode/scheduled-chats/:scheduleId
 // Delete scheduled chat
 router.delete('/scheduled-chats/:scheduleId', asyncHandler(agentModeController.deleteScheduledChat));
+
+// GET /api/agent-mode/scheduled-chats/:scheduleId/test-history
+// Get test history for a scheduled chat
+router.get('/scheduled-chats/:scheduleId/test-history', asyncHandler(agentModeController.getScheduledChatTestHistory));
 
 export default router;
