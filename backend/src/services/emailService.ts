@@ -550,7 +550,7 @@ export const emailService = {
             .misses { color: #dc3545; font-weight: bold; }
             .response { background-color: #f8f9fa; padding: 15px; border-radius: 4px; border-left: 4px solid #1976d2; white-space: pre-wrap; word-wrap: break-word; }
             .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; }
-            .button { display: inline-block; background-color: #1976d2; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin: 10px 0; }
+            .button { display: inline-block; background-color: #1976d2; color: white !important; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin: 10px 0; }
             .button:hover { background-color: #1565c0; }
             .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin: 15px 0; }
             .stat { text-align: center; padding: 10px; background-color: #f8f9fa; border-radius: 4px; }

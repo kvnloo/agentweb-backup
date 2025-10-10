@@ -28,6 +28,21 @@ router.get("/channels", authenticateToken, async (req: Request, res: Response) =
     
     const channels = await getSlackChannels();
     
+    // If user has an account-level Slack channel configured, filter to only show that channel
+    if (authReq.user?.userId) {
+      const { userDb } = await import("../services/db");
+      const user = await userDb.getUserById(authReq.user.userId);
+      
+      if (user?.slackChannel) {
+        const filteredChannels = channels.filter(channel => 
+          channel.id === user.slackChannel
+        );
+        console.log(`✅ Filtered to ${filteredChannels.length} channels based on user's account-level Slack channel`);
+        res.json(filteredChannels);
+        return;
+      }
+    }
+    
     console.log(`✅ Successfully fetched ${channels.length} Slack channels`);
     res.json(channels);
   } catch (error: any) {

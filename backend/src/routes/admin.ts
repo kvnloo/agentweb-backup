@@ -138,6 +138,29 @@ router.put("/users/:userId/email-sender", async (req, res) => {
   }
 });
 
+// Update user slack channel
+router.put("/users/:userId/slack-channel", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { slackChannel } = req.body;
+
+    // Check if user exists
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Update the user's slack channel
+    const updatedUser = await userDb.updateUser(userId, { 
+      slackChannel 
+    });
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error updating user slack channel:", error);
+    res.status(500).json({ message: "Error updating slack channel" });
+  }
+});
+
 // Update user password
 router.put("/users/:userId/password", async (req, res) => {
   try {
