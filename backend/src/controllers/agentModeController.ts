@@ -640,6 +640,36 @@ export const agentModeController = {
     }
   },
 
+  // Get share information for a session
+  async getShareInfo(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { sessionId } = req.params;
+
+      // Verify the session belongs to the user
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session || session.userId !== user.userId) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Check if the session is shared
+      if (!session.shareMetadata?.isShared) {
+        return res.status(404).json({ error: 'Session is not shared' });
+      }
+
+      // Return the share information
+      res.json({
+        shareId: sessionId, // The sessionId is used as the shareId
+        isShared: true,
+        sharedAt: session.shareMetadata.sharedAt,
+        expiresAt: session.shareMetadata.expiresAt
+      });
+    } catch (error) {
+      console.error('AgentMode: Get share info error:', error);
+      res.status(500).json({ error: 'Failed to get share information' });
+    }
+  },
+
   // Get shared conversation
   async getSharedConversation(req: Request, res: Response) {
     try {
