@@ -1201,6 +1201,9 @@ Context - Original Task: {base_prompt}"""
                     prompt = f"Task: {base_prompt}\n\nNote: Previous attempt {previous_feedback['time_ago']} was {previous_feedback['feedback']}. Previous result: {previous_feedback['result']}"
                 else:
                     prompt = f"Task: {base_prompt}"
+                
+                # Add CAPTCHA/reCAPTCHA handling instruction
+                prompt += "\n\nImportant: If you encounter CAPTCHA or reCAPTCHA challenges when visiting websites, immediately stop trying to access that website and seek alternative web sources instead. Do not attempt to solve or bypass CAPTCHA challenges - simply move on to other sources of information."
 
             # Add attachment information if present
             has_attachments = bool(task.get('attachments'))
