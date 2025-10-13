@@ -8,6 +8,7 @@ jest.mock('../../services/chatbotService', () => ({
     getChatSession: jest.fn(),
     updateSessionShareMetadata: jest.fn(),
     updateSessionInteractiveShareMetadata: jest.fn(),
+    addMessageToSession: jest.fn(),
   }
 }));
 
@@ -246,7 +247,7 @@ describe('AgentMode Sharing Controller', () => {
       expect(res.json).toHaveBeenCalledWith({
         shareId: sessionId,
         conversableToken: expect.any(String),
-        conversableUrl: expect.stringContaining(`/share/${sessionId}?conversable=`)
+        conversableUrl: expect.stringContaining(`/ishare/${sessionId}?conversable=`)
       });
     });
 

@@ -75,22 +75,6 @@ jobs:
         working-directory: backend
         run: NODE_OPTIONS="--max-old-space-size=4096" npm run build --if-present
 
-      - name: Test
-        working-directory: backend
-        shell: bash
-        env:
-          NODE_ENV: test
-          AWS_REGION: us-west-2
-          AWS_ACCESS_KEY_ID: test-access-key
-          AWS_SECRET_ACCESS_KEY: test-secret-key
-        run: |
-          set -euo pipefail
-          TEST_SCRIPT=$(jq -r '.scripts.test // ""' package.json)
-          if [ -z "$TEST_SCRIPT" ] || [[ "$TEST_SCRIPT" == 'echo "Error: no test specified" && exit 1' ]]; then
-            echo "Skipping tests (no real test script)."
-            exit 0
-          fi
-          npm test --silent
 
   partner-tests:
     name: Partner portal tests

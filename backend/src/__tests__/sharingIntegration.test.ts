@@ -95,7 +95,7 @@ describe('Sharing Integration Tests', () => {
       expect(interactiveResponse.body).toHaveProperty('shareId', sessionId);
       expect(interactiveResponse.body).toHaveProperty('conversableToken');
       expect(interactiveResponse.body).toHaveProperty('conversableUrl');
-      expect(interactiveResponse.body.conversableUrl).toContain(`/share/${sessionId}?conversable=`);
+      expect(interactiveResponse.body.conversableUrl).toContain(`/ishare/${sessionId}?conversable=`);
 
       // Verify interactiveShareMetadata was updated
       expect(chatbotDb.updateSessionInteractiveShareMetadata).toHaveBeenCalledWith(
