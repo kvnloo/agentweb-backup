@@ -611,7 +611,10 @@ export const agentModeController = {
       // Update the session with share metadata
       await chatbotDb.updateSessionShareMetadata(sessionId, shareMetadata);
 
-      res.json({ shareId });
+      res.status(200).json({ 
+        shareId,
+        shareUrl: `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5176'}/share/${shareId}`
+      });
     } catch (error) {
       console.error('AgentMode: Create share link error:', error);
       res.status(500).json({ error: 'Failed to create share link' });
@@ -633,7 +636,7 @@ export const agentModeController = {
       // Remove share metadata from the session
       await chatbotDb.updateSessionShareMetadata(sessionId, { isShared: false });
 
-      res.json({ success: true });
+      res.status(200).json({ success: true });
     } catch (error) {
       console.error('AgentMode: Stop sharing error:', error);
       res.status(500).json({ error: 'Failed to stop sharing' });
@@ -690,17 +693,16 @@ export const agentModeController = {
       // Generate a unique token for the conversable share
       const conversableToken = require('crypto').randomBytes(32).toString('hex');
       
-      // Update session with conversable share metadata
-      await chatbotDb.updateSessionShareMetadata(sessionId, {
-        ...session.shareMetadata,
-        conversableShare: {
-          token: conversableToken,
-          sharedAt: new Date().toISOString(),
-          isActive: true
-        }
-      } as any);
+      // Update session with interactive share metadata
+      const interactiveShareMetadata = {
+        isActive: true,
+        token: conversableToken,
+        sharedAt: new Date().toISOString()
+      };
+      
+      await chatbotDb.updateSessionInteractiveShareMetadata(sessionId, interactiveShareMetadata);
 
-      res.json({
+      res.status(200).json({
         shareId: sessionId,
         conversableToken: conversableToken,
         conversableUrl: `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5176'}/share/${sessionId}?conversable=${conversableToken}`
@@ -723,13 +725,14 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found' });
       }
 
-      // Remove conversable share metadata
-      const updatedShareMetadata = { ...session.shareMetadata } as any;
-      delete updatedShareMetadata.conversableShare;
+      // Remove interactive share metadata
+      const interactiveShareMetadata = {
+        isActive: false
+      };
       
-      await chatbotDb.updateSessionShareMetadata(sessionId, updatedShareMetadata);
+      await chatbotDb.updateSessionInteractiveShareMetadata(sessionId, interactiveShareMetadata);
 
-      res.json({ success: true });
+      res.status(200).json({ success: true });
     } catch (error) {
       console.error('AgentMode: Stop conversable share error:', error);
       res.status(500).json({ error: 'Failed to stop conversable sharing' });
@@ -748,13 +751,21 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Conversation not found' });
       }
 
-      // Check if the session is shared
-      if (!session.shareMetadata?.isShared) {
+      // Check if the session has any sharing enabled
+      const hasViewOnlyShare = session.shareMetadata?.isShared;
+      const hasInteractiveShare = session.interactiveShareMetadata?.isActive;
+      
+      if (!hasViewOnlyShare && !hasInteractiveShare) {
         return res.status(404).json({ error: 'This conversation is not shared' });
       }
 
-      // Check if expired (only if expiresAt is set)
-      if (session.shareMetadata.expiresAt && new Date() > new Date(session.shareMetadata.expiresAt)) {
+      // If it's a conversable request, ensure there's a valid interactive share
+      if (conversable && !hasInteractiveShare) {
+        return res.status(404).json({ error: 'This conversation does not have interactive sharing enabled' });
+      }
+
+      // Check if view-only share expired (only if expiresAt is set)
+      if (hasViewOnlyShare && session.shareMetadata?.expiresAt && new Date() > new Date(session.shareMetadata.expiresAt)) {
         // Remove share metadata if expired
         await chatbotDb.updateSessionShareMetadata(shareId, { isShared: false });
         return res.status(410).json({ error: 'Share link has expired' });
@@ -762,13 +773,13 @@ export const agentModeController = {
 
       // If conversable token is provided, validate it
       if (conversable) {
-        const conversableShare = (session.shareMetadata as any)?.conversableShare;
-        if (!conversableShare?.isActive || conversableShare.token !== conversable) {
-          return res.status(401).json({ error: 'Invalid or expired conversable token' });
+        const interactiveToken = session.interactiveShareMetadata?.token;
+        if (!interactiveToken || interactiveToken !== conversable) {
+          return res.status(401).json({ error: 'Invalid or expired interactive token' });
         }
       }
 
-      res.json({
+      res.status(200).json({
         session: {
           sessionId: session.sessionId,
           title: session.title,
@@ -776,6 +787,7 @@ export const agentModeController = {
           createdAt: session.createdAt,
           updatedAt: session.updatedAt,
           shareMetadata: session.shareMetadata,
+          interactiveShareMetadata: session.interactiveShareMetadata,
           isConversable: !!conversable
         }
       });
@@ -807,8 +819,8 @@ export const agentModeController = {
         return res.status(401).json({ error: 'Conversable token required' });
       }
 
-      const conversableShare = (session.shareMetadata as any)?.conversableShare;
-      if (!conversableShare?.isActive || conversableShare.token !== conversable) {
+      const interactiveShare = session.interactiveShareMetadata;
+      if (!interactiveShare?.isActive || interactiveShare.token !== conversable) {
         return res.status(401).json({ error: 'Invalid or expired conversable token' });
       }
 

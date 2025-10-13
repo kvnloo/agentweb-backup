@@ -119,6 +119,11 @@ export interface ChatSession {
     sharedAt?: string;
     expiresAt?: string;
   };
+  interactiveShareMetadata?: {
+    isActive: boolean;
+    token?: string;
+    sharedAt?: string;
+  };
 }
 
 // Interface for context chunks
@@ -966,6 +971,34 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session share metadata:", error);
+      throw error;
+    }
+  }
+
+  async updateSessionInteractiveShareMetadata(
+    sessionId: string,
+    interactiveShareMetadata: { isActive: boolean; token?: string; sharedAt?: string }
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression: "SET interactiveShareMetadata = :interactiveShareMetadata, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":interactiveShareMetadata": interactiveShareMetadata,
+        ":updatedAt": timestamp,
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating session interactive share metadata:", error);
       throw error;
     }
   }
