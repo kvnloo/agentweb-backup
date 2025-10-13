@@ -1,6 +1,7 @@
 import express, { Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest, requireAdmin } from '../middleware/auth';
 import { agentModeController } from '../controllers/agentModeController';
+import { chatbotDb } from '../services/chatbotService';
 import multer from 'multer';
 
 const router = express.Router();
@@ -13,10 +14,15 @@ const asyncHandler = (fn: (req: Request, res: Response, next: express.NextFuncti
   };
 };
 
+
 // Public routes (no authentication required)
 // GET /api/agent-mode/share/:shareId
 // Get shared conversation (public)
 router.get('/share/:shareId', asyncHandler(agentModeController.getSharedConversation));
+
+// POST /api/agent-mode/share/:shareId/generate
+// Generate response for shared conversation (with conversable token)
+router.post('/share/:shareId/generate', asyncHandler(agentModeController.generateSharedResponse));
 
 // GET /api/agent-mode/public/welcome-message
 // Get current welcome message (public)
@@ -29,6 +35,8 @@ router.get('/public/conversation-starters', asyncHandler(agentModeController.get
 // POST /api/agent-mode/run-scheduled-chats
 // Run all scheduled chats that are ready to execute (called by agent-engine)
 router.post('/run-scheduled-chats', asyncHandler(agentModeController.runScheduledChats));
+
+// Conversable routes (protected by conversable token, not authentication)
 
 // All other routes require authentication
 router.use(authenticateToken);
@@ -90,6 +98,15 @@ router.delete('/session/:sessionId/share', asyncHandler(agentModeController.stop
 // GET /api/agent-mode/session/:sessionId/share
 // Get share information for a session
 router.get('/session/:sessionId/share', asyncHandler(agentModeController.getShareInfo));
+
+// POST /api/agent-mode/conversable-share
+// Create conversable share link for a session
+router.post('/conversable-share', asyncHandler(agentModeController.createConversableShare));
+
+// DELETE /api/agent-mode/session/:sessionId/conversable-share
+// Stop conversable sharing
+router.delete('/session/:sessionId/conversable-share', asyncHandler(agentModeController.stopConversableShare));
+
 
 // POST /api/agent-mode/scheduled-chats
 // Create scheduled chat
