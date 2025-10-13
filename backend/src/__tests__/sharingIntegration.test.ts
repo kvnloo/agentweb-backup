@@ -157,7 +157,10 @@ describe('Sharing Integration Tests', () => {
       // Verify only shareMetadata was updated
       expect(chatbotDb.updateSessionShareMetadata).toHaveBeenCalledWith(
         sessionId,
-        { isShared: false }
+        { 
+          isShared: false,
+          sharedAt: "2024-01-01T00:00:00Z"
+        }
       );
 
       // Step 6: Verify interactive share still works
@@ -183,11 +186,16 @@ describe('Sharing Integration Tests', () => {
         .delete(`/api/agent-mode/session/${sessionId}/conversable-share`)
         .expect(200);
 
-      // Verify only interactiveShareMetadata was updated
-      expect(chatbotDb.updateSessionInteractiveShareMetadata).toHaveBeenCalledWith(
+      // Verify only interactiveShareMetadata was updated (check the last call)
+      const lastCall = (chatbotDb.updateSessionInteractiveShareMetadata as jest.Mock).mock.calls.slice(-1)[0];
+      expect(lastCall).toEqual([
         sessionId,
-        { isActive: false }
-      );
+        { 
+          isActive: false,
+          sharedAt: "2024-01-01T00:00:00Z",
+          token: "test-token"
+        }
+      ]);
 
       // Step 8: Verify no sharing is available
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(sessionWithNoShares);
@@ -266,7 +274,11 @@ describe('Sharing Integration Tests', () => {
       // Verify only interactiveShareMetadata was updated
       expect(chatbotDb.updateSessionInteractiveShareMetadata).toHaveBeenCalledWith(
         sessionId,
-        { isActive: false }
+        { 
+          isActive: false,
+          sharedAt: "2024-01-01T00:00:00Z",
+          token: "test-token"
+        }
       );
 
       // Verify shareMetadata was not touched

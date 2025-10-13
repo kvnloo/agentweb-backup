@@ -633,8 +633,12 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found' });
       }
 
-      // Remove share metadata from the session
-      await chatbotDb.updateSessionShareMetadata(sessionId, { isShared: false });
+      // Update share metadata to disable sharing while preserving other fields
+      const currentShareMetadata = session.shareMetadata || {};
+      await chatbotDb.updateSessionShareMetadata(sessionId, { 
+        ...currentShareMetadata,
+        isShared: false 
+      });
 
       res.status(200).json({ success: true });
     } catch (error) {
@@ -725,8 +729,10 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found' });
       }
 
-      // Remove interactive share metadata
+      // Update interactive share metadata to disable sharing while preserving other fields
+      const currentInteractiveShareMetadata = session.interactiveShareMetadata || {};
       const interactiveShareMetadata = {
+        ...currentInteractiveShareMetadata,
         isActive: false
       };
       
@@ -751,17 +757,20 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Conversation not found' });
       }
 
-      // Check if the session has any sharing enabled
+      // Check sharing status
       const hasViewOnlyShare = session.shareMetadata?.isShared;
       const hasInteractiveShare = session.interactiveShareMetadata?.isActive;
       
-      if (!hasViewOnlyShare && !hasInteractiveShare) {
-        return res.status(404).json({ error: 'This conversation is not shared' });
-      }
-
-      // If it's a conversable request, ensure there's a valid interactive share
-      if (conversable && !hasInteractiveShare) {
-        return res.status(404).json({ error: 'This conversation does not have interactive sharing enabled' });
+      // If it's a conversable request (interactive share), ensure there's a valid interactive share
+      if (conversable) {
+        if (!hasInteractiveShare) {
+          return res.status(404).json({ error: 'This conversation does not have interactive sharing enabled' });
+        }
+      } else {
+        // If it's a view-only request, ensure there's a valid view-only share
+        if (!hasViewOnlyShare) {
+          return res.status(404).json({ error: 'This conversation is not shared for viewing' });
+        }
       }
 
       // Check if view-only share expired (only if expiresAt is set)

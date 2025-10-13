@@ -156,7 +156,10 @@ describe('AgentMode Sharing Controller', () => {
       expect(chatbotDb.getChatSession).toHaveBeenCalledWith(sessionId);
       expect(chatbotDb.updateSessionShareMetadata).toHaveBeenCalledWith(
         sessionId,
-        { isShared: false }
+        { 
+          isShared: false,
+          sharedAt: "2024-01-01T00:00:00Z"
+        }
       );
       expect(res.status).toHaveBeenCalledWith(200);
       expect(res.json).toHaveBeenCalledWith({ success: true });
@@ -194,7 +197,10 @@ describe('AgentMode Sharing Controller', () => {
       // Verify that only shareMetadata is updated, interactiveShareMetadata is preserved
       expect(chatbotDb.updateSessionShareMetadata).toHaveBeenCalledWith(
         sessionId,
-        { isShared: false }
+        { 
+          isShared: false,
+          sharedAt: "2024-01-01T00:00:00Z"
+        }
       );
       expect(res.status).toHaveBeenCalledWith(200);
     });
@@ -330,7 +336,11 @@ describe('AgentMode Sharing Controller', () => {
       expect(chatbotDb.getChatSession).toHaveBeenCalledWith(sessionId);
       expect(chatbotDb.updateSessionInteractiveShareMetadata).toHaveBeenCalledWith(
         sessionId,
-        { isActive: false }
+        { 
+          isActive: false,
+          sharedAt: "2024-01-01T00:00:00Z",
+          token: "test-token"
+        }
       );
       expect(res.status).toHaveBeenCalledWith(200);
       expect(res.json).toHaveBeenCalledWith({ success: true });
@@ -368,7 +378,11 @@ describe('AgentMode Sharing Controller', () => {
       // Verify that only interactiveShareMetadata is updated, shareMetadata is preserved
       expect(chatbotDb.updateSessionInteractiveShareMetadata).toHaveBeenCalledWith(
         sessionId,
-        { isActive: false }
+        { 
+          isActive: false,
+          sharedAt: "2024-01-01T00:00:00Z",
+          token: "test-token"
+        }
       );
       expect(res.status).toHaveBeenCalledWith(200);
     });
@@ -513,7 +527,7 @@ describe('AgentMode Sharing Controller', () => {
       await agentModeController.getSharedConversation(req as Request, res as Response);
 
       expect(res.status).toHaveBeenCalledWith(404);
-      expect(res.json).toHaveBeenCalledWith({ error: 'This conversation is not shared' });
+      expect(res.json).toHaveBeenCalledWith({ error: 'This conversation is not shared for viewing' });
     });
 
     it('should return 401 for invalid conversable token', async () => {
