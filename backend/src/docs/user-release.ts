@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-10-13',
+    changes: [
+      'Supported Shared Interactive Link in Agent Mode',
+      '- Users can now create interactive share links for Agent Mode conversations that allow others to continue chatting without login',
+      '- Interactive share links use secure tokens for access control and can be shared via email or direct links',
+      '- Scheduled chat email notifications now automatically include interactive share links for seamless conversation continuation',
+      '- Separate from view-only share links, interactive shares enable full conversation participation',
+    ],
+  },
+  {
     date: '2025-10-10',
     changes: [
       'Supported Scheduled Chats in Agent Mode',

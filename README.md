@@ -556,6 +556,87 @@ Store your Google Search API credentials in AWS Secrets Manager:
 - If Google Search API credentials are not found in Secrets Manager or the API fails, the system automatically falls back to mock search results
 - This ensures Agent Mode continues to work even without the API configured
 
+## Testing
+
+### Running Backend Unit Tests
+
+The backend includes comprehensive unit tests for the sharing functionality and other core features. To run the tests locally:
+
+#### Prerequisites
+
+1. **Install Dependencies**:
+   ```bash
+   cd backend
+   npm install
+   ```
+
+2. **Set Environment Variables**:
+   ```bash
+   export NODE_ENV=test
+   export AWS_REGION=us-west-2
+   export AWS_ACCESS_KEY_ID=test-access-key
+   export AWS_SECRET_ACCESS_KEY=test-secret-key
+   ```
+
+#### Running Tests
+
+1. **Run All Tests**:
+   ```bash
+   cd backend
+   npm test
+   ```
+
+2. **Run Tests with Coverage**:
+   ```bash
+   cd backend
+   npm run test:coverage
+   ```
+
+3. **Run Specific Test Files**:
+   ```bash
+   cd backend
+   npm test -- --testPathPattern=agentModeSharing
+   ```
+
+#### Test Structure
+
+The tests are located in `backend/src/__tests__/` and include:
+
+- **Unit Tests**: Test individual functions and controllers in isolation
+- **Integration Tests**: Test API endpoints and database interactions
+- **Mocking**: Uses Jest mocks for AWS services and external dependencies
+
+#### Test Configuration
+
+- **Jest Configuration**: `backend/jest.config.js`
+- **Test Setup**: `backend/src/__tests__/setup.ts`
+- **Environment**: Tests run with `NODE_ENV=test` and mock AWS credentials
+
+#### Available Test Scripts
+
+- `npm test` - Run all tests
+- `npm run test:watch` - Run tests in watch mode
+- `npm run test:coverage` - Run tests with coverage report
+- `npm run test:ci` - Run tests in CI mode (single run, no watch)
+
+#### Troubleshooting Tests
+
+**Common Issues:**
+
+1. **"Cannot find module" errors**:
+   - Ensure all dependencies are installed with `npm install`
+   - Check that the test setup file is properly configured
+
+2. **AWS credential errors**:
+   - Make sure environment variables are set correctly
+   - Tests use mock credentials, not real AWS credentials
+
+3. **Database connection errors**:
+   - Tests use mocked database services, not real DynamoDB
+   - Check that mocks are properly configured in test files
+
+**Note**: Tests are not run automatically in the CI/CD pipeline to avoid complexity and reduce build times. Run tests locally before submitting pull requests.
+
 ## Deployment to AWS Elastic Beanstalk
 
 ### Prerequisites
@@ -1280,13 +1361,14 @@ Some AgentWeb features require GUI access for browser automation. To enable GUI 
 
 ## Repository CI/CD (GitHub Actions)
 
-This repository includes CI (tests) and CD (deploy) workflows for `backend` and `partner-portal` in `.github/workflows/`:
+This repository includes CI (build verification) and CD (deploy) workflows for `backend` and `partner-portal` in `.github/workflows/`:
 
 - `tests.yml` — Runs on Pull Requests touching `backend/**` or `partner-portal/**`
   - Detects which project changed and runs only the relevant jobs
   - Version rule for PRs: the `package.json` version in the PR must be the same or higher than the base branch
-  - Backend tests are skipped if the test script is the default placeholder
+  - Builds the projects to verify compilation
   - Uses the runner's default Node version (no explicit `node-version`)
+  - **Note**: Unit tests are not run in CI - run them locally before submitting PRs (see [Testing](#testing) section)
 
 - `deploy.yml` — Runs on push to `main` touching `backend/**` or `partner-portal/**`
   - Detects which project changed and runs only the relevant jobs

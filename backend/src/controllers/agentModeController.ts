@@ -611,7 +611,10 @@ export const agentModeController = {
       // Update the session with share metadata
       await chatbotDb.updateSessionShareMetadata(sessionId, shareMetadata);
 
-      res.json({ shareId });
+      res.status(200).json({ 
+        shareId,
+        shareUrl: `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5176'}/share/${shareId}`
+      });
     } catch (error) {
       console.error('AgentMode: Create share link error:', error);
       res.status(500).json({ error: 'Failed to create share link' });
@@ -630,13 +633,115 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found' });
       }
 
-      // Remove share metadata from the session
-      await chatbotDb.updateSessionShareMetadata(sessionId, { isShared: false });
+      // Update share metadata to disable sharing while preserving other fields
+      const currentShareMetadata = session.shareMetadata || {};
+      await chatbotDb.updateSessionShareMetadata(sessionId, { 
+        ...currentShareMetadata,
+        isShared: false 
+      });
 
-      res.json({ success: true });
+      res.status(200).json({ success: true });
     } catch (error) {
       console.error('AgentMode: Stop sharing error:', error);
       res.status(500).json({ error: 'Failed to stop sharing' });
+    }
+  },
+
+  // Get share information for a session
+  async getShareInfo(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { sessionId } = req.params;
+
+      // Verify the session belongs to the user
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session || session.userId !== user.userId) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Check if the session is shared
+      if (!session.shareMetadata?.isShared) {
+        return res.status(404).json({ error: 'Session is not shared' });
+      }
+
+      // Return the share information
+      res.json({
+        shareId: sessionId, // The sessionId is used as the shareId
+        isShared: true,
+        sharedAt: session.shareMetadata.sharedAt,
+        expiresAt: session.shareMetadata.expiresAt,
+        conversableShare: (session.shareMetadata as any).conversableShare ? {
+          isActive: (session.shareMetadata as any).conversableShare.isActive,
+          sharedAt: (session.shareMetadata as any).conversableShare.sharedAt,
+          conversableUrl: `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5176'}/ishare/${sessionId}?conversable=${(session.shareMetadata as any).conversableShare.token}`
+        } : null
+      });
+    } catch (error) {
+      console.error('AgentMode: Get share info error:', error);
+      res.status(500).json({ error: 'Failed to get share information' });
+    }
+  },
+
+  // Create conversable share link for a session
+  async createConversableShare(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { sessionId } = req.body;
+
+      // Verify the session belongs to the user
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session || session.userId !== user.userId) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Generate a unique token for the conversable share
+      const conversableToken = require('crypto').randomBytes(32).toString('hex');
+      
+      // Update session with interactive share metadata
+      const interactiveShareMetadata = {
+        isActive: true,
+        token: conversableToken,
+        sharedAt: new Date().toISOString()
+      };
+      
+      await chatbotDb.updateSessionInteractiveShareMetadata(sessionId, interactiveShareMetadata);
+
+      res.status(200).json({
+        shareId: sessionId,
+        conversableToken: conversableToken,
+        conversableUrl: `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5176'}/ishare/${sessionId}?conversable=${conversableToken}`
+      });
+    } catch (error) {
+      console.error('AgentMode: Create conversable share error:', error);
+      res.status(500).json({ error: 'Failed to create conversable share link' });
+    }
+  },
+
+  // Stop conversable sharing
+  async stopConversableShare(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { sessionId } = req.params;
+
+      // Verify the session belongs to the user
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session || session.userId !== user.userId) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Update interactive share metadata to disable sharing while preserving other fields
+      const currentInteractiveShareMetadata = session.interactiveShareMetadata || {};
+      const interactiveShareMetadata = {
+        ...currentInteractiveShareMetadata,
+        isActive: false
+      };
+      
+      await chatbotDb.updateSessionInteractiveShareMetadata(sessionId, interactiveShareMetadata);
+
+      res.status(200).json({ success: true });
+    } catch (error) {
+      console.error('AgentMode: Stop conversable share error:', error);
+      res.status(500).json({ error: 'Failed to stop conversable sharing' });
     }
   },
 
@@ -644,6 +749,7 @@ export const agentModeController = {
   async getSharedConversation(req: Request, res: Response) {
     try {
       const { shareId } = req.params;
+      const { conversable } = req.query;
 
       // Get the session data directly using shareId as sessionId
       const session = await chatbotDb.getChatSession(shareId);
@@ -651,31 +757,123 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Conversation not found' });
       }
 
-      // Check if the session is shared
-      if (!session.shareMetadata?.isShared) {
-        return res.status(404).json({ error: 'This conversation is not shared' });
+      // Check sharing status
+      const hasViewOnlyShare = session.shareMetadata?.isShared;
+      const hasInteractiveShare = session.interactiveShareMetadata?.isActive;
+      
+      // If it's a conversable request (interactive share), ensure there's a valid interactive share
+      if (conversable) {
+        if (!hasInteractiveShare) {
+          return res.status(404).json({ error: 'This conversation does not have interactive sharing enabled' });
+        }
+      } else {
+        // If it's a view-only request, ensure there's a valid view-only share
+        if (!hasViewOnlyShare) {
+          return res.status(404).json({ error: 'This conversation is not shared for viewing' });
+        }
       }
 
-      // Check if expired (only if expiresAt is set)
-      if (session.shareMetadata.expiresAt && new Date() > new Date(session.shareMetadata.expiresAt)) {
+      // Check if view-only share expired (only if expiresAt is set)
+      if (hasViewOnlyShare && session.shareMetadata?.expiresAt && new Date() > new Date(session.shareMetadata.expiresAt)) {
         // Remove share metadata if expired
         await chatbotDb.updateSessionShareMetadata(shareId, { isShared: false });
         return res.status(410).json({ error: 'Share link has expired' });
       }
 
-      res.json({
+      // If conversable token is provided, validate it
+      if (conversable) {
+        const interactiveToken = session.interactiveShareMetadata?.token;
+        if (!interactiveToken || interactiveToken !== conversable) {
+          return res.status(401).json({ error: 'Invalid or expired interactive token' });
+        }
+      }
+
+      res.status(200).json({
         session: {
           sessionId: session.sessionId,
           title: session.title,
           messages: filterMessagesForClient(session.messages),
           createdAt: session.createdAt,
           updatedAt: session.updatedAt,
-          shareMetadata: session.shareMetadata
+          shareMetadata: session.shareMetadata,
+          interactiveShareMetadata: session.interactiveShareMetadata,
+          isConversable: !!conversable
         }
       });
     } catch (error) {
       console.error('AgentMode: Get shared conversation error:', error);
       res.status(500).json({ error: 'Failed to get shared conversation' });
+    }
+  },
+
+  // Generate response for shared conversation (with conversable token)
+  async generateSharedResponse(req: Request, res: Response) {
+    try {
+      const { shareId } = req.params;
+      const { conversable } = req.query;
+      const { userMessage, attachments = [] } = req.body;
+
+      if (!userMessage) {
+        return res.status(400).json({ error: 'User message is required' });
+      }
+
+      // Get the session to verify the conversable token
+      const session = await chatbotDb.getChatSession(shareId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Check if conversable sharing is active and token matches
+      if (!conversable) {
+        return res.status(401).json({ error: 'Conversable token required' });
+      }
+
+      const interactiveShare = session.interactiveShareMetadata;
+      if (!interactiveShare?.isActive || interactiveShare.token !== conversable) {
+        return res.status(401).json({ error: 'Invalid or expired conversable token' });
+      }
+
+      // Use the same generateSessionResponse logic as the regular generateResponse
+      const response = await generateSessionResponse(
+        session.sessionId,
+        userMessage,
+        session.userId,
+        attachments
+      );
+
+      res.json({
+        content: response.content,
+        toolCalls: response.toolCalls,
+        knowledgeBaseQueries: response.knowledgeBaseQueries,
+        sources: response.sources
+      });
+    } catch (error) {
+      console.error('AgentMode: Generate shared response error:', error);
+      
+      // Handle specific error types (same as generateResponse)
+      if (error instanceof Error) {
+        if (error.message.includes('SESSION_SIZE_LIMIT_EXCEEDED')) {
+          res.status(413).json({ 
+            error: 'Session size limit exceeded',
+            message: 'Please start a new session to continue the conversation.',
+            code: 'SESSION_SIZE_LIMIT_EXCEEDED',
+            suggestion: 'start_new_session'
+          });
+          return;
+        }
+        
+        if (error.message.includes('MESSAGE_TOO_LARGE')) {
+          res.status(413).json({ 
+            error: 'Message too large',
+            message: 'The message content is too large to be saved. Please try with shorter content.',
+            code: 'MESSAGE_TOO_LARGE',
+            suggestion: 'shorten_content'
+          });
+          return;
+        }
+      }
+      
+      res.status(500).json({ error: 'Failed to generate response' });
     }
   },
 
@@ -1056,5 +1254,87 @@ export const agentModeController = {
             console.error('AgentMode: Run scheduled chats error:', error);
             res.status(500).json({ error: 'Failed to run scheduled chats' });
           }
+        },
+
+  // Get session for conversable access
+  async getConversableSession(req: Request, res: Response) {
+    try {
+      const { sessionId } = req.params;
+      const session = (req as any).conversableSession;
+
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      res.json({
+        sessionId: session.sessionId,
+        title: session.title,
+        messages: filterMessagesForClient(session.messages),
+        createdAt: session.createdAt,
+        updatedAt: session.updatedAt,
+        isConversable: true
+      });
+    } catch (error) {
+      console.error('AgentMode: Get conversable session error:', error);
+      res.status(500).json({ error: 'Failed to get session' });
+    }
+  },
+
+  // Generate response for conversable session
+  async generateConversableResponse(req: Request, res: Response) {
+    try {
+      const { userMessage, attachments } = req.body;
+      const session = (req as any).conversableSession;
+
+      if (!userMessage) {
+        return res.status(400).json({ error: 'User message is required' });
+      }
+
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Generate AI response using the same function as regular users
+      const response = await generateSessionResponse(
+        session.sessionId,
+        userMessage,
+        session.userId, // Use the original session owner's userId
+        attachments
+      );
+
+      res.json({
+        content: response.content,
+        toolCalls: response.toolCalls,
+        knowledgeBaseQueries: response.knowledgeBaseQueries,
+        sources: response.sources
+      });
+    } catch (error) {
+      console.error('AgentMode: Generate conversable response error:', error);
+      
+      // Handle specific error types (same as generateResponse)
+      if (error instanceof Error) {
+        if (error.message.includes('SESSION_SIZE_LIMIT_EXCEEDED')) {
+          res.status(413).json({ 
+            error: 'Session size limit exceeded',
+            message: 'Please start a new session to continue the conversation.',
+            code: 'SESSION_SIZE_LIMIT_EXCEEDED',
+            suggestion: 'start_new_session'
+          });
+          return;
         }
+        
+        if (error.message.includes('MESSAGE_TOO_LARGE')) {
+          res.status(413).json({ 
+            error: 'Message too large',
+            message: 'The message content is too large to be saved. Please try with shorter content.',
+            code: 'MESSAGE_TOO_LARGE',
+            suggestion: 'shorten_content'
+          });
+          return;
+        }
+      }
+      
+      res.status(500).json({ error: 'Failed to generate response' });
+    }
+  }
 };
