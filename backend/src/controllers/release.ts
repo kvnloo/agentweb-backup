@@ -8,6 +8,13 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-10-13",
+    changes: [
+      "Added search_web function call to browser agent",
+      "- search_web is an alternative to search_google as Google Search sometimes are blocked by reCAPTCHA",
+    ],
+  },
+  {
     date: "2025-10-07",
     changes: [
       "Added Create User in Waitlist tab of Admin Page",
