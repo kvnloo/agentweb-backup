@@ -515,7 +515,33 @@ export const emailService = {
   ) {
     try {
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
-      const sessionUrl = `${customerFrontendUrl}/agent-mode/${result.sessionId}`;
+      
+      // Create an interactive share for the session so user can access without login
+      let sessionUrl = `${customerFrontendUrl}/agent-mode/${result.sessionId}`;
+      try {
+        const { chatbotDb } = require('./chatbotService');
+        const crypto = require('crypto');
+        
+        // Generate a unique token for the conversable share
+        const conversableToken = crypto.randomBytes(32).toString('hex');
+        
+        // Update session with interactive share metadata
+        const interactiveShareMetadata = {
+          isActive: true,
+          token: conversableToken,
+          sharedAt: new Date().toISOString()
+        };
+        
+        await chatbotDb.updateSessionInteractiveShareMetadata(result.sessionId, interactiveShareMetadata);
+        
+        // Use the interactive share URL instead of the agent-mode URL
+        sessionUrl = `${customerFrontendUrl}/ishare/${result.sessionId}?conversable=${conversableToken}`;
+        
+        console.log(`Created interactive share for scheduled chat session ${result.sessionId}`);
+      } catch (shareError) {
+        console.error('Error creating interactive share for scheduled chat:', shareError);
+        // Fall back to regular agent-mode URL if share creation fails
+      }
       
       const statusColor = result.passed ? '#28a745' : '#dc3545';
       const statusText = result.passed ? 'PASSED' : 'FAILED';
@@ -580,9 +606,9 @@ export const emailService = {
               </div>
               
               <div class="section">
-                <h3>🔗 View Full Conversation</h3>
-                <p>Click the button below to view the complete conversation in Agent Mode:</p>
-                <a href="${sessionUrl}" class="button">Open in Agent Mode</a>
+                <h3>🔗 Continue the Conversation</h3>
+                <p>Click the button below to view the complete conversation and continue chatting with the AI.</p>
+                <a href="${sessionUrl}" class="button">Continue Chatting</a>
                 <p style="margin-top: 10px; font-size: 14px; color: #6c757d;">
                   Or copy this link: <a href="${sessionUrl}">${sessionUrl}</a>
                 </p>
@@ -609,7 +635,7 @@ It ran for ${Math.round(result.executionTime / 1000)} seconds and completed at $
 AI Response:
 ${result.actualResponse}
 
-View full conversation: ${sessionUrl}
+Continue the conversation: ${sessionUrl}
 
 ---
 This is an automated email from your scheduled chat.
