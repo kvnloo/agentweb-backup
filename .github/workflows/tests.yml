@@ -78,6 +78,11 @@ jobs:
       - name: Test
         working-directory: backend
         shell: bash
+        env:
+          NODE_ENV: test
+          AWS_REGION: us-west-2
+          AWS_ACCESS_KEY_ID: test-access-key
+          AWS_SECRET_ACCESS_KEY: test-secret-key
         run: |
           set -euo pipefail
           TEST_SCRIPT=$(jq -r '.scripts.test // ""' package.json)

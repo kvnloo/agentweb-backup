@@ -7,6 +7,7 @@ module.exports = {
   clearMocks: true,
   verbose: false,
   maxWorkers: '50%',
+  setupFilesAfterEnv: ['<rootDir>/src/__tests__/setup.ts'],
   transform: {
     '^.+\\.ts$': [
       'ts-jest',
