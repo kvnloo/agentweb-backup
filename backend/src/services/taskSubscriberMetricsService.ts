@@ -30,6 +30,21 @@ export interface TaskSubscriberMetrics {
   };
 }
 
+export interface TaskSubscriberEngagementEvents {
+  taskId: string;
+  emailSubject: string;
+  events: Array<{
+    eventId: string;
+    emailId: string;
+    emailDomain: string;
+    eventType: string;
+    createdAt: string;
+    data: any;
+    processedAt: string;
+  }>;
+  count: number;
+}
+
 export class TaskSubscriberMetricsService {
   /**
    * Get comprehensive task subscriber metrics for a given task
@@ -294,6 +309,98 @@ export class TaskSubscriberMetricsService {
       };
     } catch (error: any) {
       console.error('Error fetching task subscriber metrics:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get email engagement events for a specific task and email subject
+   * This is the common function used by both the UI and Agent Mode function calls
+   */
+  static async getTaskSubscriberEngagementEvents(taskId: string, emailSubject: string, userId: string): Promise<TaskSubscriberEngagementEvents> {
+    try {
+      // Get task to verify ownership
+      const task = await taskDb.getTaskById(taskId);
+      if (!task) {
+        throw new Error('Task not found');
+      }
+
+      // Verify task belongs to user or user is admin
+      const user = await userDb.getUserById(userId);
+      if (!user) {
+        throw new Error('User not found');
+      }
+
+      if (!user.isAdmin && task.userId !== userId) {
+        throw new Error('Access denied');
+      }
+
+      // Get all subscribers for this task
+      const subscribers = await subscriberDb.getAllTaskSubscribers(taskId);
+      
+      if (!subscribers || subscribers.length === 0) {
+        return {
+          taskId,
+          emailSubject,
+          events: [],
+          count: 0
+        };
+      }
+
+      // Get email domain from user
+      const emailDomain = user.emailDomain;
+      
+      if (!emailDomain) {
+        return {
+          taskId,
+          emailSubject,
+          events: [],
+          count: 0
+        };
+      }
+
+      // Collect all Resend email IDs from subscribers' email history that match the subject
+      const matchingEmailIds = new Set<string>();
+      subscribers.forEach(subscriber => {
+        if (subscriber.emailHistory) {
+          subscriber.emailHistory.forEach((email: any) => {
+            if (email.senderType === 'resend' && email.emailId && email.subject === emailSubject) {
+              matchingEmailIds.add(email.emailId);
+            }
+          });
+        }
+      });
+
+      if (matchingEmailIds.size === 0) {
+        return {
+          taskId,
+          emailSubject,
+          events: [],
+          count: 0
+        };
+      }
+
+      // Import emailEventsDb here to avoid circular dependency
+      const { emailEventsDb } = await import('./emailEventsDb');
+      
+      // Fetch events for each matching email ID
+      const allEvents = [];
+      for (const emailId of matchingEmailIds) {
+        const events = await emailEventsDb.getEventsByEmailId(emailId);
+        allEvents.push(...events);
+      }
+
+      // Sort events by creation time (newest first)
+      allEvents.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      
+      return {
+        taskId,
+        emailSubject,
+        events: allEvents,
+        count: allEvents.length
+      };
+    } catch (error: any) {
+      console.error('Error fetching task subscriber engagement events:', error);
       throw error;
     }
   }

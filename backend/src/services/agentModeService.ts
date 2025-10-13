@@ -935,6 +935,27 @@ Use the available tools to create tasks in the agent-engine when complex work is
             required: ['task_id']
           }
         }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'get_task_subscriber_engagement_events',
+          description: 'Get email engagement events for a specific task and email subject, showing detailed event history like delivered, opened, clicked, bounced, etc.',
+          parameters: {
+            type: 'object',
+            properties: {
+              task_id: {
+                type: 'string',
+                description: 'The ID of the task to get engagement events for'
+              },
+              email_subject: {
+                type: 'string',
+                description: 'The email subject line to filter events by'
+              }
+            },
+            required: ['task_id', 'email_subject']
+          }
+        }
       }
     ];
   }
@@ -1354,6 +1375,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
           return await this.createBlogArticle(args.topic, args.keywords || '', args.tone || 'professional', args.length || 'medium', args.researchContext || '', args.requirements || '', userId, sessionId);
       case 'get_task_subscriber_metrics':
         return await this.getTaskSubscriberMetrics(args.task_id, userId);
+      case 'get_task_subscriber_engagement_events':
+        return await this.getTaskSubscriberEngagementEvents(args.task_id, args.email_subject, userId);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -4124,6 +4147,29 @@ Use the available tools to create tasks in the agent-engine when complex work is
       return {
         success: false,
         message: 'Failed to get task subscriber metrics',
+        error: error.message
+      };
+    }
+  }
+
+  /**
+   * Get task subscriber engagement events for Agent Mode function calls
+   */
+  private async getTaskSubscriberEngagementEvents(taskId: string, emailSubject: string, userId: string): Promise<any> {
+    try {
+      const { TaskSubscriberMetricsService } = await import('./taskSubscriberMetricsService');
+      const events = await TaskSubscriberMetricsService.getTaskSubscriberEngagementEvents(taskId, emailSubject, userId);
+      
+      return {
+        success: true,
+        message: 'Task subscriber engagement events retrieved successfully',
+        data: events
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error getting task subscriber engagement events:', error);
+      return {
+        success: false,
+        message: 'Failed to get task subscriber engagement events',
         error: error.message
       };
     }
