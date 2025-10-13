@@ -669,7 +669,7 @@ export const agentModeController = {
         conversableShare: (session.shareMetadata as any).conversableShare ? {
           isActive: (session.shareMetadata as any).conversableShare.isActive,
           sharedAt: (session.shareMetadata as any).conversableShare.sharedAt,
-          conversableUrl: `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5176'}/share/${sessionId}?conversable=${(session.shareMetadata as any).conversableShare.token}`
+          conversableUrl: `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5176'}/ishare/${sessionId}?conversable=${(session.shareMetadata as any).conversableShare.token}`
         } : null
       });
     } catch (error) {
@@ -705,7 +705,7 @@ export const agentModeController = {
       res.status(200).json({
         shareId: sessionId,
         conversableToken: conversableToken,
-        conversableUrl: `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5176'}/share/${sessionId}?conversable=${conversableToken}`
+        conversableUrl: `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5176'}/ishare/${sessionId}?conversable=${conversableToken}`
       });
     } catch (error) {
       console.error('AgentMode: Create conversable share error:', error);
