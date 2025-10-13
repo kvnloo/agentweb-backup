@@ -918,6 +918,23 @@ Use the available tools to create tasks in the agent-engine when complex work is
             required: ['topic']
           }
         }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'get_task_subscriber_metrics',
+          description: 'Get comprehensive email metrics for all subscribers of a specific task, including open rates, click-through rates, and engagement data',
+          parameters: {
+            type: 'object',
+            properties: {
+              task_id: {
+                type: 'string',
+                description: 'The ID of the task to get subscriber metrics for'
+              }
+            },
+            required: ['task_id']
+          }
+        }
       }
     ];
   }
@@ -1335,6 +1352,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.generateImage(args.prompt, args.filename, args.size || '1024x1024', args.quality || 'medium', args.inputImages || [], userId, sessionId);
         case 'create_blog_article':
           return await this.createBlogArticle(args.topic, args.keywords || '', args.tone || 'professional', args.length || 'medium', args.researchContext || '', args.requirements || '', userId, sessionId);
+      case 'get_task_subscriber_metrics':
+        return await this.getTaskSubscriberMetrics(args.task_id, userId);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -4082,6 +4101,29 @@ Use the available tools to create tasks in the agent-engine when complex work is
       return {
         success: false,
         message: 'Failed to create blog article',
+        error: error.message
+      };
+    }
+  }
+
+  /**
+   * Get task subscriber metrics for Agent Mode function calls
+   */
+  private async getTaskSubscriberMetrics(taskId: string, userId: string): Promise<any> {
+    try {
+      const { TaskSubscriberMetricsService } = await import('./taskSubscriberMetricsService');
+      const metrics = await TaskSubscriberMetricsService.getTaskSubscriberMetrics(taskId, userId);
+      
+      return {
+        success: true,
+        message: 'Task subscriber metrics retrieved successfully',
+        data: metrics
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error getting task subscriber metrics:', error);
+      return {
+        success: false,
+        message: 'Failed to get task subscriber metrics',
         error: error.message
       };
     }
