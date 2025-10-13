@@ -20,9 +20,17 @@ const asyncHandler = (fn: (req: Request, res: Response, next: express.NextFuncti
 // Get shared conversation (public)
 router.get('/share/:shareId', asyncHandler(agentModeController.getSharedConversation));
 
+// GET /api/agent-mode/ishare/:shareId
+// Get interactive shared conversation (with conversable token)
+router.get('/ishare/:shareId', asyncHandler(agentModeController.getSharedConversation));
+
 // POST /api/agent-mode/share/:shareId/generate
 // Generate response for shared conversation (with conversable token)
 router.post('/share/:shareId/generate', asyncHandler(agentModeController.generateSharedResponse));
+
+// POST /api/agent-mode/ishare/:shareId/generate
+// Generate response for interactive shared conversation (with conversable token)
+router.post('/ishare/:shareId/generate', asyncHandler(agentModeController.generateSharedResponse));
 
 // GET /api/agent-mode/public/welcome-message
 // Get current welcome message (public)
