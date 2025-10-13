@@ -41,6 +41,7 @@ import xml.etree.ElementTree as ET
 import json
 import csv
 import io
+import requests
 # Load environment variables
 load_dotenv()
 
@@ -546,6 +547,97 @@ class WebAgent:
             return None
 
     def _register_actions(self):
+        @self.controller.registry.action('search_web, an alternative to search_google')
+        def search_web(query: str, max_results: int = 5) -> ActionResult:
+            """Search the web using Google Custom Search API.
+            
+            Parameters:
+            - query: The search query string
+            - max_results: Maximum number of results to return (default 5, max 10)
+            
+            Environment variables required:
+            - GOOGLE_SEARCH_API_KEY
+            - GOOGLE_SEARCH_ENGINE_ID
+            """
+            try:
+                if not query or not isinstance(query, str):
+                    return ActionResult(error="Please provide a non-empty search query")
+
+                api_key = os.getenv('GOOGLE_SEARCH_API_KEY')
+                search_engine_id = os.getenv('GOOGLE_SEARCH_ENGINE_ID')
+
+                if not api_key or not search_engine_id:
+                    return ActionResult(error="Google Search API not configured. Set GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_ENGINE_ID in .env")
+
+                limit = max(1, min(int(max_results) if isinstance(max_results, int) else 5, 10))
+
+                params = {
+                    'key': api_key,
+                    'cx': search_engine_id,
+                    'q': query,
+                    'num': limit,
+                    'safe': 'medium',
+                    'fields': 'items(title,link,snippet,pagemap/metatags,pagemap/cse_thumbnail)'
+                }
+
+                resp = requests.get('https://www.googleapis.com/customsearch/v1', params=params, timeout=20)
+                if resp.status_code != 200:
+                    try:
+                        data = resp.json()
+                        message = data.get('error', {}).get('message') or data.get('message') or 'Unknown error'
+                    except Exception:
+                        message = resp.text
+                    return ActionResult(error=f"Google Search API error ({resp.status_code}): {message}")
+
+                data = resp.json()
+                items = data.get('items', []) or []
+                if not items:
+                    return ActionResult(extracted_content=f"No search results found for: {query}")
+
+                results = []
+                for item in items:
+                    metatags = None
+                    try:
+                        metatags = (item.get('pagemap', {}) or {}).get('metatags', [{}])[0]
+                    except Exception:
+                        metatags = None
+                    published = None
+                    if isinstance(metatags, dict):
+                        # Try a few common date meta keys
+                        for key in ['article:published_time', 'og:updated_time', 'date', 'dc.date', 'pubdate', 'last-modified']:
+                            if metatags.get(key):
+                                published = metatags.get(key)
+                                break
+
+                    thumb = None
+                    try:
+                        thumbs = (item.get('pagemap', {}) or {}).get('cse_thumbnail', [])
+                        if thumbs and isinstance(thumbs, list):
+                            thumb = thumbs[0].get('src')
+                    except Exception:
+                        thumb = None
+
+                    results.append({
+                        'title': item.get('title') or 'No title',
+                        'url': item.get('link') or '#',
+                        'snippet': item.get('snippet') or 'No description available',
+                        'publishedDate': published or datetime.now(timezone.utc).isoformat(),
+                        'thumbnail': thumb
+                    })
+
+                # Provide a concise, readable summary for the agent
+                lines = [f"Web search results for: {query}"]
+                for idx, r in enumerate(results, start=1):
+                    lines.append(f"{idx}. {r['title']}\n   {r['url']}\n   {r['snippet']}")
+
+                # Also include a JSON payload at the end to allow structured parsing
+                lines.append("\nJSON Results:")
+                lines.append(json.dumps({'results': results}, ensure_ascii=False))
+
+                return ActionResult(extracted_content='\n'.join(lines))
+            except Exception as e:
+                return ActionResult(error=f"Failed to perform web search: {str(e)}")
+
         @self.controller.registry.action('Get login credentials by domain')
         def get_login_credentials(domain: str) -> ActionResult:
             """Get login credentials for a domain based on use_shared_browser mode."""
