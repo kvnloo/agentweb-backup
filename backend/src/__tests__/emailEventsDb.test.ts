@@ -1,0 +1,312 @@
+import { emailEventsDb, EmailEvent } from '../services/emailEventsDb';
+import { dynamodb } from '../config/aws';
+
+// Mock the AWS DynamoDB
+jest.mock('../config/aws', () => ({
+  dynamodb: {
+    put: jest.fn(),
+    get: jest.fn(),
+    query: jest.fn(),
+    scan: jest.fn(),
+  },
+}));
+
+const mockDynamodb = dynamodb as jest.Mocked<typeof dynamodb>;
+
+describe('EmailEventsDb', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  describe('addEmailEvent', () => {
+    it('should add an email event successfully', async () => {
+      const mockEvent = {
+        type: 'email.delivered',
+        created_at: '2025-01-01T00:00:00.000Z',
+        data: {
+          email_id: 'email-123',
+          to: 'test@example.com',
+          from: 'sender@example.com',
+          subject: 'Test Email',
+        },
+      };
+
+      const emailDomain = 'example.com';
+      const eventId = 'event-123';
+
+      mockDynamodb.put.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      } as any);
+
+      const result = await emailEventsDb.addEmailEvent(mockEvent as any, emailDomain, eventId);
+
+      expect(mockDynamodb.put).toHaveBeenCalledWith({
+        TableName: expect.stringContaining('AW-EmailEvents'),
+        Item: expect.objectContaining({
+          eventId,
+          emailId: 'email-123',
+          emailDomain,
+          eventType: 'email.delivered',
+          createdAt: '2025-01-01T00:00:00.000Z',
+          data: mockEvent.data,
+          processedAt: expect.any(String),
+        }),
+      });
+
+      expect(result).toEqual(expect.objectContaining({
+        eventId,
+        emailId: 'email-123',
+        emailDomain,
+        eventType: 'email.delivered',
+        createdAt: '2025-01-01T00:00:00.000Z',
+        data: mockEvent.data,
+        processedAt: expect.any(String),
+      }));
+    });
+  });
+
+  describe('getEventsByEmailId', () => {
+    it('should return all events for an email ID with pagination', async () => {
+      const emailId = 'email-123';
+      const mockEvents: EmailEvent[] = [
+        {
+          eventId: 'event-1',
+          emailId,
+          emailDomain: 'example.com',
+          eventType: 'email.delivered',
+          createdAt: '2025-01-01T00:00:00.000Z',
+          data: { email_id: emailId },
+          processedAt: '2025-01-01T00:00:00.000Z',
+        },
+        {
+          eventId: 'event-2',
+          emailId,
+          emailDomain: 'example.com',
+          eventType: 'email.opened',
+          createdAt: '2025-01-01T01:00:00.000Z',
+          data: { email_id: emailId },
+          processedAt: '2025-01-01T01:00:00.000Z',
+        },
+      ];
+
+      // Mock pagination - first call returns partial data with LastEvaluatedKey
+      mockDynamodb.query
+        .mockReturnValueOnce({
+          promise: jest.fn().mockResolvedValue({
+            Items: [mockEvents[0]],
+            LastEvaluatedKey: { eventId: 'event-1' },
+          }),
+        } as any)
+        .mockReturnValueOnce({
+          promise: jest.fn().mockResolvedValue({
+            Items: [mockEvents[1]],
+            LastEvaluatedKey: undefined, // No more pages
+          }),
+        } as any);
+
+      const result = await emailEventsDb.getEventsByEmailId(emailId);
+
+      expect(mockDynamodb.query).toHaveBeenCalledTimes(2);
+      expect(result).toEqual(mockEvents);
+    });
+
+    it('should return empty array when no events found', async () => {
+      const emailId = 'email-123';
+
+      mockDynamodb.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Items: undefined,
+          LastEvaluatedKey: undefined,
+        }),
+      } as any);
+
+      const result = await emailEventsDb.getEventsByEmailId(emailId);
+
+      expect(result).toEqual([]);
+    });
+
+    it('should handle single page of results', async () => {
+      const emailId = 'email-123';
+      const mockEvent: EmailEvent = {
+        eventId: 'event-1',
+        emailId,
+        emailDomain: 'example.com',
+        eventType: 'email.delivered',
+        createdAt: '2025-01-01T00:00:00.000Z',
+        data: { email_id: emailId },
+        processedAt: '2025-01-01T00:00:00.000Z',
+      };
+
+      mockDynamodb.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Items: [mockEvent],
+          LastEvaluatedKey: undefined,
+        }),
+      } as any);
+
+      const result = await emailEventsDb.getEventsByEmailId(emailId);
+
+      expect(mockDynamodb.query).toHaveBeenCalledTimes(1);
+      expect(result).toEqual([mockEvent]);
+    });
+  });
+
+  describe('getEventsByEmailDomain', () => {
+    it('should return all events for an email domain with pagination', async () => {
+      const emailDomain = 'example.com';
+      const mockEvents: EmailEvent[] = [
+        {
+          eventId: 'event-1',
+          emailId: 'email-1',
+          emailDomain,
+          eventType: 'email.delivered',
+          createdAt: '2025-01-01T00:00:00.000Z',
+          data: { email_id: 'email-1' },
+          processedAt: '2025-01-01T00:00:00.000Z',
+        },
+        {
+          eventId: 'event-2',
+          emailId: 'email-2',
+          emailDomain,
+          eventType: 'email.opened',
+          createdAt: '2025-01-01T01:00:00.000Z',
+          data: { email_id: 'email-2' },
+          processedAt: '2025-01-01T01:00:00.000Z',
+        },
+      ];
+
+      // Mock pagination
+      mockDynamodb.query
+        .mockReturnValueOnce({
+          promise: jest.fn().mockResolvedValue({
+            Items: [mockEvents[0]],
+            LastEvaluatedKey: { eventId: 'event-1' },
+          }),
+        } as any)
+        .mockReturnValueOnce({
+          promise: jest.fn().mockResolvedValue({
+            Items: [mockEvents[1]],
+            LastEvaluatedKey: undefined,
+          }),
+        } as any);
+
+      const result = await emailEventsDb.getEventsByEmailDomain(emailDomain);
+
+      expect(mockDynamodb.query).toHaveBeenCalledTimes(2);
+      expect(result).toEqual(mockEvents);
+    });
+  });
+
+  describe('getEventById', () => {
+    it('should return an event by ID', async () => {
+      const eventId = 'event-123';
+      const mockEvent: EmailEvent = {
+        eventId,
+        emailId: 'email-123',
+        emailDomain: 'example.com',
+        eventType: 'email.delivered',
+        createdAt: '2025-01-01T00:00:00.000Z',
+        data: { email_id: 'email-123' },
+        processedAt: '2025-01-01T00:00:00.000Z',
+      };
+
+      mockDynamodb.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Item: mockEvent,
+        }),
+      } as any);
+
+      const result = await emailEventsDb.getEventById(eventId);
+
+      expect(mockDynamodb.get).toHaveBeenCalledWith({
+        TableName: expect.stringContaining('AW-EmailEvents'),
+        Key: { eventId },
+      });
+      expect(result).toEqual(mockEvent);
+    });
+
+    it('should return null when event not found', async () => {
+      const eventId = 'event-123';
+
+      mockDynamodb.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Item: undefined,
+        }),
+      } as any);
+
+      const result = await emailEventsDb.getEventById(eventId);
+
+      expect(result).toBeNull();
+    });
+  });
+
+  describe('eventExists', () => {
+    it('should return true when event exists', async () => {
+      const eventId = 'event-123';
+      const mockEvent: EmailEvent = {
+        eventId,
+        emailId: 'email-123',
+        emailDomain: 'example.com',
+        eventType: 'email.delivered',
+        createdAt: '2025-01-01T00:00:00.000Z',
+        data: { email_id: 'email-123' },
+        processedAt: '2025-01-01T00:00:00.000Z',
+      };
+
+      mockDynamodb.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Item: mockEvent,
+        }),
+      } as any);
+
+      const result = await emailEventsDb.eventExists(eventId);
+
+      expect(result).toBe(true);
+    });
+
+    it('should return false when event does not exist', async () => {
+      const eventId = 'event-123';
+
+      mockDynamodb.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Item: undefined,
+        }),
+      } as any);
+
+      const result = await emailEventsDb.eventExists(eventId);
+
+      expect(result).toBe(false);
+    });
+  });
+
+
+  describe('error handling', () => {
+    it('should propagate errors from DynamoDB operations', async () => {
+      const emailId = 'email-123';
+      const error = new Error('DynamoDB error');
+
+      mockDynamodb.query.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(error),
+      } as any);
+
+      await expect(emailEventsDb.getEventsByEmailId(emailId)).rejects.toThrow('DynamoDB error');
+    });
+
+    it('should handle errors in addEmailEvent', async () => {
+      const mockEvent = {
+        type: 'email.delivered',
+        created_at: '2025-01-01T00:00:00.000Z',
+        data: { email_id: 'email-123' },
+      };
+      const error = new Error('DynamoDB put error');
+
+      mockDynamodb.put.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(error),
+      } as any);
+
+      await expect(
+        emailEventsDb.addEmailEvent(mockEvent as any, 'example.com', 'event-123')
+      ).rejects.toThrow('DynamoDB put error');
+    });
+  });
+});

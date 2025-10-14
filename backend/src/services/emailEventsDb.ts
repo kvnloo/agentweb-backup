@@ -38,31 +38,63 @@ class EmailEventsDb {
   }
 
   async getEventsByEmailId(emailId: string): Promise<EmailEvent[]> {
-    const params = {
-      TableName: TABLE_NAME,
-      IndexName: 'EmailIdIndex',
-      KeyConditionExpression: 'emailId = :emailId',
-      ExpressionAttributeValues: {
-        ':emailId': emailId
-      }
-    };
+    const allItems: EmailEvent[] = [];
+    let lastEvaluatedKey: any = undefined;
 
-    const result = await dynamodb.query(params).promise();
-    return result.Items as EmailEvent[] || [];
+    do {
+      const params: any = {
+        TableName: TABLE_NAME,
+        IndexName: 'EmailIdIndex',
+        KeyConditionExpression: 'emailId = :emailId',
+        ExpressionAttributeValues: {
+          ':emailId': emailId
+        }
+      };
+
+      if (lastEvaluatedKey) {
+        params.ExclusiveStartKey = lastEvaluatedKey;
+      }
+
+      const result = await dynamodb.query(params).promise();
+      
+      if (result.Items) {
+        allItems.push(...(result.Items as EmailEvent[]));
+      }
+      
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+
+    return allItems;
   }
 
   async getEventsByEmailDomain(emailDomain: string): Promise<EmailEvent[]> {
-    const params = {
-      TableName: TABLE_NAME,
-      IndexName: 'EmailDomainIndex',
-      KeyConditionExpression: 'emailDomain = :emailDomain',
-      ExpressionAttributeValues: {
-        ':emailDomain': emailDomain
-      }
-    };
+    const allItems: EmailEvent[] = [];
+    let lastEvaluatedKey: any = undefined;
 
-    const result = await dynamodb.query(params).promise();
-    return result.Items as EmailEvent[] || [];
+    do {
+      const params: any = {
+        TableName: TABLE_NAME,
+        IndexName: 'EmailDomainIndex',
+        KeyConditionExpression: 'emailDomain = :emailDomain',
+        ExpressionAttributeValues: {
+          ':emailDomain': emailDomain
+        }
+      };
+
+      if (lastEvaluatedKey) {
+        params.ExclusiveStartKey = lastEvaluatedKey;
+      }
+
+      const result = await dynamodb.query(params).promise();
+      
+      if (result.Items) {
+        allItems.push(...(result.Items as EmailEvent[]));
+      }
+      
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+
+    return allItems;
   }
 
   async getEventById(eventId: string): Promise<EmailEvent | null> {
@@ -81,6 +113,7 @@ class EmailEventsDb {
     const event = await this.getEventById(eventId);
     return event !== null;
   }
+
 }
 
 export const emailEventsDb = new EmailEventsDb();
