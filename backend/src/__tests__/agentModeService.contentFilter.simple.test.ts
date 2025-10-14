@@ -59,6 +59,7 @@ describe('AgentModeService - Content Filtering Error Handling', () => {
 
       await expect(
         agentModeService.generateMarketingResponse(
+          'Test message',
           [{ role: 'user', content: 'Test message' }],
           'test-user',
           'test-session'
@@ -105,6 +106,7 @@ describe('AgentModeService - Content Filtering Error Handling', () => {
 
       await expect(
         agentModeService.generateMarketingResponse(
+          'Test message',
           [{ role: 'user', content: 'Test message' }],
           'test-user',
           'test-session'
@@ -148,6 +150,7 @@ describe('AgentModeService - Content Filtering Error Handling', () => {
 
       await expect(
         agentModeService.generateMarketingResponse(
+          'Test message',
           [{ role: 'user', content: 'Test message' }],
           'test-user',
           'test-session'
@@ -191,6 +194,7 @@ describe('AgentModeService - Content Filtering Error Handling', () => {
 
       await expect(
         agentModeService.generateMarketingResponse(
+          'Test message',
           [{ role: 'user', content: 'Test message' }],
           'test-user',
           'test-session'
@@ -231,6 +235,7 @@ describe('AgentModeService - Content Filtering Error Handling', () => {
 
       await expect(
         agentModeService.generateMarketingResponse(
+          'Test message',
           [{ role: 'user', content: 'Test message' }],
           'test-user',
           'test-session'
