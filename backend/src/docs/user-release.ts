@@ -14,6 +14,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Interactive share links use secure tokens for access control and can be shared via email or direct links',
       '- Scheduled chat email notifications now automatically include interactive share links for seamless conversation continuation',
       '- Separate from view-only share links, interactive shares enable full conversation participation',
+      'Supported loading email metrics in Agent Mode',
+      '- Added get_task_subscriber_metrics function call to retrieve email performance metrics for specific tasks',
+      '- Added get_task_subscriber_engagement_events function call to get detailed email engagement events by subject',
+      '- Both function calls provide the same data as the UI Email Metrics and Subscriber Details popups',
+      'Supported Email Notification list in Scheduled Chats',
+      '- Users can now configure multiple email addresses for scheduled chat notifications',
     ],
   },
   {

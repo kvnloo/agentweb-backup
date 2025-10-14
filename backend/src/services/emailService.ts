@@ -497,7 +497,7 @@ export const emailService = {
   },
 
   async sendScheduledChatResultEmail(
-    toEmail: string,
+    toEmails: string | string[],
     scheduleName: string,
     result: {
       passed: boolean;
@@ -644,11 +644,18 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
 
       const subject = `${statusIcon} Scheduled Chat: ${scheduleName} - ${statusText}`;
       
-      await this.sendEmail(toEmail, subject, text, html);
-      console.log(`Scheduled chat result email sent to: ${toEmail}`);
+      // Normalize to array for consistent handling
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      
+      // Send email to all addresses
+      const emailPromises = emailList.map(email => this.sendEmail(email, subject, text, html));
+      await Promise.allSettled(emailPromises);
+      
+      console.log(`Scheduled chat result emails sent to: ${emailList.join(', ')}`);
       
     } catch (error) {
-      console.error(`Error sending scheduled chat result email to ${toEmail}:`, error);
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      console.error(`Error sending scheduled chat result emails to ${emailList.join(', ')}:`, error);
       // Don't throw error - email failure shouldn't break the scheduled chat execution
     }
   }
