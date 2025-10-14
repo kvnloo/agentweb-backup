@@ -543,6 +543,26 @@ export const agentModeController = {
           });
           return;
         }
+        
+        if (error.message.includes('content policies') || error.message.includes('violate content policies')) {
+          res.status(400).json({ 
+            error: 'Content policy violation',
+            message: error.message,
+            code: 'CONTENT_FILTER',
+            suggestion: 'rephrase_message'
+          });
+          return;
+        }
+        
+        if (error.message.includes('high demand')) {
+          res.status(429).json({ 
+            error: 'Rate limit exceeded',
+            message: error.message,
+            code: 'RATE_LIMIT',
+            suggestion: 'wait_and_retry'
+          });
+          return;
+        }
       }
       
       res.status(500).json({ error: 'Failed to generate response' });
@@ -868,6 +888,26 @@ export const agentModeController = {
             message: 'The message content is too large to be saved. Please try with shorter content.',
             code: 'MESSAGE_TOO_LARGE',
             suggestion: 'shorten_content'
+          });
+          return;
+        }
+        
+        if (error.message.includes('content policies') || error.message.includes('violate content policies')) {
+          res.status(400).json({ 
+            error: 'Content policy violation',
+            message: error.message,
+            code: 'CONTENT_FILTER',
+            suggestion: 'rephrase_message'
+          });
+          return;
+        }
+        
+        if (error.message.includes('high demand')) {
+          res.status(429).json({ 
+            error: 'Rate limit exceeded',
+            message: error.message,
+            code: 'RATE_LIMIT',
+            suggestion: 'wait_and_retry'
           });
           return;
         }
@@ -1387,6 +1427,26 @@ export const agentModeController = {
             message: 'The message content is too large to be saved. Please try with shorter content.',
             code: 'MESSAGE_TOO_LARGE',
             suggestion: 'shorten_content'
+          });
+          return;
+        }
+        
+        if (error.message.includes('content policies') || error.message.includes('violate content policies')) {
+          res.status(400).json({ 
+            error: 'Content policy violation',
+            message: error.message,
+            code: 'CONTENT_FILTER',
+            suggestion: 'rephrase_message'
+          });
+          return;
+        }
+        
+        if (error.message.includes('high demand')) {
+          res.status(429).json({ 
+            error: 'Rate limit exceeded',
+            message: error.message,
+            code: 'RATE_LIMIT',
+            suggestion: 'wait_and_retry'
           });
           return;
         }
