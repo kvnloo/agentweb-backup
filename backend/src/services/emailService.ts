@@ -25,7 +25,7 @@ export const emailService = {
       .replace(/'/g, '&#39;');
   },
 
-  async sendEmail(to: string, subject: string, text: string, html: string, cc?: string) {
+  async sendEmail(to: string | string[], subject: string, text: string, html: string, cc?: string | string[]) {
     const mailOptions = {
       from: process.env.FROM_EMAIL,
       replyTo: 'support@agentweb.pro',
@@ -38,7 +38,9 @@ export const emailService = {
 
     try {
       await transporter.sendMail(mailOptions);
-      console.log('Email sent successfully to:', to, cc ? `CC: ${cc}` : '');
+      const toList = Array.isArray(to) ? to.join(', ') : to;
+      const ccList = cc ? (Array.isArray(cc) ? cc.join(', ') : cc) : '';
+      console.log('Email sent successfully to:', toList, cc ? `CC: ${ccList}` : '');
     } catch (error) {
       console.error('Error sending email:', error);
       // Don't throw - just log the error
@@ -647,11 +649,10 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       // Normalize to array for consistent handling
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       
-      // Send email to all addresses
-      const emailPromises = emailList.map(email => this.sendEmail(email, subject, text, html));
-      await Promise.allSettled(emailPromises);
+      // Send ONE email to all recipients
+      await this.sendEmail(emailList, subject, text, html);
       
-      console.log(`Scheduled chat result emails sent to: ${emailList.join(', ')}`);
+      console.log(`Scheduled chat result email sent to recipients: ${emailList.join(', ')}`);
       
     } catch (error) {
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
