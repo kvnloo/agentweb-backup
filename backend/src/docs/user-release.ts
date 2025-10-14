@@ -11,7 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
     changes: [
       'Added Support for Sending Test Email and Group Recipients for Scheduled Chats',
       '- Users can send a test notification email for any Test History record by providing an email address',
-      '- Scheduled chat notifications now send a single email addressed to all recipients instead of one-by-one'
+      '- Scheduled chat notifications now send a single email addressed to all recipients instead of one-by-one',
+      'Enhanced Founder Profile Management in Brand Guidelines',
+      '- Individual edit buttons for each founder entry instead of global edit mode',
+      '- Improved UX with Save/Cancel buttons for each founder entry',
+      'Fixed Agent Mode Session Jumping Bug',
+      '- Resolved issue where conversations would disappear after typing messages',
+      'Added Azure OpenAI Content Filtering Error Handling',
+      '- Graceful handling of content policy violations with user-friendly error messages',
     ],
   },
   {

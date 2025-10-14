@@ -174,9 +174,26 @@ export class AgentModeService {
         sources,
         responseMessages: messages.slice(initialMessageCount)
       };
-    } catch (error) {
+    } catch (error: any) {
       console.error('AgentMode: Response generation failed:', error);
-      throw new Error('Failed to generate response');
+      
+      // Handle Azure OpenAI content filtering errors specifically
+      if (error?.code === 'content_filter' || error?.error?.code === 'ResponsibleAIPolicyViolation') {
+        throw new Error('I apologize, but I cannot respond to that request as it may violate content policies. Please try rephrasing your question or asking about something else.');
+      }
+      
+      // Handle other OpenAI API errors
+      if (error?.status === 400) {
+        throw new Error('I encountered an issue processing your request. Please try rephrasing your question.');
+      }
+      
+      // Handle rate limiting
+      if (error?.status === 429) {
+        throw new Error('I\'m currently experiencing high demand. Please wait a moment and try again.');
+      }
+      
+      // Generic error fallback
+      throw new Error('I apologize, but I encountered an error processing your request. Please try again.');
     }
   }
 

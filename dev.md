@@ -139,3 +139,21 @@ aws dynamodb describe-table \
 Notes:
 - GSI creation is asynchronous; queries against `UserIdIndex` work after status becomes `ACTIVE`.
 - Replace `Dev-AW-TaskSchedules` with `AW-TaskSchedules` for production.
+
+## Port Management
+
+### Finding and Killing Processes on Port 3001
+
+When you need to free up port 3001 (commonly used by development servers), use these commands:
+
+1. **Find processes using port 3001:**
+   ```bash
+   lsof -ti:3001
+   ```
+   This will return the Process IDs (PIDs) of all processes using port 3001.
+
+2. **Kill the processes:**
+   ```bash
+   kill -9 <PID1> <PID2> ...
+   ```
+   Replace `<PID1>`, `<PID2>`, etc. with the actual PIDs returned from the previous command.
