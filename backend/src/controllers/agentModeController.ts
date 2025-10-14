@@ -955,7 +955,8 @@ export const agentModeController = {
               startingMessage,
               scheduleFrequency,
               keywords,
-              requiredFunctionCalls
+              requiredFunctionCalls,
+              emailNotifications
             } = req.body;
 
             if (!scheduleName || !startingMessage || !scheduleFrequency) {
@@ -985,6 +986,7 @@ export const agentModeController = {
               startingMessage,
               keywords: keywords || [],
               requiredFunctionCalls: requiredFunctionCalls || [],
+              emailNotifications: emailNotifications || [],
               status: 'active',
               nextRunTime: nextRunTime.toISOString(),
               createdAt: now.toISOString(),
@@ -1035,7 +1037,8 @@ export const agentModeController = {
               startingMessage,
               scheduleFrequency,
               keywords,
-              requiredFunctionCalls
+              requiredFunctionCalls,
+              emailNotifications
             } = req.body;
 
             if (!scheduleName || !startingMessage || !scheduleFrequency) {
@@ -1060,6 +1063,7 @@ export const agentModeController = {
               frequency: scheduleFrequency,
               keywords: keywords || [],
               requiredFunctionCalls: requiredFunctionCalls || [],
+              emailNotifications: emailNotifications || [],
               nextRunTime: nextRunTime.toISOString(),
               updatedAt: now.toISOString()
             };
@@ -1202,14 +1206,17 @@ export const agentModeController = {
              runScheduledChat(schedule, schedule.userId, false).then(async (result) => {
                // Send email notification with the result
                try {
-                 const user = await userDb.getUserById(schedule.userId);
-                 if (user && user.email) {
+                 // Only send emails if email notifications are specified
+                 const emailNotifications = schedule.emailNotifications || [];
+                 if (emailNotifications.length > 0) {
                    await emailService.sendScheduledChatResultEmail(
-                     user.email,
+                     emailNotifications,
                      schedule.scheduleName,
                      result,
                      schedule.scheduleId
                    );
+                 } else {
+                   console.log(`No email notifications configured for schedule ${schedule.scheduleName}, skipping email send`);
                  }
                } catch (error) {
                  console.error('Error sending scheduled chat result email:', error);
