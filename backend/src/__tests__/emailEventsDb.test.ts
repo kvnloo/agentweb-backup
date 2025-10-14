@@ -75,7 +75,13 @@ describe('EmailEventsDb', () => {
           emailDomain: 'example.com',
           eventType: 'email.delivered',
           createdAt: '2025-01-01T00:00:00.000Z',
-          data: { email_id: emailId },
+          data: {
+          email_id: emailId,
+          created_at: '2025-01-01T00:00:00.000Z',
+          from: 'sender@example.com',
+          to: ['test@example.com'],
+          subject: 'Test Email',
+        },
           processedAt: '2025-01-01T00:00:00.000Z',
         },
         {
@@ -84,7 +90,13 @@ describe('EmailEventsDb', () => {
           emailDomain: 'example.com',
           eventType: 'email.opened',
           createdAt: '2025-01-01T01:00:00.000Z',
-          data: { email_id: emailId },
+          data: {
+          email_id: emailId,
+          created_at: '2025-01-01T00:00:00.000Z',
+          from: 'sender@example.com',
+          to: ['test@example.com'],
+          subject: 'Test Email',
+        },
           processedAt: '2025-01-01T01:00:00.000Z',
         },
       ];
@@ -133,7 +145,13 @@ describe('EmailEventsDb', () => {
         emailDomain: 'example.com',
         eventType: 'email.delivered',
         createdAt: '2025-01-01T00:00:00.000Z',
-        data: { email_id: emailId },
+        data: {
+          email_id: emailId,
+          created_at: '2025-01-01T00:00:00.000Z',
+          from: 'sender@example.com',
+          to: ['test@example.com'],
+          subject: 'Test Email',
+        },
         processedAt: '2025-01-01T00:00:00.000Z',
       };
 
@@ -161,7 +179,13 @@ describe('EmailEventsDb', () => {
           emailDomain,
           eventType: 'email.delivered',
           createdAt: '2025-01-01T00:00:00.000Z',
-          data: { email_id: 'email-1' },
+          data: {
+          email_id: 'email-1',
+          created_at: '2025-01-01T00:00:00.000Z',
+          from: 'sender@example.com',
+          to: ['test@example.com'],
+          subject: 'Test Email',
+        },
           processedAt: '2025-01-01T00:00:00.000Z',
         },
         {
@@ -170,7 +194,13 @@ describe('EmailEventsDb', () => {
           emailDomain,
           eventType: 'email.opened',
           createdAt: '2025-01-01T01:00:00.000Z',
-          data: { email_id: 'email-2' },
+          data: {
+          email_id: 'email-2',
+          created_at: '2025-01-01T01:00:00.000Z',
+          from: 'sender@example.com',
+          to: ['test@example.com'],
+          subject: 'Test Email 2',
+        },
           processedAt: '2025-01-01T01:00:00.000Z',
         },
       ];
@@ -206,7 +236,13 @@ describe('EmailEventsDb', () => {
         emailDomain: 'example.com',
         eventType: 'email.delivered',
         createdAt: '2025-01-01T00:00:00.000Z',
-        data: { email_id: 'email-123' },
+        data: {
+          email_id: 'email-123',
+          created_at: '2025-01-01T00:00:00.000Z',
+          from: 'sender@example.com',
+          to: ['test@example.com'],
+          subject: 'Test Email',
+        },
         processedAt: '2025-01-01T00:00:00.000Z',
       };
 
@@ -249,7 +285,13 @@ describe('EmailEventsDb', () => {
         emailDomain: 'example.com',
         eventType: 'email.delivered',
         createdAt: '2025-01-01T00:00:00.000Z',
-        data: { email_id: 'email-123' },
+        data: {
+          email_id: 'email-123',
+          created_at: '2025-01-01T00:00:00.000Z',
+          from: 'sender@example.com',
+          to: ['test@example.com'],
+          subject: 'Test Email',
+        },
         processedAt: '2025-01-01T00:00:00.000Z',
       };
 
@@ -296,7 +338,13 @@ describe('EmailEventsDb', () => {
       const mockEvent = {
         type: 'email.delivered',
         created_at: '2025-01-01T00:00:00.000Z',
-        data: { email_id: 'email-123' },
+        data: {
+          email_id: 'email-123',
+          created_at: '2025-01-01T00:00:00.000Z',
+          from: 'sender@example.com',
+          to: ['test@example.com'],
+          subject: 'Test Email',
+        },
       };
       const error = new Error('DynamoDB put error');
 

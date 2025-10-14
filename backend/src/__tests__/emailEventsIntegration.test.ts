@@ -30,7 +30,13 @@ describe('Email Events Integration Tests', () => {
         emailDomain,
         eventType: 'email.delivered',
         createdAt: `2025-01-01T${String(i % 24).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}:00.000Z`,
-        data: { email_id: emailId },
+        data: {
+          email_id: emailId,
+          created_at: '2025-01-01T00:00:00.000Z',
+          from: 'sender@example.com',
+          to: ['test@example.com'],
+          subject: 'Test Email',
+        },
         processedAt: `2025-01-01T${String(i % 24).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}:00.000Z`,
       }));
 
@@ -91,7 +97,13 @@ describe('Email Events Integration Tests', () => {
           emailDomain: 'example.com',
           eventType: 'email.delivered',
           createdAt: '2025-01-01T00:00:00.000Z',
-          data: { email_id: emailId },
+          data: {
+          email_id: emailId,
+          created_at: '2025-01-01T00:00:00.000Z',
+          from: 'sender@example.com',
+          to: ['test@example.com'],
+          subject: 'Test Email',
+        },
           processedAt: '2025-01-01T00:00:00.000Z',
         },
       ];
@@ -119,7 +131,13 @@ describe('Email Events Integration Tests', () => {
         emailDomain,
         eventType: 'email.delivered',
         createdAt: `2025-01-01T${String(i % 24).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}:00.000Z`,
-        data: { email_id: `email-${Math.floor(i / 100) + 1}` },
+        data: {
+          email_id: `email-${Math.floor(i / 100) + 1}`,
+          created_at: '2025-01-01T00:00:00.000Z',
+          from: 'sender@example.com',
+          to: ['test@example.com'],
+          subject: 'Test Email',
+        },
         processedAt: `2025-01-01T${String(i % 24).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}:00.000Z`,
       }));
 
