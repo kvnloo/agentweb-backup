@@ -3,8 +3,6 @@ import { userDb } from './db';
 import { subscriberDb } from './db';
 
 export interface TaskSubscriberMetrics {
-  subscribers: any[];
-  events: any[];
   metrics: {
     timeline: Array<{
       date: string;
@@ -73,8 +71,6 @@ export class TaskSubscriberMetricsService {
       
       if (!subscribers || subscribers.length === 0) {
         return {
-          subscribers: [],
-          events: [],
           metrics: {
             timeline: [],
             totalEvents: 0,
@@ -89,8 +85,6 @@ export class TaskSubscriberMetricsService {
       
       if (!emailDomain) {
         return {
-          subscribers,
-          events: [],
           metrics: {
             timeline: [],
             totalEvents: 0,
@@ -298,8 +292,6 @@ export class TaskSubscriberMetricsService {
         .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
       return {
-        subscribers,
-        events: taskEvents,
         metrics: {
           timeline,
           totalEvents: taskEvents.length,
