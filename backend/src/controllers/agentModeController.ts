@@ -1174,6 +1174,57 @@ export const agentModeController = {
           }
         },
 
+        async sendScheduledChatTestEmail(req: Request, res: Response) {
+          try {
+            const user = req.user as User;
+            const { scheduleId, runId } = req.params as { scheduleId: string; runId: string };
+            const { toEmail } = req.body as { toEmail: string };
+
+            if (!toEmail) {
+              return res.status(400).json({ error: 'toEmail is required' });
+            }
+
+            // Verify schedule exists and belongs to user
+            const schedule = await scheduleDb.getScheduleById(scheduleId);
+            if (!schedule || schedule.userId !== user.userId) {
+              return res.status(404).json({ error: 'Scheduled chat not found' });
+            }
+
+            // Load test history and find the record
+            const testHistory = await scheduleDb.getRunResults(scheduleId);
+            const record = (testHistory || []).find((r: any) => r.runId === runId);
+            if (!record) {
+              return res.status(404).json({ error: 'Test record not found' });
+            }
+
+            // Build a result object compatible with emailService
+            const resultForEmail = {
+              passed: !!record.passed,
+              actualResponse: record.actualResponse || record.response || '',
+              keywordMatches: record.keywordMatches || [],
+              keywordMisses: record.keywordMisses || [],
+              functionCallMatches: record.functionCallMatches || [],
+              functionCallMisses: record.functionCallMisses || [],
+              executionTime: record.executionTime || 0,
+              sessionId: record.sessionId,
+              attempt: record.attempt || 1,
+              createdAt: record.createdAt || new Date().toISOString(),
+            };
+
+            await emailService.sendScheduledChatResultEmail(
+              [toEmail],
+              schedule.scheduleName,
+              resultForEmail,
+              schedule.scheduleId
+            );
+
+            res.json({ success: true });
+          } catch (error) {
+            console.error('AgentMode: Send scheduled chat test email error:', error);
+            res.status(500).json({ error: 'Failed to send test email' });
+          }
+        },
+
         async runScheduledChats(req: Request, res: Response) {
           try {
             // Get all scheduled chats that are ready to run

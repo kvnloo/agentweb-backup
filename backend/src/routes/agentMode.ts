@@ -144,4 +144,8 @@ router.delete('/scheduled-chats/:scheduleId', asyncHandler(agentModeController.d
 // Get test history for a scheduled chat
 router.get('/scheduled-chats/:scheduleId/test-history', asyncHandler(agentModeController.getScheduledChatTestHistory));
 
+// POST /api/agent-mode/scheduled-chats/:scheduleId/test-history/:runId/send-email
+// Send test notification email for a specific test history record
+router.post('/scheduled-chats/:scheduleId/test-history/:runId/send-email', asyncHandler(agentModeController.sendScheduledChatTestEmail));
+
 export default router;
