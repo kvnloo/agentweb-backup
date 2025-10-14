@@ -181,8 +181,8 @@ describe('Task Subscriber Metrics Integration Tests', () => {
       const result = await TaskSubscriberMetricsService.getTaskSubscriberMetrics('task123', 'user123');
 
       // Verify basic structure
-      expect(result.subscribers).toHaveLength(3);
-      expect(result.events).toHaveLength(6);
+      // subscribers property removed - no longer returned
+      // events property removed - no longer returned
       expect(result.metrics.totalEvents).toBe(6);
 
       // Verify event type counts
@@ -317,8 +317,8 @@ describe('Task Subscriber Metrics Integration Tests', () => {
       const result = await TaskSubscriberMetricsService.getTaskSubscriberMetrics('task123', 'user123');
 
       // Verify the structure matches the interface
-      expect(result).toHaveProperty('subscribers');
-      expect(result).toHaveProperty('events');
+      // subscribers property removed - no longer returned
+      // events property removed - no longer returned
       expect(result).toHaveProperty('metrics');
       expect(result.metrics).toHaveProperty('timeline');
       expect(result.metrics).toHaveProperty('totalEvents');
