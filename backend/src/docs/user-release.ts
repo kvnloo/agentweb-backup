@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-10-14',
+    changes: [
+      'Added Support for Sending Test Email and Group Recipients for Scheduled Chats',
+      '- Users can send a test notification email for any Test History record by providing an email address',
+      '- Scheduled chat notifications now send a single email addressed to all recipients instead of one-by-one'
+    ],
+  },
+  {
     date: '2025-10-13',
     changes: [
       'Supported Shared Interactive Link in Agent Mode',
