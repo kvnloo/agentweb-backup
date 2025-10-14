@@ -19,6 +19,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Resolved issue where conversations would disappear after typing messages',
       'Added Azure OpenAI Content Filtering Error Handling',
       '- Graceful handling of content policy violations with user-friendly error messages',
+      'Improved Email Events Data Loading',
+      '- Fixed issue where email events data was not fully loaded when fetching large datasets',
     ],
   },
   {
