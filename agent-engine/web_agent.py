@@ -4001,9 +4001,24 @@ class WebAgent:
             logger.info(f"Task run by user {self.run_user_id} who is not the owner. Setting headless=false to allow admin interaction.")
             headless = False
             
-        # Initialize BrowserSession (new API) without explicit BrowserConfig
-        # Headless is managed internally; turning off headless is handled by flags above
+        # Initialize Browser (alias to BrowserSession) without explicit BrowserConfig
         self.browser = Browser()
+
+        # Provide config expected by Agent in 0.8.x via browser.config.new_context_config
+        try:
+            from types import SimpleNamespace
+            if not hasattr(self.browser, 'config') or self.browser.config is None:
+                self.browser.config = SimpleNamespace()
+            # Set cookies and downloads path so new contexts pick them up
+            self.browser.config.new_context_config = {
+                'cookies_file': cookies_path,
+                'save_downloads_path': downloads_path,
+            }
+        except Exception as e:
+            logger.warning(f"Failed to set browser new_context_config: {e}")
+
+        # Ensure headless flag respected via env (used by browser-use startup)
+        os.environ['BROWSER_HEADLESS'] = 'false' if not headless else 'true'
         
         # Get all credentials for log filtering
         if self.user_id:
