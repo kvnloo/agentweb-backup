@@ -706,15 +706,23 @@ export const getTaskExecutionPublic = async (req: Request, res: Response) => {
       return res.status(404).json({ message: 'Session not found' });
     }
 
-    // Check if the session is shared
-    if (!session.shareMetadata?.isShared) {
+    // Check if the session is shared (either view-only or interactive)
+    const hasViewOnlyShare = session.shareMetadata?.isShared;
+    const hasInteractiveShare = session.interactiveShareMetadata?.isActive;
+    
+    if (!hasViewOnlyShare && !hasInteractiveShare) {
       return res.status(404).json({ message: 'Session is not shared' });
     }
 
-    // Check if the session has expired
-    if (session.shareMetadata.expiresAt && new Date() > new Date(session.shareMetadata.expiresAt)) {
+    // Check if the session has expired (for view-only shares)
+    if (hasViewOnlyShare && session.shareMetadata?.expiresAt && new Date() > new Date(session.shareMetadata.expiresAt)) {
       return res.status(410).json({ message: 'Share link has expired' });
     }
+    
+    // Check if the interactive share has expired (interactive shares don't have expiration for now)
+    // if (hasInteractiveShare && session.interactiveShareMetadata?.expiresAt && new Date() > new Date(session.interactiveShareMetadata.expiresAt)) {
+    //   return res.status(410).json({ message: 'Interactive share link has expired' });
+    // }
 
     // Verify that the task execution exists in this session's messages
     let taskExecutionFound = false;

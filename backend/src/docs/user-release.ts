@@ -7,6 +7,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-10-15',
+    changes: [
+      'Fixed Interactive Share Link Task Results Display',
+      '- Resolved issue where interactive share links were not displaying task execution results properly',
+    ],
+  },
+  {
     date: '2025-10-14',
     changes: [
       'Added Support for Sending Test Email and Group Recipients for Scheduled Chats',
