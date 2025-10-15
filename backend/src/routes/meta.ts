@@ -991,5 +991,148 @@ router.post("/create-ad", async (req, res) => {
   }
 });
 
+// Search Meta Ad Library
+router.get("/ad-library", async (req, res) => {
+  const userId = (req as any).user.userId;
+  const {
+    search_terms,
+    ad_active_status = "ALL",
+    ad_reached_countries = "US",
+    publisher_platforms = "facebook,instagram",
+    media_type = "ALL",
+    ad_type = "ALL",
+    impressions = "ALL",
+    spend = "ALL",
+    languages = "en",
+    after
+  } = req.query;
+
+  try {
+    // Validate required parameters
+    if (!search_terms || typeof search_terms !== 'string' || search_terms.trim() === '') {
+      return res.status(400).json({ 
+        error: "search_terms is required",
+        message: "Please provide search terms to search the ad library"
+      });
+    }
+
+    // Get Meta API access token from Secrets Manager
+    let accessToken: string;
+    try {
+      accessToken = await getMetaAccessToken();
+    } catch (error: any) {
+      console.error("Error fetching Meta access token:", error);
+      return res.status(500).json({ 
+        error: "Meta access token not configured",
+        message: "Failed to fetch access token from Secrets Manager"
+      });
+    }
+
+    // Use a stable API version for Ad Library
+    const apiVersion = 'v24.0';
+    
+    console.log("=== Searching Meta Ad Library ===");
+    console.log("Search terms:", search_terms);
+    console.log("Filters:", {
+      ad_active_status,
+      ad_reached_countries,
+      publisher_platforms,
+      media_type,
+      ad_type,
+      impressions,
+      spend,
+      languages
+    });
+
+    // Build the Ad Library API URL with proper parameters
+    const baseUrl = `https://graph.facebook.com/${apiVersion}/ads_archive`;
+    const params = new URLSearchParams({
+      search_terms: search_terms.trim(),
+      access_token: accessToken,
+      limit: '25', // Limit results per page
+      ad_reached_countries: ad_reached_countries as string, // Required parameter
+      ad_active_status: ad_active_status as string, // Required parameter
+      publisher_platforms: publisher_platforms as string, // Required parameter
+    });
+
+    // Add optional parameters only if they're not default values
+    if (media_type !== 'ALL') {
+      params.append('media_type', media_type as string);
+    }
+    if (ad_type !== 'ALL') {
+      params.append('ad_type', ad_type as string);
+    }
+    if (impressions !== 'ALL') {
+      params.append('impressions', impressions as string);
+    }
+    if (spend !== 'ALL') {
+      params.append('spend', spend as string);
+    }
+    if (languages !== 'en') {
+      params.append('languages', languages as string);
+    }
+
+    // Add pagination cursor if provided
+    if (after && typeof after === 'string') {
+      params.append('after', after);
+    }
+
+    const adLibraryUrl = `${baseUrl}?${params.toString()}`;
+    console.log("Ad Library URL:", adLibraryUrl);
+
+    // Make the API request
+    const response = await fetch(adLibraryUrl);
+    const data = await response.json();
+
+    console.log("Ad Library API Response:", JSON.stringify(data, null, 2));
+
+    if (data.error) {
+      console.error("Ad Library API Error:", data.error);
+      
+      // Handle specific error cases
+      if (data.error.code === 1) {
+        // OAuth error - likely permission or token issue
+        throw new Error(`Ad Library API Error: Access denied. The access token may not have the required permissions for Ad Library access, or the Ad Library API may not be available in your region. (Code: ${data.error.code})`);
+      } else if (data.error.code === 10) {
+        // Permission error - most common for Ad Library
+        throw new Error(`Ad Library API Error: Application does not have permission for this action. The access token does not have the required permissions for Ad Library access. Please ensure your Meta API token has Ad Library permissions. (Code: ${data.error.code})`);
+      } else if (data.error.code === 190) {
+        // Invalid access token
+        throw new Error(`Ad Library API Error: Invalid access token. Please check your Meta API configuration. (Code: ${data.error.code})`);
+      } else if (data.error.code === 100) {
+        // Invalid parameter
+        throw new Error(`Ad Library API Error: Invalid parameter. ${data.error.message} (Code: ${data.error.code})`);
+      } else {
+        throw new Error(`Ad Library API Error: ${data.error.message} (Code: ${data.error.code})`);
+      }
+    }
+
+    if (!response.ok) {
+      throw new Error(`HTTP Error: ${response.status} ${response.statusText}`);
+    }
+
+    // Process the response data
+    const processedData = {
+      data: data.data || [],
+      paging: data.paging || null
+    };
+
+    console.log(`Successfully fetched ${processedData.data.length} ads from Ad Library`);
+
+    res.json(processedData);
+
+  } catch (error: any) {
+    console.error("Error searching ad library:", error);
+    
+    const errorMessage = error.message || "Unknown error";
+    const errorDetails = error.details || null;
+    
+    res.status(500).json({
+      error: errorMessage,
+      details: errorDetails,
+      message: "Failed to search Meta Ad Library"
+    });
+  }
+});
 
 export default router;
