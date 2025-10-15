@@ -153,7 +153,7 @@ describe('Interactive Share Public Endpoint Tests', () => {
         interactiveShareMetadata: { isActive: false }
       };
       mockChatbotDb.getChatSession.mockResolvedValue(mockSession as any);
-      mockTaskDb.getTaskExecutionById.mockResolvedValue(null);
+      mockTaskDb.getTaskExecutionById.mockResolvedValue(undefined);
 
       const response = await request(app)
         .get(`/api/tasks/${taskId}/executions/${executionId}/public?sessionId=${sessionId}`);
