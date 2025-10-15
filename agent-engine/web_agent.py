@@ -43,6 +43,14 @@ import requests
 # Load environment variables
 load_dotenv()
 
+# Pre-set headless env if user toggles via TURN OFF HEADLESS flag or env; this must be
+# done before browser_use initializes to ensure the correct headless mode is applied.
+try:
+    if os.getenv('BROWSER_HEADLESS') is not None:
+        os.environ['BROWSER_USE_HEADLESS'] = 'true' if os.getenv('BROWSER_HEADLESS','true').lower() == 'true' else 'false'
+except Exception:
+    pass
+
 # Get table prefix based on NODE_ENV
 TABLE_PREFIX = 'Dev-' if os.getenv('NODE_ENV') == 'development' else ''
 
@@ -4001,6 +4009,9 @@ class WebAgent:
             logger.info(f"Task run by user {self.run_user_id} who is not the owner. Setting headless=false to allow admin interaction.")
             headless = False
             
+        # Ensure headless flag respected via env (browser-use reads BROWSER_USE_HEADLESS)
+        os.environ['BROWSER_USE_HEADLESS'] = 'false' if not headless else 'true'
+
         # Initialize Browser (alias to BrowserSession) without explicit BrowserConfig
         self.browser = Browser()
 
@@ -4016,9 +4027,6 @@ class WebAgent:
             }
         except Exception as e:
             logger.warning(f"Failed to set browser new_context_config: {e}")
-
-        # Ensure headless flag respected via env (used by browser-use startup)
-        os.environ['BROWSER_HEADLESS'] = 'false' if not headless else 'true'
         
         # Get all credentials for log filtering
         if self.user_id:
