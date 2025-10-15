@@ -32,8 +32,7 @@ def run_all_tests():
     # Run tests that don't require external dependencies first
     standalone_tests = [
         "tests/test_validate_content_format_standalone.py",
-        "tests/test_browser_use_integration.py::TestBrowserUseIntegration::test_action_result_creation",
-        "tests/test_browser_use_integration.py::TestBrowserUseIntegration::test_action_result_with_metadata",
+        "tests/test_browser_use_integration.py",
         "tests/test_memory_fix_comprehensive.py",
         "tests/test_azure_openai_with_memory_fix.py",
     ]
@@ -56,10 +55,7 @@ def run_browser_use_tests():
     print("Running browser-use integration tests...")
     
     tests = [
-        "tests/test_browser_use_integration.py::TestBrowserUseIntegration::test_action_result_creation",
-        "tests/test_browser_use_integration.py::TestBrowserUseIntegration::test_action_result_with_metadata",
-        "tests/test_browser_use_integration.py::TestBrowserUseErrorHandling::test_action_result_error_handling",
-        "tests/test_browser_use_integration.py::TestBrowserUseErrorHandling::test_action_result_validation",
+        "tests/test_browser_use_integration.py",
     ]
     
     success_count = 0

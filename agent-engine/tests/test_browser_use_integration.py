@@ -339,25 +339,20 @@ class TestBrowserUseErrorHandling(unittest.TestCase):
         
     def test_agent_initialization_error_handling(self):
         """Test Agent initialization with invalid parameters."""
-        # Test with None LLM - this might not raise an error immediately
-        # depending on how the Agent handles validation
+        # Test with None LLM - this should raise an error during LLM verification
         mock_browser = Mock(spec=Browser)
         mock_browser.config = Mock()
         mock_browser.config.new_context_config = Mock()
         
-        try:
+        # The Agent constructor should raise an error when llm=None
+        # because it tries to verify the LLM connection
+        with self.assertRaises((TypeError, ValueError, AttributeError)):
             agent = Agent(
                 task="test",
                 llm=None,
                 controller=self.controller,
                 browser=mock_browser
             )
-            # If it doesn't raise an error, that's also acceptable
-            # The error might occur later when the agent is actually used
-            self.assertIsInstance(agent, Agent)
-        except (TypeError, ValueError):
-            # This is also acceptable - the agent should reject invalid LLM
-            pass
             
     def test_browser_config_error_handling(self):
         """Test BrowserConfig with invalid parameters."""
