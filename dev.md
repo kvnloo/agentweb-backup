@@ -157,3 +157,57 @@ When you need to free up port 3001 (commonly used by development servers), use t
    kill -9 <PID1> <PID2> ...
    ```
    Replace `<PID1>`, `<PID2>`, etc. with the actual PIDs returned from the previous command.
+
+## Memory System Issues (October 14, 2025)
+
+### Azure OpenAI Models Failing with Database Errors
+
+If Azure OpenAI models (gpt-4o, gpt-4.1) fail with errors like:
+- `"there is already another table or index with this name: old_history"`
+- `"no such column: prev_value"`
+
+This indicates corrupted memory database files in the mem0 system used by browser-use.
+
+### Quick Fix
+
+Run the memory cleanup script:
+```bash
+cd agent-engine
+conda activate agent-engine
+python memory_fix_v2.py
+```
+
+This will:
+- Clean up all corrupted mem0 database files
+- Configure memory system to use in-memory database
+- Resolve database schema issues
+
+### Manual Cleanup (if script not available)
+
+```bash
+# Remove all mem0 directories
+rm -rf /tmp/mem0_*
+rm -rf ~/.mem0
+
+# Set environment variables
+export MEM0_DATABASE_URL="sqlite:///:memory:"
+export MEM0_BACKEND="sqlite"
+```
+
+### Prevention
+
+The memory fix only needs to be applied once when the issue occurs. It doesn't need to run automatically on every startup.
+
+### Alternative: Disable Memory Entirely
+
+If memory issues persist, you can disable the memory system:
+```bash
+export MEM0_DISABLED="true"
+export BROWSER_USE_MEMORY_DISABLED="true"
+```
+
+### Files Created for Reference
+
+- `agent-engine/memory_fix_v2.py` - Enhanced memory fix script
+- `agent-engine/tests/test_memory_fix_v2.py` - Comprehensive tests
+- `agent-engine/MEMORY_FIX_V2_SUMMARY.md` - Detailed documentation

@@ -163,32 +163,218 @@ conda env update -f environment.yml
 
 ### Running Tests
 
-The agent engine includes unit tests to ensure functionality works as expected. To run the tests:
+The agent engine includes comprehensive unit tests to ensure functionality works as expected. All test files are organized under the `tests/` directory.
+
+#### Prerequisites
 
 1. Activate the conda environment:
 ```bash
 conda activate agent-engine
 ```
 
-2. Run all tests:
+2. Ensure all dependencies are installed:
 ```bash
+pip install -r requirements.txt
+```
+
+#### Running All Tests
+
+Run the complete test suite:
+```bash
+# Run the test runner script (recommended)
 python run_tests.py
+
+# Or run all tests with verbose output
+python -m unittest discover tests/ -v
 ```
 
-3. Run a specific test file:
+**Note**: Some tests may require specific environment variables or external dependencies. Use the test runner script for better error handling and organized output.
+
+#### Running Specific Test Categories
+
+**Browser-Use Integration Tests:**
 ```bash
-python -m unittest tests/test_validate_content_format.py
+# Test browser-use library integration and compatibility
+python -m unittest tests.test_browser_use_integration -v
+
+# Verify browser-use upgrade
+python tests/verify_browser_use_upgrade.py
 ```
 
-4. Run standalone tests (no dependencies):
+**Core Functionality Tests:**
 ```bash
+# Test task monitoring functionality
+python -m unittest tests.test_task_monitor -v
+
+# Test task utilities
+python -m unittest tests.test_task_utils -v
+
+# Test content validation
+python -m unittest tests.test_validate_content_format -v
+```
+
+**AI Model Integration Tests:**
+```bash
+# Test Gemini integration
+python tests/test_gemini.py
+
+# Test Gemini with browser automation
+python tests/test_gemini.py --browser-use
+
+# Test Azure GPT image generation
+python -m unittest tests.test_azure_gpt_image -v
+
+# Test image generation
+python -m unittest tests.test_image_generation -v
+```
+
+**File Processing Tests:**
+```bash
+# Test file upload functionality
+python -m unittest tests.test_file_upload -v
+
+# Test downloads functionality
+python -m unittest tests.test_downloads -v
+
+# Test SVG conversion
+python -m unittest tests.test_svg_conversion -v
+```
+
+**Standalone Tests (No Dependencies):**
+```bash
+# Run standalone content validation tests
 python tests/test_validate_content_format_standalone.py
 ```
 
-#### Available Tests
+#### Available Test Files
 
-- `test_validate_content_format.py`: Tests for the content format validation function
-- `test_task_monitor.py`: Tests for the task monitoring functionality
+**Core Functionality:**
+- `test_task_monitor.py`: Tests for task monitoring and scheduling
+- `test_task_utils.py`: Tests for task utility functions
+- `test_validate_content_format.py`: Tests for content format validation
+- `test_validate_content_format_standalone.py`: Standalone validation tests
+
+**Browser-Use Integration:**
+- `test_browser_use_integration.py`: Comprehensive browser-use library tests
+- `test_browser_use_upgrade.py`: Browser-use upgrade verification
+- `verify_browser_use_upgrade.py`: Conda environment verification
+
+**AI Model Integration:**
+- `test_gemini.py`: Google Gemini model integration tests
+- `test_azure_gpt_image.py`: Azure GPT image generation tests
+- `test_image_generation.py`: Image generation functionality tests
+- `test_image_model.py`: Image model configuration tests
+- `test_pld_deepseek.py`: DeepSeek model integration tests
+
+**File Processing:**
+- `test_file_upload.py`: File upload functionality tests
+- `test_downloads.py`: Download functionality tests
+- `test_svg_conversion.py`: SVG conversion tests
+- `test_file_has_relative_images.py`: Relative image handling tests
+
+**Other Features:**
+- `test_knowledge_base.py`: Knowledge base functionality tests
+- `test_autogen.py`: AutoGen integration tests
+- `test_extract_page_content.py`: Page content extraction tests
+- `test_extract_json_from_content.py`: JSON extraction tests
+
+#### Test Configuration
+
+**Environment Variables for Testing:**
+```bash
+# Required for AI model tests
+export GEMINI_API_KEY=your_gemini_api_key
+export AZURE_OPENAI_API_KEY=your_azure_api_key
+export AZURE_OPENAI_ENDPOINT=your_azure_endpoint
+
+# Required for backend integration tests
+export BACKEND_URL=http://localhost:3001
+
+# Optional for email tests
+export RESEND_API_KEY=your_resend_api_key
+```
+
+**Test Data:**
+- Test files and sample data are located in the `tests/` directory
+- Mock data is generated automatically for most tests
+- Some tests require specific test files (see individual test files for details)
+
+#### Adding New Tests
+
+To add new tests:
+
+1. Create a new test file in the `tests/` directory:
+```bash
+touch tests/test_new_feature.py
+```
+
+2. Follow the existing test patterns:
+```python
+import unittest
+from unittest.mock import Mock, patch
+import sys
+import os
+
+# Add the parent directory to the path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+class TestNewFeature(unittest.TestCase):
+    def setUp(self):
+        """Set up test fixtures."""
+        pass
+    
+    def test_feature_functionality(self):
+        """Test the new feature."""
+        # Your test code here
+        self.assertTrue(True)
+    
+    def tearDown(self):
+        """Clean up after tests."""
+        pass
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
+3. Run your new test:
+```bash
+python -m unittest tests.test_new_feature -v
+```
+
+#### Test Coverage
+
+The test suite covers:
+- ✅ Core task monitoring and scheduling functionality
+- ✅ Browser automation and web scraping
+- ✅ AI model integrations (Gemini, Azure GPT, DeepSeek)
+- ✅ File processing and upload/download functionality
+- ✅ Content validation and extraction
+- ✅ Error handling and edge cases
+- ✅ API integrations and external services
+
+#### Test Status
+
+**Working Tests:**
+- ✅ `test_validate_content_format_standalone.py` - Content validation tests
+- ✅ `test_browser_use_integration.py` - Browser-use library integration
+- ✅ `verify_browser_use_upgrade.py` - Browser-use upgrade verification
+
+**Tests Requiring Updates:**
+- ⚠️ `test_task_monitor.py` - Some tests may need environment setup
+- ⚠️ `test_task_utils.py` - Function signatures may have changed
+- ⚠️ AI model tests - Require API keys and external dependencies
+
+**Running Individual Tests:**
+```bash
+# Run a specific working test
+python -m unittest tests.test_validate_content_format_standalone -v
+
+# Run browser-use verification
+python tests/verify_browser_use_upgrade.py
+
+# Run browser-use integration tests
+python -m unittest tests.test_browser_use_integration.TestBrowserUseIntegration.test_action_result_creation -v
+```
 
 ## Integration
 
@@ -303,55 +489,9 @@ http://localhost:3000/tasks/123456
   - `frequency` (String): daily, weekly, monthly
   - `status` (String): active, paused
 
-## Unit Tests
+## Test Organization
 
-The test suite (`tests/test_task_monitor.py`) covers the core functionality of the task monitor:
-
-### Running Tests
-```bash
-# Activate conda environment
-conda activate agent-engine
-
-# Run tests with verbose output
-python -m unittest tests/test_task_monitor.py -v
-```
-
-### Test Coverage
-
-1. Execution Monitoring
-   - `test_get_pending_executions_no_last_time`: Tests basic execution querying
-   - `test_get_pending_executions_with_last_time`: Tests timestamp optimization
-   - `test_create_execution`: Validates execution creation
-   - `test_update_execution_status`: Tests status updates for success/failure
-
-2. Schedule Management
-   - `test_get_due_schedules`: Tests schedule querying
-   - `test_update_schedule_next_run_time`: Tests next run time calculations
-     - Daily schedules: Next day at 9:00 AM
-     - Weekly schedules: Next week at 9:00 AM
-     - Monthly schedules: Next month at 9:00 AM
-
-### Adding New Tests
-
-To add new tests:
-1. Add test methods to `TestTaskMonitor` class in `tests/test_task_monitor.py`
-2. Use `@patch` decorators to mock DynamoDB interactions
-3. Follow existing patterns for setup and assertions
-
-Example:
-```python
-@patch('task_monitor.executions_table')
-def test_new_feature(self, mock_table):
-    # Setup test data
-    mock_table.query.return_value = {'Items': [...]}
-    
-    # Call function
-    result = your_function()
-    
-    # Verify behavior
-    self.assertEqual(result, expected_result)
-    mock_table.query.assert_called_once_with(...)
-```
+All test files are organized under the `tests/` directory for better maintainability and discoverability. The test suite includes comprehensive coverage of all major functionality areas.
 
 # Upgrade a python package
 pip install --upgrade <package_name, e.g., browser use>
