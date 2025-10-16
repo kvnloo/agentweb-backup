@@ -16,11 +16,11 @@ export interface TaskSubscriberMetrics {
       [subject: string]: {
         sent: number;
         delivered: number;
-        opened: number;
+        opened?: number;
         clicked: number;
         bounced: number;
         failed: number;
-        openRate: number;
+        openRate?: number;
         clickThroughRate: number;
         engagedEmails: string[];
       };
@@ -131,7 +131,7 @@ export class TaskSubscriberMetricsService {
         clicked: number;
         bounced: number;
         failed: number;
-        openRate: number;
+        openRate?: number;
         clickThroughRate: number;
         engagedEmails: string[];
       } } = {};
@@ -162,7 +162,6 @@ export class TaskSubscriberMetricsService {
             clicked: 0,
             bounced: 0,
             failed: 0,
-            openRate: 0,
             clickThroughRate: 0,
             engagedEmails: []
           };
@@ -256,7 +255,6 @@ export class TaskSubscriberMetricsService {
                   clicked: 0,
                   bounced: 0,
                   failed: 0,
-                  openRate: 0,
                   clickThroughRate: 0,
                   engagedEmails: []
                 };
@@ -268,10 +266,20 @@ export class TaskSubscriberMetricsService {
       });
 
       // Calculate rates for each subject using unique recipients
+      const processedSubjectMetrics: { [subject: string]: any } = {};
       Object.keys(subjectMetrics).forEach(subject => {
         const metrics = subjectMetrics[subject];
-        metrics.openRate = metrics.delivered > 0 ? (metrics.opened / metrics.delivered) * 100 : 0;
         metrics.clickThroughRate = metrics.delivered > 0 ? (metrics.clicked / metrics.delivered) * 100 : 0;
+        
+        // Only include opened and openRate if opened > 0 (opened tracking is enabled)
+        if (metrics.opened > 0) {
+          metrics.openRate = metrics.delivered > 0 ? (metrics.opened / metrics.delivered) * 100 : 0;
+          processedSubjectMetrics[subject] = metrics;
+        } else {
+          // Remove opened and openRate when opened is 0 (opened tracking disabled)
+          const { opened, openRate, ...metricsWithoutOpened } = metrics;
+          processedSubjectMetrics[subject] = metricsWithoutOpened;
+        }
       });
       
       // Convert to timeline array
@@ -296,7 +304,7 @@ export class TaskSubscriberMetricsService {
           timeline,
           totalEvents: taskEvents.length,
           eventTypes,
-          subjectMetrics
+          subjectMetrics: processedSubjectMetrics
         }
       };
     } catch (error: any) {

@@ -11,6 +11,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
     changes: [
       'Fixed Interactive Share Link Task Results Display',
       '- Resolved issue where interactive share links were not displaying task execution results properly',
+      'Enhanced Email Metrics Display with Smart Open Tracking',
+      '- Email metrics now intelligently hide opened count and open rate when open tracking is disabled',
     ],
   },
   {
