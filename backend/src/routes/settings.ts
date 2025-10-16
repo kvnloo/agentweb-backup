@@ -89,76 +89,79 @@ export default router;
 // Get email_campaign_tasks (customer accessible)
 router.get('/customer/email-campaign-tasks', authenticateToken, async (req, res) => {
   try {
-    const setting = await settingsService.getSetting('email_campaign_tasks');
-    const value = setting?.settingValue || '[]';
-    let list: string[] = [];
-    try {
-      const parsed = JSON.parse(value);
-      list = Array.isArray(parsed) ? parsed : [];
-    } catch {
-      list = [];
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
     }
-    res.json({ taskIds: list });
+    const setting = await settingsService.getSetting(`user-${userId}-email_campaign_tasks`);
+    let taskIds: string[] = [];
+    if (setting) {
+      try {
+        const parsed = JSON.parse(setting.settingValue);
+        taskIds = Array.isArray(parsed) ? parsed : [];
+      } catch {
+        taskIds = [];
+      }
+    }
+    res.json({ taskIds });
   } catch (error) {
-    console.error('Error getting email_campaign_tasks:', error);
-    res.status(500).json({ error: 'Failed to get email_campaign_tasks' });
+    console.error('Error getting customer email campaign tasks:', error);
+    res.status(500).json({ error: 'Failed to get email campaign tasks' });
   }
 });
 
 // Add a taskId to email_campaign_tasks (customer accessible)
 router.post('/customer/email-campaign-tasks/:taskId', authenticateToken, async (req, res) => {
   try {
+    const userId = req.user?.userId;
     const { taskId } = req.params;
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
     if (!taskId) {
       return res.status(400).json({ error: 'taskId is required' });
     }
 
-    const existing = await settingsService.getSetting('email_campaign_tasks');
-    const currentValue = existing?.settingValue || '[]';
-    let list: string[] = [];
-    try {
-      const parsed = JSON.parse(currentValue);
-      list = Array.isArray(parsed) ? parsed : [];
-    } catch {
-      list = [];
+    const settingName = `user-${userId}-email_campaign_tasks`;
+    const existingSetting = await settingsService.getSetting(settingName);
+    let taskIds: string[] = existingSetting ? JSON.parse(existingSetting.settingValue) : [];
+
+    if (!taskIds.includes(taskId)) {
+      taskIds.push(taskId);
+      await settingsService.setSetting(settingName, JSON.stringify(taskIds), 'User-monitored email campaign tasks', req.user?.email);
     }
-    if (!list.includes(taskId)) {
-      list.push(taskId);
-    }
-    const updated = JSON.stringify(list);
-    const updatedBy = req.user?.email || 'customer';
-    await settingsService.setSetting('email_campaign_tasks', updated, 'Task IDs monitored by Campaign Performance', updatedBy);
-    res.json({ taskIds: list });
+    res.json({ message: 'Task added to email campaign monitoring', taskIds });
   } catch (error) {
-    console.error('Error updating email_campaign_tasks:', error);
-    res.status(500).json({ error: 'Failed to update email_campaign_tasks' });
+    console.error('Error adding customer email campaign task:', error);
+    res.status(500).json({ error: 'Failed to add email campaign task' });
   }
 });
 
 // Remove a taskId from email_campaign_tasks (customer accessible)
 router.delete('/customer/email-campaign-tasks/:taskId', authenticateToken, async (req, res) => {
   try {
+    const userId = req.user?.userId;
     const { taskId } = req.params;
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
     if (!taskId) {
       return res.status(400).json({ error: 'taskId is required' });
     }
 
-    const existing = await settingsService.getSetting('email_campaign_tasks');
-    const currentValue = existing?.settingValue || '[]';
-    let list: string[] = [];
-    try {
-      const parsed = JSON.parse(currentValue);
-      list = Array.isArray(parsed) ? parsed : [];
-    } catch {
-      list = [];
+    const settingName = `user-${userId}-email_campaign_tasks`;
+    const existingSetting = await settingsService.getSetting(settingName);
+    let taskIds: string[] = existingSetting ? JSON.parse(existingSetting.settingValue) : [];
+
+    const initialLength = taskIds.length;
+    taskIds = taskIds.filter((id) => id !== taskId);
+
+    if (taskIds.length < initialLength) {
+      await settingsService.setSetting(settingName, JSON.stringify(taskIds), 'User-monitored email campaign tasks', req.user?.email);
     }
-    const newList = list.filter((id) => id !== taskId);
-    const updated = JSON.stringify(newList);
-    const updatedBy = req.user?.email || 'customer';
-    await settingsService.setSetting('email_campaign_tasks', updated, 'Task IDs monitored by Campaign Performance', updatedBy);
-    res.json({ taskIds: newList });
+    res.json({ message: 'Task removed from email campaign monitoring', taskIds });
   } catch (error) {
-    console.error('Error removing from email_campaign_tasks:', error);
-    res.status(500).json({ error: 'Failed to remove from email_campaign_tasks' });
+    console.error('Error removing customer email campaign task:', error);
+    res.status(500).json({ error: 'Failed to remove email campaign task' });
   }
 });
