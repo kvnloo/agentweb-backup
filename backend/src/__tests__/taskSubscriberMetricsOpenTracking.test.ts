@@ -410,7 +410,7 @@ describe('TaskSubscriberMetricsService - Open Tracking Tests', () => {
       const userId = 'user123';
 
       // Mock task not found
-      mockTaskDb.getTaskById.mockResolvedValue(null);
+      mockTaskDb.getTaskById.mockResolvedValue(undefined);
 
       await expect(
         TaskSubscriberMetricsService.getTaskSubscriberMetrics(taskId, userId)
@@ -430,7 +430,7 @@ describe('TaskSubscriberMetricsService - Open Tracking Tests', () => {
       } as any);
 
       // Mock user not found
-      mockUserDb.getUserById.mockResolvedValue(null);
+      mockUserDb.getUserById.mockResolvedValue(undefined);
 
       await expect(
         TaskSubscriberMetricsService.getTaskSubscriberMetrics(taskId, userId)
