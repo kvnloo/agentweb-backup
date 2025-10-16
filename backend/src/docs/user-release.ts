@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-10-16',
+    changes: [
+      'Renamed Meta Campaigns to Campaign Performance with Enhanced Email Campaign Monitoring',
+      '- Meta Campaigns page renamed to Campaign Performance for broader campaign tracking',
+      '- Added Email Campaigns section for monitoring email campaign performance',
+      '- Added comprehensive backend API endpoints for email campaign task management',
+    ],
+  },
+  {
     date: '2025-10-15',
     changes: [
       'Fixed Interactive Share Link Task Results Display',
