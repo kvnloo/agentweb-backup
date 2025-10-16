@@ -21,7 +21,7 @@ describe('Email Campaign Settings API', () => {
     app.use(express.json());
     
     // Mock authenticateToken to pass through
-    mockedAuthenticateToken.mockImplementation((req, res, next) => {
+    mockedAuthenticateToken.mockImplementation(async (req, res, next) => {
       // Set up a mock user
       (req as any).user = {
         userId: 'test-user-123',
@@ -29,6 +29,7 @@ describe('Email Campaign Settings API', () => {
         isAdmin: false
       };
       next();
+      return undefined;
     });
     
     app.use('/api/settings', settingsRouter);
@@ -85,9 +86,10 @@ describe('Email Campaign Settings API', () => {
     });
 
     it('should return 401 when user is not authenticated', async () => {
-      mockedAuthenticateToken.mockImplementation((req, res, next) => {
+      mockedAuthenticateToken.mockImplementation(async (req, res, next) => {
         (req as any).user = null;
         next();
+        return undefined;
       });
 
       const response = await request(app)
@@ -192,9 +194,10 @@ describe('Email Campaign Settings API', () => {
     });
 
     it('should return 401 when user is not authenticated', async () => {
-      mockedAuthenticateToken.mockImplementation((req, res, next) => {
+      mockedAuthenticateToken.mockImplementation(async (req, res, next) => {
         (req as any).user = null;
         next();
+        return undefined;
       });
 
       const response = await request(app)
@@ -292,9 +295,10 @@ describe('Email Campaign Settings API', () => {
     });
 
     it('should return 401 when user is not authenticated', async () => {
-      mockedAuthenticateToken.mockImplementation((req, res, next) => {
+      mockedAuthenticateToken.mockImplementation(async (req, res, next) => {
         (req as any).user = null;
         next();
+        return undefined;
       });
 
       const response = await request(app)
@@ -340,13 +344,14 @@ describe('Email Campaign Settings API', () => {
       expect(mockedSettingsService.getSetting).toHaveBeenCalledWith('user-test-user-123-email_campaign_tasks');
 
       // Second user
-      mockedAuthenticateToken.mockImplementation((req, res, next) => {
+      mockedAuthenticateToken.mockImplementation(async (req, res, next) => {
         (req as any).user = {
           userId: 'user-456',
           email: 'user2@example.com',
           isAdmin: false
         };
         next();
+        return undefined;
       });
 
       mockedSettingsService.getSetting.mockResolvedValueOnce({
