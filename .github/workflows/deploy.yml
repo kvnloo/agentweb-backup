@@ -144,13 +144,8 @@ jobs:
           echo "📊 Check deployment status: https://${{ env.AWS_REGION }}.console.aws.amazon.com/elasticbeanstalk/home?region=${{ env.AWS_REGION }}#/environments"
           echo "✅ Version deployed: backend_v${VERSION}"
 
-      - name: Upload artifact
-        if: env.backend_should_deploy == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: backend-build
-          path: backend/builds/*.zip
-          retention-days: 30
+      # Artifact upload removed to save GitHub storage quota
+      # Build artifacts are already uploaded to S3 for deployment
 
   partner-deploy:
     name: Partner portal deploy (only if version increased)
@@ -260,12 +255,7 @@ jobs:
           echo "📊 Check deployment status: https://${{ env.AWS_REGION }}.console.aws.amazon.com/elasticbeanstalk/home?region=${{ env.AWS_REGION }}#/environments"
           echo "✅ Version deployed: partner_v${VERSION}"
 
-      - name: Upload artifact
-        if: env.partner_should_deploy == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: partner-portal-build
-          path: partner-portal/builds/*.zip
-          retention-days: 30
+      # Artifact upload removed to save GitHub storage quota
+      # Build artifacts are already uploaded to S3 for deployment
 
 
