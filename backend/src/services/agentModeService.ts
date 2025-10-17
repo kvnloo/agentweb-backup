@@ -4187,16 +4187,20 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
   /**
    * Get task subscriber engagement events for Agent Mode function calls
+   * Returns engagement metrics instead of raw events for better agent processing
    */
   private async getTaskSubscriberEngagementEvents(taskId: string, emailSubject: string, userId: string): Promise<any> {
     try {
       const { TaskSubscriberMetricsService } = await import('./taskSubscriberMetricsService');
       const events = await TaskSubscriberMetricsService.getTaskSubscriberEngagementEvents(taskId, emailSubject, userId);
       
+      // Transform raw events into meaningful engagement metrics
+      const engagementMetrics = this.calculateEngagementMetrics(events);
+      
       return {
         success: true,
-        message: 'Task subscriber engagement events retrieved successfully',
-        data: events
+        message: 'Task subscriber engagement metrics retrieved successfully',
+        data: engagementMetrics
       };
     } catch (error: any) {
       console.error('AgentMode: Error getting task subscriber engagement events:', error);
@@ -4206,6 +4210,160 @@ Use the available tools to create tasks in the agent-engine when complex work is
         error: error.message
       };
     }
+  }
+
+  /**
+   * Calculate engagement metrics from raw events data
+   */
+  private calculateEngagementMetrics(events: any) {
+    const { eventsByUser, totalEngagedUsers, taskId, emailSubject } = events;
+    
+    if (totalEngagedUsers === 0) {
+      return {
+        taskId,
+        emailSubject,
+        engagementPatterns: {
+          immediateEngagement: 0,
+          delayedEngagement: 0,
+          multiTouchEngagement: 0,
+          singleTouchEngagement: 0
+        },
+        timingMetrics: {
+          averageTimeToOpen: null,
+          averageTimeToClick: null,
+          fastestEngagement: null,
+          slowestEngagement: null
+        },
+        linkAnalysis: {
+          totalClicks: 0,
+          uniqueLinksClicked: 0,
+          mostClickedLink: null
+        }
+      };
+    }
+
+    // Calculate engagement-specific metrics
+    let clickedCount = 0;
+    const linkClicks = new Map<string, number>();
+    const engagementTimes: number[] = [];
+    const openTimes: number[] = [];
+    const clickTimes: number[] = [];
+
+    // Analyze each user's engagement
+    let immediateEngagement = 0; // Users who engaged within 1 hour
+    let delayedEngagement = 0; // Users who engaged after 1 hour
+    let multiTouchEngagement = 0; // Users with multiple event types
+    let singleTouchEngagement = 0; // Users with only one event type
+
+    eventsByUser.forEach((user: any) => {
+      const userEvents = user.events;
+      
+      // Count event types for engagement analysis
+      const eventTypes = new Set(userEvents.map((e: any) => e.eventType));
+      userEvents.forEach((event: any) => {
+        if (event.eventType === 'email.clicked') {
+          clickedCount++;
+          if (event.link) {
+            linkClicks.set(event.link, (linkClicks.get(event.link) || 0) + 1);
+          }
+        }
+      });
+
+      // Calculate engagement timing
+      if (userEvents.length > 0) {
+        const firstEvent = userEvents[0];
+        const firstEventTime = new Date(firstEvent.createdAt).getTime();
+        const emailSentTime = firstEventTime; // Assuming first event is delivery
+        
+        // Find first engagement (open or click)
+        const firstEngagement = userEvents.find((e: any) => 
+          e.eventType === 'email.opened' || e.eventType === 'email.clicked'
+        );
+        
+        if (firstEngagement) {
+          const engagementTime = new Date(firstEngagement.createdAt).getTime();
+          const timeToEngagement = engagementTime - emailSentTime;
+          engagementTimes.push(timeToEngagement);
+          
+          // Categorize engagement timing
+          if (timeToEngagement <= 3600000) { // 1 hour in milliseconds
+            immediateEngagement++;
+          } else {
+            delayedEngagement++;
+          }
+        }
+
+        // Find open and click times
+        const openEvent = userEvents.find((e: any) => e.eventType === 'email.opened');
+        const clickEvent = userEvents.find((e: any) => e.eventType === 'email.clicked');
+        
+        if (openEvent) {
+          const openTime = new Date(openEvent.createdAt).getTime();
+          openTimes.push(openTime - emailSentTime);
+        }
+        
+        if (clickEvent) {
+          const clickTime = new Date(clickEvent.createdAt).getTime();
+          clickTimes.push(clickTime - emailSentTime);
+        }
+
+        // Categorize engagement depth
+        if (eventTypes.size > 1) {
+          multiTouchEngagement++;
+        } else {
+          singleTouchEngagement++;
+        }
+      }
+    });
+
+    // Calculate timing metrics
+    const averageTimeToOpen = openTimes.length > 0 
+      ? Math.round(openTimes.reduce((a, b) => a + b, 0) / openTimes.length / 1000 / 60) // Convert to minutes
+      : null;
+    
+    const averageTimeToClick = clickTimes.length > 0 
+      ? Math.round(clickTimes.reduce((a, b) => a + b, 0) / clickTimes.length / 1000 / 60) // Convert to minutes
+      : null;
+
+    const fastestEngagement = engagementTimes.length > 0 
+      ? Math.round(Math.min(...engagementTimes) / 1000 / 60) // Convert to minutes
+      : null;
+    
+    const slowestEngagement = engagementTimes.length > 0 
+      ? Math.round(Math.max(...engagementTimes) / 1000 / 60) // Convert to minutes
+      : null;
+
+    // Find most clicked link
+    let mostClickedLink = null;
+    let maxClicks = 0;
+    linkClicks.forEach((clicks, link) => {
+      if (clicks > maxClicks) {
+        maxClicks = clicks;
+        mostClickedLink = link;
+      }
+    });
+
+    return {
+      taskId,
+      emailSubject,
+      engagementPatterns: {
+        immediateEngagement,
+        delayedEngagement,
+        multiTouchEngagement,
+        singleTouchEngagement
+      },
+      timingMetrics: {
+        averageTimeToOpen,
+        averageTimeToClick,
+        fastestEngagement,
+        slowestEngagement
+      },
+      linkAnalysis: {
+        totalClicks: clickedCount,
+        uniqueLinksClicked: linkClicks.size,
+        mostClickedLink
+      }
+    };
   }
 
 
