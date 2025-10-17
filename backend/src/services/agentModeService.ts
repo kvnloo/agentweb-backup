@@ -4260,7 +4260,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
         if (event.eventType === 'email.clicked') {
           clickedCount++;
           if (event.link) {
-            linkClicks.set(event.link, (linkClicks.get(event.link) || 0) + 1);
+            // Normalize unsubscribe links by replacing email with placeholder
+            let normalizedLink = event.link;
+            if (event.link.includes('/unsubscribe?') && event.link.includes('email=')) {
+              normalizedLink = event.link.replace(/email=[^&]+/, 'email=placeholder@example.com');
+            }
+            linkClicks.set(normalizedLink, (linkClicks.get(normalizedLink) || 0) + 1);
           }
         }
       });

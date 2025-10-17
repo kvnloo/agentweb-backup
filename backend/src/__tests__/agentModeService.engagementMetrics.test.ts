@@ -376,5 +376,82 @@ describe('AgentModeService - Engagement Metrics', () => {
         clicks: 1
       });
     });
+
+    it('should normalize unsubscribe links by replacing email with placeholder', async () => {
+      const taskId = 'test-task-123';
+      const userId = 'test-user-123';
+      const emailSubject = 'Test Newsletter';
+
+      const mockEvents = {
+        taskId,
+        emailSubject,
+        eventsByUser: [
+          {
+            userEmail: 'user1@example.com',
+            events: [
+              {
+                eventType: 'email.delivered',
+                createdAt: '2024-01-01T10:00:00Z'
+              },
+              {
+                eventType: 'email.clicked',
+                createdAt: '2024-01-01T10:15:00Z',
+                link: 'https://app.agentweb.pro/unsubscribe?taskId=1744901929945&email=user1@example.com'
+              }
+            ]
+          },
+          {
+            userEmail: 'user2@example.com',
+            events: [
+              {
+                eventType: 'email.delivered',
+                createdAt: '2024-01-01T10:00:00Z'
+              },
+              {
+                eventType: 'email.clicked',
+                createdAt: '2024-01-01T10:20:00Z',
+                link: 'https://app.agentweb.pro/unsubscribe?taskId=1744901929945&email=user2@example.com'
+              }
+            ]
+          },
+          {
+            userEmail: 'user3@example.com',
+            events: [
+              {
+                eventType: 'email.delivered',
+                createdAt: '2024-01-01T10:00:00Z'
+              },
+              {
+                eventType: 'email.clicked',
+                createdAt: '2024-01-01T10:25:00Z',
+                link: 'https://example.com/cta1'
+              }
+            ]
+          }
+        ],
+        totalEngagedUsers: 3
+      };
+
+      mockTaskSubscriberMetricsService.getTaskSubscriberEngagementEvents.mockResolvedValue(mockEvents);
+
+      const result = await (agentModeService as any).getTaskSubscriberEngagementEvents(taskId, emailSubject, userId);
+
+      expect(result.success).toBe(true);
+      
+      // Verify link analysis normalizes unsubscribe links
+      expect(result.data.linkAnalysis).toHaveLength(2);
+      
+      // Unsubscribe links should be normalized and combined
+      const unsubscribeLink = result.data.linkAnalysis.find(link => link.url.includes('/unsubscribe?'));
+      expect(unsubscribeLink).toBeDefined();
+      expect(unsubscribeLink.url).toBe('https://app.agentweb.pro/unsubscribe?taskId=1744901929945&email=placeholder@example.com');
+      expect(unsubscribeLink.clicks).toBe(2); // Both user1 and user2 clicked unsubscribe
+      
+      // Regular links should remain unchanged
+      const regularLink = result.data.linkAnalysis.find(link => link.url.includes('cta1'));
+      expect(regularLink).toBeDefined();
+      expect(regularLink.url).toBe('https://example.com/cta1');
+      expect(regularLink.clicks).toBe(1);
+    });
   });
 });
