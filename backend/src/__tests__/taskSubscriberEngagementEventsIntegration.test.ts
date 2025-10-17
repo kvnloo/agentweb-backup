@@ -131,17 +131,18 @@ describe('Task Subscriber Engagement Events Integration Tests', () => {
       // Verify basic structure
       expect(result.taskId).toBe('task123');
       expect(result.emailSubject).toBe('Weekly Newsletter');
-      expect(result.eventsByUser).toHaveLength(2); // Two users
-      expect(result.totalEvents).toBe(4); // 3 events for subscriber1 + 1 event for subscriber2
+      expect(result.eventsByUser).toHaveLength(1); // Only subscriber1 has engagement (opened/clicked)
+      expect(result.totalEngagedUsers).toBe(1); // 1 engaged user (subscriber1)
 
       // Verify events are grouped by user email
       const subscriber1Events = result.eventsByUser.find(user => user.userEmail === 'subscriber1@example.com');
-      const subscriber2Events = result.eventsByUser.find(user => user.userEmail === 'subscriber2@example.com');
       
       expect(subscriber1Events).toBeDefined();
       expect(subscriber1Events!.events).toHaveLength(3);
-      expect(subscriber2Events).toBeDefined();
-      expect(subscriber2Events!.events).toHaveLength(1);
+      
+      // subscriber2 should be filtered out since they only have delivered events (no engagement)
+      const subscriber2Events = result.eventsByUser.find(user => user.userEmail === 'subscriber2@example.com');
+      expect(subscriber2Events).toBeUndefined();
 
       // Verify events are sorted by createdAt (chronological order) for subscriber1
       expect(subscriber1Events!.events[0].eventType).toBe('email.delivered');
@@ -154,8 +155,7 @@ describe('Task Subscriber Engagement Events Integration Tests', () => {
       expect(eventTypes).toContain('email.opened');
       expect(eventTypes).toContain('email.clicked');
 
-      // Verify subscriber2 only has delivered event
-      expect(subscriber2Events!.events[0].eventType).toBe('email.delivered');
+      // subscriber2 is filtered out since they only have delivered events (no engagement)
     });
 
     it('should filter events by email subject correctly', async () => {
@@ -362,8 +362,8 @@ describe('Task Subscriber Engagement Events Integration Tests', () => {
 
       const result = await TaskSubscriberMetricsService.getTaskSubscriberEngagementEvents('task123', 'Newsletter', 'user123');
 
-      expect(result.eventsByUser).toHaveLength(1); // One user with events
-      expect(result.totalEvents).toBe(2); // delivered + clicked events
+      expect(result.eventsByUser).toHaveLength(1); // One user with engagement events
+      expect(result.totalEngagedUsers).toBe(1); // 1 engaged user
       
       // Should include events from both email IDs for the same user
       const userEvents = result.eventsByUser[0];
@@ -405,9 +405,9 @@ describe('Task Subscriber Engagement Events Integration Tests', () => {
       expect(result).toHaveProperty('taskId');
       expect(result).toHaveProperty('emailSubject');
       expect(result).toHaveProperty('eventsByUser');
-      expect(result).toHaveProperty('totalEvents');
+      expect(result).toHaveProperty('totalEngagedUsers');
       expect(Array.isArray(result.eventsByUser)).toBe(true);
-      expect(typeof result.totalEvents).toBe('number');
+      expect(typeof result.totalEngagedUsers).toBe('number');
     });
   });
 });

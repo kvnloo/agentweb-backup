@@ -87,7 +87,7 @@ describe('TaskSubscriberMetricsService - Engagement Events (Simple Tests)', () =
         taskId: 'task123',
         emailSubject: 'Test Subject',
         eventsByUser: [],
-        totalEvents: 0
+        totalEngagedUsers: 0
       });
     });
 
@@ -110,7 +110,7 @@ describe('TaskSubscriberMetricsService - Engagement Events (Simple Tests)', () =
         taskId: 'task123',
         emailSubject: 'Test Subject',
         eventsByUser: [],
-        totalEvents: 0
+        totalEngagedUsers: 0
       });
     });
 
@@ -135,7 +135,7 @@ describe('TaskSubscriberMetricsService - Engagement Events (Simple Tests)', () =
         taskId: 'task123',
         emailSubject: 'Test Subject',
         eventsByUser: [],
-        totalEvents: 0
+        totalEngagedUsers: 0
       });
     });
 
@@ -176,7 +176,7 @@ describe('TaskSubscriberMetricsService - Engagement Events (Simple Tests)', () =
         taskId: 'task123',
         emailSubject: 'Test Subject',
         eventsByUser: [],
-        totalEvents: 0
+        totalEngagedUsers: 0
       });
     });
 
@@ -215,7 +215,7 @@ describe('TaskSubscriberMetricsService - Engagement Events (Simple Tests)', () =
 
       // Should not match due to case sensitivity
       expect(result.eventsByUser).toHaveLength(0);
-      expect(result.totalEvents).toBe(0);
+      expect(result.totalEngagedUsers).toBe(0);
     });
   });
 });
