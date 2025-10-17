@@ -4234,11 +4234,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           fastestEngagement: null,
           slowestEngagement: null
         },
-        linkAnalysis: {
-          totalClicks: 0,
-          uniqueLinksClicked: 0,
-          mostClickedLink: null
-        }
+        linkAnalysis: []
       };
     }
 
@@ -4252,8 +4248,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
     // Analyze each user's engagement
     let immediateEngagement = 0; // Users who engaged within 1 hour
     let delayedEngagement = 0; // Users who engaged after 1 hour
-    let multiTouchEngagement = 0; // Users with multiple event types
-    let singleTouchEngagement = 0; // Users with only one event type
+    let multiTouchEngagement = 0; // Users with 2+ engagement events (opened or clicked)
+    let singleTouchEngagement = 0; // Users with only 1 engagement event (opened or clicked)
 
     eventsByUser.forEach((user: any) => {
       const userEvents = user.events;
@@ -4307,10 +4303,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
           clickTimes.push(clickTime - emailSentTime);
         }
 
-        // Categorize engagement depth
-        if (eventTypes.size > 1) {
+        // Categorize engagement depth based on opened/clicked events
+        const engagementEvents = userEvents.filter((event: any) => 
+          event.eventType === 'email.opened' || event.eventType === 'email.clicked'
+        );
+        
+        if (engagementEvents.length >= 2) {
           multiTouchEngagement++;
-        } else {
+        } else if (engagementEvents.length === 1) {
           singleTouchEngagement++;
         }
       }
@@ -4333,15 +4333,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
       ? Math.round(Math.max(...engagementTimes) / 1000 / 60) // Convert to minutes
       : null;
 
-    // Find most clicked link
-    let mostClickedLink = null;
-    let maxClicks = 0;
-    linkClicks.forEach((clicks, link) => {
-      if (clicks > maxClicks) {
-        maxClicks = clicks;
-        mostClickedLink = link;
-      }
-    });
+    // Convert link clicks map to array of objects
+    const linkAnalysis = Array.from(linkClicks.entries()).map(([url, clicks]) => ({
+      url,
+      clicks
+    })).sort((a, b) => b.clicks - a.clicks); // Sort by click count descending
 
     return {
       taskId,
@@ -4358,11 +4354,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         fastestEngagement,
         slowestEngagement
       },
-      linkAnalysis: {
-        totalClicks: clickedCount,
-        uniqueLinksClicked: linkClicks.size,
-        mostClickedLink
-      }
+      linkAnalysis
     };
   }
 

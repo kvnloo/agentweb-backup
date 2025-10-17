@@ -92,8 +92,8 @@ describe('AgentModeService - Engagement Metrics', () => {
       // Verify engagement patterns
       expect(result.data.engagementPatterns.immediateEngagement).toBe(2); // user1 and user3
       expect(result.data.engagementPatterns.delayedEngagement).toBe(1); // user2
-      expect(result.data.engagementPatterns.multiTouchEngagement).toBe(3); // All users have multiple event types
-      expect(result.data.engagementPatterns.singleTouchEngagement).toBe(0); // None have single event type
+      expect(result.data.engagementPatterns.multiTouchEngagement).toBe(2); // user1 and user3 have 2+ engagement events (opened + clicked)
+      expect(result.data.engagementPatterns.singleTouchEngagement).toBe(1); // user2 has only 1 engagement event (opened only)
 
       // Verify timing metrics
       expect(result.data.timingMetrics.averageTimeToOpen).toBe(53); // Average of 15 and 90 minutes
@@ -102,9 +102,15 @@ describe('AgentModeService - Engagement Metrics', () => {
       expect(result.data.timingMetrics.slowestEngagement).toBe(90); // 90 minutes
 
       // Verify link analysis
-      expect(result.data.linkAnalysis.totalClicks).toBe(3);
-      expect(result.data.linkAnalysis.uniqueLinksClicked).toBe(2);
-      expect(result.data.linkAnalysis.mostClickedLink).toBe('https://example.com/cta1'); // Clicked twice
+      expect(result.data.linkAnalysis).toHaveLength(2);
+      expect(result.data.linkAnalysis[0]).toEqual({
+        url: 'https://example.com/cta1',
+        clicks: 2
+      });
+      expect(result.data.linkAnalysis[1]).toEqual({
+        url: 'https://example.com/cta2',
+        clicks: 1
+      });
     });
 
     it('should handle empty engagement data', async () => {
@@ -132,9 +138,7 @@ describe('AgentModeService - Engagement Metrics', () => {
       expect(result.data.timingMetrics.averageTimeToClick).toBeNull();
       expect(result.data.timingMetrics.fastestEngagement).toBeNull();
       expect(result.data.timingMetrics.slowestEngagement).toBeNull();
-      expect(result.data.linkAnalysis.totalClicks).toBe(0);
-      expect(result.data.linkAnalysis.uniqueLinksClicked).toBe(0);
-      expect(result.data.linkAnalysis.mostClickedLink).toBeNull();
+      expect(result.data.linkAnalysis).toEqual([]);
     });
 
     it('should handle users with only delivered events (no engagement)', async () => {
@@ -201,7 +205,7 @@ describe('AgentModeService - Engagement Metrics', () => {
       expect(result.success).toBe(true);
       expect(result.data.timingMetrics.averageTimeToOpen).toBe(30); // 30 minutes
       expect(result.data.timingMetrics.averageTimeToClick).toBeNull();
-      expect(result.data.linkAnalysis.totalClicks).toBe(0);
+      expect(result.data.linkAnalysis).toEqual([]);
     });
 
     it('should handle service errors gracefully', async () => {
@@ -312,9 +316,65 @@ describe('AgentModeService - Engagement Metrics', () => {
 
       const result = await (agentModeService as any).getTaskSubscriberEngagementEvents(taskId, emailSubject, userId);
 
-      // Both users have multiple event types (delivered + opened/clicked), so both are multi-touch
-      expect(result.data.engagementPatterns.multiTouchEngagement).toBe(2);
-      expect(result.data.engagementPatterns.singleTouchEngagement).toBe(0);
+      // First user has 2 engagement events (opened + clicked), second user has 1 (opened only)
+      expect(result.data.engagementPatterns.multiTouchEngagement).toBe(1);
+      expect(result.data.engagementPatterns.singleTouchEngagement).toBe(1);
+    });
+
+    it('should correctly identify single-touch engagement for click-only users', async () => {
+      const taskId = 'test-task-123';
+      const userId = 'test-user-123';
+      const emailSubject = 'Test Newsletter';
+
+      const mockEvents = {
+        taskId,
+        emailSubject,
+        eventsByUser: [
+          {
+            userEmail: 'clickonly@example.com',
+            events: [
+              {
+                eventType: 'email.delivered',
+                createdAt: '2024-01-01T10:00:00Z'
+              },
+              {
+                eventType: 'email.clicked',
+                createdAt: '2024-01-01T10:15:00Z',
+                link: 'https://example.com/cta1'
+              }
+            ]
+          },
+          {
+            userEmail: 'openonly@example.com',
+            events: [
+              {
+                eventType: 'email.delivered',
+                createdAt: '2024-01-01T10:00:00Z'
+              },
+              {
+                eventType: 'email.opened',
+                createdAt: '2024-01-01T10:30:00Z'
+              }
+            ]
+          }
+        ],
+        totalEngagedUsers: 2
+      };
+
+      mockTaskSubscriberMetricsService.getTaskSubscriberEngagementEvents.mockResolvedValue(mockEvents);
+
+      const result = await (agentModeService as any).getTaskSubscriberEngagementEvents(taskId, emailSubject, userId);
+
+      // Both users have only 1 engagement event each (click-only and open-only)
+      expect(result.data.engagementPatterns.multiTouchEngagement).toBe(0);
+      expect(result.data.engagementPatterns.singleTouchEngagement).toBe(2);
+      
+      // Verify link analysis includes the click-only user's link
+      expect(result.data.linkAnalysis).toHaveLength(1);
+      expect(result.data.linkAnalysis[0]).toEqual({
+        url: 'https://example.com/cta1',
+        clicks: 1
+      });
     });
   });
 });
