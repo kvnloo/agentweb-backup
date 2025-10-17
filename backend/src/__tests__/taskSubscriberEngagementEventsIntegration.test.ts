@@ -131,26 +131,31 @@ describe('Task Subscriber Engagement Events Integration Tests', () => {
       // Verify basic structure
       expect(result.taskId).toBe('task123');
       expect(result.emailSubject).toBe('Weekly Newsletter');
-      expect(result.events).toHaveLength(4);
-      expect(result.count).toBe(4);
+      expect(result.eventsByUser).toHaveLength(2); // Two users
+      expect(result.totalEvents).toBe(4); // 3 events for subscriber1 + 1 event for subscriber2
 
-      // Verify events are sorted by creation time (newest first)
-      expect(result.events[0].eventId).toBe('event3'); // clicked
-      expect(result.events[1].eventId).toBe('event2'); // opened
-      expect(result.events[2].eventId).toBe('event1'); // delivered
-      expect(result.events[3].eventId).toBe('event4'); // delivered
+      // Verify events are grouped by user email
+      const subscriber1Events = result.eventsByUser.find(user => user.userEmail === 'subscriber1@example.com');
+      const subscriber2Events = result.eventsByUser.find(user => user.userEmail === 'subscriber2@example.com');
+      
+      expect(subscriber1Events).toBeDefined();
+      expect(subscriber1Events!.events).toHaveLength(3);
+      expect(subscriber2Events).toBeDefined();
+      expect(subscriber2Events!.events).toHaveLength(1);
 
-      // Verify all events are for the correct email ID
-      result.events.forEach(event => {
-        expect(event.emailId).toBe('email1');
-        expect(event.emailDomain).toBe('company.com');
-      });
+      // Verify events are sorted by createdAt (chronological order) for subscriber1
+      expect(subscriber1Events!.events[0].eventType).toBe('email.delivered');
+      expect(subscriber1Events!.events[1].eventType).toBe('email.opened');
+      expect(subscriber1Events!.events[2].eventType).toBe('email.clicked');
 
-      // Verify event types
-      const eventTypes = result.events.map(event => event.eventType);
+      // Verify delivered, clicked and opened events are included for subscriber1
+      const eventTypes = subscriber1Events!.events.map(event => event.eventType);
       expect(eventTypes).toContain('email.delivered');
       expect(eventTypes).toContain('email.opened');
       expect(eventTypes).toContain('email.clicked');
+
+      // Verify subscriber2 only has delivered event
+      expect(subscriber2Events!.events[0].eventType).toBe('email.delivered');
     });
 
     it('should filter events by email subject correctly', async () => {
@@ -191,6 +196,15 @@ describe('Task Subscriber Engagement Events Integration Tests', () => {
           emailId: 'email1',
           emailDomain: 'test.com',
           eventType: 'email.delivered',
+          createdAt: '2024-01-01T09:00:00Z',
+          data: { to: 'subscriber1@example.com' },
+          processedAt: '2024-01-01T09:01:00Z'
+        },
+        {
+          eventId: 'event2',
+          emailId: 'email1',
+          emailDomain: 'test.com',
+          eventType: 'email.opened',
           createdAt: '2024-01-01T10:00:00Z',
           data: { to: 'subscriber1@example.com' },
           processedAt: '2024-01-01T10:01:00Z'
@@ -199,10 +213,19 @@ describe('Task Subscriber Engagement Events Integration Tests', () => {
 
       const productUpdateEvents = [
         {
-          eventId: 'event2',
+          eventId: 'event3',
           emailId: 'email2',
           emailDomain: 'test.com',
           eventType: 'email.delivered',
+          createdAt: '2024-01-01T10:30:00Z',
+          data: { to: 'subscriber1@example.com' },
+          processedAt: '2024-01-01T10:31:00Z'
+        },
+        {
+          eventId: 'event4',
+          emailId: 'email2',
+          emailDomain: 'test.com',
+          eventType: 'email.clicked',
           createdAt: '2024-01-01T11:00:00Z',
           data: { to: 'subscriber1@example.com' },
           processedAt: '2024-01-01T11:01:00Z'
@@ -216,14 +239,16 @@ describe('Task Subscriber Engagement Events Integration Tests', () => {
 
       // Test Newsletter subject
       const newsletterResult = await TaskSubscriberMetricsService.getTaskSubscriberEngagementEvents('task123', 'Newsletter', 'user123');
-      expect(newsletterResult.events).toHaveLength(1);
-      expect(newsletterResult.events[0].emailId).toBe('email1');
+      expect(newsletterResult.eventsByUser).toHaveLength(1);
+      expect(newsletterResult.eventsByUser[0].userEmail).toBe('subscriber1@example.com');
+      expect(newsletterResult.eventsByUser[0].events).toHaveLength(2); // delivered + opened
 
       // Test Product Update subject
       mockEmailEventsDb.getEventsByEmailId.mockResolvedValue(productUpdateEvents);
       const productResult = await TaskSubscriberMetricsService.getTaskSubscriberEngagementEvents('task123', 'Product Update', 'user123');
-      expect(productResult.events).toHaveLength(1);
-      expect(productResult.events[0].emailId).toBe('email2');
+      expect(productResult.eventsByUser).toHaveLength(1);
+      expect(productResult.eventsByUser[0].userEmail).toBe('subscriber1@example.com');
+      expect(productResult.eventsByUser[0].events).toHaveLength(2); // delivered + clicked
     });
 
     it('should handle case-sensitive subject matching', async () => {
@@ -260,11 +285,11 @@ describe('Task Subscriber Engagement Events Integration Tests', () => {
 
       // Test exact case match
       const exactMatch = await TaskSubscriberMetricsService.getTaskSubscriberEngagementEvents('task123', 'Newsletter', 'user123');
-      expect(exactMatch.events).toHaveLength(0); // No events mocked, but structure is correct
+      expect(exactMatch.eventsByUser).toHaveLength(0); // No events mocked, but structure is correct
 
       // Test different case
       const differentCase = await TaskSubscriberMetricsService.getTaskSubscriberEngagementEvents('task123', 'newsletter', 'user123');
-      expect(differentCase.events).toHaveLength(0);
+      expect(differentCase.eventsByUser).toHaveLength(0);
     });
 
     it('should handle multiple subscribers with same email subject', async () => {
@@ -310,7 +335,7 @@ describe('Task Subscriber Engagement Events Integration Tests', () => {
           eventId: 'event1',
           emailId: 'email1',
           emailDomain: 'test.com',
-          eventType: 'email.delivered',
+          eventType: 'email.opened',
           createdAt: '2024-01-01T10:00:00Z',
           data: { to: 'subscriber1@example.com' },
           processedAt: '2024-01-01T10:01:00Z'
@@ -319,9 +344,9 @@ describe('Task Subscriber Engagement Events Integration Tests', () => {
           eventId: 'event2',
           emailId: 'email2',
           emailDomain: 'test.com',
-          eventType: 'email.delivered',
+          eventType: 'email.clicked',
           createdAt: '2024-01-01T11:00:00Z',
-          data: { to: 'subscriber2@example.com' },
+          data: { to: 'subscriber1@example.com' },
           processedAt: '2024-01-01T11:01:00Z'
         }
       ];
@@ -337,13 +362,13 @@ describe('Task Subscriber Engagement Events Integration Tests', () => {
 
       const result = await TaskSubscriberMetricsService.getTaskSubscriberEngagementEvents('task123', 'Newsletter', 'user123');
 
-      expect(result.events).toHaveLength(2);
-      expect(result.count).toBe(2);
+      expect(result.eventsByUser).toHaveLength(1); // One user with events
+      expect(result.totalEvents).toBe(2); // delivered + clicked events
       
-      // Should include events from both email IDs
-      const emailIds = result.events.map(event => event.emailId);
-      expect(emailIds).toContain('email1');
-      expect(emailIds).toContain('email2');
+      // Should include events from both email IDs for the same user
+      const userEvents = result.eventsByUser[0];
+      expect(userEvents.userEmail).toBe('subscriber1@example.com');
+      expect(userEvents.events).toHaveLength(2);
     });
   });
 
@@ -379,10 +404,10 @@ describe('Task Subscriber Engagement Events Integration Tests', () => {
       // Verify the structure matches the interface
       expect(result).toHaveProperty('taskId');
       expect(result).toHaveProperty('emailSubject');
-      expect(result).toHaveProperty('events');
-      expect(result).toHaveProperty('count');
-      expect(Array.isArray(result.events)).toBe(true);
-      expect(typeof result.count).toBe('number');
+      expect(result).toHaveProperty('eventsByUser');
+      expect(result).toHaveProperty('totalEvents');
+      expect(Array.isArray(result.eventsByUser)).toBe(true);
+      expect(typeof result.totalEvents).toBe('number');
     });
   });
 });

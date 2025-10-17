@@ -86,8 +86,8 @@ describe('TaskSubscriberMetricsService - Engagement Events (Simple Tests)', () =
       expect(result).toEqual({
         taskId: 'task123',
         emailSubject: 'Test Subject',
-        events: [],
-        count: 0
+        eventsByUser: [],
+        totalEvents: 0
       });
     });
 
@@ -109,8 +109,8 @@ describe('TaskSubscriberMetricsService - Engagement Events (Simple Tests)', () =
       expect(result).toEqual({
         taskId: 'task123',
         emailSubject: 'Test Subject',
-        events: [],
-        count: 0
+        eventsByUser: [],
+        totalEvents: 0
       });
     });
 
@@ -134,8 +134,8 @@ describe('TaskSubscriberMetricsService - Engagement Events (Simple Tests)', () =
       expect(result).toEqual({
         taskId: 'task123',
         emailSubject: 'Test Subject',
-        events: [],
-        count: 0
+        eventsByUser: [],
+        totalEvents: 0
       });
     });
 
@@ -175,8 +175,8 @@ describe('TaskSubscriberMetricsService - Engagement Events (Simple Tests)', () =
       expect(result).toEqual({
         taskId: 'task123',
         emailSubject: 'Test Subject',
-        events: [],
-        count: 0
+        eventsByUser: [],
+        totalEvents: 0
       });
     });
 
@@ -214,8 +214,8 @@ describe('TaskSubscriberMetricsService - Engagement Events (Simple Tests)', () =
       const result = await TaskSubscriberMetricsService.getTaskSubscriberEngagementEvents('task123', 'newsletter', 'user123');
 
       // Should not match due to case sensitivity
-      expect(result.events).toHaveLength(0);
-      expect(result.count).toBe(0);
+      expect(result.eventsByUser).toHaveLength(0);
+      expect(result.totalEvents).toBe(0);
     });
   });
 });
