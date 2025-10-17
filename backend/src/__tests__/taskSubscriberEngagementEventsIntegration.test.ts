@@ -105,7 +105,12 @@ describe('Task Subscriber Engagement Events Integration Tests', () => {
           emailDomain: 'company.com',
           eventType: 'email.clicked',
           createdAt: '2024-01-01T12:00:00Z',
-          data: { to: 'subscriber1@example.com' },
+          data: { 
+            to: 'subscriber1@example.com',
+            click: {
+              link: 'https://example.com/unsubscribe?taskId=123&email=subscriber1@example.com'
+            }
+          },
           processedAt: '2024-01-01T12:01:00Z'
         },
         {
@@ -148,6 +153,9 @@ describe('Task Subscriber Engagement Events Integration Tests', () => {
       expect(subscriber1Events!.events[0].eventType).toBe('email.delivered');
       expect(subscriber1Events!.events[1].eventType).toBe('email.opened');
       expect(subscriber1Events!.events[2].eventType).toBe('email.clicked');
+      
+      // Verify clicked event includes link
+      expect(subscriber1Events!.events[2].link).toBe('https://example.com/unsubscribe?taskId=123&email=subscriber1@example.com');
 
       // Verify delivered, clicked and opened events are included for subscriber1
       const eventTypes = subscriber1Events!.events.map(event => event.eventType);
@@ -227,7 +235,12 @@ describe('Task Subscriber Engagement Events Integration Tests', () => {
           emailDomain: 'test.com',
           eventType: 'email.clicked',
           createdAt: '2024-01-01T11:00:00Z',
-          data: { to: 'subscriber1@example.com' },
+          data: { 
+            to: 'subscriber1@example.com',
+            click: {
+              link: 'https://example.com/product-update?taskId=456&email=subscriber1@example.com'
+            }
+          },
           processedAt: '2024-01-01T11:01:00Z'
         }
       ];
@@ -346,7 +359,12 @@ describe('Task Subscriber Engagement Events Integration Tests', () => {
           emailDomain: 'test.com',
           eventType: 'email.clicked',
           createdAt: '2024-01-01T11:00:00Z',
-          data: { to: 'subscriber1@example.com' },
+          data: { 
+            to: 'subscriber1@example.com',
+            click: {
+              link: 'https://example.com/newsletter?taskId=789&email=subscriber1@example.com'
+            }
+          },
           processedAt: '2024-01-01T11:01:00Z'
         }
       ];

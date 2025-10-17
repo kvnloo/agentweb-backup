@@ -36,6 +36,7 @@ export interface TaskSubscriberEngagementEvents {
     events: Array<{
       eventType: 'email.delivered' | 'email.opened' | 'email.clicked';
       createdAt: string;
+      link?: string; // Only present for clicked events
     }>;
   }>;
   totalEngagedUsers: number;
@@ -395,7 +396,7 @@ export class TaskSubscriberMetricsService {
       }
 
       // Group events by user email
-      const eventsByUserMap = new Map<string, Array<{eventType: 'email.delivered' | 'email.opened' | 'email.clicked', createdAt: string}>>();
+      const eventsByUserMap = new Map<string, Array<{eventType: 'email.delivered' | 'email.opened' | 'email.clicked', createdAt: string, link?: string}>>();
       
       allEvents.forEach(event => {
         // Handle both string and array formats for the 'to' field
@@ -405,10 +406,17 @@ export class TaskSubscriberMetricsService {
         if (!eventsByUserMap.has(userEmail)) {
           eventsByUserMap.set(userEmail, []);
         }
-        eventsByUserMap.get(userEmail)!.push({
+        const eventData: any = {
           eventType: event.eventType as 'email.delivered' | 'email.opened' | 'email.clicked',
           createdAt: event.createdAt
-        });
+        };
+
+        // Add link for clicked events
+        if (event.eventType === 'email.clicked' && event.data?.click?.link) {
+          eventData.link = event.data.click.link;
+        }
+
+        eventsByUserMap.get(userEmail)!.push(eventData);
       });
 
       // Convert map to array and sort events by createdAt for each user
