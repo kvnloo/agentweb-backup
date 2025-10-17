@@ -397,7 +397,7 @@ router.get('/:taskId/subscribers/all', authenticateToken, async (req, res) => {
     }
 
     const subscribers = await subscriberDb.getAllTaskSubscribers(taskId);
-    console.log(`Admin endpoint: Found ${subscribers?.length || 0} subscribers for task ${taskId}:`, subscribers);
+    console.log(`Admin endpoint: Found ${subscribers?.length || 0} subscribers for task ${taskId}`);
     res.json(subscribers);
   } catch (error: any) {
     console.error('Error getting all subscribers:', error);
