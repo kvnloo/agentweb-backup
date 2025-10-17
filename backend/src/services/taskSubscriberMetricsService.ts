@@ -31,16 +31,14 @@ export interface TaskSubscriberMetrics {
 export interface TaskSubscriberEngagementEvents {
   taskId: string;
   emailSubject: string;
-  events: Array<{
-    eventId: string;
-    emailId: string;
-    emailDomain: string;
-    eventType: string;
-    createdAt: string;
-    data: any;
-    processedAt: string;
+  eventsByUser: Array<{
+    userEmail: string;
+    events: Array<{
+      eventType: 'email.delivered' | 'email.opened' | 'email.clicked';
+      createdAt: string;
+    }>;
   }>;
-  count: number;
+  totalEvents: number;
 }
 
 export class TaskSubscriberMetricsService {
@@ -342,8 +340,8 @@ export class TaskSubscriberMetricsService {
         return {
           taskId,
           emailSubject,
-          events: [],
-          count: 0
+          eventsByUser: [],
+          totalEvents: 0
         };
       }
 
@@ -354,8 +352,8 @@ export class TaskSubscriberMetricsService {
         return {
           taskId,
           emailSubject,
-          events: [],
-          count: 0
+          eventsByUser: [],
+          totalEvents: 0
         };
       }
 
@@ -375,29 +373,63 @@ export class TaskSubscriberMetricsService {
         return {
           taskId,
           emailSubject,
-          events: [],
-          count: 0
+          eventsByUser: [],
+          totalEvents: 0
         };
       }
 
       // Import emailEventsDb here to avoid circular dependency
       const { emailEventsDb } = await import('./emailEventsDb');
       
-      // Fetch events for each matching email ID
+      // Fetch events for each matching email ID and filter for delivered/clicked/opened events
       const allEvents = [];
       for (const emailId of matchingEmailIds) {
         const events = await emailEventsDb.getEventsByEmailId(emailId);
-        allEvents.push(...events);
+        // Filter for delivered, clicked and opened events
+        const filteredEvents = events.filter(event => 
+          event.eventType === 'email.delivered' || 
+          event.eventType === 'email.clicked' || 
+          event.eventType === 'email.opened'
+        );
+        allEvents.push(...filteredEvents);
       }
 
-      // Sort events by creation time (newest first)
-      allEvents.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      // Group events by user email
+      const eventsByUserMap = new Map<string, Array<{eventType: 'email.delivered' | 'email.opened' | 'email.clicked', createdAt: string}>>();
+      
+      allEvents.forEach(event => {
+        // Handle both string and array formats for the 'to' field
+        const toField = event.data?.to;
+        const userEmail = Array.isArray(toField) ? toField[0] : toField || 'unknown';
+        
+        if (!eventsByUserMap.has(userEmail)) {
+          eventsByUserMap.set(userEmail, []);
+        }
+        eventsByUserMap.get(userEmail)!.push({
+          eventType: event.eventType as 'email.delivered' | 'email.opened' | 'email.clicked',
+          createdAt: event.createdAt
+        });
+      });
+
+      // Convert map to array and sort events by createdAt for each user
+      const eventsByUser = Array.from(eventsByUserMap.entries()).map(([userEmail, events]) => ({
+        userEmail,
+        events: events.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
+      }));
+
+      // Sort users by the createdAt of their first event (chronological order)
+      eventsByUser.sort((a, b) => {
+        const aFirstEvent = a.events[0]?.createdAt;
+        const bFirstEvent = b.events[0]?.createdAt;
+        if (!aFirstEvent || !bFirstEvent) return 0;
+        return new Date(aFirstEvent).getTime() - new Date(bFirstEvent).getTime();
+      });
       
       return {
         taskId,
         emailSubject,
-        events: allEvents,
-        count: allEvents.length
+        eventsByUser,
+        totalEvents: allEvents.length
       };
     } catch (error: any) {
       console.error('Error fetching task subscriber engagement events:', error);

@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-10-17',
+    changes: [
+      'Enhanced Email Engagement Events Data Structure in Agent Mode',
+      '- Improved get_task_subscriber_engagement_events function to focus on key engagement events (delivered, opened, clicked)',
+      '- Events are now grouped by user email for better timeline analysis and easier tracking of user engagement patterns',
+    ],
+  },
+  {
     date: '2025-10-16',
     changes: [
       'Renamed Meta Campaigns to Campaign Performance with Enhanced Email Campaign Monitoring',

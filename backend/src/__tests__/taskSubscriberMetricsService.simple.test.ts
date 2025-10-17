@@ -221,7 +221,7 @@ describe('TaskSubscriberMetricsService - Simple Tests', () => {
       expect(result.taskId).toBe(taskId);
       expect(result.emailSubject).toBe(emailSubject);
       // events property removed - no longer returned
-      expect(result.count).toBe(0);
+      expect(result.totalEvents).toBe(0);
     });
 
     it('should return empty events when user has no email domain', async () => {
@@ -239,7 +239,7 @@ describe('TaskSubscriberMetricsService - Simple Tests', () => {
       expect(result.taskId).toBe(taskId);
       expect(result.emailSubject).toBe(emailSubject);
       // events property removed - no longer returned
-      expect(result.count).toBe(0);
+      expect(result.totalEvents).toBe(0);
     });
 
     it('should throw error when task not found', async () => {
@@ -287,7 +287,7 @@ describe('TaskSubscriberMetricsService - Simple Tests', () => {
       expect(result.taskId).toBe(taskId);
       expect(result.emailSubject).toBe(emailSubject);
       // events property removed - no longer returned
-      expect(result.count).toBe(0);
+      expect(result.totalEvents).toBe(0);
     });
   });
 });
