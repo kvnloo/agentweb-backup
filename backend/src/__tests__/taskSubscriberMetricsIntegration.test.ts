@@ -193,10 +193,6 @@ describe('Task Subscriber Metrics Integration Tests', () => {
         'email.bounced': 1
       });
 
-      // Verify timeline
-      expect(result.metrics.timeline).toHaveLength(2);
-      expect(result.metrics.timeline[0].date).toBe('2024-01-08');
-      expect(result.metrics.timeline[1].date).toBe('2024-01-01');
 
       // Verify Week 1 Newsletter metrics
       const week1Metrics = result.metrics.subjectMetrics['Weekly Newsletter - Week 1'];
@@ -320,7 +316,6 @@ describe('Task Subscriber Metrics Integration Tests', () => {
       // subscribers property removed - no longer returned
       // events property removed - no longer returned
       expect(result).toHaveProperty('metrics');
-      expect(result.metrics).toHaveProperty('timeline');
       expect(result.metrics).toHaveProperty('totalEvents');
       expect(result.metrics).toHaveProperty('eventTypes');
       expect(result.metrics).toHaveProperty('subjectMetrics');

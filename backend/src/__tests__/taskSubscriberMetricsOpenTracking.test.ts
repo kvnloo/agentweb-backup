@@ -363,7 +363,6 @@ describe('TaskSubscriberMetricsService - Open Tracking Tests', () => {
 
       const result = await TaskSubscriberMetricsService.getTaskSubscriberMetrics(taskId, userId);
 
-      expect(result.metrics.timeline).toEqual([]);
       expect(result.metrics.totalEvents).toBe(0);
       expect(result.metrics.eventTypes).toEqual({});
       expect(result.metrics.subjectMetrics).toEqual({});
@@ -399,7 +398,6 @@ describe('TaskSubscriberMetricsService - Open Tracking Tests', () => {
 
       const result = await TaskSubscriberMetricsService.getTaskSubscriberMetrics(taskId, userId);
 
-      expect(result.metrics.timeline).toEqual([]);
       expect(result.metrics.totalEvents).toBe(0);
       expect(result.metrics.eventTypes).toEqual({});
       expect(result.metrics.subjectMetrics).toEqual({});

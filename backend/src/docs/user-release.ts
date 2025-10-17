@@ -14,6 +14,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Events are now grouped by user email for better timeline analysis and easier tracking of user engagement patterns',
       'Improved Chat Message Display with Newline Formatting in Agent Mode',
       '- User messages with newlines are automatically converted to HTML for proper display',
+      'Optimized Email Metrics Performance',
+      '- Removed unused timeline data from email metrics API to improve performance and reduce data transfer',
     ],
   },
   {
