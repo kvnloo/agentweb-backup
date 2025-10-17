@@ -4154,10 +4154,26 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const { TaskSubscriberMetricsService } = await import('./taskSubscriberMetricsService');
       const metrics = await TaskSubscriberMetricsService.getTaskSubscriberMetrics(taskId, userId);
       
+      // Strip engagedEmails from subject metrics to reduce data for agent processing
+      const cleanedMetrics = {
+        ...metrics,
+        metrics: {
+          ...metrics.metrics,
+          subjectMetrics: Object.fromEntries(
+            Object.entries(metrics.metrics.subjectMetrics).map(([subject, subjectData]) => [
+              subject,
+              Object.fromEntries(
+                Object.entries(subjectData).filter(([key]) => key !== 'engagedEmails')
+              )
+            ])
+          )
+        }
+      };
+      
       return {
         success: true,
         message: 'Task subscriber metrics retrieved successfully',
-        data: metrics
+        data: cleanedMetrics
       };
     } catch (error: any) {
       console.error('AgentMode: Error getting task subscriber metrics:', error);
