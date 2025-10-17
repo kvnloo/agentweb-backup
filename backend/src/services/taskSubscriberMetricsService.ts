@@ -4,12 +4,6 @@ import { subscriberDb } from './db';
 
 export interface TaskSubscriberMetrics {
   metrics: {
-    timeline: Array<{
-      date: string;
-      events: { [eventType: string]: number };
-      total: number;
-      clickedEmails: string[];
-    }>;
     totalEvents: number;
     eventTypes: { [eventType: string]: number };
     subjectMetrics: {
@@ -71,7 +65,6 @@ export class TaskSubscriberMetricsService {
       if (!subscribers || subscribers.length === 0) {
         return {
           metrics: {
-            timeline: [],
             totalEvents: 0,
             eventTypes: {},
             subjectMetrics: {}
@@ -85,7 +78,6 @@ export class TaskSubscriberMetricsService {
       if (!emailDomain) {
         return {
           metrics: {
-            timeline: [],
             totalEvents: 0,
             eventTypes: {},
             subjectMetrics: {}
@@ -115,8 +107,6 @@ export class TaskSubscriberMetricsService {
 
       // Process events into metrics data
       const eventTypes: { [eventType: string]: number } = {};
-      const dateMap: { [date: string]: { [eventType: string]: number } } = {};
-      const clickedEmailsByDate: { [date: string]: string[] } = {};
       // Track unique recipients by subject for delivered, opened, clicked
       const subjectDeliveredRecipients: { [subject: string]: Set<string> } = {};
       const subjectOpenedRecipients: { [subject: string]: Set<string> } = {};
@@ -169,12 +159,6 @@ export class TaskSubscriberMetricsService {
         // Count by event type
         eventTypes[eventType] = (eventTypes[eventType] || 0) + 1;
         
-        // Count by date
-        if (!dateMap[date]) {
-          dateMap[date] = {};
-        }
-        dateMap[date][eventType] = (dateMap[date][eventType] || 0) + 1;
-        
         // Count by subject
         if (eventType === 'email.delivered') {
           // Unique delivered recipients per subject
@@ -219,15 +203,6 @@ export class TaskSubscriberMetricsService {
           subjectMetrics[subject].bounced++;
         } else if (eventType === 'email.complained') {
           subjectMetrics[subject].failed++;
-        }
-        
-        // Collect clicked email addresses by date
-        if (eventType === 'email.clicked' && event.data && event.data.to) {
-          if (!clickedEmailsByDate[date]) {
-            clickedEmailsByDate[date] = [];
-          }
-          const emails = Array.isArray(event.data.to) ? event.data.to : [event.data.to];
-          clickedEmailsByDate[date].push(...emails);
         }
       });
       
@@ -280,27 +255,9 @@ export class TaskSubscriberMetricsService {
           processedSubjectMetrics[subject] = metricsWithoutOpened;
         }
       });
-      
-      // Convert to timeline array
-      const timeline = Object.entries(dateMap)
-        .map(([date, events]) => {
-          // Get unique clicked emails for this date
-          const clickedEmails = clickedEmailsByDate[date] 
-            ? [...new Set(clickedEmailsByDate[date])] // Remove duplicates
-            : [];
-          
-          return {
-            date,
-            events,
-            total: Object.values(events).reduce((sum, count) => sum + count, 0),
-            clickedEmails
-          };
-        })
-        .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
       return {
         metrics: {
-          timeline,
           totalEvents: taskEvents.length,
           eventTypes,
           subjectMetrics: processedSubjectMetrics
