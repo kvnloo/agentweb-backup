@@ -38,7 +38,7 @@ export interface TaskSubscriberEngagementEvents {
       createdAt: string;
     }>;
   }>;
-  totalEvents: number;
+  totalEngagedUsers: number;
 }
 
 export class TaskSubscriberMetricsService {
@@ -341,7 +341,7 @@ export class TaskSubscriberMetricsService {
           taskId,
           emailSubject,
           eventsByUser: [],
-          totalEvents: 0
+          totalEngagedUsers: 0
         };
       }
 
@@ -353,7 +353,7 @@ export class TaskSubscriberMetricsService {
           taskId,
           emailSubject,
           eventsByUser: [],
-          totalEvents: 0
+          totalEngagedUsers: 0
         };
       }
 
@@ -374,7 +374,7 @@ export class TaskSubscriberMetricsService {
           taskId,
           emailSubject,
           eventsByUser: [],
-          totalEvents: 0
+          totalEngagedUsers: 0
         };
       }
 
@@ -412,10 +412,18 @@ export class TaskSubscriberMetricsService {
       });
 
       // Convert map to array and sort events by createdAt for each user
-      const eventsByUser = Array.from(eventsByUserMap.entries()).map(([userEmail, events]) => ({
+      let eventsByUser = Array.from(eventsByUserMap.entries()).map(([userEmail, events]) => ({
         userEmail,
         events: events.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
       }));
+
+      // Filter out users who only have delivered events (no engagement)
+      eventsByUser = eventsByUser.filter(user => {
+        const hasOpenedOrClicked = user.events.some(event => 
+          event.eventType === 'email.opened' || event.eventType === 'email.clicked'
+        );
+        return hasOpenedOrClicked;
+      });
 
       // Sort users by the createdAt of their first event (chronological order)
       eventsByUser.sort((a, b) => {
@@ -429,7 +437,7 @@ export class TaskSubscriberMetricsService {
         taskId,
         emailSubject,
         eventsByUser,
-        totalEvents: allEvents.length
+        totalEngagedUsers: eventsByUser.length
       };
     } catch (error: any) {
       console.error('Error fetching task subscriber engagement events:', error);
