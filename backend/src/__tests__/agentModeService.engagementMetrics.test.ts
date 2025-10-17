@@ -442,13 +442,13 @@ describe('AgentModeService - Engagement Metrics', () => {
       expect(result.data.linkAnalysis).toHaveLength(2);
       
       // Unsubscribe links should be normalized and combined
-      const unsubscribeLink = result.data.linkAnalysis.find(link => link.url.includes('/unsubscribe?'));
+      const unsubscribeLink = result.data.linkAnalysis.find((link: any) => link.url.includes('/unsubscribe?'));
       expect(unsubscribeLink).toBeDefined();
       expect(unsubscribeLink.url).toBe('https://app.agentweb.pro/unsubscribe?taskId=1744901929945&email=placeholder@example.com');
       expect(unsubscribeLink.clicks).toBe(2); // Both user1 and user2 clicked unsubscribe
       
       // Regular links should remain unchanged
-      const regularLink = result.data.linkAnalysis.find(link => link.url.includes('cta1'));
+      const regularLink = result.data.linkAnalysis.find((link: any) => link.url.includes('cta1'));
       expect(regularLink).toBeDefined();
       expect(regularLink.url).toBe('https://example.com/cta1');
       expect(regularLink.clicks).toBe(1);
