@@ -12,7 +12,7 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Enhanced Email Engagement Events Data Structure in Agent Mode',
       '- Improved get_task_subscriber_engagement_events function to focus on key engagement events (delivered, opened, clicked)',
       '- Events are now grouped by user email for better timeline analysis and easier tracking of user engagement patterns',
-      'Improved Scheduled Chat Message Display with Newline Formatting',
+      'Improved Chat Message Display with Newline Formatting in Agent Mode',
       '- User messages with newlines are automatically converted to HTML for proper display',
     ],
   },
