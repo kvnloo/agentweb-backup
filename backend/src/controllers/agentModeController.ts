@@ -121,7 +121,7 @@ async function runScheduledChat(
   createdAt: string;
 }> {
   const now = new Date();
-  const maxTries = 3;
+  const maxTries = 6;
   let attempt = 0;
   let finalResult: {
     scheduleId: string;

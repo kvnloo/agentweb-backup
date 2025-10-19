@@ -7,6 +7,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-10-19',
+    changes: [
+      'Enhanced Scheduled Chat Reliability with Increased Retry Attempts',
+      '- Increased maximum retry attempts from 3 to 6 for scheduled chats to improve success rates',
+    ],
+  },
+  {
     date: '2025-10-17',
     changes: [
       'Enhanced Email Engagement Events Data Structure in Agent Mode',
