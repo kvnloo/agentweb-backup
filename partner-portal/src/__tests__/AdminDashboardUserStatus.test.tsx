@@ -1,4 +1,4 @@
-import React from 'react';
+// import React from 'react'; // Not needed for this test
 import { render, screen } from '@testing-library/react';
 import '@testing-library/jest-dom';
 
@@ -20,8 +20,8 @@ const AdminDashboard = () => {
   const getUserStatus = (entry: any) => {
     const existingUser = contextUsers.find(user => user.email === entry.email);
     const userExists = !!existingUser;
-    const isFreeUserOnly = existingUser && existingUser.roles?.includes('free') && !existingUser.roles?.some(role => role !== 'free');
-    const isRegisteredUser = existingUser && existingUser.roles?.some(role => role !== 'free');
+    const isFreeUserOnly = existingUser && existingUser.roles?.includes('free') && !existingUser.roles?.some((role: string) => role !== 'free');
+    const isRegisteredUser = existingUser && existingUser.roles?.some((role: string) => role !== 'free');
 
     return {
       existingUser,
@@ -114,8 +114,8 @@ describe('AdminDashboard User Status Logic', () => {
     const getUserStatus = (entry: any) => {
       const existingUser = contextUsers.find(user => user.email === entry.email);
       const userExists = !!existingUser;
-      const isFreeUserOnly = existingUser && existingUser.roles?.includes('free') && !existingUser.roles?.some(role => role !== 'free');
-      const isRegisteredUser = existingUser && existingUser.roles?.some(role => role !== 'free');
+      const isFreeUserOnly = existingUser && existingUser.roles?.includes('free') && !existingUser.roles?.some((role: string) => role !== 'free');
+      const isRegisteredUser = existingUser && existingUser.roles?.some((role: string) => role !== 'free');
 
       return {
         existingUser,
@@ -159,8 +159,8 @@ describe('AdminDashboard User Status Logic', () => {
     const getUserStatus = (entry: any) => {
       const existingUser = contextUsers.find(user => user.email === entry.email);
       const userExists = !!existingUser;
-      const isFreeUserOnly = existingUser && existingUser.roles?.includes('free') && !existingUser.roles?.some(role => role !== 'free');
-      const isRegisteredUser = existingUser && existingUser.roles?.some(role => role !== 'free');
+      const isFreeUserOnly = existingUser && existingUser.roles?.includes('free') && !existingUser.roles?.some((role: string) => role !== 'free');
+      const isRegisteredUser = existingUser && existingUser.roles?.some((role: string) => role !== 'free');
 
       return {
         existingUser,

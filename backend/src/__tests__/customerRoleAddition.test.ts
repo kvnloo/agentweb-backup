@@ -21,7 +21,7 @@ describe('Customer Role Addition Logic', () => {
 
     it('should add customer role to a free user without customer role', async () => {
       const user = { userId: 'user1', email: 'test@example.com', roles: ['free'] };
-      mockUserDb.updateUser.mockResolvedValue(undefined);
+      (mockUserDb as any).updateUser.mockResolvedValue(undefined);
 
       await addCustomerRoleToFreeUser(user);
 
@@ -30,7 +30,7 @@ describe('Customer Role Addition Logic', () => {
 
     it('should not add customer role if user already has customer role', async () => {
       const user = { userId: 'user2', email: 'test2@example.com', roles: ['free', 'customer'] };
-      mockUserDb.updateUser.mockResolvedValue(undefined);
+      (mockUserDb as any).updateUser.mockResolvedValue(undefined);
 
       await addCustomerRoleToFreeUser(user);
 
@@ -39,7 +39,7 @@ describe('Customer Role Addition Logic', () => {
 
     it('should not add customer role if user is not a free user', async () => {
       const user = { userId: 'user3', email: 'test3@example.com', roles: ['partner'] };
-      mockUserDb.updateUser.mockResolvedValue(undefined);
+      (mockUserDb as any).updateUser.mockResolvedValue(undefined);
 
       await addCustomerRoleToFreeUser(user);
 
@@ -48,7 +48,7 @@ describe('Customer Role Addition Logic', () => {
 
     it('should handle user with no roles array', async () => {
       const user = { userId: 'user4', email: 'test4@example.com' }; // No roles property
-      mockUserDb.updateUser.mockResolvedValue(undefined);
+      (mockUserDb as any).updateUser.mockResolvedValue(undefined);
 
       await addCustomerRoleToFreeUser(user);
 
@@ -57,7 +57,7 @@ describe('Customer Role Addition Logic', () => {
 
     it('should handle user with empty roles array', async () => {
       const user = { userId: 'user5', email: 'test5@example.com', roles: [] };
-      mockUserDb.updateUser.mockResolvedValue(undefined);
+      (mockUserDb as any).updateUser.mockResolvedValue(undefined);
 
       await addCustomerRoleToFreeUser(user);
 
@@ -66,7 +66,7 @@ describe('Customer Role Addition Logic', () => {
 
     it('should handle user with multiple roles including free and customer', async () => {
       const user = { userId: 'user6', email: 'test6@example.com', roles: ['free', 'customer', 'partner'] };
-      mockUserDb.updateUser.mockResolvedValue(undefined);
+      (mockUserDb as any).updateUser.mockResolvedValue(undefined);
 
       await addCustomerRoleToFreeUser(user);
 
@@ -75,7 +75,7 @@ describe('Customer Role Addition Logic', () => {
 
     it('should handle user with free role and other non-customer roles', async () => {
       const user = { userId: 'user7', email: 'test7@example.com', roles: ['free', 'partner'] };
-      mockUserDb.updateUser.mockResolvedValue(undefined);
+      (mockUserDb as any).updateUser.mockResolvedValue(undefined);
 
       await addCustomerRoleToFreeUser(user);
 

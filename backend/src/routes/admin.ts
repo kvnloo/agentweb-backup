@@ -199,7 +199,10 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
     // Check if user already exists
     const existingUser = await userDb.getUserByEmail(email);
     if (existingUser) {
-      return res.status(400).json({ message: "User already exists" });
+      // Allow free users to be created (upgraded to customer)
+      if (existingUser.roles && existingUser.roles.some((role: string) => role !== 'free')) {
+        return res.status(400).json({ message: "User already exists" });
+      }
     }
 
     // Get waitlist entry
@@ -208,51 +211,68 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
       return res.status(404).json({ message: "Waitlist entry not found" });
     }
 
-    // Generate random password
-    const generateRandomPassword = (length: number = 12) => {
-      const charset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*';
-      let password = '';
-      for (let i = 0; i < length; i++) {
-        password += charset.charAt(Math.floor(Math.random() * charset.length));
+    let resultUser;
+    let temporaryPassword;
+
+    if (existingUser) {
+      // Update existing free user with new roles
+      const updatedRoles = [...(existingUser.roles || []), ...roles];
+      await userDb.updateUser(existingUser.userId, { roles: updatedRoles });
+      resultUser = { ...existingUser, roles: updatedRoles };
+      
+      // Send welcome email without password for existing user upgrade
+      await emailService.sendWelcomeEmail(email);
+    } else {
+      // Create new user with waitlist data
+      const generateRandomPassword = (length: number = 12) => {
+        const charset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*';
+        let password = '';
+        for (let i = 0; i < length; i++) {
+          password += charset.charAt(Math.floor(Math.random() * charset.length));
+        }
+        return password;
+      };
+      
+      temporaryPassword = generateRandomPassword(16);
+      const hashedPassword = await bcrypt.hash(temporaryPassword, 10);
+
+      const userId = require('uuid').v4();
+      const newUser = await userDb.createUser(
+        email,
+        userId,
+        hashedPassword,
+        false, // isOAuthUser
+        false, // isAdmin
+        roles,
+        waitlistEntry.fullName || email.split("@")[0], // displayName
+        undefined, // googleId
+        waitlistEntry.stripe_customer_id, // from waitlist
+        waitlistEntry.companyName, // from waitlist
+        waitlistEntry.useCaseCategories // from waitlist
+      );
+
+      if (!newUser) {
+        return res.status(500).json({ message: "Failed to create user" });
       }
-      return password;
-    };
-    
-    const randomPassword = generateRandomPassword(16);
-    const hashedPassword = await bcrypt.hash(randomPassword, 10);
 
-    // Create user with waitlist data
-    const userId = require('uuid').v4();
-    const newUser = await userDb.createUser(
-      email,
-      userId,
-      hashedPassword,
-      false, // isOAuthUser
-      false, // isAdmin
-      roles,
-      waitlistEntry.fullName || email.split("@")[0], // displayName
-      undefined, // googleId
-      waitlistEntry.stripe_customer_id, // from waitlist
-      waitlistEntry.companyName, // from waitlist
-      waitlistEntry.useCaseCategories // from waitlist
-    );
-
-    if (!newUser) {
-      return res.status(500).json({ message: "Failed to create user" });
+      resultUser = newUser;
+      
+      // Send welcome email with temporary password for new user
+      await emailService.sendWelcomeEmail(email, temporaryPassword);
     }
 
-    // Send welcome email with temporary password
-    await emailService.sendWelcomeEmail(email, randomPassword);
+    // Update waitlist status to completed
+    await waitlistDb.updateStatus(email, 'completed');
 
     res.json({ 
       message: "User created successfully", 
       user: {
-        userId: newUser.userId,
-        email: newUser.email,
-        displayName: newUser.displayName,
-        roles: newUser.roles
+        userId: resultUser.userId,
+        email: resultUser.email,
+        displayName: resultUser.displayName,
+        roles: resultUser.roles
       },
-      temporaryPassword: randomPassword
+      ...(temporaryPassword && { temporaryPassword })
     });
   } catch (error) {
     console.error("Error creating user from waitlist:", error);
@@ -339,7 +359,7 @@ router.put("/waitlist/:email/status", async (req, res) => {
     const existingUser = await userDb.getUserByEmail(email);
     if (existingUser) {
       // Allow free users to be updated
-      if (existingUser.roles && existingUser.roles.some(role => role !== 'free')) {
+      if (existingUser.roles && existingUser.roles.some((role: string) => role !== 'free')) {
         return res.status(400).json({ message: "User already exists" });
       }
     }
