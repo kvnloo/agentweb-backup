@@ -355,6 +355,11 @@ router.put("/waitlist/:email/status", async (req, res) => {
         // Check if user already exists to determine email type
         const existingUser = await userDb.getUserByEmail(email);
         if (existingUser) {
+          // Add customer role to existing free users so they can access customer portal
+          if (existingUser.roles && existingUser.roles.includes('free') && !existingUser.roles.includes('customer')) {
+            const updatedRoles = [...existingUser.roles, 'customer'];
+            await userDb.updateUser(existingUser.userId, { roles: updatedRoles });
+          }
           await emailService.sendWelcomeEmail(email); // No password = upgrade email
         } else {
           await emailService.sendInvitation(email);
@@ -482,6 +487,11 @@ router.post("/waitlist/resend-invitation", async (req, res) => {
       // Check if user already exists to determine email type
       const existingUser = await userDb.getUserByEmail(email);
       if (existingUser) {
+        // Add customer role to existing free users so they can access customer portal
+        if (existingUser.roles && existingUser.roles.includes('free') && !existingUser.roles.includes('customer')) {
+          const updatedRoles = [...existingUser.roles, 'customer'];
+          await userDb.updateUser(existingUser.userId, { roles: updatedRoles });
+        }
         await emailService.sendWelcomeEmail(email); // No password = upgrade email
       } else {
         await emailService.sendInvitation(email);
@@ -567,6 +577,11 @@ router.post("/waitlist/invite", async (req, res) => {
       try {
         // Use welcome email for existing users, invitation email for new users
         if (existingUser) {
+          // Add customer role to existing free users so they can access customer portal
+          if (existingUser.roles && existingUser.roles.includes('free') && !existingUser.roles.includes('customer')) {
+            const updatedRoles = [...existingUser.roles, 'customer'];
+            await userDb.updateUser(existingUser.userId, { roles: updatedRoles });
+          }
           await emailService.sendWelcomeEmail(email); // No password = upgrade email
         } else {
           await emailService.sendInvitation(email);
