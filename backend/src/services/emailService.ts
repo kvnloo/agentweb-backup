@@ -90,6 +90,134 @@ export const emailService = {
     }
   },
 
+  async sendWelcomeEmail(email: string, temporaryPassword?: string) {
+    const isUpgrade = !temporaryPassword;
+    
+    const welcomeHtml = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+        <div style="text-align: center; margin-bottom: 30px;">
+          <h1 style="color: #1B2549; margin: 0;">AgentWeb</h1>
+          <p style="color: #666; margin: 5px 0;">Customer Portal</p>
+        </div>
+        
+        <div style="background: #f8f9fa; padding: 30px; border-radius: 8px; margin-bottom: 20px;">
+          <h2 style="color: #1B2549; margin-top: 0;">Welcome to AgentWeb!</h2>
+          <p style="color: #333; line-height: 1.6;">
+            ${isUpgrade 
+              ? 'Great news! Your account has been upgraded and you now have access to our premium features.'
+              : 'Your account has been created successfully. You can now access the AgentWeb Customer Portal.'
+            }
+          </p>
+          ${isUpgrade ? `
+          <p style="color: #333; line-height: 1.6;">
+            Since you already have an account, you can log in directly using your existing credentials.
+          </p>
+          ` : ''}
+          
+          ${temporaryPassword ? `
+          <div style="background: #fff; padding: 20px; border-radius: 6px; border-left: 4px solid #643B7E; margin: 20px 0;">
+            <h3 style="color: #1B2549; margin-top: 0;">Your Login Credentials</h3>
+            <p style="margin: 10px 0;"><strong>Email:</strong> ${email}</p>
+            <p style="margin: 10px 0;"><strong>Temporary Password:</strong> <code style="background: #f0f0f0; padding: 2px 6px; border-radius: 3px;">${temporaryPassword}</code></p>
+          </div>
+          ` : ''}
+          
+          <div style="text-align: center; margin: 30px 0;">
+            <a href="${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/login" 
+               style="background: linear-gradient(90deg, #643B7E 0%, #6F3DFD 100%); 
+                      color: white; 
+                      padding: 12px 30px; 
+                      text-decoration: none; 
+                      border-radius: 6px; 
+                      display: inline-block;
+                      font-weight: bold;">
+              Sign In Now
+            </a>
+          </div>
+          
+          ${isUpgrade ? `
+                 <div style="background: #fff; padding: 20px; border-radius: 6px; border-left: 4px solid #643B7E; margin: 20px 0;">
+                   <h3 style="color: #1B2549; margin-top: 0;">What's New with Your Upgrade</h3>
+                   <p style="margin: 10px 0; color: #333; line-height: 1.6;">
+                     You now have access to our full suite of AI-powered marketing automation tools, including Emma AI Assistant, advanced content creation, Meta Ads integration, and comprehensive analytics. Transform your marketing workflow with intelligent automation and data-driven insights.
+                   </p>
+                 </div>
+          ` : ''}
+          
+          <p style="color: #666; font-size: 14px; margin-top: 20px;">
+            ${temporaryPassword 
+              ? '<strong>Important:</strong> Please change your password after your first login for security reasons.'
+              : ''
+            }
+          </p>
+          
+          <div style="background: #fff; padding: 20px; border-radius: 6px; border-left: 4px solid #643B7E; margin: 20px 0;">
+            <h3 style="color: #1B2549; margin-top: 0;">Getting Started with AgentWeb</h3>
+            <p style="margin: 10px 0; color: #333; line-height: 1.6;">Check out these resources to help you get the most out of AgentWeb:</p>
+            <ul style="margin: 10px 0; padding-left: 20px; color: #333;">
+              <li><a href="${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/changelog" style="color: #643B7E; text-decoration: none;">Release Notes</a> - Learn about our latest features and updates</li>
+              <li><a href="${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/guide" style="color: #643B7E; text-decoration: none;">User Guide</a> - Detailed instructions on how to create and manage your web automation tasks</li>
+            </ul>
+          </div>
+        </div>
+        
+        <div style="text-align: center; color: #666; font-size: 12px;">
+          <p>If you have any questions, please contact our support team.</p>
+        </div>
+      </div>
+    `;
+
+    const welcomeText = `
+AgentWeb Customer Portal - Welcome!
+
+${isUpgrade 
+  ? 'Great news! Your account has been upgraded and you now have access to our premium features.\n\nSince you already have an account, you can log in directly using your existing credentials.'
+  : 'Your account has been created successfully. You can now access the AgentWeb Customer Portal.'
+}
+
+${temporaryPassword ? `
+Your Login Credentials:
+Email: ${email}
+Temporary Password: ${temporaryPassword}
+` : ''}
+
+Sign in at: ${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/login
+
+${isUpgrade ? `
+What's New with Your Upgrade:
+You now have access to our full suite of AI-powered marketing automation tools, including Emma AI Assistant, advanced content creation, Meta Ads integration, and comprehensive analytics. Transform your marketing workflow with intelligent automation and data-driven insights.
+` : ''}
+
+${temporaryPassword 
+  ? 'Important: Please change your password after your first login for security reasons.'
+  : ''
+}
+
+Getting Started with AgentWeb:
+Check out these resources to help you get the most out of AgentWeb:
+- Release Notes: ${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/changelog - Learn about our latest features and updates
+- User Guide: ${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/guide - Detailed instructions on how to create and manage your web automation tasks
+
+If you have any questions, please contact our support team.
+
+Best regards,
+The AgentWeb Team
+    `;
+
+    try {
+      await this.sendEmail(
+        email,
+        isUpgrade ? 'Welcome to AgentWeb - Your Account is Upgraded!' : 'Welcome to AgentWeb - Your Account is Ready!',
+        welcomeText,
+        welcomeHtml
+      );
+      console.log(`Welcome email sent successfully to: ${email}`);
+    } catch (error) {
+      console.error("Error sending welcome email:", error);
+      throw error;
+    }
+  },
+
   async sendTaskOwnershipChangeEmail(
     recipientEmail: string,
     taskName: string,

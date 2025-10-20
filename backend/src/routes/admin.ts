@@ -242,74 +242,7 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
     }
 
     // Send welcome email with temporary password
-    const welcomeHtml = `
-      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-        <div style="text-align: center; margin-bottom: 30px;">
-          <h1 style="color: #1B2549; margin: 0;">AgentWeb</h1>
-          <p style="color: #666; margin: 5px 0;">Customer Portal</p>
-        </div>
-        
-        <div style="background: #f8f9fa; padding: 30px; border-radius: 8px; margin-bottom: 20px;">
-          <h2 style="color: #1B2549; margin-top: 0;">Welcome to AgentWeb!</h2>
-          <p style="color: #333; line-height: 1.6;">
-            Your account has been created successfully. You can now access the AgentWeb Customer Portal.
-          </p>
-          
-          <div style="background: #fff; padding: 20px; border-radius: 6px; border-left: 4px solid #643B7E; margin: 20px 0;">
-            <h3 style="color: #1B2549; margin-top: 0;">Your Login Credentials</h3>
-            <p style="margin: 10px 0;"><strong>Email:</strong> ${email}</p>
-            <p style="margin: 10px 0;"><strong>Temporary Password:</strong> <code style="background: #f0f0f0; padding: 2px 6px; border-radius: 3px;">${randomPassword}</code></p>
-          </div>
-          
-          <div style="text-align: center; margin: 30px 0;">
-            <a href="${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/login" 
-               style="background: linear-gradient(90deg, #643B7E 0%, #6F3DFD 100%); 
-                      color: white; 
-                      padding: 12px 30px; 
-                      text-decoration: none; 
-                      border-radius: 6px; 
-                      display: inline-block;
-                      font-weight: bold;">
-              Sign In Now
-            </a>
-          </div>
-          
-          <p style="color: #666; font-size: 14px; margin-top: 20px;">
-            <strong>Important:</strong> Please change your password after your first login for security reasons.
-          </p>
-        </div>
-        
-        <div style="text-align: center; color: #666; font-size: 12px;">
-          <p>If you have any questions, please contact our support team.</p>
-        </div>
-      </div>
-    `;
-
-    const welcomeText = `
-AgentWeb Customer Portal - Welcome!
-
-Your account has been created successfully. You can now access the AgentWeb Customer Portal.
-
-Your Login Credentials:
-Email: ${email}
-Temporary Password: ${randomPassword}
-
-Sign in at: ${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/login
-
-Important: Please change your password after your first login for security reasons.
-
-If you have any questions, please contact our support team.
-
-Best regards,
-The AgentWeb Team
-    `;
-
-    await emailService.sendEmail(
-      email,
-      'Welcome to AgentWeb - Your Account is Ready!',
-      welcomeText,
-      welcomeHtml
-    );
+    await emailService.sendWelcomeEmail(email, randomPassword);
 
     res.json({ 
       message: "User created successfully", 
@@ -419,7 +352,13 @@ router.put("/waitlist/:email/status", async (req, res) => {
     // Send invitation email if status is 'invited'
     if (status === "invited") {
       try {
-        await emailService.sendInvitation(email);
+        // Check if user already exists to determine email type
+        const existingUser = await userDb.getUserByEmail(email);
+        if (existingUser) {
+          await emailService.sendWelcomeEmail(email); // No password = upgrade email
+        } else {
+          await emailService.sendInvitation(email);
+        }
       } catch (emailError) {
         console.error("Error sending invitation email:", emailError);
         // Revert the status update
@@ -528,9 +467,9 @@ router.post("/waitlist/resend-invitation", async (req, res) => {
       return res.status(400).json({ message: "User has not been invited yet" });
     }
 
-    // Check if user already exists
+    // Check if user already exists (allow free users to be resent invitations)
     const existingUser = await userDb.getUserByEmail(email);
-    if (existingUser) {
+    if (existingUser && !existingUser.roles.includes('free')) {
       return res.status(400).json({ message: "User already exists" });
     }
 
@@ -540,7 +479,13 @@ router.post("/waitlist/resend-invitation", async (req, res) => {
 
     // Send the invitation email
     try {
-      await emailService.sendInvitation(email);
+      // Check if user already exists to determine email type
+      const existingUser = await userDb.getUserByEmail(email);
+      if (existingUser) {
+        await emailService.sendWelcomeEmail(email); // No password = upgrade email
+      } else {
+        await emailService.sendInvitation(email);
+      }
     } catch (emailError) {
       console.error("Error sending invitation email:", emailError);
       return res
@@ -589,7 +534,10 @@ router.post("/waitlist/invite", async (req, res) => {
     // Check if user already exists
     const existingUser = await userDb.getUserByEmail(email);
     if (existingUser) {
-      return res.status(409).json({ message: "User already exists" });
+      // Allow free users to be added to waitlist even if they already exist
+      if (!existingUser.roles.includes('free')) {
+        return res.status(409).json({ message: "User already exists" });
+      }
     }
 
     // Create waitlist entry
@@ -617,7 +565,12 @@ router.post("/waitlist/invite", async (req, res) => {
     // Send invitation email if requested
     if (sendInvitation) {
       try {
-        await emailService.sendInvitation(email);
+        // Use welcome email for existing users, invitation email for new users
+        if (existingUser) {
+          await emailService.sendWelcomeEmail(email); // No password = upgrade email
+        } else {
+          await emailService.sendInvitation(email);
+        }
       } catch (emailError) {
         console.error("Error sending invitation email:", emailError);
         // Optionally delete the entry or update status back to pending

@@ -2151,9 +2151,10 @@ export default function AdminDashboard() {
                   </TableRow>
                 ) : (
                   waitlist.map((entry: WaitlistEntry) => {
-                    const userExists = contextUsers.some(
+                    const existingUser = contextUsers.find(
                       (user) => user.email === entry.email
                     );
+                    const userExists = existingUser && !existingUser.roles?.includes('free');
                     return (
                       <TableRow key={entry.email}>
                         <TableCell>{entry.email}</TableCell>
@@ -2381,7 +2382,7 @@ export default function AdminDashboard() {
                                 Resend
                               </Button>
                             )}
-                            {!userExists && !adminLoading && (
+                            {!userExists && !existingUser && !adminLoading && (
                               <Tooltip title="Create User">
                                 <IconButton
                                   size="small"
@@ -2392,12 +2393,12 @@ export default function AdminDashboard() {
                                 </IconButton>
                               </Tooltip>
                             )}
-                            {userExists && (
+                            {existingUser && (
                               <Typography
                                 variant="body2"
-                                color="text.secondary"
+                                color={existingUser.roles?.includes('free') ? "warning.main" : "text.secondary"}
                               >
-                                Registered
+                                {existingUser.roles?.includes('free') ? 'Free User' : 'Registered'}
                               </Typography>
                             )}
                             {/* Delete Button - visible for all entries for now */}
