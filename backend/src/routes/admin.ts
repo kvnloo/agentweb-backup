@@ -338,7 +338,10 @@ router.put("/waitlist/:email/status", async (req, res) => {
     // Check if user already exists
     const existingUser = await userDb.getUserByEmail(email);
     if (existingUser) {
-      return res.status(400).json({ message: "User already exists" });
+      // Allow free users to be updated
+      if (existingUser.roles && existingUser.roles.some(role => role !== 'free')) {
+        return res.status(400).json({ message: "User already exists" });
+      }
     }
 
     // Update invitedAt timestamp for invited users

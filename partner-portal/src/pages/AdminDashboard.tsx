@@ -2154,7 +2154,9 @@ export default function AdminDashboard() {
                     const existingUser = contextUsers.find(
                       (user) => user.email === entry.email
                     );
-                    const userExists = existingUser && !existingUser.roles?.includes('free');
+                    const userExists = !!existingUser;
+                    const isFreeUserOnly = existingUser && existingUser.roles?.includes('free') && !existingUser.roles?.some(role => role !== 'free');
+                    const isRegisteredUser = existingUser && existingUser.roles?.some(role => role !== 'free');
                     return (
                       <TableRow key={entry.email}>
                         <TableCell>{entry.email}</TableCell>
@@ -2360,7 +2362,7 @@ export default function AdminDashboard() {
                               gap: 0.5,
                             }}
                           >
-                            {!userExists && entry.status !== "invited" && (
+                            {(!userExists || isFreeUserOnly) && entry.status !== "invited" && !isRegisteredUser && (
                               <Button
                                 variant="outlined"
                                 size="small"
@@ -2371,7 +2373,7 @@ export default function AdminDashboard() {
                                 Invite
                               </Button>
                             )}
-                            {!userExists && entry.status === "invited" && (
+                            {(!userExists || isFreeUserOnly) && entry.status === "invited" && !isRegisteredUser && (
                               <Button
                                 variant="outlined"
                                 size="small"
@@ -2382,7 +2384,7 @@ export default function AdminDashboard() {
                                 Resend
                               </Button>
                             )}
-                            {!userExists && !existingUser && !adminLoading && (
+                            {!userExists && !adminLoading && (
                               <Tooltip title="Create User">
                                 <IconButton
                                   size="small"
@@ -2396,9 +2398,9 @@ export default function AdminDashboard() {
                             {existingUser && (
                               <Typography
                                 variant="body2"
-                                color={existingUser.roles?.includes('free') ? "warning.main" : "text.secondary"}
+                                color={isRegisteredUser ? "text.secondary" : "warning.main"}
                               >
-                                {existingUser.roles?.includes('free') ? 'Free User' : 'Registered'}
+                                {isRegisteredUser ? 'Registered' : 'Free User'}
                               </Typography>
                             )}
                             {/* Delete Button - visible for all entries for now */}
