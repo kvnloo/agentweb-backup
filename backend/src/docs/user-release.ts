@@ -7,6 +7,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-10-20',
+    changes: [
+      'Enhanced Free User Waitlist Management and Customer Portal Access',
+      '- Free users can now be added to the waitlist and receive invitation emails to join the Customer Portal',
+    ],
+  },
+  {
     date: '2025-10-19',
     changes: [
       'Enhanced Scheduled Chat Reliability with Increased Retry Attempts',
