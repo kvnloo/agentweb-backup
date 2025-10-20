@@ -218,7 +218,12 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
       // Update existing free user with new roles
       const updatedRoles = [...(existingUser.roles || []), ...roles];
       await userDb.updateUser(existingUser.userId, { roles: updatedRoles });
-      resultUser = { ...existingUser, roles: updatedRoles };
+      resultUser = {
+        userId: existingUser.userId,
+        email: existingUser.email,
+        displayName: existingUser.displayName,
+        roles: updatedRoles
+      };
       
       // Send welcome email without password for existing user upgrade
       await emailService.sendWelcomeEmail(email);

@@ -2,7 +2,7 @@ import request from 'supertest';
 import express from 'express';
 import adminRoutes from '../routes/admin';
 import { userDb } from '../services/db';
-import { waitlistDb } from '../services/waitlistDb';
+import { waitlistDb, WaitlistEntry } from '../services/waitlistDb';
 import { emailService } from '../services/emailService';
 
 // Mock the dependencies
@@ -23,10 +23,51 @@ const mockUserDb = userDb as jest.Mocked<typeof userDb>;
 const mockWaitlistDb = waitlistDb as jest.Mocked<typeof waitlistDb>;
 const mockEmailService = emailService as jest.Mocked<typeof emailService>;
 
+// Type that matches what the actual DynamoDB methods return
+type DynamoDBWaitlistItem = {
+  email: string;
+  joinedAt: string;
+  status: string;
+  invitedAt: string | undefined;
+  fullName: string | undefined;
+  phoneNumber: string | undefined;
+  companyName: string | undefined;
+  requestReport: boolean;
+  useCaseCategories: string[];
+  useCaseDescription: string;
+  supportNote: string;
+  stripe_customer_id: string | undefined;
+  productUsagePlan: string | undefined;
+  monthlyMarketingSpend: string | undefined;
+  businessArea: string | undefined;
+  marketingChannels: string[];
+};
+
+// Helper function to create a complete DynamoDB waitlist item
+const createWaitlistItem = (email: string, overrides: Partial<DynamoDBWaitlistItem> = {}): DynamoDBWaitlistItem => ({
+  email,
+  joinedAt: new Date().toISOString(),
+  status: 'pending',
+  invitedAt: undefined,
+  fullName: undefined,
+  phoneNumber: undefined,
+  companyName: undefined,
+  requestReport: false,
+  useCaseCategories: [],
+  useCaseDescription: '',
+  supportNote: '',
+  stripe_customer_id: undefined,
+  productUsagePlan: undefined,
+  monthlyMarketingSpend: undefined,
+  businessArea: undefined,
+  marketingChannels: [],
+  ...overrides
+});
+
 // Set up mock implementations
-(mockWaitlistDb as any).updateStatus = jest.fn().mockResolvedValue(undefined);
+(mockWaitlistDb as any).updateStatus = jest.fn().mockResolvedValue(createWaitlistItem('test@example.com'));
 (mockWaitlistDb as any).getByEmail = jest.fn().mockResolvedValue(undefined);
-(mockWaitlistDb as any).add = jest.fn().mockResolvedValue({ email: 'test@example.com', joinedAt: new Date().toISOString() });
+(mockWaitlistDb as any).add = jest.fn().mockResolvedValue(createWaitlistItem('test@example.com'));
 (mockWaitlistDb as any).list = jest.fn().mockResolvedValue({ items: [], lastEvaluatedKey: null });
 (mockWaitlistDb as any).updateSupportNote = jest.fn().mockResolvedValue(undefined);
 (mockWaitlistDb as any).updateDetails = jest.fn().mockResolvedValue(undefined);
@@ -77,7 +118,7 @@ describe('Admin Waitlist Free User Management', () => {
 
       mockUserDb.getUserByEmail.mockResolvedValue(freeUser);
       mockWaitlistDb.getByEmail.mockResolvedValue(undefined);
-      mockWaitlistDb.add.mockResolvedValue({ email, joinedAt: new Date().toISOString() });
+      mockWaitlistDb.add.mockResolvedValue(createWaitlistItem(email));
       (mockUserDb as any).updateUser.mockResolvedValue(undefined);
 
       const response = await request(app)
@@ -124,7 +165,7 @@ describe('Admin Waitlist Free User Management', () => {
 
       mockUserDb.getUserByEmail.mockResolvedValue(undefined);
       mockWaitlistDb.getByEmail.mockResolvedValue(undefined);
-      mockWaitlistDb.add.mockResolvedValue({ email, joinedAt: new Date().toISOString() });
+      mockWaitlistDb.add.mockResolvedValue(createWaitlistItem(email));
 
       const response = await request(app)
         .post('/api/admin/waitlist/invite')
@@ -148,7 +189,7 @@ describe('Admin Waitlist Free User Management', () => {
       };
 
       mockUserDb.getUserByEmail.mockResolvedValue(freeUser);
-      (mockWaitlistDb as any).updateStatus.mockResolvedValue({ email, status: 'invited' });
+      (mockWaitlistDb as any).updateStatus.mockResolvedValue(createWaitlistItem(email, { status: 'invited' }));
       (mockUserDb as any).updateUser.mockResolvedValue(undefined);
 
       const response = await request(app)
@@ -189,16 +230,15 @@ describe('Admin Waitlist Free User Management', () => {
         email: email,
         roles: ['free']
       };
-      const waitlistEntry = {
-        email,
+      const waitlistEntry = createWaitlistItem(email, {
         fullName: 'Test User',
         companyName: 'Test Company'
-      };
+      });
 
       mockUserDb.getUserByEmail.mockResolvedValue(freeUser);
       mockWaitlistDb.getByEmail.mockResolvedValue(waitlistEntry);
       (mockUserDb as any).createUser.mockResolvedValue({ userId: 'new-user-id' });
-      (mockWaitlistDb as any).updateStatus.mockResolvedValue({ email, status: 'completed' });
+      (mockWaitlistDb as any).updateStatus.mockResolvedValue(createWaitlistItem(email, { status: 'completed' }));
 
       const response = await request(app)
         .post(`/api/admin/waitlist/${email}/create-user`)
@@ -240,7 +280,7 @@ describe('Admin Waitlist Free User Management', () => {
 
       mockUserDb.getUserByEmail.mockResolvedValue(freeUser);
       mockWaitlistDb.getByEmail.mockResolvedValue(undefined);
-      mockWaitlistDb.add.mockResolvedValue({ email, joinedAt: new Date().toISOString() });
+      mockWaitlistDb.add.mockResolvedValue(createWaitlistItem(email));
       (mockUserDb as any).updateUser.mockResolvedValue(undefined);
 
       const response = await request(app)
@@ -266,7 +306,7 @@ describe('Admin Waitlist Free User Management', () => {
 
       mockUserDb.getUserByEmail.mockResolvedValue(freeUserWithCustomer);
       mockWaitlistDb.getByEmail.mockResolvedValue(undefined);
-      mockWaitlistDb.add.mockResolvedValue({ email, joinedAt: new Date().toISOString() });
+      mockWaitlistDb.add.mockResolvedValue(createWaitlistItem(email));
 
       const response = await request(app)
         .post('/api/admin/waitlist/invite')
