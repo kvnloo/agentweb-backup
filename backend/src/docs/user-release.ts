@@ -11,6 +11,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
     changes: [
       'Fixed Interactive Sharing Task Results Display Issue',
       '- Resolved "Access denied" error when loading task execution results in interactive sharing mode',
+      'Fixed Create Revision Task Display in Agent Mode',
+      '- Create revision tool calls now properly display task execution status in the Agent Mode chat box',
     ],
   },
   {

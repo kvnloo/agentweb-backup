@@ -980,7 +980,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   // Extract only the necessary data for the frontend to reduce storage size
   private extractMinimalToolResult(result: any, toolName: string): any {
     // For task creation tools, only keep the essential fields for TaskExecutionStatus
-    if (toolName === 'create_task_from_template' || toolName === 'create_task_from_prompt' || toolName === 'create_image_task_from_prompt') {
+    if (toolName === 'create_task_from_template' || toolName === 'create_task_from_prompt' || toolName === 'create_image_task_from_prompt' || toolName === 'create_revision') {
       return {
         taskId: result.taskId,
         executionId: result.executionId,
@@ -1010,24 +1010,27 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return {
           success: true,
           taskId: `mock-task-${Date.now()}`,
+          executionId: `mock-execution-${Date.now()}`,
           message: `Mock task created from template ${args.template_id}`,
-          status: 'created'
+          status: 'pending'
         };
       
       case 'create_task_from_prompt':
         return {
           success: true,
           taskId: `mock-task-${Date.now()}`,
+          executionId: `mock-execution-${Date.now()}`,
           message: `Mock task created: ${args.task_name}`,
-          status: 'created'
+          status: 'pending'
         };
       
       case 'create_image_task_from_prompt':
         return {
           success: true,
           taskId: `mock-image-task-${Date.now()}`,
+          executionId: `mock-execution-${Date.now()}`,
           message: `Mock image task created: ${args.task_name}`,
-          status: 'created'
+          status: 'pending'
         };
       
       case 'generate_image':
@@ -1298,8 +1301,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'create_revision':
         return {
           success: true,
-          revisionId: `mock-revision-${Date.now()}`,
-          message: 'Mock revision created successfully'
+          message: 'Mock revision created successfully',
+          taskId: `mock-task-${Date.now()}`,
+          executionId: `mock-execution-${Date.now()}`,
+          status: 'pending',
+          assetType: 'report',
+          targetFile: 'mock-report.html'
         };
       
       case 'save_file':
@@ -1412,7 +1419,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       session.messages.forEach((message: ChatMessage) => {
         if (message.metadata?.toolCalls) {
           message.metadata.toolCalls.forEach((toolCall: any) => {
-            if (toolCall.name === 'create_task_from_template' || toolCall.name === 'create_task_from_prompt' || toolCall.name === 'create_image_task_from_prompt') {
+            if (toolCall.name === 'create_task_from_template' || toolCall.name === 'create_task_from_prompt' || toolCall.name === 'create_image_task_from_prompt' || toolCall.name === 'create_revision') {
               if (toolCall.result?.taskId) {
                 taskIds.add(toolCall.result.taskId);
               }
@@ -1874,7 +1881,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         if (message.metadata?.toolCalls) {
           message.metadata.toolCalls.forEach((toolCall: any) => {
             // Check if this is a task creation tool call
-            if ((toolCall.name === 'create_task_from_template' || toolCall.name === 'create_task_from_prompt' || toolCall.name === 'create_image_task_from_prompt') && toolCall.result) {
+            if ((toolCall.name === 'create_task_from_template' || toolCall.name === 'create_task_from_prompt' || toolCall.name === 'create_image_task_from_prompt' || toolCall.name === 'create_revision') && toolCall.result) {
               const result = toolCall.result;
               if (result.taskId && result.executionId) {
                 taskStatuses.push({
