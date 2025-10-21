@@ -15,6 +15,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Create revision tool calls now properly display task execution status in the Agent Mode chat box',
       'Enhanced Meta Ads Metrics with Campaign-Specific Breakdown Filtering',
       '- Added optional campaign_name parameter to get_meta_ads_metrics function for filtering by specific campaigns',
+      'Fixed Brand Guidelines Creation in Agent Mode',
+      '- Agent Mode can now create brand guidelines using update_brand_guidelines when no existing guidelines are found',
+      '- Previously returned an error requiring users to create guidelines first; now automatically creates initial structure',
     ],
   },
   {
