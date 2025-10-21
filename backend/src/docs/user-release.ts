@@ -13,6 +13,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Resolved "Access denied" error when loading task execution results in interactive sharing mode',
       'Fixed Create Revision Task Display in Agent Mode',
       '- Create revision tool calls now properly display task execution status in the Agent Mode chat box',
+      'Enhanced Meta Ads Metrics with Campaign-Specific Breakdown Filtering',
+      '- Added optional campaign_name parameter to get_meta_ads_metrics function for filtering by specific campaigns',
     ],
   },
   {
