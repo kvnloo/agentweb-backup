@@ -1749,13 +1749,39 @@ Use the available tools to create tasks in the agent-engine when complex work is
       }
 
       // Get existing brand guidelines
-      const existingBrand = user.brandGuidelines;
+      let existingBrand = user.brandGuidelines;
+      
+      // If no existing brand guidelines, create a new structure
       if (!existingBrand) {
-        return {
-          success: false,
-          message: 'No existing brand guidelines found. Please create brand guidelines first.',
-          error: 'No existing brand guidelines'
+        // Create initial brand guidelines structure
+        const initialBrandGuidelines = {
+          brandData: {
+            brandName: "",
+            tagline: "",
+            primaryColor: "",
+            primaryColorEnd: "",
+            secondaryColor: "",
+            fontFamily: "",
+            toneOfVoice: "",
+            keyMessages: [],
+            brandValues: [],
+            targetAudience: "",
+            brandPersonality: "",
+            isGradient: false,
+            founders: [],
+          },
+          attachments: [],
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
         };
+        
+        // Update the user with initial brand guidelines
+        await userDb.updateUser(userId, {
+          brandGuidelines: initialBrandGuidelines
+        });
+        
+        // Use the initial structure as the base for updates
+        existingBrand = initialBrandGuidelines;
       }
 
       // Extract brandData and brandAssets from updateData
