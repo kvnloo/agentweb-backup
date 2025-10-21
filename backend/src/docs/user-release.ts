@@ -9,6 +9,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2025-10-21',
     changes: [
+      'Enhanced Interactive Share (ishare) User Experience with Mobile Optimization',
+      '- Interactive share links now hide the left sidebar and right chat panel for a cleaner, focused experience',
       'Fixed Interactive Sharing Task Results Display Issue',
       '- Resolved "Access denied" error when loading task execution results in interactive sharing mode',
       'Fixed Create Revision Task Display in Agent Mode',
