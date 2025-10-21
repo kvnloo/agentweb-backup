@@ -365,7 +365,30 @@ User: "Show me all users created in the last month"
 Agent: Uses mcp-use client to execute PostgreSQL MCP server tools
 ```
 
-### 3. Web Search
+### 3. Simple Data Analytics
+
+**MCP Server Configuration**:
+```typescript
+{
+  serverId: 'simple-analytics-server',
+  serverName: 'analytics',
+  command: 'npx',
+  args: ['@modelcontextprotocol/server-simple-analytics'],
+  env: {},
+  isActive: true
+}
+```
+
+**Single Tool** (discovered via mcp-use):
+- `analyze_data` - Takes analysis goal and data sources, returns complete analysis
+
+**Example Usage**:
+```
+User: "Analyze our Q4 sales performance using our sales.csv file"
+Agent: Uses mcp-use client to execute the single analytics tool
+```
+
+### 4. Web Search
 
 **MCP Server Configuration**:
 ```typescript
@@ -403,6 +426,54 @@ Agent: Uses mcp-use client to execute web search MCP server tools
 - Simple error messages for failed operations
 - Basic logging of MCP tool executions
 
+## Simple Data Analytics Example
+
+### One-Tool Analytics Workflow
+
+**User Request**: "Analyze our Q4 sales performance using our sales.csv file"
+
+**Agent Response**: Uses single `analyze_data` tool that handles everything:
+
+```typescript
+// Single tool call
+const result = await client.executeTool('analyze_data', {
+  goal: "Analyze Q4 sales performance and identify trends",
+  dataSources: [
+    {
+      type: "csv",
+      path: "/data/sales.csv",
+      description: "Q4 sales data with columns: date, product, revenue, quantity"
+    }
+  ],
+  outputFormat: "comprehensive_report" // or "summary", "visualization"
+});
+```
+
+**What the tool does internally**:
+1. Loads the CSV data
+2. Performs statistical analysis
+3. Identifies trends and patterns
+4. Generates insights and recommendations
+5. Creates visualizations
+6. Returns complete analysis report
+
+**Example MCP Server Configuration**:
+```typescript
+{
+  serverId: 'simple-analytics-server',
+  serverName: 'analytics',
+  command: 'npx',
+  args: ['@modelcontextprotocol/server-simple-analytics'],
+  env: {},
+  isActive: true
+}
+```
+
+**Single Tool Interface**:
+- `analyze_data` - Complete analysis in one call
+  - **Input**: Analysis goal + data sources list
+  - **Output**: Complete analysis report with insights, charts, and recommendations
+
 ## Implementation with mcp-use Library
 
 ### Key Benefits of Using mcp-use
@@ -419,20 +490,27 @@ Agent: Uses mcp-use client to execute web search MCP server tools
 // 1. Create MCP client
 const client = new MCPClient();
 
-// 2. Connect to server with configuration
+// 2. Connect to simple analytics server
 await client.connect({
-  serverName: 'filesystem',
+  serverName: 'analytics',
   command: 'npx',
-  args: ['@modelcontextprotocol/server-filesystem', '/path'],
+  args: ['@modelcontextprotocol/server-simple-analytics'],
   env: {},
   startServer: true
 });
 
-// 3. Discover tools
+// 3. Discover tools (will find single 'analyze_data' tool)
 const tools = await client.listTools({ verbose: true });
 
-// 4. Execute tools
-const result = await client.executeTool('read_file', { path: '/path/to/file' });
+// 4. Execute single analytics tool
+const result = await client.executeTool('analyze_data', {
+  goal: "Analyze sales performance and identify trends",
+  dataSources: [
+    { type: "csv", path: "/data/sales.csv" },
+    { type: "database", connection: "postgresql://...", query: "SELECT * FROM customers" }
+  ],
+  outputFormat: "comprehensive_report"
+});
 ```
 
 ## Conclusion
