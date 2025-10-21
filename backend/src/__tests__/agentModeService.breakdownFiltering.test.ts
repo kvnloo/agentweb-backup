@@ -1,0 +1,534 @@
+import { AgentModeService } from '../services/agentModeService';
+
+// Mock the dependencies
+jest.mock('../utils/secretsManager', () => ({
+  getMetaAccessToken: jest.fn().mockResolvedValue('mock-access-token')
+}));
+
+jest.mock('../services/db', () => ({
+  userDb: {
+    getUserById: jest.fn()
+  }
+}));
+
+describe('AgentModeService - Breakdown Data Filtering', () => {
+  let agentModeService: AgentModeService;
+
+  beforeEach(() => {
+    agentModeService = new AgentModeService();
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  describe('getMetaAdsMetrics with campaign filtering', () => {
+    it('should filter breakdown data by campaign when campaign_name is provided', async () => {
+      // Mock user data
+      const mockUser = {
+        id: 'user123',
+        adAccount: '123456789'
+      };
+
+      // Mock the userDb.getUserById to return the mock user
+      const { userDb } = await import('../services/db');
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      // Mock fetch to return sample data
+      global.fetch = jest.fn().mockImplementation((url: string) => {
+        if (url.includes('/campaigns') && !url.includes('filtering')) {
+          return Promise.resolve({
+            json: () => Promise.resolve({
+              data: [
+                { id: 'camp1', name: 'FB_Prospecting' },
+                { id: 'camp2', name: 'Other Campaign' }
+              ]
+            })
+          });
+        }
+        
+        if (url.includes('breakdowns=publisher_platform,platform_position')) {
+          return Promise.resolve({
+            json: () => Promise.resolve({
+              data: [
+                {
+                  publisher_platform: 'facebook',
+                  platform_position: 'feed',
+                  impressions: '1000',
+                  clicks: '50',
+                  spend: '100.00',
+                  websiteLeads: 5,
+                  formLeads: 3,
+                  campaign_id: 'camp1'  // FB_Prospecting
+                },
+                {
+                  publisher_platform: 'instagram',
+                  platform_position: 'feed',
+                  impressions: '500',
+                  clicks: '25',
+                  spend: '50.00',
+                  websiteLeads: 2,
+                  formLeads: 1,
+                  campaign_id: 'camp2'  // Other Campaign
+                }
+              ]
+            })
+          });
+        }
+        
+        if (url.includes('breakdowns=age,gender')) {
+          return Promise.resolve({
+            json: () => Promise.resolve({
+              data: [
+                {
+                  age: '25-34',
+                  gender: 'male',
+                  impressions: '800',
+                  clicks: '40',
+                  spend: '80.00',
+                  websiteLeads: 4,
+                  formLeads: 2,
+                  campaign_id: 'camp1'  // FB_Prospecting
+                },
+                {
+                  age: '35-44',
+                  gender: 'female',
+                  impressions: '600',
+                  clicks: '30',
+                  spend: '60.00',
+                  websiteLeads: 3,
+                  formLeads: 1,
+                  campaign_id: 'camp2'  // Other Campaign
+                }
+              ]
+            })
+          });
+        }
+        
+        if (url.includes('breakdowns=impression_device')) {
+          return Promise.resolve({
+            json: () => Promise.resolve({
+              data: [
+                {
+                  impression_device: 'iPhone',
+                  impressions: '1200',
+                  clicks: '60',
+                  spend: '120.00',
+                  websiteLeads: 6,
+                  formLeads: 3,
+                  campaign_id: 'camp1'  // FB_Prospecting
+                },
+                {
+                  impression_device: 'Android',
+                  impressions: '400',
+                  clicks: '20',
+                  spend: '40.00',
+                  websiteLeads: 2,
+                  formLeads: 1,
+                  campaign_id: 'camp2'  // Other Campaign
+                }
+              ]
+            })
+          });
+        }
+        
+        // For all other API calls, return empty data
+        return Promise.resolve({
+          json: () => Promise.resolve({ data: [] })
+        });
+      });
+
+      // Test with campaign name filter
+      const result = await (agentModeService as any).getMetaAdsMetrics('7d', 'user123', 'FB_Prospecting');
+
+      expect(result.success).toBe(true);
+      
+      // Check that breakdown data is filtered correctly
+      const placementBreakdown = result.data.placementBreakdown;
+      const demographicsBreakdown = result.data.demographicsBreakdown;
+      const deviceBreakdown = result.data.deviceBreakdown;
+      
+      // Placement breakdown should only contain FB_Prospecting data
+      expect(placementBreakdown).toHaveLength(1);
+      expect(placementBreakdown[0].publisher_platform).toBe('facebook');
+      expect(placementBreakdown[0].campaign_id).toBe('camp1');
+      
+      // Demographics breakdown should only contain FB_Prospecting data
+      expect(demographicsBreakdown).toHaveLength(1);
+      expect(demographicsBreakdown[0].age).toBe('25-34');
+      expect(demographicsBreakdown[0].campaign_id).toBe('camp1');
+      
+      // Device breakdown should only contain FB_Prospecting data
+      expect(deviceBreakdown).toHaveLength(1);
+      expect(deviceBreakdown[0].impression_device).toBe('iPhone');
+      expect(deviceBreakdown[0].campaign_id).toBe('camp1');
+    });
+
+    it('should return all breakdown data when no campaign filtering is applied', async () => {
+      // Mock user data
+      const mockUser = {
+        id: 'user123',
+        adAccount: '123456789'
+      };
+
+      // Mock the userDb.getUserById to return the mock user
+      const { userDb } = await import('../services/db');
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      // Mock fetch to return sample data
+      global.fetch = jest.fn().mockImplementation((url: string) => {
+        if (url.includes('breakdowns=publisher_platform,platform_position')) {
+          return Promise.resolve({
+            json: () => Promise.resolve({
+              data: [
+                {
+                  publisher_platform: 'facebook',
+                  platform_position: 'feed',
+                  impressions: '1000',
+                  clicks: '50',
+                  spend: '100.00',
+                  websiteLeads: 5,
+                  formLeads: 3,
+                  campaign_id: 'camp1'
+                },
+                {
+                  publisher_platform: 'instagram',
+                  platform_position: 'feed',
+                  impressions: '500',
+                  clicks: '25',
+                  spend: '50.00',
+                  websiteLeads: 2,
+                  formLeads: 1,
+                  campaign_id: 'camp2'
+                }
+              ]
+            })
+          });
+        }
+        
+        // For all other API calls, return empty data
+        return Promise.resolve({
+          json: () => Promise.resolve({ data: [] })
+        });
+      });
+
+      // Test without campaign filtering
+      const result = await (agentModeService as any).getMetaAdsMetrics('7d', 'user123');
+
+      expect(result.success).toBe(true);
+      
+      // Check that all breakdown data is returned
+      const placementBreakdown = result.data.placementBreakdown;
+      expect(placementBreakdown).toHaveLength(2);
+      expect(placementBreakdown[0].publisher_platform).toBe('facebook');
+      expect(placementBreakdown[1].publisher_platform).toBe('instagram');
+    });
+  });
+
+  describe('processBreakdownData', () => {
+    it('should process placement breakdown data correctly', () => {
+      const mockPlacementData = [
+        {
+          publisher_platform: 'facebook',
+          platform_position: 'feed',
+          impressions: '1000',
+          clicks: '50',
+          spend: '100.00',
+          websiteLeads: 5,
+          formLeads: 3,
+          campaign_id: 'camp1'
+        },
+        {
+          publisher_platform: 'facebook',
+          platform_position: 'feed',
+          impressions: '2000',
+          clicks: '100',
+          spend: '200.00',
+          websiteLeads: 8,
+          formLeads: 2,
+          campaign_id: 'camp1'
+        }
+      ];
+
+      const result = (agentModeService as any).processBreakdownData(mockPlacementData);
+
+      expect(result).toHaveLength(2);
+      expect(result[0].publisher_platform).toBe('facebook');
+      expect(result[0].platform_position).toBe('feed');
+      expect(result[0].impressions).toBe('1000');
+      expect(result[0].spend).toBe('100.00');
+    });
+  });
+
+  describe('formatMetricsSummary - Breakdown Data Aggregation', () => {
+    it('should aggregate placement data correctly with all lead types', () => {
+      const mockData = {
+        adPerformance: [],
+        adSetsData: [],
+        adsData: [],
+        campaignSummary: { 
+          totalSpend: 350,
+          totalCampaigns: 1,
+          totalImpressions: 10000,
+          totalClicks: 200,
+          averageCtr: 2.0,
+          averageCpc: 1.75,
+          totalWebsiteLeads: 15,
+          totalFormLeads: 5,
+          totalLeads: 20,
+          averageCostPerWebsiteLead: 23.33,
+          averageCostPerFormLead: 70.0,
+          averageCostPerLead: 17.5
+        },
+        demographicsBreakdown: [],
+        placementBreakdown: [
+          {
+            publisher_platform: 'facebook',
+            platform_position: 'feed',
+            impressions: '1000',
+            clicks: '50',
+            spend: '100.00',
+            websiteLeads: 5,
+            formLeads: 3
+          },
+          {
+            publisher_platform: 'facebook',
+            platform_position: 'feed',
+            impressions: '2000',
+            clicks: '100',
+            spend: '200.00',
+            websiteLeads: 8,
+            formLeads: 2
+          },
+          {
+            publisher_platform: 'instagram',
+            platform_position: 'feed',
+            impressions: '500',
+            clicks: '25',
+            spend: '50.00',
+            websiteLeads: 2,
+            formLeads: 1
+          }
+        ],
+        deviceBreakdown: [],
+        attributionWindow: { start: '2025-01-01', end: '2025-01-07', days: 7 },
+        timeframe: '7d'
+      };
+
+      const result = (agentModeService as any).formatMetricsSummary(mockData);
+
+      // Check that placement breakdown is included
+      expect(result).toContain('Placement Performance');
+      
+      // Check that data is aggregated (facebook-feed should appear once with combined data)
+      const facebookFeedLines = result.split('\n').filter((line: string) => 
+        line.includes('facebook') && line.includes('feed')
+      );
+      expect(facebookFeedLines).toHaveLength(1); // Should be aggregated into one line
+      
+      // Check that the aggregated data shows combined spend
+      expect(result).toContain('$300.00'); // 100 + 200
+      expect(result).toContain('13'); // 5 + 8 website leads
+      expect(result).toContain('5'); // 3 + 2 form leads
+      expect(result).toContain('18'); // 13 + 5 total leads
+    });
+
+    it('should aggregate device data correctly with all lead types', () => {
+      const mockData = {
+        adPerformance: [],
+        adSetsData: [],
+        adsData: [],
+        campaignSummary: { 
+          totalSpend: 200,
+          totalCampaigns: 1,
+          totalImpressions: 5000,
+          totalClicks: 100,
+          averageCtr: 2.0,
+          averageCpc: 2.0,
+          totalWebsiteLeads: 8,
+          totalFormLeads: 2,
+          totalLeads: 10,
+          averageCostPerWebsiteLead: 25.0,
+          averageCostPerFormLead: 100.0,
+          averageCostPerLead: 20.0
+        },
+        demographicsBreakdown: [],
+        placementBreakdown: [],
+        deviceBreakdown: [
+          {
+            impression_device: 'iPhone',
+            impressions: '1000',
+            clicks: '50',
+            spend: '100.00',
+            websiteLeads: 5,
+            formLeads: 3
+          },
+          {
+            impression_device: 'iPhone',
+            impressions: '2000',
+            clicks: '100',
+            spend: '200.00',
+            websiteLeads: 8,
+            formLeads: 2
+          },
+          {
+            impression_device: 'Android',
+            impressions: '500',
+            clicks: '25',
+            spend: '50.00',
+            websiteLeads: 2,
+            formLeads: 1
+          }
+        ],
+        attributionWindow: { start: '2025-01-01', end: '2025-01-07', days: 7 },
+        timeframe: '7d'
+      };
+
+      const result = (agentModeService as any).formatMetricsSummary(mockData);
+
+      // Check that device breakdown is included
+      expect(result).toContain('Device Performance');
+      
+      // Check that data is aggregated (iPhone should appear once with combined data)
+      const iPhoneLines = result.split('\n').filter((line: string) => 
+        line.includes('iPhone')
+      );
+      expect(iPhoneLines).toHaveLength(1); // Should be aggregated into one line
+      
+      // Check that the aggregated data shows combined spend
+      expect(result).toContain('$300.00'); // 100 + 200
+      expect(result).toContain('13'); // 5 + 8 website leads
+      expect(result).toContain('5'); // 3 + 2 form leads
+      expect(result).toContain('18'); // 13 + 5 total leads
+    });
+
+    it('should include explanatory note about breakdown data limitations', () => {
+      const mockData = {
+        adPerformance: [],
+        adSetsData: [],
+        adsData: [],
+        campaignSummary: { 
+          totalSpend: 100,
+          totalCampaigns: 1,
+          totalImpressions: 2000,
+          totalClicks: 50,
+          averageCtr: 2.5,
+          averageCpc: 2.0,
+          totalWebsiteLeads: 4,
+          totalFormLeads: 1,
+          totalLeads: 5,
+          averageCostPerWebsiteLead: 25.0,
+          averageCostPerFormLead: 100.0,
+          averageCostPerLead: 20.0
+        },
+        demographicsBreakdown: [],
+        placementBreakdown: [],
+        deviceBreakdown: [],
+        attributionWindow: { start: '2025-01-01', end: '2025-01-07', days: 7 },
+        timeframe: '7d'
+      };
+
+      const result = (agentModeService as any).formatMetricsSummary(mockData);
+
+      // Check that explanatory note is included
+      expect(result).toContain('Breakdown data (demographics, placement, device) only includes spend from ads with sufficient data for those breakdowns');
+      expect(result).toContain('Breakdown totals may not match campaign totals due to this limitation');
+    });
+  });
+
+  describe('Campaign filtering edge cases', () => {
+    it('should handle case when no campaigns match the filter name', async () => {
+      // Mock user data
+      const mockUser = {
+        id: 'user123',
+        adAccount: '123456789'
+      };
+
+      // Mock the userDb.getUserById to return the mock user
+      const { userDb } = await import('../services/db');
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      // Mock fetch to return no matching campaigns
+      global.fetch = jest.fn().mockImplementation((url: string) => {
+        if (url.includes('/campaigns') && !url.includes('filtering')) {
+          return Promise.resolve({
+            json: () => Promise.resolve({
+              data: [
+                { id: 'camp1', name: 'Other Campaign' }
+              ]
+            })
+          });
+        }
+        
+        // For all other API calls, return empty data
+        return Promise.resolve({
+          json: () => Promise.resolve({ data: [] })
+        });
+      });
+
+      // Test with non-matching campaign name
+      const result = await (agentModeService as any).getMetaAdsMetrics('7d', 'user123', 'NonExistentCampaign');
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('No campaigns found matching the name "NonExistentCampaign"');
+    });
+
+    it('should handle case when breakdown data has no campaign_id field', async () => {
+      // Mock user data
+      const mockUser = {
+        id: 'user123',
+        adAccount: '123456789'
+      };
+
+      // Mock the userDb.getUserById to return the mock user
+      const { userDb } = await import('../services/db');
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      // Mock fetch to return data without campaign_id
+      global.fetch = jest.fn().mockImplementation((url: string) => {
+        if (url.includes('/campaigns') && !url.includes('filtering')) {
+          return Promise.resolve({
+            json: () => Promise.resolve({
+              data: [
+                { id: 'camp1', name: 'FB_Prospecting' }
+              ]
+            })
+          });
+        }
+        
+        if (url.includes('breakdowns=publisher_platform,platform_position')) {
+          return Promise.resolve({
+            json: () => Promise.resolve({
+              data: [
+                {
+                  publisher_platform: 'facebook',
+                  platform_position: 'feed',
+                  impressions: '1000',
+                  clicks: '50',
+                  spend: '100.00',
+                  websiteLeads: 5,
+                  formLeads: 3
+                  // No campaign_id field
+                }
+              ]
+            })
+          });
+        }
+        
+        // For all other API calls, return empty data
+        return Promise.resolve({
+          json: () => Promise.resolve({ data: [] })
+        });
+      });
+
+      // Test with campaign name filter
+      const result = await (agentModeService as any).getMetaAdsMetrics('7d', 'user123', 'FB_Prospecting');
+
+      expect(result.success).toBe(true);
+      
+      // Check that breakdown data is empty (filtered out due to missing campaign_id)
+      const placementBreakdown = result.data.placementBreakdown;
+      expect(placementBreakdown).toHaveLength(0);
+    });
+  });
+});

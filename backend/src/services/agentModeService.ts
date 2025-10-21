@@ -739,6 +739,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 description: 'Time period for metrics (7d, 14d, 30d, 90d)',
                 enum: ['7d', '14d', '30d', '90d'],
                 default: '7d'
+              },
+              campaign_name: {
+                type: 'string',
+                description: 'Optional campaign name to filter metrics by. If provided, only data from campaigns matching this name will be returned.',
+                default: null
               }
             },
             required: []
@@ -1374,7 +1379,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         const attachPreviousTaskResultsForImage = args.attach_previous_task_results !== false;
         return await this.createImageTaskFromPrompt(args.task_name, args.prompt, args.category || 'Creatives', userId, sessionId, attachPreviousTaskResultsForImage);
       case 'get_meta_ads_metrics':
-        return await this.getMetaAdsMetrics(args.timeframe || '7d', userId);
+        return await this.getMetaAdsMetrics(args.timeframe || '7d', userId, args.campaign_name);
       case 'create_revision':
         return await this.createRevision(args.task_id, args.execution_id, args.revision_prompt, userId, args.target_result_name);
       case 'search_web':
@@ -2325,7 +2330,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
 
 
-  private async getMetaAdsMetrics(timeframe: string, userId: string): Promise<any> {
+  private async getMetaAdsMetrics(timeframe: string, userId: string, campaign_name?: string): Promise<any> {
     try {
       
       // Import the Meta API functions directly to reuse the same logic
@@ -2383,23 +2388,57 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const untilStr = endDate.toISOString().split('T')[0];
       const attributionDays = Math.max(1, Math.ceil((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24)));
 
+      // First, get campaigns to find matching campaign IDs if filtering by campaign name
+      let campaignFilterIds: string[] = [];
+      if (campaign_name) {
+        console.log('AgentMode: Getting campaigns to find matching IDs for:', campaign_name);
+        const campaignsResponse = await fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`);
+        const campaignsData = await campaignsResponse.json();
+        
+        if (campaignsData.error) {
+          console.error('AgentMode: Campaigns API Error:', campaignsData.error);
+          throw new Error(`Campaigns API Error: ${campaignsData.error.message}`);
+        }
+        
+        const matchingCampaigns = (campaignsData.data || []).filter((campaign: any) => 
+          campaign.name && campaign.name.toLowerCase().includes(campaign_name.toLowerCase())
+        );
+        
+        if (matchingCampaigns.length === 0) {
+          return {
+            success: false,
+            message: `No campaigns found matching the name "${campaign_name}"`,
+            error: 'Campaign not found'
+          };
+        }
+        
+        campaignFilterIds = matchingCampaigns.map((c: any) => c.id);
+        console.log('AgentMode: Found matching campaign IDs:', campaignFilterIds);
+      }
+
+      // Build filtering parameter for API calls
+      const filteringParam = campaignFilterIds.length > 0 
+        ? `&filtering=[{"field":"campaign.id","operator":"IN","value":["${campaignFilterIds.join('","')}"]}]`
+        : '';
+      
+
       // Get campaigns, ad sets, ads, and insights using Graph API - fetch at multiple levels
       const [campaignsResponse, adSetsResponse, adsResponse, adInsightsResponse, adSetInsightsResponse, campaignInsightsResponse, insightsDemographicsResponse, insightsPlacementResponse, insightsDeviceResponse] = await Promise.all([
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`),
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting&access_token=${accessToken}`),
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}&access_token=${accessToken}`),
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective${filteringParam}&access_token=${accessToken}`),
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting${filteringParam}&access_token=${accessToken}`),
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}${filteringParam}&access_token=${accessToken}`),
         // Ad-level insights for ads processing
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad&access_token=${accessToken}`),
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
         // Adset-level insights for ad sets processing
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=adset&access_token=${accessToken}`),
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=adset${filteringParam}&access_token=${accessToken}`),
         // Campaign-level insights for campaigns processing
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign&access_token=${accessToken}`),
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
         // Demographics breakdown (age/gender)
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type&breakdowns=age,gender&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad&access_token=${accessToken}`),
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id,adset_id,ad_id&breakdowns=age,gender&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
         // Placement breakdown (publisher platform and position)
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type&breakdowns=publisher_platform,platform_position&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad&access_token=${accessToken}`),
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id,adset_id,ad_id&breakdowns=publisher_platform,platform_position&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
         // Device breakdown (mobile/desktop, etc.)
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad&access_token=${accessToken}`)
+        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id,adset_id,ad_id&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`)
       ]);
 
       const [campaignsData, adSetsData, adsData, adInsightsData, adSetInsightsData, campaignInsightsData, insightsDemographicsData, insightsPlacementData, insightsDeviceData] = await Promise.all([
@@ -2453,14 +2492,31 @@ Use the available tools to create tasks in the agent-engine when complex work is
         // Don't throw; proceed without devices
       }
 
-      // Process the data using simplified logic
+      // Process the data using simplified logic (filtering is now done at API level)
       const adPerformance = this.processCampaignData(campaignsData.data || [], campaignInsightsData.data || [], adSetsData.data || []);
       const processedAdSetsData = this.processAdSetsData(adSetsData.data || [], adSetInsightsData.data || [], campaignsData.data || []);
       const processedAdsData = this.processAdsData(adsData.data || [], adInsightsData.data || [], adSetsData.data || [], campaignsData.data || []);
       const campaignSummary = this.generateCampaignSummary(adPerformance);
-      const processedDemographicsBreakdown = this.processBreakdownData(insightsDemographicsData?.data || []);
-      const processedPlacementBreakdown = this.processBreakdownData(insightsPlacementData?.data || []);
-      const processedDeviceBreakdown = this.processBreakdownData(insightsDeviceData?.data || []);
+      // Filter breakdown data by campaign if filtering is applied
+      let demographicsBreakdown = insightsDemographicsData?.data || [];
+      let placementBreakdown = insightsPlacementData?.data || [];
+      let deviceBreakdown = insightsDeviceData?.data || [];
+      
+      if (campaignFilterIds.length > 0) {
+        demographicsBreakdown = demographicsBreakdown.filter((item: any) => 
+          item.campaign_id && campaignFilterIds.includes(item.campaign_id)
+        );
+        placementBreakdown = placementBreakdown.filter((item: any) => 
+          item.campaign_id && campaignFilterIds.includes(item.campaign_id)
+        );
+        deviceBreakdown = deviceBreakdown.filter((item: any) => 
+          item.campaign_id && campaignFilterIds.includes(item.campaign_id)
+        );
+      }
+      
+      const processedDemographicsBreakdown = this.processBreakdownData(demographicsBreakdown);
+      const processedPlacementBreakdown = this.processBreakdownData(placementBreakdown);
+      const processedDeviceBreakdown = this.processBreakdownData(deviceBreakdown);
       
       // Format the data for LLM consumption
       const formattedContent = this.formatMetricsSummary({
@@ -3192,8 +3248,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
     // Placement Breakdown
     if (placementBreakdown && placementBreakdown.length > 0) {
       summary += `**Placement Performance**\n`;
-      summary += `| Platform | Position | Impressions | Clicks | Spend | CTR | CPC | Website Leads | Cost/Lead |\n`;
-      summary += `|----------|----------|-------------|--------|-------|-----|-----|---------------|----------|\n`;
+      summary += `| Platform | Position | Impressions | Clicks | Spend | CTR | CPC | Website Leads | Form Leads | Total Leads | Cost/Lead |\n`;
+      summary += `|----------|----------|-------------|--------|-------|-----|-----|---------------|------------|-------------|----------|\n`;
       
       // Group by platform and position, then aggregate metrics
       const placementMap = new Map();
@@ -3206,7 +3262,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
             impressions: 0,
             clicks: 0,
             spend: 0,
-            websiteLeads: 0
+            websiteLeads: 0,
+            formLeads: 0,
+            totalLeads: 0
           });
         }
         const placement = placementMap.get(key);
@@ -3214,6 +3272,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         placement.clicks += parseInt(item.clicks) || 0;
         placement.spend += parseFloat(item.spend) || 0;
         placement.websiteLeads += parseInt(item.websiteLeads) || 0;
+        placement.formLeads += parseInt(item.formLeads) || 0;
+        placement.totalLeads = placement.websiteLeads + placement.formLeads;
       });
       
       // Sort by spend descending and show top 10
@@ -3224,8 +3284,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       sortedPlacements.forEach((placement: any) => {
         const ctr = placement.impressions > 0 ? (placement.clicks / placement.impressions) * 100 : 0;
         const cpc = placement.clicks > 0 ? placement.spend / placement.clicks : 0;
-        const costPerLead = placement.websiteLeads > 0 ? placement.spend / placement.websiteLeads : 0;
-        summary += `| ${placement.platform} | ${placement.position} | ${placement.impressions.toLocaleString()} | ${placement.clicks.toLocaleString()} | $${placement.spend.toFixed(2)} | ${ctr.toFixed(2)}% | $${cpc.toFixed(2)} | ${placement.websiteLeads.toLocaleString()} | $${costPerLead.toFixed(2)} |\n`;
+        const costPerLead = placement.totalLeads > 0 ? placement.spend / placement.totalLeads : 0;
+        summary += `| ${placement.platform} | ${placement.position} | ${placement.impressions.toLocaleString()} | ${placement.clicks.toLocaleString()} | $${placement.spend.toFixed(2)} | ${ctr.toFixed(2)}% | $${cpc.toFixed(2)} | ${placement.websiteLeads.toLocaleString()} | ${placement.formLeads.toLocaleString()} | ${placement.totalLeads.toLocaleString()} | $${costPerLead.toFixed(2)} |\n`;
       });
       summary += `\n`;
     }
@@ -3233,8 +3293,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
     // Device Breakdown
     if (deviceBreakdown && deviceBreakdown.length > 0) {
       summary += `**Device Performance**\n`;
-      summary += `| Device | Impressions | Clicks | Spend | CTR | CPC | Website Leads | Cost/Lead |\n`;
-      summary += `|--------|-------------|--------|-------|-----|-----|---------------|----------|\n`;
+      summary += `| Device | Impressions | Clicks | Spend | CTR | CPC | Website Leads | Form Leads | Total Leads | Cost/Lead |\n`;
+      summary += `|--------|-------------|--------|-------|-----|-----|---------------|------------|-------------|----------|\n`;
       
       // Group by device, then aggregate metrics
       const deviceMap = new Map();
@@ -3246,7 +3306,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
             impressions: 0,
             clicks: 0,
             spend: 0,
-            websiteLeads: 0
+            websiteLeads: 0,
+            formLeads: 0,
+            totalLeads: 0
           });
         }
         const deviceData = deviceMap.get(device);
@@ -3254,6 +3316,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         deviceData.clicks += parseInt(item.clicks) || 0;
         deviceData.spend += parseFloat(item.spend) || 0;
         deviceData.websiteLeads += parseInt(item.websiteLeads) || 0;
+        deviceData.formLeads += parseInt(item.formLeads) || 0;
+        deviceData.totalLeads = deviceData.websiteLeads + deviceData.formLeads;
       });
       
       // Sort by spend descending
@@ -3263,13 +3327,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
       sortedDevices.forEach((device: any) => {
         const ctr = device.impressions > 0 ? (device.clicks / device.impressions) * 100 : 0;
         const cpc = device.clicks > 0 ? device.spend / device.clicks : 0;
-        const costPerLead = device.websiteLeads > 0 ? device.spend / device.websiteLeads : 0;
-        summary += `| ${device.device} | ${device.impressions.toLocaleString()} | ${device.clicks.toLocaleString()} | $${device.spend.toFixed(2)} | ${ctr.toFixed(2)}% | $${cpc.toFixed(2)} | ${device.websiteLeads.toLocaleString()} | $${costPerLead.toFixed(2)} |\n`;
+        const costPerLead = device.totalLeads > 0 ? device.spend / device.totalLeads : 0;
+        summary += `| ${device.device} | ${device.impressions.toLocaleString()} | ${device.clicks.toLocaleString()} | $${device.spend.toFixed(2)} | ${ctr.toFixed(2)}% | $${cpc.toFixed(2)} | ${device.websiteLeads.toLocaleString()} | ${device.formLeads.toLocaleString()} | ${device.totalLeads.toLocaleString()} | $${costPerLead.toFixed(2)} |\n`;
       });
       summary += `\n`;
     }
     
     summary += `*Data includes ${adPerformance?.length || 0} campaigns, ${adSetsData?.length || 0} ad sets, and ${adsData?.length || 0} individual ads.*\n`;
+    summary += `*Note: Breakdown data (demographics, placement, device) only includes spend from ads with sufficient data for those breakdowns. Breakdown totals may not match campaign totals due to this limitation.*\n`;
     
     return summary;
   }
