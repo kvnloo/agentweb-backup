@@ -321,7 +321,7 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
       expect(result).toContain('Placement Performance');
       
       // Check that data is aggregated (facebook-feed should appear once with combined data)
-      const facebookFeedLines = result.split('\n').filter(line => 
+      const facebookFeedLines = result.split('\n').filter((line: string) => 
         line.includes('facebook') && line.includes('feed')
       );
       expect(facebookFeedLines).toHaveLength(1); // Should be aggregated into one line
@@ -390,7 +390,7 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
       expect(result).toContain('Device Performance');
       
       // Check that data is aggregated (iPhone should appear once with combined data)
-      const iPhoneLines = result.split('\n').filter(line => 
+      const iPhoneLines = result.split('\n').filter((line: string) => 
         line.includes('iPhone')
       );
       expect(iPhoneLines).toHaveLength(1); // Should be aggregated into one line

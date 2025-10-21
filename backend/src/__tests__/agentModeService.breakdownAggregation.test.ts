@@ -59,7 +59,7 @@ describe('AgentModeService - Breakdown Data Aggregation', () => {
       expect(result).toContain('Placement Performance');
       
       // Check that facebook-feed appears only once (aggregated)
-      const facebookFeedLines = result.split('\n').filter(line => 
+      const facebookFeedLines = result.split('\n').filter((line: string) => 
         line.includes('facebook') && line.includes('feed')
       );
       expect(facebookFeedLines).toHaveLength(1);
@@ -164,7 +164,7 @@ describe('AgentModeService - Breakdown Data Aggregation', () => {
       expect(result).toContain('Device Performance');
       
       // Check that iPhone appears only once (aggregated)
-      const iPhoneLines = result.split('\n').filter(line => 
+      const iPhoneLines = result.split('\n').filter((line: string) => 
         line.includes('iPhone')
       );
       expect(iPhoneLines).toHaveLength(1);
@@ -229,7 +229,7 @@ describe('AgentModeService - Breakdown Data Aggregation', () => {
       expect(result).toContain('Demographics Performance');
       
       // Check that 25-34 male appears only once (aggregated)
-      const male2534Lines = result.split('\n').filter(line => 
+      const male2534Lines = result.split('\n').filter((line: string) => 
         line.includes('25-34') && line.includes('male')
       );
       expect(male2534Lines).toHaveLength(1);
