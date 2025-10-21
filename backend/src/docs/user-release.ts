@@ -7,6 +7,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-10-21',
+    changes: [
+      'Fixed Interactive Sharing Task Results Display Issue',
+      '- Resolved "Access denied" error when loading task execution results in interactive sharing mode',
+    ],
+  },
+  {
     date: '2025-10-20',
     changes: [
       'Enhanced Free User Waitlist Management and Customer Portal Access',
