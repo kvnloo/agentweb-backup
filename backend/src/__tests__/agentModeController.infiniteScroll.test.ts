@@ -42,7 +42,7 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
   const mockRequest = (query: any = {}) => ({
     user: mockUser,
     query
-  });
+  } as any);
 
   const mockResponse = () => {
     const res: any = {};

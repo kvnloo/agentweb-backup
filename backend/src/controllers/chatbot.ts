@@ -44,10 +44,10 @@ export const listUserSessions = async (req: AuthenticatedRequest, res: Response)
       return res.status(401).json({ error: 'User not authenticated' });
     }
 
-    const sessions = await chatbotDb.getUserSessions(userId);
+    const result = await chatbotDb.getUserSessions(userId);
     
     // Remove page content from response to reduce payload size
-    const sanitizedSessions = sessions.map(session => {
+    const sanitizedSessions = result.sessions.map(session => {
       const { pageContent, contextChunks, ...rest } = session;
       return rest;
     });

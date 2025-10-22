@@ -37,7 +37,7 @@ describe('Agent Mode Controller - Session Loading', () => {
   const mockRequest = (user: any, sessionId: string) => ({
     user,
     params: { sessionId }
-  });
+  } as any);
 
   const mockResponse = () => {
     const res: any = {};
