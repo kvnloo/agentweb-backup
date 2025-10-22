@@ -636,6 +636,7 @@ The AgentWeb Team
       keywordMisses: string[];
       functionCallMatches: string[];
       functionCallMisses: string[];
+      functionCallDetails?: { [functionName: string]: { actual: number; required: number } };
       executionTime: number;
       sessionId: string;
       attempt: number;
@@ -717,6 +718,25 @@ The AgentWeb Team
                 </p>
               </div>
               
+              ${result.functionCallDetails && Object.keys(result.functionCallDetails).length > 0 ? `
+              <div class="section">
+                <h3>🔧 Function Call Details</h3>
+                <div class="criteria">
+                  ${Object.entries(result.functionCallDetails).map(([funcName, details]) => `
+                    <div class="criteria-item">
+                      <h4>${funcName}</h4>
+                      <p>
+                        <span class="${details.actual >= details.required ? 'matches' : 'misses'}">
+                          ${details.actual}/${details.required} calls
+                        </span>
+                        ${details.actual >= details.required ? '✅' : '❌'}
+                      </p>
+                    </div>
+                  `).join('')}
+                </div>
+              </div>
+              ` : ''}
+              
               <div class="section">
                 <h3>💬 AI Response</h3>
                 <div class="response">${result.actualResponse}</div>
@@ -749,7 +769,13 @@ Scheduled Chat Results: ${scheduleName}
 Your scheduled chat "${scheduleName}" has been ${result.passed ? 'successfully executed' : 'executed but did not meet all criteria'} and results are ready.
 It ran for ${Math.round(result.executionTime / 1000)} seconds and completed at ${currentDate}.
 
-AI Response:
+${result.functionCallDetails && Object.keys(result.functionCallDetails).length > 0 ? `
+Function Call Details:
+${Object.entries(result.functionCallDetails).map(([funcName, details]) => 
+  `- ${funcName}: ${details.actual}/${details.required} calls ${details.actual >= details.required ? '✅' : '❌'}`
+).join('\n')}
+
+` : ''}AI Response:
 ${result.actualResponse}
 
 Continue the conversation: ${sessionUrl}

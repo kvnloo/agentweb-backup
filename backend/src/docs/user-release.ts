@@ -13,6 +13,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Hourly scheduled chats now support a "Daily Digest" option to consolidate multiple runs into a single daily summary email',
       '- When enabled, individual run emails are suppressed and replaced with a comprehensive daily digest sent at the end of each day',
       '- Daily digest includes all run results from the day with statistics (total runs, success rate, average runtime) and interactive share links',
+      'Enhanced Scheduled Chats with Minimum Function Call Requirements',
+      '- Added support for specifying minimum number of calls required for each selected function in scheduled chats',
+      '- Default minimum is 1 call per function, but users can configure higher requirements (e.g., 2+ calls)',
     ],
   },
   {

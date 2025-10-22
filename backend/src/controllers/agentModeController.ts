@@ -20,6 +20,7 @@ interface ScheduledChatTestResult {
   keywordMisses: string[];
   functionCallMatches: string[];
   functionCallMisses: string[];
+  functionCallDetails?: { [functionName: string]: { actual: number; required: number } };
   executionTime: number; // milliseconds
   sessionId: string; // Test session ID for viewing conversation
   attempt: number; // Which attempt this was (1-3)
@@ -33,6 +34,7 @@ function evaluateScheduleResponse(
   expectedOutput: {
     keywords: string[];
     functionCalls: string[];
+    functionCallMinCalls?: { [functionName: string]: number };
   }
 ): {
   passed: boolean;
@@ -40,9 +42,11 @@ function evaluateScheduleResponse(
   keywordMisses: string[];
   functionCallMatches: string[];
   functionCallMisses: string[];
+  functionCallDetails?: { [functionName: string]: { actual: number; required: number } };
 } {
   const expectedKeywords = expectedOutput.keywords || [];
   const expectedFunctionCalls = expectedOutput.functionCalls || [];
+  const functionCallMinCalls = expectedOutput.functionCallMinCalls || {};
 
   // Evaluate keywords
   const keywordMatches: string[] = [];
@@ -56,19 +60,34 @@ function evaluateScheduleResponse(
     }
   });
 
-  // Evaluate function calls
+  // Evaluate function calls with minimum call requirements
   const functionCallMatches: string[] = [];
   const functionCallMisses: string[] = [];
+  const functionCallDetails: { [functionName: string]: { actual: number; required: number } } = {};
+  
+  // Count actual function calls using a hash map
+  const actualFunctionCallCounts: { [functionName: string]: number } = {};
+  actualFunctionCalls.forEach((call: string) => {
+    actualFunctionCallCounts[call] = (actualFunctionCallCounts[call] || 0) + 1;
+  });
   
   expectedFunctionCalls.forEach((expectedCall: string) => {
-    if (actualFunctionCalls.includes(expectedCall)) {
+    const actualCount = actualFunctionCallCounts[expectedCall] || 0;
+    const requiredCount = functionCallMinCalls[expectedCall] || 1; // Default to 1 if not specified
+    
+    functionCallDetails[expectedCall] = {
+      actual: actualCount,
+      required: requiredCount
+    };
+    
+    if (actualCount >= requiredCount) {
       functionCallMatches.push(expectedCall);
     } else {
       functionCallMisses.push(expectedCall);
     }
   });
 
-  // Pass only if ALL expected keywords and ALL expected function calls are present
+  // Pass only if ALL expected keywords and ALL expected function calls meet minimum requirements
   const allKeywordsPresent = expectedKeywords.length === 0 || keywordMisses.length === 0;
   const allFunctionCallsPresent = expectedFunctionCalls.length === 0 || functionCallMisses.length === 0;
   const passed = allKeywordsPresent && allFunctionCallsPresent;
@@ -78,7 +97,8 @@ function evaluateScheduleResponse(
     keywordMatches,
     keywordMisses,
     functionCallMatches,
-    functionCallMisses
+    functionCallMisses,
+    functionCallDetails
   };
 }
 
@@ -181,6 +201,7 @@ async function runScheduledChat(
     keywordMisses: string[];
     functionCallMatches: string[];
     functionCallMisses: string[];
+    functionCallDetails?: { [functionName: string]: { actual: number; required: number } };
     executionTime: number;
     sessionId: string;
     attempt: number;
@@ -190,8 +211,18 @@ async function runScheduledChat(
   // Track missing items across all attempts
   const expectedKeywords = schedule.keywords || [];
   const expectedFunctionCalls = schedule.requiredFunctionCalls || [];
+  const functionCallMinCalls = schedule.functionCallMinCalls || {};
   let remainingKeywords = [...expectedKeywords];
   let remainingFunctionCalls = [...expectedFunctionCalls];
+  
+  // Track remaining function call counts
+  const remainingFunctionCallCounts: { [functionName: string]: number } = {};
+  expectedFunctionCalls.forEach((funcName: string) => {
+    remainingFunctionCallCounts[funcName] = functionCallMinCalls[funcName] || 1;
+  });
+  
+  // Track all function calls across all attempts
+  const allActualFunctionCalls: string[] = [];
 
   try {
     // Create a session for the run
@@ -208,7 +239,16 @@ async function runScheduledChat(
       
             if (attempt > 1) {
               const keywordText = remainingKeywords.length > 0 ? `include these keywords: ${remainingKeywords.join(', ')}` : '';
-              const functionCallText = remainingFunctionCalls.length > 0 ? `use these function calls: ${remainingFunctionCalls.join(', ')}` : '';
+              
+              // Build function call text with remaining call requirements
+              let functionCallText = '';
+              if (remainingFunctionCalls.length > 0) {
+                const functionCallDetails = remainingFunctionCalls.map(funcName => {
+                  const remainingCount = remainingFunctionCallCounts[funcName] || 0;
+                  return `${funcName} (${remainingCount} more time${remainingCount > 1 ? 's' : ''} needed)`;
+                });
+                functionCallText = `use these function calls: ${functionCallDetails.join(', ')}`;
+              }
               
               userMessage = `Please try again. Make sure to ${keywordText}${keywordText && functionCallText ? ' and ' : ''}${functionCallText}.`;
             }
@@ -222,6 +262,9 @@ async function runScheduledChat(
 
       // Extract function calls from the response
       const actualFunctionCalls = response.toolCalls?.map((call: any) => call.name).filter(Boolean) || [];
+      
+      // Add to cumulative list
+      allActualFunctionCalls.push(...actualFunctionCalls);
 
       // Evaluate the response against expected criteria
       const evaluation = evaluateScheduleResponse(
@@ -229,16 +272,26 @@ async function runScheduledChat(
         actualFunctionCalls,
         {
           keywords: remainingKeywords,
-          functionCalls: remainingFunctionCalls
+          functionCalls: remainingFunctionCalls,
+          functionCallMinCalls: functionCallMinCalls
         }
       );
+
+      // Update remaining function call counts based on actual calls made
+      actualFunctionCalls.forEach(callName => {
+        if (remainingFunctionCallCounts.hasOwnProperty(callName) && remainingFunctionCallCounts[callName] > 0) {
+          remainingFunctionCallCounts[callName]--;
+        }
+      });
 
       // Remove found items from remaining lists
       remainingKeywords = remainingKeywords.filter(keyword => 
         !evaluation.keywordMatches.includes(keyword)
       );
+      
+      // Remove function calls from remaining list only when their count reaches zero
       remainingFunctionCalls = remainingFunctionCalls.filter(funcCall => 
-        !evaluation.functionCallMatches.includes(funcCall)
+        remainingFunctionCallCounts[funcCall] > 0
       );
 
       // Calculate cumulative results across all attempts
@@ -249,17 +302,34 @@ async function runScheduledChat(
         !remainingFunctionCalls.includes(funcCall)
       );
 
+      // Calculate final function call details using cumulative counts
+      const finalFunctionCallDetails: { [functionName: string]: { actual: number; required: number } } = {};
+      const actualFunctionCallCounts: { [functionName: string]: number } = {};
+      allActualFunctionCalls.forEach((call: string) => {
+        actualFunctionCallCounts[call] = (actualFunctionCallCounts[call] || 0) + 1;
+      });
+      
+      expectedFunctionCalls.forEach((funcCall: string) => {
+        const actualCount = actualFunctionCallCounts[funcCall] || 0;
+        const requiredCount = functionCallMinCalls[funcCall] || 1;
+        finalFunctionCallDetails[funcCall] = {
+          actual: actualCount,
+          required: requiredCount
+        };
+      });
+
       finalResult = {
         scheduleId: schedule.scheduleId,
         runId: require('uuid').v4(),
         status: evaluation.passed ? 'success' : 'failure',
         passed: evaluation.passed,
         actualResponse: response.content,
-        actualFunctionCalls,
+        actualFunctionCalls: allActualFunctionCalls, // Use cumulative function calls
         keywordMatches: totalKeywordMatches, // Show all keywords found so far
         keywordMisses: remainingKeywords, // Show what's still missing
         functionCallMatches: totalFunctionCallMatches, // Show all function calls found so far
         functionCallMisses: remainingFunctionCalls, // Show what's still missing
+        functionCallDetails: finalFunctionCallDetails,
         executionTime: Date.now() - now.getTime(),
         sessionId: sessionId,
         attempt,
@@ -268,8 +338,10 @@ async function runScheduledChat(
 
       // If all items found, break out of loop
       if (remainingKeywords.length === 0 && remainingFunctionCalls.length === 0) {
-        finalResult.passed = true;
-        finalResult.status = 'success';
+        if (finalResult) {
+          finalResult.passed = true;
+          finalResult.status = 'success';
+        }
         break;
       }
 
@@ -1038,6 +1110,7 @@ export const agentModeController = {
               scheduleFrequency,
               keywords,
               requiredFunctionCalls,
+              functionCallMinCalls,
               emailNotifications
             } = req.body;
 
@@ -1068,6 +1141,7 @@ export const agentModeController = {
               startingMessage,
               keywords: keywords || [],
               requiredFunctionCalls: requiredFunctionCalls || [],
+              functionCallMinCalls: functionCallMinCalls || {},
               emailNotifications: emailNotifications || [],
               dailyDigest: scheduleFrequency === 'hourly' ? (req.body.dailyDigest || false) : false, // Only allow daily digest for hourly schedules
               status: 'active',
@@ -1121,6 +1195,7 @@ export const agentModeController = {
               scheduleFrequency,
               keywords,
               requiredFunctionCalls,
+              functionCallMinCalls,
               emailNotifications,
               dailyDigest
             } = req.body;
@@ -1147,6 +1222,7 @@ export const agentModeController = {
               frequency: scheduleFrequency,
               keywords: keywords || [],
               requiredFunctionCalls: requiredFunctionCalls || [],
+              functionCallMinCalls: functionCallMinCalls || {},
               emailNotifications: emailNotifications || [],
               dailyDigest: scheduleFrequency === 'hourly' ? (dailyDigest || false) : false, // Only allow daily digest for hourly schedules
               nextRunTime: nextRunTime.toISOString(),
