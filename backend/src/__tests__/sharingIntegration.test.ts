@@ -9,6 +9,8 @@ jest.mock('../services/chatbotService', () => ({
     getChatSession: jest.fn(),
     updateSessionShareMetadata: jest.fn(),
     updateSessionInteractiveShareMetadata: jest.fn(),
+    addMessagesToSession: jest.fn(),
+    createOrReuseInteractiveShare: jest.fn(),
   }
 }));
 
@@ -69,6 +71,9 @@ describe('Sharing Integration Tests', () => {
 
       // Mock initial session retrieval
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      (chatbotDb.createOrReuseInteractiveShare as jest.Mock).mockResolvedValue(
+        `http://localhost:5174/ishare/${sessionId}?conversable=test-token`
+      );
 
       // Step 1: Create view-only share
       const viewOnlyResponse = await request(app)
@@ -97,15 +102,8 @@ describe('Sharing Integration Tests', () => {
       expect(interactiveResponse.body).toHaveProperty('conversableUrl');
       expect(interactiveResponse.body.conversableUrl).toContain(`/ishare/${sessionId}?conversable=`);
 
-      // Verify interactiveShareMetadata was updated
-      expect(chatbotDb.updateSessionInteractiveShareMetadata).toHaveBeenCalledWith(
-        sessionId,
-        { 
-          isActive: true, 
-          token: expect.any(String), 
-          sharedAt: expect.any(String) 
-        }
-      );
+      // Verify createOrReuseInteractiveShare was called
+      expect(chatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith(sessionId);
 
       // Step 3: Test view-only access
       const sessionWithBothShares = {
@@ -221,6 +219,9 @@ describe('Sharing Integration Tests', () => {
       };
 
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      (chatbotDb.createOrReuseInteractiveShare as jest.Mock).mockResolvedValue(
+        `http://localhost:5174/ishare/${sessionId}?conversable=test-token`
+      );
 
       // Create only interactive share (no view-only share)
       const interactiveResponse = await request(app)
@@ -231,15 +232,8 @@ describe('Sharing Integration Tests', () => {
       expect(interactiveResponse.body).toHaveProperty('conversableToken');
       expect(interactiveResponse.body).toHaveProperty('conversableUrl');
 
-      // Verify only interactiveShareMetadata was updated
-      expect(chatbotDb.updateSessionInteractiveShareMetadata).toHaveBeenCalledWith(
-        sessionId,
-        { 
-          isActive: true, 
-          token: expect.any(String), 
-          sharedAt: expect.any(String) 
-        }
-      );
+      // Verify createOrReuseInteractiveShare was called
+      expect(chatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith(sessionId);
 
       // Verify shareMetadata was not touched
       expect(chatbotDb.updateSessionShareMetadata).not.toHaveBeenCalled();

@@ -1453,6 +1453,8 @@ export const scheduleDb = {
             startingMessage: string;
             keywords: string[];
             requiredFunctionCalls: string[];
+            emailNotifications: string[];
+            dailyDigest: boolean;
             updatedAt: string;
           }>
         ) {

@@ -650,24 +650,11 @@ The AgentWeb Team
       let sessionUrl = `${customerFrontendUrl}/agent-mode/${result.sessionId}`;
       try {
         const { chatbotDb } = require('./chatbotService');
-        const crypto = require('crypto');
         
-        // Generate a unique token for the conversable share
-        const conversableToken = crypto.randomBytes(32).toString('hex');
+        // Use the common function to create or reuse interactive share
+        sessionUrl = await chatbotDb.createOrReuseInteractiveShare(result.sessionId);
         
-        // Update session with interactive share metadata
-        const interactiveShareMetadata = {
-          isActive: true,
-          token: conversableToken,
-          sharedAt: new Date().toISOString()
-        };
-        
-        await chatbotDb.updateSessionInteractiveShareMetadata(result.sessionId, interactiveShareMetadata);
-        
-        // Use the interactive share URL instead of the agent-mode URL
-        sessionUrl = `${customerFrontendUrl}/ishare/${result.sessionId}?conversable=${conversableToken}`;
-        
-        console.log(`Created interactive share for scheduled chat session ${result.sessionId}`);
+        console.log(`Created or reused interactive share for scheduled chat session ${result.sessionId}`);
       } catch (shareError) {
         console.error('Error creating interactive share for scheduled chat:', shareError);
         // Fall back to regular agent-mode URL if share creation fails
@@ -785,6 +772,213 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
     } catch (error) {
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       console.error(`Error sending scheduled chat result emails to ${emailList.join(', ')}:`, error);
+      // Don't throw error - email failure shouldn't break the scheduled chat execution
+    }
+  },
+
+  async sendDailyDigestEmail(
+    toEmails: string | string[],
+    scheduleName: string,
+    todaysResults: any[],
+    scheduleId: string,
+    customDate?: Date
+  ) {
+    try {
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      
+      const displayDate = customDate || new Date();
+      const currentDate = displayDate.toLocaleDateString('en-US', { 
+        year: 'numeric', 
+        month: 'long', 
+        day: 'numeric'
+      });
+      
+      // Determine if this is for today or a different date
+      const isToday = !customDate || displayDate.toDateString() === new Date().toDateString();
+      const dateLabel = isToday ? "Today's Summary" : `${currentDate} Summary`;
+
+      // Calculate summary statistics
+      const totalRuns = todaysResults.length;
+      const successfulRuns = todaysResults.filter(result => result.passed).length;
+      const failedRuns = totalRuns - successfulRuns;
+      const averageExecutionTime = Math.round(
+        todaysResults.reduce((sum, result) => sum + result.executionTime, 0) / totalRuns / 1000
+      );
+
+      // Create interactive shares for all sessions
+      const sessionUrls: { [sessionId: string]: string } = {};
+      for (const result of todaysResults) {
+        if (result.sessionId) {
+          try {
+            const { chatbotDb } = require('./chatbotService');
+            
+            // Use the common function to create or reuse interactive share
+            sessionUrls[result.sessionId] = await chatbotDb.createOrReuseInteractiveShare(result.sessionId);
+          } catch (shareError) {
+            console.error('Error creating interactive share for daily digest:', shareError);
+            // Fall back to regular agent-mode URL if share creation fails
+            sessionUrls[result.sessionId] = `${customerFrontendUrl}/agent-mode/${result.sessionId}`;
+          }
+        }
+      }
+
+      // Generate results HTML
+      const resultsHtml = todaysResults.map((result, index) => {
+        const statusIcon = result.passed ? '✅' : '❌';
+        const statusColor = result.passed ? '#28a745' : '#dc3545';
+        const runTime = new Date(result.createdAt).toLocaleTimeString('en-US', { 
+          hour: '2-digit', 
+          minute: '2-digit' 
+        });
+        const sessionUrl = result.sessionId ? sessionUrls[result.sessionId] : '#';
+        
+        return `
+          <div class="result-item" style="border: 1px solid #e9ecef; border-radius: 8px; padding: 15px; margin: 10px 0; background-color: ${result.passed ? '#f8fff8' : '#fff8f8'};">
+            <div class="result-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+              <div class="result-info">
+                <span class="status-badge" style="display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; background-color: ${statusColor}; color: white;">
+                  ${statusIcon} ${result.passed ? 'PASSED' : 'FAILED'}
+                </span>
+                <span style="margin-left: 15px; color: #6c757d; font-size: 14px;">Run ${index + 1} at ${runTime}</span>
+              </div>
+              <div class="result-stats" style="font-size: 12px; color: #6c757d; text-align: right; min-width: 120px;">
+                <div style="margin-bottom: 2px;">${Math.round(result.executionTime / 1000)}s</div>
+                <div>Attempt ${result.attempt || 1}</div>
+              </div>
+            </div>
+            <div class="result-content">
+              <div class="response-preview" style="background-color: #f8f9fa; padding: 10px; border-radius: 4px; margin: 10px 0; font-size: 14px; line-height: 1.4; max-height: 100px; overflow: hidden; position: relative;">
+                ${this.escapeHtml(result.actualResponse.length > 200 ? result.actualResponse.substring(0, 200) + '...' : result.actualResponse)}
+              </div>
+              ${result.sessionId ? `
+                <a href="${sessionUrl}" class="view-conversation-btn" style="display: inline-block; background-color: #1976d2; color: white; padding: 8px 16px; text-decoration: none; border-radius: 4px; font-size: 12px; margin-top: 8px;">
+                  View Full Conversation
+                </a>
+              ` : ''}
+            </div>
+          </div>
+        `;
+      }).join('');
+
+      const html = `
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa; }
+            .container { max-width: 900px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .header { background: linear-gradient(135deg, #1976d2, #1565c0); color: white; padding: 30px; border-radius: 8px 8px 0 0; text-align: center; }
+            .header h1 { margin: 0; font-size: 28px; font-weight: 300; }
+            .header p { margin: 10px 0 0 0; opacity: 0.9; font-size: 16px; }
+            .content { padding: 30px; }
+            .summary { background: linear-gradient(135deg, #f8f9fa, #e9ecef); padding: 20px; border-radius: 8px; margin: 20px 0; }
+            .summary h2 { margin: 0 0 15px 0; color: #495057; font-size: 20px; }
+            .stats-container { display: table; width: 100%; padding: 20px 0; margin: 15px 0; }
+            .stat-item { display: table-cell; text-align: center; width: 25%; vertical-align: middle; }
+            .stat-value { font-size: 28px; font-weight: bold; color: #1976d2; margin-bottom: 5px; }
+            .stat-label { font-size: 13px; color: #6c757d; font-weight: 500; }
+            .results-section { margin: 30px 0; }
+            .results-section h2 { color: #495057; border-bottom: 2px solid #e9ecef; padding-bottom: 10px; margin-bottom: 20px; }
+            .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; }
+            .button { display: inline-block; background-color: #1976d2; color: white !important; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin: 10px 0; font-weight: 500; }
+            .button:hover { background-color: #1565c0; }
+            .view-conversation-btn:hover { background-color: #1565c0 !important; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h1>📊 Daily Digest</h1>
+              <p>${scheduleName} - ${currentDate}</p>
+            </div>
+            
+            <div class="content">
+              <div class="summary">
+                <h2>📈 ${dateLabel}</h2>
+                <p style="margin: 0 0 15px 0; color: #6c757d; font-size: 16px;">
+                  Your scheduled chat ran <strong>${totalRuns} times</strong> on <strong>${currentDate}</strong> with a <strong>${Math.round((successfulRuns / totalRuns) * 100)}%</strong> success rate.
+                </p>
+                <div class="stats-container">
+                  <div class="stat-item">
+                    <div class="stat-value">${totalRuns}</div>
+                    <div class="stat-label">Total Runs</div>
+                  </div>
+                  <div class="stat-item">
+                    <div class="stat-value" style="color: #28a745;">${successfulRuns}</div>
+                    <div class="stat-label">Successful</div>
+                  </div>
+                  <div class="stat-item">
+                    <div class="stat-value" style="color: #dc3545;">${failedRuns}</div>
+                    <div class="stat-label">Failed</div>
+                  </div>
+                  <div class="stat-item">
+                    <div class="stat-value">${averageExecutionTime}s</div>
+                    <div class="stat-label">Avg Runtime</div>
+                  </div>
+                </div>
+              </div>
+              
+              <div class="results-section">
+                <h2>🔍 Individual Run Results</h2>
+                <p style="color: #6c757d; margin-bottom: 20px;">
+                  Click on any "View Full Conversation" button to continue chatting with the AI about that specific run.
+                </p>
+                ${resultsHtml}
+              </div>
+            </div>
+            
+            <div class="footer">
+              <p style="margin-top: 15px; font-size: 12px; color: #6c757d;">
+                This is your daily digest for scheduled chat "${scheduleName}". 
+                <a href="${customerFrontendUrl}/agent-mode" style="color: #1976d2;">Manage your schedules</a>
+              </p>
+            </div>
+          </div>
+        </body>
+        </html>
+      `;
+
+      const text = `
+Daily Digest: ${scheduleName} - ${currentDate}
+
+${dateLabel}:
+- Total Runs: ${totalRuns}
+- Successful: ${successfulRuns}
+- Failed: ${failedRuns}
+- Average Runtime: ${averageExecutionTime} seconds
+- Success Rate: ${Math.round((successfulRuns / totalRuns) * 100)}%
+
+Individual Run Results:
+${todaysResults.map((result, index) => {
+  const runTime = new Date(result.createdAt).toLocaleTimeString('en-US', { 
+    hour: '2-digit', 
+    minute: '2-digit' 
+  });
+  const sessionUrl = result.sessionId ? sessionUrls[result.sessionId] : 'N/A';
+  return `
+Run ${index + 1} at ${runTime} - ${result.passed ? 'PASSED' : 'FAILED'}
+Response: ${result.actualResponse.substring(0, 100)}${result.actualResponse.length > 100 ? '...' : ''}
+View Conversation: ${sessionUrl}
+`;
+}).join('\n')}
+
+---
+This is your daily digest for scheduled chat "${scheduleName}" for ${currentDate}.
+Manage your schedules: ${customerFrontendUrl}/agent-mode
+      `;
+
+      const subject = `📊 Daily Digest: ${scheduleName} - ${currentDate} - ${totalRuns} runs (${Math.round((successfulRuns / totalRuns) * 100)}% success)`;
+      
+      // Normalize to array for consistent handling
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      
+      // Send ONE email to all recipients
+      await this.sendEmail(emailList, subject, text, html);
+      
+      console.log(`Daily digest email sent to recipients: ${emailList.join(', ')}`);
+      
+    } catch (error) {
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      console.error(`Error sending daily digest emails to ${emailList.join(', ')}:`, error);
       // Don't throw error - email failure shouldn't break the scheduled chat execution
     }
   }

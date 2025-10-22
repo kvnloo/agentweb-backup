@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-10-22',
+    changes: [
+      'Added Daily Digest Feature for Scheduled Chats',
+      '- Hourly scheduled chats now support a "Daily Digest" option to consolidate multiple runs into a single daily summary email',
+      '- When enabled, individual run emails are suppressed and replaced with a comprehensive daily digest sent at the end of each day',
+      '- Daily digest includes all run results from the day with statistics (total runs, success rate, average runtime) and interactive share links',
+    ],
+  },
+  {
     date: '2025-10-21',
     changes: [
       'Enhanced Interactive Share (ishare) User Experience with Mobile Optimization',

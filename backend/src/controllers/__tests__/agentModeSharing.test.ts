@@ -9,6 +9,8 @@ jest.mock('../../services/chatbotService', () => ({
     updateSessionShareMetadata: jest.fn(),
     updateSessionInteractiveShareMetadata: jest.fn(),
     addMessageToSession: jest.fn(),
+    addMessagesToSession: jest.fn(),
+    createOrReuseInteractiveShare: jest.fn(),
   }
 }));
 
@@ -231,6 +233,9 @@ describe('AgentMode Sharing Controller', () => {
           sharedAt: '2024-01-01T00:00:00Z' 
         }
       });
+      (chatbotDb.createOrReuseInteractiveShare as jest.Mock).mockResolvedValue(
+        `http://localhost:5174/ishare/${sessionId}?conversable=test-token`
+      );
 
       const req = mockRequest({
         body: { sessionId },
@@ -241,14 +246,7 @@ describe('AgentMode Sharing Controller', () => {
       await agentModeController.createConversableShare(req as Request, res as Response);
 
       expect(chatbotDb.getChatSession).toHaveBeenCalledWith(sessionId);
-      expect(chatbotDb.updateSessionInteractiveShareMetadata).toHaveBeenCalledWith(
-        sessionId,
-        { 
-          isActive: true, 
-          token: expect.any(String), 
-          sharedAt: expect.any(String) 
-        }
-      );
+      expect(chatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith(sessionId);
       expect(res.status).toHaveBeenCalledWith(200);
       expect(res.json).toHaveBeenCalledWith({
         shareId: sessionId,
@@ -281,6 +279,9 @@ describe('AgentMode Sharing Controller', () => {
           sharedAt: '2024-01-01T00:00:00Z' 
         }
       });
+      (chatbotDb.createOrReuseInteractiveShare as jest.Mock).mockResolvedValue(
+        `http://localhost:5174/ishare/${sessionId}?conversable=test-token`
+      );
 
       const req = mockRequest({
         body: { sessionId },
@@ -290,15 +291,8 @@ describe('AgentMode Sharing Controller', () => {
 
       await agentModeController.createConversableShare(req as Request, res as Response);
 
-      // Verify that only interactiveShareMetadata is updated, shareMetadata is preserved
-      expect(chatbotDb.updateSessionInteractiveShareMetadata).toHaveBeenCalledWith(
-        sessionId,
-        { 
-          isActive: true, 
-          token: expect.any(String), 
-          sharedAt: expect.any(String) 
-        }
-      );
+      // Verify that createOrReuseInteractiveShare is called
+      expect(chatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith(sessionId);
       expect(res.status).toHaveBeenCalledWith(200);
     });
   });
