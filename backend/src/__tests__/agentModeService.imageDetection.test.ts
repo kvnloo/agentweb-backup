@@ -191,7 +191,7 @@ describe('Describe Image Function', () => {
       expect(result).toHaveProperty('description');
       expect(result).toHaveProperty('imageUrl', imageUrl);
       expect(typeof result.description).toBe('string');
-      expect(result.description.length).toBeGreaterThan(0);
+      expect(result.description && result.description.length).toBeGreaterThan(0);
     });
 
     it('should return correct response structure for failed analysis', async () => {
@@ -200,7 +200,7 @@ describe('Describe Image Function', () => {
       expect(result).toHaveProperty('success', false);
       expect(result).toHaveProperty('message');
       expect(typeof result.message).toBe('string');
-      expect(result.message.length).toBeGreaterThan(0);
+      expect(result.message && result.message.length).toBeGreaterThan(0);
     });
   });
 
