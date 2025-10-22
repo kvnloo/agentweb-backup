@@ -978,6 +978,28 @@ Use the available tools to create tasks in the agent-engine when complex work is
             required: ['task_id', 'email_subject']
           }
         }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'describe_image',
+          description: 'Analyze and describe an image from a URL. Use this when the user mentions an image or when you need to understand visual content.',
+          parameters: {
+            type: 'object',
+            properties: {
+              image_url: {
+                type: 'string',
+                description: 'Image URL to analyze and describe'
+              },
+              prompt: {
+                type: 'string',
+                description: 'Custom prompt/instructions for analyzing the image. Specify what aspects to focus on (e.g., colors, composition, text, branding, marketing elements, etc.)',
+                default: 'Please analyze and describe this image in detail. Focus on visual elements, composition, colors, text, and any marketing or branding elements you can identify.'
+              }
+            },
+            required: ['image_url']
+          }
+        }
       }
     ];
   }
@@ -1338,6 +1360,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
           file_url: args.url
         };
       
+      case 'describe_image':
+        return {
+          success: true,
+          description: `Mock image analysis for ${args.image_url}${args.prompt ? ` with custom prompt: "${args.prompt}"` : ''}. This would contain detailed visual analysis including colors, composition, text content, and marketing elements in a real scenario.`,
+          imageUrl: args.image_url
+        };
+      
       default:
         return {
           success: true,
@@ -1406,8 +1435,64 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.getTaskSubscriberMetrics(args.task_id, userId);
       case 'get_task_subscriber_engagement_events':
         return await this.getTaskSubscriberEngagementEvents(args.task_id, args.email_subject, userId);
+      case 'describe_image':
+        return await this.describeImage(args.image_url, args.prompt);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
+    }
+  }
+
+  private async describeImage(imageUrl: string, prompt?: string): Promise<any> {
+    try {
+      if (!imageUrl) {
+        return {
+          success: false,
+          message: 'No image URL provided'
+        };
+      }
+
+      // Use custom prompt or default
+      const analysisPrompt = prompt || 'Please analyze and describe this image in detail. Focus on visual elements, composition, colors, text, and any marketing or branding elements you can identify.';
+
+      // Create messages for vision API
+      const messages = [
+        {
+          role: 'user' as const,
+          content: [
+            {
+              type: 'text' as const,
+              text: analysisPrompt
+            },
+            {
+              type: 'image_url' as const,
+              image_url: { url: imageUrl }
+            }
+          ]
+        }
+      ];
+
+      // Call OpenAI Vision API using the same model as agent mode
+      const response = await this.openai.chat.completions.create({
+        model: process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
+        messages: messages,
+        max_completion_tokens: 2000
+      });
+
+      const description = response.choices[0]?.message?.content || 'Unable to analyze image';
+
+      return {
+        success: true,
+        description: description,
+        imageUrl: imageUrl
+      };
+
+    } catch (error) {
+      console.error('AgentMode: Error describing image:', error);
+      return {
+        success: false,
+        message: 'Failed to analyze image. Please check that the URL is accessible and contains a valid image.',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
     }
   }
 
