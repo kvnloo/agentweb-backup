@@ -16,6 +16,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Enhanced Scheduled Chats with Minimum Function Call Requirements',
       '- Added support for specifying minimum number of calls required for each selected function in scheduled chats',
       '- Default minimum is 1 call per function, but users can configure higher requirements (e.g., 2+ calls)',
+      'Improved Agent Mode Session Loading and Navigation',
+      '- Fixed issue where not all chat sessions were loaded in the Chat Sessions sidebar due to DynamoDB query limits',
+      '- Implemented infinite scroll for Chat Sessions to load all sessions seamlessly as users scroll down',
+      'Fixed layout issues to ensure left sidebar aligns properly and chat window utilizes full available space',
     ],
   },
   {

@@ -517,20 +517,29 @@ const calculateNextRunTime = (frequency: string, fromDate: Date): Date => {
 };
 
 export const agentModeController = {
-  // Get user's agent chat sessions
+  // Get user's agent chat sessions with infinite scroll support
   async getSessions(req: Request, res: Response) {
     try {
       const user = req.user as User;
-
-      const sessions = await chatbotDb.getUserSessions(user.userId, 'agent');
+      
+      // Parse pagination parameters
+      const lastEvaluatedKey = req.query.lastEvaluatedKey as string;
+      const limit = Math.min(parseInt(req.query.limit as string) || 50, 100); // Max 100 per request
+      
+      // Get sessions with pagination
+      const result = await chatbotDb.getUserSessions(user.userId, 'agent', limit, true, lastEvaluatedKey);
       
       // Filter out tool messages and assistant messages with tool calls for user display
-      const filteredSessions = sessions.map(session => ({
+      const filteredSessions = result.sessions.map(session => ({
         ...session,
         messages: filterMessagesForClient(session.messages)
       }));
       
-      res.json(filteredSessions);
+      res.json({
+        sessions: filteredSessions,
+        lastEvaluatedKey: result.lastEvaluatedKey,
+        hasMore: !!result.lastEvaluatedKey
+      });
     } catch (error) {
       console.error('AgentMode: Get sessions error:', error);
       res.status(500).json({ error: 'Failed to get sessions' });
@@ -582,7 +591,13 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Unauthorized access to session' });
       }
 
-      res.json(session);
+      // Filter out tool messages and assistant messages with tool calls for user display
+      const filteredSession = {
+        ...session,
+        messages: filterMessagesForClient(session.messages)
+      };
+
+      res.json(filteredSession);
     } catch (error) {
       console.error('AgentMode: Get session error:', error);
       res.status(500).json({ error: 'Failed to get session' });

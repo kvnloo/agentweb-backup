@@ -39,16 +39,16 @@ export const growthGeniusController = {
 
       // Get only Growth Genius sessions for the user from the database
       // Use filtering at the database level for better performance
-      const geniusSessions = await chatbotDb.getUserSessions(
+      const result = await chatbotDb.getUserSessions(
         user.userId, 
         'genius',  // portalType filter
         100,       // limit to prevent performance issues
         true       // sort by updatedAt descending (newest first)
       );
       
-      console.log(`GrowthGenius: Found ${geniusSessions.length} genius sessions for user ${user.userId}`);
+      console.log(`GrowthGenius: Found ${result.sessions.length} genius sessions for user ${user.userId}`);
       
-      res.json(geniusSessions);
+      res.json(result.sessions);
     } catch (error) {
       console.error('GrowthGenius: Get sessions error:', error);
       res.status(500).json({ message: 'Failed to get chat sessions' });
@@ -392,14 +392,14 @@ export const growthGeniusController = {
       console.log(`GrowthGenius: Migrating sessions for user ${user.userId}`);
 
       // Get all sessions for the user (no portal type filter for migration)
-      const allSessions = await chatbotDb.getUserSessions(user.userId, undefined, 200, false);
+      const result = await chatbotDb.getUserSessions(user.userId, undefined, 200, false);
       
       // Filter sessions that don't have portalType: 'genius'
-      const sessionsToMigrate = allSessions.filter(session => 
+      const sessionsToMigrate = result.sessions.filter(session => 
         session.portalType !== 'genius'
       );
 
-      console.log(`GrowthGenius: Found ${sessionsToMigrate.length} sessions to migrate out of ${allSessions.length} total sessions`);
+      console.log(`GrowthGenius: Found ${sessionsToMigrate.length} sessions to migrate out of ${result.sessions.length} total sessions`);
 
       // Update each session to have portalType: 'genius'
       const migrationResults = [];
@@ -428,7 +428,7 @@ export const growthGeniusController = {
       res.json({
         message: `Migration completed. ${successCount}/${sessionsToMigrate.length} sessions migrated successfully`,
         results: migrationResults,
-        totalSessions: allSessions.length,
+        totalSessions: result.sessions.length,
         migratedSessions: successCount
       });
     } catch (error) {
