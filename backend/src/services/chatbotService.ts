@@ -1003,6 +1003,44 @@ export class ChatbotDB {
     }
   }
 
+  // Common function to create or reuse interactive share for a session
+  async createOrReuseInteractiveShare(sessionId: string): Promise<string> {
+    try {
+      // First, get the current session to check if it already has an interactive share
+      const session = await this.getChatSession(sessionId);
+      if (!session) {
+        throw new Error(`Session ${sessionId} not found`);
+      }
+
+      // Check if there's already an active interactive share
+      if (session.interactiveShareMetadata?.isActive && session.interactiveShareMetadata?.token) {
+        const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+        return `${customerFrontendUrl}/ishare/${sessionId}?conversable=${session.interactiveShareMetadata.token}`;
+      }
+
+      // Create a new interactive share
+      const crypto = require('crypto');
+      const conversableToken = crypto.randomBytes(32).toString('hex');
+      
+      const interactiveShareMetadata = {
+        isActive: true,
+        token: conversableToken,
+        sharedAt: new Date().toISOString()
+      };
+      
+      await this.updateSessionInteractiveShareMetadata(sessionId, interactiveShareMetadata);
+      
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      return `${customerFrontendUrl}/ishare/${sessionId}?conversable=${conversableToken}`;
+      
+    } catch (error) {
+      console.error(`Error creating or reusing interactive share for session ${sessionId}:`, error);
+      // Fall back to regular agent-mode URL if share creation fails
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      return `${customerFrontendUrl}/agent-mode/${sessionId}`;
+    }
+  }
+
   async getAllSessions(): Promise<ChatSession[]> {
     let allSessions: ChatSession[] = [];
     let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined =

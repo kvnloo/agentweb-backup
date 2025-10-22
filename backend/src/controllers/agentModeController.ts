@@ -99,6 +99,53 @@ const filterMessagesForClient = (messages: any[]) => {
   });
 };
 
+// Helper function to check if this is the last run of the day for an hourly schedule
+function isLastRunOfDayForHourlySchedule(currentTime: Date, nextRunTime: Date): boolean {
+  const currentDay = currentTime.getDate();
+  const nextDay = nextRunTime.getDate();
+  const currentMonth = currentTime.getMonth();
+  const nextMonth = nextRunTime.getMonth();
+  const currentYear = currentTime.getFullYear();
+  const nextYear = nextRunTime.getFullYear();
+  
+  // If the next run is on a different day, month, or year, this is the last run of the current day
+  return nextDay !== currentDay || nextMonth !== currentMonth || nextYear !== currentYear;
+}
+
+// Helper function to send daily digest email
+async function sendDailyDigestEmail(schedule: any, emailNotifications: string[]) {
+  try {
+    // Get all run results for today
+    const today = new Date();
+    const startOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    const endOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
+    
+    const runResults = await scheduleDb.getRunResults(schedule.scheduleId);
+    const todaysResults = runResults.filter((result: any) => {
+      const resultDate = new Date(result.createdAt);
+      return resultDate >= startOfDay && resultDate < endOfDay;
+    });
+    
+    if (todaysResults.length === 0) {
+      console.log(`No run results found for today for schedule ${schedule.scheduleName}`);
+      return;
+    }
+    
+    // Send daily digest email
+    await emailService.sendDailyDigestEmail(
+      emailNotifications,
+      schedule.scheduleName,
+      todaysResults,
+      schedule.scheduleId
+    );
+    
+    console.log(`Daily digest email sent for schedule ${schedule.scheduleName} with ${todaysResults.length} results`);
+  } catch (error) {
+    console.error(`Error sending daily digest email for schedule ${schedule.scheduleName}:`, error);
+    throw error;
+  }
+}
+
 // Common function to run a scheduled chat (used by both test and actual execution)
 async function runScheduledChat(
   schedule: any,
@@ -714,22 +761,17 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found' });
       }
 
-      // Generate a unique token for the conversable share
-      const conversableToken = require('crypto').randomBytes(32).toString('hex');
+      // Use the common function to create or reuse interactive share
+      const conversableUrl = await chatbotDb.createOrReuseInteractiveShare(sessionId);
       
-      // Update session with interactive share metadata
-      const interactiveShareMetadata = {
-        isActive: true,
-        token: conversableToken,
-        sharedAt: new Date().toISOString()
-      };
-      
-      await chatbotDb.updateSessionInteractiveShareMetadata(sessionId, interactiveShareMetadata);
+      // Extract the token from the URL for backward compatibility
+      const urlParams = new URL(conversableUrl).searchParams;
+      const conversableToken = urlParams.get('conversable') || '';
 
       res.status(200).json({
         shareId: sessionId,
         conversableToken: conversableToken,
-        conversableUrl: `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5176'}/ishare/${sessionId}?conversable=${conversableToken}`
+        conversableUrl: conversableUrl
       });
     } catch (error) {
       console.error('AgentMode: Create conversable share error:', error);
@@ -1027,6 +1069,7 @@ export const agentModeController = {
               keywords: keywords || [],
               requiredFunctionCalls: requiredFunctionCalls || [],
               emailNotifications: emailNotifications || [],
+              dailyDigest: scheduleFrequency === 'hourly' ? (req.body.dailyDigest || false) : false, // Only allow daily digest for hourly schedules
               status: 'active',
               nextRunTime: nextRunTime.toISOString(),
               createdAt: now.toISOString(),
@@ -1078,7 +1121,8 @@ export const agentModeController = {
               scheduleFrequency,
               keywords,
               requiredFunctionCalls,
-              emailNotifications
+              emailNotifications,
+              dailyDigest
             } = req.body;
 
             if (!scheduleName || !startingMessage || !scheduleFrequency) {
@@ -1104,6 +1148,7 @@ export const agentModeController = {
               keywords: keywords || [],
               requiredFunctionCalls: requiredFunctionCalls || [],
               emailNotifications: emailNotifications || [],
+              dailyDigest: scheduleFrequency === 'hourly' ? (dailyDigest || false) : false, // Only allow daily digest for hourly schedules
               nextRunTime: nextRunTime.toISOString(),
               updatedAt: now.toISOString()
             };
@@ -1237,6 +1282,46 @@ export const agentModeController = {
               return res.status(404).json({ error: 'Test record not found' });
             }
 
+            // Check if this is an hourly schedule with daily digest enabled
+            if (schedule.frequency === 'hourly' && schedule.dailyDigest) {
+              // For hourly schedules with daily digest, send a daily digest email
+              // Get all run results for the same date as the selected test entry
+              const selectedResultDate = new Date(record.createdAt);
+              const startOfDay = new Date(selectedResultDate.getFullYear(), selectedResultDate.getMonth(), selectedResultDate.getDate());
+              const endOfDay = new Date(selectedResultDate.getFullYear(), selectedResultDate.getMonth(), selectedResultDate.getDate() + 1);
+              
+              const sameDayResults = testHistory.filter((result: any) => {
+                const resultDate = new Date(result.createdAt);
+                return resultDate >= startOfDay && resultDate < endOfDay;
+              });
+              
+              if (sameDayResults.length > 0) {
+                // Send daily digest email for the specific date
+                await emailService.sendDailyDigestEmail(
+                  [toEmail],
+                  schedule.scheduleName,
+                  sameDayResults,
+                  schedule.scheduleId,
+                  selectedResultDate
+                );
+                
+                const dateStr = selectedResultDate.toLocaleDateString('en-US', { 
+                  year: 'numeric', 
+                  month: 'long', 
+                  day: 'numeric' 
+                });
+                
+                res.json({ 
+                  success: true, 
+                  message: `Daily digest email sent with all results from ${dateStr}`,
+                  resultCount: sameDayResults.length,
+                  date: dateStr
+                });
+                return;
+              }
+            }
+
+            // For non-hourly schedules or hourly without daily digest, send individual email
             // Build a result object compatible with emailService
             const resultForEmail = {
               passed: !!record.passed,
@@ -1300,12 +1385,34 @@ export const agentModeController = {
                  // Only send emails if email notifications are specified
                  const emailNotifications = schedule.emailNotifications || [];
                  if (emailNotifications.length > 0) {
-                   await emailService.sendScheduledChatResultEmail(
-                     emailNotifications,
-                     schedule.scheduleName,
-                     result,
-                     schedule.scheduleId
-                   );
+                   // Check if this is an hourly schedule with daily digest enabled
+                   if (schedule.frequency === 'hourly' && schedule.dailyDigest) {
+                     // Check if this is the last run of the day
+                     const now = new Date();
+                     const nextRunTime = calculateNextRunTime('hourly', now);
+                     const isLastRunOfDay = isLastRunOfDayForHourlySchedule(now, nextRunTime);
+                     
+                     if (isLastRunOfDay) {
+                       // Send daily digest instead of individual email
+                       await sendDailyDigestEmail(schedule, emailNotifications);
+                     } else {
+                       // Send individual email as usual
+                       await emailService.sendScheduledChatResultEmail(
+                         emailNotifications,
+                         schedule.scheduleName,
+                         result,
+                         schedule.scheduleId
+                       );
+                     }
+                   } else {
+                     // Send individual email as usual
+                     await emailService.sendScheduledChatResultEmail(
+                       emailNotifications,
+                       schedule.scheduleName,
+                       result,
+                       schedule.scheduleId
+                     );
+                   }
                  } else {
                    console.log(`No email notifications configured for schedule ${schedule.scheduleName}, skipping email send`);
                  }

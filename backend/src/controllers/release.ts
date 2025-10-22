@@ -8,14 +8,6 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
-    date: "2025-10-14",
-    changes: [
-      "Upgraded browser-use library to latest version",
-      "- Updated browser-use from 0.1.0 to 0.8.0 for improved web automation capabilities",
-      "- Added comprehensive unit tests to ensure safe usage",
-    ],
-  },
-  {
     date: "2025-10-13",
     changes: [
       "Added search_web function call to browser agent",
