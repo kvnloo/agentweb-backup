@@ -20,6 +20,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fixed Brand Guidelines Creation in Agent Mode',
       '- Agent Mode can now create brand guidelines using update_brand_guidelines when no existing guidelines are found',
       '- Previously returned an error requiring users to create guidelines first; now automatically creates initial structure',
+      'Added Image Analysis Capability to Agent Mode',
+      '- New describe_image function allows Emma to analyze and describe images from URLs',
+      '- Supports custom analysis prompts to focus on specific aspects like colors, composition, text, or branding elements',
     ],
   },
   {
