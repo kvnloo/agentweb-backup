@@ -637,8 +637,9 @@ export class ChatbotDB {
     userId: string,
     portalType?: "customer" | "partner" | "genius" | "agent",
     limit?: number,
-    sortDescending: boolean = true
-  ): Promise<ChatSession[]> {
+    sortDescending: boolean = true,
+    lastEvaluatedKey?: string
+  ): Promise<{ sessions: ChatSession[], lastEvaluatedKey?: any }> {
     console.log(
       `Getting chat sessions for user: ${userId} from table: ${this.tableName}, portalType: ${portalType || 'all'}, limit: ${limit || 'unlimited'}`
     );
@@ -667,6 +668,16 @@ export class ChatbotDB {
     // Note: DynamoDB UserIdIndex doesn't support sorting by updatedAt, so we'll sort in memory
     params.ScanIndexForward = false; // Always get in consistent order
 
+    // Add lastEvaluatedKey if provided for pagination
+    if (lastEvaluatedKey) {
+      try {
+        params.ExclusiveStartKey = JSON.parse(lastEvaluatedKey);
+      } catch (error) {
+        console.error("Invalid lastEvaluatedKey format:", error);
+        throw new Error("Invalid pagination key");
+      }
+    }
+
     try {
       const result = await dynamodb.query(params).promise();
       let sessions = (result.Items as ChatSession[]) || [];
@@ -682,7 +693,6 @@ export class ChatbotDB {
         `Found ${sessions.length} non-archived chat sessions for user: ${userId}`
       );
 
-
       // Sort by updatedAt in memory (DynamoDB UserIdIndex doesn't support updatedAt sorting)
       if (sortDescending) {
         sessions = sessions.sort((a, b) => 
@@ -694,7 +704,14 @@ export class ChatbotDB {
         );
       }
 
-      return sessions;
+      console.log(
+        `Returning ${sessions.length} sorted chat sessions for user: ${userId}`
+      );
+
+      return {
+        sessions,
+        lastEvaluatedKey: result.LastEvaluatedKey
+      };
     } catch (error) {
       console.error("Error getting user chat sessions:", error);
       throw error;
