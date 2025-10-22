@@ -40,7 +40,7 @@ describe('Interactive Share Common Function - Simple Tests', () => {
       } catch (error) {
         // If the function throws, that's also acceptable behavior
         expect(error).toBeInstanceOf(Error);
-        expect(error.message).toBe('Database error');
+        expect((error as Error).message).toBe('Database error');
       }
 
       expect(mockCreateOrReuseInteractiveShare).toHaveBeenCalledWith('test-session');
