@@ -7,6 +7,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-10-23',
+    changes: [
+      'Fixed Daily Digest Email Bug for Hourly Schedules',
+      '- Resolved critical issue where hourly schedules with daily digest enabled were sending both individual emails AND daily digest emails',
+    ],
+  },
+  {
     date: '2025-10-22',
     changes: [
       'Added Daily Digest Feature for Scheduled Chats',
