@@ -13,8 +13,6 @@ const s3 = new S3();
 // Get table prefix based on NODE_ENV
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
-console.log(`[BRAND DEBUG] Using table prefix: ${TABLE_PREFIX}`);
-console.log(`[BRAND DEBUG] Users table: ${TABLE_PREFIX}AW-Users`);
 
 // Configure multer for file uploads
 const upload = multer({
@@ -55,7 +53,6 @@ async function uploadBrandFile(
     process.env.AWS_S3_BUCKET || "agentweb-user-files"
   }.s3.${process.env.AWS_REGION || "us-west-2"}.amazonaws.com/${key}`;
 
-  console.log(`[BRAND DEBUG] File uploaded successfully: ${url}`);
   return { url, key };
 }
 
@@ -63,16 +60,10 @@ async function uploadBrandFile(
 router.get("/guidelines", authenticateToken, async (req, res) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
-    console.log(`[BRAND DEBUG] GET request for user: ${userId}`);
 
     if (!userId) {
-      console.log(`[BRAND DEBUG] No userId provided in request`);
       return res.status(401).json({ error: "User ID not provided" });
     }
-
-    console.log(
-      `[BRAND DEBUG] Querying table: ${TABLE_PREFIX}AW-Users with UserIdIndex`
-    );
 
     const result = await dynamodb
       .query({
@@ -85,38 +76,21 @@ router.get("/guidelines", authenticateToken, async (req, res) => {
       })
       .promise();
 
-    console.log(
-      `[BRAND DEBUG] Query result count: ${result.Items?.length || 0}`
-    );
-
     const users = result.Items || [];
 
     if (users.length === 0) {
-      console.log(`[BRAND DEBUG] User not found in database`);
       return res.status(404).json({ error: "User not found" });
     }
 
     const user = users[0];
-    console.log(`[BRAND DEBUG] Found user: ${user.email}`);
-    console.log(
-      `[BRAND DEBUG] User has brandGuidelines field: ${!!user.brandGuidelines}`
-    );
-
     const brandGuidelines = user.brandGuidelines;
 
     if (!brandGuidelines) {
-      console.log(`[BRAND DEBUG] No brand guidelines found for user`);
       return res.json({
         exists: false,
         message: "No brand guidelines found",
       });
     }
-
-    console.log(
-      `[BRAND DEBUG] Returning brand guidelines with ${
-        brandGuidelines.attachments?.length || 0
-      } attachments`
-    );
 
     res.json({
       exists: true,
@@ -144,11 +118,8 @@ router.post(
   async (req, res) => {
     try {
       const userId = (req as AuthenticatedRequest).user?.userId;
-      console.log(`[BRAND DEBUG] POST request for user: ${userId}`);
-      console.log(`[BRAND DEBUG] Request body:`, req.body);
 
       if (!userId) {
-        console.log(`[BRAND DEBUG] No userId provided in POST request`);
         return res.status(401).json({ error: "User ID not provided" });
       }
 
@@ -167,7 +138,6 @@ router.post(
       } = req.body;
 
       const files = req.files as { [fieldname: string]: Express.Multer.File[] };
-      console.log(`[BRAND DEBUG] Files received:`, Object.keys(files));
 
       // Upload files to S3
       const attachments = [];
@@ -247,20 +217,11 @@ router.post(
         .promise();
 
       if (!userResult.Items || userResult.Items.length === 0) {
-        console.log(
-          `[BRAND DEBUG] User not found during brand guidelines save`
-        );
         return res.status(404).json({ error: "User not found" });
       }
 
       const user = userResult.Items[0];
-      console.log(`[BRAND DEBUG] Found user for update: ${user.email}`);
-      console.log(`[BRAND DEBUG] User primary key (email): ${user.email}`);
-
       const existingBrandGuidelines = user.brandGuidelines;
-      console.log(
-        `[BRAND DEBUG] Existing brand guidelines: ${!!existingBrandGuidelines}`
-      );
 
       // Parse keyMessages if it's a string
       let parsedKeyMessages = [];
@@ -407,7 +368,6 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       .promise();
 
     if (!result.Items || result.Items.length === 0) {
-      console.log(`[BRAND DEBUG] User not found for asset deletion`);
       return res.status(404).json({ error: "User not found" });
     }
 
@@ -415,7 +375,6 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
     const brandGuidelines = user.brandGuidelines;
 
     if (!brandGuidelines) {
-      console.log(`[BRAND DEBUG] No brand guidelines found for asset deletion`);
       return res.status(404).json({ error: "Brand guidelines not found" });
     }
 
@@ -438,9 +397,8 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
           Key: decodeURIComponent(key),
         })
         .promise();
-      console.log(`[BRAND DEBUG] Successfully deleted file from S3: ${key}`);
     } catch (s3Error) {
-      console.warn("[BRAND DEBUG] Failed to delete from S3:", s3Error);
+      console.warn("Failed to delete from S3:", s3Error);
       // Continue with database update even if S3 deletion fails
     }
 
