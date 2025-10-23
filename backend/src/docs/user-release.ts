@@ -20,6 +20,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Fixed issue where not all chat sessions were loaded in the Chat Sessions sidebar due to DynamoDB query limits',
       '- Implemented infinite scroll for Chat Sessions to load all sessions seamlessly as users scroll down',
       'Fixed layout issues to ensure left sidebar aligns properly and chat window utilizes full available space',
+      'Optimized Brand Guidelines Data Updates',
+      '- Fixed critical bug where updating brand guidelines would overwrite existing data with empty values',
+      '- Implemented section-specific save functions that only send the fields being edited in each section',
     ],
   },
   {

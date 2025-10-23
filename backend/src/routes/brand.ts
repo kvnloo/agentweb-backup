@@ -304,16 +304,17 @@ router.post(
 
       const brandGuidelinesData = {
         brandData: {
-          brandName: brandName || "",
-          tagline: tagline || "",
-          primaryColor: primaryColor || "",
-          secondaryColor: secondaryColor || "",
-          fontFamily: fontFamily || "",
-          toneOfVoice: toneOfVoice || "",
+          // Only update fields that are provided, preserve existing data for missing fields
+          brandName: brandName !== undefined ? brandName : (existingBrandGuidelines?.brandData?.brandName || ""),
+          tagline: tagline !== undefined ? tagline : (existingBrandGuidelines?.brandData?.tagline || ""),
+          primaryColor: primaryColor !== undefined ? primaryColor : (existingBrandGuidelines?.brandData?.primaryColor || ""),
+          secondaryColor: secondaryColor !== undefined ? secondaryColor : (existingBrandGuidelines?.brandData?.secondaryColor || ""),
+          fontFamily: fontFamily !== undefined ? fontFamily : (existingBrandGuidelines?.brandData?.fontFamily || ""),
+          toneOfVoice: toneOfVoice !== undefined ? toneOfVoice : (existingBrandGuidelines?.brandData?.toneOfVoice || ""),
           keyMessages: parsedKeyMessages,
           brandValues: parsedBrandValues,
-          targetAudience: targetAudience || "",
-          brandPersonality: brandPersonality || "",
+          targetAudience: targetAudience !== undefined ? targetAudience : (existingBrandGuidelines?.brandData?.targetAudience || ""),
+          brandPersonality: brandPersonality !== undefined ? brandPersonality : (existingBrandGuidelines?.brandData?.brandPersonality || ""),
           founders: parsedFounders,
         },
         attachments: [
