@@ -11,6 +11,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
     changes: [
       'Fixed Daily Digest Email Bug for Hourly Schedules',
       '- Resolved critical issue where hourly schedules with daily digest enabled were sending both individual emails AND daily digest emails',
+      'Made Agent Mode the Default Page in Customer Portal',
+      '- Updated navigation order to prioritize Agent Mode as the primary landing experience',
     ],
   },
   {
