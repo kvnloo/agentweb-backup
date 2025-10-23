@@ -1486,17 +1486,11 @@ export const agentModeController = {
                      if (isLastRunOfDay) {
                        // Send daily digest instead of individual email
                        await sendDailyDigestEmail(schedule, emailNotifications);
-                     } else {
-                       // Send individual email as usual
-                       await emailService.sendScheduledChatResultEmail(
-                         emailNotifications,
-                         schedule.scheduleName,
-                         result,
-                         schedule.scheduleId
-                       );
                      }
+                     // For hourly schedules with daily digest, don't send individual emails
+                     // Only send the daily digest on the last run of the day
                    } else {
-                     // Send individual email as usual
+                     // Send individual email as usual for non-hourly schedules or hourly without daily digest
                      await emailService.sendScheduledChatResultEmail(
                        emailNotifications,
                        schedule.scheduleName,
