@@ -44,7 +44,7 @@ describe('Brand Route - Bug Fix Tests', () => {
       };
 
       // Simulate incoming request data with only some fields
-      const incomingData = {
+      const incomingData: any = {
         primaryColor: "#FF0000", // Only this field is provided
         // Other fields are undefined (not provided)
       };
@@ -109,7 +109,7 @@ describe('Brand Route - Bug Fix Tests', () => {
       };
 
       // Simulate incoming request data with only some fields
-      const incomingData = {
+      const incomingData: any = {
         primaryColor: "#FF0000", // Only this field is provided
         // Other fields are undefined (not provided)
       };
@@ -171,7 +171,7 @@ describe('Brand Route - Bug Fix Tests', () => {
       };
 
       // Simulate incoming request data with explicit empty string
-      const incomingData = {
+      const incomingData: any = {
         brandName: "Updated DataScoop", // Explicitly provided
         tagline: "", // Explicitly set to empty string
         primaryColor: "#FF0000", // Explicitly provided
@@ -213,10 +213,10 @@ describe('Brand Route - Bug Fix Tests', () => {
 
     it('should create new brand guidelines when none exist', () => {
       // Simulate no existing brand guidelines
-      const existingBrandGuidelines = null;
+      const existingBrandGuidelines: any = null;
 
       // Simulate incoming request data
-      const incomingData = {
+      const incomingData: any = {
         brandName: "New Brand",
         tagline: "New Tagline",
         primaryColor: "#FF0000",
