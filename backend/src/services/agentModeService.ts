@@ -744,6 +744,27 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 type: 'string',
                 description: 'Optional campaign name to filter metrics by. If provided, only data from campaigns matching this name will be returned.',
                 default: null
+              },
+              custom_breakdowns: {
+                type: 'object',
+                description: 'Optional custom breakdown configuration. When provided, overrides default breakdowns.',
+                properties: {
+                  breakdowns: {
+                    type: 'array',
+                    items: {
+                      type: 'string'
+                    },
+                    description: 'Array of breakdown dimensions (e.g., ["age", "gender", "publisher_platform"])'
+                  },
+                  fields: {
+                    type: 'array',
+                    items: {
+                      type: 'string'
+                    },
+                    description: 'Array of fields to include in breakdown queries (e.g., ["campaign_name", "adset_name", "impressions", "spend", "ctr", "cpc", "reach", "actions", "cost_per_action_type"])'
+                  }
+                },
+                default: null
               }
             },
             required: []
@@ -1408,7 +1429,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         const attachPreviousTaskResultsForImage = args.attach_previous_task_results !== false;
         return await this.createImageTaskFromPrompt(args.task_name, args.prompt, args.category || 'Creatives', userId, sessionId, attachPreviousTaskResultsForImage);
       case 'get_meta_ads_metrics':
-        return await this.getMetaAdsMetrics(args.timeframe || '7d', userId, args.campaign_name);
+        return await this.getMetaAdsMetrics(args.timeframe || '7d', userId, args.campaign_name, args.custom_breakdowns);
       case 'create_revision':
         return await this.createRevision(args.task_id, args.execution_id, args.revision_prompt, userId, args.target_result_name);
       case 'search_web':
@@ -2441,7 +2462,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
 
 
-  private async getMetaAdsMetrics(timeframe: string, userId: string, campaign_name?: string): Promise<any> {
+  private async getMetaAdsMetrics(timeframe: string, userId: string, campaign_name?: string, custom_breakdowns?: { breakdowns: string[], fields: string[] }): Promise<any> {
     try {
       
       // Import the Meta API functions directly to reuse the same logic
@@ -2532,25 +2553,130 @@ Use the available tools to create tasks in the agent-engine when complex work is
         ? `&filtering=[{"field":"campaign.id","operator":"IN","value":["${campaignFilterIds.join('","')}"]}]`
         : '';
       
+      // Determine breakdown configuration
+      let breakdownConfig: {
+        breakdowns?: string;
+        fields?: string;
+        demographics?: { breakdowns: string; fields: string };
+        placement?: { breakdowns: string; fields: string };
+        device?: { breakdowns: string; fields: string };
+      };
+      
+        if (custom_breakdowns && custom_breakdowns.breakdowns && custom_breakdowns.fields) {
+          // Use custom breakdowns - filter out breakdown dimensions from fields
+          const validFields = custom_breakdowns.fields.filter(field => 
+            !custom_breakdowns.breakdowns.includes(field)
+          );
+          
+          // Only use valid Meta API fields for breakdown queries
+          const metaValidFields = [
+            'campaign_name', 'adset_name', 'impressions', 'reach', 'spend', 'ctr', 'cpc', 
+            'clicks', 'actions', 'cost_per_action_type', 'campaign_id', 'adset_id', 'ad_id',
+            'frequency'
+          ];
+          
+          // Map user-requested fields to valid Meta API fields
+          const fieldMapping: { [key: string]: string } = {
+            'link_clicks': 'clicks',
+            'quality_ranking': 'quality_ranking',
+            'engagement_rate_ranking': 'engagement_rate_ranking', 
+            'conversion_rate_ranking': 'conversion_rate_ranking'
+          };
+          
+          // Map fields to valid Meta API fields and filter
+          const mappedFields = validFields.map(field => fieldMapping[field] || field);
+          const finalFields = mappedFields.filter(field => metaValidFields.includes(field));
+          
+          breakdownConfig = {
+            breakdowns: custom_breakdowns.breakdowns.join(','),
+            fields: finalFields.join(',')
+          };
+          console.log('AgentMode: Using custom breakdowns:', breakdownConfig);
+          console.log('AgentMode: Original fields:', custom_breakdowns.fields);
+          console.log('AgentMode: After removing breakdown dimensions:', validFields);
+          console.log('AgentMode: After filtering for valid Meta API fields:', finalFields);
+      } else {
+        // Use default breakdowns
+        breakdownConfig = {
+          demographics: { breakdowns: 'age,gender', fields: 'impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_name,adset_name,ad_id' },
+          placement: { breakdowns: 'publisher_platform,platform_position', fields: 'impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_name,adset_name,ad_id' },
+          device: { breakdowns: 'impression_device', fields: 'impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_name,adset_name,ad_id' }
+        };
+        console.log('AgentMode: Using default breakdowns');
+      }
 
       // Get campaigns, ad sets, ads, and insights using Graph API - fetch at multiple levels
-      const [campaignsResponse, adSetsResponse, adsResponse, adInsightsResponse, adSetInsightsResponse, campaignInsightsResponse, insightsDemographicsResponse, insightsPlacementResponse, insightsDeviceResponse] = await Promise.all([
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective${filteringParam}&access_token=${accessToken}`),
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting${filteringParam}&access_token=${accessToken}`),
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}${filteringParam}&access_token=${accessToken}`),
-        // Ad-level insights for ads processing
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
-        // Adset-level insights for ad sets processing
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=adset${filteringParam}&access_token=${accessToken}`),
-        // Campaign-level insights for campaigns processing
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
-        // Demographics breakdown (age/gender)
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id,adset_id,ad_id&breakdowns=age,gender&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
-        // Placement breakdown (publisher platform and position)
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id,adset_id,ad_id&breakdowns=publisher_platform,platform_position&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
-        // Device breakdown (mobile/desktop, etc.)
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id,adset_id,ad_id&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`)
-      ]);
+      let apiCalls;
+      if (custom_breakdowns && custom_breakdowns.breakdowns && custom_breakdowns.fields) {
+        // Use custom breakdowns - single breakdown query
+        // Filter out breakdown dimensions from fields to avoid API errors
+        const validFields = custom_breakdowns.fields.filter(field => 
+          !custom_breakdowns.breakdowns.includes(field)
+        );
+        
+        // Only use valid Meta API fields for breakdown queries
+        const metaValidFields = [
+          'campaign_name', 'adset_name', 'impressions', 'reach', 'spend', 'ctr', 'cpc', 
+          'clicks', 'actions', 'cost_per_action_type', 'campaign_id', 'adset_id', 'ad_id',
+          'frequency'
+        ];
+        
+        // Map user-requested fields to valid Meta API fields
+        const fieldMapping: { [key: string]: string } = {
+          'link_clicks': 'clicks',
+          'quality_ranking': 'quality_ranking',
+          'engagement_rate_ranking': 'engagement_rate_ranking', 
+          'conversion_rate_ranking': 'conversion_rate_ranking'
+        };
+        
+        // Map fields to valid Meta API fields and filter
+        const mappedFields = validFields.map(field => fieldMapping[field] || field);
+        const finalFields = mappedFields.filter(field => metaValidFields.includes(field));
+        const customFields = finalFields.join(',');
+        
+        console.log('AgentMode: Original fields:', custom_breakdowns.fields);
+        console.log('AgentMode: After removing breakdown dimensions:', validFields);
+        console.log('AgentMode: After filtering for valid Meta API fields:', finalFields);
+        
+        apiCalls = [
+          fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective${filteringParam}&access_token=${accessToken}`),
+          fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting${filteringParam}&access_token=${accessToken}`),
+          fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}${filteringParam}&access_token=${accessToken}`),
+          // Ad-level insights for ads processing
+          fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
+          // Adset-level insights for ad sets processing
+          fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=adset${filteringParam}&access_token=${accessToken}`),
+          // Campaign-level insights for campaigns processing
+          fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+          // Custom breakdown with filtered fields
+          fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=${customFields}&breakdowns=${breakdownConfig.breakdowns}&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
+          // Placeholder for compatibility
+          Promise.resolve({ json: () => Promise.resolve({ data: [] }) }),
+          // Placeholder for compatibility
+          Promise.resolve({ json: () => Promise.resolve({ data: [] }) })
+        ];
+      } else {
+        // Use default breakdowns - multiple breakdown queries
+        apiCalls = [
+          fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective${filteringParam}&access_token=${accessToken}`),
+          fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting${filteringParam}&access_token=${accessToken}`),
+          fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}${filteringParam}&access_token=${accessToken}`),
+          // Ad-level insights for ads processing
+          fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
+          // Adset-level insights for ad sets processing
+          fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=adset${filteringParam}&access_token=${accessToken}`),
+          // Campaign-level insights for campaigns processing
+          fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+          // Demographics breakdown (age/gender)
+          fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=${breakdownConfig.demographics!.fields}&breakdowns=${breakdownConfig.demographics!.breakdowns}&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
+          // Placement breakdown (publisher platform and position)
+          fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=${breakdownConfig.placement!.fields}&breakdowns=${breakdownConfig.placement!.breakdowns}&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
+          // Device breakdown (mobile/desktop, etc.)
+          fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=${breakdownConfig.device!.fields}&breakdowns=${breakdownConfig.device!.breakdowns}&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`)
+        ];
+      }
+
+      const [campaignsResponse, adSetsResponse, adsResponse, adInsightsResponse, adSetInsightsResponse, campaignInsightsResponse, insightsDemographicsResponse, insightsPlacementResponse, insightsDeviceResponse] = await Promise.all(apiCalls);
 
       const [campaignsData, adSetsData, adsData, adInsightsData, adSetInsightsData, campaignInsightsData, insightsDemographicsData, insightsPlacementData, insightsDeviceData] = await Promise.all([
         campaignsResponse.json(),
@@ -2608,21 +2734,79 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const processedAdSetsData = this.processAdSetsData(adSetsData.data || [], adSetInsightsData.data || [], campaignsData.data || []);
       const processedAdsData = this.processAdsData(adsData.data || [], adInsightsData.data || [], adSetsData.data || [], campaignsData.data || []);
       const campaignSummary = this.generateCampaignSummary(adPerformance);
-      // Filter breakdown data by campaign if filtering is applied
-      let demographicsBreakdown = insightsDemographicsData?.data || [];
-      let placementBreakdown = insightsPlacementData?.data || [];
-      let deviceBreakdown = insightsDeviceData?.data || [];
       
-      if (campaignFilterIds.length > 0) {
-        demographicsBreakdown = demographicsBreakdown.filter((item: any) => 
-          item.campaign_id && campaignFilterIds.includes(item.campaign_id)
-        );
-        placementBreakdown = placementBreakdown.filter((item: any) => 
-          item.campaign_id && campaignFilterIds.includes(item.campaign_id)
-        );
-        deviceBreakdown = deviceBreakdown.filter((item: any) => 
-          item.campaign_id && campaignFilterIds.includes(item.campaign_id)
-        );
+        // Process breakdown data based on configuration
+        let demographicsBreakdown, placementBreakdown, deviceBreakdown;
+
+        if (custom_breakdowns && custom_breakdowns.breakdowns && custom_breakdowns.fields) {
+          // Use custom breakdown data - all breakdowns use the same custom data
+          const customBreakdownData = insightsDemographicsData?.data || [];
+          console.log('AgentMode: Custom breakdown data received:', customBreakdownData.length, 'items');
+          console.log('AgentMode: Sample custom breakdown item:', customBreakdownData[0]);
+
+          // Check if we actually got breakdown data
+          if (customBreakdownData.length === 0) {
+            console.warn('AgentMode: WARNING - No custom breakdown data received! This may indicate an API error or invalid field configuration.');
+            console.warn('AgentMode: Check the API error logs above for field validation issues.');
+            
+            // Return an error response indicating the breakdown data is empty
+            return {
+              success: false,
+              error: 'No breakdown data available. This may be due to invalid field configuration or API restrictions. Please check the field names and try again.',
+              campaigns: campaignsData?.data || [],
+              adSets: adSetsData?.data || [],
+              ads: adsData?.data || [],
+              insights: {
+                ad: adInsightsData?.data || [],
+                adset: adSetInsightsData?.data || [],
+                campaign: campaignInsightsData?.data || []
+              },
+              breakdowns: {
+                demographics: [],
+                placement: [],
+                device: []
+              }
+            };
+          }
+
+          demographicsBreakdown = customBreakdownData;
+          placementBreakdown = customBreakdownData; // Use same data for all breakdowns
+          deviceBreakdown = customBreakdownData; // Use same data for all breakdowns
+
+          // Filter custom breakdown data by campaign if filtering is applied
+          if (campaignFilterIds.length > 0) {
+            // For custom breakdowns, filter by campaign_name since breakdown data doesn't have campaign_id
+            demographicsBreakdown = demographicsBreakdown.filter((item: any) =>
+              item.campaign_name && campaign_name && item.campaign_name === campaign_name
+            );
+            placementBreakdown = placementBreakdown.filter((item: any) =>
+              item.campaign_name && campaign_name && item.campaign_name === campaign_name
+            );
+            deviceBreakdown = deviceBreakdown.filter((item: any) =>
+              item.campaign_name && campaign_name && item.campaign_name === campaign_name
+            );
+          }
+
+          console.log('AgentMode: After filtering - demographics:', demographicsBreakdown.length, 'placement:', placementBreakdown.length, 'device:', deviceBreakdown.length);
+      } else {
+        // Use default breakdown data
+        demographicsBreakdown = insightsDemographicsData?.data || [];
+        placementBreakdown = insightsPlacementData?.data || [];
+        deviceBreakdown = insightsDeviceData?.data || [];
+        
+        // Filter breakdown data by campaign if filtering is applied
+        if (campaignFilterIds.length > 0) {
+          // For default breakdowns, filter by campaign_name since we now request it in the API call
+          demographicsBreakdown = demographicsBreakdown.filter((item: any) => 
+            item.campaign_name && campaign_name && item.campaign_name === campaign_name
+          );
+          placementBreakdown = placementBreakdown.filter((item: any) => 
+            item.campaign_name && campaign_name && item.campaign_name === campaign_name
+          );
+          deviceBreakdown = deviceBreakdown.filter((item: any) => 
+            item.campaign_name && campaign_name && item.campaign_name === campaign_name
+          );
+        }
       }
       
       const processedDemographicsBreakdown = this.processBreakdownData(demographicsBreakdown);
@@ -2639,6 +2823,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         placementBreakdown: processedPlacementBreakdown,
         deviceBreakdown: processedDeviceBreakdown,
         attributionWindow: { start: sinceStr, end: untilStr, days: attributionDays },
+        isCustomBreakdown: !!(custom_breakdowns && custom_breakdowns.breakdowns && custom_breakdowns.fields),
         timeframe
       });
 
@@ -3244,7 +3429,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
   // Helper function to format metrics summary for AI analysis
   private formatMetricsSummary(data: any): string {
-    const { adPerformance, adSetsData, adsData, campaignSummary, demographicsBreakdown, placementBreakdown, deviceBreakdown, attributionWindow } = data;
+    const { adPerformance, adSetsData, adsData, campaignSummary, demographicsBreakdown, placementBreakdown, deviceBreakdown, attributionWindow, isCustomBreakdown = false } = data;
     
     let summary = `📊 **Meta Ads Performance Data**\n\n`;
     
@@ -3356,8 +3541,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       summary += `\n`;
     }
     
-    // Placement Breakdown
-    if (placementBreakdown && placementBreakdown.length > 0) {
+    // Placement Breakdown (skip for custom breakdowns)
+    if (!isCustomBreakdown && placementBreakdown && placementBreakdown.length > 0) {
       summary += `**Placement Performance**\n`;
       summary += `| Platform | Position | Impressions | Clicks | Spend | CTR | CPC | Website Leads | Form Leads | Total Leads | Cost/Lead |\n`;
       summary += `|----------|----------|-------------|--------|-------|-----|-----|---------------|------------|-------------|----------|\n`;
@@ -3401,8 +3586,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       summary += `\n`;
     }
     
-    // Device Breakdown
-    if (deviceBreakdown && deviceBreakdown.length > 0) {
+    // Device Breakdown (skip for custom breakdowns)
+    if (!isCustomBreakdown && deviceBreakdown && deviceBreakdown.length > 0) {
       summary += `**Device Performance**\n`;
       summary += `| Device | Impressions | Clicks | Spend | CTR | CPC | Website Leads | Form Leads | Total Leads | Cost/Lead |\n`;
       summary += `|--------|-------------|--------|-------|-----|-----|---------------|------------|-------------|----------|\n`;
