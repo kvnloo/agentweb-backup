@@ -1037,6 +1037,32 @@ Use the available tools to create tasks in the agent-engine when complex work is
               required: ['template_name', 'variable_values_json', 'array_variable_values_json']
             }
           }
+        },
+        {
+          type: 'function' as const,
+          function: {
+            name: 'update_html_file',
+            description: 'Update an HTML file by replacing specific content with new content. Use update_type="full" with old_file_hash for entire file replacement, or update_type="part" with old_content for partial replacements',
+            parameters: {
+              type: 'object',
+              properties: {
+                file_url: {
+                  type: 'string',
+                  description: 'URL of the HTML file to update (S3 URL or file path)'
+                },
+                update_type: {
+                  type: 'string',
+                  enum: ['part', 'full'],
+                  description: 'Type of update: "part" for partial content replacement using old_content, "full" for entire file replacement using old_file_hash'
+                },
+                replacement_json: {
+                  type: 'string',
+                  description: 'JSON string containing a list of replacement instructions. For full replacement: [{"old_file_hash": "abc123...", "new_content": "<!DOCTYPE html>...", "expected_count": 1}]. For part replacement: [{"old_content": "<h1>Old Title</h1>", "new_content": "<h1>New Title</h1>", "expected_count": 1}]'
+                }
+              },
+              required: ['file_url', 'update_type', 'replacement_json']
+            }
+          }
         }
     ];
   }
@@ -1487,6 +1513,106 @@ Use the available tools to create tasks in the agent-engine when complex work is
           message: 'Mock HTML generated using LLM variable substitution'
         };
       
+      case 'update_html_file':
+        // Mock validation for update_html_file
+        try {
+          const instructions = JSON.parse(args.replacement_json);
+          
+          // Validate that it's an array
+          if (!Array.isArray(instructions)) {
+            return {
+              success: false,
+              message: 'replacement_json must be an array of replacement instructions'
+            };
+          }
+          
+          if (instructions.length === 0) {
+            return {
+              success: false,
+              message: 'At least one replacement instruction is required'
+            };
+          }
+          
+          // Validate each instruction based on update_type
+          for (let i = 0; i < instructions.length; i++) {
+            const instruction = instructions[i];
+            
+            if (!instruction.new_content || instruction.expected_count === undefined) {
+              return {
+                success: false,
+                message: `Missing required fields in replacement instruction ${i + 1}: new_content and expected_count are required`
+              };
+            }
+            
+            if (args.update_type === 'full') {
+              // For full replacement, require old_file_hash
+              if (!instruction.old_file_hash) {
+                return {
+                  success: false,
+                  message: `Replacement instruction ${i + 1} missing old_file_hash. For update_type="full", old_file_hash is required`
+                };
+              }
+              if (instruction.old_content !== undefined) {
+                return {
+                  success: false,
+                  message: `Replacement instruction ${i + 1} should not have old_content when update_type="full". Use old_file_hash instead`
+                };
+              }
+            } else if (args.update_type === 'part') {
+              // For part replacement, require old_content
+              if (!instruction.old_content) {
+                return {
+                  success: false,
+                  message: `Replacement instruction ${i + 1} missing old_content. For update_type="part", old_content is required`
+                };
+              }
+              if (instruction.old_file_hash !== undefined) {
+                return {
+                  success: false,
+                  message: `Replacement instruction ${i + 1} should not have old_file_hash when update_type="part". Use old_content instead`
+                };
+              }
+            }
+          }
+          
+          // Mock successful replacement
+          const replacementResults = instructions.map((instruction, index) => {
+            const result: any = {
+              index: index + 1,
+              new_content: instruction.new_content,
+              expected_count: instruction.expected_count,
+              actual_count: instruction.expected_count, // Mock: assume count matches
+              success: true
+            };
+            
+            if (args.update_type === 'full') {
+              result.old_file_hash = instruction.old_file_hash;
+            } else {
+              result.old_content = instruction.old_content;
+            }
+            
+            return result;
+          });
+          
+          // Mock versioned filename
+          const mockVersionedFilename = `updated_file_v2.html`;
+          
+          return {
+            success: true,
+            s3_url: `https://mock-s3-bucket.s3.amazonaws.com/${mockVersionedFilename}`,
+            message: `File updated successfully with ${replacementResults.length} replacements`,
+            method: 'mixed_replacement',
+            replacements: replacementResults,
+            versioned_filename: mockVersionedFilename
+          };
+        } catch (error) {
+          return {
+            success: false,
+            message: 'Invalid JSON in replacement_json',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          };
+        }
+      
       default:
         return {
           success: true,
@@ -1597,6 +1723,42 @@ Use the available tools to create tasks in the agent-engine when complex work is
         }
         
         return await this.createHtmlFromTemplate(args.template_name, variableValues, arrayVariableValues, userId, sessionId);
+        case 'update_html_file':
+          // Ensure we have the required parameters
+          if (!args.file_url) {
+            return {
+              success: false,
+              message: 'file_url is required'
+            };
+          }
+          
+          if (!args.update_type) {
+            return {
+              success: false,
+              message: 'update_type is required'
+            };
+          }
+          
+          if (!args.replacement_json) {
+            return {
+              success: false,
+              message: 'replacement_json is required'
+            };
+          }
+        
+        // Parse replacement instructions
+        let replacementInstructions;
+        try {
+          replacementInstructions = JSON.parse(args.replacement_json);
+        } catch (error) {
+          return {
+            success: false,
+            message: 'Invalid JSON in replacement_json',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          };
+        }
+        
+        return await this.updateHtmlFile(args.file_url, args.update_type, replacementInstructions, userId, sessionId);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -4279,9 +4441,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
         file_url: fileUrl
       });
 
+      // Compute content hash for integrity verification
+      const contentHash = createHash('sha256').update(extractedContent).digest('hex');
+      console.log(`AgentMode: Computed content hash: ${contentHash}`);
+
       return {
         success: true,
         content: extractedContent,
+        content_hash: contentHash,
         file_type: fileType,
         file_size: buffer.length,
         content_length: extractedContent.length,
@@ -4743,6 +4910,374 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
+  // Update HTML file with direct content replacement
+  private async updateHtmlFile(
+    fileUrl: string,
+    updateType: string,
+    replacementInstructions: any,
+    userId: string,
+    sessionId: string
+  ): Promise<any> {
+    try {
+      // Validate update_type
+      if (!updateType || !['part', 'full'].includes(updateType)) {
+        return {
+          success: false,
+          message: 'update_type must be either "part" or "full"'
+        };
+      }
+      
+      // Validate that replacementInstructions is an array
+      if (!Array.isArray(replacementInstructions)) {
+        return {
+          success: false,
+          message: 'replacement_json must be an array of replacement instructions'
+        };
+      }
+      
+      if (replacementInstructions.length === 0) {
+        return {
+          success: false,
+          message: 'At least one replacement instruction is required'
+        };
+      }
+      
+      // Validate each replacement instruction based on update_type
+      for (let i = 0; i < replacementInstructions.length; i++) {
+        const instruction = replacementInstructions[i];
+        
+        if (!instruction.new_content || instruction.expected_count === undefined) {
+          return {
+            success: false,
+            message: `Missing required fields in replacement instruction ${i + 1}: new_content and expected_count are required`
+          };
+        }
+        
+        if (updateType === 'full') {
+          // For full replacement, require old_file_hash
+          if (!instruction.old_file_hash) {
+            return {
+              success: false,
+              message: `Replacement instruction ${i + 1} missing old_file_hash. For update_type="full", old_file_hash is required`
+            };
+          }
+          if (instruction.old_content !== undefined) {
+            return {
+              success: false,
+              message: `Replacement instruction ${i + 1} should not have old_content when update_type="full". Use old_file_hash instead`
+            };
+          }
+        } else if (updateType === 'part') {
+          // For part replacement, require old_content
+          if (!instruction.old_content) {
+            return {
+              success: false,
+              message: `Replacement instruction ${i + 1} missing old_content. For update_type="part", old_content is required`
+            };
+          }
+          if (instruction.old_file_hash !== undefined) {
+            return {
+              success: false,
+              message: `Replacement instruction ${i + 1} should not have old_file_hash when update_type="part". Use old_content instead`
+            };
+          }
+        }
+      }
+      
+      // Fetch current file content
+      const currentContent = await this.fetchFileContent(fileUrl);
+      console.log(`AgentMode: Fetched file content, length: ${currentContent.length} characters`);
+      
+      // Compute hash of current content for verification
+      const currentContentHash = createHash('sha256').update(currentContent).digest('hex');
+      console.log(`AgentMode: Computed current content hash: ${currentContentHash}`);
+      
+      let updatedContent = currentContent;
+      
+      // Perform all replacements
+      const replacementResults = [];
+      
+      for (let i = 0; i < replacementInstructions.length; i++) {
+        const instruction = replacementInstructions[i];
+        const { new_content, expected_count } = instruction;
+        
+        if (updateType === 'full') {
+          // Entire file replacement using hash
+          const { old_file_hash } = instruction;
+          console.log(`AgentMode: Full replacement ${i + 1}: old_file_hash: ${old_file_hash}, new_content length: ${new_content.length}, expected_count: ${expected_count}`);
+          
+          // Verify that the provided hash matches the current content hash
+          if (old_file_hash !== currentContentHash) {
+            return {
+              success: false,
+              message: `Replacement ${i + 1} failed: File hash mismatch. Expected: ${currentContentHash}, provided: ${old_file_hash}. The file may have been modified since it was last read.`,
+              suggestion: 'Use read_file_content to get the current content and hash, then retry the replacement'
+            };
+          }
+          
+          // For hash-based replacement, we replace the entire content
+          if (expected_count === 1) {
+            console.log(`AgentMode: Hash verification successful, replacing entire content`);
+            updatedContent = new_content;
+            replacementResults.push({
+              index: i + 1,
+              old_file_hash: old_file_hash,
+              new_content: new_content,
+              expected_count: expected_count,
+              actual_count: 1,
+              success: true
+            });
+          } else {
+            return {
+              success: false,
+              message: `Replacement ${i + 1} failed: Full replacement only supports expected_count of 1 (entire file replacement)`,
+              suggestion: 'Use expected_count: 1 for full file replacement'
+            };
+          }
+        } else if (updateType === 'part') {
+          // Partial content replacement using old_content
+          const { old_content } = instruction;
+          console.log(`AgentMode: Part replacement ${i + 1}: old_content length: ${old_content.length}, new_content length: ${new_content.length}, expected_count: ${expected_count}`);
+          
+          // Perform the replacement using the existing logic
+          const replacementResult = this.performDirectReplacement(
+            updatedContent,
+            old_content,
+            new_content,
+            true // exact_match = true for partial replacements
+          );
+          
+          if (replacementResult === null) {
+            return {
+              success: false,
+              message: `Replacement ${i + 1} failed: The old_content was not found in the file. No changes were made to the file.`,
+              suggestion: 'Check that the old_content exactly matches the content in the file'
+            };
+          }
+          
+          // Check if the actual change count matches expected count
+          if (replacementResult.changeCount !== expected_count) {
+            return {
+              success: false,
+              message: `Replacement ${i + 1} failed: Expected ${expected_count} occurrences of old_content, but found ${replacementResult.changeCount}. No changes were made to the file.`,
+              suggestion: 'Check the expected_count matches the actual number of occurrences in the file'
+            };
+          }
+          
+          updatedContent = replacementResult.content;
+          replacementResults.push({
+            index: i + 1,
+            old_content: old_content,
+            new_content: new_content,
+            expected_count: expected_count,
+            actual_count: replacementResult.changeCount,
+            success: true
+          });
+        }
+      }
+      
+      // Create versioned filename and upload the updated content
+      const versionedFilename = this.createVersionedFilename(fileUrl);
+      console.log(`AgentMode: Original file URL: ${fileUrl}`);
+      console.log(`AgentMode: Generated versioned filename: ${versionedFilename}`);
+      const originalPath = this.extractPathFromS3Url(fileUrl);
+      console.log(`AgentMode: Original path: ${originalPath}`);
+      const uploadResult = await this.uploadUpdatedFile(updatedContent, versionedFilename, originalPath);
+      
+      return {
+        success: true,
+        s3_url: uploadResult.url,
+        message: `File updated successfully with ${replacementResults.length} replacements`,
+        method: 'mixed_replacement',
+        replacements: replacementResults,
+        versioned_filename: versionedFilename
+      };
+      
+    } catch (error) {
+      console.error('Error updating HTML file:', error);
+      return {
+        success: false,
+        message: 'Failed to update HTML file',
+        error: error instanceof Error ? error.message : 'Unknown error',
+        suggestion: 'For entire file replacement, use old_file_hash from read_file_content. For partial replacement, use old_content with the exact text to replace'
+      };
+    }
+  }
+
+  // Fetch file content from URL
+  private async fetchFileContent(fileUrl: string): Promise<string> {
+    try {
+      const response = await fetch(fileUrl);
+      if (!response.ok) {
+        throw new Error(`Failed to fetch file: ${response.status} ${response.statusText}`);
+      }
+      return await response.text();
+    } catch (error) {
+      console.error('Error fetching file content:', error);
+      throw new Error(`Failed to fetch file content: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  // Perform direct replacement of old content with new content
+  private performDirectReplacement(
+    content: string,
+    oldContent: string,
+    newContent: string,
+    exactMatch: boolean = true
+  ): { content: string; changeCount: number } | null {
+    try {
+      // For entire file replacement (when oldContent is very large), use more flexible matching
+      if (oldContent.length > 1000) {
+        if (exactMatch) {
+          // Use exact string comparison
+          if (content === oldContent) {
+            console.log(`AgentMode: Exact match found for entire file replacement`);
+            return { content: newContent, changeCount: 1 };
+          } else {
+            console.warn(`Old content does not match exactly. Expected length: ${oldContent.length}, actual length: ${content.length}`);
+            console.warn(`First 100 chars of expected: ${oldContent.substring(0, 100)}`);
+            console.warn(`First 100 chars of actual: ${content.substring(0, 100)}`);
+            return null;
+          }
+        } else {
+          // Use normalized whitespace comparison for flexible matching
+          const normalizedContent = content.replace(/\s+/g, ' ').trim();
+          const normalizedOldContent = oldContent.replace(/\s+/g, ' ').trim();
+          
+          if (normalizedContent === normalizedOldContent) {
+            console.log(`AgentMode: Normalized match found for entire file replacement`);
+            return { content: newContent, changeCount: 1 };
+          } else {
+            // Try exact match as fallback
+            if (content === oldContent) {
+              console.log(`AgentMode: Exact match found for entire file replacement (fallback)`);
+              return { content: newContent, changeCount: 1 };
+            } else {
+              console.warn(`Old content does not match even with normalization. Expected length: ${oldContent.length}, actual length: ${content.length}`);
+              console.warn(`First 100 chars of expected: ${oldContent.substring(0, 100)}`);
+              console.warn(`First 100 chars of actual: ${content.substring(0, 100)}`);
+              return null;
+            }
+          }
+        }
+      }
+      
+      // For smaller content, use regex for more flexible matching
+      const changeCount = (content.match(new RegExp(oldContent.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
+      
+      // Check if old content exists
+      if (changeCount === 0) {
+        console.warn(`Old content not found. Content length: ${content.length}, old content length: ${oldContent.length}`);
+        return null;
+      }
+      
+      // Perform replacement - replace all occurrences
+      const updatedContent = content.replace(new RegExp(oldContent.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), newContent);
+      
+      return { content: updatedContent, changeCount };
+      
+    } catch (error) {
+      console.error('Error in direct replacement:', error);
+      return null;
+    }
+  }
+
+  // Extract path from S3 URL
+  private extractPathFromS3Url(s3Url: string): string {
+    try {
+      // Parse the S3 URL to extract the key
+      const url = new URL(s3Url);
+      const key = url.pathname.substring(1); // Remove leading slash
+      
+      // Extract path by removing the filename
+      const lastSlashIndex = key.lastIndexOf('/');
+      if (lastSlashIndex === -1) {
+        return ''; // No path, just filename
+      }
+      
+      return key.substring(0, lastSlashIndex);
+    } catch (error) {
+      console.error('Error extracting path from S3 URL:', error);
+      return '';
+    }
+  }
+
+  // Create versioned filename
+  private createVersionedFilename(originalUrl: string): string {
+    try {
+      // Extract filename from original URL
+      const urlParts = originalUrl.split('/');
+      const filename = urlParts[urlParts.length - 1];
+      console.log(`AgentMode: Extracted filename: ${filename}`);
+      
+      // Split filename into name and extension
+      const lastDotIndex = filename.lastIndexOf('.');
+      if (lastDotIndex === -1) {
+        // No extension, just add version
+        console.log(`AgentMode: No extension found, adding _v2`);
+        return `${filename}_v2`;
+      }
+      
+      const nameWithoutExt = filename.substring(0, lastDotIndex);
+      const extension = filename.substring(lastDotIndex);
+      console.log(`AgentMode: Name without ext: ${nameWithoutExt}, extension: ${extension}`);
+      
+      // Check if filename already has a version pattern (_v followed by digits)
+      const versionMatch = nameWithoutExt.match(/^(.+)_v(\d+)$/);
+      console.log(`AgentMode: Version match result:`, versionMatch);
+      
+      if (versionMatch) {
+        // Extract base name and current version number
+        const baseName = versionMatch[1];
+        const currentVersion = parseInt(versionMatch[2], 10);
+        const newVersion = currentVersion + 1;
+        console.log(`AgentMode: Found existing version ${currentVersion}, incrementing to ${newVersion}`);
+        return `${baseName}_v${newVersion}${extension}`;
+      } else {
+        // No existing version, add _v2
+        console.log(`AgentMode: No existing version found, adding _v2`);
+        return `${nameWithoutExt}_v2${extension}`;
+      }
+    } catch (error) {
+      console.error('Error creating versioned filename:', error);
+      // Fallback: add timestamp to avoid conflicts
+      const timestamp = Date.now();
+      const urlParts = originalUrl.split('/');
+      const filename = urlParts[urlParts.length - 1];
+      const lastDotIndex = filename.lastIndexOf('.');
+      
+      if (lastDotIndex === -1) {
+        return `${filename}_v2_${timestamp}`;
+      } else {
+        const nameWithoutExt = filename.substring(0, lastDotIndex);
+        const extension = filename.substring(lastDotIndex);
+        return `${nameWithoutExt}_v2_${timestamp}${extension}`;
+      }
+    }
+  }
+
+  // Upload updated file content
+  private async uploadUpdatedFile(
+    content: string,
+    filename: string,
+    path: string
+  ): Promise<{ url: string }> {
+    try {
+      // Upload to S3 with the same path as the original file
+      const { uploadFileToS3WithPath } = await import('../utils/s3Utils');
+      const uploadResult = await uploadFileToS3WithPath(content, filename, 'text/html', path);
+      
+      if (!uploadResult.success || !uploadResult.url) {
+        throw new Error(uploadResult.error || 'Failed to upload updated file');
+      }
+      
+      return { url: uploadResult.url };
+    } catch (error) {
+      console.error('Error uploading updated file:', error);
+      throw new Error(`Failed to upload updated file: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
   // Create HTML from template with variable substitution
     private async createHtmlFromTemplate(
       templateName: string,
@@ -4939,7 +5474,7 @@ RESPONSE FORMAT:
       
       // Upload to S3
       const { uploadFileToS3 } = await import('../utils/s3Utils');
-      const filename = `html_${templateName}_${Date.now()}.html`;
+      const filename = `html_${templateName}.html`;
       const uploadResult = await uploadFileToS3(finalHtml, filename, userId, 'text/html');
       
       if (!uploadResult.success || !uploadResult.url) {

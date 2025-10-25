@@ -210,7 +210,7 @@ describe('Email Campaign Settings API', () => {
     it('should return 400 when taskId is missing', async () => {
       const response = await request(app)
         .post('/api/settings/customer/email-campaign-tasks/')
-        .expect(404); // Express returns 404 for missing route parameter
+        .expect(400); // General route expects tasks array in body
     });
 
     it('should return 500 when settings service throws error', async () => {
