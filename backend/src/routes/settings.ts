@@ -4,6 +4,89 @@ import { authenticateToken, requireAdmin } from '../middleware/auth';
 
 const router = express.Router();
 
+// Function to extract variables from HTML content and subject
+const extractVariables = (htmlContent: string, subject?: string): { variables: string[], arrayVariables: string[] } => {
+  const variableRegex = /\{\{([^}]+)\}\}/g;
+  const allVariables: string[] = [];
+  const regularVariables: string[] = [];
+  const arrayVariableNames = new Set<string>();
+  let match;
+
+  // Collect all variables from HTML content
+  while ((match = variableRegex.exec(htmlContent)) !== null) {
+    const variable = match[1].trim();
+    if (!allVariables.includes(variable)) {
+      allVariables.push(variable);
+    }
+  }
+
+  // Also collect variables from subject if provided
+  if (subject) {
+    const subjectRegex = /\{\{([^}]+)\}\}/g;
+    let subjectMatch;
+    while ((subjectMatch = subjectRegex.exec(subject)) !== null) {
+      const variable = subjectMatch[1].trim();
+      if (!allVariables.includes(variable)) {
+        allVariables.push(variable);
+      }
+    }
+  }
+
+  // Find all _n and _n_ patterns first
+  const nPatterns = new Set<string>();
+  allVariables.forEach(variable => {
+    const nMatch = variable.match(/^(.+)_n(?:_(.+))?$/);
+    if (nMatch) {
+      const baseName = nMatch[1];
+      const suffix = nMatch[2];
+      if (suffix) {
+        nPatterns.add(`${baseName}_n_${suffix}`);
+      } else {
+        nPatterns.add(`${baseName}_n`);
+      }
+    }
+  });
+
+  // Now process all variables
+  const processedArrayNames = new Set<string>();
+
+  allVariables.forEach(variable => {
+    let isArrayVariable = false;
+
+    // Check if this variable matches any _n pattern
+    nPatterns.forEach(nPattern => {
+      const baseName = nPattern.replace(/_n.*$/, '');
+      const numericMatch = variable.match(new RegExp(`^${baseName}_(\\d+)(?:_|$)`));
+      if (numericMatch) {
+        if (!processedArrayNames.has(nPattern)) {
+          arrayVariableNames.add(nPattern);
+          processedArrayNames.add(nPattern);
+        }
+        isArrayVariable = true;
+      }
+    });
+
+    // Check if this is already an _n pattern
+    const nMatch = variable.match(/^(.+)_n(?:_(.+))?$/);
+    if (nMatch) {
+      const baseName = nMatch[1];
+      const suffix = nMatch[2];
+      const fullName = suffix ? `${baseName}_n_${suffix}` : `${baseName}_n`;
+      if (!processedArrayNames.has(fullName)) {
+        arrayVariableNames.add(fullName);
+        processedArrayNames.add(fullName);
+      }
+      isArrayVariable = true;
+    }
+
+    if (!isArrayVariable) {
+      regularVariables.push(variable);
+    }
+  });
+
+  return { variables: regularVariables, arrayVariables: Array.from(arrayVariableNames) };
+};
+
 // Get all settings
 router.get('/', authenticateToken, requireAdmin, async (req, res) => {
   try {
@@ -32,6 +115,36 @@ router.get('/email-templates', authenticateToken, async (req, res) => {
     if (setting) {
       try {
         templates = JSON.parse(setting.settingValue);
+        
+        // Add backward compatibility: extract variables for templates that don't have them
+        let needsUpdate = false;
+        templates = templates.map((template: any) => {
+          if (!template.variables || !template.arrayVariables) {
+            const { variables, arrayVariables } = extractVariables(template.html_content, template.subject);
+            needsUpdate = true;
+            return {
+              ...template,
+              variables: template.variables || variables,
+              arrayVariables: template.arrayVariables || arrayVariables
+            };
+          }
+          return template;
+        });
+        
+        // If we updated any templates, save them back to the database
+        if (needsUpdate) {
+          try {
+            await settingsService.setSetting(
+              settingName, 
+              JSON.stringify(templates), 
+              'User email templates', 
+              req.user?.email
+            );
+          } catch (error) {
+            console.error('Error updating templates with variables:', error);
+            // Don't fail the request, just log the error
+          }
+        }
       } catch (error) {
         console.error('Error parsing email templates:', error);
         templates = [];
@@ -74,6 +187,9 @@ router.post('/email-templates', authenticateToken, async (req, res) => {
       }
     }
     
+    // Extract variables from the template
+    const { variables, arrayVariables } = extractVariables(html_content, subject);
+    
     // Check if template already exists
     const existingTemplateIndex = templates.findIndex(
       (t: any) => t.template_name === template_name
@@ -83,6 +199,8 @@ router.post('/email-templates', authenticateToken, async (req, res) => {
       template_name,
       subject,
       html_content,
+      variables,
+      arrayVariables,
       created_at: existingTemplateIndex >= 0 ? templates[existingTemplateIndex].created_at : new Date().toISOString(),
       updated_at: new Date().toISOString()
     };
