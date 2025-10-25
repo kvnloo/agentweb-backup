@@ -5330,48 +5330,26 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const templateVariables = template.variables || [];
       const templateArrayVariables = template.arrayVariables || [];
       
-      // Parse JSON strings to objects
-      let safeVariableValues = {};
-      let safeArrayVariableValues = {};
-      
-      try {
-        if (variableValues) {
-          safeVariableValues = JSON.parse(variableValues);
-        }
-      } catch (error) {
-        return {
-          success: false,
-          message: 'Invalid JSON in variable_values'
-        };
-      }
-      
-      try {
-        if (arrayVariableValues) {
-          safeArrayVariableValues = JSON.parse(arrayVariableValues);
-        }
-      } catch (error) {
-        return {
-          success: false,
-          message: 'Invalid JSON in array_variable_values'
-        };
-      }
+      // Parameters are already objects
+      const variableValuesObj = variableValues || {};
+      const arrayVariableValuesObj = arrayVariableValues || {};
       
       // Check for missing regular variables
       const missingVariables = templateVariables.filter((variable: string) => 
-        !(variable in safeVariableValues)
+        !(variable in variableValuesObj)
       );
       
       // Check for missing array variables
       const missingArrayVariables = templateArrayVariables.filter((variable: string) => 
-        !(variable in safeArrayVariableValues)
+        !(variable in arrayVariableValuesObj)
       );
       
       // Check for extra variables that aren't in the template
-      const extraVariables = Object.keys(safeVariableValues).filter(variable => 
+      const extraVariables = Object.keys(variableValuesObj).filter(variable => 
         !templateVariables.includes(variable)
       );
       
-      const extraArrayVariables = Object.keys(safeArrayVariableValues).filter(variable => 
+      const extraArrayVariables = Object.keys(arrayVariableValuesObj).filter(variable => 
         !templateArrayVariables.includes(variable)
       );
       
@@ -5395,7 +5373,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       }
       
       // Validate array variable values are actually arrays
-      const invalidArrayVariables = Object.entries(safeArrayVariableValues).filter(([key, value]) => 
+      const invalidArrayVariables = Object.entries(arrayVariableValuesObj).filter(([key, value]) => 
         !Array.isArray(value)
       );
       
@@ -5423,10 +5401,10 @@ TEMPLATE SUBJECT:
 ${template.subject}
 
 VARIABLE VALUES:
-${JSON.stringify(safeVariableValues, null, 2)}
+${JSON.stringify(variableValuesObj, null, 2)}
 
 ARRAY VARIABLE VALUES:
-${JSON.stringify(safeArrayVariableValues, null, 2)}
+${JSON.stringify(arrayVariableValuesObj, null, 2)}
 
 CRITICAL INSTRUCTIONS:
 1. PRESERVE THE EXACT FORMAT: Keep the same HTML structure, tags, classes, and styling as the original template
@@ -5441,8 +5419,8 @@ CRITICAL INSTRUCTIONS:
 
 RESPONSE FORMAT:
 {
-  "html": "final HTML content with variables replaced but structure preserved",
-  "subject": "final subject with variables replaced"
+  "final_html": "final HTML content with variables replaced but structure preserved",
+  "final_subject": "final subject with variables replaced"
 }`;
 
       const substitutionResponse = await this.openai.chat.completions.create({
@@ -5466,7 +5444,6 @@ RESPONSE FORMAT:
       try {
         substitutionData = JSON.parse(substitutionResult);
       } catch (parseError) {
-        console.error('Error parsing LLM substitution result:', parseError);
         throw new Error('LLM returned invalid JSON for variable substitution');
       }
 
