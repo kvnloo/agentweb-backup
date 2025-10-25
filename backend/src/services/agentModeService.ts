@@ -1000,7 +1000,44 @@ Use the available tools to create tasks in the agent-engine when complex work is
             required: ['image_url']
           }
         }
-      }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'list_html_templates',
+          description: 'Get a list of all available HTML templates for the user (including email templates)',
+          parameters: {
+            type: 'object',
+            properties: {},
+            required: []
+          }
+        }
+      },
+        {
+          type: 'function' as const,
+          function: {
+            name: 'create_html_from_template',
+            description: 'Create final HTML from a template by providing variable values and array variable values as JSON strings, then upload to S3',
+            parameters: {
+              type: 'object',
+              properties: {
+                template_name: {
+                  type: 'string',
+                  description: 'Name of the HTML template to use'
+                },
+                variable_values_json: {
+                  type: 'string',
+                  description: 'JSON string containing regular variable values where keys are variable names and values are the actual values. Example: {"title": "Hello", "company_name": "Acme Corp"}'
+                },
+                array_variable_values_json: {
+                  type: 'string',
+                  description: 'JSON string containing array variable values where keys are array variable names and values are arrays of strings. Example: {"features_n": ["Feature 1", "Feature 2"], "links_n": ["Link 1", "Link 2"]}'
+                }
+              },
+              required: ['template_name', 'variable_values_json', 'array_variable_values_json']
+            }
+          }
+        }
     ];
   }
 
@@ -1367,6 +1404,89 @@ Use the available tools to create tasks in the agent-engine when complex work is
           imageUrl: args.image_url
         };
       
+      case 'list_html_templates':
+        return {
+          success: true,
+          email_templates: [
+            {
+              template_name: 'welcome_email',
+              subject: 'Welcome to {{company_name}}!',
+              variables: ['company_name', 'user_name'],
+              arrayVariables: ['features_n'],
+              created_at: '2024-01-15T10:00:00Z',
+              updated_at: '2024-01-15T10:00:00Z'
+            },
+            {
+              template_name: 'newsletter',
+              subject: 'Weekly Update: {{news_title}}',
+              variables: ['news_title', 'company_name'],
+              arrayVariables: ['news_n_category', 'links_n'],
+              created_at: '2024-01-20T14:30:00Z',
+              updated_at: '2024-01-20T14:30:00Z'
+            }
+          ]
+        };
+      
+      case 'create_html_from_template':
+        // Mock validation - check if required variables are provided
+        const mockTemplate = {
+          variables: ['title', 'company_name'],
+          arrayVariables: ['features_n']
+        };
+        
+        // Parse JSON strings for mock validation
+        let mockVariableValues = {};
+        let mockArrayVariableValues = {};
+        
+        try {
+          if (args.variable_values_json) {
+            mockVariableValues = JSON.parse(args.variable_values_json);
+          }
+        } catch (error) {
+          return {
+            success: false,
+            message: 'Invalid JSON in variable_values_json',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          };
+        }
+        
+        try {
+          if (args.array_variable_values_json) {
+            mockArrayVariableValues = JSON.parse(args.array_variable_values_json);
+          }
+        } catch (error) {
+          return {
+            success: false,
+            message: 'Invalid JSON in array_variable_values_json',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          };
+        }
+        
+        const missingVars = mockTemplate.variables.filter(v => !(v in mockVariableValues));
+        const missingArrayVars = mockTemplate.arrayVariables.filter(v => !(v in mockArrayVariableValues));
+        
+        if (missingVars.length > 0 || missingArrayVars.length > 0) {
+          return {
+            success: false,
+            message: 'Variable validation failed',
+            errors: [
+              ...(missingVars.length > 0 ? [`Missing required variables: ${missingVars.join(', ')}`] : []),
+              ...(missingArrayVars.length > 0 ? [`Missing required array variables: ${missingArrayVars.join(', ')}`] : [])
+            ],
+            template_variables: mockTemplate.variables,
+            template_array_variables: mockTemplate.arrayVariables
+          };
+        }
+        
+        return {
+          success: true,
+          s3_url: `https://mock-s3-bucket.s3.amazonaws.com/html_${args.template_name}_${Date.now()}.html`,
+          subject: `Mock subject with variables substituted for ${args.template_name}`,
+          template_name: args.template_name,
+          filename: `html_${args.template_name}_${Date.now()}.html`,
+          message: 'Mock HTML generated using LLM variable substitution'
+        };
+      
       default:
         return {
           success: true,
@@ -1437,6 +1557,46 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.getTaskSubscriberEngagementEvents(args.task_id, args.email_subject, userId);
       case 'describe_image':
         return await this.describeImage(args.image_url, args.prompt);
+      case 'list_html_templates':
+        return await this.listHtmlTemplates(userId);
+      case 'create_html_from_template':
+        // Ensure we have the required parameters
+        if (!args.template_name) {
+          return {
+            success: false,
+            message: 'template_name is required'
+          };
+        }
+        
+        // Parse JSON strings
+        let variableValues = {};
+        let arrayVariableValues = {};
+        
+        try {
+          if (args.variable_values_json) {
+            variableValues = JSON.parse(args.variable_values_json);
+          }
+        } catch (error) {
+          return {
+            success: false,
+            message: 'Invalid JSON in variable_values_json',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          };
+        }
+        
+        try {
+          if (args.array_variable_values_json) {
+            arrayVariableValues = JSON.parse(args.array_variable_values_json);
+          }
+        } catch (error) {
+          return {
+            success: false,
+            message: 'Invalid JSON in array_variable_values_json',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          };
+        }
+        
+        return await this.createHtmlFromTemplate(args.template_name, variableValues, arrayVariableValues, userId, sessionId);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -4544,6 +4704,348 @@ Use the available tools to create tasks in the agent-engine when complex work is
       },
       linkAnalysis
     };
+  }
+
+  // List all HTML templates for the user (including email templates)
+  private async listHtmlTemplates(userId: string): Promise<any> {
+    try {
+      const settingName = `email_templates_${userId}`;
+      const setting = await settingsService.getSetting(settingName);
+      
+      let templates = [];
+      if (setting) {
+        try {
+          templates = JSON.parse(setting.settingValue);
+        } catch (error) {
+          console.error('Error parsing email templates:', error);
+          templates = [];
+        }
+      }
+      
+      return {
+        success: true,
+        email_templates: templates.map((template: any) => ({
+          template_name: template.template_name,
+          subject: template.subject,
+          variables: template.variables || [],
+          arrayVariables: template.arrayVariables || [],
+          created_at: template.created_at,
+          updated_at: template.updated_at
+        }))
+      };
+    } catch (error) {
+      console.error('Error listing email templates:', error);
+      return {
+        success: false,
+        message: 'Failed to list email templates',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // Create HTML from template with variable substitution
+    private async createHtmlFromTemplate(
+      templateName: string,
+      variableValues: Record<string, string> | undefined,
+      arrayVariableValues: Record<string, string[]> | undefined,
+      userId: string,
+      sessionId: string
+    ): Promise<any> {
+    try {
+      // Get the template
+      const settingName = `email_templates_${userId}`;
+      const setting = await settingsService.getSetting(settingName);
+      
+      if (!setting) {
+        return {
+          success: false,
+          message: 'No email templates found for user'
+        };
+      }
+      
+      let templates = [];
+      try {
+        templates = JSON.parse(setting.settingValue);
+      } catch (error) {
+        console.error('Error parsing email templates:', error);
+        return {
+          success: false,
+          message: 'Failed to parse email templates'
+        };
+      }
+      
+      // Find the specific template
+      const template = templates.find((t: any) => t.template_name === templateName);
+      if (!template) {
+        return {
+          success: false,
+          message: `Template '${templateName}' not found`
+        };
+      }
+
+      // Validate that all required variables are provided
+      const templateVariables = template.variables || [];
+      const templateArrayVariables = template.arrayVariables || [];
+      
+      // Ensure we have valid objects to work with
+      const safeVariableValues = variableValues || {};
+      const safeArrayVariableValues = arrayVariableValues || {};
+      
+      // Check for missing regular variables
+      const missingVariables = templateVariables.filter((variable: string) => 
+        !(variable in safeVariableValues)
+      );
+      
+      // Check for missing array variables
+      const missingArrayVariables = templateArrayVariables.filter((variable: string) => 
+        !(variable in safeArrayVariableValues)
+      );
+      
+      // Check for extra variables that aren't in the template
+      const extraVariables = Object.keys(safeVariableValues).filter(variable => 
+        !templateVariables.includes(variable)
+      );
+      
+      const extraArrayVariables = Object.keys(safeArrayVariableValues).filter(variable => 
+        !templateArrayVariables.includes(variable)
+      );
+      
+      // Build validation error message
+      const validationErrors = [];
+      
+      if (missingVariables.length > 0) {
+        validationErrors.push(`Missing required variables: ${missingVariables.join(', ')}`);
+      }
+      
+      if (missingArrayVariables.length > 0) {
+        validationErrors.push(`Missing required array variables: ${missingArrayVariables.join(', ')}`);
+      }
+      
+      if (extraVariables.length > 0) {
+        validationErrors.push(`Extra variables provided (not in template): ${extraVariables.join(', ')}`);
+      }
+      
+      if (extraArrayVariables.length > 0) {
+        validationErrors.push(`Extra array variables provided (not in template): ${extraArrayVariables.join(', ')}`);
+      }
+      
+      // Validate array variable values are actually arrays
+      const invalidArrayVariables = Object.entries(safeArrayVariableValues).filter(([key, value]) => 
+        !Array.isArray(value)
+      );
+      
+      if (invalidArrayVariables.length > 0) {
+        validationErrors.push(`Array variables must be arrays: ${invalidArrayVariables.map(([key]) => key).join(', ')}`);
+      }
+      
+      if (validationErrors.length > 0) {
+        return {
+          success: false,
+          message: 'Variable validation failed',
+          errors: validationErrors,
+          template_variables: templateVariables,
+          template_array_variables: templateArrayVariables
+        };
+      }
+      
+      // Use LLM to handle variable substitution
+      const substitutionPrompt = `You are a template engine. Your task is to replace variables in HTML templates with provided values while preserving the exact same format and structure.
+
+TEMPLATE HTML:
+${template.html_content}
+
+TEMPLATE SUBJECT:
+${template.subject}
+
+VARIABLE VALUES:
+${JSON.stringify(safeVariableValues, null, 2)}
+
+ARRAY VARIABLE VALUES:
+${JSON.stringify(safeArrayVariableValues, null, 2)}
+
+CRITICAL INSTRUCTIONS:
+1. PRESERVE THE EXACT FORMAT: Keep the same HTML structure, tags, classes, and styling as the original template
+2. REPLACE VARIABLES: Replace all {{variable_name}} placeholders with corresponding values
+3. ARRAY VARIABLES: For array variables, repeat the surrounding HTML structure for each array item
+   - If {{array_var}} is inside a <li> tag, repeat the <li> tag for each array item
+   - If {{array_var}} is inside a <div> tag, repeat the <div> tag for each array item
+   - Maintain the exact same HTML structure around the array variable
+4. VALID HTML: Ensure the final HTML is valid and well-formatted
+5. NO STRUCTURAL CHANGES: Do not add new HTML elements, change classes, or modify the template structure
+6. EXACT REPLACEMENT: Only replace {{}} placeholders, keep everything else identical
+
+RESPONSE FORMAT:
+{
+  "html": "final HTML content with variables replaced but structure preserved",
+  "subject": "final subject with variables replaced"
+}`;
+
+      const substitutionResponse = await this.openai.chat.completions.create({
+        model: process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
+        messages: [
+          {
+            role: 'user',
+            content: substitutionPrompt
+          }
+        ],
+        max_completion_tokens: 4000,
+        temperature: 0.1
+      });
+
+      const substitutionResult = substitutionResponse.choices[0].message.content;
+      if (!substitutionResult) {
+        throw new Error('LLM did not return substitution result');
+      }
+
+      let substitutionData;
+      try {
+        substitutionData = JSON.parse(substitutionResult);
+      } catch (parseError) {
+        console.error('Error parsing LLM substitution result:', parseError);
+        throw new Error('LLM returned invalid JSON for variable substitution');
+      }
+
+      if (!substitutionData.html || !substitutionData.subject) {
+        throw new Error('LLM substitution result missing html or subject fields');
+      }
+
+      const finalHtml = substitutionData.html;
+      const finalSubject = substitutionData.subject;
+      
+      // Verify the substitution was correct
+      const remainingPlaceholders = finalHtml.match(/\{\{[^}]+\}\}/g) || [];
+      const remainingSubjectPlaceholders = finalSubject.match(/\{\{[^}]+\}\}/g) || [];
+      
+      if (remainingPlaceholders.length > 0 || remainingSubjectPlaceholders.length > 0) {
+        console.warn('Warning: Some variables were not substituted:', {
+          htmlPlaceholders: remainingPlaceholders,
+          subjectPlaceholders: remainingSubjectPlaceholders
+        });
+      }
+      
+      // Verify HTML structure is preserved (basic check)
+      const originalTagCount = (template.html_content.match(/<[^>]+>/g) || []).length;
+      const finalTagCount = (finalHtml.match(/<[^>]+>/g) || []).length;
+      
+      // Allow for some variation due to array repetition, but flag significant changes
+      const tagDifference = Math.abs(originalTagCount - finalTagCount);
+      if (tagDifference > originalTagCount * 0.5) { // More than 50% change in tag count
+        console.warn('Warning: Significant HTML structure change detected:', {
+          originalTagCount,
+          finalTagCount,
+          difference: tagDifference
+        });
+      }
+      
+      // Upload to S3
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const filename = `html_${templateName}_${Date.now()}.html`;
+      const uploadResult = await uploadFileToS3(finalHtml, filename, userId, 'text/html');
+      
+      if (!uploadResult.success || !uploadResult.url) {
+        throw new Error(uploadResult.error || 'Failed to upload to S3');
+      }
+      
+      const s3Url = uploadResult.url;
+      
+      return {
+        success: true,
+        s3_url: s3Url,
+        subject: finalSubject,
+        template_name: templateName,
+        filename: filename
+      };
+    } catch (error) {
+      console.error('Error creating email HTML from template:', error);
+      return {
+        success: false,
+        message: 'Failed to create email HTML from template',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // Extract variables from HTML content and subject (same logic as in settings.ts)
+  private extractVariables(htmlContent: string, subject?: string): { variables: string[], arrayVariables: string[] } {
+    const variableRegex = /\{\{([^}]+)\}\}/g;
+    const allVariables: string[] = [];
+    const regularVariables: string[] = [];
+    const arrayVariableNames = new Set<string>();
+    let match;
+
+    // Collect all variables from HTML content
+    while ((match = variableRegex.exec(htmlContent)) !== null) {
+      const variable = match[1].trim();
+      if (!allVariables.includes(variable)) {
+        allVariables.push(variable);
+      }
+    }
+
+    // Also collect variables from subject if provided
+    if (subject) {
+      const subjectRegex = /\{\{([^}]+)\}\}/g;
+      let subjectMatch;
+      while ((subjectMatch = subjectRegex.exec(subject)) !== null) {
+        const variable = subjectMatch[1].trim();
+        if (!allVariables.includes(variable)) {
+          allVariables.push(variable);
+        }
+      }
+    }
+
+    // Find all _n and _n_ patterns first
+    const nPatterns = new Set<string>();
+    allVariables.forEach(variable => {
+      const nMatch = variable.match(/^(.+)_n(?:_(.+))?$/);
+      if (nMatch) {
+        const baseName = nMatch[1];
+        const suffix = nMatch[2];
+        if (suffix) {
+          nPatterns.add(`${baseName}_n_${suffix}`);
+        } else {
+          nPatterns.add(`${baseName}_n`);
+        }
+      }
+    });
+
+    // Now process all variables
+    const processedArrayNames = new Set<string>();
+
+    allVariables.forEach(variable => {
+      let isArrayVariable = false;
+
+      // Check if this variable matches any _n pattern
+      nPatterns.forEach(nPattern => {
+        const baseName = nPattern.replace(/_n.*$/, '');
+        const numericMatch = variable.match(new RegExp(`^${baseName}_(\\d+)(?:_|$)`));
+        if (numericMatch) {
+          if (!processedArrayNames.has(nPattern)) {
+            arrayVariableNames.add(nPattern);
+            processedArrayNames.add(nPattern);
+          }
+          isArrayVariable = true;
+        }
+      });
+
+      // Check if this is already an _n pattern
+      const nMatch = variable.match(/^(.+)_n(?:_(.+))?$/);
+      if (nMatch) {
+        const baseName = nMatch[1];
+        const suffix = nMatch[2];
+        const fullName = suffix ? `${baseName}_n_${suffix}` : `${baseName}_n`;
+        if (!processedArrayNames.has(fullName)) {
+          arrayVariableNames.add(fullName);
+          processedArrayNames.add(fullName);
+        }
+        isArrayVariable = true;
+      }
+
+      if (!isArrayVariable) {
+        regularVariables.push(variable);
+      }
+    });
+
+    return { variables: regularVariables, arrayVariables: Array.from(arrayVariableNames) };
   }
 
 
