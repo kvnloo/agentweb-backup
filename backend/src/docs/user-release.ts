@@ -7,6 +7,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-10-24',
+    changes: [
+      'Fixed Templates Section Navigation in Customer Portal',
+      '- Resolved issue where Templates section in sidebar stopped working after Agent Mode became the default page',
+    ],
+  },
+  {
     date: '2025-10-23',
     changes: [
       'Fixed Daily Digest Email Bug for Hourly Schedules',
