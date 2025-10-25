@@ -5318,13 +5318,43 @@ Use the available tools to create tasks in the agent-engine when complex work is
         };
       }
 
+      // Validate template structure first
+      if (!template.html_content || !template.subject) {
+        return {
+          success: false,
+          message: 'Invalid template structure: missing html_content or subject'
+        };
+      }
+
       // Validate that all required variables are provided
       const templateVariables = template.variables || [];
       const templateArrayVariables = template.arrayVariables || [];
       
-      // Ensure we have valid objects to work with
-      const safeVariableValues = variableValues || {};
-      const safeArrayVariableValues = arrayVariableValues || {};
+      // Parse JSON strings to objects
+      let safeVariableValues = {};
+      let safeArrayVariableValues = {};
+      
+      try {
+        if (variableValues) {
+          safeVariableValues = JSON.parse(variableValues);
+        }
+      } catch (error) {
+        return {
+          success: false,
+          message: 'Invalid JSON in variable_values'
+        };
+      }
+      
+      try {
+        if (arrayVariableValues) {
+          safeArrayVariableValues = JSON.parse(arrayVariableValues);
+        }
+      } catch (error) {
+        return {
+          success: false,
+          message: 'Invalid JSON in array_variable_values'
+        };
+      }
       
       // Check for missing regular variables
       const missingVariables = templateVariables.filter((variable: string) => 
@@ -5357,11 +5387,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
       }
       
       if (extraVariables.length > 0) {
-        validationErrors.push(`Extra variables provided (not in template): ${extraVariables.join(', ')}`);
+        validationErrors.push(`Extra variables provided: ${extraVariables.join(', ')}`);
       }
       
       if (extraArrayVariables.length > 0) {
-        validationErrors.push(`Extra array variables provided (not in template): ${extraArrayVariables.join(', ')}`);
+        validationErrors.push(`Extra array variables provided: ${extraArrayVariables.join(', ')}`);
       }
       
       // Validate array variable values are actually arrays
@@ -5370,13 +5400,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
       );
       
       if (invalidArrayVariables.length > 0) {
-        validationErrors.push(`Array variables must be arrays: ${invalidArrayVariables.map(([key]) => key).join(', ')}`);
+        validationErrors.push(`Array variable items must be an array: ${invalidArrayVariables.map(([key]) => key).join(', ')}`);
       }
       
       if (validationErrors.length > 0) {
         return {
           success: false,
-          message: 'Variable validation failed',
+          message: validationErrors.join('; '),
           errors: validationErrors,
           template_variables: templateVariables,
           template_array_variables: templateArrayVariables
@@ -5440,12 +5470,12 @@ RESPONSE FORMAT:
         throw new Error('LLM returned invalid JSON for variable substitution');
       }
 
-      if (!substitutionData.html || !substitutionData.subject) {
-        throw new Error('LLM substitution result missing html or subject fields');
+      if (!substitutionData.final_html || !substitutionData.final_subject) {
+        throw new Error('LLM substitution result missing final_html or final_subject fields');
       }
 
-      const finalHtml = substitutionData.html;
-      const finalSubject = substitutionData.subject;
+      const finalHtml = substitutionData.final_html;
+      const finalSubject = substitutionData.final_subject;
       
       // Verify the substitution was correct
       const remainingPlaceholders = finalHtml.match(/\{\{[^}]+\}\}/g) || [];
@@ -5486,12 +5516,42 @@ RESPONSE FORMAT:
       return {
         success: true,
         s3_url: s3Url,
-        subject: finalSubject,
+        final_subject: finalSubject,
         template_name: templateName,
         filename: filename
       };
     } catch (error) {
       console.error('Error creating email HTML from template:', error);
+      
+      // Return specific error messages based on the error type
+      if (error instanceof Error) {
+        if (error.message.includes('Failed to process template with LLM') || error.message.includes('OpenAI API error')) {
+          return {
+            success: false,
+            message: 'Failed to process template with LLM',
+            error: error.message
+          };
+        } else if (error.message.includes('LLM returned invalid JSON')) {
+          return {
+            success: false,
+            message: 'Failed to parse LLM response',
+            error: error.message
+          };
+        } else if (error.message.includes('missing final_html or final_subject')) {
+          return {
+            success: false,
+            message: 'LLM response missing final_html',
+            error: error.message
+          };
+        } else if (error.message.includes('Failed to upload to S3') || error.message.includes('S3 upload failed')) {
+          return {
+            success: false,
+            message: 'Failed to upload to S3',
+            error: error.message
+          };
+        }
+      }
+      
       return {
         success: false,
         message: 'Failed to create email HTML from template',
