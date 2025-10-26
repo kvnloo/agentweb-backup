@@ -5418,10 +5418,13 @@ CRITICAL INSTRUCTIONS:
 6. EXACT REPLACEMENT: Only replace {{}} placeholders, keep everything else identical
 
 RESPONSE FORMAT:
+You must return a valid JSON object with exactly these two fields:
 {
   "final_html": "final HTML content with variables replaced but structure preserved",
   "final_subject": "final subject with variables replaced"
-}`;
+}
+
+IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
 
       const substitutionResponse = await this.openai.chat.completions.create({
         model: process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
@@ -5431,8 +5434,8 @@ RESPONSE FORMAT:
             content: substitutionPrompt
           }
         ],
-        max_completion_tokens: 4000,
-        temperature: 0.1
+        temperature: 0.1,
+        response_format: { type: 'json_object' }
       });
 
       const substitutionResult = substitutionResponse.choices[0].message.content;
