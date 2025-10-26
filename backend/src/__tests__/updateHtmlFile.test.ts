@@ -1,0 +1,500 @@
+import { AgentModeService } from '../services/agentModeService';
+import { DynamoDB } from 'aws-sdk';
+
+// Mock AWS SDK
+jest.mock('aws-sdk', () => ({
+  DynamoDB: {
+    DocumentClient: jest.fn(() => ({
+      put: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+      get: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+      scan: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+      query: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+      update: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+      delete: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+    }))
+  },
+  S3: jest.fn(() => ({
+    upload: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+    getObject: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+  })),
+  SecretsManager: jest.fn(() => ({
+    getSecretValue: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+  })),
+  config: {
+    update: jest.fn()
+  }
+}));
+
+// Mock axios
+jest.mock('axios', () => ({
+  get: jest.fn(),
+}));
+
+// Mock crypto
+jest.mock('crypto', () => ({
+  createHash: jest.fn()
+}));
+
+// Mock s3Utils
+jest.mock('../utils/s3Utils', () => ({
+  uploadFileToS3WithPath: jest.fn().mockResolvedValue({
+    success: true,
+    url: 'https://s3.amazonaws.com/bucket/updated_file_v2.html',
+    key: 'updated_file_v2.html'
+  })
+}));
+
+describe('updateHtmlFile', () => {
+  let agentModeService: AgentModeService;
+  let mockDynamoDB: jest.Mocked<DynamoDB>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    
+    mockDynamoDB = {
+      put: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+      get: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+      scan: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+      query: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+      update: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+      delete: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+    } as any;
+
+    agentModeService = new AgentModeService();
+    (agentModeService as any).dynamoDB = mockDynamoDB;
+
+    // Setup crypto mock
+    const mockHash = {
+      update: jest.fn().mockReturnThis(),
+      digest: jest.fn().mockReturnValue('mock-hash-123')
+    };
+    const { createHash } = require('crypto');
+    createHash.mockReturnValue(mockHash);
+  });
+
+  describe('update_type validation', () => {
+    it('should reject invalid update_type', async () => {
+      const result = await (agentModeService as any).updateHtmlFile(
+        'https://s3.amazonaws.com/bucket/file.html',
+        'invalid',
+        [],
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('update_type must be either "part" or "full"');
+    });
+
+    it('should accept valid update_type "part"', async () => {
+      // Mock fetchFileContent
+      jest.spyOn(agentModeService as any, 'fetchFileContent').mockResolvedValue('<html><h1>Old</h1></html>');
+      // Mock performDirectReplacement
+      jest.spyOn(agentModeService as any, 'performDirectReplacement').mockReturnValue({
+        content: '<html><h1>New</h1></html>',
+        changeCount: 1
+      });
+
+      const result = await (agentModeService as any).updateHtmlFile(
+        'https://s3.amazonaws.com/bucket/file.html',
+        'part',
+        [{ old_content: '<h1>Old</h1>', new_content: '<h1>New</h1>', expected_count: 1 }],
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+    });
+
+    it('should accept valid update_type "full"', async () => {
+      // Mock fetchFileContent
+      jest.spyOn(agentModeService as any, 'fetchFileContent').mockResolvedValue('<html>Old</html>');
+
+      const result = await (agentModeService as any).updateHtmlFile(
+        'https://s3.amazonaws.com/bucket/file.html',
+        'full',
+        [{ old_file_hash: 'mock-hash-123', new_content: '<html>New</html>', expected_count: 1 }],
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+    });
+  });
+
+  describe('full replacement (update_type="full")', () => {
+    beforeEach(() => {
+      // Mock fetchFileContent to return test content
+      jest.spyOn(agentModeService as any, 'fetchFileContent').mockResolvedValue('<html>Test content</html>');
+      
+      // Mock createHash to return consistent hash
+      const mockHash = jest.fn(() => ({
+        update: jest.fn().mockReturnThis(),
+        digest: jest.fn().mockReturnValue('test-hash-123')
+      }));
+      require('crypto').createHash = mockHash;
+    });
+
+    it('should require old_file_hash for full replacement', async () => {
+      const result = await (agentModeService as any).updateHtmlFile(
+        'https://s3.amazonaws.com/bucket/file.html',
+        'full',
+        [{ new_content: '<html>New</html>', expected_count: 1 }],
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('old_file_hash is required');
+    });
+
+    it('should reject old_content when update_type is full', async () => {
+      const result = await (agentModeService as any).updateHtmlFile(
+        'https://s3.amazonaws.com/bucket/file.html',
+        'full',
+        [{ old_file_hash: 'hash123', old_content: '<h1>Old</h1>', new_content: '<html>New</html>', expected_count: 1 }],
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('should not have old_content when update_type="full"');
+    });
+
+    it('should verify file hash matches for full replacement', async () => {
+      const result = await (agentModeService as any).updateHtmlFile(
+        'https://s3.amazonaws.com/bucket/file.html',
+        'full',
+        [{ old_file_hash: 'wrong-hash', new_content: '<html>New</html>', expected_count: 1 }],
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('File hash mismatch');
+    });
+
+    it('should succeed when hash matches for full replacement', async () => {
+      const result = await (agentModeService as any).updateHtmlFile(
+        'https://s3.amazonaws.com/bucket/file.html',
+        'full',
+        [{ old_file_hash: 'test-hash-123', new_content: '<html>New</html>', expected_count: 1 }],
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.method).toBe('mixed_replacement');
+      expect(result.replacements[0].old_file_hash).toBe('test-hash-123');
+    });
+
+    it('should reject expected_count other than 1 for full replacement', async () => {
+      const result = await (agentModeService as any).updateHtmlFile(
+        'https://s3.amazonaws.com/bucket/file.html',
+        'full',
+        [{ old_file_hash: 'test-hash-123', new_content: '<html>New</html>', expected_count: 2 }],
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Full replacement only supports expected_count of 1');
+    });
+  });
+
+  describe('part replacement (update_type="part")', () => {
+    beforeEach(() => {
+      // Mock fetchFileContent to return test content
+      jest.spyOn(agentModeService as any, 'fetchFileContent').mockResolvedValue('<html><h1>Old Title</h1></html>');
+      
+      // Mock performDirectReplacement
+      jest.spyOn(agentModeService as any, 'performDirectReplacement').mockReturnValue({
+        content: '<html><h1>New Title</h1></html>',
+        changeCount: 1
+      });
+    });
+
+    it('should require old_content for part replacement', async () => {
+      const result = await (agentModeService as any).updateHtmlFile(
+        'https://s3.amazonaws.com/bucket/file.html',
+        'part',
+        [{ new_content: '<h1>New</h1>', expected_count: 1 }],
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('old_content is required');
+    });
+
+    it('should reject old_file_hash when update_type is part', async () => {
+      const result = await (agentModeService as any).updateHtmlFile(
+        'https://s3.amazonaws.com/bucket/file.html',
+        'part',
+        [{ old_content: '<h1>Old</h1>', old_file_hash: 'hash123', new_content: '<h1>New</h1>', expected_count: 1 }],
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('should not have old_file_hash when update_type="part"');
+    });
+
+    it('should succeed when old_content is found for part replacement', async () => {
+      const result = await (agentModeService as any).updateHtmlFile(
+        'https://s3.amazonaws.com/bucket/file.html',
+        'part',
+        [{ old_content: '<h1>Old Title</h1>', new_content: '<h1>New Title</h1>', expected_count: 1 }],
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.method).toBe('mixed_replacement');
+      expect(result.replacements[0].old_content).toBe('<h1>Old Title</h1>');
+    });
+
+    it('should fail when old_content is not found for part replacement', async () => {
+      jest.spyOn(agentModeService as any, 'performDirectReplacement').mockReturnValue(null);
+
+      const result = await (agentModeService as any).updateHtmlFile(
+        'https://s3.amazonaws.com/bucket/file.html',
+        'part',
+        [{ old_content: '<h1>Not Found</h1>', new_content: '<h1>New</h1>', expected_count: 1 }],
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('old_content was not found');
+    });
+
+    it('should fail when expected_count does not match actual count for part replacement', async () => {
+      jest.spyOn(agentModeService as any, 'performDirectReplacement').mockReturnValue({
+        content: '<html><h1>New Title</h1></html>',
+        changeCount: 2 // Different from expected_count: 1
+      });
+
+      const result = await (agentModeService as any).updateHtmlFile(
+        'https://s3.amazonaws.com/bucket/file.html',
+        'part',
+        [{ old_content: '<h1>Old Title</h1>', new_content: '<h1>New Title</h1>', expected_count: 1 }],
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Expected 1 occurrences of old_content, but found 2');
+    });
+  });
+
+  describe('createVersionedFilename', () => {
+    it('should add _v2 to filename without existing version', () => {
+      const result = (agentModeService as any).createVersionedFilename('https://s3.amazonaws.com/bucket/file.html');
+      expect(result).toBe('file_v2.html');
+    });
+
+    it('should increment existing version number', () => {
+      const result = (agentModeService as any).createVersionedFilename('https://s3.amazonaws.com/bucket/file_v2.html');
+      expect(result).toBe('file_v3.html');
+    });
+
+    it('should handle filename without extension', () => {
+      const result = (agentModeService as any).createVersionedFilename('https://s3.amazonaws.com/bucket/file');
+      expect(result).toBe('file_v2');
+    });
+
+    it('should handle complex filename with existing version', () => {
+      const result = (agentModeService as any).createVersionedFilename('https://s3.amazonaws.com/bucket/newsletter_2024_v3.html');
+      expect(result).toBe('newsletter_2024_v4.html');
+    });
+
+    it('should handle multiple version patterns correctly', () => {
+      const result = (agentModeService as any).createVersionedFilename('https://s3.amazonaws.com/bucket/html_digital_marketing_newsletter2_1761399141269_v3.html');
+      expect(result).toBe('html_digital_marketing_newsletter2_1761399141269_v4.html');
+    });
+  });
+
+  describe('performDirectReplacement', () => {
+    it('should perform exact string replacement for small content', () => {
+      const result = (agentModeService as any).performDirectReplacement(
+        'Hello World',
+        'World',
+        'Universe'
+      );
+
+      expect(result).toEqual({
+        content: 'Hello Universe',
+        changeCount: 1
+      });
+    });
+
+    it('should handle multiple occurrences', () => {
+      const result = (agentModeService as any).performDirectReplacement(
+        'Hello World, Hello World',
+        'World',
+        'Universe'
+      );
+
+      expect(result).toEqual({
+        content: 'Hello Universe, Hello Universe',
+        changeCount: 2
+      });
+    });
+
+    it('should return null when old content not found', () => {
+      const result = (agentModeService as any).performDirectReplacement(
+        'Hello World',
+        'NotFound',
+        'Universe'
+      );
+
+      expect(result).toBeNull();
+    });
+
+    it('should handle large content with exact match', () => {
+      const largeContent = '<html>' + 'x'.repeat(2000) + '</html>';
+      const newContent = '<html>' + 'y'.repeat(2000) + '</html>';
+      
+      const result = (agentModeService as any).performDirectReplacement(
+        largeContent,
+        largeContent,
+        newContent,
+        true
+      );
+
+      expect(result).toEqual({
+        content: newContent,
+        changeCount: 1
+      });
+    });
+
+    it('should handle large content with exact match', () => {
+      const largeContent = '<html>' + 'x'.repeat(2000) + '</html>';
+      const newContent = '<html>' + 'y'.repeat(2000) + '</html>';
+      
+      const result = (agentModeService as any).performDirectReplacement(
+        largeContent,
+        largeContent,
+        newContent
+      );
+
+      expect(result).toEqual({
+        content: newContent,
+        changeCount: 1
+      });
+    });
+  });
+
+  describe('extractPathFromS3Url', () => {
+    it('should extract path from S3 URL', () => {
+      const result = (agentModeService as any).extractPathFromS3Url('https://s3.amazonaws.com/bucket/path/to/file.html');
+      expect(result).toBe('bucket/path/to');
+    });
+
+    it('should return empty string for URL without path', () => {
+      const result = (agentModeService as any).extractPathFromS3Url('https://s3.amazonaws.com/bucket/file.html');
+      expect(result).toBe('bucket');
+    });
+
+    it('should handle complex S3 URLs', () => {
+      const result = (agentModeService as any).extractPathFromS3Url('https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/123/files/456/789/file.html');
+      expect(result).toBe('users/123/files/456/789');
+    });
+  });
+
+  describe('error handling', () => {
+    it('should handle fetchFileContent errors', async () => {
+      jest.spyOn(agentModeService as any, 'fetchFileContent').mockRejectedValue(new Error('Network error'));
+
+      const result = await (agentModeService as any).updateHtmlFile(
+        'https://s3.amazonaws.com/bucket/file.html',
+        'part',
+        [{ old_content: '<h1>Old</h1>', new_content: '<h1>New</h1>', expected_count: 1 }],
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Failed to update HTML file');
+    });
+
+    it('should handle uploadFileToS3WithPath errors', async () => {
+      const { uploadFileToS3WithPath } = require('../utils/s3Utils');
+      uploadFileToS3WithPath.mockResolvedValue({
+        success: false,
+        error: 'Upload failed'
+      });
+
+      jest.spyOn(agentModeService as any, 'fetchFileContent').mockResolvedValue('<html>Test</html>');
+      jest.spyOn(agentModeService as any, 'performDirectReplacement').mockReturnValue({
+        content: '<html>Updated</html>',
+        changeCount: 1
+      });
+
+      const result = await (agentModeService as any).updateHtmlFile(
+        'https://s3.amazonaws.com/bucket/file.html',
+        'part',
+        [{ old_content: '<html>Test</html>', new_content: '<html>Updated</html>', expected_count: 1 }],
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Failed to update HTML file');
+    });
+  });
+
+  describe('integration scenarios', () => {
+    it('should handle mixed replacement types in single call', async () => {
+      jest.spyOn(agentModeService as any, 'fetchFileContent').mockResolvedValue('<html>Test content</html>');
+      jest.spyOn(agentModeService as any, 'performDirectReplacement').mockReturnValue({
+        content: '<html>Updated content</html>',
+        changeCount: 1
+      });
+      jest.spyOn(agentModeService as any, 'uploadUpdatedFile').mockResolvedValue({
+        url: 'https://s3.amazonaws.com/bucket/new-file.html'
+      });
+
+      const result = await (agentModeService as any).updateHtmlFile(
+        'https://s3.amazonaws.com/bucket/file.html',
+        'part',
+        [
+          { old_content: 'Test', new_content: 'Updated', expected_count: 1 },
+          { old_content: 'content', new_content: 'data', expected_count: 1 }
+        ],
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.replacements).toHaveLength(2);
+    });
+
+    it('should handle empty replacement instructions', async () => {
+      const result = await (agentModeService as any).updateHtmlFile(
+        'https://s3.amazonaws.com/bucket/file.html',
+        'part',
+        [],
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('At least one replacement instruction is required');
+    });
+
+    it('should handle non-array replacement instructions', async () => {
+      const result = await (agentModeService as any).updateHtmlFile(
+        'https://s3.amazonaws.com/bucket/file.html',
+        'part',
+        'not an array',
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('replacement_json must be an array of replacement instructions');
+    });
+  });
+});

@@ -52,7 +52,7 @@ export class AgentModeService {
       
       // Build initial messages array (preserve structured history and tool messages)
       const messages: any[] = [
-        { role: 'system', content: systemPrompt },
+        { role: 'system', content: `${systemPrompt}\n\nCurrent time: ${new Date().toISOString()}` },
         { role: 'assistant', content: templatesContext },
         ...marketingMessages
       ];
@@ -522,6 +522,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 items: { type: 'string' },
                 description: 'Array of file URLs to attach to this task. These should be URLs from files uploaded in the current conversation.',
                 default: []
+              },
+              async: {
+                type: 'boolean',
+                description: 'Whether to execute the task asynchronously. If false, the function will wait for task completion before returning the final result.',
+                default: true
               }
             },
             required: ['template_id', 'parameters_json']
@@ -689,6 +694,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 items: { type: 'string' },
                 description: 'Array of file URLs to attach to this task. These should be URLs from files uploaded in the current conversation.',
                 default: []
+              },
+              async: {
+                type: 'boolean',
+                description: 'Whether to execute the task asynchronously. If false, the function will wait for task completion before returning the final result.',
+                default: true
               }
             },
             required: ['task_name', 'prompt', 'category']
@@ -1000,7 +1010,70 @@ Use the available tools to create tasks in the agent-engine when complex work is
             required: ['image_url']
           }
         }
-      }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'list_html_templates',
+          description: 'Get a list of all available HTML templates for the user (including email templates)',
+          parameters: {
+            type: 'object',
+            properties: {},
+            required: []
+          }
+        }
+      },
+        {
+          type: 'function' as const,
+          function: {
+            name: 'create_html_from_template',
+            description: 'Create final HTML from a template by providing variable values and array variable values as JSON strings, then upload to S3',
+            parameters: {
+              type: 'object',
+              properties: {
+                template_name: {
+                  type: 'string',
+                  description: 'Name of the HTML template to use'
+                },
+                variable_values_json: {
+                  type: 'string',
+                  description: 'JSON string containing regular variable values where keys are variable names and values are the actual values. Example: {"title": "Hello", "company_name": "Acme Corp"}'
+                },
+                array_variable_values_json: {
+                  type: 'string',
+                  description: 'JSON string containing array variable values where keys are array variable names and values are arrays of strings. Example: {"features_n": ["Feature 1", "Feature 2"], "links_n": ["Link 1", "Link 2"]}'
+                }
+              },
+              required: ['template_name', 'variable_values_json', 'array_variable_values_json']
+            }
+          }
+        },
+        {
+          type: 'function' as const,
+          function: {
+            name: 'update_html_file',
+            description: 'Update an HTML file by replacing specific content with new content. Use update_type="full" with old_file_hash for entire file replacement, or update_type="part" with old_content for partial replacements',
+            parameters: {
+              type: 'object',
+              properties: {
+                file_url: {
+                  type: 'string',
+                  description: 'URL of the HTML file to update (S3 URL or file path)'
+                },
+                update_type: {
+                  type: 'string',
+                  enum: ['part', 'full'],
+                  description: 'Type of update: "part" for partial content replacement using old_content, "full" for entire file replacement using old_file_hash'
+                },
+                replacement_json: {
+                  type: 'string',
+                  description: 'JSON string containing a list of replacement instructions. For full replacement: [{"old_file_hash": "abc123...", "new_content": "<!DOCTYPE html>...", "expected_count": 1}]. For part replacement: [{"old_content": "<h1>Old Title</h1>", "new_content": "<h1>New Title</h1>", "expected_count": 1}]. Use empty string for new_content to delete the specified content.'
+                }
+              },
+              required: ['file_url', 'update_type', 'replacement_json']
+            }
+          }
+        }
     ];
   }
 
@@ -1367,6 +1440,189 @@ Use the available tools to create tasks in the agent-engine when complex work is
           imageUrl: args.image_url
         };
       
+      case 'list_html_templates':
+        return {
+          success: true,
+          email_templates: [
+            {
+              template_name: 'welcome_email',
+              subject: 'Welcome to {{company_name}}!',
+              variables: ['company_name', 'user_name'],
+              arrayVariables: ['features_n'],
+              created_at: '2024-01-15T10:00:00Z',
+              updated_at: '2024-01-15T10:00:00Z'
+            },
+            {
+              template_name: 'newsletter',
+              subject: 'Weekly Update: {{news_title}}',
+              variables: ['news_title', 'company_name'],
+              arrayVariables: ['news_n_category', 'links_n'],
+              created_at: '2024-01-20T14:30:00Z',
+              updated_at: '2024-01-20T14:30:00Z'
+            }
+          ]
+        };
+      
+      case 'create_html_from_template':
+        // Mock validation - check if required variables are provided
+        const mockTemplate = {
+          variables: ['title', 'company_name'],
+          arrayVariables: ['features_n']
+        };
+        
+        // Parse JSON strings for mock validation
+        let mockVariableValues = {};
+        let mockArrayVariableValues = {};
+        
+        try {
+          if (args.variable_values_json) {
+            mockVariableValues = JSON.parse(args.variable_values_json);
+          }
+        } catch (error) {
+          return {
+            success: false,
+            message: 'Invalid JSON in variable_values_json',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          };
+        }
+        
+        try {
+          if (args.array_variable_values_json) {
+            mockArrayVariableValues = JSON.parse(args.array_variable_values_json);
+          }
+        } catch (error) {
+          return {
+            success: false,
+            message: 'Invalid JSON in array_variable_values_json',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          };
+        }
+        
+        const missingVars = mockTemplate.variables.filter(v => !(v in mockVariableValues));
+        const missingArrayVars = mockTemplate.arrayVariables.filter(v => !(v in mockArrayVariableValues));
+        
+        if (missingVars.length > 0 || missingArrayVars.length > 0) {
+          return {
+            success: false,
+            message: 'Variable validation failed',
+            errors: [
+              ...(missingVars.length > 0 ? [`Missing required variables: ${missingVars.join(', ')}`] : []),
+              ...(missingArrayVars.length > 0 ? [`Missing required array variables: ${missingArrayVars.join(', ')}`] : [])
+            ],
+            template_variables: mockTemplate.variables,
+            template_array_variables: mockTemplate.arrayVariables
+          };
+        }
+        
+        return {
+          success: true,
+          s3_url: `https://mock-s3-bucket.s3.amazonaws.com/html_${args.template_name}_${Date.now()}.html`,
+          subject: `Mock subject with variables substituted for ${args.template_name}`,
+          template_name: args.template_name,
+          filename: `html_${args.template_name}_${Date.now()}.html`,
+          message: 'Mock HTML generated using LLM variable substitution'
+        };
+      
+      case 'update_html_file':
+        // Mock validation for update_html_file
+        try {
+          const instructions = JSON.parse(args.replacement_json);
+          
+          // Validate that it's an array
+          if (!Array.isArray(instructions)) {
+            return {
+              success: false,
+              message: 'replacement_json must be an array of replacement instructions'
+            };
+          }
+          
+          if (instructions.length === 0) {
+            return {
+              success: false,
+              message: 'At least one replacement instruction is required'
+            };
+          }
+          
+          // Validate each instruction based on update_type
+          for (let i = 0; i < instructions.length; i++) {
+            const instruction = instructions[i];
+            
+            if (!instruction.new_content || instruction.expected_count === undefined) {
+              return {
+                success: false,
+                message: `Missing required fields in replacement instruction ${i + 1}: new_content and expected_count are required`
+              };
+            }
+            
+            if (args.update_type === 'full') {
+              // For full replacement, require old_file_hash
+              if (!instruction.old_file_hash) {
+                return {
+                  success: false,
+                  message: `Replacement instruction ${i + 1} missing old_file_hash. For update_type="full", old_file_hash is required`
+                };
+              }
+              if (instruction.old_content !== undefined) {
+                return {
+                  success: false,
+                  message: `Replacement instruction ${i + 1} should not have old_content when update_type="full". Use old_file_hash instead`
+                };
+              }
+            } else if (args.update_type === 'part') {
+              // For part replacement, require old_content
+              if (!instruction.old_content) {
+                return {
+                  success: false,
+                  message: `Replacement instruction ${i + 1} missing old_content. For update_type="part", old_content is required`
+                };
+              }
+              if (instruction.old_file_hash !== undefined) {
+                return {
+                  success: false,
+                  message: `Replacement instruction ${i + 1} should not have old_file_hash when update_type="part". Use old_content instead`
+                };
+              }
+            }
+          }
+          
+          // Mock successful replacement
+          const replacementResults = instructions.map((instruction, index) => {
+            const result: any = {
+              index: index + 1,
+              new_content: instruction.new_content,
+              expected_count: instruction.expected_count,
+              actual_count: instruction.expected_count, // Mock: assume count matches
+              success: true
+            };
+            
+            if (args.update_type === 'full') {
+              result.old_file_hash = instruction.old_file_hash;
+            } else {
+              result.old_content = instruction.old_content;
+            }
+            
+            return result;
+          });
+          
+          // Mock versioned filename
+          const mockVersionedFilename = `updated_file_v2.html`;
+          
+          return {
+            success: true,
+            s3_url: `https://mock-s3-bucket.s3.amazonaws.com/${mockVersionedFilename}`,
+            message: `File updated successfully with ${replacementResults.length} replacements`,
+            method: 'mixed_replacement',
+            replacements: replacementResults,
+            versioned_filename: mockVersionedFilename
+          };
+        } catch (error) {
+          return {
+            success: false,
+            message: 'Invalid JSON in replacement_json',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          };
+        }
+      
       default:
         return {
           success: true,
@@ -1391,7 +1647,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
           const parameters = JSON.parse(args.parameters_json || '{}');
           const attachPreviousTaskResults = args.attach_previous_task_results !== false;
           const attachedFileUrls = args.attached_file_urls || [];
-          return await this.createTaskFromTemplate(args.template_id, parameters, userId, sessionId, attachPreviousTaskResults, attachedFileUrls);
+          const async = args.async !== false; // Default to true
+          return await this.createTaskFromTemplate(args.template_id, parameters, userId, sessionId, attachPreviousTaskResults, attachedFileUrls, async);
         } catch (parseError) {
           console.error('AgentMode: Error parsing parameters JSON:', parseError);
           return {
@@ -1403,7 +1660,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'create_task_from_prompt':
         const attachPreviousTaskResults = args.attach_previous_task_results !== false;
         const attachedFileUrls = args.attached_file_urls || [];
-        return await this.createTaskFromPrompt(args.task_name, args.prompt, args.category, userId, sessionId, attachPreviousTaskResults, attachedFileUrls);
+        const async = args.async !== false; // Default to true
+        return await this.createTaskFromPrompt(args.task_name, args.prompt, args.category, userId, sessionId, attachPreviousTaskResults, attachedFileUrls, async);
       case 'create_image_task_from_prompt':
         const attachPreviousTaskResultsForImage = args.attach_previous_task_results !== false;
         return await this.createImageTaskFromPrompt(args.task_name, args.prompt, args.category || 'Creatives', userId, sessionId, attachPreviousTaskResultsForImage);
@@ -1437,6 +1695,82 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.getTaskSubscriberEngagementEvents(args.task_id, args.email_subject, userId);
       case 'describe_image':
         return await this.describeImage(args.image_url, args.prompt);
+      case 'list_html_templates':
+        return await this.listHtmlTemplates(userId);
+      case 'create_html_from_template':
+        // Ensure we have the required parameters
+        if (!args.template_name) {
+          return {
+            success: false,
+            message: 'template_name is required'
+          };
+        }
+        
+        // Parse JSON strings
+        let variableValues = {};
+        let arrayVariableValues = {};
+        
+        try {
+          if (args.variable_values_json) {
+            variableValues = JSON.parse(args.variable_values_json);
+          }
+        } catch (error) {
+          return {
+            success: false,
+            message: 'Invalid JSON in variable_values_json',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          };
+        }
+        
+        try {
+          if (args.array_variable_values_json) {
+            arrayVariableValues = JSON.parse(args.array_variable_values_json);
+          }
+        } catch (error) {
+          return {
+            success: false,
+            message: 'Invalid JSON in array_variable_values_json',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          };
+        }
+        
+        return await this.createHtmlFromTemplate(args.template_name, variableValues, arrayVariableValues, userId, sessionId);
+        case 'update_html_file':
+          // Ensure we have the required parameters
+          if (!args.file_url) {
+            return {
+              success: false,
+              message: 'file_url is required'
+            };
+          }
+          
+          if (!args.update_type) {
+            return {
+              success: false,
+              message: 'update_type is required'
+            };
+          }
+          
+          if (!args.replacement_json) {
+            return {
+              success: false,
+              message: 'replacement_json is required'
+            };
+          }
+        
+        // Parse replacement instructions
+        let replacementInstructions;
+        try {
+          replacementInstructions = JSON.parse(args.replacement_json);
+        } catch (error) {
+          return {
+            success: false,
+            message: 'Invalid JSON in replacement_json',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          };
+        }
+        
+        return await this.updateHtmlFile(args.file_url, args.update_type, replacementInstructions, userId, sessionId);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -2098,8 +2432,49 @@ Use the available tools to create tasks in the agent-engine when complex work is
     });
   }
 
+  // Helper function to wait for task completion
+  private async waitForTaskCompletion(taskId: string, executionId: string, userId: string, maxWaitTime: number = 300000, additionalFields: any = {}, pollInterval: number = 2000): Promise<any> {
+    const startTime = Date.now();
+    
+    while (Date.now() - startTime < maxWaitTime) {
+      try {
+        const execution = await taskDb.getTaskExecutionById(executionId);
+        if (execution && (execution.status === 'completed' || execution.status === 'failed')) {
+          return {
+            success: execution.status === 'completed',
+            message: execution.status === 'completed' 
+              ? 'Task completed successfully' 
+              : `Task failed: ${execution.error || 'Unknown error'}`,
+            status: execution.status,
+            taskId: taskId,
+            executionId: executionId,
+            result: execution.result,
+            error: execution.error,
+            ...additionalFields
+          };
+        }
+        
+        // Wait before next poll
+        await new Promise(resolve => setTimeout(resolve, pollInterval));
+      } catch (error) {
+        console.error('AgentMode: Error polling task execution:', error);
+        await new Promise(resolve => setTimeout(resolve, pollInterval));
+      }
+    }
+    
+    // Timeout reached - return async format
+    return {
+      success: true,
+      message: `Task "${additionalFields.taskName || 'Unknown'}" has been created successfully. The task is still running and may complete later.`,
+      status: 'pending',
+      taskId: taskId,
+      executionId: executionId,
+      ...additionalFields
+    };
+  }
+
   // Create task from template
-  private async createTaskFromTemplate(templateId: string, parameters: Record<string, string>, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true, attachedFileUrls: string[] = []): Promise<any> {
+  private async createTaskFromTemplate(templateId: string, parameters: Record<string, string>, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true, attachedFileUrls: string[] = [], async: boolean = true): Promise<any> {
     try {
 
       // Validate parameters
@@ -2242,6 +2617,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
         startTime: new Date().toISOString()
       });
 
+      // If async is false, wait for task completion
+      if (!async && execution?.executionId) {
+        return await this.waitForTaskCompletion(task.taskId, execution.executionId, userId, 300000, {
+          templateName: templateData.name,
+          taskName: taskName
+        });
+      }
 
       return {
         success: true,
@@ -2263,7 +2645,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   // Create task from raw prompt
-  private async createTaskFromPrompt(taskName: string, prompt: string, category: string, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true, attachedFileUrls: string[] = []): Promise<any> {
+  private async createTaskFromPrompt(taskName: string, prompt: string, category: string, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true, attachedFileUrls: string[] = [], async: boolean = true): Promise<any> {
     try {
 
       // Attach previous task results if requested
@@ -2319,6 +2701,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
         startTime: new Date().toISOString()
       });
 
+      // If async is false, wait for task completion
+      if (!async && execution?.executionId) {
+        return await this.waitForTaskCompletion(task.taskId, execution.executionId, userId, 300000, {
+          taskName: taskName
+        });
+      }
 
       return {
         success: true,
@@ -4119,9 +4507,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
         file_url: fileUrl
       });
 
+      // Compute content hash for integrity verification
+      const contentHash = createHash('sha256').update(extractedContent).digest('hex');
+      console.log(`AgentMode: Computed content hash: ${contentHash}`);
+
       return {
         success: true,
         content: extractedContent,
+        content_hash: contentHash,
         file_type: fileType,
         file_size: buffer.length,
         content_length: extractedContent.length,
@@ -4544,6 +4937,756 @@ Use the available tools to create tasks in the agent-engine when complex work is
       },
       linkAnalysis
     };
+  }
+
+  // List all HTML templates for the user (including email templates)
+  private async listHtmlTemplates(userId: string): Promise<any> {
+    try {
+      const settingName = `email_templates_${userId}`;
+      const setting = await settingsService.getSetting(settingName);
+      
+      let templates = [];
+      if (setting) {
+        try {
+          templates = JSON.parse(setting.settingValue);
+        } catch (error) {
+          console.error('Error parsing email templates:', error);
+          templates = [];
+        }
+      }
+      
+      return {
+        success: true,
+        email_templates: templates.map((template: any) => ({
+          template_name: template.template_name,
+          subject: template.subject,
+          variables: template.variables || [],
+          arrayVariables: template.arrayVariables || [],
+          created_at: template.created_at,
+          updated_at: template.updated_at
+        }))
+      };
+    } catch (error) {
+      console.error('Error listing email templates:', error);
+      return {
+        success: false,
+        message: 'Failed to list email templates',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // Update HTML file with direct content replacement
+  private async updateHtmlFile(
+    fileUrl: string,
+    updateType: string,
+    replacementInstructions: any,
+    userId: string,
+    sessionId: string
+  ): Promise<any> {
+    try {
+      // Validate update_type
+      if (!updateType || !['part', 'full'].includes(updateType)) {
+        return {
+          success: false,
+          message: 'update_type must be either "part" or "full"'
+        };
+      }
+      
+      // Validate that replacementInstructions is an array
+      if (!Array.isArray(replacementInstructions)) {
+        return {
+          success: false,
+          message: 'replacement_json must be an array of replacement instructions'
+        };
+      }
+      
+      if (replacementInstructions.length === 0) {
+        return {
+          success: false,
+          message: 'At least one replacement instruction is required'
+        };
+      }
+      
+      // Validate each replacement instruction based on update_type
+      for (let i = 0; i < replacementInstructions.length; i++) {
+        const instruction = replacementInstructions[i];
+        
+        if (instruction.new_content === undefined || instruction.expected_count === undefined) {
+          return {
+            success: false,
+            message: `Missing required fields in replacement instruction ${i + 1}: new_content and expected_count are required`
+          };
+        }
+        
+        if (updateType === 'full') {
+          // For full replacement, require old_file_hash
+          if (!instruction.old_file_hash) {
+            return {
+              success: false,
+              message: `Replacement instruction ${i + 1} missing old_file_hash. For update_type="full", old_file_hash is required`
+            };
+          }
+          if (instruction.old_content !== undefined) {
+            return {
+              success: false,
+              message: `Replacement instruction ${i + 1} should not have old_content when update_type="full". Use old_file_hash instead`
+            };
+          }
+        } else if (updateType === 'part') {
+          // For part replacement, require old_content
+          if (!instruction.old_content) {
+            return {
+              success: false,
+              message: `Replacement instruction ${i + 1} missing old_content. For update_type="part", old_content is required`
+            };
+          }
+          if (instruction.old_file_hash !== undefined) {
+            return {
+              success: false,
+              message: `Replacement instruction ${i + 1} should not have old_file_hash when update_type="part". Use old_content instead`
+            };
+          }
+        }
+      }
+      
+      // Fetch current file content
+      const currentContent = await this.fetchFileContent(fileUrl);
+      console.log(`AgentMode: Fetched file content, length: ${currentContent.length} characters`);
+      
+      // Compute hash of current content for verification
+      const currentContentHash = createHash('sha256').update(currentContent).digest('hex');
+      console.log(`AgentMode: Computed current content hash: ${currentContentHash}`);
+      
+      let updatedContent = currentContent;
+      
+      // Perform all replacements
+      const replacementResults = [];
+      
+      for (let i = 0; i < replacementInstructions.length; i++) {
+        const instruction = replacementInstructions[i];
+        const { new_content, expected_count } = instruction;
+        
+        if (updateType === 'full') {
+          // Entire file replacement using hash
+          const { old_file_hash } = instruction;
+          console.log(`AgentMode: Full replacement ${i + 1}: old_file_hash: ${old_file_hash}, new_content length: ${new_content.length}, expected_count: ${expected_count}`);
+          
+          // Verify that the provided hash matches the current content hash
+          if (old_file_hash !== currentContentHash) {
+            return {
+              success: false,
+              message: `Replacement ${i + 1} failed: File hash mismatch. Expected: ${currentContentHash}, provided: ${old_file_hash}. The file may have been modified since it was last read.`,
+              suggestion: 'Use read_file_content to get the current content and hash, then retry the replacement'
+            };
+          }
+          
+          // For hash-based replacement, we replace the entire content
+          if (expected_count === 1) {
+            console.log(`AgentMode: Hash verification successful, replacing entire content`);
+            updatedContent = new_content;
+            replacementResults.push({
+              index: i + 1,
+              old_file_hash: old_file_hash,
+              new_content: new_content,
+              expected_count: expected_count,
+              actual_count: 1,
+              success: true
+            });
+          } else {
+            return {
+              success: false,
+              message: `Replacement ${i + 1} failed: Full replacement only supports expected_count of 1 (entire file replacement)`,
+              suggestion: 'Use expected_count: 1 for full file replacement'
+            };
+          }
+        } else if (updateType === 'part') {
+          // Partial content replacement using old_content
+          const { old_content } = instruction;
+          console.log(`AgentMode: Part replacement ${i + 1}: old_content length: ${old_content.length}, new_content length: ${new_content.length}, expected_count: ${expected_count}`);
+          
+          // Perform the replacement using the existing logic
+          const replacementResult = this.performDirectReplacement(
+            updatedContent,
+            old_content,
+            new_content,
+            true // exact_match = true for partial replacements
+          );
+          
+          if (replacementResult === null) {
+            return {
+              success: false,
+              message: `Replacement ${i + 1} failed: The old_content was not found in the file. No changes were made to the file.`,
+              suggestion: 'Check that the old_content exactly matches the content in the file'
+            };
+          }
+          
+          // Check if the actual change count matches expected count
+          if (replacementResult.changeCount !== expected_count) {
+            return {
+              success: false,
+              message: `Replacement ${i + 1} failed: Expected ${expected_count} occurrences of old_content, but found ${replacementResult.changeCount}. No changes were made to the file.`,
+              suggestion: 'Check the expected_count matches the actual number of occurrences in the file'
+            };
+          }
+          
+          updatedContent = replacementResult.content;
+          replacementResults.push({
+            index: i + 1,
+            old_content: old_content,
+            new_content: new_content,
+            expected_count: expected_count,
+            actual_count: replacementResult.changeCount,
+            success: true
+          });
+        }
+      }
+      
+      // Create versioned filename and upload the updated content
+      const versionedFilename = this.createVersionedFilename(fileUrl);
+      console.log(`AgentMode: Original file URL: ${fileUrl}`);
+      console.log(`AgentMode: Generated versioned filename: ${versionedFilename}`);
+      const originalPath = this.extractPathFromS3Url(fileUrl);
+      console.log(`AgentMode: Original path: ${originalPath}`);
+      const uploadResult = await this.uploadUpdatedFile(updatedContent, versionedFilename, originalPath);
+      
+      return {
+        success: true,
+        s3_url: uploadResult.url,
+        message: `File updated successfully with ${replacementResults.length} replacements`,
+        method: 'mixed_replacement',
+        replacements: replacementResults,
+        versioned_filename: versionedFilename
+      };
+      
+    } catch (error) {
+      console.error('Error updating HTML file:', error);
+      return {
+        success: false,
+        message: 'Failed to update HTML file',
+        error: error instanceof Error ? error.message : 'Unknown error',
+        suggestion: 'For entire file replacement, use old_file_hash from read_file_content. For partial replacement, use old_content with the exact text to replace'
+      };
+    }
+  }
+
+  // Fetch file content from URL
+  private async fetchFileContent(fileUrl: string): Promise<string> {
+    try {
+      const response = await fetch(fileUrl);
+      if (!response.ok) {
+        throw new Error(`Failed to fetch file: ${response.status} ${response.statusText}`);
+      }
+      return await response.text();
+    } catch (error) {
+      console.error('Error fetching file content:', error);
+      throw new Error(`Failed to fetch file content: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  // Perform direct replacement of old content with new content
+  private performDirectReplacement(
+    content: string,
+    oldContent: string,
+    newContent: string,
+    exactMatch: boolean = true
+  ): { content: string; changeCount: number } | null {
+    try {
+      // For entire file replacement (when oldContent is very large), use more flexible matching
+      if (oldContent.length > 1000) {
+        if (exactMatch) {
+          // Use exact string comparison
+          if (content === oldContent) {
+            console.log(`AgentMode: Exact match found for entire file replacement`);
+            return { content: newContent, changeCount: 1 };
+          } else {
+            console.warn(`Old content does not match exactly. Expected length: ${oldContent.length}, actual length: ${content.length}`);
+            console.warn(`First 100 chars of expected: ${oldContent.substring(0, 100)}`);
+            console.warn(`First 100 chars of actual: ${content.substring(0, 100)}`);
+            return null;
+          }
+        } else {
+          // Use normalized whitespace comparison for flexible matching
+          const normalizedContent = content.replace(/\s+/g, ' ').trim();
+          const normalizedOldContent = oldContent.replace(/\s+/g, ' ').trim();
+          
+          if (normalizedContent === normalizedOldContent) {
+            console.log(`AgentMode: Normalized match found for entire file replacement`);
+            return { content: newContent, changeCount: 1 };
+          } else {
+            // Try exact match as fallback
+            if (content === oldContent) {
+              console.log(`AgentMode: Exact match found for entire file replacement (fallback)`);
+              return { content: newContent, changeCount: 1 };
+            } else {
+              console.warn(`Old content does not match even with normalization. Expected length: ${oldContent.length}, actual length: ${content.length}`);
+              console.warn(`First 100 chars of expected: ${oldContent.substring(0, 100)}`);
+              console.warn(`First 100 chars of actual: ${content.substring(0, 100)}`);
+              return null;
+            }
+          }
+        }
+      }
+      
+      // For smaller content, use regex for more flexible matching
+      const changeCount = (content.match(new RegExp(oldContent.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
+      
+      // Check if old content exists
+      if (changeCount === 0) {
+        console.warn(`Old content not found. Content length: ${content.length}, old content length: ${oldContent.length}`);
+        return null;
+      }
+      
+      // Perform replacement - replace all occurrences
+      const updatedContent = content.replace(new RegExp(oldContent.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), newContent);
+      
+      return { content: updatedContent, changeCount };
+      
+    } catch (error) {
+      console.error('Error in direct replacement:', error);
+      return null;
+    }
+  }
+
+  // Extract path from S3 URL
+  private extractPathFromS3Url(s3Url: string): string {
+    try {
+      // Parse the S3 URL to extract the key
+      const url = new URL(s3Url);
+      const key = url.pathname.substring(1); // Remove leading slash
+      
+      // Extract path by removing the filename
+      const lastSlashIndex = key.lastIndexOf('/');
+      if (lastSlashIndex === -1) {
+        return ''; // No path, just filename
+      }
+      
+      return key.substring(0, lastSlashIndex);
+    } catch (error) {
+      console.error('Error extracting path from S3 URL:', error);
+      return '';
+    }
+  }
+
+  // Create versioned filename
+  private createVersionedFilename(originalUrl: string): string {
+    try {
+      // Extract filename from original URL
+      const urlParts = originalUrl.split('/');
+      const filename = urlParts[urlParts.length - 1];
+      console.log(`AgentMode: Extracted filename: ${filename}`);
+      
+      // Split filename into name and extension
+      const lastDotIndex = filename.lastIndexOf('.');
+      if (lastDotIndex === -1) {
+        // No extension, just add version
+        console.log(`AgentMode: No extension found, adding _v2`);
+        return `${filename}_v2`;
+      }
+      
+      const nameWithoutExt = filename.substring(0, lastDotIndex);
+      const extension = filename.substring(lastDotIndex);
+      console.log(`AgentMode: Name without ext: ${nameWithoutExt}, extension: ${extension}`);
+      
+      // Check if filename already has a version pattern (_v followed by digits)
+      const versionMatch = nameWithoutExt.match(/^(.+)_v(\d+)$/);
+      console.log(`AgentMode: Version match result:`, versionMatch);
+      
+      if (versionMatch) {
+        // Extract base name and current version number
+        const baseName = versionMatch[1];
+        const currentVersion = parseInt(versionMatch[2], 10);
+        const newVersion = currentVersion + 1;
+        console.log(`AgentMode: Found existing version ${currentVersion}, incrementing to ${newVersion}`);
+        return `${baseName}_v${newVersion}${extension}`;
+      } else {
+        // No existing version, add _v2
+        console.log(`AgentMode: No existing version found, adding _v2`);
+        return `${nameWithoutExt}_v2${extension}`;
+      }
+    } catch (error) {
+      console.error('Error creating versioned filename:', error);
+      // Fallback: add timestamp to avoid conflicts
+      const timestamp = Date.now();
+      const urlParts = originalUrl.split('/');
+      const filename = urlParts[urlParts.length - 1];
+      const lastDotIndex = filename.lastIndexOf('.');
+      
+      if (lastDotIndex === -1) {
+        return `${filename}_v2_${timestamp}`;
+      } else {
+        const nameWithoutExt = filename.substring(0, lastDotIndex);
+        const extension = filename.substring(lastDotIndex);
+        return `${nameWithoutExt}_v2_${timestamp}${extension}`;
+      }
+    }
+  }
+
+  // Upload updated file content
+  private async uploadUpdatedFile(
+    content: string,
+    filename: string,
+    path: string
+  ): Promise<{ url: string }> {
+    try {
+      // Upload to S3 with the same path as the original file
+      const { uploadFileToS3WithPath } = await import('../utils/s3Utils');
+      const uploadResult = await uploadFileToS3WithPath(content, filename, 'text/html', path);
+      
+      if (!uploadResult.success || !uploadResult.url) {
+        throw new Error(uploadResult.error || 'Failed to upload updated file');
+      }
+      
+      return { url: uploadResult.url };
+    } catch (error) {
+      console.error('Error uploading updated file:', error);
+      throw new Error(`Failed to upload updated file: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  // Create HTML from template with variable substitution
+    private async createHtmlFromTemplate(
+      templateName: string,
+      variableValues: Record<string, string> | undefined,
+      arrayVariableValues: Record<string, string[]> | undefined,
+      userId: string,
+      sessionId: string
+    ): Promise<any> {
+    try {
+      // Get the template
+      const settingName = `email_templates_${userId}`;
+      const setting = await settingsService.getSetting(settingName);
+      
+      if (!setting) {
+        return {
+          success: false,
+          message: 'No email templates found for user'
+        };
+      }
+      
+      let templates = [];
+      try {
+        templates = JSON.parse(setting.settingValue);
+      } catch (error) {
+        console.error('Error parsing email templates:', error);
+        return {
+          success: false,
+          message: 'Failed to parse email templates'
+        };
+      }
+      
+      // Find the specific template
+      const template = templates.find((t: any) => t.template_name === templateName);
+      if (!template) {
+        return {
+          success: false,
+          message: `Template '${templateName}' not found`
+        };
+      }
+
+      // Validate template structure first
+      if (!template.html_content || !template.subject) {
+        return {
+          success: false,
+          message: 'Invalid template structure: missing html_content or subject'
+        };
+      }
+
+      // Validate that all required variables are provided
+      const templateVariables = template.variables || [];
+      const templateArrayVariables = template.arrayVariables || [];
+      
+      // Parameters are already objects
+      const variableValuesObj = variableValues || {};
+      const arrayVariableValuesObj = arrayVariableValues || {};
+      
+      // Check for missing regular variables
+      const missingVariables = templateVariables.filter((variable: string) => 
+        !(variable in variableValuesObj)
+      );
+      
+      // Check for missing array variables
+      const missingArrayVariables = templateArrayVariables.filter((variable: string) => 
+        !(variable in arrayVariableValuesObj)
+      );
+      
+      // Check for extra variables that aren't in the template
+      const extraVariables = Object.keys(variableValuesObj).filter(variable => 
+        !templateVariables.includes(variable)
+      );
+      
+      const extraArrayVariables = Object.keys(arrayVariableValuesObj).filter(variable => 
+        !templateArrayVariables.includes(variable)
+      );
+      
+      // Build validation error message
+      const validationErrors = [];
+      
+      if (missingVariables.length > 0) {
+        validationErrors.push(`Missing required variables: ${missingVariables.join(', ')}`);
+      }
+      
+      if (missingArrayVariables.length > 0) {
+        validationErrors.push(`Missing required array variables: ${missingArrayVariables.join(', ')}`);
+      }
+      
+      if (extraVariables.length > 0) {
+        validationErrors.push(`Extra variables provided: ${extraVariables.join(', ')}`);
+      }
+      
+      if (extraArrayVariables.length > 0) {
+        validationErrors.push(`Extra array variables provided: ${extraArrayVariables.join(', ')}`);
+      }
+      
+      // Validate array variable values are actually arrays
+      const invalidArrayVariables = Object.entries(arrayVariableValuesObj).filter(([key, value]) => 
+        !Array.isArray(value)
+      );
+      
+      if (invalidArrayVariables.length > 0) {
+        validationErrors.push(`Array variable items must be an array: ${invalidArrayVariables.map(([key]) => key).join(', ')}`);
+      }
+      
+      if (validationErrors.length > 0) {
+        return {
+          success: false,
+          message: validationErrors.join('; '),
+          errors: validationErrors,
+          template_variables: templateVariables,
+          template_array_variables: templateArrayVariables
+        };
+      }
+      
+      // Use LLM to handle variable substitution
+      const substitutionPrompt = `You are a template engine. Your task is to replace variables in HTML templates with provided values while preserving the exact same format and structure.
+
+TEMPLATE HTML:
+${template.html_content}
+
+TEMPLATE SUBJECT:
+${template.subject}
+
+VARIABLE VALUES:
+${JSON.stringify(variableValuesObj, null, 2)}
+
+ARRAY VARIABLE VALUES:
+${JSON.stringify(arrayVariableValuesObj, null, 2)}
+
+CRITICAL INSTRUCTIONS:
+1. PRESERVE THE EXACT FORMAT: Keep the same HTML structure, tags, classes, and styling as the original template
+2. REPLACE VARIABLES: Replace all {{variable_name}} placeholders with corresponding values
+3. ARRAY VARIABLES: For array variables, repeat the surrounding HTML structure for each array item
+   - If {{array_var}} is inside a <li> tag, repeat the <li> tag for each array item
+   - If {{array_var}} is inside a <div> tag, repeat the <div> tag for each array item
+   - Maintain the exact same HTML structure around the array variable
+4. VALID HTML: Ensure the final HTML is valid and well-formatted
+5. NO STRUCTURAL CHANGES: Do not add new HTML elements, change classes, or modify the template structure
+6. EXACT REPLACEMENT: Only replace {{}} placeholders, keep everything else identical
+
+RESPONSE FORMAT:
+You must return a valid JSON object with exactly these two fields:
+{
+  "final_html": "final HTML content with variables replaced but structure preserved",
+  "final_subject": "final subject with variables replaced"
+}
+
+IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
+
+      const substitutionResponse = await this.openai.chat.completions.create({
+        model: process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
+        messages: [
+          {
+            role: 'user',
+            content: substitutionPrompt
+          }
+        ],
+        temperature: 0.1,
+        response_format: { type: 'json_object' }
+      });
+
+      const substitutionResult = substitutionResponse.choices[0].message.content;
+      if (!substitutionResult) {
+        throw new Error('LLM did not return substitution result');
+      }
+
+      let substitutionData;
+      try {
+        substitutionData = JSON.parse(substitutionResult);
+      } catch (parseError) {
+        throw new Error('LLM returned invalid JSON for variable substitution');
+      }
+
+      if (!substitutionData.final_html || !substitutionData.final_subject) {
+        throw new Error('LLM substitution result missing final_html or final_subject fields');
+      }
+
+      const finalHtml = substitutionData.final_html;
+      const finalSubject = substitutionData.final_subject;
+      
+      // Verify the substitution was correct
+      const remainingPlaceholders = finalHtml.match(/\{\{[^}]+\}\}/g) || [];
+      const remainingSubjectPlaceholders = finalSubject.match(/\{\{[^}]+\}\}/g) || [];
+      
+      if (remainingPlaceholders.length > 0 || remainingSubjectPlaceholders.length > 0) {
+        console.warn('Warning: Some variables were not substituted:', {
+          htmlPlaceholders: remainingPlaceholders,
+          subjectPlaceholders: remainingSubjectPlaceholders
+        });
+      }
+      
+      // Verify HTML structure is preserved (basic check)
+      const originalTagCount = (template.html_content.match(/<[^>]+>/g) || []).length;
+      const finalTagCount = (finalHtml.match(/<[^>]+>/g) || []).length;
+      
+      // Allow for some variation due to array repetition, but flag significant changes
+      const tagDifference = Math.abs(originalTagCount - finalTagCount);
+      if (tagDifference > originalTagCount * 0.5) { // More than 50% change in tag count
+        console.warn('Warning: Significant HTML structure change detected:', {
+          originalTagCount,
+          finalTagCount,
+          difference: tagDifference
+        });
+      }
+      
+      // Upload to S3
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const filename = `html_${templateName}.html`;
+      const uploadResult = await uploadFileToS3(finalHtml, filename, userId, 'text/html');
+      
+      if (!uploadResult.success || !uploadResult.url) {
+        throw new Error(uploadResult.error || 'Failed to upload to S3');
+      }
+      
+      const s3Url = uploadResult.url;
+      
+      return {
+        success: true,
+        s3_url: s3Url,
+        final_subject: finalSubject,
+        template_name: templateName,
+        filename: filename
+      };
+    } catch (error) {
+      console.error('Error creating email HTML from template:', error);
+      
+      // Return specific error messages based on the error type
+      if (error instanceof Error) {
+        if (error.message.includes('Failed to process template with LLM') || error.message.includes('OpenAI API error')) {
+          return {
+            success: false,
+            message: 'Failed to process template with LLM',
+            error: error.message
+          };
+        } else if (error.message.includes('LLM returned invalid JSON')) {
+          return {
+            success: false,
+            message: 'Failed to parse LLM response',
+            error: error.message
+          };
+        } else if (error.message.includes('missing final_html or final_subject')) {
+          return {
+            success: false,
+            message: 'LLM response missing final_html',
+            error: error.message
+          };
+        } else if (error.message.includes('Failed to upload to S3') || error.message.includes('S3 upload failed')) {
+          return {
+            success: false,
+            message: 'Failed to upload to S3',
+            error: error.message
+          };
+        }
+      }
+      
+      return {
+        success: false,
+        message: 'Failed to create email HTML from template',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // Extract variables from HTML content and subject (same logic as in settings.ts)
+  private extractVariables(htmlContent: string, subject?: string): { variables: string[], arrayVariables: string[] } {
+    const variableRegex = /\{\{([^}]+)\}\}/g;
+    const allVariables: string[] = [];
+    const regularVariables: string[] = [];
+    const arrayVariableNames = new Set<string>();
+    let match;
+
+    // Collect all variables from HTML content
+    while ((match = variableRegex.exec(htmlContent)) !== null) {
+      const variable = match[1].trim();
+      if (!allVariables.includes(variable)) {
+        allVariables.push(variable);
+      }
+    }
+
+    // Also collect variables from subject if provided
+    if (subject) {
+      const subjectRegex = /\{\{([^}]+)\}\}/g;
+      let subjectMatch;
+      while ((subjectMatch = subjectRegex.exec(subject)) !== null) {
+        const variable = subjectMatch[1].trim();
+        if (!allVariables.includes(variable)) {
+          allVariables.push(variable);
+        }
+      }
+    }
+
+    // Find all _n and _n_ patterns first
+    const nPatterns = new Set<string>();
+    allVariables.forEach(variable => {
+      const nMatch = variable.match(/^(.+)_n(?:_(.+))?$/);
+      if (nMatch) {
+        const baseName = nMatch[1];
+        const suffix = nMatch[2];
+        if (suffix) {
+          nPatterns.add(`${baseName}_n_${suffix}`);
+        } else {
+          nPatterns.add(`${baseName}_n`);
+        }
+      }
+    });
+
+    // Now process all variables
+    const processedArrayNames = new Set<string>();
+
+    allVariables.forEach(variable => {
+      let isArrayVariable = false;
+
+      // Check if this variable matches any _n pattern
+      nPatterns.forEach(nPattern => {
+        const baseName = nPattern.replace(/_n.*$/, '');
+        const numericMatch = variable.match(new RegExp(`^${baseName}_(\\d+)(?:_|$)`));
+        if (numericMatch) {
+          if (!processedArrayNames.has(nPattern)) {
+            arrayVariableNames.add(nPattern);
+            processedArrayNames.add(nPattern);
+          }
+          isArrayVariable = true;
+        }
+      });
+
+      // Check if this is already an _n pattern
+      const nMatch = variable.match(/^(.+)_n(?:_(.+))?$/);
+      if (nMatch) {
+        const baseName = nMatch[1];
+        const suffix = nMatch[2];
+        const fullName = suffix ? `${baseName}_n_${suffix}` : `${baseName}_n`;
+        if (!processedArrayNames.has(fullName)) {
+          arrayVariableNames.add(fullName);
+          processedArrayNames.add(fullName);
+        }
+        isArrayVariable = true;
+      }
+
+      if (!isArrayVariable) {
+        regularVariables.push(variable);
+      }
+    });
+
+    return { variables: regularVariables, arrayVariables: Array.from(arrayVariableNames) };
   }
 
 

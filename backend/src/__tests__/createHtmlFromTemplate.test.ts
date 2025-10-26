@@ -1,0 +1,424 @@
+import { AgentModeService } from '../services/agentModeService';
+import { settingsService } from '../services/settingsService';
+
+// Mock AWS SDK
+jest.mock('aws-sdk', () => ({
+  DynamoDB: {
+    DocumentClient: jest.fn(() => ({
+      put: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+      get: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+      scan: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+      query: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+      update: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+      delete: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+    }))
+  },
+  S3: jest.fn(() => ({
+    upload: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+    getObject: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+  })),
+  SecretsManager: jest.fn(() => ({
+    getSecretValue: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+  })),
+  config: {
+    update: jest.fn()
+  }
+}));
+
+// Mock axios
+jest.mock('axios', () => ({
+  get: jest.fn(),
+  post: jest.fn()
+}));
+
+// Mock crypto
+jest.mock('crypto', () => ({
+  createHash: jest.fn(() => ({
+    update: jest.fn().mockReturnThis(),
+    digest: jest.fn().mockReturnValue('mock-hash')
+  })),
+  getRandomValues: jest.fn((arr) => {
+    for (let i = 0; i < arr.length; i++) {
+      arr[i] = Math.floor(Math.random() * 256);
+    }
+    return arr;
+  })
+}));
+
+// Mock settingsService
+jest.mock('../services/settingsService', () => ({
+  settingsService: {
+    getSetting: jest.fn()
+  }
+}));
+
+// Mock s3Utils
+jest.mock('../utils/s3Utils', () => ({
+  uploadFileToS3: jest.fn().mockResolvedValue({
+    success: true,
+    url: 'https://s3.amazonaws.com/bucket/test-template.html'
+  })
+}));
+
+// Mock OpenAI
+jest.mock('openai', () => ({
+  __esModule: true,
+  default: jest.fn(() => ({
+    chat: {
+      completions: {
+        create: jest.fn()
+      }
+    }
+  }))
+}));
+
+describe('AgentModeService - createHtmlFromTemplate', () => {
+  let agentModeService: AgentModeService;
+  let mockOpenAI: any;
+  let mockAxios: any;
+  let mockS3: any;
+
+  beforeEach(() => {
+    // Clear all mocks
+    jest.clearAllMocks();
+
+    // Setup OpenAI mock
+    const OpenAI = require('openai').default;
+    mockOpenAI = {
+      chat: {
+        completions: {
+          create: jest.fn()
+        }
+      }
+    };
+    OpenAI.mockImplementation(() => mockOpenAI);
+
+    // Setup axios mock
+    const axios = require('axios');
+    mockAxios = axios;
+
+    // Setup S3 mock
+    const AWS = require('aws-sdk');
+    mockS3 = new AWS.S3();
+
+    // Setup crypto mock
+    const { createHash } = require('crypto');
+    const mockHash = {
+      update: jest.fn().mockReturnThis(),
+      digest: jest.fn().mockReturnValue('test-hash-123')
+    };
+    createHash.mockReturnValue(mockHash);
+
+    // Create service instance
+    agentModeService = new AgentModeService();
+  });
+
+  describe('createHtmlFromTemplate', () => {
+    const mockTemplate = {
+      template_name: 'test-template',
+      html_content: '<html><body><h1>{{title}}</h1><p>{{content}}</p></body></html>',
+      subject: 'Test Subject: {{title}}',
+      variables: ['title', 'content'],
+      arrayVariables: []
+    };
+
+    beforeEach(() => {
+      // Mock the settingsService to return the template
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([mockTemplate])
+      });
+
+      // Mock OpenAI response
+      mockOpenAI.chat.completions.create.mockResolvedValue({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              final_html: '<html><body><h1>Test Title</h1><p>Test Content</p></body></html>',
+              final_subject: 'Test Subject: Test Title'
+            })
+          }
+        }]
+      });
+
+      // Mock S3 upload
+      mockS3.upload().promise.mockResolvedValue({
+        Location: 'https://s3.amazonaws.com/bucket/test-template.html'
+      });
+    });
+
+    it('should create HTML from template with valid parameters', async () => {
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        'test-template',
+        { title: 'Test Title', content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.s3_url).toBe('https://s3.amazonaws.com/bucket/test-template.html');
+      expect(result.final_subject).toBe('Test Subject: Test Title');
+      expect(mockOpenAI.chat.completions.create).toHaveBeenCalledWith({
+        model: 'gpt-5-chat-2',
+        messages: expect.arrayContaining([
+          expect.objectContaining({
+            role: 'user',
+            content: expect.stringContaining('You are a template engine')
+          })
+        ]),
+        temperature: 0.1,
+        response_format: { type: 'json_object' }
+      });
+    });
+
+    it('should handle array variables correctly', async () => {
+      const templateWithArrays = {
+        ...mockTemplate,
+        arrayVariables: ['items'],
+        html_content: '<html><body><ul>{{#items}}<li>{{item}}</li>{{/items}}</ul></body></html>'
+      };
+
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([templateWithArrays])
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        'test-template',
+        { title: 'Test Title', content: 'Test Content' },
+        { items: [{ item: 'Item 1' }, { item: 'Item 2' }] },
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      expect(mockOpenAI.chat.completions.create).toHaveBeenCalled();
+    });
+
+    it('should validate that all required variables are provided', async () => {
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        'test-template',
+        { title: 'Test Title' }, // Missing 'content'
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Missing required variables');
+      expect(result.message).toContain('content');
+    });
+
+    it('should validate that no extra variables are provided', async () => {
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        'test-template',
+        { title: 'Test Title', content: 'Test Content', extra: 'Extra' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Extra variables provided');
+      expect(result.message).toContain('extra');
+    });
+
+    it('should validate array variables are arrays', async () => {
+      const templateWithArrays = {
+        ...mockTemplate,
+        arrayVariables: ['items']
+      };
+
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([templateWithArrays])
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        'test-template',
+        { title: 'Test Title', content: 'Test Content' },
+        { items: 'not-an-array' }, // Should be array
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Array variable items must be an array');
+    });
+
+    it('should handle template not found', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([]) // Empty templates array
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        'nonexistent-template',
+        { title: 'Test Title', content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Template \'nonexistent-template\' not found');
+    });
+
+    it('should handle OpenAI API errors', async () => {
+      mockOpenAI.chat.completions.create.mockRejectedValue(new Error('OpenAI API error'));
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        'test-template',
+        { title: 'Test Title', content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Failed to process template with LLM');
+    });
+
+    it('should handle invalid LLM response', async () => {
+      mockOpenAI.chat.completions.create.mockResolvedValue({
+        choices: [{
+          message: {
+            content: 'invalid-json-response'
+          }
+        }]
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        'test-template',
+        { title: 'Test Title', content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Failed to parse LLM response');
+    });
+
+    it('should handle missing final_html in LLM response', async () => {
+      mockOpenAI.chat.completions.create.mockResolvedValue({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              final_subject: 'Test Subject: Test Title'
+              // Missing final_html
+            })
+          }
+        }]
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        'test-template',
+        { title: 'Test Title', content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('LLM response missing final_html');
+    });
+
+    it('should handle S3 upload errors', async () => {
+      const { uploadFileToS3 } = require('../utils/s3Utils');
+      uploadFileToS3.mockResolvedValueOnce({
+        success: false,
+        error: 'S3 upload failed'
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        'test-template',
+        { title: 'Test Title', content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Failed to upload to S3');
+    });
+
+    it('should include proper metadata in S3 upload', async () => {
+      const { uploadFileToS3 } = require('../utils/s3Utils');
+      
+      await (agentModeService as any).createHtmlFromTemplate(
+        'test-template',
+        { title: 'Test Title', content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(uploadFileToS3).toHaveBeenCalledWith(
+        expect.any(String), // finalHtml
+        'html_test-template.html', // filename
+        'user123', // userId
+        'text/html' // contentType
+      );
+    });
+
+    it('should handle undefined variable_values and array_variable_values', async () => {
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        'test-template',
+        undefined,
+        undefined,
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Missing required variables');
+    });
+
+    it('should validate template structure', async () => {
+      const invalidTemplate = {
+        template_name: 'test-template',
+        // Missing required fields
+      };
+
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([invalidTemplate])
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        'test-template',
+        { title: 'Test Title', content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Invalid template structure');
+    });
+
+    it('should handle complex array variables', async () => {
+      const templateWithComplexArrays = {
+        ...mockTemplate,
+        arrayVariables: ['items', 'categories'],
+        html_content: '<html><body><ul>{{#items}}<li>{{name}} - {{price}}</li>{{/items}}</ul><div>{{#categories}}<span>{{cat}}</span>{{/categories}}</div></body></html>',
+        subject: 'Test Subject: {{title}}'
+      };
+
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([templateWithComplexArrays])
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        'test-template',
+        { title: 'Test Title', content: 'Test Content' },
+        {
+          items: [{ name: 'Item 1', price: '$10' }, { name: 'Item 2', price: '$20' }],
+          categories: [{ cat: 'Electronics' }, { cat: 'Books' }]
+        },
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      expect(mockOpenAI.chat.completions.create).toHaveBeenCalled();
+    });
+  });
+});

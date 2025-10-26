@@ -7,6 +7,27 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-10-26',
+    changes: [
+      'Added Email Templates Management Page',
+      '- New Email Templates page in Brand Settings for creating and managing HTML email templates with variables',
+      '- Templates support both regular variables (e.g., {{title}}) and array variables (e.g., {{item_n}}) for dynamic content',
+      '- Built-in template preview functionality to visualize how templates look with sample data',
+      'Enhanced Agent Mode with Template Support',
+      '- Agent Mode can now list all available HTML email templates using list_html_templates function',
+      '- New create_html_from_template function allows generating HTML emails from templates with provided variable values',
+      '- Supports both regular and array variable substitution for dynamic content generation',
+      '- Templates are automatically uploaded to S3 with final subject line metadata',
+    ],
+  },
+  {
+    date: '2025-10-24',
+    changes: [
+      'Fixed Templates Section Navigation in Customer Portal',
+      '- Resolved issue where Templates section in sidebar stopped working after Agent Mode became the default page',
+    ],
+  },
+  {
     date: '2025-10-23',
     changes: [
       'Fixed Daily Digest Email Bug for Hourly Schedules',
