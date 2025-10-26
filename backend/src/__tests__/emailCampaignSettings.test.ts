@@ -406,4 +406,287 @@ describe('Email Campaign Settings API', () => {
       expect(response.body).toEqual({ taskIds: [] });
     });
   });
+
+  describe('POST /api/settings/email-templates', () => {
+    it('should create a new template with variables from request body', async () => {
+      mockedSettingsService.getSetting.mockResolvedValue(null);
+      mockedSettingsService.setSetting.mockResolvedValue();
+
+      const templateData = {
+        template_name: 'test_template',
+        subject: 'Test {{subject_var}}',
+        html_content: '<h1>{{title}}</h1><p>{{content}}</p>',
+        variables: ['title', 'content'],
+        arrayVariables: []
+      };
+
+      const response = await request(app)
+        .post('/api/settings/email-templates')
+        .send(templateData)
+        .expect(200);
+
+      expect(response.body.success).toBe(true);
+      expect(response.body.template.template_name).toBe('test_template');
+      expect(response.body.template.variables).toEqual(['title', 'content']);
+      expect(response.body.template.arrayVariables).toEqual([]);
+      
+      expect(mockedSettingsService.getSetting).toHaveBeenCalledWith('email_templates_test-user-123');
+      expect(mockedSettingsService.setSetting).toHaveBeenCalledWith(
+        'email_templates_test-user-123',
+        expect.any(String),
+        'User email templates',
+        'test@example.com'
+      );
+    });
+
+    it('should update an existing template with new variables', async () => {
+      const existingTemplates = [{
+        template_name: 'test_template',
+        subject: 'Old {{old_var}}',
+        html_content: '<p>{{old_content}}</p>',
+        variables: ['old_var', 'old_content'],
+        arrayVariables: [],
+        created_at: '2024-01-01T00:00:00.000Z',
+        updated_at: '2024-01-01T00:00:00.000Z'
+      }];
+
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'email_templates_test-user-123',
+        settingValue: JSON.stringify(existingTemplates),
+        description: 'User email templates',
+        updatedBy: 'test@example.com',
+        updatedAt: new Date().toISOString()
+      });
+      mockedSettingsService.setSetting.mockResolvedValue();
+
+      const updateData = {
+        template_name: 'test_template',
+        subject: 'New {{new_var}}',
+        html_content: '<h1>{{new_title}}</h1>',
+        variables: ['new_var', 'new_title'],
+        arrayVariables: ['news_n_content']
+      };
+
+      const response = await request(app)
+        .post('/api/settings/email-templates')
+        .send(updateData)
+        .expect(200);
+
+      expect(response.body.success).toBe(true);
+      expect(response.body.template.variables).toEqual(['new_var', 'new_title']);
+      expect(response.body.template.arrayVariables).toEqual(['news_n_content']);
+      expect(response.body.template.created_at).toBe('2024-01-01T00:00:00.000Z');
+      expect(response.body.template.updated_at).not.toBe('2024-01-01T00:00:00.000Z');
+    });
+
+    it('should extract variables when not provided in request', async () => {
+      mockedSettingsService.getSetting.mockResolvedValue(null);
+      mockedSettingsService.setSetting.mockResolvedValue();
+
+      const templateData = {
+        template_name: 'auto_extract_template',
+        subject: 'Subject with {{subject_var}}',
+        html_content: '<h1>{{title}}</h1><div>{{item_1}}</div><div>{{item_n}}</div>'
+      };
+
+      const response = await request(app)
+        .post('/api/settings/email-templates')
+        .send(templateData)
+        .expect(200);
+
+      expect(response.body.success).toBe(true);
+      // Should have extracted variables
+      expect(response.body.template.variables).toBeDefined();
+      expect(response.body.template.arrayVariables).toBeDefined();
+      // item_1 should be merged into item_n array
+      expect(response.body.template.variables).not.toContain('item_1');
+    });
+
+    it('should return 400 when required fields are missing', async () => {
+      const incompleteData = {
+        template_name: 'incomplete'
+        // missing subject and html_content
+      };
+
+      const response = await request(app)
+        .post('/api/settings/email-templates')
+        .send(incompleteData)
+        .expect(400);
+
+      expect(response.body.error).toContain('required');
+    });
+
+    it('should handle array variables correctly', async () => {
+      mockedSettingsService.getSetting.mockResolvedValue(null);
+      mockedSettingsService.setSetting.mockResolvedValue();
+
+      const templateData = {
+        template_name: 'array_template',
+        subject: 'Newsletter',
+        html_content: '<div>{{amino_news_1_content}}</div><div>{{amino_news_2_content}}</div><div>{{amino_news_n_content}}</div>',
+        variables: ['other_var'],
+        arrayVariables: ['amino_news_n_content']
+      };
+
+      const response = await request(app)
+        .post('/api/settings/email-templates')
+        .send(templateData)
+        .expect(200);
+
+      expect(response.body.success).toBe(true);
+      expect(response.body.template.arrayVariables).toContain('amino_news_n_content');
+      expect(response.body.template.variables).not.toContain('amino_news_1_content');
+      expect(response.body.template.variables).not.toContain('amino_news_2_content');
+    });
+
+    it('should return 401 when user is not authenticated', async () => {
+      mockedAuthenticateToken.mockImplementation(async (req, res, next) => {
+        (req as any).user = null;
+        next();
+        return undefined;
+      });
+
+      const templateData = {
+        template_name: 'test',
+        subject: 'Test',
+        html_content: '<p>Test</p>'
+      };
+
+      const response = await request(app)
+        .post('/api/settings/email-templates')
+        .send(templateData)
+        .expect(401);
+
+      expect(response.body).toEqual({ error: 'Unauthorized' });
+    });
+  });
+
+  describe('GET /api/settings/email-templates', () => {
+    it('should return empty array when no templates exist', async () => {
+      mockedSettingsService.getSetting.mockResolvedValue(null);
+
+      const response = await request(app)
+        .get('/api/settings/email-templates')
+        .expect(200);
+
+      expect(response.body.templates).toEqual([]);
+    });
+
+    it('should return templates with variables', async () => {
+      const mockTemplates = [
+        {
+          template_name: 'template1',
+          subject: 'Subject',
+          html_content: '<h1>{{title}}</h1>',
+          variables: ['title'],
+          arrayVariables: ['news_n_content'],
+          created_at: '2024-01-01T00:00:00.000Z',
+          updated_at: '2024-01-01T00:00:00.000Z'
+        }
+      ];
+
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'email_templates_test-user-123',
+        settingValue: JSON.stringify(mockTemplates),
+        description: 'User email templates',
+        updatedBy: 'test@example.com',
+        updatedAt: new Date().toISOString()
+      });
+
+      const response = await request(app)
+        .get('/api/settings/email-templates')
+        .expect(200);
+
+      expect(response.body.templates).toHaveLength(1);
+      expect(response.body.templates[0].variables).toEqual(['title']);
+      expect(response.body.templates[0].arrayVariables).toEqual(['news_n_content']);
+    });
+
+    it('should add backward compatibility for templates without variables', async () => {
+      const mockTemplates = [
+        {
+          template_name: 'old_template',
+          subject: 'Subject with {{old_var}}',
+          html_content: '<h1>{{title}}</h1><div>{{item_1}}</div><div>{{item_n}}</div>',
+          created_at: '2024-01-01T00:00:00.000Z',
+          updated_at: '2024-01-01T00:00:00.000Z'
+        }
+      ];
+
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'email_templates_test-user-123',
+        settingValue: JSON.stringify(mockTemplates),
+        description: 'User email templates',
+        updatedBy: 'test@example.com',
+        updatedAt: new Date().toISOString()
+      });
+      mockedSettingsService.setSetting.mockResolvedValue();
+
+      const response = await request(app)
+        .get('/api/settings/email-templates')
+        .expect(200);
+
+      expect(response.body.templates).toHaveLength(1);
+      expect(response.body.templates[0].variables).toBeDefined();
+      expect(response.body.templates[0].arrayVariables).toBeDefined();
+      // Should have called setSetting to update the template with variables
+      expect(mockedSettingsService.setSetting).toHaveBeenCalled();
+    });
+  });
+
+  describe('DELETE /api/settings/email-templates/:templateName', () => {
+    it('should delete an existing template', async () => {
+      const mockTemplates = [
+        {
+          template_name: 'template1',
+          subject: 'Subject',
+          html_content: '<p>Content</p>',
+          variables: [],
+          arrayVariables: [],
+          created_at: '2024-01-01T00:00:00.000Z',
+          updated_at: '2024-01-01T00:00:00.000Z'
+        },
+        {
+          template_name: 'template2',
+          subject: 'Subject 2',
+          html_content: '<p>Content 2</p>',
+          variables: [],
+          arrayVariables: [],
+          created_at: '2024-01-02T00:00:00.000Z',
+          updated_at: '2024-01-02T00:00:00.000Z'
+        }
+      ];
+
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'email_templates_test-user-123',
+        settingValue: JSON.stringify(mockTemplates),
+        description: 'User email templates',
+        updatedBy: 'test@example.com',
+        updatedAt: new Date().toISOString()
+      });
+      mockedSettingsService.setSetting.mockResolvedValue();
+
+      const response = await request(app)
+        .delete('/api/settings/email-templates/template1')
+        .expect(200);
+
+      expect(response.body.success).toBe(true);
+      expect(mockedSettingsService.setSetting).toHaveBeenCalledWith(
+        'email_templates_test-user-123',
+        expect.stringContaining('template2'),
+        'User email templates',
+        'test@example.com'
+      );
+    });
+
+    it('should return 404 when no templates exist', async () => {
+      mockedSettingsService.getSetting.mockResolvedValue(null);
+
+      const response = await request(app)
+        .delete('/api/settings/email-templates/nonexistent')
+        .expect(404);
+
+      expect(response.body.error).toBe('No templates found');
+    });
+  });
 });
