@@ -522,6 +522,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 items: { type: 'string' },
                 description: 'Array of file URLs to attach to this task. These should be URLs from files uploaded in the current conversation.',
                 default: []
+              },
+              async: {
+                type: 'boolean',
+                description: 'Whether to execute the task asynchronously. If false, the function will wait for task completion before returning the final result.',
+                default: true
               }
             },
             required: ['template_id', 'parameters_json']
@@ -689,6 +694,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 items: { type: 'string' },
                 description: 'Array of file URLs to attach to this task. These should be URLs from files uploaded in the current conversation.',
                 default: []
+              },
+              async: {
+                type: 'boolean',
+                description: 'Whether to execute the task asynchronously. If false, the function will wait for task completion before returning the final result.',
+                default: true
               }
             },
             required: ['task_name', 'prompt', 'category']
@@ -1057,7 +1067,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 },
                 replacement_json: {
                   type: 'string',
-                  description: 'JSON string containing a list of replacement instructions. For full replacement: [{"old_file_hash": "abc123...", "new_content": "<!DOCTYPE html>...", "expected_count": 1}]. For part replacement: [{"old_content": "<h1>Old Title</h1>", "new_content": "<h1>New Title</h1>", "expected_count": 1}]'
+                  description: 'JSON string containing a list of replacement instructions. For full replacement: [{"old_file_hash": "abc123...", "new_content": "<!DOCTYPE html>...", "expected_count": 1}]. For part replacement: [{"old_content": "<h1>Old Title</h1>", "new_content": "<h1>New Title</h1>", "expected_count": 1}]. Use empty string for new_content to delete the specified content.'
                 }
               },
               required: ['file_url', 'update_type', 'replacement_json']
@@ -1637,7 +1647,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
           const parameters = JSON.parse(args.parameters_json || '{}');
           const attachPreviousTaskResults = args.attach_previous_task_results !== false;
           const attachedFileUrls = args.attached_file_urls || [];
-          return await this.createTaskFromTemplate(args.template_id, parameters, userId, sessionId, attachPreviousTaskResults, attachedFileUrls);
+          const async = args.async !== false; // Default to true
+          return await this.createTaskFromTemplate(args.template_id, parameters, userId, sessionId, attachPreviousTaskResults, attachedFileUrls, async);
         } catch (parseError) {
           console.error('AgentMode: Error parsing parameters JSON:', parseError);
           return {
@@ -1649,7 +1660,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'create_task_from_prompt':
         const attachPreviousTaskResults = args.attach_previous_task_results !== false;
         const attachedFileUrls = args.attached_file_urls || [];
-        return await this.createTaskFromPrompt(args.task_name, args.prompt, args.category, userId, sessionId, attachPreviousTaskResults, attachedFileUrls);
+        const async = args.async !== false; // Default to true
+        return await this.createTaskFromPrompt(args.task_name, args.prompt, args.category, userId, sessionId, attachPreviousTaskResults, attachedFileUrls, async);
       case 'create_image_task_from_prompt':
         const attachPreviousTaskResultsForImage = args.attach_previous_task_results !== false;
         return await this.createImageTaskFromPrompt(args.task_name, args.prompt, args.category || 'Creatives', userId, sessionId, attachPreviousTaskResultsForImage);
@@ -2420,8 +2432,50 @@ Use the available tools to create tasks in the agent-engine when complex work is
     });
   }
 
+  // Helper function to wait for task completion
+  private async waitForTaskCompletion(taskId: string, executionId: string, userId: string, maxWaitTime: number = 300000, additionalFields: any = {}): Promise<any> {
+    const startTime = Date.now();
+    const pollInterval = 2000; // Poll every 2 seconds
+    
+    while (Date.now() - startTime < maxWaitTime) {
+      try {
+        const execution = await taskDb.getTaskExecutionById(executionId);
+        if (execution && (execution.status === 'completed' || execution.status === 'failed')) {
+          return {
+            success: execution.status === 'completed',
+            message: execution.status === 'completed' 
+              ? 'Task completed successfully' 
+              : `Task failed: ${execution.error || 'Unknown error'}`,
+            status: execution.status,
+            taskId: taskId,
+            executionId: executionId,
+            result: execution.result,
+            error: execution.error,
+            ...additionalFields
+          };
+        }
+        
+        // Wait before next poll
+        await new Promise(resolve => setTimeout(resolve, pollInterval));
+      } catch (error) {
+        console.error('AgentMode: Error polling task execution:', error);
+        await new Promise(resolve => setTimeout(resolve, pollInterval));
+      }
+    }
+    
+    // Timeout reached - return async format
+    return {
+      success: true,
+      message: `Task "${additionalFields.taskName || 'Unknown'}" has been created successfully. The task is still running and may complete later.`,
+      status: 'pending',
+      taskId: taskId,
+      executionId: executionId,
+      ...additionalFields
+    };
+  }
+
   // Create task from template
-  private async createTaskFromTemplate(templateId: string, parameters: Record<string, string>, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true, attachedFileUrls: string[] = []): Promise<any> {
+  private async createTaskFromTemplate(templateId: string, parameters: Record<string, string>, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true, attachedFileUrls: string[] = [], async: boolean = true): Promise<any> {
     try {
 
       // Validate parameters
@@ -2564,6 +2618,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
         startTime: new Date().toISOString()
       });
 
+      // If async is false, wait for task completion
+      if (!async && execution?.executionId) {
+        return await this.waitForTaskCompletion(task.taskId, execution.executionId, userId, 300000, {
+          templateName: templateData.name,
+          taskName: taskName
+        });
+      }
 
       return {
         success: true,
@@ -2585,7 +2646,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   // Create task from raw prompt
-  private async createTaskFromPrompt(taskName: string, prompt: string, category: string, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true, attachedFileUrls: string[] = []): Promise<any> {
+  private async createTaskFromPrompt(taskName: string, prompt: string, category: string, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true, attachedFileUrls: string[] = [], async: boolean = true): Promise<any> {
     try {
 
       // Attach previous task results if requested
@@ -2641,6 +2702,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
         startTime: new Date().toISOString()
       });
 
+      // If async is false, wait for task completion
+      if (!async && execution?.executionId) {
+        return await this.waitForTaskCompletion(task.taskId, execution.executionId, userId, 300000, {
+          taskName: taskName
+        });
+      }
 
       return {
         success: true,
@@ -4946,7 +5013,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       for (let i = 0; i < replacementInstructions.length; i++) {
         const instruction = replacementInstructions[i];
         
-        if (!instruction.new_content || instruction.expected_count === undefined) {
+        if (instruction.new_content === undefined || instruction.expected_count === undefined) {
           return {
             success: false,
             message: `Missing required fields in replacement instruction ${i + 1}: new_content and expected_count are required`
