@@ -319,9 +319,8 @@ router.post('/', authenticateToken, requireAdmin, async (req, res) => {
 router.delete('/:settingName', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { settingName } = req.params;
-    const deletedBy = req.user?.email || 'unknown';
     
-    await settingsService.deleteSetting(settingName, deletedBy);
+    await settingsService.deleteSetting(settingName);
     res.json({ success: true, message: 'Setting deleted successfully' });
   } catch (error) {
     console.error('Error deleting setting:', error);
