@@ -410,7 +410,13 @@ describe('Email Campaign Settings API', () => {
   describe('POST /api/settings/email-templates', () => {
     it('should create a new template with variables from request body', async () => {
       mockedSettingsService.getSetting.mockResolvedValue(null);
-      mockedSettingsService.setSetting.mockResolvedValue();
+      mockedSettingsService.setSetting.mockResolvedValue({
+        settingName: 'email_templates_test-user-123',
+        settingValue: expect.any(String),
+        description: 'User email templates',
+        updatedBy: 'test@example.com',
+        updatedAt: expect.any(String)
+      });
 
       const templateData = {
         template_name: 'test_template',
@@ -457,7 +463,13 @@ describe('Email Campaign Settings API', () => {
         updatedBy: 'test@example.com',
         updatedAt: new Date().toISOString()
       });
-      mockedSettingsService.setSetting.mockResolvedValue();
+      mockedSettingsService.setSetting.mockResolvedValue({
+        settingName: 'email_templates_test-user-123',
+        settingValue: expect.any(String),
+        description: 'User email templates',
+        updatedBy: 'test@example.com',
+        updatedAt: expect.any(String)
+      });
 
       const updateData = {
         template_name: 'test_template',
@@ -481,7 +493,13 @@ describe('Email Campaign Settings API', () => {
 
     it('should extract variables when not provided in request', async () => {
       mockedSettingsService.getSetting.mockResolvedValue(null);
-      mockedSettingsService.setSetting.mockResolvedValue();
+      mockedSettingsService.setSetting.mockResolvedValue({
+        settingName: 'email_templates_test-user-123',
+        settingValue: expect.any(String),
+        description: 'User email templates',
+        updatedBy: 'test@example.com',
+        updatedAt: expect.any(String)
+      });
 
       const templateData = {
         template_name: 'auto_extract_template',
@@ -518,7 +536,13 @@ describe('Email Campaign Settings API', () => {
 
     it('should handle array variables correctly', async () => {
       mockedSettingsService.getSetting.mockResolvedValue(null);
-      mockedSettingsService.setSetting.mockResolvedValue();
+      mockedSettingsService.setSetting.mockResolvedValue({
+        settingName: 'email_templates_test-user-123',
+        settingValue: expect.any(String),
+        description: 'User email templates',
+        updatedBy: 'test@example.com',
+        updatedAt: expect.any(String)
+      });
 
       const templateData = {
         template_name: 'array_template',
@@ -620,7 +644,13 @@ describe('Email Campaign Settings API', () => {
         updatedBy: 'test@example.com',
         updatedAt: new Date().toISOString()
       });
-      mockedSettingsService.setSetting.mockResolvedValue();
+      mockedSettingsService.setSetting.mockResolvedValue({
+        settingName: 'email_templates_test-user-123',
+        settingValue: expect.any(String),
+        description: 'User email templates',
+        updatedBy: 'test@example.com',
+        updatedAt: expect.any(String)
+      });
 
       const response = await request(app)
         .get('/api/settings/email-templates')
@@ -664,7 +694,13 @@ describe('Email Campaign Settings API', () => {
         updatedBy: 'test@example.com',
         updatedAt: new Date().toISOString()
       });
-      mockedSettingsService.setSetting.mockResolvedValue();
+      mockedSettingsService.setSetting.mockResolvedValue({
+        settingName: 'email_templates_test-user-123',
+        settingValue: expect.any(String),
+        description: 'User email templates',
+        updatedBy: 'test@example.com',
+        updatedAt: expect.any(String)
+      });
 
       const response = await request(app)
         .delete('/api/settings/email-templates/template1')
