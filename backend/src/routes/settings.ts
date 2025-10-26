@@ -166,7 +166,7 @@ router.post('/email-templates', authenticateToken, async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
     
-    const { template_name, subject, html_content } = req.body;
+    const { template_name, subject, html_content, variables, arrayVariables } = req.body;
     
     if (!template_name || !subject || !html_content) {
       return res.status(400).json({ 
@@ -187,8 +187,14 @@ router.post('/email-templates', authenticateToken, async (req, res) => {
       }
     }
     
-    // Extract variables from the template
-    const { variables, arrayVariables } = extractVariables(html_content, subject);
+    // Use provided variables if available, otherwise extract them
+    let finalVariables = variables;
+    let finalArrayVariables = arrayVariables;
+    if (!finalVariables || !finalArrayVariables) {
+      const extracted = extractVariables(html_content, subject);
+      finalVariables = extracted.variables;
+      finalArrayVariables = extracted.arrayVariables;
+    }
     
     // Check if template already exists
     const existingTemplateIndex = templates.findIndex(
@@ -199,8 +205,8 @@ router.post('/email-templates', authenticateToken, async (req, res) => {
       template_name,
       subject,
       html_content,
-      variables,
-      arrayVariables,
+      variables: finalVariables,
+      arrayVariables: finalArrayVariables,
       created_at: existingTemplateIndex >= 0 ? templates[existingTemplateIndex].created_at : new Date().toISOString(),
       updated_at: new Date().toISOString()
     };
