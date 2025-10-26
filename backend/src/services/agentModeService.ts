@@ -2433,9 +2433,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   // Helper function to wait for task completion
-  private async waitForTaskCompletion(taskId: string, executionId: string, userId: string, maxWaitTime: number = 300000, additionalFields: any = {}): Promise<any> {
+  private async waitForTaskCompletion(taskId: string, executionId: string, userId: string, maxWaitTime: number = 300000, additionalFields: any = {}, pollInterval: number = 2000): Promise<any> {
     const startTime = Date.now();
-    const pollInterval = 2000; // Poll every 2 seconds
     
     while (Date.now() - startTime < maxWaitTime) {
       try {
