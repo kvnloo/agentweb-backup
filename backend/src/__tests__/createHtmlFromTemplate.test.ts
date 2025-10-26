@@ -119,7 +119,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       html_content: '<html><body><h1>{{title}}</h1><p>{{content}}</p></body></html>',
       subject: 'Test Subject: {{title}}',
       variables: ['title', 'content'],
-      array_variables: []
+      arrayVariables: []
     };
 
     beforeEach(() => {
@@ -149,8 +149,8 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
     it('should create HTML from template with valid parameters', async () => {
       const result = await (agentModeService as any).createHtmlFromTemplate(
         'test-template',
-        JSON.stringify({ title: 'Test Title', content: 'Test Content' }),
-        JSON.stringify({}),
+        { title: 'Test Title', content: 'Test Content' },
+        {},
         'user123',
         'session123'
       );
@@ -184,8 +184,8 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         'test-template',
-        JSON.stringify({ title: 'Test Title', content: 'Test Content' }),
-        JSON.stringify({ items: [{ item: 'Item 1' }, { item: 'Item 2' }] }),
+        { title: 'Test Title', content: 'Test Content' },
+        { items: [{ item: 'Item 1' }, { item: 'Item 2' }] },
         'user123',
         'session123'
       );
@@ -197,8 +197,8 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
     it('should validate that all required variables are provided', async () => {
       const result = await (agentModeService as any).createHtmlFromTemplate(
         'test-template',
-        JSON.stringify({ title: 'Test Title' }), // Missing 'content'
-        JSON.stringify({}),
+        { title: 'Test Title' }, // Missing 'content'
+        {},
         'user123',
         'session123'
       );
@@ -211,8 +211,8 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
     it('should validate that no extra variables are provided', async () => {
       const result = await (agentModeService as any).createHtmlFromTemplate(
         'test-template',
-        JSON.stringify({ title: 'Test Title', content: 'Test Content', extra: 'Extra' }),
-        JSON.stringify({}),
+        { title: 'Test Title', content: 'Test Content', extra: 'Extra' },
+        {},
         'user123',
         'session123'
       );
@@ -225,7 +225,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
     it('should validate array variables are arrays', async () => {
       const templateWithArrays = {
         ...mockTemplate,
-        array_variables: ['items']
+        arrayVariables: ['items']
       };
 
       (settingsService.getSetting as jest.Mock).mockResolvedValue({
@@ -234,8 +234,8 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         'test-template',
-        JSON.stringify({ title: 'Test Title', content: 'Test Content' }),
-        JSON.stringify({ items: 'not-an-array' }), // Should be array
+        { title: 'Test Title', content: 'Test Content' },
+        { items: 'not-an-array' }, // Should be array
         'user123',
         'session123'
       );
@@ -251,8 +251,8 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         'nonexistent-template',
-        JSON.stringify({ title: 'Test Title', content: 'Test Content' }),
-        JSON.stringify({}),
+        { title: 'Test Title', content: 'Test Content' },
+        {},
         'user123',
         'session123'
       );
@@ -261,39 +261,13 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       expect(result.message).toContain('Template \'nonexistent-template\' not found');
     });
 
-    it('should handle invalid JSON in variable_values', async () => {
-      const result = await (agentModeService as any).createHtmlFromTemplate(
-        'test-template',
-        'invalid-json',
-        JSON.stringify({}),
-        'user123',
-        'session123'
-      );
-
-      expect(result.success).toBe(false);
-      expect(result.message).toContain('Invalid JSON in variable_values');
-    });
-
-    it('should handle invalid JSON in array_variable_values', async () => {
-      const result = await (agentModeService as any).createHtmlFromTemplate(
-        'test-template',
-        JSON.stringify({ title: 'Test Title', content: 'Test Content' }),
-        'invalid-json',
-        'user123',
-        'session123'
-      );
-
-      expect(result.success).toBe(false);
-      expect(result.message).toContain('Invalid JSON in array_variable_values');
-    });
-
     it('should handle OpenAI API errors', async () => {
       mockOpenAI.chat.completions.create.mockRejectedValue(new Error('OpenAI API error'));
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         'test-template',
-        JSON.stringify({ title: 'Test Title', content: 'Test Content' }),
-        JSON.stringify({}),
+        { title: 'Test Title', content: 'Test Content' },
+        {},
         'user123',
         'session123'
       );
@@ -313,8 +287,8 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         'test-template',
-        JSON.stringify({ title: 'Test Title', content: 'Test Content' }),
-        JSON.stringify({}),
+        { title: 'Test Title', content: 'Test Content' },
+        {},
         'user123',
         'session123'
       );
@@ -337,8 +311,8 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         'test-template',
-        JSON.stringify({ title: 'Test Title', content: 'Test Content' }),
-        JSON.stringify({}),
+        { title: 'Test Title', content: 'Test Content' },
+        {},
         'user123',
         'session123'
       );
@@ -356,8 +330,8 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         'test-template',
-        JSON.stringify({ title: 'Test Title', content: 'Test Content' }),
-        JSON.stringify({}),
+        { title: 'Test Title', content: 'Test Content' },
+        {},
         'user123',
         'session123'
       );
@@ -371,8 +345,8 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       
       await (agentModeService as any).createHtmlFromTemplate(
         'test-template',
-        JSON.stringify({ title: 'Test Title', content: 'Test Content' }),
-        JSON.stringify({}),
+        { title: 'Test Title', content: 'Test Content' },
+        {},
         'user123',
         'session123'
       );
@@ -410,8 +384,8 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         'test-template',
-        JSON.stringify({ title: 'Test Title', content: 'Test Content' }),
-        JSON.stringify({}),
+        { title: 'Test Title', content: 'Test Content' },
+        {},
         'user123',
         'session123'
       );
@@ -434,11 +408,11 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         'test-template',
-        JSON.stringify({ title: 'Test Title', content: 'Test Content' }),
-        JSON.stringify({
+        { title: 'Test Title', content: 'Test Content' },
+        {
           items: [{ name: 'Item 1', price: '$10' }, { name: 'Item 2', price: '$20' }],
           categories: [{ cat: 'Electronics' }, { cat: 'Books' }]
-        }),
+        },
         'user123',
         'session123'
       );
