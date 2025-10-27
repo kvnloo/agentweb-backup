@@ -1016,7 +1016,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'perform_data_analysis',
-          description: 'Perform data analysis with code execution on files from URLs. Uploads files to Gemini for analysis with Python code execution capabilities.',
+          description: 'Perform data analysis with code execution on files from URLs. If no files are attached, treat the information in the instruction as the complete dataset.',
           parameters: {
             type: 'object',
             properties: {
@@ -1865,12 +1865,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
   private async performDataAnalysis(fileUrls: string[], analysisInstruction: string, userId: string): Promise<any> {
     try {
-      if (!fileUrls || fileUrls.length === 0) {
-        return {
-          success: false,
-          message: 'No file URLs provided'
-        };
-      }
+      const urlsToProcess = Array.isArray(fileUrls) ? fileUrls.filter(url => !!url) : [];
 
       if (!analysisInstruction) {
         return {
@@ -1901,7 +1896,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const fileParts: any[] = [];
       let totalSize = 0;
 
-      for (const fileUrl of fileUrls) {
+      for (const fileUrl of urlsToProcess) {
         try {
           // Download the file
           const response = await axios.get(fileUrl, {
@@ -1977,9 +1972,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
       // Add file parts
       fileParts.forEach(part => parts.push(part));
       
-      // Add text part with analysis instruction
+      // Add text part with analysis instruction so the model knows how to proceed with or without files
       parts.push({
-        text: `Please perform the following analysis task on the provided files:\n\n${analysisInstruction}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present.`
+        text: `Please perform the following analysis task. ${urlsToProcess.length > 0 ? 'Use the attached files as primary data sources and incorporate any structured data included in the instruction text.' : 'No external files are attached; treat the information in the instruction as the complete dataset for this task.'}\n\n${analysisInstruction}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present.`
       });
 
       // Call Gemini API directly via REST to enable code execution
