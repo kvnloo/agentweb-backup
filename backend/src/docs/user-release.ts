@@ -7,6 +7,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-10-27',
+    changes: [
+      'Added perform_data_analysis function call to Agent Mode',
+      '- Agent Mode can now request code execution to analyze datasets using attached files or inline instructions',
+    ],
+  },
+  {
     date: '2025-10-26',
     changes: [
       'Added Email Templates Management Page',

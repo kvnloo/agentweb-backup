@@ -2,6 +2,7 @@ import axios from 'axios';
 import OpenAI from 'openai';
 import { google } from 'googleapis';
 import { createHash } from 'crypto';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import { chatbotDb, ChatMessage } from './chatbotService';
 import { taskDb, taskTemplateDb } from './db';
 import { settingsService } from './settingsService';
@@ -1014,6 +1015,28 @@ Use the available tools to create tasks in the agent-engine when complex work is
       {
         type: 'function' as const,
         function: {
+          name: 'perform_data_analysis',
+          description: 'Perform data analysis with code execution on files from URLs. If no files are attached, treat the information in the instruction as the complete dataset.',
+          parameters: {
+            type: 'object',
+            properties: {
+              file_urls: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'List of file URLs to analyze (URLs from uploaded files or previous task results)'
+              },
+              analysis_instruction: {
+                type: 'string',
+                description: 'Description of the analysis task to perform on the provided files'
+              }
+            },
+            required: ['file_urls', 'analysis_instruction']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
           name: 'list_html_templates',
           description: 'Get a list of all available HTML templates for the user (including email templates)',
           parameters: {
@@ -1440,6 +1463,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
           imageUrl: args.image_url
         };
       
+      case 'perform_data_analysis':
+        return {
+          success: true,
+          message: 'Mock data analysis completed successfully',
+          analysis: `**Analysis:** Mock analysis results for ${args.file_urls?.length || 0} file(s).\n\nAnalysis task: ${args.analysis_instruction}\n\n**Code Executed:**\n\`\`\`python\n# Mock analysis code\nimport pandas as pd\nimport numpy as np\n\n# Analyze the data\nprint("Data analysis completed")\n\`\`\`\n\n**Code Output:**\n\`\`\`\nData analysis completed\nMock results would appear here in a real scenario.\n\`\`\``,
+          codeExecuted: true
+        };
+      
       case 'list_html_templates':
         return {
           success: true,
@@ -1695,6 +1726,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.getTaskSubscriberEngagementEvents(args.task_id, args.email_subject, userId);
       case 'describe_image':
         return await this.describeImage(args.image_url, args.prompt);
+      case 'perform_data_analysis':
+        return await this.performDataAnalysis(args.file_urls, args.analysis_instruction, userId);
       case 'list_html_templates':
         return await this.listHtmlTemplates(userId);
       case 'create_html_from_template':
@@ -1825,6 +1858,254 @@ Use the available tools to create tasks in the agent-engine when complex work is
       return {
         success: false,
         message: 'Failed to analyze image. Please check that the URL is accessible and contains a valid image.',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async performDataAnalysis(fileUrls: string[], analysisInstruction: string, userId: string): Promise<any> {
+    try {
+      const urlsToProcess = Array.isArray(fileUrls) ? fileUrls.filter(url => !!url) : [];
+
+      if (!analysisInstruction) {
+        return {
+          success: false,
+          message: 'Analysis instruction is required'
+        };
+      }
+
+      // Get Gemini API key from Secrets Manager
+      const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+      const geminiSecretName = environment === 'prod'
+        ? 'prod/AgentWeb/GeminiAPIKey'
+        : 'dev/AgentWeb/GeminiAPIKey';
+      let geminiApiKey: string;
+      try {
+        geminiApiKey = await getSecret(geminiSecretName);
+      } catch (error) {
+        console.error('AgentMode: Failed to retrieve Gemini API key from Secrets Manager:', error);
+        return {
+          success: false,
+          message: 'Failed to retrieve Gemini API key from Secrets Manager'
+        };
+      }
+
+      geminiApiKey = geminiApiKey.trim();
+      if (!geminiApiKey) {
+        return {
+          success: false,
+          message: 'Gemini API key is empty'
+        };
+      }
+
+      // Initialize Google Generative AI client
+      const genAI = new GoogleGenerativeAI(geminiApiKey);
+
+      // Get the model name from environment or use default
+      const modelName = process.env.DATA_ANALYSIS_LLM_NAME || 'gemini-2.5-flash';
+      
+      // Get file size limit from environment or use default (50MB)
+      const maxTotalSize = parseInt(process.env.DATA_ANALYSIS_FILE_SIZE || '52428800'); // 50MB in bytes
+
+      // Prepare file data for analysis
+      const fileParts: any[] = [];
+      let totalSize = 0;
+
+      for (const fileUrl of urlsToProcess) {
+        try {
+          // Download the file
+          const response = await axios.get(fileUrl, {
+            responseType: 'arraybuffer',
+            timeout: 30000
+          });
+
+          // Check file size
+          const fileData = response.data as ArrayBuffer;
+          totalSize += fileData.byteLength;
+          if (totalSize > maxTotalSize) {
+            return {
+              success: false,
+              message: `Total file size (${totalSize} bytes) exceeds the ${maxTotalSize} bytes limit. Please reduce the number or size of files.`
+            };
+          }
+
+          // Determine MIME type from URL or response headers
+          const contentType = response.headers['content-type'];
+          const url = fileUrl.toLowerCase();
+          
+          let mimeType = 'text/plain';
+          if (contentType) {
+            mimeType = contentType;
+          } else if (url.includes('.csv')) {
+            mimeType = 'text/csv';
+          } else if (url.includes('.json')) {
+            mimeType = 'application/json';
+          } else if (url.includes('.jsonl')) {
+            mimeType = 'application/jsonl';
+          } else if (url.includes('.xml')) {
+            mimeType = 'application/xml';
+          } else if (url.includes('.yaml') || url.includes('.yml')) {
+            mimeType = 'application/x-yaml';
+          } else if (url.includes('.html') || url.includes('.htm')) {
+            mimeType = 'text/html';
+          } else if (url.includes('.md')) {
+            mimeType = 'text/markdown';
+          } else if (url.includes('.py')) {
+            mimeType = 'text/x-python';
+          } else if (url.includes('.js')) {
+            mimeType = 'text/javascript';
+          } else if (url.includes('.ts')) {
+            mimeType = 'text/typescript';
+          }
+
+          // Upload file to Gemini
+          const base64Content = Buffer.from(fileData).toString('base64');
+          
+          fileParts.push({
+            inline_data: {
+              data: base64Content,
+              mime_type: mimeType
+            }
+          });
+
+        } catch (error) {
+          console.error(`Error processing file ${fileUrl}:`, error);
+          return {
+            success: false,
+            message: `Failed to download or process file: ${fileUrl}`,
+            error: error instanceof Error ? error.message : 'Unknown error'
+          };
+        }
+      }
+
+      // Prepare content parts
+      const parts: any[] = [];
+      
+      // Add file parts
+      fileParts.forEach(part => parts.push(part));
+      
+      // Add text part with analysis instruction so the model knows how to proceed with or without files
+      parts.push({
+        text: `Please perform the following analysis task. ${urlsToProcess.length > 0 ? 'Use the attached files as primary data sources and incorporate any structured data included in the instruction text.' : 'No external files are attached; treat the information in the instruction as the complete dataset for this task.'}\n\n${analysisInstruction}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present.`
+      });
+
+      // Call Gemini API directly via REST to enable code execution
+      const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`;
+      const apiResponse = await axios.post(apiUrl, 
+        {
+          tools: [{ code_execution: {} }],
+          contents: [
+            {
+              parts: parts
+            }
+          ]
+        },
+        {
+          headers: {
+            'x-goog-api-key': geminiApiKey,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+
+      // Extract and format the response
+      const candidates = (apiResponse.data as any).candidates;
+      
+      if (!candidates || candidates.length === 0) {
+        return {
+          success: false,
+          message: 'No response received from Gemini API'
+        };
+      }
+
+      const resultParts: string[] = [];
+      let codeExecuted = false;
+
+      // Extract parts from response
+      const responseParts = candidates[0].content.parts || [];
+      
+      for (const part of responseParts) {
+        if (part.text) {
+          resultParts.push(`**Analysis:** ${part.text}`);
+        }
+        // Handle inline data (images/charts from code execution) (handle both camelCase and snake_case)
+        if ((part as any).inlineData && (part as any).inlineData.data) {
+          try {
+            const imageData = (part as any).inlineData.data;
+            const mimeType = (part as any).inlineData.mimeType || 'image/png';
+            
+            // Convert base64 string to Buffer for S3 upload
+            const imageBuffer = Buffer.from(imageData, 'base64');
+            
+            // Upload image to S3
+            const { uploadFileToS3 } = await import('../utils/s3Utils');
+            const imageFilename = `analysis_chart_${Date.now()}.png`;
+            const uploadResult = await uploadFileToS3(
+              imageBuffer,
+              imageFilename,
+              userId,
+              mimeType
+            );
+            
+            if (uploadResult.success && uploadResult.url) {
+              resultParts.push(`**Chart/Image Generated:**\n![Analysis Result](${uploadResult.url})`);
+            }
+          } catch (error) {
+            console.error('Error uploading inline data to S3:', error);
+            resultParts.push(`**Chart/Image Generated:** (Failed to upload to S3)`);
+          }
+        } else if ((part as any).inline_data && (part as any).inline_data.data) {
+          // Handle snake_case format
+          try {
+            const imageData = (part as any).inline_data.data;
+            const mimeType = (part as any).inline_data.mimeType || (part as any).inline_data.mime_type || 'image/png';
+            
+            // Convert base64 string to Buffer for S3 upload
+            const imageBuffer = Buffer.from(imageData, 'base64');
+            
+            // Upload image to S3
+            const { uploadFileToS3 } = await import('../utils/s3Utils');
+            const imageFilename = `analysis_chart_${Date.now()}.png`;
+            const uploadResult = await uploadFileToS3(
+              imageBuffer,
+              imageFilename,
+              userId,
+              mimeType
+            );
+            
+            if (uploadResult.success && uploadResult.url) {
+              resultParts.push(`**Chart/Image Generated:**\n![Analysis Result](${uploadResult.url})`);
+            }
+          } catch (error) {
+            console.error('Error uploading inline_data (snake_case) to S3:', error);
+            resultParts.push(`**Chart/Image Generated:** (Failed to upload to S3)`);
+          }
+        }
+      }
+
+      if (resultParts.length === 0) {
+        return {
+          success: false,
+          message: 'No analysis results received from Gemini'
+        };
+      }
+
+      // Combine all results
+      const analysisResult = resultParts.join('\n\n');
+      
+      return {
+        success: true,
+        message: 'Data analysis completed successfully',
+        analysis: analysisResult,
+        codeExecuted: codeExecuted,
+        formattedContent: analysisResult
+      };
+
+    } catch (error) {
+      console.error('AgentMode: Error performing data analysis:', error);
+      return {
+        success: false,
+        message: 'Failed to perform data analysis. Please check that the file URLs are accessible.',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
