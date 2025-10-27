@@ -1943,9 +1943,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
             mimeType = 'text/typescript';
           }
 
-          // Get model to check if it supports file uploads
-          const model = genAI.getGenerativeModel({ model: modelName });
-          
           // Upload file to Gemini
           const base64Content = Buffer.from(fileData).toString('base64');
           
@@ -2022,10 +2019,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
             const imageData = (part as any).inlineData.data;
             const mimeType = (part as any).inlineData.mimeType || 'image/png';
             
-            console.log('AgentMode: Found inlineData, type:', typeof imageData);
-            console.log('AgentMode: MIME type:', mimeType);
-            console.log('AgentMode: Data length:', imageData?.length);
-            
             // Convert base64 string to Buffer for S3 upload
             const imageBuffer = Buffer.from(imageData, 'base64');
             
@@ -2038,8 +2031,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
               userId,
               mimeType
             );
-            
-            console.log('AgentMode: Upload result:', uploadResult.success, uploadResult.url);
             
             if (uploadResult.success && uploadResult.url) {
               resultParts.push(`**Chart/Image Generated:**\n![Analysis Result](${uploadResult.url})`);
@@ -2054,10 +2045,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
             const imageData = (part as any).inline_data.data;
             const mimeType = (part as any).inline_data.mimeType || (part as any).inline_data.mime_type || 'image/png';
             
-            console.log('AgentMode: Found inline_data (snake_case), type:', typeof imageData);
-            console.log('AgentMode: MIME type:', mimeType);
-            console.log('AgentMode: Data length:', imageData?.length);
-            
             // Convert base64 string to Buffer for S3 upload
             const imageBuffer = Buffer.from(imageData, 'base64');
             
@@ -2071,8 +2058,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
               mimeType
             );
             
-            console.log('AgentMode: Upload result (snake_case):', uploadResult.success, uploadResult.url);
-            
             if (uploadResult.success && uploadResult.url) {
               resultParts.push(`**Chart/Image Generated:**\n![Analysis Result](${uploadResult.url})`);
             }
@@ -2081,9 +2066,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
             resultParts.push(`**Chart/Image Generated:** (Failed to upload to S3)`);
           }
         }
-        
-        // Add debug logging for all parts to understand the structure
-        console.log('AgentMode: Part keys:', Object.keys(part as any));
       }
 
       if (resultParts.length === 0) {
