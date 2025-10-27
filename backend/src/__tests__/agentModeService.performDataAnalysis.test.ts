@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { AgentModeService } from '../services/agentModeService';
 import { uploadFileToS3 } from '../utils/s3Utils';
+import { getSecret } from '../utils/secretsManager';
 
 jest.mock('axios', () => ({
   get: jest.fn(),
@@ -18,9 +19,14 @@ jest.mock('../utils/s3Utils', () => ({
   })
 }));
 
+jest.mock('../utils/secretsManager', () => ({
+  getSecret: jest.fn()
+}));
+
 const mockedAxiosGet = axios.get as jest.Mock;
 const mockedAxiosPost = axios.post as jest.Mock;
 const mockedUploadFileToS3 = uploadFileToS3 as jest.Mock;
+const mockedGetSecret = getSecret as jest.Mock;
 
 describe('AgentModeService.performDataAnalysis', () => {
   let service: AgentModeService;
@@ -34,8 +40,8 @@ describe('AgentModeService.performDataAnalysis', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    process.env.GEMINI_API_KEY = 'test-gemini-key';
     delete process.env.DATA_ANALYSIS_FILE_SIZE;
+    mockedGetSecret.mockResolvedValue('test-gemini-key');
     service = new AgentModeService();
   });
 
@@ -50,15 +56,16 @@ describe('AgentModeService.performDataAnalysis', () => {
     );
   });
 
-  test('returns error when GEMINI_API_KEY is not set', async () => {
-    delete process.env.GEMINI_API_KEY;
+  test('returns error when Gemini API key cannot be retrieved', async () => {
+    mockedGetSecret.mockRejectedValueOnce(new Error('Secret missing'));
 
     const result = await (service as any).performDataAnalysis([], 'Analyze the provided dataset', 'user-1');
 
+    expect(mockedGetSecret).toHaveBeenCalledWith('dev/AgentWeb/GeminiAPIKey');
     expect(result).toEqual(
       expect.objectContaining({
         success: false,
-        message: 'GEMINI_API_KEY environment variable is not set'
+        message: 'Failed to retrieve Gemini API key from Secrets Manager'
       })
     );
   });

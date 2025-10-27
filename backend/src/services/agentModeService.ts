@@ -1874,12 +1874,27 @@ Use the available tools to create tasks in the agent-engine when complex work is
         };
       }
 
-      // Get Gemini API key and configuration from environment
-      const geminiApiKey = process.env.GEMINI_API_KEY;
+      // Get Gemini API key from Secrets Manager
+      const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+      const geminiSecretName = environment === 'prod'
+        ? 'prod/AgentWeb/GeminiAPIKey'
+        : 'dev/AgentWeb/GeminiAPIKey';
+      let geminiApiKey: string;
+      try {
+        geminiApiKey = await getSecret(geminiSecretName);
+      } catch (error) {
+        console.error('AgentMode: Failed to retrieve Gemini API key from Secrets Manager:', error);
+        return {
+          success: false,
+          message: 'Failed to retrieve Gemini API key from Secrets Manager'
+        };
+      }
+
+      geminiApiKey = geminiApiKey.trim();
       if (!geminiApiKey) {
         return {
           success: false,
-          message: 'GEMINI_API_KEY environment variable is not set'
+          message: 'Gemini API key is empty'
         };
       }
 
