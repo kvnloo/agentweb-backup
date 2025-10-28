@@ -7,6 +7,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-10-28',
+    changes: [
+      'Improved HTML Generation Template Variable Substitution Handling for Empty Arrays',
+      '- For create_html_from_template, if there is no data for an array variable, users must provide an empty array in array_variable_values_json (e.g., "features_n": []).',
+    ],
+  },
+  {
     date: '2025-10-27',
     changes: [
       'Added perform_data_analysis function call to Agent Mode',

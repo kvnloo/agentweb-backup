@@ -420,5 +420,116 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       expect(result.success).toBe(true);
       expect(mockOpenAI.chat.completions.create).toHaveBeenCalled();
     });
+
+    it('should handle empty array variables and prompt for placeholder text', async () => {
+      const templateWithEmptyArray = {
+        ...mockTemplate,
+        arrayVariables: ['features_n'],
+        html_content: '<html><body><h1>{{title}}</h1><ul class="features-list">{{#features_n}}<li>{{features_1}}</li>{{/features_n}}</ul><p>{{content}}</p></body></html>',
+        subject: 'Test Subject: {{title}}'
+      };
+
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([templateWithEmptyArray])
+      });
+
+      // Mock LLM response with placeholder for empty array
+      mockOpenAI.chat.completions.create.mockResolvedValue({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              final_html: '<html><body><h1>Test Title</h1><ul class="features-list"><li style="color: #888; font-style: italic;">No data available</li></ul><p>Test Content</p></body></html>',
+              final_subject: 'Test Subject: Test Title'
+            })
+          }
+        }]
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        'test-template',
+        { title: 'Test Title', content: 'Test Content' },
+        { features_n: [] }, // Empty array
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      
+      // Verify the prompt includes empty array handling instructions
+      const callArgs = mockOpenAI.chat.completions.create.mock.calls[0][0];
+      expect(callArgs.messages[0].content).toContain('EMPTY ARRAY VARIABLES');
+      expect(callArgs.messages[0].content).toContain('remove the array variables from the HTML structure');
+      
+      // Verify the array variable values are passed as empty
+      expect(callArgs.messages[0].content).toContain('"features_n": []');
+    });
+
+    it('should handle partial empty array variables', async () => {
+      const templateWithMixedArrays = {
+        ...mockTemplate,
+        arrayVariables: ['features_n', 'links_n'],
+        html_content: '<html><body><h1>{{title}}</h1><ul class="features">{{#features_n}}<li>{{features_1}}</li>{{/features_n}}</ul><ul class="links">{{#links_n}}<li>{{links_1}}</li>{{/links_n}}</ul></body></html>',
+        subject: 'Test Subject: {{title}}'
+      };
+
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([templateWithMixedArrays])
+      });
+
+      // Mock LLM response with one empty array handled
+      mockOpenAI.chat.completions.create.mockResolvedValue({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              final_html: '<html><body><h1>Test Title</h1><ul class="features"><li>Feature 1</li><li>Feature 2</li></ul><ul class="links"><li style="color: #888;">None</li></ul></body></html>',
+              final_subject: 'Test Subject: Test Title'
+            })
+          }
+        }]
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        'test-template',
+        { title: 'Test Title', content: 'Test Content' },
+        {
+          features_n: ['Feature 1', 'Feature 2'],
+          links_n: [] // Empty array
+        },
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      
+      // Verify the prompt includes both populated and empty arrays
+      const callArgs = mockOpenAI.chat.completions.create.mock.calls[0][0];
+      expect(callArgs.messages[0].content).toContain('"features_n"');
+      expect(callArgs.messages[0].content).toContain('"links_n": []');
+    });
+
+    it('should require array variables even if empty', async () => {
+      const templateWithArray = {
+        ...mockTemplate,
+        arrayVariables: ['features_n'],
+        html_content: '<html><body><h1>{{title}}</h1><ul class="features">{{#features_n}}<li>{{features_1}}</li>{{/features_n}}</ul><p>{{content}}</p></body></html>',
+        subject: 'Test Subject: {{title}}'
+      };
+
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([templateWithArray])
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        'test-template',
+        { title: 'Test Title', content: 'Test Content' },
+        {}, // Missing array variable entirely
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Missing required array variables');
+      expect(result.message).toContain('features_n');
+    });
   });
 });
