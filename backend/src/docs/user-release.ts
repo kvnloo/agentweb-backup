@@ -11,6 +11,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
     changes: [
       'Improved HTML Generation Template Variable Substitution Handling for Empty Arrays',
       '- For create_html_from_template, if there is no data for an array variable, users must provide an empty array in array_variable_values_json (e.g., "features_n": []).',
+      'Made Templates Section Folded by Default in Customer Portal',
+      '- This is a user-friendly change as templates are expected to be used less directly by users, but more through Agent Mode',
     ],
   },
   {
