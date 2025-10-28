@@ -1064,7 +1064,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 },
                 array_variable_values_json: {
                   type: 'string',
-                  description: 'JSON string containing array variable values where keys are array variable names and values are arrays of strings. Example: {"features_n": ["Feature 1", "Feature 2"], "links_n": ["Link 1", "Link 2"]}'
+                  description: 'JSON string containing array variable values where keys are array variable names and values are arrays of strings. If there is no data for an array variable, provide an empty array for that variable. Example: {"features_n": ["Feature 1", "Feature 2"], "links_n": []} for when links_n has no data.'
                 }
               },
               required: ['template_name', 'variable_values_json', 'array_variable_values_json']
@@ -5761,8 +5761,9 @@ CRITICAL INSTRUCTIONS:
    - If {{array_var}} is inside a <div> tag, repeat the <div> tag for each array item
    - Maintain the exact same HTML structure around the array variable
 4. VALID HTML: Ensure the final HTML is valid and well-formatted
-5. NO STRUCTURAL CHANGES: Do not add new HTML elements, change classes, or modify the template structure
-6. EXACT REPLACEMENT: Only replace {{}} placeholders, keep everything else identical
+5. NO STRUCTURAL CHANGES: Do not add new HTML elements, change classes, or modify the template structure (except for empty array handling as described below)
+6. EMPTY ARRAY VARIABLES: If an array variable has an empty array (no data), you must add text within that section to indicate there is no data, remove the array variables from the HTML structure and keep the rest of the HTML structure intact. For example, for array variable "features_n", if there is no data, all variables "features_1", "features_2", etc. must be removed from the HTML structure as they together indicate the array variable.
+7. EXACT REPLACEMENT: Only replace {{}} placeholders, keep everything else identical
 
 RESPONSE FORMAT:
 You must return a valid JSON object with exactly these two fields:
