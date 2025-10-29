@@ -14,6 +14,24 @@ jest.mock('../../services/chatbotService', () => ({
   }
 }));
 
+// Mock the agentModeService.generateMarketingResponse used inside generateSessionResponse
+jest.mock('../../services/agentModeService', () => ({
+  agentModeService: {
+    getMarketingSystemPrompt: jest.fn().mockResolvedValue('System prompt'),
+    generateSessionTitle: jest.fn().mockResolvedValue('Title'),
+    generateMarketingResponse: jest.fn().mockResolvedValue({
+      content: 'AI response here',
+      toolCalls: [],
+      knowledgeBaseQueries: [],
+      sources: [],
+      responseMessages: [ { role: 'assistant', content: 'AI response here' } ]
+    })
+  },
+  AgentModeService: jest.fn().mockImplementation(() => ({
+    getAvailableTools: () => []
+  }))
+}));
+
 // Mock the User type
 interface User {
   userId: string;
