@@ -527,7 +527,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
               async: {
                 type: 'boolean',
                 description: 'Whether to execute the task asynchronously. If false, the function will wait for task completion before returning the final result.',
-                default: true
+                default: false
               }
             },
             required: ['template_id', 'parameters_json']
@@ -699,7 +699,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
               async: {
                 type: 'boolean',
                 description: 'Whether to execute the task asynchronously. If false, the function will wait for task completion before returning the final result.',
-                default: true
+                default: false
               }
             },
             required: ['task_name', 'prompt', 'category']

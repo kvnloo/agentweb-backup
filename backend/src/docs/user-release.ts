@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-10-29',
+    changes: [
+      "Changed default execution mode for task creation tools to sync",
+      "- For create_task_from_prompt and create_task_from_template, the async parameter now defaults to false (synchronous execution).",
+      "- If you want background execution, explicitly set async to true when invoking these tools."
+    ],
+  },
+  {
     date: '2025-10-28',
     changes: [
       'Improved HTML Generation Template Variable Substitution Handling for Empty Arrays',
