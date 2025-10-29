@@ -473,6 +473,68 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
       );
     });
 
+    it('should create scheduled chat with emailCampaignTaskId', async () => {
+      const emailCampaignTaskId = 'campaign-task-456';
+      
+      mockScheduleDb.createSchedule.mockResolvedValue({
+        scheduleId: 'new-schedule-123',
+        taskId: 'global',
+        userId: mockUserId,
+        frequency: 'daily',
+        scheduleName: 'Test Schedule',
+        description: 'Test Description',
+        startingMessage: 'Hello, please help me with marketing',
+        keywords: ['marketing', 'strategy'],
+        requiredFunctionCalls: ['get_marketing_tips'],
+        functionCallMinCalls: {},
+        emailNotifications: ['test@example.com'],
+        dailyDigest: false,
+        emailCampaignTaskId: emailCampaignTaskId,
+        status: 'active',
+        nextRunTime: expect.any(String),
+        createdAt: expect.any(String),
+        updatedAt: expect.any(String),
+        sessionId: null,
+        type: 'scheduled_chat'
+      });
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        body: {
+          scheduleName: 'Test Schedule',
+          description: 'Test Description',
+          startingMessage: 'Hello, please help me with marketing',
+          scheduleFrequency: 'daily',
+          keywords: ['marketing', 'strategy'],
+          requiredFunctionCalls: ['get_marketing_tips'],
+          emailNotifications: ['test@example.com'],
+          emailCampaignTaskId: emailCampaignTaskId
+        }
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.createScheduledChat(mockReq, mockRes);
+
+      // Verify that createSchedule was called with emailCampaignTaskId
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalledWith(
+        expect.objectContaining({
+          emailCampaignTaskId: emailCampaignTaskId
+        })
+      );
+
+      expect(mockRes.status).toHaveBeenCalledWith(201);
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          scheduleId: expect.any(String),
+          message: 'Scheduled chat created successfully'
+        })
+      );
+    });
+
     it('should update scheduled chat with minimum call requirements', async () => {
       const existingSchedule = {
         ...baseSchedule,
@@ -507,6 +569,104 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
       } as unknown as Response;
 
       await agentModeController.updateScheduledChat(mockReq, mockRes);
+
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: 'Scheduled chat updated successfully'
+        })
+      );
+    });
+
+    it('should update scheduled chat with emailCampaignTaskId', async () => {
+      const existingSchedule = {
+        ...baseSchedule,
+        userId: mockUserId,
+        emailCampaignTaskId: 'old-campaign-task-123'
+      };
+
+      const newEmailCampaignTaskId = 'new-campaign-task-456';
+
+      mockScheduleDb.getScheduleById.mockResolvedValue(existingSchedule);
+      mockScheduleDb.updateSchedule.mockResolvedValue(undefined);
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+        body: {
+          scheduleName: 'Updated Test Schedule',
+          description: 'Updated Test Description',
+          startingMessage: 'Updated starting message',
+          scheduleFrequency: 'daily',
+          keywords: ['marketing', 'strategy'],
+          requiredFunctionCalls: ['get_marketing_tips'],
+          functionCallMinCalls: {},
+          emailNotifications: ['test@example.com'],
+          emailCampaignTaskId: newEmailCampaignTaskId
+        }
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.updateScheduledChat(mockReq, mockRes);
+
+      // Verify that updateSchedule was called with the new emailCampaignTaskId
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+        mockScheduleId,
+        expect.objectContaining({
+          emailCampaignTaskId: newEmailCampaignTaskId
+        })
+      );
+
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: 'Scheduled chat updated successfully'
+        })
+      );
+    });
+
+    it('should update scheduled chat to remove emailCampaignTaskId', async () => {
+      const existingSchedule = {
+        ...baseSchedule,
+        userId: mockUserId,
+        emailCampaignTaskId: 'old-campaign-task-123'
+      };
+
+      mockScheduleDb.getScheduleById.mockResolvedValue(existingSchedule);
+      mockScheduleDb.updateSchedule.mockResolvedValue(undefined);
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+        body: {
+          scheduleName: 'Updated Test Schedule',
+          description: 'Updated Test Description',
+          startingMessage: 'Updated starting message',
+          scheduleFrequency: 'daily',
+          keywords: ['marketing', 'strategy'],
+          requiredFunctionCalls: ['get_marketing_tips'],
+          functionCallMinCalls: {},
+          emailNotifications: ['test@example.com'],
+          emailCampaignTaskId: null
+        }
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.updateScheduledChat(mockReq, mockRes);
+
+      // Verify that updateSchedule was called with null emailCampaignTaskId
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+        mockScheduleId,
+        expect.objectContaining({
+          emailCampaignTaskId: null
+        })
+      );
 
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({

@@ -1404,6 +1404,7 @@ export const scheduleDb = {
     updatedAt?: string;
     sessionId?: string | null;
     type?: string;
+    emailCampaignTaskId?: string;
   }) {
     try {
       const params = {
@@ -1469,6 +1470,7 @@ export const scheduleDb = {
             emailNotifications: string[];
             dailyDigest: boolean;
             updatedAt: string;
+            emailCampaignTaskId: string;
           }>
         ) {
           try {

@@ -114,6 +114,7 @@ export interface ChatSession {
   selectedStartupId?: string; // Selected startup profile for context
   workflowId?: string; // Added workflowId for agent mode sessions
   executionId?: string; // Added executionId for agent mode sessions
+  emailCampaignTaskId?: string; // Added emailCampaignTaskId for email campaign integration
   shareMetadata?: {
     isShared: boolean;
     sharedAt?: string;
@@ -449,7 +450,8 @@ export class ChatbotDB {
     pageIdentifier?: string,
     selectedStartupId?: string,
     workflowId?: string,
-    executionId?: string
+    executionId?: string,
+    emailCampaignTaskId?: string
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
@@ -483,6 +485,7 @@ export class ChatbotDB {
       selectedStartupId,
       workflowId,
       executionId,
+      emailCampaignTaskId,
     };
 
     if (pageContent) {

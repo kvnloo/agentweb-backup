@@ -227,7 +227,16 @@ async function runScheduledChat(
   try {
     // Create a session for the run
     const sessionTitle = isTest ? `Test: ${schedule.scheduleName}` : `Scheduled: ${schedule.scheduleName}`;
-    const testSession = await chatbotDb.createChatSession(userId, undefined, "agent", sessionTitle);
+    const testSession = await chatbotDb.createChatSession(
+      userId, 
+      undefined, 
+      "agent", 
+      sessionTitle,
+      undefined,
+      undefined,
+      undefined,
+      schedule.emailCampaignTaskId
+    );
     const sessionId = testSession.sessionId;
 
   while (attempt < maxTries) {
@@ -1126,7 +1135,8 @@ export const agentModeController = {
               keywords,
               requiredFunctionCalls,
               functionCallMinCalls,
-              emailNotifications
+              emailNotifications,
+              emailCampaignTaskId
             } = req.body;
 
             if (!scheduleName || !startingMessage || !scheduleFrequency) {
@@ -1164,7 +1174,8 @@ export const agentModeController = {
               createdAt: now.toISOString(),
               updatedAt: now.toISOString(),
               sessionId: sessionId || null, // Store original sessionId for reference (can be null)
-              type: 'scheduled_chat' // Distinguish from regular task schedules
+              type: 'scheduled_chat', // Distinguish from regular task schedules
+              emailCampaignTaskId: emailCampaignTaskId || null
             };
 
             await scheduleDb.createSchedule(scheduledChat);
@@ -1212,7 +1223,8 @@ export const agentModeController = {
               requiredFunctionCalls,
               functionCallMinCalls,
               emailNotifications,
-              dailyDigest
+              dailyDigest,
+              emailCampaignTaskId
             } = req.body;
 
             if (!scheduleName || !startingMessage || !scheduleFrequency) {
@@ -1241,7 +1253,8 @@ export const agentModeController = {
               emailNotifications: emailNotifications || [],
               dailyDigest: scheduleFrequency === 'hourly' ? (dailyDigest || false) : false, // Only allow daily digest for hourly schedules
               nextRunTime: nextRunTime.toISOString(),
-              updatedAt: now.toISOString()
+              updatedAt: now.toISOString(),
+              emailCampaignTaskId: emailCampaignTaskId || null
             };
 
             await scheduleDb.updateSchedule(scheduleId, updates);

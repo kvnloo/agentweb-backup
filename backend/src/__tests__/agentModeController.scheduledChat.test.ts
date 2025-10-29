@@ -404,7 +404,85 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         mockUserId,
         undefined,
         'agent',
-        'Test: Test Schedule'
+        'Test: Test Schedule',
+        undefined,
+        undefined,
+        undefined,
+        undefined
+      );
+    });
+
+    it('should copy emailCampaignTaskId from schedule to session', async () => {
+      const scheduleWithCampaignId = {
+        ...baseSchedule,
+        emailCampaignTaskId: 'campaign-task-123',
+      };
+
+      mockScheduleDb.getScheduleById.mockResolvedValue(scheduleWithCampaignId);
+      mockAgentModeService.generateMarketingResponse.mockResolvedValue({
+        ...mockResponse,
+        content: 'Here are some marketing strategy and tips for your business.',
+      });
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.testScheduledChat(mockReq, mockRes);
+
+      // Should create session with emailCampaignTaskId from schedule
+      expect(mockChatbotDb.createChatSession).toHaveBeenCalledWith(
+        mockUserId,
+        undefined,
+        'agent',
+        'Test: Test Schedule',
+        undefined,
+        undefined,
+        undefined,
+        'campaign-task-123'
+      );
+    });
+
+    it('should handle schedule with null emailCampaignTaskId', async () => {
+      const scheduleWithoutCampaignId = {
+        ...baseSchedule,
+        emailCampaignTaskId: null,
+      };
+
+      mockScheduleDb.getScheduleById.mockResolvedValue(scheduleWithoutCampaignId);
+      mockAgentModeService.generateMarketingResponse.mockResolvedValue({
+        ...mockResponse,
+        content: 'Here are some marketing strategy and tips for your business.',
+      });
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.testScheduledChat(mockReq, mockRes);
+
+      // Should create session with undefined emailCampaignTaskId
+      expect(mockChatbotDb.createChatSession).toHaveBeenCalledWith(
+        mockUserId,
+        undefined,
+        'agent',
+        'Test: Test Schedule',
+        undefined,
+        undefined,
+        undefined,
+        null
       );
     });
 
