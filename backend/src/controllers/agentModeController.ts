@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { agentModeService, AgentModeService } from '../services/agentModeService';
 import { chatbotDb, updateTaskExecutionStatus } from '../services/chatbotService';
-import { scheduleDb, userDb } from '../services/db';
+import { scheduleDb, userDb, taskDb } from '../services/db';
 import { User } from '../types/auth';
 import multer from 'multer';
 import crypto from 'crypto';
@@ -598,6 +598,83 @@ export const agentModeController = {
       // For non-admin users, check if they own the session
       if (session.userId !== user?.userId) {
         return res.status(403).json({ error: 'Unauthorized access to session' });
+      }
+
+      // If session is linked to an Email Campaign task, ensure an execution exists and is synced with HTML result files
+      try {
+        if (session.emailCampaignTaskId) {
+          const emailCampaignTaskId: string = session.emailCampaignTaskId;
+          const execId = `agentmode_${session.sessionId}`;
+
+          // Collect unique HTML S3 URLs from assistant messages
+          const assistantMessages = Array.isArray(session.messages)
+            ? session.messages.filter((m: any) => m && m.role === 'assistant' && typeof m.content === 'string')
+            : [];
+          const htmlUrlRegex = /(https?:\/\/[^\s\"]+\.amazonaws\.com\/[^\s\"]+\.html)/gi;
+          const foundUrlsSet = new Set<string>();
+          assistantMessages.forEach((msg: any) => {
+            let match;
+            while ((match = htmlUrlRegex.exec(msg.content)) !== null) {
+              foundUrlsSet.add(match[1]);
+            }
+          });
+
+          const foundUrls = Array.from(foundUrlsSet);
+
+          if (foundUrls.length > 0) {
+            // Ensure execution exists
+            const existingExecution = await taskDb.getTaskExecutionById(execId);
+            if (!existingExecution) {
+              const nowIso = new Date().toISOString();
+              await taskDb.createTaskExecution({
+                executionId: execId,
+                taskId: emailCampaignTaskId,
+                userId: session.userId,
+                status: 'completed',
+                startTime: nowIso
+              });
+              // Initialize result_files with HTML files and set completedAt
+              const resultFiles = foundUrls.map((url) => ({
+                url,
+                filename: url.split('/').pop() || 'report.html',
+                token: Array.from(crypto.getRandomValues(new Uint8Array(16)))
+                  .map((b) => b.toString(16).padStart(2, '0'))
+                  .join(''),
+                is_html: true
+              }));
+              // Update result_files first
+              await taskDb.updateTaskExecution(execId, {
+                result_files: resultFiles as any
+              });
+              // Then set completedAt in a separate update call to avoid multiple SET clauses
+              await taskDb.updateTaskExecution(execId, {
+                completedAt: nowIso
+              });
+            } else {
+              // Merge missing URLs into result_files
+              const current = existingExecution.result_files || [];
+              const currentUrlSet = new Set<string>(current.map((f: any) => f.url));
+              const additions = foundUrls
+                .filter((u) => !currentUrlSet.has(u))
+                .map((url) => ({
+                  url,
+                  filename: url.split('/').pop() || 'report.html',
+                  token: Array.from(crypto.getRandomValues(new Uint8Array(16)))
+                    .map((b) => b.toString(16).padStart(2, '0'))
+                    .join(''),
+                  is_html: true
+                }));
+              if (additions.length > 0) {
+                await taskDb.updateTaskExecution(execId, {
+                  result_files: [...current, ...additions] as any
+                });
+              }
+            }
+          }
+        }
+      } catch (syncErr) {
+        console.error('AgentMode: Email campaign execution sync error:', syncErr);
+        // Do not fail the session load because of sync issues
       }
 
       // Filter out tool messages and assistant messages with tool calls for user display
