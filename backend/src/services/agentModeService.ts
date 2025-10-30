@@ -418,7 +418,19 @@ Use the available tools to create tasks in the agent-engine when complex work is
     
     // Copy all sliced messages as-is
     for (const msg of sliced) {
-      const messageObj: any = { role: msg.role, content: msg.content };
+      let content = msg.content;
+      
+      // For user messages with attachments, reconstruct content to include attachment URLs
+      // This matches how generateSessionResponse processes attachments (lines 495-502 in agentModeController)
+      if (msg.role === 'user' && (msg as any).metadata?.attachments?.length > 0) {
+        const attachments = (msg as any).metadata.attachments;
+        const attachmentUrls = attachments.map((attachment: any) => {
+          return `[${attachment.filename || 'Attachment'}](${attachment.url})`;
+        }).join('\n');
+        content = `${msg.content}\n\n**Attached Files:**\n${attachmentUrls}`;
+      }
+      
+      const messageObj: any = { role: msg.role, content: content };
       
       // Add optional properties based on message type
       if ((msg as any).name) {
