@@ -113,6 +113,78 @@ describe('AgentModeController - Session load email campaign sync', () => {
       })
     );
   });
+
+  it('does not sync if session has no emailCampaignTaskId', async () => {
+    const session = {
+      sessionId: 'sess-123',
+      userId: 'user-1',
+      title: 'Test',
+      messages: [
+        { role: 'assistant', content: 'Report: https://agentweb-user-files.s3.us-west-2.amazonaws.com/path/report.html' },
+      ],
+      createdAt: '2024-01-01T00:00:00Z',
+      updatedAt: '2024-01-01T00:00:00Z',
+    };
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(session);
+
+    const req = makeReq('sess-123');
+    const res = makeRes();
+
+    await agentModeController.getSession(req, res);
+
+    // Should not call task execution sync
+    expect(taskDb.getTaskExecutionById).not.toHaveBeenCalled();
+    expect(taskDb.createTaskExecution).not.toHaveBeenCalled();
+    expect(taskDb.updateTaskExecution).not.toHaveBeenCalled();
+  });
+
+  it('does not sync if session has no HTML URLs', async () => {
+    const session = {
+      sessionId: 'sess-123',
+      userId: 'user-1',
+      title: 'Test',
+      messages: [
+        { role: 'user', content: 'Hello' },
+        { role: 'assistant', content: 'No HTML reports here' },
+      ],
+      createdAt: '2024-01-01T00:00:00Z',
+      updatedAt: '2024-01-01T00:00:00Z',
+      emailCampaignTaskId: 'task-abc',
+    };
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(session);
+
+    const req = makeReq('sess-123');
+    const res = makeRes();
+
+    await agentModeController.getSession(req, res);
+
+    // Should not create/update execution if no HTML URLs found
+    expect(taskDb.createTaskExecution).not.toHaveBeenCalled();
+    expect(taskDb.updateTaskExecution).not.toHaveBeenCalled();
+  });
+
+  it('handles sync errors gracefully without failing session load', async () => {
+    const session = {
+      sessionId: 'sess-123',
+      userId: 'user-1',
+      title: 'Test',
+      messages: [
+        { role: 'assistant', content: 'Report: https://agentweb-user-files.s3.us-west-2.amazonaws.com/path/report.html' },
+      ],
+      createdAt: '2024-01-01T00:00:00Z',
+      updatedAt: '2024-01-01T00:00:00Z',
+      emailCampaignTaskId: 'task-abc',
+    };
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(session);
+    (taskDb.getTaskExecutionById as jest.Mock).mockRejectedValue(new Error('Database error'));
+
+    const req = makeReq('sess-123');
+    const res = makeRes();
+
+    // Should not throw, just log the error
+    await expect(agentModeController.getSession(req, res)).resolves.not.toThrow();
+    expect(res.json).toHaveBeenCalled();
+  });
 });
 
 
