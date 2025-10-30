@@ -2900,7 +2900,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // If async is false, wait for task completion
       if (!async && execution?.executionId) {
-        return await this.waitForTaskCompletion(task.taskId, execution.executionId, userId, 300000, {
+        return await this.waitForTaskCompletion(task.taskId, execution.executionId, userId, 3600000, {
           templateName: templateData.name,
           taskName: taskName
         });
@@ -2984,7 +2984,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // If async is false, wait for task completion
       if (!async && execution?.executionId) {
-        return await this.waitForTaskCompletion(task.taskId, execution.executionId, userId, 300000, {
+        return await this.waitForTaskCompletion(task.taskId, execution.executionId, userId, 3600000, {
           taskName: taskName
         });
       }
