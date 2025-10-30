@@ -59,6 +59,9 @@ describe('AgentModeService - buildMarketingContext with Attachments', () => {
               {
                 filename: 'report.pdf',
                 url: 'https://example.com/files/report.pdf',
+                size: 1024000,
+                mimetype: 'application/pdf',
+                uploadedAt: '2025-01-01T00:00:30.000Z',
               },
             ],
           },
@@ -108,10 +111,16 @@ describe('AgentModeService - buildMarketingContext with Attachments', () => {
               {
                 filename: 'file1.pdf',
                 url: 'https://example.com/files/file1.pdf',
+                size: 2048000,
+                mimetype: 'application/pdf',
+                uploadedAt: '2025-01-01T00:00:30.000Z',
               },
               {
                 filename: 'file2.pdf',
                 url: 'https://example.com/files/file2.pdf',
+                size: 1536000,
+                mimetype: 'application/pdf',
+                uploadedAt: '2025-01-01T00:00:35.000Z',
               },
             ],
           },
@@ -204,7 +213,7 @@ describe('AgentModeService - buildMarketingContext with Attachments', () => {
       expect(userMessage.content).not.toContain('**Attached Files:**');
     });
 
-    it('should handle attachments without filename', () => {
+    it('should handle attachments with empty filename', () => {
       const sessionHistory: ChatMessage[] = [
         {
           role: 'system',
@@ -221,6 +230,10 @@ describe('AgentModeService - buildMarketingContext with Attachments', () => {
             attachments: [
               {
                 url: 'https://example.com/files/document.pdf',
+                filename: '',
+                size: 512000,
+                mimetype: 'application/pdf',
+                uploadedAt: '2025-01-01T00:00:30.000Z',
               },
             ],
           },
@@ -309,6 +322,9 @@ describe('AgentModeService - buildMarketingContext with Attachments', () => {
               {
                 filename: 'important.pdf',
                 url: 'https://example.com/files/important.pdf',
+                size: 3072000,
+                mimetype: 'application/pdf',
+                uploadedAt: new Date(Date.now() + i * 1000).toISOString(),
               },
             ],
           } : undefined,
