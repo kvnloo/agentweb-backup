@@ -26,6 +26,11 @@ jest.mock('../services/db', () => ({
     getSchedulesReadyToRun: jest.fn(),
     updateScheduleAfterRun: jest.fn(),
   },
+  taskDb: {
+    getTaskExecutionById: jest.fn(),
+    createTaskExecution: jest.fn(),
+    updateTaskExecution: jest.fn(),
+  },
 }));
 
 jest.mock('uuid', () => ({
@@ -35,12 +40,13 @@ jest.mock('uuid', () => ({
 // Import mocked services
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
-import { scheduleDb } from '../services/db';
+import { scheduleDb, taskDb } from '../services/db';
 import { agentModeController } from '../controllers/agentModeController';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
 const mockScheduleDb = scheduleDb as jest.Mocked<typeof scheduleDb>;
+const mockTaskDb = taskDb as jest.Mocked<typeof taskDb>;
 
 describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
   const mockUserId = 'test-user-123';
@@ -560,6 +566,245 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         processed: 0,
         results: [],
       });
+    });
+  });
+
+  describe('Email Campaign Sync After Scheduled Chat Run', () => {
+    const mockUserId = 'test-user-123';
+    const mockScheduleId = 'test-schedule-123';
+    
+    const baseSchedule = {
+      scheduleId: mockScheduleId,
+      taskId: 'task-123',
+      userId: mockUserId,
+      frequency: 'daily',
+      nextRunTime: new Date().toISOString(),
+      status: 'active',
+      createdAt: new Date().toISOString(),
+      scheduleName: 'Test Schedule',
+      startingMessage: 'Hello',
+      emailCampaignTaskId: 'campaign-task-456',
+    };
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+      // Setup default mocks needed for runScheduledChat
+      mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
+      mockAgentModeService.generateSessionTitle.mockResolvedValue('Generated Title');
+      mockScheduleDb.updateScheduleAfterRun.mockResolvedValue(undefined);
+      mockChatbotDb.addMessageToSession.mockResolvedValue(undefined);
+      mockChatbotDb.addMessagesToSession.mockResolvedValue(undefined);
+      mockChatbotDb.updateSessionTitle.mockResolvedValue(undefined);
+      mockTaskDb.getTaskExecutionById.mockResolvedValue(null);
+    });
+
+    it('should sync email campaign execution after scheduled chat run with HTML URLs', async () => {
+      const scheduleWithCampaign = { ...baseSchedule };
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([scheduleWithCampaign]);
+      
+      const sessionWithMessages = {
+        sessionId: 'session-123',
+        userId: mockUserId,
+        messages: [
+          { role: 'user', content: 'Hello' },
+          { role: 'assistant', content: 'Report: https://agentweb-user-files.s3.us-west-2.amazonaws.com/reports/report1.html' },
+        ],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        emailCampaignTaskId: 'campaign-task-456',
+      };
+
+      mockAgentModeService.generateMarketingResponse.mockResolvedValue({
+        content: 'Report: https://agentweb-user-files.s3.us-west-2.amazonaws.com/reports/report1.html',
+        toolCalls: [],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+      mockChatbotDb.createChatSession.mockResolvedValue({
+        sessionId: 'session-123',
+        userId: mockUserId,
+        messages: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        emailCampaignTaskId: 'campaign-task-456',
+      });
+      // getChatSession returns session with messages (for sync to find HTML URLs)
+      mockChatbotDb.getChatSession.mockResolvedValue(sessionWithMessages);
+
+      const mockReq = {} as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.runScheduledChats(mockReq, mockRes);
+
+      // Wait for async runScheduledChat to complete
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      // Should create execution and sync HTML URLs
+      expect(mockTaskDb.createTaskExecution).toHaveBeenCalledWith(
+        expect.objectContaining({
+          executionId: 'agentmode_session-123',
+          taskId: 'campaign-task-456',
+          userId: mockUserId,
+        })
+      );
+      expect(mockTaskDb.updateTaskExecution).toHaveBeenCalledWith(
+        'agentmode_session-123',
+        expect.objectContaining({
+          result_files: expect.arrayContaining([
+            expect.objectContaining({ url: expect.stringContaining('report1.html'), is_html: true })
+          ])
+        })
+      );
+      expect(mockTaskDb.updateTaskExecution).toHaveBeenCalledWith(
+        'agentmode_session-123',
+        expect.objectContaining({ completedAt: expect.any(String) })
+      );
+    });
+
+    it('should not sync if schedule has no emailCampaignTaskId', async () => {
+      const scheduleWithoutCampaign = { ...baseSchedule };
+      delete scheduleWithoutCampaign.emailCampaignTaskId;
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([scheduleWithoutCampaign]);
+      mockAgentModeService.generateMarketingResponse.mockResolvedValue({
+        content: 'Some content',
+        toolCalls: [],
+        knowledgeBaseQueries: [],
+        sources: [],
+      });
+      mockChatbotDb.createChatSession.mockResolvedValue({
+        sessionId: 'session-123',
+        userId: mockUserId,
+        messages: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+
+      const mockReq = {} as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.runScheduledChats(mockReq, mockRes);
+
+      // Should not call task execution sync
+      expect(mockTaskDb.createTaskExecution).not.toHaveBeenCalled();
+      expect(mockTaskDb.updateTaskExecution).not.toHaveBeenCalled();
+    });
+
+    it('should update existing execution with new HTML URLs', async () => {
+      const scheduleWithCampaign = { ...baseSchedule };
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([scheduleWithCampaign]);
+      
+      const sessionWithMessages = {
+        sessionId: 'session-123',
+        userId: mockUserId,
+        messages: [
+          { role: 'assistant', content: 'Old: https://agentweb-user-files.s3.us-west-2.amazonaws.com/reports/old.html New: https://agentweb-user-files.s3.us-west-2.amazonaws.com/reports/new.html' },
+        ],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        emailCampaignTaskId: 'campaign-task-456',
+      };
+
+      mockAgentModeService.generateMarketingResponse.mockResolvedValue({
+        content: 'New report: https://agentweb-user-files.s3.us-west-2.amazonaws.com/reports/new.html',
+        toolCalls: [],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+      mockChatbotDb.createChatSession.mockResolvedValue({
+        sessionId: 'session-123',
+        userId: mockUserId,
+        messages: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        emailCampaignTaskId: 'campaign-task-456',
+      });
+      mockChatbotDb.getChatSession.mockResolvedValue(sessionWithMessages);
+      
+      mockTaskDb.getTaskExecutionById.mockResolvedValue({
+        executionId: 'agentmode_session-123',
+        taskId: 'campaign-task-456',
+        userId: mockUserId,
+        result_files: [
+          { url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/reports/old.html', filename: 'old.html', token: 't', is_html: true }
+        ],
+      });
+
+      const mockReq = {} as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.runScheduledChats(mockReq, mockRes);
+
+      // Wait for async runScheduledChat to complete
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      // Should update with new URL, keeping old one
+      expect(mockTaskDb.updateTaskExecution).toHaveBeenCalledWith(
+        'agentmode_session-123',
+        expect.objectContaining({
+          result_files: expect.arrayContaining([
+            expect.objectContaining({ url: expect.stringContaining('old.html') }),
+            expect.objectContaining({ url: expect.stringContaining('new.html'), is_html: true })
+          ])
+        })
+      );
+      // Should not create a new execution
+      expect(mockTaskDb.createTaskExecution).not.toHaveBeenCalled();
+    });
+
+    it('should handle sync errors gracefully without failing the run', async () => {
+      const scheduleWithCampaign = { ...baseSchedule };
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([scheduleWithCampaign]);
+      
+      const initialSession = {
+        sessionId: 'session-123',
+        userId: mockUserId,
+        messages: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        emailCampaignTaskId: 'campaign-task-456',
+      };
+
+      mockAgentModeService.generateMarketingResponse.mockResolvedValue({
+        content: 'Some content',
+        toolCalls: [],
+        knowledgeBaseQueries: [],
+        sources: [],
+      });
+      mockChatbotDb.createChatSession.mockResolvedValue(initialSession);
+      
+      // getChatSession works during the run, but fails during sync
+      let callCount = 0;
+      mockChatbotDb.getChatSession.mockImplementation(() => {
+        callCount++;
+        // During run, return session normally
+        if (callCount <= 5) {
+          return Promise.resolve(initialSession);
+        }
+        // During sync, throw error
+        throw new Error('Database error');
+      });
+
+      const mockReq = {} as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      // Should not throw, just log the error
+      await expect(agentModeController.runScheduledChats(mockReq, mockRes)).resolves.not.toThrow();
+      // The run should still complete successfully
+      expect(mockRes.json).toHaveBeenCalled();
     });
   });
 });

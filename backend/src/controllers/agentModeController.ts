@@ -7,6 +7,82 @@ import multer from 'multer';
 import crypto from 'crypto';
 import { uploadFileToS3 } from '../utils/s3Utils';
 import { emailService } from '../services/emailService';
+// Common function: ensure a campaign execution exists and contains all HTML report URLs
+async function syncEmailCampaignExecution(
+  userId: string,
+  sessionId: string,
+  emailCampaignTaskId: string
+): Promise<void> {
+  try {
+    if (!emailCampaignTaskId) return;
+
+    const session = await chatbotDb.getChatSession(sessionId);
+    if (!session) return;
+
+    // Collect unique HTML S3 URLs from assistant messages
+    const assistantMessages = Array.isArray(session.messages)
+      ? session.messages.filter((m: any) => m && m.role === 'assistant' && typeof m.content === 'string')
+      : [];
+    const htmlUrlRegex = /(https?:\/\/[^\s\"]+\.amazonaws\.com\/[^\s\"]+\.html)/gi;
+    const foundUrlsSet = new Set<string>();
+    assistantMessages.forEach((msg: any) => {
+      let match;
+      while ((match = htmlUrlRegex.exec(msg.content)) !== null) {
+        foundUrlsSet.add(match[1]);
+      }
+    });
+
+    const foundUrls = Array.from(foundUrlsSet);
+    if (foundUrls.length === 0) return;
+
+    const execId = `agentmode_${sessionId}`;
+    const existingExecution = await taskDb.getTaskExecutionById(execId);
+    if (!existingExecution) {
+      const nowIso = new Date().toISOString();
+      await taskDb.createTaskExecution({
+        executionId: execId,
+        taskId: emailCampaignTaskId,
+        userId,
+        status: 'completed',
+        startTime: nowIso
+      });
+      const resultFiles = foundUrls.map((url) => ({
+        url,
+        filename: url.split('/').pop() || 'report.html',
+        token: Array.from(crypto.getRandomValues(new Uint8Array(16)))
+          .map((b) => b.toString(16).padStart(2, '0'))
+          .join(''),
+        is_html: true
+      }));
+      await taskDb.updateTaskExecution(execId, {
+        result_files: resultFiles as any
+      });
+      await taskDb.updateTaskExecution(execId, {
+        completedAt: nowIso
+      });
+    } else {
+      const current = existingExecution.result_files || [];
+      const currentUrlSet = new Set<string>(current.map((f: any) => f.url));
+      const additions = foundUrls
+        .filter((u) => !currentUrlSet.has(u))
+        .map((url) => ({
+          url,
+          filename: url.split('/').pop() || 'report.html',
+          token: Array.from(crypto.getRandomValues(new Uint8Array(16)))
+            .map((b) => b.toString(16).padStart(2, '0'))
+            .join(''),
+          is_html: true
+        }));
+      if (additions.length > 0) {
+        await taskDb.updateTaskExecution(execId, {
+          result_files: [...current, ...additions] as any
+        });
+      }
+    }
+  } catch (err) {
+    console.error('AgentMode: Email campaign execution sync error:', err);
+  }
+}
 
 // Interface for scheduled chat test results
 interface ScheduledChatTestResult {
@@ -374,6 +450,15 @@ async function runScheduledChat(
       console.error('Error saving run result:', error);
       // Continue even if saving fails - we still want to return the result
     }
+
+  // Also sync Research Reports execution for email campaigns
+  try {
+    if (schedule.emailCampaignTaskId) {
+      await syncEmailCampaignExecution(userId, finalResult.sessionId, schedule.emailCampaignTaskId);
+    }
+  } catch (err) {
+    console.error('AgentMode: Email campaign execution sync after run error:', err);
+  }
     
     return finalResult;
   
@@ -600,82 +685,7 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Unauthorized access to session' });
       }
 
-      // If session is linked to an Email Campaign task, ensure an execution exists and is synced with HTML result files
-      try {
-        if (session.emailCampaignTaskId) {
-          const emailCampaignTaskId: string = session.emailCampaignTaskId;
-          const execId = `agentmode_${session.sessionId}`;
-
-          // Collect unique HTML S3 URLs from assistant messages
-          const assistantMessages = Array.isArray(session.messages)
-            ? session.messages.filter((m: any) => m && m.role === 'assistant' && typeof m.content === 'string')
-            : [];
-          const htmlUrlRegex = /(https?:\/\/[^\s\"]+\.amazonaws\.com\/[^\s\"]+\.html)/gi;
-          const foundUrlsSet = new Set<string>();
-          assistantMessages.forEach((msg: any) => {
-            let match;
-            while ((match = htmlUrlRegex.exec(msg.content)) !== null) {
-              foundUrlsSet.add(match[1]);
-            }
-          });
-
-          const foundUrls = Array.from(foundUrlsSet);
-
-          if (foundUrls.length > 0) {
-            // Ensure execution exists
-            const existingExecution = await taskDb.getTaskExecutionById(execId);
-            if (!existingExecution) {
-              const nowIso = new Date().toISOString();
-              await taskDb.createTaskExecution({
-                executionId: execId,
-                taskId: emailCampaignTaskId,
-                userId: session.userId,
-                status: 'completed',
-                startTime: nowIso
-              });
-              // Initialize result_files with HTML files and set completedAt
-              const resultFiles = foundUrls.map((url) => ({
-                url,
-                filename: url.split('/').pop() || 'report.html',
-                token: Array.from(crypto.getRandomValues(new Uint8Array(16)))
-                  .map((b) => b.toString(16).padStart(2, '0'))
-                  .join(''),
-                is_html: true
-              }));
-              // Update result_files first
-              await taskDb.updateTaskExecution(execId, {
-                result_files: resultFiles as any
-              });
-              // Then set completedAt in a separate update call to avoid multiple SET clauses
-              await taskDb.updateTaskExecution(execId, {
-                completedAt: nowIso
-              });
-            } else {
-              // Merge missing URLs into result_files
-              const current = existingExecution.result_files || [];
-              const currentUrlSet = new Set<string>(current.map((f: any) => f.url));
-              const additions = foundUrls
-                .filter((u) => !currentUrlSet.has(u))
-                .map((url) => ({
-                  url,
-                  filename: url.split('/').pop() || 'report.html',
-                  token: Array.from(crypto.getRandomValues(new Uint8Array(16)))
-                    .map((b) => b.toString(16).padStart(2, '0'))
-                    .join(''),
-                  is_html: true
-                }));
-              if (additions.length > 0) {
-                await taskDb.updateTaskExecution(execId, {
-                  result_files: [...current, ...additions] as any
-                });
-              }
-            }
-          }
-        }
-      } catch (syncErr) {
-        console.error('AgentMode: Email campaign execution sync error:', syncErr);
-        // Do not fail the session load because of sync issues
-      }
+      await syncEmailCampaignExecution(session.userId, session.sessionId, session.emailCampaignTaskId || '');
 
       // Filter out tool messages and assistant messages with tool calls for user display
       const filteredSession = {
