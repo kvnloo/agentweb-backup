@@ -591,11 +591,11 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       // Setup default mocks needed for runScheduledChat
       mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
       mockAgentModeService.generateSessionTitle.mockResolvedValue('Generated Title');
-      mockScheduleDb.updateScheduleAfterRun.mockResolvedValue(undefined);
-      mockChatbotDb.addMessageToSession.mockResolvedValue(undefined);
-      mockChatbotDb.addMessagesToSession.mockResolvedValue(undefined);
-      mockChatbotDb.updateSessionTitle.mockResolvedValue(undefined);
-      mockTaskDb.getTaskExecutionById.mockResolvedValue(null);
+      mockScheduleDb.updateScheduleAfterRun.mockResolvedValue(void 0 as any);
+      mockChatbotDb.addMessageToSession.mockResolvedValue(void 0 as any);
+      mockChatbotDb.addMessagesToSession.mockResolvedValue(void 0 as any);
+      mockChatbotDb.updateSessionTitle.mockResolvedValue(void 0 as any);
+      mockTaskDb.getTaskExecutionById.mockResolvedValue(null as any);
     });
 
     it('should sync email campaign execution after scheduled chat run with HTML URLs', async () => {
@@ -606,13 +606,13 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         sessionId: 'session-123',
         userId: mockUserId,
         messages: [
-          { role: 'user', content: 'Hello' },
-          { role: 'assistant', content: 'Report: https://agentweb-user-files.s3.us-west-2.amazonaws.com/reports/report1.html' },
+          { role: 'user' as const, content: 'Hello' },
+          { role: 'assistant' as const, content: 'Report: https://agentweb-user-files.s3.us-west-2.amazonaws.com/reports/report1.html' },
         ],
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         emailCampaignTaskId: 'campaign-task-456',
-      };
+      } as any;
 
       mockAgentModeService.generateMarketingResponse.mockResolvedValue({
         content: 'Report: https://agentweb-user-files.s3.us-west-2.amazonaws.com/reports/report1.html',
@@ -666,14 +666,14 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     });
 
     it('should not sync if schedule has no emailCampaignTaskId', async () => {
-      const scheduleWithoutCampaign = { ...baseSchedule };
-      delete scheduleWithoutCampaign.emailCampaignTaskId;
+      const scheduleWithoutCampaign = { ...baseSchedule, emailCampaignTaskId: undefined };
       mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([scheduleWithoutCampaign]);
       mockAgentModeService.generateMarketingResponse.mockResolvedValue({
         content: 'Some content',
         toolCalls: [],
         knowledgeBaseQueries: [],
         sources: [],
+        responseMessages: [],
       });
       mockChatbotDb.createChatSession.mockResolvedValue({
         sessionId: 'session-123',
@@ -704,12 +704,12 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         sessionId: 'session-123',
         userId: mockUserId,
         messages: [
-          { role: 'assistant', content: 'Old: https://agentweb-user-files.s3.us-west-2.amazonaws.com/reports/old.html New: https://agentweb-user-files.s3.us-west-2.amazonaws.com/reports/new.html' },
+          { role: 'assistant' as const, content: 'Old: https://agentweb-user-files.s3.us-west-2.amazonaws.com/reports/old.html New: https://agentweb-user-files.s3.us-west-2.amazonaws.com/reports/new.html' },
         ],
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         emailCampaignTaskId: 'campaign-task-456',
-      };
+      } as any;
 
       mockAgentModeService.generateMarketingResponse.mockResolvedValue({
         content: 'New report: https://agentweb-user-files.s3.us-west-2.amazonaws.com/reports/new.html',
@@ -780,6 +780,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         toolCalls: [],
         knowledgeBaseQueries: [],
         sources: [],
+        responseMessages: [],
       });
       mockChatbotDb.createChatSession.mockResolvedValue(initialSession);
       
