@@ -3129,6 +3129,52 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const { getMetaAccessToken } = await import('../utils/secretsManager');
       const { userDb } = await import('./db');
       
+      // Helper function to fetch with retry logic
+      const fetchWithRetry = async (url: string, retries: number = 3, delayMs: number = 1000): Promise<Response> => {
+        for (let attempt = 1; attempt <= retries; attempt++) {
+          try {
+            const response = await fetch(url);
+            
+            // If successful, return response
+            if (response.ok) {
+              return response;
+            }
+            
+            // Check if it's a rate limit or server error that should be retried
+            if (response.status === 429 || response.status >= 500) {
+              console.log(`AgentMode: Facebook API request failed with status ${response.status}, attempt ${attempt}/${retries}`);
+              
+              if (attempt < retries) {
+                // Exponential backoff with jitter
+                const backoffDelay = delayMs * Math.pow(2, attempt - 1) + Math.random() * 1000;
+                console.log(`AgentMode: Retrying after ${Math.round(backoffDelay)}ms...`);
+                await new Promise(resolve => setTimeout(resolve, backoffDelay));
+                continue;
+              }
+            }
+            
+            // For other errors or if we've exhausted retries, return the response
+            return response;
+          } catch (error) {
+            console.error(`AgentMode: Facebook API request error on attempt ${attempt}/${retries}:`, error);
+            
+            if (attempt < retries) {
+              // Exponential backoff with jitter for network errors
+              const backoffDelay = delayMs * Math.pow(2, attempt - 1) + Math.random() * 1000;
+              console.log(`AgentMode: Retrying after ${Math.round(backoffDelay)}ms...`);
+              await new Promise(resolve => setTimeout(resolve, backoffDelay));
+              continue;
+            }
+            
+            // If all retries exhausted, rethrow the error
+            throw error;
+          }
+        }
+        
+        // This should never be reached, but TypeScript requires it
+        throw new Error('Unexpected: fetchWithRetry exhausted all attempts without returning');
+      };
+      
       // Get user from database
       const user = await userDb.getUserById(userId);
       if (!user) {
@@ -3184,7 +3230,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       let campaignFilterIds: string[] = [];
       if (campaign_name) {
         console.log('AgentMode: Getting campaigns to find matching IDs for:', campaign_name);
-        const campaignsResponse = await fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`);
+        const campaignsResponse = await fetchWithRetry(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`);
         const campaignsData = await campaignsResponse.json();
         
         if (campaignsData.error) {
@@ -3216,21 +3262,21 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Get campaigns, ad sets, ads, and insights using Graph API - fetch at multiple levels
       const [campaignsResponse, adSetsResponse, adsResponse, adInsightsResponse, adSetInsightsResponse, campaignInsightsResponse, insightsDemographicsResponse, insightsPlacementResponse, insightsDeviceResponse] = await Promise.all([
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective${filteringParam}&access_token=${accessToken}`),
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting${filteringParam}&access_token=${accessToken}`),
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetry(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetry(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetry(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}${filteringParam}&access_token=${accessToken}`),
         // Ad-level insights for ads processing
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetry(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
         // Adset-level insights for ad sets processing
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=adset${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetry(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=adset${filteringParam}&access_token=${accessToken}`),
         // Campaign-level insights for campaigns processing
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetry(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
         // Demographics breakdown (age/gender)
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=age,gender&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetry(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=age,gender&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
         // Placement breakdown (publisher platform and position)
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=publisher_platform,platform_position&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetry(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=publisher_platform,platform_position&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
         // Device breakdown (mobile/desktop, etc.)
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`)
+        fetchWithRetry(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`)
       ]);
 
       const [campaignsData, adSetsData, adsData, adInsightsData, adSetInsightsData, campaignInsightsData, insightsDemographicsData, insightsPlacementData, insightsDeviceData] = await Promise.all([
