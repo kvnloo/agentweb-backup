@@ -3128,6 +3128,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       // Import the Meta API functions directly to reuse the same logic
       const { getMetaAccessToken } = await import('../utils/secretsManager');
       const { userDb } = await import('./db');
+      const { fetchWithRetryAndPaging } = await import('../utils/metaApiFetch');
       
       // Get user from database
       const user = await userDb.getUserById(userId);
@@ -3165,27 +3166,28 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const apiVersion = process.env.META_API_VERSION || 'v18.0';
       
       // Calculate date range based on timeframe
+      // Exclude today since it's not fully complete - use yesterday as end date
       const endDate = new Date();
-      const startDate = new Date();
+      endDate.setDate(endDate.getDate() - 1); // Set to yesterday
+      const startDate = new Date(endDate); // Copy endDate
       if (timeframe === "7d") {
-        startDate.setDate(endDate.getDate() - 7);
+        startDate.setDate(endDate.getDate() - 6); // 7 days total (yesterday - 6 = 7 days)
       } else if (timeframe === "14d") {
-        startDate.setDate(endDate.getDate() - 14);
+        startDate.setDate(endDate.getDate() - 13); // 14 days total
       } else if (timeframe === "30d") {
-        startDate.setDate(endDate.getDate() - 30);
+        startDate.setDate(endDate.getDate() - 29); // 30 days total
       } else if (timeframe === "90d") {
-        startDate.setDate(endDate.getDate() - 90);
+        startDate.setDate(endDate.getDate() - 89); // 90 days total
       }
       const sinceStr = startDate.toISOString().split('T')[0];
       const untilStr = endDate.toISOString().split('T')[0];
-      const attributionDays = Math.max(1, Math.ceil((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24)));
+      const attributionDays = Math.max(1, Math.ceil((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24))) + 1; // +1 to include both start and end dates
 
       // First, get campaigns to find matching campaign IDs if filtering by campaign name
       let campaignFilterIds: string[] = [];
       if (campaign_name) {
         console.log('AgentMode: Getting campaigns to find matching IDs for:', campaign_name);
-        const campaignsResponse = await fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`);
-        const campaignsData = await campaignsResponse.json();
+        const campaignsData = await fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`);
         
         if (campaignsData.error) {
           console.error('AgentMode: Campaigns API Error:', campaignsData.error);
@@ -3215,34 +3217,23 @@ Use the available tools to create tasks in the agent-engine when complex work is
       
 
       // Get campaigns, ad sets, ads, and insights using Graph API - fetch at multiple levels
-      const [campaignsResponse, adSetsResponse, adsResponse, adInsightsResponse, adSetInsightsResponse, campaignInsightsResponse, insightsDemographicsResponse, insightsPlacementResponse, insightsDeviceResponse] = await Promise.all([
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective${filteringParam}&access_token=${accessToken}`),
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting${filteringParam}&access_token=${accessToken}`),
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}${filteringParam}&access_token=${accessToken}`),
-        // Ad-level insights for ads processing
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
-        // Adset-level insights for ad sets processing
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=adset${filteringParam}&access_token=${accessToken}`),
-        // Campaign-level insights for campaigns processing
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
-        // Demographics breakdown (age/gender)
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id,adset_id,ad_id&breakdowns=age,gender&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
-        // Placement breakdown (publisher platform and position)
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id,adset_id,ad_id&breakdowns=publisher_platform,platform_position&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
-        // Device breakdown (mobile/desktop, etc.)
-        fetch(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id,adset_id,ad_id&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`)
-      ]);
-
+      // Using fetchWithRetryAndPaging to automatically handle pagination if there are multiple pages
       const [campaignsData, adSetsData, adsData, adInsightsData, adSetInsightsData, campaignInsightsData, insightsDemographicsData, insightsPlacementData, insightsDeviceData] = await Promise.all([
-        campaignsResponse.json(),
-        adSetsResponse.json(),
-        adsResponse.json(),
-        adInsightsResponse.json(),
-        adSetInsightsResponse.json(),
-        campaignInsightsResponse.json(),
-        insightsDemographicsResponse.json(),
-        insightsPlacementResponse.json(),
-        insightsDeviceResponse.json()
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}${filteringParam}&access_token=${accessToken}`),
+        // Ad-level insights for ads processing
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
+        // Adset-level insights for ad sets processing
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=adset${filteringParam}&access_token=${accessToken}`),
+        // Campaign-level insights for campaigns processing
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+        // Demographics breakdown (age/gender)
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=age,gender&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+        // Placement breakdown (publisher platform and position)
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=publisher_platform,platform_position&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+        // Device breakdown (mobile/desktop, etc.)
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`)
       ]);
 
 
@@ -3311,7 +3302,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const processedDeviceBreakdown = this.processBreakdownData(deviceBreakdown);
       
       // Format the data for LLM consumption
-      const formattedContent = this.formatMetricsSummary({
+      const formattedContent = await this.formatMetricsSummary({
         adPerformance,
         adSetsData: processedAdSetsData,
         adsData: processedAdsData,
@@ -3321,7 +3312,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         deviceBreakdown: processedDeviceBreakdown,
         attributionWindow: { start: sinceStr, end: untilStr, days: attributionDays },
         timeframe
-      });
+      }, userId);
 
       const result = {
         success: true,
@@ -3924,211 +3915,331 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   // Helper function to format metrics summary for AI analysis
-  private formatMetricsSummary(data: any): string {
+  private async formatMetricsSummary(data: any, userId: string): Promise<string> {
     const { adPerformance, adSetsData, adsData, campaignSummary, demographicsBreakdown, placementBreakdown, deviceBreakdown, attributionWindow } = data;
     
-    let summary = `📊 **Meta Ads Performance Data**\n\n`;
-    
-    // Attribution Window Information (start, end, number of days)
-    if (attributionWindow && attributionWindow.start && attributionWindow.end) {
-      summary += `**Attribution Window**\n`;
-      summary += `| Start | End | Days |\n`;
-      summary += `|-------|-----|------|\n`;
-      summary += `| ${attributionWindow.start} | ${attributionWindow.end} | ${attributionWindow.days} |\n\n`;
-    }
-    
-    // Campaign Summary Table
-    if (campaignSummary) {
-      summary += `**Campaign Summary**\n`;
-      summary += `| Metric | Value |\n`;
-      summary += `|--------|-------|\n`;
-      summary += `| Total Campaigns | ${campaignSummary.totalCampaigns} |\n`;
-      summary += `| Total Spend | $${campaignSummary.totalSpend.toFixed(2)} |\n`;
-      summary += `| Impressions | ${campaignSummary.totalImpressions.toLocaleString()} |\n`;
-      summary += `| Clicks | ${campaignSummary.totalClicks.toLocaleString()} |\n`;
-      summary += `| CTR | ${campaignSummary.averageCtr.toFixed(2)}% |\n`;
-      summary += `| CPC | $${campaignSummary.averageCpc.toFixed(2)} |\n`;
-      summary += `| Website Leads | ${campaignSummary.totalWebsiteLeads.toLocaleString()} |\n`;
-      summary += `| Form Submissions | ${campaignSummary.totalFormLeads.toLocaleString()} |\n`;
-      summary += `| Total Leads | ${campaignSummary.totalLeads.toLocaleString()} |\n`;
-      summary += `| Cost per Website Lead | $${campaignSummary.averageCostPerWebsiteLead.toFixed(2)} |\n`;
-      summary += `| Cost per Form Lead | $${campaignSummary.averageCostPerFormLead.toFixed(2)} |\n`;
-      summary += `| Cost per Lead | $${campaignSummary.averageCostPerLead.toFixed(2)} |\n\n`;
-    }
-    
-    // Campaign Performance Table
-    if (adPerformance && adPerformance.length > 0) {
-      summary += `**Campaign Performance**\n`;
-      summary += `| Campaign Name | Spend | Impressions | Clicks | CTR | CPC | Website Leads | Form Leads | Total Leads | Cost/Lead |\n`;
-      summary += `|---------------|-------|-------------|--------|-----|-----|---------------|------------|-------------|----------|\n`;
+    try {
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const fileUrls: { url: string; name: string }[] = [];
       
-      adPerformance.forEach((campaign: any) => {
-        summary += `| ${campaign.name} | $${campaign.spend.toFixed(2)} | ${campaign.impressions.toLocaleString()} | ${campaign.clicks.toLocaleString()} | ${campaign.ctr.toFixed(2)}% | $${campaign.cpc.toFixed(2)} | ${(campaign.websiteLeads || 0).toLocaleString()} | ${(campaign.formLeads || 0).toLocaleString()} | ${(campaign.totalLeads || 0).toLocaleString()} | $${(campaign.costPerLead || 0).toFixed(2)} |\n`;
-      });
-      summary += `\n`;
-    }
-    
-    // Ad Sets Performance Table
-    if (adSetsData && adSetsData.length > 0) {
-      summary += `**Ad Sets Performance**\n`;
-      summary += `| Ad Set Name | Campaign | Spend | Impressions | Clicks | CTR | CPC | Website Leads | Form Leads | Total Leads | Cost/Lead |\n`;
-      summary += `|-------------|----------|-------|-------------|--------|-----|-----|---------------|------------|-------------|----------|\n`;
+      // Create date range string for filenames
+      const startDate = attributionWindow?.start || 'unknown';
+      const endDate = attributionWindow?.end || 'unknown';
+      const dateRange = `${startDate}_${endDate}`;
       
-      adSetsData.forEach((adSet: any) => {
-        summary += `| ${adSet.name} | ${adSet.campaignName} | $${adSet.spend.toFixed(2)} | ${adSet.impressions.toLocaleString()} | ${adSet.clicks.toLocaleString()} | ${adSet.ctr.toFixed(2)}% | $${adSet.cpc.toFixed(2)} | ${(adSet.websiteLeads || 0).toLocaleString()} | ${(adSet.formLeads || 0).toLocaleString()} | ${(adSet.totalLeads || 0).toLocaleString()} | $${(adSet.costPerLead || 0).toFixed(2)} |\n`;
-      });
-      summary += `\n`;
-    }
-    
-    // Individual Ads Performance Table
-    if (adsData && adsData.length > 0) {
-      summary += `**Individual Ads Performance**\n`;
-      summary += `| Ad Name | Ad Set | Campaign | Spend | Impressions | Clicks | CTR | CPC | Website Leads | Form Leads | Total Leads | Cost/Lead |\n`;
-      summary += `|---------|--------|----------|-------|-------------|--------|-----|-----|---------------|------------|-------------|----------|\n`;
+      // Helper function to convert array to CSV
+      const arrayToCSV = (headers: string[], rows: string[][]): string => {
+        const csvRows = [headers.join(',')];
+        rows.forEach(row => {
+          csvRows.push(row.map(cell => {
+            // Escape quotes and wrap in quotes if contains comma or quote
+            const cellStr = String(cell);
+            if (cellStr.includes(',') || cellStr.includes('"') || cellStr.includes('\n')) {
+              return `"${cellStr.replace(/"/g, '""')}"`;
+            }
+            return cellStr;
+          }).join(','));
+        });
+        return csvRows.join('\n');
+      };
       
-      adsData.forEach((ad: any) => {
-        summary += `| ${ad.name} | ${ad.adSetName} | ${ad.campaignName} | $${ad.spend.toFixed(2)} | ${ad.impressions.toLocaleString()} | ${ad.clicks.toLocaleString()} | ${ad.ctr.toFixed(2)}% | $${ad.cpc.toFixed(2)} | ${(ad.websiteLeads || 0).toLocaleString()} | ${(ad.formLeads || 0).toLocaleString()} | ${(ad.totalLeads || 0).toLocaleString()} | $${(ad.costPerLead || 0).toFixed(2)} |\n`;
-      });
-      summary += `\n`;
-    }
-    
-    // Demographics Breakdown
-    if (demographicsBreakdown && demographicsBreakdown.length > 0) {
-      summary += `**Demographics Performance**\n`;
-      summary += `| Age | Gender | Impressions | Clicks | Spend | CTR | CPC | Website Leads | Form Leads | Total Leads | Cost/Lead |\n`;
-      summary += `|-----|--------|-------------|--------|-------|-----|-----|---------------|------------|-------------|----------|\n`;
-      
-      // Group by age and gender, then aggregate metrics
-      const demographicsMap = new Map();
-      demographicsBreakdown.forEach((item: any) => {
-        const key = `${item.age || 'Unknown'}-${item.gender || 'Unknown'}`;
-        if (!demographicsMap.has(key)) {
-          demographicsMap.set(key, {
-            age: item.age || 'Unknown',
-            gender: item.gender || 'Unknown',
-            impressions: 0,
-            clicks: 0,
-            spend: 0,
-            websiteLeads: 0,
-            formLeads: 0,
-            totalLeads: 0
-          });
+      // 1. Ad-Level Data CSV
+      if (adsData && adsData.length > 0) {
+        const adRows = adsData.map((ad: any) => [
+          ad.name,
+          ad.adSetName,
+          ad.campaignName,
+          String(ad.impressions),
+          String(ad.clicks),
+          `$${ad.spend.toFixed(2)}`,
+          `${ad.ctr.toFixed(2)}%`,
+          `$${ad.cpc.toFixed(2)}`,
+          String(ad.websiteLeads || 0),
+          String(ad.formLeads || 0),
+          String(ad.totalLeads || 0),
+          `$${(ad.costPerLead || 0).toFixed(2)}`
+        ]);
+        
+        const adCSV = arrayToCSV(
+          ['Ad Name', 'Ad Set', 'Campaign', 'Impressions', 'Clicks', 'Spend', 'CTR', 'CPC', 'Website Leads', 'Form Leads', 'Total Leads', 'Cost/Lead'],
+          adRows
+        );
+        const adResult = await uploadFileToS3(
+          Buffer.from(adCSV, 'utf-8'),
+          `meta-ads-ad-level-data-${dateRange}.csv`,
+          userId,
+          'text/csv'
+        );
+        if (adResult.success && adResult.url) {
+          fileUrls.push({ url: adResult.url, name: 'Ad-Level Data (all individual ads)' });
         }
-        const demo = demographicsMap.get(key);
-        demo.impressions += parseInt(item.impressions) || 0;
-        demo.clicks += parseInt(item.clicks) || 0;
-        demo.spend += parseFloat(item.spend) || 0;
-        demo.websiteLeads += parseInt(item.websiteLeads) || 0;
-        demo.formLeads += parseInt(item.formLeads) || 0;
-        demo.totalLeads = demo.websiteLeads + demo.formLeads;
-      });
+      }
       
-      // Sort by spend descending and show top 10
-      const sortedDemographics = Array.from(demographicsMap.values())
-        .sort((a, b) => b.spend - a.spend)
-        .slice(0, 10);
-      
-      sortedDemographics.forEach((demo: any) => {
-        const ctr = demo.impressions > 0 ? (demo.clicks / demo.impressions) * 100 : 0;
-        const cpc = demo.clicks > 0 ? demo.spend / demo.clicks : 0;
-        const costPerLead = demo.totalLeads > 0 ? demo.spend / demo.totalLeads : 0;
-        summary += `| ${demo.age} | ${demo.gender} | ${demo.impressions.toLocaleString()} | ${demo.clicks.toLocaleString()} | $${demo.spend.toFixed(2)} | ${ctr.toFixed(2)}% | $${cpc.toFixed(2)} | ${demo.websiteLeads.toLocaleString()} | ${demo.formLeads.toLocaleString()} | ${demo.totalLeads.toLocaleString()} | $${costPerLead.toFixed(2)} |\n`;
-      });
-      summary += `\n`;
-    }
-    
-    // Placement Breakdown
-    if (placementBreakdown && placementBreakdown.length > 0) {
-      summary += `**Placement Performance**\n`;
-      summary += `| Platform | Position | Impressions | Clicks | Spend | CTR | CPC | Website Leads | Form Leads | Total Leads | Cost/Lead |\n`;
-      summary += `|----------|----------|-------------|--------|-------|-----|-----|---------------|------------|-------------|----------|\n`;
-      
-      // Group by platform and position, then aggregate metrics
-      const placementMap = new Map();
-      placementBreakdown.forEach((item: any) => {
-        const key = `${item.publisher_platform || 'Unknown'}-${item.platform_position || 'Unknown'}`;
-        if (!placementMap.has(key)) {
-          placementMap.set(key, {
-            platform: item.publisher_platform || 'Unknown',
-            position: item.platform_position || 'Unknown',
-            impressions: 0,
-            clicks: 0,
-            spend: 0,
-            websiteLeads: 0,
-            formLeads: 0,
-            totalLeads: 0
-          });
+      // 2. Demographics Breakdown CSV
+      if (demographicsBreakdown && demographicsBreakdown.length > 0) {
+        // Group by age and gender, then aggregate metrics
+        const demographicsMap = new Map();
+        demographicsBreakdown.forEach((item: any) => {
+          const key = `${item.age || 'Unknown'}-${item.gender || 'Unknown'}`;
+          if (!demographicsMap.has(key)) {
+            demographicsMap.set(key, {
+              age: item.age || 'Unknown',
+              gender: item.gender || 'Unknown',
+              impressions: 0,
+              clicks: 0,
+              spend: 0,
+              websiteLeads: 0,
+              formLeads: 0,
+              totalLeads: 0
+            });
+          }
+          const demo = demographicsMap.get(key);
+          demo.impressions += parseInt(item.impressions) || 0;
+          demo.clicks += parseInt(item.clicks) || 0;
+          demo.spend += parseFloat(item.spend) || 0;
+          demo.websiteLeads += parseInt(item.websiteLeads) || 0;
+          demo.formLeads += parseInt(item.formLeads) || 0;
+          demo.totalLeads = demo.websiteLeads + demo.formLeads;
+        });
+        
+        // Sort by spend descending
+        const sortedDemographics = Array.from(demographicsMap.values())
+          .sort((a, b) => b.spend - a.spend);
+        
+        const demoRows = sortedDemographics.map((demo: any) => {
+          const ctr = demo.impressions > 0 ? (demo.clicks / demo.impressions) * 100 : 0;
+          const cpc = demo.clicks > 0 ? demo.spend / demo.clicks : 0;
+          const costPerLead = demo.totalLeads > 0 ? demo.spend / demo.totalLeads : 0;
+          return [
+            demo.age,
+            demo.gender,
+            String(demo.impressions),
+            String(demo.clicks),
+            `$${demo.spend.toFixed(2)}`,
+            `${ctr.toFixed(2)}%`,
+            `$${cpc.toFixed(2)}`,
+            String(demo.websiteLeads),
+            String(demo.formLeads),
+            String(demo.totalLeads),
+            `$${costPerLead.toFixed(2)}`
+          ];
+        });
+        
+        const demoCSV = arrayToCSV(
+          ['Age', 'Gender', 'Impressions', 'Clicks', 'Spend', 'CTR', 'CPC', 'Website Leads', 'Form Leads', 'Total Leads', 'Cost/Lead'],
+          demoRows
+        );
+        const demoResult = await uploadFileToS3(
+          Buffer.from(demoCSV, 'utf-8'),
+          `meta-ads-demographics-breakdown-${dateRange}.csv`,
+          userId,
+          'text/csv'
+        );
+        if (demoResult.success && demoResult.url) {
+          fileUrls.push({ url: demoResult.url, name: 'Demographics Breakdown' });
         }
-        const placement = placementMap.get(key);
-        placement.impressions += parseInt(item.impressions) || 0;
-        placement.clicks += parseInt(item.clicks) || 0;
-        placement.spend += parseFloat(item.spend) || 0;
-        placement.websiteLeads += parseInt(item.websiteLeads) || 0;
-        placement.formLeads += parseInt(item.formLeads) || 0;
-        placement.totalLeads = placement.websiteLeads + placement.formLeads;
-      });
+      }
       
-      // Sort by spend descending and show top 10
-      const sortedPlacements = Array.from(placementMap.values())
-        .sort((a, b) => b.spend - a.spend)
-        .slice(0, 10);
-      
-      sortedPlacements.forEach((placement: any) => {
-        const ctr = placement.impressions > 0 ? (placement.clicks / placement.impressions) * 100 : 0;
-        const cpc = placement.clicks > 0 ? placement.spend / placement.clicks : 0;
-        const costPerLead = placement.totalLeads > 0 ? placement.spend / placement.totalLeads : 0;
-        summary += `| ${placement.platform} | ${placement.position} | ${placement.impressions.toLocaleString()} | ${placement.clicks.toLocaleString()} | $${placement.spend.toFixed(2)} | ${ctr.toFixed(2)}% | $${cpc.toFixed(2)} | ${placement.websiteLeads.toLocaleString()} | ${placement.formLeads.toLocaleString()} | ${placement.totalLeads.toLocaleString()} | $${costPerLead.toFixed(2)} |\n`;
-      });
-      summary += `\n`;
-    }
-    
-    // Device Breakdown
-    if (deviceBreakdown && deviceBreakdown.length > 0) {
-      summary += `**Device Performance**\n`;
-      summary += `| Device | Impressions | Clicks | Spend | CTR | CPC | Website Leads | Form Leads | Total Leads | Cost/Lead |\n`;
-      summary += `|--------|-------------|--------|-------|-----|-----|---------------|------------|-------------|----------|\n`;
-      
-      // Group by device, then aggregate metrics
-      const deviceMap = new Map();
-      deviceBreakdown.forEach((item: any) => {
-        const device = item.impression_device || 'Unknown';
-        if (!deviceMap.has(device)) {
-          deviceMap.set(device, {
-            device,
-            impressions: 0,
-            clicks: 0,
-            spend: 0,
-            websiteLeads: 0,
-            formLeads: 0,
-            totalLeads: 0
-          });
+      // 3. Placement Breakdown CSV
+      if (placementBreakdown && placementBreakdown.length > 0) {
+        // Group by platform and position, then aggregate metrics
+        const placementMap = new Map();
+        placementBreakdown.forEach((item: any) => {
+          const key = `${item.publisher_platform || 'Unknown'}-${item.platform_position || 'Unknown'}`;
+          if (!placementMap.has(key)) {
+            placementMap.set(key, {
+              platform: item.publisher_platform || 'Unknown',
+              position: item.platform_position || 'Unknown',
+              impressions: 0,
+              clicks: 0,
+              spend: 0,
+              websiteLeads: 0,
+              formLeads: 0,
+              totalLeads: 0
+            });
+          }
+          const placement = placementMap.get(key);
+          placement.impressions += parseInt(item.impressions) || 0;
+          placement.clicks += parseInt(item.clicks) || 0;
+          placement.spend += parseFloat(item.spend) || 0;
+          placement.websiteLeads += parseInt(item.websiteLeads) || 0;
+          placement.formLeads += parseInt(item.formLeads) || 0;
+          placement.totalLeads = placement.websiteLeads + placement.formLeads;
+        });
+        
+        // Sort by spend descending
+        const sortedPlacements = Array.from(placementMap.values())
+          .sort((a, b) => b.spend - a.spend);
+        
+        const placementRows = sortedPlacements.map((placement: any) => {
+          const ctr = placement.impressions > 0 ? (placement.clicks / placement.impressions) * 100 : 0;
+          const cpc = placement.clicks > 0 ? placement.spend / placement.clicks : 0;
+          const costPerLead = placement.totalLeads > 0 ? placement.spend / placement.totalLeads : 0;
+          return [
+            placement.platform,
+            placement.position,
+            String(placement.impressions),
+            String(placement.clicks),
+            `$${placement.spend.toFixed(2)}`,
+            `${ctr.toFixed(2)}%`,
+            `$${cpc.toFixed(2)}`,
+            String(placement.websiteLeads),
+            String(placement.formLeads),
+            String(placement.totalLeads),
+            `$${costPerLead.toFixed(2)}`
+          ];
+        });
+        
+        const placementCSV = arrayToCSV(
+          ['Platform', 'Position', 'Impressions', 'Clicks', 'Spend', 'CTR', 'CPC', 'Website Leads', 'Form Leads', 'Total Leads', 'Cost/Lead'],
+          placementRows
+        );
+        const placementResult = await uploadFileToS3(
+          Buffer.from(placementCSV, 'utf-8'),
+          `meta-ads-placement-breakdown-${dateRange}.csv`,
+          userId,
+          'text/csv'
+        );
+        if (placementResult.success && placementResult.url) {
+          fileUrls.push({ url: placementResult.url, name: 'Placement Breakdown' });
         }
-        const deviceData = deviceMap.get(device);
-        deviceData.impressions += parseInt(item.impressions) || 0;
-        deviceData.clicks += parseInt(item.clicks) || 0;
-        deviceData.spend += parseFloat(item.spend) || 0;
-        deviceData.websiteLeads += parseInt(item.websiteLeads) || 0;
-        deviceData.formLeads += parseInt(item.formLeads) || 0;
-        deviceData.totalLeads = deviceData.websiteLeads + deviceData.formLeads;
-      });
+      }
       
-      // Sort by spend descending
-      const sortedDevices = Array.from(deviceMap.values())
-        .sort((a, b) => b.spend - a.spend);
+      // 4. Device Breakdown CSV
+      if (deviceBreakdown && deviceBreakdown.length > 0) {
+        // Group by device, then aggregate metrics
+        const deviceMap = new Map();
+        deviceBreakdown.forEach((item: any) => {
+          const device = item.impression_device || 'Unknown';
+          if (!deviceMap.has(device)) {
+            deviceMap.set(device, {
+              device,
+              impressions: 0,
+              clicks: 0,
+              spend: 0,
+              websiteLeads: 0,
+              formLeads: 0,
+              totalLeads: 0
+            });
+          }
+          const deviceData = deviceMap.get(device);
+          deviceData.impressions += parseInt(item.impressions) || 0;
+          deviceData.clicks += parseInt(item.clicks) || 0;
+          deviceData.spend += parseFloat(item.spend) || 0;
+          deviceData.websiteLeads += parseInt(item.websiteLeads) || 0;
+          deviceData.formLeads += parseInt(item.formLeads) || 0;
+          deviceData.totalLeads = deviceData.websiteLeads + deviceData.formLeads;
+        });
+        
+        // Sort by spend descending
+        const sortedDevices = Array.from(deviceMap.values())
+          .sort((a, b) => b.spend - a.spend);
+        
+        const deviceRows = sortedDevices.map((device: any) => {
+          const ctr = device.impressions > 0 ? (device.clicks / device.impressions) * 100 : 0;
+          const cpc = device.clicks > 0 ? device.spend / device.clicks : 0;
+          const costPerLead = device.totalLeads > 0 ? device.spend / device.totalLeads : 0;
+          return [
+            device.device,
+            String(device.impressions),
+            String(device.clicks),
+            `$${device.spend.toFixed(2)}`,
+            `${ctr.toFixed(2)}%`,
+            `$${cpc.toFixed(2)}`,
+            String(device.websiteLeads),
+            String(device.formLeads),
+            String(device.totalLeads),
+            `$${costPerLead.toFixed(2)}`
+          ];
+        });
+        
+        const deviceCSV = arrayToCSV(
+          ['Device', 'Impressions', 'Clicks', 'Spend', 'CTR', 'CPC', 'Website Leads', 'Form Leads', 'Total Leads', 'Cost/Lead'],
+          deviceRows
+        );
+        const deviceResult = await uploadFileToS3(
+          Buffer.from(deviceCSV, 'utf-8'),
+          `meta-ads-device-breakdown-${dateRange}.csv`,
+          userId,
+          'text/csv'
+        );
+        if (deviceResult.success && deviceResult.url) {
+          fileUrls.push({ url: deviceResult.url, name: 'Device Breakdown' });
+        }
+      }
       
-      sortedDevices.forEach((device: any) => {
-        const ctr = device.impressions > 0 ? (device.clicks / device.impressions) * 100 : 0;
-        const cpc = device.clicks > 0 ? device.spend / device.clicks : 0;
-        const costPerLead = device.totalLeads > 0 ? device.spend / device.totalLeads : 0;
-        summary += `| ${device.device} | ${device.impressions.toLocaleString()} | ${device.clicks.toLocaleString()} | $${device.spend.toFixed(2)} | ${ctr.toFixed(2)}% | $${cpc.toFixed(2)} | ${device.websiteLeads.toLocaleString()} | ${device.formLeads.toLocaleString()} | ${device.totalLeads.toLocaleString()} | $${costPerLead.toFixed(2)} |\n`;
-      });
-      summary += `\n`;
+      // Build summary with campaign and ad set data, plus file URLs
+      let summary = `📊 **Meta Ads Performance Data**\n\n`;
+      
+      // Attribution Window
+      if (attributionWindow && attributionWindow.start && attributionWindow.end) {
+        summary += `**Attribution Window:** ${attributionWindow.start} to ${attributionWindow.end} (${attributionWindow.days} days)\n\n`;
+      }
+      
+      // Campaign Summary
+      if (campaignSummary) {
+        summary += `**📈 Campaign Summary**\n\n`;
+        summary += `| Metric | Value |\n`;
+        summary += `|--------|-------|\n`;
+        summary += `| Total Campaigns | ${campaignSummary.totalCampaigns} |\n`;
+        summary += `| Total Spend | $${campaignSummary.totalSpend.toFixed(2)} |\n`;
+        summary += `| Impressions | ${campaignSummary.totalImpressions.toLocaleString()} |\n`;
+        summary += `| Clicks | ${campaignSummary.totalClicks.toLocaleString()} |\n`;
+        summary += `| CTR | ${campaignSummary.averageCtr.toFixed(2)}% |\n`;
+        summary += `| CPC | $${campaignSummary.averageCpc.toFixed(2)} |\n`;
+        summary += `| Website Leads | ${campaignSummary.totalWebsiteLeads.toLocaleString()} |\n`;
+        summary += `| Form Submissions | ${campaignSummary.totalFormLeads.toLocaleString()} |\n`;
+        summary += `| Total Leads | ${campaignSummary.totalLeads.toLocaleString()} |\n`;
+        summary += `| Cost per Website Lead | $${campaignSummary.averageCostPerWebsiteLead.toFixed(2)} |\n`;
+        summary += `| Cost per Form Lead | $${campaignSummary.averageCostPerFormLead.toFixed(2)} |\n`;
+        summary += `| Cost per Lead | $${campaignSummary.averageCostPerLead.toFixed(2)} |\n\n`;
+      }
+      
+      // Campaign Performance (top 10 by spend)
+      if (adPerformance && adPerformance.length > 0) {
+        const topCampaigns = adPerformance.slice(0, 10);
+        summary += `**🎯 Campaign Performance** (Top ${topCampaigns.length} by Spend)\n\n`;
+        summary += `| Campaign Name | Spend | Impressions | Clicks | CTR | CPC | Website Leads | Form Leads | Total Leads | Cost/Lead |\n`;
+        summary += `|---------------|-------|-------------|--------|-----|-----|---------------|------------|-------------|----------|\n`;
+        
+        topCampaigns.forEach((campaign: any) => {
+          summary += `| ${campaign.name} | $${campaign.spend.toFixed(2)} | ${campaign.impressions.toLocaleString()} | ${campaign.clicks.toLocaleString()} | ${campaign.ctr.toFixed(2)}% | $${campaign.cpc.toFixed(2)} | ${(campaign.websiteLeads || 0).toLocaleString()} | ${(campaign.formLeads || 0).toLocaleString()} | ${(campaign.totalLeads || 0).toLocaleString()} | $${(campaign.costPerLead || 0).toFixed(2)} |\n`;
+        });
+        summary += `\n`;
+      }
+      
+      // Ad Sets Performance (top 10 by spend)
+      if (adSetsData && adSetsData.length > 0) {
+        const topAdSets = adSetsData.slice(0, 10);
+        summary += `**📦 Ad Sets Performance** (Top ${topAdSets.length} by Spend)\n\n`;
+        summary += `| Ad Set Name | Campaign | Spend | Impressions | Clicks | CTR | CPC | Website Leads | Form Leads | Total Leads | Cost/Lead |\n`;
+        summary += `|-------------|----------|-------|-------------|--------|-----|-----|---------------|------------|-------------|----------|\n`;
+        
+        topAdSets.forEach((adSet: any) => {
+          summary += `| ${adSet.name} | ${adSet.campaignName} | $${adSet.spend.toFixed(2)} | ${adSet.impressions.toLocaleString()} | ${adSet.clicks.toLocaleString()} | ${adSet.ctr.toFixed(2)}% | $${adSet.cpc.toFixed(2)} | ${(adSet.websiteLeads || 0).toLocaleString()} | ${(adSet.formLeads || 0).toLocaleString()} | ${(adSet.totalLeads || 0).toLocaleString()} | $${(adSet.costPerLead || 0).toFixed(2)} |\n`;
+        });
+        summary += `\n`;
+      }
+      
+      // CSV Files Section
+      if (fileUrls.length > 0) {
+        summary += `**📥 Detailed Data Files**\n\n`;
+        summary += `The following CSV files contain detailed ad-level and breakdown data:\n\n`;
+        
+        fileUrls.forEach((file, index) => {
+          summary += `${index + 1}. **${file.name}**\n   📥 [Download CSV](${file.url})\n\n`;
+        });
+      }
+      
+      summary += `*Data includes ${adPerformance?.length || 0} campaigns, ${adSetsData?.length || 0} ad sets, and ${adsData?.length || 0} individual ads.*\n`;
+      summary += `*Note: Breakdown data (demographics, placement, device) only includes spend from ads with sufficient data for those breakdowns. Breakdown totals may not match campaign totals due to this limitation.*\n`;
+      
+      return summary;
+    } catch (error) {
+      console.error('Error generating CSV files for Meta ads metrics:', error);
+      // Fallback to text summary if CSV generation fails
+      return `📊 **Meta Ads Performance Data**\n\nError generating CSV files: ${error instanceof Error ? error.message : 'Unknown error'}. Please try again.`;
     }
-    
-    summary += `*Data includes ${adPerformance?.length || 0} campaigns, ${adSetsData?.length || 0} ad sets, and ${adsData?.length || 0} individual ads.*\n`;
-    summary += `*Note: Breakdown data (demographics, placement, device) only includes spend from ads with sufficient data for those breakdowns. Breakdown totals may not match campaign totals due to this limitation.*\n`;
-    
-    return summary;
   }
 
 

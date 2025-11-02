@@ -111,18 +111,23 @@ router.get("/ad-performance", async (req, res) => {
     }
     
     // Calculate date range based on timeframe
+    // Exclude today since it's not fully complete - use yesterday as end date
     const endDate = new Date();
-    const startDate = new Date();
+    endDate.setDate(endDate.getDate() - 1); // Set to yesterday
+    const startDate = new Date(endDate); // Copy endDate
     if (timeframe === "7d") {
-      startDate.setDate(endDate.getDate() - 7);
+      startDate.setDate(endDate.getDate() - 6); // 7 days total (yesterday - 6 = 7 days)
     } else if (timeframe === "14d") {
-      startDate.setDate(endDate.getDate() - 14);
+      startDate.setDate(endDate.getDate() - 13); // 14 days total
     } else if (timeframe === "30d") {
-      startDate.setDate(endDate.getDate() - 30);
+      startDate.setDate(endDate.getDate() - 29); // 30 days total
     } else if (timeframe === "90d") {
-      startDate.setDate(endDate.getDate() - 90);
+      startDate.setDate(endDate.getDate() - 89); // 90 days total
     }
 
+    // Import Meta API fetch utilities with retry and pagination support
+    const { fetchWithRetryAndPaging } = await import('../utils/metaApiFetch');
+    
     // Get campaigns using Graph API
     console.log("Fetching campaigns for timeframe:", timeframe);
     let campaigns;
@@ -130,8 +135,7 @@ router.get("/ad-performance", async (req, res) => {
       const campaignsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`;
       console.log("Campaigns URL:", campaignsUrl);
       
-      const campaignsResponse = await fetch(campaignsUrl);
-      const campaignsData = await campaignsResponse.json();
+      const campaignsData = await fetchWithRetryAndPaging(campaignsUrl);
       
       if (campaignsData.error) {
         throw new Error(`Graph API Error: ${campaignsData.error.message}`);
@@ -144,94 +148,89 @@ router.get("/ad-performance", async (req, res) => {
       throw new Error(`Failed to fetch campaigns: ${campaignError.message || 'Unknown error'}`);
     }
 
-          // Get ad sets using Graph API
-      console.log("Fetching ad sets for timeframe:", timeframe);
-      let adSets;
-      try {
-        const adSetsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting&access_token=${accessToken}`;
-        console.log("Ad Sets URL:", adSetsUrl);
-        
-        const adSetsResponse = await fetch(adSetsUrl);
-        const adSetsData = await adSetsResponse.json();
-        
-        if (adSetsData.error) {
-          throw new Error(`Graph API Error: ${adSetsData.error.message}`);
-        }
-        
-        adSets = adSetsData.data || [];
-        console.log("Ad Sets fetched successfully:", adSets.length);
-      } catch (adSetsError: any) {
-        console.error("Error fetching ad sets:", adSetsError);
-        throw new Error(`Failed to fetch ad sets: ${adSetsError.message || 'Unknown error'}`);
+    // Get ad sets using Graph API
+    console.log("Fetching ad sets for timeframe:", timeframe);
+    let adSets;
+    try {
+      const adSetsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting&access_token=${accessToken}`;
+      console.log("Ad Sets URL:", adSetsUrl);
+      
+      const adSetsData = await fetchWithRetryAndPaging(adSetsUrl);
+      
+      if (adSetsData.error) {
+        throw new Error(`Graph API Error: ${adSetsData.error.message}`);
       }
+      
+      adSets = adSetsData.data || [];
+      console.log("Ad Sets fetched successfully:", adSets.length);
+    } catch (adSetsError: any) {
+      console.error("Error fetching ad sets:", adSetsError);
+      throw new Error(`Failed to fetch ad sets: ${adSetsError.message || 'Unknown error'}`);
+    }
 
-      // Get ads using Graph API
-      console.log("Fetching ads for timeframe:", timeframe);
-      let ads;
-      try {
-        const adsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}&access_token=${accessToken}`;
-        console.log("Ads URL:", adsUrl);
-        
-        const adsResponse = await fetch(adsUrl);
-        const adsData = await adsResponse.json();
-        
-        if (adsData.error) {
-          throw new Error(`Graph API Error: ${adsData.error.message}`);
-        }
-        
-        ads = adsData.data || [];
-        console.log("Ads fetched successfully:", ads.length);
-      } catch (adsError: any) {
-        console.error("Error fetching ads:", adsError);
-        throw new Error(`Failed to fetch ads: ${adsError.message || 'Unknown error'}`);
+    // Get ads using Graph API
+    console.log("Fetching ads for timeframe:", timeframe);
+    let ads;
+    try {
+      const adsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}&access_token=${accessToken}`;
+      console.log("Ads URL:", adsUrl);
+      
+      const adsData = await fetchWithRetryAndPaging(adsUrl);
+      
+      if (adsData.error) {
+        throw new Error(`Graph API Error: ${adsData.error.message}`);
       }
+      
+      ads = adsData.data || [];
+      console.log("Ads fetched successfully:", ads.length);
+    } catch (adsError: any) {
+      console.error("Error fetching ads:", adsError);
+      throw new Error(`Failed to fetch ads: ${adsError.message || 'Unknown error'}`);
+    }
 
-      // Get insights using Graph API - fetch at multiple levels
-      console.log("Fetching insights for timeframe:", timeframe);
-      let insights, adSetInsights, campaignInsights;
-      try {
-        // Fetch ad-level insights for ads processing
-        const adInsightsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&action_breakdowns=action_type&action_report_time=conversion&action_attribution_windows=default&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=ad&access_token=${accessToken}`;
-        
-        const adInsightsResponse = await fetch(adInsightsUrl);
-        const adInsightsData = await adInsightsResponse.json();
-        
-        if (adInsightsData.error) {
-          throw new Error(`Graph API Error: ${adInsightsData.error.message}`);
-        }
-        
-        insights = adInsightsData.data || [];
-        console.log("Ad-level insights fetched successfully:", insights.length);
-
-        // Fetch adset-level insights for ad sets processing
-        const adSetInsightsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&action_breakdowns=action_type&action_report_time=conversion&action_attribution_windows=default&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=adset&access_token=${accessToken}`;
-        
-        const adSetInsightsResponse = await fetch(adSetInsightsUrl);
-        const adSetInsightsData = await adSetInsightsResponse.json();
-        
-        if (adSetInsightsData.error) {
-          throw new Error(`Graph API Error: ${adSetInsightsData.error.message}`);
-        }
-        
-        adSetInsights = adSetInsightsData.data || [];
-        console.log("Adset-level insights fetched successfully:", adSetInsights.length);
-
-        // Fetch campaign-level insights for campaigns processing
-        const campaignInsightsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&action_breakdowns=action_type&action_report_time=conversion&action_attribution_windows=default&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=campaign&access_token=${accessToken}`;
-        
-        const campaignInsightsResponse = await fetch(campaignInsightsUrl);
-        const campaignInsightsData = await campaignInsightsResponse.json();
-        
-        if (campaignInsightsData.error) {
-          throw new Error(`Graph API Error: ${campaignInsightsData.error.message}`);
-        }
-        
-        campaignInsights = campaignInsightsData.data || [];
-        console.log("Campaign-level insights fetched successfully:", campaignInsights.length);
-      } catch (insightsError: any) {
-        console.error("Error fetching insights:", insightsError);
-        throw new Error(`Failed to fetch insights: ${insightsError.message || 'Unknown error'}`);
+    // Get insights using Graph API - fetch at multiple levels
+    console.log("Fetching insights for timeframe:", timeframe);
+    let insights, adSetInsights, campaignInsights;
+    try {
+      // Fetch ad-level insights for ads processing
+      const adInsightsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&action_breakdowns=action_type&action_report_time=conversion&action_attribution_windows=default&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=ad&access_token=${accessToken}`;
+      
+      const adInsightsData = await fetchWithRetryAndPaging(adInsightsUrl);
+      
+      if (adInsightsData.error) {
+        throw new Error(`Graph API Error: ${adInsightsData.error.message}`);
       }
+      
+      insights = adInsightsData.data || [];
+      console.log("Ad-level insights fetched successfully:", insights.length);
+
+      // Fetch adset-level insights for ad sets processing
+      const adSetInsightsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&action_breakdowns=action_type&action_report_time=conversion&action_attribution_windows=default&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=adset&access_token=${accessToken}`;
+      
+      const adSetInsightsData = await fetchWithRetryAndPaging(adSetInsightsUrl);
+      
+      if (adSetInsightsData.error) {
+        throw new Error(`Graph API Error: ${adSetInsightsData.error.message}`);
+      }
+      
+      adSetInsights = adSetInsightsData.data || [];
+      console.log("Adset-level insights fetched successfully:", adSetInsights.length);
+
+      // Fetch campaign-level insights for campaigns processing
+      const campaignInsightsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&action_breakdowns=action_type&action_report_time=conversion&action_attribution_windows=default&time_range={'since':'${startDate.toISOString().split('T')[0]}','until':'${endDate.toISOString().split('T')[0]}'}&level=campaign&access_token=${accessToken}`;
+      
+      const campaignInsightsData = await fetchWithRetryAndPaging(campaignInsightsUrl);
+      
+      if (campaignInsightsData.error) {
+        throw new Error(`Graph API Error: ${campaignInsightsData.error.message}`);
+      }
+      
+      campaignInsights = campaignInsightsData.data || [];
+      console.log("Campaign-level insights fetched successfully:", campaignInsights.length);
+    } catch (insightsError: any) {
+      console.error("Error fetching insights:", insightsError);
+      throw new Error(`Failed to fetch insights: ${insightsError.message || 'Unknown error'}`);
+    }
 
     // Process the data
     const adPerformance = await processCampaignData(campaigns, campaignInsights, adSets);

@@ -11,6 +11,14 @@ jest.mock('../services/db', () => ({
   }
 }));
 
+jest.mock('../utils/s3Utils', () => ({
+  uploadFileToS3: jest.fn().mockResolvedValue({
+    success: true,
+    url: 'https://s3.amazonaws.com/mock-bucket/mock-file.csv',
+    key: 'mock-key'
+  })
+}));
+
 describe('AgentModeService - Breakdown Data Filtering', () => {
   let agentModeService: AgentModeService;
 
@@ -261,7 +269,7 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
   });
 
   describe('formatMetricsSummary - Breakdown Data Aggregation', () => {
-    it('should aggregate placement data correctly with all lead types', () => {
+    it('should aggregate placement data correctly with all lead types', async () => {
       const mockData = {
         adPerformance: [],
         adSetsData: [],
@@ -315,25 +323,45 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
         timeframe: '7d'
       };
 
-      const result = (agentModeService as any).formatMetricsSummary(mockData);
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const uploadMock = uploadFileToS3 as jest.Mock;
+      uploadMock.mockClear();
+      
+      const result = await (agentModeService as any).formatMetricsSummary(mockData, 'test-user-id');
 
-      // Check that placement breakdown is included
-      expect(result).toContain('Placement Performance');
-      
-      // Check that data is aggregated (facebook-feed should appear once with combined data)
-      const facebookFeedLines = result.split('\n').filter((line: string) => 
-        line.includes('facebook') && line.includes('feed')
+      // Verify uploadFileToS3 was called with placement CSV
+      expect(uploadMock).toHaveBeenCalled();
+      const placementCall = uploadMock.mock.calls.find((call: any) => 
+        call[1].includes('placement-breakdown')
       );
-      expect(facebookFeedLines).toHaveLength(1); // Should be aggregated into one line
+      expect(placementCall).toBeDefined();
       
-      // Check that the aggregated data shows combined spend
-      expect(result).toContain('$300.00'); // 100 + 200
-      expect(result).toContain('13'); // 5 + 8 website leads
-      expect(result).toContain('5'); // 3 + 2 form leads
-      expect(result).toContain('18'); // 13 + 5 total leads
+      // Parse and verify the CSV content
+      const csvContent = placementCall[0].toString();
+      const lines = csvContent.split('\n');
+      
+      // Check CSV headers
+      expect(lines[0]).toContain('Platform');
+      expect(lines[0]).toContain('Position');
+      expect(lines[0]).toContain('Impressions');
+      
+      // Check aggregated data (should have 2 rows: facebook-feed aggregated + instagram-feed)
+      const dataLines = lines.slice(1).filter((line: string) => line.trim().length > 0);
+      expect(dataLines.length).toBe(2);
+      
+      // Verify facebook-feed aggregated values in the CSV (sorted by spend, so should be first)
+      const facebookLine = dataLines[0];
+      expect(facebookLine).toContain('facebook');
+      expect(facebookLine).toContain('feed');
+      expect(facebookLine).toContain('3000'); // 1000 + 2000 impressions
+      expect(facebookLine).toContain('150'); // 50 + 100 clicks
+      expect(facebookLine).toContain('$300.00'); // 100 + 200 spend
+      
+      // Check that campaign summary is included in result
+      expect(result).toContain('Campaign Summary');
     });
 
-    it('should aggregate device data correctly with all lead types', () => {
+    it('should aggregate device data correctly with all lead types', async () => {
       const mockData = {
         adPerformance: [],
         adSetsData: [],
@@ -384,25 +412,44 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
         timeframe: '7d'
       };
 
-      const result = (agentModeService as any).formatMetricsSummary(mockData);
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const uploadMock = uploadFileToS3 as jest.Mock;
+      uploadMock.mockClear();
+      
+      const result = await (agentModeService as any).formatMetricsSummary(mockData, 'test-user-id');
 
-      // Check that device breakdown is included
-      expect(result).toContain('Device Performance');
-      
-      // Check that data is aggregated (iPhone should appear once with combined data)
-      const iPhoneLines = result.split('\n').filter((line: string) => 
-        line.includes('iPhone')
+      // Verify uploadFileToS3 was called with device CSV
+      expect(uploadMock).toHaveBeenCalled();
+      const deviceCall = uploadMock.mock.calls.find((call: any) => 
+        call[1].includes('device-breakdown')
       );
-      expect(iPhoneLines).toHaveLength(1); // Should be aggregated into one line
+      expect(deviceCall).toBeDefined();
       
-      // Check that the aggregated data shows combined spend
-      expect(result).toContain('$300.00'); // 100 + 200
-      expect(result).toContain('13'); // 5 + 8 website leads
-      expect(result).toContain('5'); // 3 + 2 form leads
-      expect(result).toContain('18'); // 13 + 5 total leads
+      // Parse and verify the CSV content
+      const csvContent = deviceCall[0].toString();
+      const lines = csvContent.split('\n');
+      
+      // Check CSV headers
+      expect(lines[0]).toContain('Device');
+      expect(lines[0]).toContain('Impressions');
+      expect(lines[0]).toContain('Clicks');
+      
+      // Check aggregated data (should have 2 rows: iPhone aggregated + Android)
+      const dataLines = lines.slice(1).filter((line: string) => line.trim().length > 0);
+      expect(dataLines.length).toBe(2);
+      
+      // Verify iPhone aggregated values in the CSV (sorted by spend, so should be first)
+      const iPhoneLine = dataLines[0];
+      expect(iPhoneLine).toContain('iPhone');
+      expect(iPhoneLine).toContain('3000'); // 1000 + 2000 impressions
+      expect(iPhoneLine).toContain('150'); // 50 + 100 clicks
+      expect(iPhoneLine).toContain('$300.00'); // 100 + 200 spend
+      
+      // Check that campaign summary is included in result
+      expect(result).toContain('Campaign Summary');
     });
 
-    it('should include explanatory note about breakdown data limitations', () => {
+    it('should include explanatory note about breakdown data limitations', async () => {
       const mockData = {
         adPerformance: [],
         adSetsData: [],
@@ -428,7 +475,7 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
         timeframe: '7d'
       };
 
-      const result = (agentModeService as any).formatMetricsSummary(mockData);
+      const result = await (agentModeService as any).formatMetricsSummary(mockData, 'test-user-id');
 
       // Check that explanatory note is included
       expect(result).toContain('Breakdown data (demographics, placement, device) only includes spend from ads with sufficient data for those breakdowns');
