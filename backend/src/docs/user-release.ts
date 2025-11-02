@@ -7,6 +7,21 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-11-02',
+    changes: [
+      'Improved Meta Ads Metrics Data Accuracy',
+      '- Fixed date range calculations to exclude today\'s incomplete data from all timeframes (7d, 14d, 30d, 90d)',
+      'Enhanced Campaign Performance Analysis',
+      '- Updated breakdown data (demographics, placement, device) to use campaign-level aggregation',
+      '- Improved data consistency by removing ad-level and ad set-level IDs from breakdown reports',
+      'Improved Facebook API Reliability',
+      '- Added automatic retry logic for Facebook API calls to handle temporary failures',
+      '- Improves overall reliability when fetching Meta ads metrics and campaign performance data',
+      'Enhanced Email Template Preview Experience',
+      '- Improved scrollability in email template dialogs when working with templates containing many variables',
+    ],
+  },
+  {
     date: '2025-10-29',
     changes: [
       'Changed default execution mode for task creation tools to sync',
