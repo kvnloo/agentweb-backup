@@ -111,16 +111,18 @@ router.get("/ad-performance", async (req, res) => {
     }
     
     // Calculate date range based on timeframe
+    // Exclude today since it's not fully complete - use yesterday as end date
     const endDate = new Date();
-    const startDate = new Date();
+    endDate.setDate(endDate.getDate() - 1); // Set to yesterday
+    const startDate = new Date(endDate); // Copy endDate
     if (timeframe === "7d") {
-      startDate.setDate(endDate.getDate() - 7);
+      startDate.setDate(endDate.getDate() - 6); // 7 days total (yesterday - 6 = 7 days)
     } else if (timeframe === "14d") {
-      startDate.setDate(endDate.getDate() - 14);
+      startDate.setDate(endDate.getDate() - 13); // 14 days total
     } else if (timeframe === "30d") {
-      startDate.setDate(endDate.getDate() - 30);
+      startDate.setDate(endDate.getDate() - 29); // 30 days total
     } else if (timeframe === "90d") {
-      startDate.setDate(endDate.getDate() - 90);
+      startDate.setDate(endDate.getDate() - 89); // 90 days total
     }
 
     // Get campaigns using Graph API

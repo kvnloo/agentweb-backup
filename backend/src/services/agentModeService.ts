@@ -3211,20 +3211,22 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const apiVersion = process.env.META_API_VERSION || 'v18.0';
       
       // Calculate date range based on timeframe
+      // Exclude today since it's not fully complete - use yesterday as end date
       const endDate = new Date();
-      const startDate = new Date();
+      endDate.setDate(endDate.getDate() - 1); // Set to yesterday
+      const startDate = new Date(endDate); // Copy endDate
       if (timeframe === "7d") {
-        startDate.setDate(endDate.getDate() - 7);
+        startDate.setDate(endDate.getDate() - 6); // 7 days total (yesterday - 6 = 7 days)
       } else if (timeframe === "14d") {
-        startDate.setDate(endDate.getDate() - 14);
+        startDate.setDate(endDate.getDate() - 13); // 14 days total
       } else if (timeframe === "30d") {
-        startDate.setDate(endDate.getDate() - 30);
+        startDate.setDate(endDate.getDate() - 29); // 30 days total
       } else if (timeframe === "90d") {
-        startDate.setDate(endDate.getDate() - 90);
+        startDate.setDate(endDate.getDate() - 89); // 90 days total
       }
       const sinceStr = startDate.toISOString().split('T')[0];
       const untilStr = endDate.toISOString().split('T')[0];
-      const attributionDays = Math.max(1, Math.ceil((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24)));
+      const attributionDays = Math.max(1, Math.ceil((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24))) + 1; // +1 to include both start and end dates
 
       // First, get campaigns to find matching campaign IDs if filtering by campaign name
       let campaignFilterIds: string[] = [];
