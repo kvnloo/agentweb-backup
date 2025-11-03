@@ -15,6 +15,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Restored missing PUT endpoint for /api/settings/:settingName to enable updating settings',
       'Fixed Benchmark Tests Tab Loading Issues',
       '- Fixed issue where not all benchmark tests were displayed in Admin Dashboard due to DynamoDB pagination limits',
+      'Fixed Scheduled Chat Next Run Time Issue',
+      '- Resolved bug where updating scheduled chat settings (name, keywords, function calls, etc.) would postpone the next run time',
     ],
   },
   {
