@@ -2243,20 +2243,36 @@ class BenchmarkTestDB {
   }
 
   async getBenchmarkTestsByCreator(createdBy: string, limit: number = 50) {
-    const params = {
-      TableName: this.tableName,
-      IndexName: "CreatedByIndex",
-      KeyConditionExpression: "createdBy = :createdBy",
-      ExpressionAttributeValues: {
-        ":createdBy": createdBy,
-      },
-      ScanIndexForward: false, // Sort by createdAt descending
-      Limit: limit,
-    };
+    const allItems: any[] = [];
+    let lastEvaluatedKey: any = undefined;
 
     try {
-      const result = await this.docClient.query(params).promise();
-      return result.Items || [];
+      do {
+        const params: any = {
+          TableName: this.tableName,
+          IndexName: "CreatedByIndex",
+          KeyConditionExpression: "createdBy = :createdBy",
+          ExpressionAttributeValues: {
+            ":createdBy": createdBy,
+          },
+          ScanIndexForward: false, // Sort by createdAt descending
+          Limit: limit,
+        };
+
+        if (lastEvaluatedKey) {
+          params.ExclusiveStartKey = lastEvaluatedKey;
+        }
+
+        const result = await this.docClient.query(params).promise();
+        
+        if (result.Items && result.Items.length > 0) {
+          allItems.push(...result.Items);
+        }
+
+        lastEvaluatedKey = result.LastEvaluatedKey;
+      } while (lastEvaluatedKey);
+
+      return allItems;
     } catch (error) {
       handleDynamoDbError(error, "getBenchmarkTestsByCreator");
       throw error;
@@ -2264,14 +2280,30 @@ class BenchmarkTestDB {
   }
 
   async getAllBenchmarkTests(limit: number = 100) {
-    const params = {
-      TableName: this.tableName,
-      Limit: limit,
-    };
+    const allItems: any[] = [];
+    let lastEvaluatedKey: any = undefined;
 
     try {
-      const result = await this.docClient.scan(params).promise();
-      return result.Items || [];
+      do {
+        const params: any = {
+          TableName: this.tableName,
+          Limit: limit,
+        };
+
+        if (lastEvaluatedKey) {
+          params.ExclusiveStartKey = lastEvaluatedKey;
+        }
+
+        const result = await this.docClient.scan(params).promise();
+        
+        if (result.Items && result.Items.length > 0) {
+          allItems.push(...result.Items);
+        }
+
+        lastEvaluatedKey = result.LastEvaluatedKey;
+      } while (lastEvaluatedKey);
+
+      return allItems;
     } catch (error) {
       handleDynamoDbError(error, "getAllBenchmarkTests");
       throw error;

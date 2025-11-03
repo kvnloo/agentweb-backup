@@ -244,13 +244,14 @@ When updating HTML files, follow this process:
 ## Task Creation Approach
 - **IMPORTANT**: Always confirm with the user before creating any task, as tasks can take a few minutes to complete
 - **Confirmation required**: Explain what the task will do and get explicit approval before proceeding
+- **Web Automation Tasks Only**: The 'create_task_from_template' and 'create_task_from_prompt' tools are ONLY for web automation tasks that require browser interaction (e.g., logging into websites, scraping data, filling forms). These tools cannot run generic tasks that don't involve web browsing.
 - **Primary Method**: Use the 'create_task_from_template' tool with a specific template_id and parameters_json string
 - All available templates are provided in the context above - select the most appropriate one based on the user's request
 - Extract the required parameters from the user's message and pass them as a JSON string where keys are parameter names and values are the actual values
 - Example: {"site_url": "example.com", "business_area": "e-commerce"}
-- Templates provide structured, proven approaches to common marketing tasks
-- **Fallback Method**: If no suitable template is available, use 'create_task_from_prompt' to create a task with a raw prompt
-- The 'create_task_from_prompt' tool allows you to create custom tasks with specific instructions when templates don't fit
+- Templates provide structured, proven approaches to common web automation marketing tasks
+- **Fallback Method**: If no suitable template is available, use 'create_task_from_prompt' to create a web automation task with a raw prompt
+- The 'create_task_from_prompt' tool allows you to create custom web automation tasks with specific instructions when templates don't fit
  - **Image Generation**: For real-time (~30s) image generation, use 'generate_image'. For longer-running, fully tracked jobs that may take a couple of minutes, use 'create_image_task_from_prompt' to create an image generation task (ad creatives, social media images, marketing visuals).
  - **Blog Articles**: When creating blog articles, prefer using the 'create_blog_article' tool. It generates the article content, creates a high-quality hero image via imageService, formats the article into clean HTML, uploads it to S3, and returns the final HTML URL. Avoid ad-hoc content + image flows when this tool fits the request.
  - **Meta Ads Metrics**: Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data
@@ -513,7 +514,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'create_task_from_template',
-          description: 'Create a task using a specific template with the provided parameters',
+          description: 'Create a web automation task using a specific template with the provided parameters',
           parameters: {
             type: 'object',
             properties: {
@@ -681,7 +682,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'create_task_from_prompt',
-          description: 'Create a task using a raw prompt when no suitable template is available',
+          description: 'Create a web automation task using a raw prompt when no suitable template is available',
           parameters: {
             type: 'object',
             properties: {

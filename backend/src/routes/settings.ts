@@ -321,6 +321,25 @@ router.post('/', authenticateToken, requireAdmin, async (req, res) => {
   }
 });
 
+// Update a specific setting
+router.put('/:settingName', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { settingName } = req.params;
+    const { settingValue, description } = req.body;
+    const updatedBy = req.user?.email || 'unknown';
+    
+    if (settingValue === undefined) {
+      return res.status(400).json({ error: 'settingValue is required' });
+    }
+    
+    const setting = await settingsService.setSetting(settingName, settingValue, description, updatedBy);
+    res.json(setting);
+  } catch (error) {
+    console.error('Error updating setting:', error);
+    res.status(500).json({ error: 'Failed to update setting' });
+  }
+});
+
 // Delete a setting
 router.delete('/:settingName', authenticateToken, requireAdmin, async (req, res) => {
   try {

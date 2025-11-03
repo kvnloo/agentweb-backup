@@ -7,6 +7,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-11-03',
+    changes: [
+      'Improved Agent Mode Task Creation Clarity',
+      '- Enhanced system prompt to explicitly state that create_task_from_template and create_task_from_prompt are ONLY for web automation tasks requiring browser interaction',
+      'Restored Settings Management API',
+      '- Restored missing PUT endpoint for /api/settings/:settingName to enable updating settings',
+      'Fixed Benchmark Tests Tab Loading Issues',
+      '- Fixed issue where not all benchmark tests were displayed in Admin Dashboard due to DynamoDB pagination limits',
+    ],
+  },
+  {
     date: '2025-11-02',
     changes: [
         'Improved Meta Ads Metrics Data Accuracy',
