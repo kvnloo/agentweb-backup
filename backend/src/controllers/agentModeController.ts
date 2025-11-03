@@ -1324,9 +1324,9 @@ export const agentModeController = {
               return res.status(404).json({ error: 'Scheduled chat not found' });
             }
 
-            // Calculate next run time based on new frequency
+            // Update the schedule without modifying nextRunTime
+            // nextRunTime should only be updated when the schedule actually runs
             const now = new Date();
-            const nextRunTime = calculateNextRunTime(scheduleFrequency, now);
 
             // Update the schedule
             const updates = {
@@ -1339,16 +1339,16 @@ export const agentModeController = {
               functionCallMinCalls: functionCallMinCalls || {},
               emailNotifications: emailNotifications || [],
               dailyDigest: scheduleFrequency === 'hourly' ? (dailyDigest || false) : false, // Only allow daily digest for hourly schedules
-              nextRunTime: nextRunTime.toISOString(),
               updatedAt: now.toISOString(),
               emailCampaignTaskId: emailCampaignTaskId || null
             };
 
             await scheduleDb.updateSchedule(scheduleId, updates);
 
+            // Return the existing nextRunTime from the schedule
             res.json({
               message: 'Scheduled chat updated successfully',
-              nextRunTime: nextRunTime.toISOString()
+              nextRunTime: existingSchedule.nextRunTime
             });
           } catch (error) {
             console.error('AgentMode: Update scheduled chat error:', error);

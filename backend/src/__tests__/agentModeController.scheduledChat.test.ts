@@ -25,6 +25,7 @@ jest.mock('../services/db', () => ({
     getScheduleById: jest.fn(),
     getSchedulesReadyToRun: jest.fn(),
     updateScheduleAfterRun: jest.fn(),
+    updateSchedule: jest.fn(),
   },
   taskDb: {
     getTaskExecutionById: jest.fn(),
@@ -806,6 +807,284 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       await expect(agentModeController.runScheduledChats(mockReq, mockRes)).resolves.not.toThrow();
       // The run should still complete successfully
       expect(mockRes.json).toHaveBeenCalled();
+    });
+  });
+
+  describe('updateScheduledChat endpoint', () => {
+    const mockUserId = 'test-user-123';
+    const mockScheduleId = 'test-schedule-456';
+    const originalNextRunTime = '2025-01-15T09:00:00.000Z';
+
+    const existingSchedule = {
+      scheduleId: mockScheduleId,
+      taskId: 'task-123',
+      userId: mockUserId,
+      frequency: 'daily',
+      nextRunTime: originalNextRunTime,
+      status: 'active',
+      createdAt: '2025-01-01T00:00:00.000Z',
+      updatedAt: '2025-01-01T00:00:00.000Z',
+      scheduleName: 'Original Schedule Name',
+      description: 'Original description',
+      startingMessage: 'Original starting message',
+      keywords: ['original', 'keywords'],
+      requiredFunctionCalls: ['original_function'],
+      functionCallMinCalls: { original_function: 1 },
+      emailNotifications: ['original@example.com'],
+      dailyDigest: false,
+      emailCampaignTaskId: 'original-campaign-123',
+      type: 'scheduled_chat',
+    };
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+      mockScheduleDb.getScheduleById.mockResolvedValue(existingSchedule);
+      mockScheduleDb.updateSchedule.mockResolvedValue(undefined);
+    });
+
+    it('should update schedule without modifying nextRunTime', async () => {
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+        body: {
+          scheduleName: 'Updated Schedule Name',
+          description: 'Updated description',
+          startingMessage: 'Updated starting message',
+          scheduleFrequency: 'daily',
+          keywords: ['updated', 'keywords'],
+          requiredFunctionCalls: ['updated_function'],
+          functionCallMinCalls: { updated_function: 2 },
+          emailNotifications: ['updated@example.com'],
+          dailyDigest: false,
+          emailCampaignTaskId: 'updated-campaign-456',
+        },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.updateScheduledChat(mockReq, mockRes);
+
+      // Verify updateSchedule was called with the right parameters
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+        mockScheduleId,
+        expect.objectContaining({
+          scheduleName: 'Updated Schedule Name',
+          description: 'Updated description',
+          startingMessage: 'Updated starting message',
+          frequency: 'daily',
+          keywords: ['updated', 'keywords'],
+          requiredFunctionCalls: ['updated_function'],
+          functionCallMinCalls: { updated_function: 2 },
+          emailNotifications: ['updated@example.com'],
+          dailyDigest: false,
+          emailCampaignTaskId: 'updated-campaign-456',
+          updatedAt: expect.any(String),
+        })
+      );
+
+      // Verify nextRunTime was NOT included in the update
+      const updateCall = mockScheduleDb.updateSchedule.mock.calls[0][1];
+      expect(updateCall).not.toHaveProperty('nextRunTime');
+
+      // Verify response returns the original nextRunTime
+      expect(mockRes.json).toHaveBeenCalledWith({
+        message: 'Scheduled chat updated successfully',
+        nextRunTime: originalNextRunTime,
+      });
+    });
+
+    it('should preserve nextRunTime even when changing frequency', async () => {
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+        body: {
+          scheduleName: 'Updated Schedule Name',
+          description: 'Updated description',
+          startingMessage: 'Updated starting message',
+          scheduleFrequency: 'weekly', // Changed from daily to weekly
+          keywords: ['updated', 'keywords'],
+          requiredFunctionCalls: ['updated_function'],
+          functionCallMinCalls: { updated_function: 1 },
+          emailNotifications: ['updated@example.com'],
+          dailyDigest: false,
+          emailCampaignTaskId: null,
+        },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.updateScheduledChat(mockReq, mockRes);
+
+      // Verify the frequency was updated
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+        mockScheduleId,
+        expect.objectContaining({
+          frequency: 'weekly',
+        })
+      );
+
+      // Verify nextRunTime was NOT updated
+      const updateCall = mockScheduleDb.updateSchedule.mock.calls[0][1];
+      expect(updateCall).not.toHaveProperty('nextRunTime');
+
+      // Verify response returns the original nextRunTime
+      expect(mockRes.json).toHaveBeenCalledWith({
+        message: 'Scheduled chat updated successfully',
+        nextRunTime: originalNextRunTime,
+      });
+    });
+
+    it('should return 404 if schedule does not exist', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue(null);
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: 'non-existent-schedule' },
+        body: {
+          scheduleName: 'Test',
+          startingMessage: 'Test',
+          scheduleFrequency: 'daily',
+        },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.updateScheduledChat(mockReq, mockRes);
+
+      expect(mockRes.status).toHaveBeenCalledWith(404);
+      expect(mockRes.json).toHaveBeenCalledWith({ error: 'Scheduled chat not found' });
+    });
+
+    it('should return 404 if schedule belongs to different user', async () => {
+      const differentUserSchedule = {
+        ...existingSchedule,
+        userId: 'different-user-id',
+      };
+      mockScheduleDb.getScheduleById.mockResolvedValue(differentUserSchedule);
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+        body: {
+          scheduleName: 'Test',
+          startingMessage: 'Test',
+          scheduleFrequency: 'daily',
+        },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.updateScheduledChat(mockReq, mockRes);
+
+      expect(mockRes.status).toHaveBeenCalledWith(404);
+      expect(mockRes.json).toHaveBeenCalledWith({ error: 'Scheduled chat not found' });
+    });
+
+    it('should return 400 if required fields are missing', async () => {
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+        body: {
+          scheduleName: 'Test',
+          // Missing startingMessage and scheduleFrequency
+        },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.updateScheduledChat(mockReq, mockRes);
+
+      expect(mockRes.status).toHaveBeenCalledWith(400);
+      expect(mockRes.json).toHaveBeenCalledWith({ error: 'Missing required fields' });
+    });
+
+    it('should handle dailyDigest setting correctly for hourly schedules', async () => {
+      const hourlySchedule = {
+        ...existingSchedule,
+        frequency: 'hourly',
+      };
+      mockScheduleDb.getScheduleById.mockResolvedValue(hourlySchedule);
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+        body: {
+          scheduleName: 'Updated Hourly Schedule',
+          description: 'Updated description',
+          startingMessage: 'Updated starting message',
+          scheduleFrequency: 'hourly',
+          keywords: [],
+          requiredFunctionCalls: [],
+          functionCallMinCalls: {},
+          emailNotifications: ['test@example.com'],
+          dailyDigest: true, // Should be allowed for hourly
+          emailCampaignTaskId: null,
+        },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.updateScheduledChat(mockReq, mockRes);
+
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+        mockScheduleId,
+        expect.objectContaining({
+          frequency: 'hourly',
+          dailyDigest: true,
+        })
+      );
+    });
+
+    it('should force dailyDigest to false for non-hourly schedules', async () => {
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+        body: {
+          scheduleName: 'Updated Daily Schedule',
+          description: 'Updated description',
+          startingMessage: 'Updated starting message',
+          scheduleFrequency: 'daily',
+          keywords: [],
+          requiredFunctionCalls: [],
+          functionCallMinCalls: {},
+          emailNotifications: ['test@example.com'],
+          dailyDigest: true, // Should be ignored for daily
+          emailCampaignTaskId: null,
+        },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.updateScheduledChat(mockReq, mockRes);
+
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+        mockScheduleId,
+        expect.objectContaining({
+          frequency: 'daily',
+          dailyDigest: false, // Should be forced to false
+        })
+      );
     });
   });
 });
