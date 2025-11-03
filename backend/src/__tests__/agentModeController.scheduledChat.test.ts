@@ -941,7 +941,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     });
 
     it('should return 404 if schedule does not exist', async () => {
-      mockScheduleDb.getScheduleById.mockResolvedValue(null);
+      mockScheduleDb.getScheduleById.mockResolvedValue(undefined);
 
       const mockReq = {
         user: { userId: mockUserId },
