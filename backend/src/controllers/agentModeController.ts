@@ -832,6 +832,45 @@ export const agentModeController = {
     }
   },
 
+  // Toggle reasoning mode for a session
+  async toggleReasoningMode(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { sessionId } = req.params;
+      const { enabled } = req.body;
+
+      if (typeof enabled !== 'boolean') {
+        return res.status(400).json({ error: 'enabled must be a boolean' });
+      }
+
+      // Verify the session belongs to the user
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session || session.userId !== user.userId) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Update reasoning mode (clear previous response ID when disabling)
+      await chatbotDb.updateSessionReasoningMode(
+        sessionId,
+        enabled,
+        enabled ? session.reasoningMode?.previousResponseId : undefined,
+        enabled ? new Date().toISOString() : undefined
+      );
+
+      res.json({ 
+        success: true,
+        reasoningMode: {
+          enabled,
+          previousResponseId: enabled ? session.reasoningMode?.previousResponseId : undefined,
+          lastChatTimestamp: enabled ? new Date().toISOString() : undefined
+        }
+      });
+    } catch (error) {
+      console.error('AgentMode: Toggle reasoning mode error:', error);
+      res.status(500).json({ error: 'Failed to toggle reasoning mode' });
+    }
+  },
+
   // Create shareable link for conversation
   async createShareLink(req: Request, res: Response) {
     try {

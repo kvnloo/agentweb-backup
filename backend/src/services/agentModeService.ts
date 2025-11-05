@@ -66,6 +66,13 @@ export class AgentModeService {
       // Remember initial message count to slice response messages later
       const initialMessageCount = messages.length;
 
+      // Check if reasoning mode is enabled
+      const session = await chatbotDb.getChatSession(sessionId);
+      const useReasoningMode = session?.reasoningMode?.enabled || false;
+      
+      // Track current response ID for reasoning mode continuation
+      let currentResponseId: string | undefined = undefined;
+      
       // Single loop for LLM calls and tool execution
       let maxIterations = 20; // Prevent infinite loops
       let iteration = 0;
@@ -74,29 +81,130 @@ export class AgentModeService {
       while (iteration < maxIterations) {
         iteration++;
         
-        // Make LLM call
-        const response = await this.openai.chat.completions.create({
-          model: process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
-          messages: messages,
-          tools: this.getAvailableTools(),
-          tool_choice: 'auto',
-          max_completion_tokens: 12384
-        });
-        
-        responseMessage = response.choices[0].message;
-        const responseContent = responseMessage.content || '';
-        
-        // Update content with LLM's response
-        if (responseContent) {
-          content = responseContent;
-        }
-        
-        // Append the model's message to conversation before handling tool calls
-        (messages as any[]).push(responseMessage);
-        
-        // If no tool calls, break the loop
-        if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
-          break;
+        // Choose API based on reasoning mode
+        if (useReasoningMode && session?.reasoningMode) {
+          // Use Response API for reasoning mode with tool support
+          let reasoningResponse: any;
+          
+          if (currentResponseId) {
+            // Continue with previous_response_id after function calls
+            // Extract function_call_output items from messages
+            const functionOutputs = messages.filter((msg: any) => msg.type === 'function_call_output');
+            reasoningResponse = await (this.openai as any).responses.create({
+              model: 'gpt-5',
+              previous_response_id: currentResponseId,
+              input: functionOutputs,
+              tools: this.getAvailableTools(),
+              reasoning: {
+                effort: "high"
+              }
+            });
+          } else if (iteration === 1 && session.reasoningMode.previousResponseId && 
+                     session.reasoningMode.lastChatTimestamp && 
+                     this.isWithin25Days(session.reasoningMode.lastChatTimestamp)) {
+            // First iteration: use stored previous_response_id if within 25 days
+            reasoningResponse = await (this.openai as any).responses.create({
+              model: 'gpt-5',
+              previous_response_id: session.reasoningMode.previousResponseId,
+              input: messageContent,
+              tools: this.getAvailableTools(),
+              reasoning: {
+                effort: "high"
+              }
+            });
+          } else {
+            // First iteration: use full conversation history
+            reasoningResponse = await (this.openai as any).responses.create({
+              model: 'gpt-5',
+              input: messages,
+              tools: this.getAvailableTools(),
+              reasoning: {
+                effort: "high"
+              }
+            });
+          }
+          
+          // Store current response ID for potential next iteration
+          currentResponseId = reasoningResponse.id;
+          
+          // Process response output and convert to standard format
+          const responseFunctionCalls: any[] = [];
+          
+          for (const output of reasoningResponse.output || []) {
+            if (output.type === 'message') {
+              // Extract text content from message
+              for (const contentItem of output.content || []) {
+                if (contentItem.type === 'output_text') {
+                  content += contentItem.text || '';
+                }
+              }
+            } else if (output.type === 'function_call') {
+              // Convert Response API function call format to Chat Completion format
+              responseFunctionCalls.push({
+                id: output.call_id,
+                type: 'function',
+                function: {
+                  name: output.name,
+                  arguments: output.arguments || '{}'
+                }
+              });
+            }
+          }
+          
+          // Store is done after all iterations complete
+          
+          // Create response message with function calls if any
+          responseMessage = {
+            role: 'assistant' as const,
+            content,
+            metadata: {
+              timestamp: new Date().toISOString(),
+              reasoningTokens: reasoningResponse.usage?.output_tokens_details?.reasoning_tokens || 0
+            }
+          };
+          
+          // Add tool_calls to response message if there are function calls
+          if (responseFunctionCalls.length > 0) {
+            responseMessage.tool_calls = responseFunctionCalls;
+          }
+          
+          // Update content with LLM's response
+          if (content) {
+            content = content;
+          }
+          
+          // Append the model's message to conversation
+          (messages as any[]).push(responseMessage);
+          
+          // If no function calls, break the loop
+          if (responseFunctionCalls.length === 0) {
+            break;
+          }
+        } else {
+          // Use Chat Completion API for standard mode
+          const response = await this.openai.chat.completions.create({
+            model: process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
+            messages: messages,
+            tools: this.getAvailableTools(),
+            tool_choice: 'auto',
+            max_completion_tokens: 12384
+          });
+          
+          responseMessage = response.choices[0].message;
+          const responseContent = responseMessage.content || '';
+          
+          // Update content with LLM's response
+          if (responseContent) {
+            content = responseContent;
+          }
+          
+          // Append the model's message to conversation before handling tool calls
+          (messages as any[]).push(responseMessage);
+          
+          // If no tool calls, break the loop
+          if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
+            break;
+          }
         }
         
         
@@ -117,16 +225,27 @@ export class AgentModeService {
               result: minimalResult
             });
 
-            // Append the tool call result as a tool message for the model to consume next
+            // Append the tool call result
             const toolContent = result.formattedContent || (typeof result === 'string' ? result : JSON.stringify(result));
-            (messages as any[]).push({
-              tool_call_id: toolCall.id,
-              role: 'tool',
-              name: toolCall.function.name,
-              content: toolContent
-            });
+            
+            if (useReasoningMode) {
+              // For Response API, use function_call_output format
+              (messages as any[]).push({
+                type: 'function_call_output',
+                call_id: toolCall.id,
+                output: toolContent
+              });
+            } else {
+              // For Chat Completion API, use tool message format
+              (messages as any[]).push({
+                tool_call_id: toolCall.id,
+                role: 'tool',
+                name: toolCall.function.name,
+                content: toolContent
+              });
+            }
 
-            // Tool results are now included in the tool message content above
+            // Tool results are now included in the message above
           } catch (error) {
             console.error(`AgentMode: Tool execution error for ${toolCall.function.name}:`, error);
             toolCalls.push({
@@ -139,13 +258,22 @@ export class AgentModeService {
             const errMsg = error instanceof Error ? error.message : String(error);
             const errorContent = this.formatToolError(toolCall.function.name, errMsg);
             
-            // Append error as tool message
-            messages.push({
-              tool_call_id: toolCall.id,
-              role: 'tool',
-              name: toolCall.function.name,
-              content: errorContent
-            });
+            if (useReasoningMode) {
+              // For Response API, send error in function_call_output format
+              messages.push({
+                type: 'function_call_output',
+                call_id: toolCall.id,
+                output: JSON.stringify({ error: errMsg })
+              });
+            } else {
+              // For Chat Completion API, use tool message format
+              messages.push({
+                tool_call_id: toolCall.id,
+                role: 'tool',
+                name: toolCall.function.name,
+                content: errorContent
+              });
+            }
           }
         }
         
@@ -166,6 +294,16 @@ export class AgentModeService {
             timestamp: new Date().toISOString(),
           };
         }
+      }
+
+      // Store final response ID for reasoning mode
+      if (useReasoningMode && currentResponseId) {
+        await (chatbotDb as any).updateSessionReasoningMode(
+          sessionId,
+          true,
+          currentResponseId,
+          new Date().toISOString()
+        );
       }
 
       return {
@@ -196,6 +334,14 @@ export class AgentModeService {
       // Generic error fallback
       throw new Error('I apologize, but I encountered an error processing your request. Please try again.');
     }
+  }
+
+  // Helper function to check if timestamp is within 25 days
+  private isWithin25Days(timestamp: string): boolean {
+    const lastChat = new Date(timestamp);
+    const now = new Date();
+    const diffInDays = (now.getTime() - lastChat.getTime()) / (1000 * 60 * 60 * 24);
+    return diffInDays <= 25;
   }
 
   async getMarketingSystemPrompt(): Promise<string> {

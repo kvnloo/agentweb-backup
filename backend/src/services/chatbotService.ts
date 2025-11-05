@@ -125,6 +125,11 @@ export interface ChatSession {
     token?: string;
     sharedAt?: string;
   };
+  reasoningMode?: {
+    enabled: boolean;
+    previousResponseId?: string;
+    lastChatTimestamp?: string;
+  };
 }
 
 // Interface for context chunks
@@ -1888,6 +1893,36 @@ export async function updateTaskExecutionStatus(
     console.log(`Successfully updated task execution status for session ${sessionId}`);
   } catch (error) {
     console.error('Error updating task execution status:', error);
+    throw error;
+  }
+}
+
+// Update session's reasoning mode
+export async function updateSessionReasoningMode(
+  sessionId: string,
+  enabled: boolean,
+  previousResponseId?: string,
+  lastChatTimestamp?: string
+): Promise<void> {
+  try {
+    const params = {
+      TableName: `${TABLE_PREFIX}AW-ChatSessions`,
+      Key: { sessionId },
+      UpdateExpression: "SET reasoningMode = :reasoningMode, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":reasoningMode": {
+          enabled,
+          ...(previousResponseId && { previousResponseId }),
+          ...(lastChatTimestamp && { lastChatTimestamp })
+        },
+        ":updatedAt": new Date().toISOString()
+      }
+    };
+
+    await dynamodb.update(params).promise();
+    console.log(`Successfully updated reasoning mode for session ${sessionId}`);
+  } catch (error) {
+    console.error('Error updating reasoning mode:', error);
     throw error;
   }
 }

@@ -87,6 +87,10 @@ router.get('/welcome-message', requireAdmin, asyncHandler(agentModeController.ge
 // Get current conversation starters (admin only)
 router.get('/conversation-starters', requireAdmin, asyncHandler(agentModeController.getConversationStarters));
 
+// PUT /api/agent-mode/session/:sessionId/reasoning-mode
+// Toggle reasoning mode for a session
+router.put('/session/:sessionId/reasoning-mode', asyncHandler(agentModeController.toggleReasoningMode));
+
 // DELETE /api/agent-mode/session/:sessionId
 // Archive a chat session
 router.delete('/session/:sessionId', asyncHandler(agentModeController.archiveSession));
