@@ -125,6 +125,19 @@ export interface ChatSession {
     token?: string;
     sharedAt?: string;
   };
+  workPlan?: {
+    title: string;
+    steps: Array<{
+      stepCount: number; // Step number starting from 1
+      title: string;
+      description?: string;
+      status: 'pending' | 'completed' | 'skipped';
+      completedAt?: string;
+      notes?: string;
+    }>;
+    createdAt: string;
+    updatedAt: string;
+  };
 }
 
 // Interface for context chunks
@@ -1019,6 +1032,62 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session interactive share metadata:", error);
+      throw error;
+    }
+  }
+
+  async updateSessionWorkPlan(
+    sessionId: string,
+    workPlan: {
+      title: string;
+      steps: Array<{
+        stepCount: number;
+        title: string;
+        description?: string;
+        status: 'pending' | 'completed' | 'skipped';
+        completedAt?: string;
+        notes?: string;
+      }>;
+      createdAt: string;
+      updatedAt: string;
+    }
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    // Validate stepCount - must be sequential starting from 1 (index+1)
+    for (let i = 0; i < workPlan.steps.length; i++) {
+      const expectedStepCount = i + 1;
+      if (workPlan.steps[i].stepCount !== expectedStepCount) {
+        throw new Error(
+          `Invalid stepCount at index ${i}: expected ${expectedStepCount} but got ${workPlan.steps[i].stepCount}. ` +
+          `Steps must be numbered sequentially starting from 1 (stepCount must equal index+1).`
+        );
+      }
+    }
+
+    const validatedWorkPlan = {
+      ...workPlan,
+      updatedAt: timestamp
+    };
+
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression: "SET workPlan = :workPlan, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":workPlan": validatedWorkPlan,
+        ":updatedAt": timestamp,
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating session work plan:", error);
       throw error;
     }
   }

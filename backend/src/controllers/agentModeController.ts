@@ -485,6 +485,7 @@ async function generateSessionResponse(
   knowledgeBaseQueries: string[];
   sources: string[];
   responseMessages: any[];
+  workPlan?: any;
 }> {
   // Get session
   const session = await chatbotDb.getChatSession(sessionId);
@@ -577,7 +578,13 @@ async function generateSessionResponse(
   // Add all response messages to session (includes assistant responses and tool calls)
   await chatbotDb.addMessagesToSession(sessionId, response.responseMessages);
 
-  return response;
+  // Get the updated session to include workPlan if it was modified
+  const finalSession = await chatbotDb.getChatSession(sessionId);
+  
+  return {
+    ...response,
+    workPlan: finalSession?.workPlan
+  };
 }
 
 // Helper function to calculate next run time based on frequency
@@ -747,7 +754,8 @@ export const agentModeController = {
         content: response.content,
         toolCalls: response.toolCalls,
         knowledgeBaseQueries: response.knowledgeBaseQueries,
-        sources: response.sources
+        sources: response.sources,
+        workPlan: response.workPlan
       });
     } catch (error) {
       console.error('AgentMode: Generate response error:', error);
@@ -1696,7 +1704,8 @@ export const agentModeController = {
         content: response.content,
         toolCalls: response.toolCalls,
         knowledgeBaseQueries: response.knowledgeBaseQueries,
-        sources: response.sources
+        sources: response.sources,
+        workPlan: response.workPlan
       });
     } catch (error) {
       console.error('AgentMode: Generate conversable response error:', error);
