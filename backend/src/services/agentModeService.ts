@@ -1233,25 +1233,35 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'set_work_plan_status',
-          description: 'Update the status of a specific step in the work plan. Use this to track progress as you complete each step.',
+          description: 'Update the status of one or more steps in the work plan. Use this to track progress as you complete steps. You can update multiple steps at once.',
           parameters: {
             type: 'object',
             properties: {
-              stepCount: {
-                type: 'number',
-                description: 'Step number to update (1, 2, 3, etc.)'
-              },
-              status: {
-                type: 'string',
-                enum: ['pending', 'completed', 'skipped'],
-                description: 'New status for the step'
-              },
-              notes: {
-                type: 'string',
-                description: 'Optional notes about what was accomplished or why the step was skipped'
+              updates: {
+                type: 'array',
+                description: 'Array of step status updates',
+                items: {
+                  type: 'object',
+                  properties: {
+                    stepCount: {
+                      type: 'number',
+                      description: 'Step number to update (1, 2, 3, etc.)'
+                    },
+                    status: {
+                      type: 'string',
+                      enum: ['pending', 'completed', 'skipped'],
+                      description: 'New status for the step'
+                    },
+                    notes: {
+                      type: 'string',
+                      description: 'Optional notes about what was accomplished or why the step was skipped'
+                    }
+                  },
+                  required: ['stepCount', 'status']
+                }
               }
             },
-            required: ['stepCount', 'status']
+            required: ['updates']
           }
         }
       }
@@ -1967,7 +1977,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'modify_work_plan':
         return await this.modifyWorkPlan(args.steps, args.removeStepCounts || [], sessionId);
       case 'set_work_plan_status':
-        return await this.setWorkPlanStatus(args.stepCount, args.status, args.notes, sessionId);
+        return await this.setWorkPlanStatus(args.updates, sessionId);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -6356,7 +6366,10 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
     }
   }
 
-  private async setWorkPlanStatus(stepCount: number, status: 'pending' | 'completed' | 'skipped', notes: string | undefined, sessionId: string): Promise<any> {
+  private async setWorkPlanStatus(
+    updates: Array<{stepCount: number; status: 'pending' | 'completed' | 'skipped'; notes?: string}>, 
+    sessionId: string
+  ): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session || !session.workPlan) {
@@ -6367,34 +6380,62 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       }
 
       const workPlan = { ...session.workPlan };
-      const stepIndex = workPlan.steps.findIndex(s => s.stepCount === stepCount);
-      
-      if (stepIndex < 0) {
-        return {
-          success: false,
-          message: `Step ${stepCount} not found in work plan`
+      const updatedSteps: Array<{stepCount: number; title: string; status: string}> = [];
+      const notFoundSteps: number[] = [];
+
+      // Process each update
+      for (const update of updates) {
+        const stepIndex = workPlan.steps.findIndex(s => s.stepCount === update.stepCount);
+        
+        if (stepIndex < 0) {
+          notFoundSteps.push(update.stepCount);
+          continue;
+        }
+
+        // Update the step status
+        workPlan.steps[stepIndex] = {
+          ...workPlan.steps[stepIndex],
+          status: update.status,
+          notes: update.notes,
+          completedAt: update.status === 'completed' ? new Date().toISOString() : workPlan.steps[stepIndex].completedAt
         };
+
+        updatedSteps.push({
+          stepCount: update.stepCount,
+          title: workPlan.steps[stepIndex].title,
+          status: update.status
+        });
       }
 
-      // Update the step status
-      workPlan.steps[stepIndex] = {
-        ...workPlan.steps[stepIndex],
-        status,
-        notes,
-        completedAt: status === 'completed' ? new Date().toISOString() : workPlan.steps[stepIndex].completedAt
-      };
+      // Check if any steps were not found
+      if (notFoundSteps.length > 0 && updatedSteps.length === 0) {
+        return {
+          success: false,
+          message: `Steps not found: ${notFoundSteps.join(', ')}`
+        };
+      }
 
       workPlan.updatedAt = new Date().toISOString();
 
       // Update the session (will throw error if stepCount is not sequential)
       await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
 
-      const step = workPlan.steps[stepIndex];
+      const message = updatedSteps.length === 1
+        ? `Step ${updatedSteps[0].stepCount} status updated to ${updatedSteps[0].status}`
+        : `Updated ${updatedSteps.length} step${updatedSteps.length > 1 ? 's' : ''}`;
+
+      const formattedContent = updatedSteps.map(s => 
+        `Updated step ${s.stepCount} "${s.title}" to ${s.status}`
+      ).join('\n');
+
       return {
         success: true,
-        message: `Step ${stepCount} status updated to ${status}`,
-        step,
-        formattedContent: `Updated step ${stepCount} "${step.title}" to ${status}${notes ? '\nNotes: ' + notes : ''}`
+        message: notFoundSteps.length > 0 
+          ? `${message}. Steps not found: ${notFoundSteps.join(', ')}`
+          : message,
+        updatedSteps,
+        notFoundSteps: notFoundSteps.length > 0 ? notFoundSteps : undefined,
+        formattedContent
       };
     } catch (error) {
       console.error('AgentMode: Error setting work plan status:', error);

@@ -339,9 +339,7 @@ describe('AgentModeService - Work Plan', () => {
       (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
 
       const result = await (agentModeService as any).setWorkPlanStatus(
-        2,
-        'completed',
-        'Completed successfully',
+        [{ stepCount: 2, status: 'completed', notes: 'Completed successfully' }],
         mockSessionId
       );
 
@@ -377,9 +375,7 @@ describe('AgentModeService - Work Plan', () => {
       (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
 
       await (agentModeService as any).setWorkPlanStatus(
-        3,
-        'skipped',
-        'Not needed',
+        [{ stepCount: 3, status: 'skipped', notes: 'Not needed' }],
         mockSessionId
       );
 
@@ -412,9 +408,7 @@ describe('AgentModeService - Work Plan', () => {
       (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
 
       await (agentModeService as any).setWorkPlanStatus(
-        2,
-        'completed',
-        undefined,
+        [{ stepCount: 2, status: 'completed' }],
         mockSessionId
       );
 
@@ -446,14 +440,12 @@ describe('AgentModeService - Work Plan', () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
 
       const result = await (agentModeService as any).setWorkPlanStatus(
-        99,
-        'completed',
-        undefined,
+        [{ stepCount: 99, status: 'completed' }],
         mockSessionId
       );
 
       expect(result.success).toBe(false);
-      expect(result.message).toContain('Step 99 not found');
+      expect(result.message).toContain('not found');
     });
 
     it('should fail when no work plan exists', async () => {
@@ -467,14 +459,56 @@ describe('AgentModeService - Work Plan', () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
 
       const result = await (agentModeService as any).setWorkPlanStatus(
-        1,
-        'completed',
-        undefined,
+        [{ stepCount: 1, status: 'completed' }],
         mockSessionId
       );
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('No work plan found');
+    });
+
+    it('should update multiple steps at once', async () => {
+      // Deep clone to avoid mutation across tests
+      const freshWorkPlan = JSON.parse(JSON.stringify(existingWorkPlan));
+      
+      const mockSession = {
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        messages: [],
+        workPlan: freshWorkPlan,
+      };
+
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+      const result = await (agentModeService as any).setWorkPlanStatus(
+        [
+          { stepCount: 1, status: 'completed', notes: 'First done' },
+          { stepCount: 2, status: 'completed', notes: 'Second done' },
+        ],
+        mockSessionId
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.message).toContain('Updated 2 steps');
+      expect(result.updatedSteps).toHaveLength(2);
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        mockSessionId,
+        expect.objectContaining({
+          steps: expect.arrayContaining([
+            expect.objectContaining({
+              stepCount: 1,
+              status: 'completed',
+              notes: 'First done',
+            }),
+            expect.objectContaining({
+              stepCount: 2,
+              status: 'completed',
+              notes: 'Second done',
+            }),
+          ]),
+        })
+      );
     });
   });
 
