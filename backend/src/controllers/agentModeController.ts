@@ -264,7 +264,7 @@ async function runScheduledChat(
   createdAt: string;
 }> {
   const now = new Date();
-  const maxTries = 6;
+  const maxTries = 20;
   let attempt = 0;
   let finalResult: {
     scheduleId: string;
@@ -298,7 +298,10 @@ async function runScheduledChat(
   });
   
   // Track all function calls across all attempts
-  const allActualFunctionCalls: string[] = [];
+  // allActualFunctionCallsForReporting: never modified, used for final reporting (array format)
+  // allActualFunctionCalls: modified during evaluation to prevent double-counting (key-value format for easy updates)
+  const allActualFunctionCallsForReporting: string[] = [];
+  const allActualFunctionCalls: Record<string, number> = {};
 
   try {
     // Create a session for the run
@@ -322,21 +325,33 @@ async function runScheduledChat(
       // Prepare user message for this attempt
       let userMessage = schedule.startingMessage;
       
-            if (attempt > 1) {
-              const keywordText = remainingKeywords.length > 0 ? `include these keywords: ${remainingKeywords.join(', ')}` : '';
-              
-              // Build function call text with remaining call requirements
-              let functionCallText = '';
-              if (remainingFunctionCalls.length > 0) {
-                const functionCallDetails = remainingFunctionCalls.map(funcName => {
-                  const remainingCount = remainingFunctionCallCounts[funcName] || 0;
-                  return `${funcName} (${remainingCount} more time${remainingCount > 1 ? 's' : ''} needed)`;
-                });
-                functionCallText = `use these function calls: ${functionCallDetails.join(', ')}`;
-              }
-              
-              userMessage = `Please try again. Make sure to ${keywordText}${keywordText && functionCallText ? ' and ' : ''}${functionCallText}.`;
-            }
+      if (attempt > 1) {
+        // Check work plan status
+        const session = await chatbotDb.getChatSession(sessionId);
+        const workPlan = session?.workPlan;
+        const workPlanCompleted = workPlan && workPlan.steps.every((step: any) => step.status === 'completed' || step.status === 'skipped');
+        
+        if (workPlan && !workPlanCompleted) {
+          // Remind to complete pending steps
+          userMessage = `Please perform the work on pending steps. After you are done, mark the steps as completed with set_work_plan_status.`;
+        } else {
+          // Work plan completed or doesn't exist - check keywords and function calls
+          const keywordText = remainingKeywords.length > 0 
+            ? `include these keywords: ${remainingKeywords.join(', ')}` 
+            : '';
+          const functionCallText = remainingFunctionCalls.length > 0
+            ? `use these function calls: ${remainingFunctionCalls.map(funcName => {
+                const remainingCount = remainingFunctionCallCounts[funcName] || 0;
+                return `${funcName} (${remainingCount} more time${remainingCount > 1 ? 's' : ''} needed)`;
+              }).join(', ')}`
+            : '';
+          
+          const parts = [keywordText, functionCallText].filter(Boolean);
+          userMessage = parts.length > 0
+            ? `Please try again. Make sure to ${parts.join(' and ')}.`
+            : schedule.startingMessage;
+        }
+      }
 
       // Generate response using the common function (same as /generateResponse)
       const response = await generateSessionResponse(
@@ -348,36 +363,81 @@ async function runScheduledChat(
       // Extract function calls from the response
       const actualFunctionCalls = response.toolCalls?.map((call: any) => call.name).filter(Boolean) || [];
       
-      // Add to cumulative list
-      allActualFunctionCalls.push(...actualFunctionCalls);
-
-      // Evaluate the response against expected criteria
-      const evaluation = evaluateScheduleResponse(
-        response.content,
-        actualFunctionCalls,
-        {
-          keywords: remainingKeywords,
-          functionCalls: remainingFunctionCalls,
-          functionCallMinCalls: functionCallMinCalls
-        }
-      );
-
-      // Update remaining function call counts based on actual calls made
-      actualFunctionCalls.forEach(callName => {
-        if (remainingFunctionCallCounts.hasOwnProperty(callName) && remainingFunctionCallCounts[callName] > 0) {
-          remainingFunctionCallCounts[callName]--;
-        }
+      // Add to reporting array
+      allActualFunctionCallsForReporting.push(...actualFunctionCalls);
+      
+      // Add to key-value format for easy updates
+      actualFunctionCalls.forEach((callName: string) => {
+        allActualFunctionCalls[callName] = (allActualFunctionCalls[callName] || 0) + 1;
       });
 
-      // Remove found items from remaining lists
-      remainingKeywords = remainingKeywords.filter(keyword => 
-        !evaluation.keywordMatches.includes(keyword)
-      );
-      
-      // Remove function calls from remaining list only when their count reaches zero
-      remainingFunctionCalls = remainingFunctionCalls.filter(funcCall => 
-        remainingFunctionCallCounts[funcCall] > 0
-      );
+      // Check work plan status
+      const workPlan = response.workPlan;
+      const workPlanCompleted = workPlan && workPlan.steps.every((step: any) => step.status === 'completed' || step.status === 'skipped');
+
+      // Only evaluate keywords and function calls if work plan is completed or doesn't exist
+      let evaluation = {
+        passed: true,
+        keywordMatches: [] as string[],
+        keywordMisses: [] as string[],
+        functionCallMatches: [] as string[],
+        functionCallMisses: [] as string[]
+      };
+
+      if (!workPlan || workPlanCompleted) {
+        // Convert Record to array for evaluation
+        const allActualFunctionCallsArray: string[] = [];
+        Object.keys(allActualFunctionCalls).forEach((funcName: string) => {
+          const count = allActualFunctionCalls[funcName] || 0;
+          for (let i = 0; i < count; i++) {
+            allActualFunctionCallsArray.push(funcName);
+          }
+        });
+
+        // Evaluate against cumulative calls to check if requirements are met
+        evaluation = evaluateScheduleResponse(
+          response.content,
+          allActualFunctionCallsArray,
+          {
+            keywords: remainingKeywords,
+            functionCalls: remainingFunctionCalls,
+            functionCallMinCalls: functionCallMinCalls
+          }
+        );
+
+        // Update remaining function call counts and remove matched calls from allActualFunctionCalls
+        // This prevents double-counting in future evaluations
+        evaluation.functionCallMatches.forEach((matchedFunc: string) => {
+          const requiredCount = functionCallMinCalls[matchedFunc] || 1;
+          
+          // Update remaining counts
+          if (remainingFunctionCallCounts.hasOwnProperty(matchedFunc)) {
+            remainingFunctionCallCounts[matchedFunc] -= requiredCount;
+            if (remainingFunctionCallCounts[matchedFunc] < 0) {
+              remainingFunctionCallCounts[matchedFunc] = 0;
+            }
+          }
+          
+          // Decrement the count of matched calls from allActualFunctionCalls
+          // This prevents them from being counted again in future evaluations
+          if (allActualFunctionCalls.hasOwnProperty(matchedFunc)) {
+            allActualFunctionCalls[matchedFunc] -= requiredCount;
+            if (allActualFunctionCalls[matchedFunc] <= 0) {
+              delete allActualFunctionCalls[matchedFunc];
+            }
+          }
+        });
+
+        // Remove matched keywords
+        remainingKeywords = remainingKeywords.filter(keyword => 
+          !evaluation.keywordMatches.includes(keyword)
+        );
+        
+        // Remove function calls from remaining list when their count reaches zero
+        remainingFunctionCalls = remainingFunctionCalls.filter(funcCall => 
+          remainingFunctionCallCounts[funcCall] > 0
+        );
+      }
 
       // Calculate cumulative results across all attempts
       const totalKeywordMatches = expectedKeywords.filter((keyword: string) => 
@@ -387,10 +447,10 @@ async function runScheduledChat(
         !remainingFunctionCalls.includes(funcCall)
       );
 
-      // Calculate final function call details using cumulative counts
+      // Calculate final function call details using cumulative counts from reporting array
       const finalFunctionCallDetails: { [functionName: string]: { actual: number; required: number } } = {};
       const actualFunctionCallCounts: { [functionName: string]: number } = {};
-      allActualFunctionCalls.forEach((call: string) => {
+      allActualFunctionCallsForReporting.forEach((call: string) => {
         actualFunctionCallCounts[call] = (actualFunctionCallCounts[call] || 0) + 1;
       });
       
@@ -403,17 +463,24 @@ async function runScheduledChat(
         };
       });
 
+      // Check if all requirements are met
+      // If work plan exists and is not completed, requirements are not met
+      // Otherwise, check keywords and function calls
+      const allRequirementsMet = (!workPlan || workPlanCompleted) && 
+        remainingKeywords.length === 0 && 
+        remainingFunctionCalls.length === 0;
+
       finalResult = {
         scheduleId: schedule.scheduleId,
         runId: require('uuid').v4(),
-        status: evaluation.passed ? 'success' : 'failure',
-        passed: evaluation.passed,
+        status: allRequirementsMet ? 'success' : 'failure',
+        passed: allRequirementsMet,
         actualResponse: response.content,
-        actualFunctionCalls: allActualFunctionCalls, // Use cumulative function calls
-        keywordMatches: totalKeywordMatches, // Show all keywords found so far
-        keywordMisses: remainingKeywords, // Show what's still missing
-        functionCallMatches: totalFunctionCallMatches, // Show all function calls found so far
-        functionCallMisses: remainingFunctionCalls, // Show what's still missing
+        actualFunctionCalls: allActualFunctionCallsForReporting,
+        keywordMatches: totalKeywordMatches,
+        keywordMisses: remainingKeywords,
+        functionCallMatches: totalFunctionCallMatches,
+        functionCallMisses: remainingFunctionCalls,
         functionCallDetails: finalFunctionCallDetails,
         executionTime: Date.now() - now.getTime(),
         sessionId: sessionId,
@@ -421,12 +488,8 @@ async function runScheduledChat(
         createdAt: new Date().toISOString()
       };
 
-      // If all items found, break out of loop
-      if (remainingKeywords.length === 0 && remainingFunctionCalls.length === 0) {
-        if (finalResult) {
-          finalResult.passed = true;
-          finalResult.status = 'success';
-        }
+      // If all requirements met, break out of loop
+      if (allRequirementsMet) {
         break;
       }
 
@@ -485,6 +548,7 @@ async function generateSessionResponse(
   knowledgeBaseQueries: string[];
   sources: string[];
   responseMessages: any[];
+  workPlan?: any;
 }> {
   // Get session
   const session = await chatbotDb.getChatSession(sessionId);
@@ -577,7 +641,13 @@ async function generateSessionResponse(
   // Add all response messages to session (includes assistant responses and tool calls)
   await chatbotDb.addMessagesToSession(sessionId, response.responseMessages);
 
-  return response;
+  // Get the updated session to include workPlan if it was modified
+  const finalSession = await chatbotDb.getChatSession(sessionId);
+  
+  return {
+    ...response,
+    workPlan: finalSession?.workPlan
+  };
 }
 
 // Helper function to calculate next run time based on frequency
@@ -747,7 +817,8 @@ export const agentModeController = {
         content: response.content,
         toolCalls: response.toolCalls,
         knowledgeBaseQueries: response.knowledgeBaseQueries,
-        sources: response.sources
+        sources: response.sources,
+        workPlan: response.workPlan
       });
     } catch (error) {
       console.error('AgentMode: Generate response error:', error);
@@ -1696,7 +1767,8 @@ export const agentModeController = {
         content: response.content,
         toolCalls: response.toolCalls,
         knowledgeBaseQueries: response.knowledgeBaseQueries,
-        sources: response.sources
+        sources: response.sources,
+        workPlan: response.workPlan
       });
     } catch (error) {
       console.error('AgentMode: Generate conversable response error:', error);

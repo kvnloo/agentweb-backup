@@ -46,7 +46,12 @@ export class AgentModeService {
       const systemPrompt = await this.getMarketingSystemPrompt();
       const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
       const availableTemplates = await this.getAvailableTemplates();
-      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses);
+      
+      // Get session to check for work plan
+      const session = await chatbotDb.getChatSession(sessionId);
+      const workPlan = session?.workPlan;
+      
+      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan);
       
       // Build templates context message
       const templatesContext = this.buildTemplatesContext(availableTemplates);
@@ -116,6 +121,14 @@ export class AgentModeService {
               arguments: functionArgs,
               result: minimalResult
             });
+
+            // Update the calledFunctions counter immediately after successful tool call
+            try {
+              await chatbotDb.incrementCalledFunctions(sessionId, { [toolCall.function.name]: 1 });
+            } catch (counterError) {
+              console.error('AgentMode: Failed to update function call counter:', counterError);
+              // Don't fail the whole tool call if counter update fails
+            }
 
             // Append the tool call result as a tool message for the model to consume next
             const toolContent = result.formattedContent || (typeof result === 'string' ? result : JSON.stringify(result));
@@ -307,6 +320,32 @@ When updating HTML files, follow this process:
 - If a user asks about a specific ad that doesn't appear in the metrics data, simply explain that the ad may be disabled, paused, or have no activity in the selected timeframe
 - **Never offer to pull metrics for individual ads by name** - you can only analyze the ads that appear in the current metrics data set
 
+## Work Plan Capabilities
+You can create and manage multi-step work plans using these tools:
+- **create_work_plan**: Create a structured plan with a title and numbered steps. Each step can include optional requiredFunctionCalls to enforce validation.
+- **modify_work_plan**: Add new steps or modify existing step details (does not change status). Can also add or modify requiredFunctionCalls for steps.
+- **set_work_plan_status**: Update step status (pending/completed/skipped) with optional notes. **IMPORTANT**: If a step has requiredFunctionCalls defined, you MUST have called those functions before marking it as completed, or you'll get an error.
+
+Work plans help organize complex multi-step projects like client onboarding, campaign planning, or content creation workflows. The current work plan status (if any) is automatically provided in your context.
+
+### Required Function Calls
+You can specify required function calls for any step to ensure proper validation:
+- Add requiredFunctionCalls array when creating or modifying steps
+- Example: \`requiredFunctionCalls: ["create_blog_article", "generate_image"]\`
+- When marking a step as completed, the system will validate that all required functions were actually called
+- If any required functions are missing, you'll get an error message listing what's missing
+- This ensures you don't skip important work before marking steps complete
+
+### Client Onboarding Workflow
+When a user requests client onboarding or says "onboard new client" or similar:
+1. **Ask for website URL**: Request their business website URL first
+2. **Create the work plan**: Use create_work_plan with title "Client Onboarding" and these steps with required function calls:
+   - Step 1: Analyze website and business (requiredFunctionCalls: ["search_web"])
+   - Step 2: Create/update brand guidelines (requiredFunctionCalls: ["update_brand_guidelines"])
+   - Step 3: Create/update marketing strategy (requiredFunctionCalls: ["update_marketing_strategy"])
+   - Step 4: Generate 3 blog articles (requiredFunctionCalls: ["create_blog_article"])
+   - Step 5: Generate social media posts (requiredFunctionCalls: ["generate_image"])
+
 ## Response Formatting
 Format your responses in HTML5 for direct rendering. Use:
 - <strong> for important points
@@ -399,7 +438,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
-  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = []): any[] {
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
     
@@ -465,6 +504,21 @@ Use the available tools to create tasks in the agent-engine when complex work is
       statusesContent = '📋 **Task Status**: No tasks have been run in this session yet.';
     }
     messages.push({ role: 'assistant', content: statusesContent });
+
+    // Insert work plan status as an assistant message if exists
+    if (workPlan) {
+      const statusIcons = {
+        completed: '✓',
+        pending: '○',
+        skipped: '⊘'
+      };
+      const workPlanContent = `[Current Work Plan: "${workPlan.title}"]\n` +
+        workPlan.steps.map((step: any) => {
+          const icon = statusIcons[step.status as keyof typeof statusIcons];
+          return `${step.stepCount}. ${icon} ${step.title} (${step.status})`;
+        }).join('\n');
+      messages.push({ role: 'assistant', content: workPlanContent });
+    }
 
     // Append the current user message at the end
     messages.push({ role: 'user', content: messageContent });
@@ -1109,7 +1163,138 @@ Use the available tools to create tasks in the agent-engine when complex work is
               required: ['file_url', 'update_type', 'replacement_json']
             }
           }
+        },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'create_work_plan',
+          description: 'Create a multi-step work plan for the current chat session. Use this to organize complex projects like client onboarding, campaign planning, or content creation workflows.',
+          parameters: {
+            type: 'object',
+            properties: {
+              title: {
+                type: 'string',
+                description: 'Title of the work plan (e.g., "Client Onboarding", "Q1 Campaign")'
+              },
+              steps: {
+                type: 'array',
+                description: 'Array of steps in the plan, each with stepCount (starting from 1), title, and optional description',
+                items: {
+                  type: 'object',
+                  properties: {
+                    stepCount: {
+                      type: 'number',
+                      description: 'Step number starting from 1'
+                    },
+                    title: {
+                      type: 'string',
+                      description: 'Step title'
+                    },
+                    description: {
+                      type: 'string',
+                      description: 'Optional detailed description of the step'
+                    },
+                    requiredFunctionCalls: {
+                      type: 'array',
+                      description: 'Optional array of function names that must be called before marking this step as completed',
+                      items: {
+                        type: 'string'
+                      }
+                    }
+                  },
+                  required: ['stepCount', 'title']
+                }
+              }
+            },
+            required: ['title', 'steps']
+          }
         }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'modify_work_plan',
+          description: 'Add new steps or modify existing step details in the current work plan. Does not change step status - use set_work_plan_status for that.',
+          parameters: {
+            type: 'object',
+            properties: {
+              steps: {
+                type: 'array',
+                description: 'Array of steps to add or update',
+                items: {
+                  type: 'object',
+                  properties: {
+                    stepCount: {
+                      type: 'number',
+                      description: 'Step number'
+                    },
+                    title: {
+                      type: 'string',
+                      description: 'Step title'
+                    },
+                    description: {
+                      type: 'string',
+                      description: 'Optional detailed description'
+                    },
+                    requiredFunctionCalls: {
+                      type: 'array',
+                      description: 'Optional array of function names that must be called before marking this step as completed',
+                      items: {
+                        type: 'string'
+                      }
+                    }
+                  },
+                  required: ['stepCount', 'title']
+                }
+              },
+              removeStepCounts: {
+                type: 'array',
+                description: 'Optional array of step numbers to remove',
+                items: {
+                  type: 'number'
+                }
+              }
+            },
+            required: ['steps']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'set_work_plan_status',
+          description: 'Update the status of one or more steps in the work plan. Use this to track progress as you complete steps. You can update multiple steps at once.',
+          parameters: {
+            type: 'object',
+            properties: {
+              updates: {
+                type: 'array',
+                description: 'Array of step status updates',
+                items: {
+                  type: 'object',
+                  properties: {
+                    stepCount: {
+                      type: 'number',
+                      description: 'Step number to update (1, 2, 3, etc.)'
+                    },
+                    status: {
+                      type: 'string',
+                      enum: ['pending', 'completed', 'skipped'],
+                      description: 'New status for the step'
+                    },
+                    notes: {
+                      type: 'string',
+                      description: 'Optional notes about what was accomplished or why the step was skipped'
+                    }
+                  },
+                  required: ['stepCount', 'status']
+                }
+              }
+            },
+            required: ['updates']
+          }
+        }
+      }
     ];
   }
 
@@ -1817,6 +2002,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
         }
         
         return await this.updateHtmlFile(args.file_url, args.update_type, replacementInstructions, userId, sessionId);
+      case 'create_work_plan':
+        return await this.createWorkPlan(args.title, args.steps, sessionId);
+      case 'modify_work_plan':
+        return await this.modifyWorkPlan(args.steps, args.removeStepCounts || [], sessionId);
+      case 'set_work_plan_status':
+        return await this.setWorkPlanStatus(args.updates, sessionId);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -6093,6 +6284,261 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
     });
 
     return { variables: regularVariables, arrayVariables: Array.from(arrayVariableNames) };
+  }
+
+  // Work Plan Management Methods
+
+  private async createWorkPlan(title: string, steps: Array<{stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]}>, sessionId: string): Promise<any> {
+    try {
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        return {
+          success: false,
+          message: 'Session not found'
+        };
+      }
+
+      // Create the work plan with all steps in pending status
+      // Ensure stepCount is sequential starting from 1
+      const workPlan = {
+        title,
+        steps: steps.map((step, index) => ({
+          stepCount: index + 1, // Must be sequential: index+1
+          title: step.title,
+          description: step.description,
+          status: 'pending' as const,
+          completedAt: undefined,
+          notes: undefined,
+          requiredFunctionCalls: step.requiredFunctionCalls
+        })),
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+
+      // Update the session with the work plan
+      await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+
+      return {
+        success: true,
+        message: `Work plan "${title}" created with ${steps.length} steps`,
+        workPlan,
+        formattedContent: `Created work plan "${title}" with ${steps.length} steps:\n${workPlan.steps.map(s => `${s.stepCount}. ${s.title}`).join('\n')}`
+      };
+    } catch (error) {
+      console.error('AgentMode: Error creating work plan:', error);
+      return {
+        success: false,
+        message: 'Failed to create work plan',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async modifyWorkPlan(steps: Array<{stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]}>, removeStepCounts: number[], sessionId: string): Promise<any> {
+    try {
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session || !session.workPlan) {
+        return {
+          success: false,
+          message: 'No work plan found in this session. Create one first using create_work_plan.'
+        };
+      }
+
+      const workPlan = { ...session.workPlan };
+      
+      // Remove steps if specified
+      if (removeStepCounts && removeStepCounts.length > 0) {
+        workPlan.steps = workPlan.steps.filter(s => !removeStepCounts.includes(s.stepCount));
+      }
+
+      // Update or add steps
+      for (const newStep of steps) {
+        const existingIndex = workPlan.steps.findIndex(s => s.stepCount === newStep.stepCount);
+        if (existingIndex >= 0) {
+          // Update existing step (preserve status and completion info)
+          workPlan.steps[existingIndex] = {
+            ...workPlan.steps[existingIndex],
+            title: newStep.title,
+            description: newStep.description,
+            requiredFunctionCalls: newStep.requiredFunctionCalls !== undefined ? newStep.requiredFunctionCalls : workPlan.steps[existingIndex].requiredFunctionCalls
+          };
+        } else {
+          // Add new step (stepCount will be fixed by updateSessionWorkPlan)
+          workPlan.steps.push({
+            stepCount: newStep.stepCount,
+            title: newStep.title,
+            description: newStep.description,
+            status: 'pending',
+            completedAt: undefined,
+            notes: undefined,
+            requiredFunctionCalls: newStep.requiredFunctionCalls
+          });
+        }
+      }
+
+      // Sort steps by stepCount before saving
+      workPlan.steps.sort((a, b) => a.stepCount - b.stepCount);
+      workPlan.updatedAt = new Date().toISOString();
+
+      // Update the session (will throw error if stepCount is not sequential)
+      await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+
+      return {
+        success: true,
+        message: `Work plan modified successfully`,
+        workPlan,
+        formattedContent: `Modified work plan. Current steps:\n${workPlan.steps.map((s, i) => `${i + 1}. ${s.title} (${s.status})`).join('\n')}`
+      };
+    } catch (error) {
+      console.error('AgentMode: Error modifying work plan:', error);
+      return {
+        success: false,
+        message: 'Failed to modify work plan',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async setWorkPlanStatus(
+    updates: Array<{stepCount: number; status: 'pending' | 'completed' | 'skipped'; notes?: string}>, 
+    sessionId: string
+  ): Promise<any> {
+    try {
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session || !session.workPlan) {
+        return {
+          success: false,
+          message: 'No work plan found in this session. Create one first using create_work_plan.'
+        };
+      }
+
+      const workPlan = { ...session.workPlan };
+      const updatedSteps: Array<{stepCount: number; title: string; status: string}> = [];
+      const notFoundSteps: number[] = [];
+      const missingFunctionCalls: Array<{stepCount: number; title: string; missing: string[]}> = [];
+
+      // Get function call counts from session (make a copy to modify)
+      const calledFunctionCounts = { ...(session.calledFunctions || {}) };
+      let countsModified = false;
+
+      // Process each update
+      for (const update of updates) {
+        const stepIndex = workPlan.steps.findIndex(s => s.stepCount === update.stepCount);
+        
+        if (stepIndex < 0) {
+          notFoundSteps.push(update.stepCount);
+          continue;
+        }
+
+        const step = workPlan.steps[stepIndex];
+
+        // Validate required function calls if marking as completed
+        if (update.status === 'completed' && step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
+          // Count how many times each function is required
+          const requiredCounts: Record<string, number> = {};
+          for (const fn of step.requiredFunctionCalls) {
+            requiredCounts[fn] = (requiredCounts[fn] || 0) + 1;
+          }
+          
+          // Check if we have enough calls for each required function
+          const missing: string[] = [];
+          for (const [fn, requiredCount] of Object.entries(requiredCounts)) {
+            const availableCount = calledFunctionCounts[fn] || 0;
+            if (availableCount < requiredCount) {
+              missing.push(`${fn} (need ${requiredCount}, have ${availableCount})`);
+            }
+          }
+          
+          if (missing.length > 0) {
+            missingFunctionCalls.push({
+              stepCount: update.stepCount,
+              title: step.title,
+              missing
+            });
+            continue; // Skip updating this step
+          }
+          
+          // If validation passed and marking as completed, decrement the function counts
+          for (const fn of step.requiredFunctionCalls) {
+            calledFunctionCounts[fn] = (calledFunctionCounts[fn] || 0) - 1;
+            countsModified = true;
+          }
+        }
+
+        // Update the step status
+        workPlan.steps[stepIndex] = {
+          ...workPlan.steps[stepIndex],
+          status: update.status,
+          notes: update.notes,
+          completedAt: update.status === 'completed' ? new Date().toISOString() : workPlan.steps[stepIndex].completedAt
+        };
+
+        updatedSteps.push({
+          stepCount: update.stepCount,
+          title: workPlan.steps[stepIndex].title,
+          status: update.status
+        });
+      }
+
+      // Check if there are missing function calls - this is a critical error
+      if (missingFunctionCalls.length > 0) {
+        const errorDetails = missingFunctionCalls.map(mfc => 
+          `Step ${mfc.stepCount} "${mfc.title}": missing required function calls: ${mfc.missing.join(', ')}`
+        ).join('\n');
+        
+        return {
+          success: false,
+          message: 'Cannot mark steps as completed. Required function calls have not been made yet.',
+          missingFunctionCalls,
+          formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nPlease make the required function calls first, then mark the steps as completed.`
+        };
+      }
+
+      // Check if any steps were not found
+      if (notFoundSteps.length > 0 && updatedSteps.length === 0) {
+        return {
+          success: false,
+          message: `Steps not found: ${notFoundSteps.join(', ')}`
+        };
+      }
+
+      // Only update if there are changes
+      if (updatedSteps.length > 0) {
+        workPlan.updatedAt = new Date().toISOString();
+        // Update the session (will throw error if stepCount is not sequential)
+        await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+        
+        // Update function counts if they were modified
+        if (countsModified) {
+          await chatbotDb.updateCalledFunctions(sessionId, calledFunctionCounts);
+        }
+      }
+
+      const message = updatedSteps.length === 1
+        ? `Step ${updatedSteps[0].stepCount} status updated to ${updatedSteps[0].status}`
+        : `Updated ${updatedSteps.length} step${updatedSteps.length > 1 ? 's' : ''}`;
+
+      const formattedContent = updatedSteps.map(s => 
+        `Updated step ${s.stepCount} "${s.title}" to ${s.status}`
+      ).join('\n');
+
+      return {
+        success: updatedSteps.length > 0,
+        message: notFoundSteps.length > 0 
+          ? `${message}. Steps not found: ${notFoundSteps.join(', ')}`
+          : message,
+        updatedSteps,
+        notFoundSteps: notFoundSteps.length > 0 ? notFoundSteps : undefined,
+        formattedContent
+      };
+    } catch (error) {
+      console.error('AgentMode: Error setting work plan status:', error);
+      return {
+        success: false,
+        message: 'Failed to update work plan status',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
   }
 
 

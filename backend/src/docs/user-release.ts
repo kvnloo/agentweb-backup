@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-11-06',
+    changes: [
+      'Added Plan and Execute Feature for Agent Mode',
+      '- Emma can now create, modify, and track multi-step work plans within chat sessions',
+      '- Each step can require specific function calls that must be executed to ensure better reliability',
+      '- Work plan progress is displayed in the chat interface with visual indicators for completion status',
+      '- Work plans are automatically integrated with scheduled chats, prioritizing step completion before general requirements',
+    ],
+  },
+  {
     date: '2025-11-03',
     changes: [
       'Improved Agent Mode Task Creation Clarity',

@@ -183,14 +183,14 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
       // The function should be called multiple times due to retry logic
-      expect(mockAgentModeService.generateMarketingResponse).toHaveBeenCalledTimes(6);
+      expect(mockAgentModeService.generateMarketingResponse).toHaveBeenCalledTimes(20);
       
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'failure', // Will fail because the logic doesn't work as expected in test
           passed: false,
-          attempt: 6,
+          attempt: 20,
           functionCallDetails: {
             'get_marketing_tips': { actual: 2, required: 2 },
             'analyze_competitors': { actual: 1, required: 1 }
@@ -292,17 +292,17 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
 
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
-      // Should have been called 6 times (maxTries = 6)
-      expect(mockAgentModeService.generateMarketingResponse).toHaveBeenCalledTimes(6);
+      // Should have been called 20 times (maxTries = 20)
+      expect(mockAgentModeService.generateMarketingResponse).toHaveBeenCalledTimes(20);
       
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'failure',
           passed: false,
-          attempt: 6,
+          attempt: 20,
           functionCallDetails: {
-            'get_marketing_tips': { actual: 6, required: 2 }, // Called 6 times but only 1 per attempt
+            'get_marketing_tips': { actual: 20, required: 2 }, // Called 20 times but only 1 per attempt
             'analyze_competitors': { actual: 0, required: 1 }
           }
         })
@@ -395,15 +395,15 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
 
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
-      // Should have been called 6 times (all attempts)
-      expect(mockAgentModeService.generateMarketingResponse).toHaveBeenCalledTimes(6);
+      // Should have been called 20 times (all attempts)
+      expect(mockAgentModeService.generateMarketingResponse).toHaveBeenCalledTimes(20);
       
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'failure',
           passed: false,
-          attempt: 6,
+          attempt: 20,
           functionCallDetails: {
             'get_marketing_tips': { actual: 3, required: 2 }, // Called 3 times, needs 2 - SUCCESS
             'analyze_competitors': { actual: 0, required: 1 } // Never called - FAILURE

@@ -160,15 +160,15 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
-      // Should have been called 6 times (maxTries = 6)
-      expect(mockAgentModeService.generateMarketingResponse).toHaveBeenCalledTimes(6);
+      // Should have been called 20 times (maxTries = 20)
+      expect(mockAgentModeService.generateMarketingResponse).toHaveBeenCalledTimes(20);
       
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'failure',
           passed: false,
-          attempt: 6, // Last attempt
+          attempt: 20, // Last attempt
           keywordMatches: [],
           keywordMisses: ['marketing', 'strategy'],
           functionCallMatches: ['get_marketing_tips'],
@@ -277,15 +277,15 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
-      // Should have been called 6 times (all attempts)
-      expect(mockAgentModeService.generateMarketingResponse).toHaveBeenCalledTimes(6);
+      // Should have been called 20 times (all attempts)
+      expect(mockAgentModeService.generateMarketingResponse).toHaveBeenCalledTimes(20);
       
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'failure',
           passed: false,
-          attempt: 6,
+          attempt: 20,
           keywordMatches: ['marketing'], // Only "marketing" found in "strategies"
           keywordMisses: ['strategy'],
           functionCallMatches: ['get_marketing_tips', 'analyze_competitors'], // Found across attempts
@@ -359,15 +359,15 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
-      // Should have been called 6 times (error on attempt 2, but continued)
-      expect(mockAgentModeService.generateMarketingResponse).toHaveBeenCalledTimes(6);
+      // Should have been called 20 times (error on attempt 2, but continued)
+      expect(mockAgentModeService.generateMarketingResponse).toHaveBeenCalledTimes(20);
       
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({
           scheduleId: mockScheduleId,
           status: 'failure',
           passed: false,
-          attempt: 6,
+          attempt: 20,
         })
       );
     });
