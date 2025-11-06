@@ -600,5 +600,331 @@ describe('AgentModeService - Work Plan', () => {
       expect(workPlanMessage).toBeUndefined();
     });
   });
+
+  describe('Required Function Calls', () => {
+    describe('createWorkPlan with requiredFunctionCalls', () => {
+      it('should create work plan with requiredFunctionCalls', async () => {
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        await (agentModeService as any).createWorkPlan(
+          'Client Onboarding',
+          [
+            {
+              stepCount: 1,
+              title: 'Analyze website',
+              requiredFunctionCalls: ['search_web'],
+            },
+            {
+              stepCount: 2,
+              title: 'Create 3 blog articles',
+              requiredFunctionCalls: ['create_blog_article', 'create_blog_article', 'create_blog_article'],
+            },
+          ],
+          mockSessionId
+        );
+
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          mockSessionId,
+          expect.objectContaining({
+            steps: expect.arrayContaining([
+              expect.objectContaining({
+                stepCount: 1,
+                title: 'Analyze website',
+                requiredFunctionCalls: ['search_web'],
+              }),
+              expect.objectContaining({
+                stepCount: 2,
+                title: 'Create 3 blog articles',
+                requiredFunctionCalls: ['create_blog_article', 'create_blog_article', 'create_blog_article'],
+              }),
+            ]),
+          })
+        );
+      });
+    });
+
+    describe('modifyWorkPlan with requiredFunctionCalls', () => {
+      it('should add requiredFunctionCalls to existing step', async () => {
+        const existingWorkPlan = {
+          title: 'Project Plan',
+          steps: [
+            { stepCount: 1, title: 'Step 1', status: 'pending' as const },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(existingWorkPlan)),
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        await (agentModeService as any).modifyWorkPlan(
+          [
+            {
+              stepCount: 1,
+              title: 'Step 1',
+              requiredFunctionCalls: ['search_web', 'create_blog_article'],
+            },
+          ],
+          [],
+          mockSessionId
+        );
+
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          mockSessionId,
+          expect.objectContaining({
+            steps: expect.arrayContaining([
+              expect.objectContaining({
+                stepCount: 1,
+                requiredFunctionCalls: ['search_web', 'create_blog_article'],
+              }),
+            ]),
+          })
+        );
+      });
+    });
+
+    describe('setWorkPlanStatus with requiredFunctionCalls validation', () => {
+      it('should fail to complete step when required functions not called', async () => {
+        const workPlan = {
+          title: 'Project Plan',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'Research',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['search_web'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: {}, // No functions called yet
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('Required function calls have not been made');
+        expect(result.missingFunctionCalls).toBeDefined();
+        expect(result.missingFunctionCalls[0].missing).toContain('search_web (need 1, have 0)');
+      });
+
+      it('should succeed when required functions have been called', async () => {
+        const workPlan = {
+          title: 'Project Plan',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'Research',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['search_web'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: { search_web: 1 }, // Function has been called
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateCalledFunctions as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.message).toContain('Step 1 status updated to completed');
+        expect(chatbotDb.updateCalledFunctions).toHaveBeenCalledWith(
+          mockSessionId,
+          { search_web: 0 } // Counter should be decremented
+        );
+      });
+
+      it('should fail when multiple calls required but not enough made', async () => {
+        const workPlan = {
+          title: 'Project Plan',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'Create 3 blog articles',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['create_blog_article', 'create_blog_article', 'create_blog_article'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: { create_blog_article: 2 }, // Only 2 calls, need 3
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('Required function calls have not been made');
+        expect(result.missingFunctionCalls[0].missing).toContain('create_blog_article (need 3, have 2)');
+      });
+
+      it('should succeed when multiple calls required and all made', async () => {
+        const workPlan = {
+          title: 'Project Plan',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'Create 3 blog articles',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['create_blog_article', 'create_blog_article', 'create_blog_article'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: { create_blog_article: 5 }, // More than enough
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateCalledFunctions as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(true);
+        expect(chatbotDb.updateCalledFunctions).toHaveBeenCalledWith(
+          mockSessionId,
+          { create_blog_article: 2 } // Should decrement by 3
+        );
+      });
+
+      it('should handle multiple different required functions', async () => {
+        const workPlan = {
+          title: 'Project Plan',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'Complete onboarding',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['search_web', 'create_blog_article', 'generate_image'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: {
+            search_web: 1,
+            create_blog_article: 1,
+            generate_image: 0, // This one is missing
+          },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.missingFunctionCalls[0].missing).toContain('generate_image (need 1, have 0)');
+        expect(result.missingFunctionCalls[0].missing).not.toContain('search_web');
+        expect(result.missingFunctionCalls[0].missing).not.toContain('create_blog_article');
+      });
+
+      it('should not validate requiredFunctionCalls when marking as skipped', async () => {
+        const workPlan = {
+          title: 'Project Plan',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'Research',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['search_web'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: {}, // No functions called
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'skipped', notes: 'Not needed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.message).toContain('Step 1 status updated to skipped');
+        // Should not try to update calledFunctions when skipping
+        expect(chatbotDb.updateCalledFunctions).not.toHaveBeenCalled();
+      });
+    });
+  });
 });
 

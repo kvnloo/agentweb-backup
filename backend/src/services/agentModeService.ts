@@ -122,6 +122,14 @@ export class AgentModeService {
               result: minimalResult
             });
 
+            // Update the calledFunctions counter immediately after successful tool call
+            try {
+              await chatbotDb.incrementCalledFunctions(sessionId, { [toolCall.function.name]: 1 });
+            } catch (counterError) {
+              console.error('AgentMode: Failed to update function call counter:', counterError);
+              // Don't fail the whole tool call if counter update fails
+            }
+
             // Append the tool call result as a tool message for the model to consume next
             const toolContent = result.formattedContent || (typeof result === 'string' ? result : JSON.stringify(result));
             (messages as any[]).push({
@@ -314,21 +322,29 @@ When updating HTML files, follow this process:
 
 ## Work Plan Capabilities
 You can create and manage multi-step work plans using these tools:
-- **create_work_plan**: Create a structured plan with a title and numbered steps
-- **modify_work_plan**: Add new steps or modify existing step details (does not change status)
-- **set_work_plan_status**: Update step status (pending/completed/skipped) with optional notes
+- **create_work_plan**: Create a structured plan with a title and numbered steps. Each step can include optional requiredFunctionCalls to enforce validation.
+- **modify_work_plan**: Add new steps or modify existing step details (does not change status). Can also add or modify requiredFunctionCalls for steps.
+- **set_work_plan_status**: Update step status (pending/completed/skipped) with optional notes. **IMPORTANT**: If a step has requiredFunctionCalls defined, you MUST have called those functions before marking it as completed, or you'll get an error.
 
 Work plans help organize complex multi-step projects like client onboarding, campaign planning, or content creation workflows. The current work plan status (if any) is automatically provided in your context.
+
+### Required Function Calls
+You can specify required function calls for any step to ensure proper validation:
+- Add requiredFunctionCalls array when creating or modifying steps
+- Example: \`requiredFunctionCalls: ["create_blog_article", "generate_image"]\`
+- When marking a step as completed, the system will validate that all required functions were actually called
+- If any required functions are missing, you'll get an error message listing what's missing
+- This ensures you don't skip important work before marking steps complete
 
 ### Client Onboarding Workflow
 When a user requests client onboarding or says "onboard new client" or similar:
 1. **Ask for website URL**: Request their business website URL first
-2. **Create the work plan**: Use create_work_plan with title "Client Onboarding" and these steps:
-   - Step 1: Analyze website and business
-   - Step 2: Create/update brand guidelines
-   - Step 3: Create/update marketing strategy
-   - Step 4: Generate 3 blog articles
-   - Step 5: Generate social media posts (LinkedIn, Facebook, Instagram)
+2. **Create the work plan**: Use create_work_plan with title "Client Onboarding" and these steps with required function calls:
+   - Step 1: Analyze website and business (requiredFunctionCalls: ["search_web"])
+   - Step 2: Create/update brand guidelines (requiredFunctionCalls: ["update_brand_guidelines"])
+   - Step 3: Create/update marketing strategy (requiredFunctionCalls: ["update_marketing_strategy"])
+   - Step 4: Generate 3 blog articles (requiredFunctionCalls: ["create_blog_article"])
+   - Step 5: Generate social media posts (requiredFunctionCalls: ["generate_image"])
 
 ## Response Formatting
 Format your responses in HTML5 for direct rendering. Use:
@@ -1177,6 +1193,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
                     description: {
                       type: 'string',
                       description: 'Optional detailed description of the step'
+                    },
+                    requiredFunctionCalls: {
+                      type: 'array',
+                      description: 'Optional array of function names that must be called before marking this step as completed',
+                      items: {
+                        type: 'string'
+                      }
                     }
                   },
                   required: ['stepCount', 'title']
@@ -1212,6 +1235,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
                     description: {
                       type: 'string',
                       description: 'Optional detailed description'
+                    },
+                    requiredFunctionCalls: {
+                      type: 'array',
+                      description: 'Optional array of function names that must be called before marking this step as completed',
+                      items: {
+                        type: 'string'
+                      }
                     }
                   },
                   required: ['stepCount', 'title']
@@ -6258,7 +6288,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
 
   // Work Plan Management Methods
 
-  private async createWorkPlan(title: string, steps: Array<{stepCount: number; title: string; description?: string}>, sessionId: string): Promise<any> {
+  private async createWorkPlan(title: string, steps: Array<{stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]}>, sessionId: string): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -6278,7 +6308,8 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
           description: step.description,
           status: 'pending' as const,
           completedAt: undefined,
-          notes: undefined
+          notes: undefined,
+          requiredFunctionCalls: step.requiredFunctionCalls
         })),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
@@ -6303,7 +6334,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
     }
   }
 
-  private async modifyWorkPlan(steps: Array<{stepCount: number; title: string; description?: string}>, removeStepCounts: number[], sessionId: string): Promise<any> {
+  private async modifyWorkPlan(steps: Array<{stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]}>, removeStepCounts: number[], sessionId: string): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session || !session.workPlan) {
@@ -6328,7 +6359,8 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
           workPlan.steps[existingIndex] = {
             ...workPlan.steps[existingIndex],
             title: newStep.title,
-            description: newStep.description
+            description: newStep.description,
+            requiredFunctionCalls: newStep.requiredFunctionCalls !== undefined ? newStep.requiredFunctionCalls : workPlan.steps[existingIndex].requiredFunctionCalls
           };
         } else {
           // Add new step (stepCount will be fixed by updateSessionWorkPlan)
@@ -6338,7 +6370,8 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
             description: newStep.description,
             status: 'pending',
             completedAt: undefined,
-            notes: undefined
+            notes: undefined,
+            requiredFunctionCalls: newStep.requiredFunctionCalls
           });
         }
       }
@@ -6382,6 +6415,11 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       const workPlan = { ...session.workPlan };
       const updatedSteps: Array<{stepCount: number; title: string; status: string}> = [];
       const notFoundSteps: number[] = [];
+      const missingFunctionCalls: Array<{stepCount: number; title: string; missing: string[]}> = [];
+
+      // Get function call counts from session (make a copy to modify)
+      const calledFunctionCounts = { ...(session.calledFunctions || {}) };
+      let countsModified = false;
 
       // Process each update
       for (const update of updates) {
@@ -6390,6 +6428,41 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         if (stepIndex < 0) {
           notFoundSteps.push(update.stepCount);
           continue;
+        }
+
+        const step = workPlan.steps[stepIndex];
+
+        // Validate required function calls if marking as completed
+        if (update.status === 'completed' && step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
+          // Count how many times each function is required
+          const requiredCounts: Record<string, number> = {};
+          for (const fn of step.requiredFunctionCalls) {
+            requiredCounts[fn] = (requiredCounts[fn] || 0) + 1;
+          }
+          
+          // Check if we have enough calls for each required function
+          const missing: string[] = [];
+          for (const [fn, requiredCount] of Object.entries(requiredCounts)) {
+            const availableCount = calledFunctionCounts[fn] || 0;
+            if (availableCount < requiredCount) {
+              missing.push(`${fn} (need ${requiredCount}, have ${availableCount})`);
+            }
+          }
+          
+          if (missing.length > 0) {
+            missingFunctionCalls.push({
+              stepCount: update.stepCount,
+              title: step.title,
+              missing
+            });
+            continue; // Skip updating this step
+          }
+          
+          // If validation passed and marking as completed, decrement the function counts
+          for (const fn of step.requiredFunctionCalls) {
+            calledFunctionCounts[fn] = (calledFunctionCounts[fn] || 0) - 1;
+            countsModified = true;
+          }
         }
 
         // Update the step status
@@ -6407,6 +6480,20 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         });
       }
 
+      // Check if there are missing function calls - this is a critical error
+      if (missingFunctionCalls.length > 0) {
+        const errorDetails = missingFunctionCalls.map(mfc => 
+          `Step ${mfc.stepCount} "${mfc.title}": missing required function calls: ${mfc.missing.join(', ')}`
+        ).join('\n');
+        
+        return {
+          success: false,
+          message: 'Cannot mark steps as completed. Required function calls have not been made yet.',
+          missingFunctionCalls,
+          formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nPlease make the required function calls first, then mark the steps as completed.`
+        };
+      }
+
       // Check if any steps were not found
       if (notFoundSteps.length > 0 && updatedSteps.length === 0) {
         return {
@@ -6415,10 +6502,17 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         };
       }
 
-      workPlan.updatedAt = new Date().toISOString();
-
-      // Update the session (will throw error if stepCount is not sequential)
-      await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+      // Only update if there are changes
+      if (updatedSteps.length > 0) {
+        workPlan.updatedAt = new Date().toISOString();
+        // Update the session (will throw error if stepCount is not sequential)
+        await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+        
+        // Update function counts if they were modified
+        if (countsModified) {
+          await chatbotDb.updateCalledFunctions(sessionId, calledFunctionCounts);
+        }
+      }
 
       const message = updatedSteps.length === 1
         ? `Step ${updatedSteps[0].stepCount} status updated to ${updatedSteps[0].status}`
@@ -6429,7 +6523,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       ).join('\n');
 
       return {
-        success: true,
+        success: updatedSteps.length > 0,
         message: notFoundSteps.length > 0 
           ? `${message}. Steps not found: ${notFoundSteps.join(', ')}`
           : message,

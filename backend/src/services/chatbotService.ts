@@ -134,10 +134,12 @@ export interface ChatSession {
       status: 'pending' | 'completed' | 'skipped';
       completedAt?: string;
       notes?: string;
+      requiredFunctionCalls?: string[]; // Required function names that must be called before marking complete
     }>;
     createdAt: string;
     updatedAt: string;
   };
+  calledFunctions?: Record<string, number>; // Track count of each function call made in this session
 }
 
 // Interface for context chunks
@@ -1047,6 +1049,7 @@ export class ChatbotDB {
         status: 'pending' | 'completed' | 'skipped';
         completedAt?: string;
         notes?: string;
+        requiredFunctionCalls?: string[];
       }>;
       createdAt: string;
       updatedAt: string;
@@ -1088,6 +1091,118 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session work plan:", error);
+      throw error;
+    }
+  }
+
+  async incrementCalledFunctions(
+    sessionId: string,
+    functionCounts: Record<string, number>
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    // Get current session to retrieve existing calledFunctions
+    const session = await this.getChatSession(sessionId);
+    if (!session) {
+      throw new Error(`Session ${sessionId} not found`);
+    }
+
+    // Merge the new counts with existing counts
+    const currentCounts = session.calledFunctions || {};
+    const updatedCounts = { ...currentCounts };
+    
+    for (const [functionName, count] of Object.entries(functionCounts)) {
+      updatedCounts[functionName] = (updatedCounts[functionName] || 0) + count;
+    }
+
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression: "SET calledFunctions = :calledFunctions, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":calledFunctions": updatedCounts,
+        ":updatedAt": timestamp,
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error incrementing called functions:", error);
+      throw error;
+    }
+  }
+
+  async decrementCalledFunctions(
+    sessionId: string,
+    functionCounts: Record<string, number>
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    // Get current session to retrieve existing calledFunctions
+    const session = await this.getChatSession(sessionId);
+    if (!session) {
+      throw new Error(`Session ${sessionId} not found`);
+    }
+
+    // Decrement the counts
+    const currentCounts = session.calledFunctions || {};
+    const updatedCounts = { ...currentCounts };
+    
+    for (const [functionName, count] of Object.entries(functionCounts)) {
+      updatedCounts[functionName] = (updatedCounts[functionName] || 0) - count;
+    }
+
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression: "SET calledFunctions = :calledFunctions, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":calledFunctions": updatedCounts,
+        ":updatedAt": timestamp,
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error decrementing called functions:", error);
+      throw error;
+    }
+  }
+
+  async updateCalledFunctions(
+    sessionId: string,
+    calledFunctions: Record<string, number>
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression: "SET calledFunctions = :calledFunctions, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":calledFunctions": calledFunctions,
+        ":updatedAt": timestamp,
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating called functions:", error);
       throw error;
     }
   }
