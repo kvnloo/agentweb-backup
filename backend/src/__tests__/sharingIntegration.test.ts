@@ -2,6 +2,7 @@ import request from 'supertest';
 import express from 'express';
 import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
+import { agentModeService } from '../services/agentModeService';
 
 // Mock the chatbotDb service
 jest.mock('../services/chatbotService', () => ({
@@ -10,8 +11,19 @@ jest.mock('../services/chatbotService', () => ({
     updateSessionShareMetadata: jest.fn(),
     updateSessionInteractiveShareMetadata: jest.fn(),
     addMessagesToSession: jest.fn(),
+    addMessageToSession: jest.fn(),
+    updateSessionTitle: jest.fn(),
     createOrReuseInteractiveShare: jest.fn(),
   }
+}));
+
+// Mock agentModeService
+jest.mock('../services/agentModeService', () => ({
+  agentModeService: {
+    getMarketingSystemPrompt: jest.fn(),
+    generateSessionTitle: jest.fn(),
+    generateMarketingResponse: jest.fn(),
+  },
 }));
 
 // Mock the User type
@@ -48,6 +60,13 @@ describe('Sharing Integration Tests', () => {
   beforeEach(() => {
     app = createTestApp();
     jest.clearAllMocks();
+    
+    // Setup default mocks
+    (agentModeService.getMarketingSystemPrompt as jest.Mock).mockResolvedValue('System prompt');
+    (agentModeService.generateSessionTitle as jest.Mock).mockResolvedValue('Generated Title');
+    (chatbotDb.addMessageToSession as jest.Mock).mockResolvedValue(undefined);
+    (chatbotDb.addMessagesToSession as jest.Mock).mockResolvedValue(undefined);
+    (chatbotDb.updateSessionTitle as jest.Mock).mockResolvedValue(undefined);
   });
 
   describe('Complete Sharing Workflow', () => {
@@ -127,6 +146,7 @@ describe('Sharing Integration Tests', () => {
       expect(viewOnlyAccessResponse.body.session.shareMetadata.isShared).toBe(true);
       expect(viewOnlyAccessResponse.body.session.interactiveShareMetadata.isActive).toBe(true);
       expect(viewOnlyAccessResponse.body.session.isConversable).toBe(false);
+      // workPlan is included in response (may be undefined/missing if session has no work plan - JSON removes undefined)
 
       // Step 4: Test interactive access
       const interactiveAccessResponse = await request(app)
@@ -138,6 +158,7 @@ describe('Sharing Integration Tests', () => {
       expect(interactiveAccessResponse.body.session.shareMetadata.isShared).toBe(true);
       expect(interactiveAccessResponse.body.session.interactiveShareMetadata.isActive).toBe(true);
       expect(interactiveAccessResponse.body.session.isConversable).toBe(true);
+      // workPlan is included in response (may be undefined/missing if session has no work plan - JSON removes undefined)
 
       // Step 5: Revoke view-only share (should preserve interactive share)
       const sessionWithOnlyInteractive = {
@@ -381,6 +402,172 @@ describe('Sharing Integration Tests', () => {
       expect(response.body.session.interactiveShareMetadata).toHaveProperty('isActive');
       expect(response.body.session.interactiveShareMetadata).toHaveProperty('token');
       expect(response.body.session.interactiveShareMetadata).toHaveProperty('sharedAt');
+    });
+  });
+
+  describe('Work Plan in Shared Links', () => {
+    it('should include workPlan in getSharedConversation response for view-only share', async () => {
+      const sessionId = 'test-session-id';
+      const mockWorkPlan = {
+        title: 'Onboarding Plan',
+        steps: [
+          {
+            stepCount: 1,
+            title: 'Step 1',
+            status: 'completed' as const,
+            completedAt: '2024-01-01T10:00:00Z'
+          },
+          {
+            stepCount: 2,
+            title: 'Step 2',
+            status: 'pending' as const
+          }
+        ],
+        createdAt: '2024-01-01T00:00:00Z',
+        updatedAt: '2024-01-01T10:00:00Z'
+      };
+
+      const mockSession = {
+        sessionId,
+        userId: 'test-user-id',
+        title: 'Test Session',
+        messages: [],
+        createdAt: '2024-01-01T00:00:00Z',
+        updatedAt: '2024-01-01T00:00:00Z',
+        shareMetadata: { isShared: true, sharedAt: '2024-01-01T00:00:00Z' },
+        interactiveShareMetadata: { isActive: false },
+        workPlan: mockWorkPlan
+      };
+
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+
+      const response = await request(app)
+        .get(`/api/agent-mode/share/${sessionId}`)
+        .expect(200);
+
+      expect(response.body.session).toHaveProperty('workPlan');
+      expect(response.body.session.workPlan).toEqual(mockWorkPlan);
+    });
+
+    it('should include workPlan in getSharedConversation response for interactive share', async () => {
+      const sessionId = 'test-session-id';
+      const mockWorkPlan = {
+        title: 'Onboarding Plan',
+        steps: [
+          {
+            stepCount: 1,
+            title: 'Step 1',
+            status: 'completed' as const,
+            completedAt: '2024-01-01T10:00:00Z'
+          }
+        ],
+        createdAt: '2024-01-01T00:00:00Z',
+        updatedAt: '2024-01-01T10:00:00Z'
+      };
+
+      const mockSession = {
+        sessionId,
+        userId: 'test-user-id',
+        title: 'Test Session',
+        messages: [],
+        createdAt: '2024-01-01T00:00:00Z',
+        updatedAt: '2024-01-01T00:00:00Z',
+        shareMetadata: { isShared: false },
+        interactiveShareMetadata: {
+          isActive: true,
+          token: 'test-token',
+          sharedAt: '2024-01-01T00:00:00Z'
+        },
+        workPlan: mockWorkPlan
+      };
+
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+
+      const response = await request(app)
+        .get(`/api/agent-mode/share/${sessionId}?conversable=test-token`)
+        .expect(200);
+
+      expect(response.body.session).toHaveProperty('workPlan');
+      expect(response.body.session.workPlan).toEqual(mockWorkPlan);
+    });
+
+    it('should include workPlan in generateSharedResponse when generating response', async () => {
+      const sessionId = 'test-session-id';
+      const mockWorkPlan = {
+        title: 'Onboarding Plan',
+        steps: [
+          {
+            stepCount: 1,
+            title: 'Step 1',
+            status: 'completed' as const,
+            completedAt: '2024-01-01T10:00:00Z'
+          }
+        ],
+        createdAt: '2024-01-01T00:00:00Z',
+        updatedAt: '2024-01-01T10:00:00Z'
+      };
+
+      const mockSession = {
+        sessionId,
+        userId: 'test-user-id',
+        title: 'Test Session',
+        messages: [
+          { role: 'user', content: 'Previous message' },
+          { role: 'assistant', content: 'Previous response' }
+        ],
+        createdAt: '2024-01-01T00:00:00Z',
+        updatedAt: '2024-01-01T00:00:00Z',
+        shareMetadata: { isShared: false },
+        interactiveShareMetadata: {
+          isActive: true,
+          token: 'test-token',
+          sharedAt: '2024-01-01T00:00:00Z'
+        }
+      };
+
+      const updatedWorkPlan = {
+        ...mockWorkPlan,
+        steps: [
+          {
+            ...mockWorkPlan.steps[0],
+            status: 'completed' as const
+          }
+        ],
+        updatedAt: '2024-01-01T11:00:00Z'
+      };
+
+      // Mock getChatSession to return session at different stages
+      let callCount = 0;
+      (chatbotDb.getChatSession as jest.Mock).mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          return Promise.resolve(mockSession);
+        } else if (callCount === 2) {
+          return Promise.resolve({ ...mockSession, messages: [...mockSession.messages, { role: 'user', content: 'Update step' }] });
+        } else {
+          return Promise.resolve({ ...mockSession, workPlan: updatedWorkPlan });
+        }
+      });
+
+      (agentModeService.generateMarketingResponse as jest.Mock).mockResolvedValue({
+        content: 'Response with work plan',
+        toolCalls: [],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [{ role: 'assistant', content: 'Response with work plan' }],
+        workPlan: updatedWorkPlan
+      });
+
+      const response = await request(app)
+        .post(`/api/agent-mode/share/${sessionId}/generate?conversable=test-token`)
+        .send({
+          userMessage: 'Update step',
+          attachments: []
+        })
+        .expect(200);
+
+      expect(response.body).toHaveProperty('workPlan');
+      expect(response.body.workPlan).toEqual(updatedWorkPlan);
     });
   });
 });
