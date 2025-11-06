@@ -1113,6 +1113,7 @@ export const agentModeController = {
           updatedAt: session.updatedAt,
           shareMetadata: session.shareMetadata,
           interactiveShareMetadata: session.interactiveShareMetadata,
+          workPlan: session.workPlan,
           isConversable: !!conversable
         }
       });
@@ -1161,7 +1162,8 @@ export const agentModeController = {
         content: response.content,
         toolCalls: response.toolCalls,
         knowledgeBaseQueries: response.knowledgeBaseQueries,
-        sources: response.sources
+        sources: response.sources,
+        workPlan: response.workPlan
       });
     } catch (error) {
       console.error('AgentMode: Generate shared response error:', error);
@@ -1733,6 +1735,7 @@ export const agentModeController = {
         messages: filterMessagesForClient(session.messages),
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
+        workPlan: session.workPlan,
         isConversable: true
       });
     } catch (error) {
