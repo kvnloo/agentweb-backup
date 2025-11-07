@@ -3759,15 +3759,36 @@ export default function AdminDashboard() {
 }
 
 // Agent Mode Settings Component
+interface WorkPlanStep {
+  stepCount: number;
+  title: string;
+  description?: string;
+  requiredFunctionCalls?: string[];
+}
+
+interface PredefinedWorkPlan {
+  title: string;
+  steps: WorkPlanStep[];
+}
+
+interface AvailableFunctionCall {
+  name: string;
+  description: string;
+}
+
 const AgentModeSettings = () => {
   const [systemPrompt, setSystemPrompt] = useState('');
   const [welcomeMessage, setWelcomeMessage] = useState('');
   const [, setConversationStarters] = useState<string[]>([]);
   const [conversationStartersText, setConversationStartersText] = useState('');
+  const [predefinedWorkPlans, setPredefinedWorkPlans] = useState<PredefinedWorkPlan[]>([]);
+  const [availableFunctionCalls, setAvailableFunctionCalls] = useState<AvailableFunctionCall[]>([]);
+  const [selectedFunctionCall, setSelectedFunctionCall] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [savingSystemPrompt, setSavingSystemPrompt] = useState(false);
   const [savingWelcomeMessage, setSavingWelcomeMessage] = useState(false);
   const [savingConversationStarters, setSavingConversationStarters] = useState(false);
+  const [savingWorkPlans, setSavingWorkPlans] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const { token } = useAuth();
@@ -3789,11 +3810,38 @@ const AgentModeSettings = () => {
       
       // Load conversation starters
       await loadConversationStarters();
+      
+      // Load available function calls
+      await loadAvailableFunctionCalls();
+      
+      // Load predefined work plans
+      await loadPredefinedWorkPlans();
     } catch (error) {
       console.error('Error loading settings:', error);
       setError('Failed to load settings');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const loadAvailableFunctionCalls = async () => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/agent-mode/function-calls'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      
+      if (response.data && response.data.functionCalls) {
+        // Filter out work plan management functions
+        const workPlanFunctions = ['create_work_plan', 'modify_work_plan', 'set_work_plan_status'];
+        const filtered = response.data.functionCalls.filter(
+          (func: AvailableFunctionCall) => !workPlanFunctions.includes(func.name)
+        );
+        setAvailableFunctionCalls(filtered);
+      }
+    } catch (error) {
+      console.error('Error loading available function calls:', error);
+      // Don't fail the entire load if this fails
+      setAvailableFunctionCalls([]);
     }
   };
 
@@ -3890,6 +3938,110 @@ const AgentModeSettings = () => {
     }
   };
 
+  const getDefaultOnboardingPlan = (): PredefinedWorkPlan => ({
+    title: 'Onboarding',
+    steps: [
+      {
+        stepCount: 1,
+        title: 'Analyze website and business',
+        description: 'Research and analyze the client\'s website and business to understand their industry, target audience, and current marketing presence',
+        requiredFunctionCalls: ['search_web']
+      },
+      {
+        stepCount: 2,
+        title: 'Create/update brand guidelines',
+        description: 'Establish or update brand guidelines including colors, fonts, tone of voice, and visual identity',
+        requiredFunctionCalls: ['update_brand_guidelines']
+      },
+      {
+        stepCount: 3,
+        title: 'Create/update marketing strategy',
+        description: 'Develop a comprehensive marketing strategy based on business analysis and brand guidelines',
+        requiredFunctionCalls: ['update_marketing_strategy']
+      },
+      {
+        stepCount: 4,
+        title: 'Generate 3 blog articles',
+        description: 'Create three high-quality blog articles aligned with the marketing strategy and brand voice',
+        requiredFunctionCalls: ['create_blog_article']
+      },
+      {
+        stepCount: 5,
+        title: 'Generate social media posts',
+        description: 'Create engaging social media content and visuals to support the marketing strategy',
+        requiredFunctionCalls: ['generate_image']
+      }
+    ]
+  });
+
+  const loadPredefinedWorkPlans = async () => {
+    try {
+      try {
+        const response = await axios.get(buildApiUrl('/api/settings/agent-mode-predefined-workplans'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        
+        if (response.data && response.data.settingValue) {
+          const workPlans = JSON.parse(response.data.settingValue);
+          
+          // Check if "Onboarding" work plan already exists
+          const hasOnboarding = workPlans.some((wp: PredefinedWorkPlan) => 
+            wp.title.toLowerCase() === 'onboarding'
+          );
+          
+          // If no Onboarding plan exists, add the default one
+          if (!hasOnboarding) {
+            const defaultOnboardingPlan = getDefaultOnboardingPlan();
+            workPlans.push(defaultOnboardingPlan);
+            
+            // Save the updated work plans with the default Onboarding plan
+            try {
+              await axios.put(buildApiUrl('/api/settings/agent-mode-predefined-workplans'), {
+                settingValue: JSON.stringify(workPlans),
+                description: 'Agent Mode predefined work plans for Emma AI assistant'
+              }, {
+                headers: { Authorization: `Bearer ${token}` }
+              });
+            } catch (saveError) {
+              console.error('Error saving default Onboarding work plan:', saveError);
+              // Continue anyway - we'll still show it in the UI
+            }
+          }
+          
+          setPredefinedWorkPlans(workPlans);
+          return;
+        }
+      } catch (settingsError: any) {
+        // If setting doesn't exist (404), create default Onboarding plan
+        if (settingsError.response?.status === 404) {
+          const defaultOnboardingPlan = getDefaultOnboardingPlan();
+          
+          // Try to save the default Onboarding plan
+          try {
+            await axios.put(buildApiUrl('/api/settings/agent-mode-predefined-workplans'), {
+              settingValue: JSON.stringify([defaultOnboardingPlan]),
+              description: 'Agent Mode predefined work plans for Emma AI assistant'
+            }, {
+              headers: { Authorization: `Bearer ${token}` }
+            });
+          } catch (saveError) {
+            console.error('Error saving default Onboarding work plan:', saveError);
+            // Continue anyway - we'll still show it in the UI
+          }
+          
+          setPredefinedWorkPlans([defaultOnboardingPlan]);
+          return;
+        } else {
+          console.error('Error loading predefined work plans:', settingsError);
+          setPredefinedWorkPlans([]);
+        }
+      }
+    } catch (error) {
+      console.error('Error loading predefined work plans:', error);
+      setPredefinedWorkPlans([]);
+    }
+  };
+
   const saveSystemPrompt = async () => {
     try {
       setSavingSystemPrompt(true);
@@ -3961,6 +4113,85 @@ const AgentModeSettings = () => {
     } finally {
       setSavingConversationStarters(false);
     }
+  };
+
+  const savePredefinedWorkPlans = async () => {
+    try {
+      setSavingWorkPlans(true);
+      setError('');
+      setSuccess('');
+      
+      // Validate work plans
+      const validatedWorkPlans = predefinedWorkPlans.map(workPlan => ({
+        title: workPlan.title.trim(),
+        steps: workPlan.steps
+          .filter(step => step.title.trim().length > 0)
+          .map((step, index) => ({
+            stepCount: index + 1,
+            title: step.title.trim(),
+            description: step.description?.trim() || undefined,
+            requiredFunctionCalls: step.requiredFunctionCalls?.filter(f => f.trim().length > 0) || undefined
+          }))
+      })).filter(workPlan => workPlan.title.length > 0 && workPlan.steps.length > 0);
+      
+      await axios.put(buildApiUrl('/api/settings/agent-mode-predefined-workplans'), {
+        settingValue: JSON.stringify(validatedWorkPlans),
+        description: 'Agent Mode predefined work plans for Emma AI assistant'
+      }, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      
+      setPredefinedWorkPlans(validatedWorkPlans);
+      setSuccess('Predefined work plans updated successfully!');
+    } catch (error) {
+      console.error('Error saving predefined work plans:', error);
+      setError('Failed to save predefined work plans');
+    } finally {
+      setSavingWorkPlans(false);
+    }
+  };
+
+  const addWorkPlan = () => {
+    setPredefinedWorkPlans([
+      ...predefinedWorkPlans,
+      {
+        title: '',
+        steps: [{ stepCount: 1, title: '' }]
+      }
+    ]);
+  };
+
+  const removeWorkPlan = (index: number) => {
+    setPredefinedWorkPlans(predefinedWorkPlans.filter((_, i) => i !== index));
+  };
+
+  const updateWorkPlan = (index: number, workPlan: PredefinedWorkPlan) => {
+    const updated = [...predefinedWorkPlans];
+    updated[index] = workPlan;
+    setPredefinedWorkPlans(updated);
+  };
+
+  const addStepToWorkPlan = (workPlanIndex: number) => {
+    const updated = [...predefinedWorkPlans];
+    updated[workPlanIndex].steps.push({
+      stepCount: updated[workPlanIndex].steps.length + 1,
+      title: ''
+    });
+    setPredefinedWorkPlans(updated);
+  };
+
+  const removeStepFromWorkPlan = (workPlanIndex: number, stepIndex: number) => {
+    const updated = [...predefinedWorkPlans];
+    updated[workPlanIndex].steps = updated[workPlanIndex].steps
+      .filter((_, i) => i !== stepIndex)
+      .map((step, i) => ({ ...step, stepCount: i + 1 }));
+    setPredefinedWorkPlans(updated);
+  };
+
+  const updateStepInWorkPlan = (workPlanIndex: number, stepIndex: number, step: WorkPlanStep) => {
+    const updated = [...predefinedWorkPlans];
+    updated[workPlanIndex].steps[stepIndex] = step;
+    setPredefinedWorkPlans(updated);
   };
 
   const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters') => {
@@ -4154,7 +4385,7 @@ const AgentModeSettings = () => {
       </Card>
 
       {/* Conversation Starters */}
-      <Card>
+      <Card sx={{ mb: 3 }}>
         <CardContent>
           <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
             <Typography variant="h6">
@@ -4191,6 +4422,214 @@ const AgentModeSettings = () => {
           
           <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
             Enter one conversation starter per line. These will appear as quick-start buttons in the Agent Mode interface.
+          </Typography>
+        </CardContent>
+      </Card>
+
+      {/* Predefined Work Plans */}
+      <Card>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">
+              Predefined Work Plans
+            </Typography>
+            <Box>
+              <Button
+                variant="outlined"
+                startIcon={<AddIcon />}
+                onClick={addWorkPlan}
+                disabled={savingWorkPlans}
+                sx={{ mr: 1 }}
+              >
+                Add Work Plan
+              </Button>
+              <Button
+                variant="contained"
+                onClick={savePredefinedWorkPlans}
+                disabled={savingWorkPlans}
+              >
+                {savingWorkPlans ? <CircularProgress size={20} /> : 'Save Changes'}
+              </Button>
+            </Box>
+          </Box>
+          
+          <Typography variant="body2" color="text.secondary" paragraph>
+            Configure predefined work plans that can be used in Agent Mode. Each work plan consists of a title and multiple steps.
+          </Typography>
+
+          {predefinedWorkPlans.length === 0 ? (
+            <Box sx={{ textAlign: 'center', py: 4 }}>
+              <Typography variant="body2" color="text.secondary">
+                No predefined work plans configured. Click "Add Work Plan" to create one.
+              </Typography>
+            </Box>
+          ) : (
+            <Box>
+              {predefinedWorkPlans.map((workPlan, workPlanIndex) => (
+                <Card key={workPlanIndex} sx={{ mb: 2, border: '1px solid', borderColor: 'divider' }}>
+                  <CardContent>
+                    <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+                      <TextField
+                        label="Work Plan Title"
+                        value={workPlan.title}
+                        onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, title: e.target.value })}
+                        placeholder="Enter work plan title..."
+                        variant="outlined"
+                        fullWidth
+                        sx={{ mr: 2 }}
+                      />
+                      <IconButton
+                        color="error"
+                        onClick={() => removeWorkPlan(workPlanIndex)}
+                        disabled={savingWorkPlans}
+                      >
+                        <DeleteIcon />
+                      </IconButton>
+                    </Box>
+
+                    <Typography variant="subtitle2" gutterBottom sx={{ mt: 2, mb: 1 }}>
+                      Steps:
+                    </Typography>
+
+                    {workPlan.steps.map((step, stepIndex) => (
+                      <Box key={stepIndex} sx={{ mb: 2, p: 2, bgcolor: 'background.default', borderRadius: 1 }}>
+                        <Box display="flex" justifyContent="space-between" alignItems="flex-start" mb={1}>
+                          <Typography variant="body2" color="text.secondary" sx={{ minWidth: 60 }}>
+                            Step {step.stepCount}:
+                          </Typography>
+                          <IconButton
+                            size="small"
+                            color="error"
+                            onClick={() => removeStepFromWorkPlan(workPlanIndex, stepIndex)}
+                            disabled={savingWorkPlans}
+                          >
+                            <DeleteIcon fontSize="small" />
+                          </IconButton>
+                        </Box>
+                        <TextField
+                          label="Step Title"
+                          value={step.title}
+                          onChange={(e) => updateStepInWorkPlan(workPlanIndex, stepIndex, { ...step, title: e.target.value })}
+                          placeholder="Enter step title..."
+                          variant="outlined"
+                          fullWidth
+                          size="small"
+                          sx={{ mb: 1 }}
+                        />
+                        <TextField
+                          label="Step Description (Optional)"
+                          value={step.description || ''}
+                          onChange={(e) => updateStepInWorkPlan(workPlanIndex, stepIndex, { ...step, description: e.target.value })}
+                          placeholder="Enter step description..."
+                          variant="outlined"
+                          fullWidth
+                          multiline
+                          rows={2}
+                          size="small"
+                          sx={{ mb: 1 }}
+                        />
+                        <Box>
+                          <Typography variant="body2" fontWeight="medium" gutterBottom>
+                            Required Function Calls (Optional)
+                          </Typography>
+                          
+                          {/* Add Function Call Dropdown */}
+                          <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+                            <FormControl size="small" sx={{ flexGrow: 1 }}>
+                              <InputLabel>Add Function Call</InputLabel>
+                              <Select
+                                value={selectedFunctionCall[`${workPlanIndex}-${stepIndex}`] || ''}
+                                label="Add Function Call"
+                                onChange={(e) => {
+                                  const selectedFunc = e.target.value as string;
+                                  if (selectedFunc) {
+                                    const currentCalls = step.requiredFunctionCalls || [];
+                                    updateStepInWorkPlan(workPlanIndex, stepIndex, {
+                                      ...step,
+                                      requiredFunctionCalls: [...currentCalls, selectedFunc]
+                                    });
+                                    // Reset the select
+                                    setSelectedFunctionCall(prev => ({
+                                      ...prev,
+                                      [`${workPlanIndex}-${stepIndex}`]: ''
+                                    }));
+                                  }
+                                }}
+                                disabled={savingWorkPlans || availableFunctionCalls.length === 0}
+                              >
+                                <MenuItem value="">
+                                  <em>Select a function...</em>
+                                </MenuItem>
+                                {availableFunctionCalls.length === 0 ? (
+                                  <MenuItem disabled>Loading function calls...</MenuItem>
+                                ) : (
+                                  availableFunctionCalls.map((func) => (
+                                    <MenuItem key={func.name} value={func.name}>
+                                      <Box>
+                                        <Typography variant="body2" fontWeight="medium">
+                                          {func.name}
+                                        </Typography>
+                                        <Typography variant="caption" color="text.secondary">
+                                          {func.description}
+                                        </Typography>
+                                      </Box>
+                                    </MenuItem>
+                                  ))
+                                )}
+                              </Select>
+                            </FormControl>
+                          </Box>
+
+                          {/* Display Added Function Calls */}
+                          {step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0 && (
+                            <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mb: 1 }}>
+                              {step.requiredFunctionCalls.map((funcName, callIndex) => (
+                                <Chip
+                                  key={`${workPlanIndex}-${stepIndex}-${callIndex}`}
+                                  label={funcName}
+                                  onDelete={() => {
+                                    const currentCalls = step.requiredFunctionCalls || [];
+                                    const newCalls = currentCalls.filter((_, idx) => idx !== callIndex);
+                                    updateStepInWorkPlan(workPlanIndex, stepIndex, {
+                                      ...step,
+                                      requiredFunctionCalls: newCalls.length > 0 ? newCalls : undefined
+                                    });
+                                  }}
+                                  deleteIcon={<DeleteIcon />}
+                                  disabled={savingWorkPlans}
+                                  color="primary"
+                                  variant="outlined"
+                                />
+                              ))}
+                            </Box>
+                          )}
+
+                          <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
+                            Add functions that must be called before this step can be marked as completed. The same function can be added multiple times.
+                          </Typography>
+                        </Box>
+                      </Box>
+                    ))}
+
+                    <Button
+                      variant="outlined"
+                      startIcon={<AddIcon />}
+                      onClick={() => addStepToWorkPlan(workPlanIndex)}
+                      disabled={savingWorkPlans}
+                      size="small"
+                      sx={{ mt: 1 }}
+                    >
+                      Add Step
+                    </Button>
+                  </CardContent>
+                </Card>
+              ))}
+            </Box>
+          )}
+
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 2, display: 'block' }}>
+            Predefined work plans can be used to quickly set up structured workflows in Agent Mode. 
+            Each step can have a title, optional description, and optional required function calls.
           </Typography>
         </CardContent>
       </Card>
