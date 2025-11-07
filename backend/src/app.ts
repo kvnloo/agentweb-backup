@@ -68,8 +68,25 @@ const corsOptions = {
   credentials: true,
 };
 
-// Middleware
-app.use(cors(corsOptions));
+// CORS middleware with exception for public subscriber join endpoint
+app.use((req, res, next) => {
+  // Check if this is the public subscriber join endpoint
+  if (req.path.match(/^\/api\/tasks\/[^\/]+\/subscribers\/join$/)) {
+    // Allow all origins for this endpoint only
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    
+    // Handle preflight requests
+    if (req.method === 'OPTIONS') {
+      return res.status(200).end();
+    }
+    // Skip the main CORS middleware for this endpoint
+    return next();
+  }
+  // Apply CORS middleware for all other routes
+  cors(corsOptions)(req, res, next);
+});
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(passport.initialize());

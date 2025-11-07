@@ -1,4 +1,5 @@
 import express, { Request, RequestHandler, Response } from 'express';
+import cors from 'cors';
 import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction, getTaskExecution, getExecutionLog, generateShareToken, getExecutionWithToken, sendExecutionEmail, uploadFileToExecution, getPlacidEditorToken, generateFromTemplateToExecution, listPlacidTemplates, createRevisionExecution, updateReport, getTaskExecutionPublic } from '../controllers/tasks';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { taskDb, subscriberDb } from '../services/db';
@@ -171,6 +172,48 @@ router.post('/:taskId/resubscribe', async (req, res) => {
   } catch (error: any) {
     console.error('Error resubscribing:', error);
     res.status(500).json({ message: error.message });
+  }
+});
+
+// Public endpoint for embed code/widget subscriptions (sends welcome email)
+// Use CORS middleware to allow requests from any origin (for embed code)
+router.post('/:taskId/subscribers/join', cors({
+  origin: '*',
+  methods: ['POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type'],
+  credentials: false
+}), async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ message: 'Email is required' });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ message: 'Invalid email format' });
+    }
+
+    // Add subscriber
+    const subscriber = await subscriberDb.addSubscriber(taskId, email);
+    
+    // Send welcome email asynchronously (don't wait for it to complete)
+    // Pass taskId instead of task name so the function can get task and user config
+    emailService.sendSubscriberWelcomeEmail(email, taskId).catch((emailError) => {
+      console.error('Failed to send welcome email (subscription still succeeded):', emailError);
+    });
+
+    res.status(201).json(subscriber);
+  } catch (error: any) {
+    console.error('Error adding subscriber:', error);
+    if (error.message.includes('already subscribed') || error.message.includes('already in the subscriber list')) {
+      res.status(409).json({ message: error.message });
+    } else {
+      res.status(500).json({ message: error.message });
+    }
   }
 });
 
@@ -694,21 +737,42 @@ router.get('/:taskId/subscribers/metrics', authenticateToken, async (req, res) =
   }
 });
 
-// Add subscriber to task
-router.post('/:taskId/subscribers', async (req, res) => {
+// Add subscriber to task (requires authentication - for customer-portal)
+router.post('/:taskId/subscribers', authenticateToken, async (req, res) => {
   try {
     const { taskId } = req.params;
     const { email } = req.body;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
 
     if (!email) {
       return res.status(400).json({ message: 'Email is required' });
+    }
+
+    // Get task to verify ownership
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Verify task belongs to user or user is admin
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
     }
 
     const subscriber = await subscriberDb.addSubscriber(taskId, email);
     res.status(201).json(subscriber);
   } catch (error: any) {
     console.error('Error adding subscriber:', error);
-    if (error.message.includes('already subscribed')) {
+    if (error.message.includes('already subscribed') || error.message.includes('already in the subscriber list')) {
       res.status(409).json({ message: error.message });
     } else {
       res.status(500).json({ message: error.message });
