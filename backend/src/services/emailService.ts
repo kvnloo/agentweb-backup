@@ -218,6 +218,94 @@ The AgentWeb Team
     }
   },
 
+  async sendSubscriberWelcomeEmail(email: string, taskId: string) {
+    try {
+      // Import required services
+      const { taskDb, userDb } = require('../services/db');
+      
+      // Get environment variables
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      
+      // Fetch task data
+      const task = await taskDb.getTaskById(taskId);
+      if (!task) {
+        throw new Error(`Task not found: ${taskId}`);
+      }
+
+      // Fetch user data for account-level email configuration
+      const user = await userDb.getUserById(task.userId);
+      if (!user) {
+        throw new Error(`User not found: ${task.userId}`);
+      }
+
+      const taskName = task.name || 'this task';
+      
+      const welcomeHtml = `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+          <div style="background: #f8f9fa; padding: 30px; border-radius: 8px; margin-bottom: 20px;">
+            <h2 style="color: #1B2549; margin-top: 0;">Thank you for subscribing!</h2>
+            <p style="color: #333; line-height: 1.6;">
+              You've successfully subscribed to updates for <strong>${this.escapeHtml(taskName)}</strong>.
+            </p>
+            <p style="color: #333; line-height: 1.6;">
+              You'll now receive updates and notifications about this topic. We'll keep you informed about important developments.
+            </p>
+          </div>
+          
+          <div class="footer" style="margin-top: 25px; font-size: 0.9em; padding: 20px;">
+            <hr>
+            <p><small>You're receiving this automated email because you're subscribed to the email updates</small></p>
+            <p><small><a href="${customerFrontendUrl}/unsubscribe?taskId=${taskId}&email=${encodeURIComponent(email)}" style="color: #e74c3c;">Unsubscribe from future updates</a></small></p>
+          </div>
+        </div>
+      `;
+
+      const welcomeText = `Thank you for subscribing!
+
+You've successfully subscribed to updates for ${taskName}.
+
+You'll now receive updates and notifications about this topic. We'll keep you informed about important developments.
+
+You're receiving this automated email because you're subscribed to the email updates.
+
+Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${taskId}&email=${encodeURIComponent(email)}`;
+
+      const subject = `Welcome! You've subscribed to ${taskName}`;
+      
+      // Determine email sender configuration with fallback to account-level (same as sendTaskExecutionEmail)
+      let emailSender = task.emailSender;
+      let fromName = task.fromName;
+      
+      // If task doesn't have custom email sender, use account-level configuration
+      if (!emailSender || !fromName) {
+        if (user.emailDomain && user.defaultSenderUsername && user.fromName) {
+          emailSender = `${user.defaultSenderUsername}@${user.emailDomain}`;
+          fromName = user.fromName;
+        }
+      }
+      
+      if (emailSender && fromName) {
+        // Use Resend service for custom email sender (task-level or account-level)
+        const from = `${fromName} <${emailSender}>`;
+        const resendResult = await resendService.sendEmail({
+          from,
+          to: email,
+          subject,
+          html: welcomeHtml,
+          text: welcomeText
+        });
+        console.log(`Subscriber welcome email sent via Resend to: ${email} from: ${from}`, resendResult?.id ? `(ID: ${resendResult.id})` : '');
+      } else {
+        // Use default SMTP service
+        await this.sendEmail(email, subject, welcomeText, welcomeHtml);
+        console.log(`Subscriber welcome email sent via SMTP to: ${email}`);
+      }
+    } catch (error) {
+      console.error("Error sending subscriber welcome email:", error);
+      // Don't throw - just log the error so subscription still succeeds
+    }
+  },
+
   async sendTaskOwnershipChangeEmail(
     recipientEmail: string,
     taskName: string,

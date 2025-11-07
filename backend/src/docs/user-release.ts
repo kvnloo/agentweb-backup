@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-11-07',
+    changes: [
+      'Added Embeddable Subscriber Form Feature',
+      '- Generate JavaScript embed code to add subscription forms to external websites',
+      '- Copy the embed code from the Subscribers page and paste it into any website to grow your audience',
+    ],
+  },
+  {
     date: '2025-11-06',
     changes: [
       'Added Plan and Execute Feature for Agent Mode',
