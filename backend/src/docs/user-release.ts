@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-11-09',
+    changes: [
+      'Added Concurrency Limiting for Scheduled Chats in Agent Mode',
+      '- Scheduled chats now respect a maximum concurrent run limit (default: 5) to prevent system overload',
+      '- Schedules that exceed the limit are automatically delayed by 30 minutes and will retry on the next cycle',
+    ],
+  },
+  {
     date: '2025-11-07',
     changes: [
       'Added Embeddable Subscriber Form Feature',

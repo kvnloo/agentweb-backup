@@ -1630,13 +1630,45 @@ export const agentModeController = {
               });
             }
 
+            // Get max concurrent runs from environment (default 5)
+            const maxConcurrentRuns = process.env.MAX_CONCURRENT_RUNS ? parseInt(process.env.MAX_CONCURRENT_RUNS) : 5;
+            
+            // Track concurrent runs
+            let currentConcurrentRuns = 0;
             const results = [];
 
         for (const schedule of scheduledChats) {
           try {
+            const now = new Date();
+            
+            // Check if we've reached the concurrent run limit
+            if (currentConcurrentRuns >= maxConcurrentRuns) {
+              // Delay the run for half an hour
+              const delayedRunTime = new Date(now);
+              delayedRunTime.setMinutes(delayedRunTime.getMinutes() + 30);
+              
+              // Update the schedule with delayed run time
+              await scheduleDb.updateScheduleAfterRun(
+                schedule.scheduleId,
+                schedule.lastRunTime || now.toISOString(),
+                delayedRunTime.toISOString()
+              );
+
+              console.log(`Delayed scheduled chat ${schedule.scheduleName} for 30 minutes due to concurrent run limit (${maxConcurrentRuns})`);
+              
+              results.push({
+                scheduleId: schedule.scheduleId,
+                scheduleName: schedule.scheduleName,
+                status: 'delayed',
+                nextRunTime: delayedRunTime.toISOString(),
+                reason: `Delayed due to concurrent run limit (${maxConcurrentRuns})`
+              });
+              
+              continue;
+            }
+            
             // Update the schedule with next run time FIRST (synchronously)
             // This prevents agent-engine from repeatedly calling the same schedule
-            const now = new Date();
             const nextRunTime = calculateNextRunTime(schedule.frequency, now);
             
             await scheduleDb.updateScheduleAfterRun(
@@ -1645,8 +1677,14 @@ export const agentModeController = {
               nextRunTime.toISOString()
             );
             
+            // Increment concurrent run counter
+            currentConcurrentRuns++;
+            
              // Start the scheduled chat run asynchronously (don't await)
              runScheduledChat(schedule, schedule.userId, false).then(async (result) => {
+               // Decrement concurrent run counter when done
+               currentConcurrentRuns--;
+               
                // Send email notification with the result
                try {
                  // Only send emails if email notifications are specified
@@ -1682,6 +1720,9 @@ export const agentModeController = {
                  // Don't throw error - email failure shouldn't break the scheduled chat execution
                }
              }).catch((error) => {
+               // Decrement concurrent run counter on error
+               currentConcurrentRuns--;
+               
                console.error(`Error running scheduled chat ${schedule.scheduleName}:`, error);
                // Log the full error details for debugging
                console.error('Full error details:', {
