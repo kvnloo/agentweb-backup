@@ -620,7 +620,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       await agentModeController.runScheduledChats(mockReq, mockRes);
 
-      const response = mockRes.json.mock.calls[0][0];
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
       const startedCount = response.results.filter((r: any) => r.status === 'started').length;
       const delayedCount = response.results.filter((r: any) => r.status === 'delayed').length;
 
@@ -648,7 +648,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       await agentModeController.runScheduledChats(mockReq, mockRes);
 
-      const response = mockRes.json.mock.calls[0][0];
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
       const startedCount = response.results.filter((r: any) => r.status === 'started').length;
       const delayedCount = response.results.filter((r: any) => r.status === 'delayed').length;
 
@@ -680,7 +680,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       const afterTime = new Date();
 
       // Check that delayed schedules have nextRunTime set to ~30 minutes from now
-      const response = mockRes.json.mock.calls[0][0];
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
       const delayedResults = response.results.filter((r: any) => r.status === 'delayed');
       
       expect(delayedResults.length).toBe(2);
@@ -725,7 +725,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       await agentModeController.runScheduledChats(mockReq, mockRes);
 
-      const response = mockRes.json.mock.calls[0][0];
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
       const startedCount = response.results.filter((r: any) => r.status === 'started').length;
       const delayedCount = response.results.filter((r: any) => r.status === 'delayed').length;
 
@@ -753,7 +753,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       await agentModeController.runScheduledChats(mockReq, mockRes);
 
-      const response = mockRes.json.mock.calls[0][0];
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
       const startedCount = response.results.filter((r: any) => r.status === 'started').length;
       const delayedCount = response.results.filter((r: any) => r.status === 'delayed').length;
 
