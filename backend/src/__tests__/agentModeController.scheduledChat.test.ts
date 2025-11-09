@@ -38,16 +38,25 @@ jest.mock('uuid', () => ({
   v4: jest.fn(() => 'mock-run-id-123'),
 }));
 
+jest.mock('../services/emailService', () => ({
+  emailService: {
+    sendScheduledChatResultEmail: jest.fn(),
+    sendDailyDigestEmail: jest.fn(),
+  },
+}));
+
 // Import mocked services
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { scheduleDb, taskDb } from '../services/db';
+import { emailService } from '../services/emailService';
 import { agentModeController } from '../controllers/agentModeController';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
 const mockScheduleDb = scheduleDb as jest.Mocked<typeof scheduleDb>;
 const mockTaskDb = taskDb as jest.Mocked<typeof taskDb>;
+const mockEmailService = emailService as jest.Mocked<typeof emailService>;
 
 describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
   const mockUserId = 'test-user-123';
@@ -522,10 +531,32 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
   });
 
   describe('runScheduledChats endpoint', () => {
+    const originalEnv = process.env;
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+      // Reset environment variables
+      process.env = { ...originalEnv };
+      // Setup default mocks needed for runScheduledChat
+      mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
+      mockAgentModeService.generateSessionTitle.mockResolvedValue('Generated Title');
+      mockAgentModeService.generateMarketingResponse.mockResolvedValue(mockResponse);
+      mockChatbotDb.createChatSession.mockResolvedValue(mockSession);
+      mockChatbotDb.getChatSession.mockResolvedValue(mockSession);
+      mockScheduleDb.addRunResult.mockResolvedValue(undefined);
+      mockScheduleDb.updateScheduleAfterRun.mockResolvedValue(undefined);
+      mockEmailService.sendScheduledChatResultEmail.mockResolvedValue(undefined);
+      mockEmailService.sendDailyDigestEmail.mockResolvedValue(undefined);
+    });
+
+    afterEach(() => {
+      process.env = originalEnv;
+    });
+
     it('should process multiple scheduled chats with 6 iterations each', async () => {
       const schedules = [
-        { ...baseSchedule, scheduleId: 'schedule-1' },
-        { ...baseSchedule, scheduleId: 'schedule-2', scheduleName: 'Test Schedule 2' },
+        { ...baseSchedule, scheduleId: 'schedule-1', frequency: 'daily' },
+        { ...baseSchedule, scheduleId: 'schedule-2', scheduleName: 'Test Schedule 2', frequency: 'daily' },
       ];
 
       // Mock getSchedulesReadyToRun to return multiple schedules
@@ -544,8 +575,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
           message: 'Processed 2 scheduled chats',
           processed: 2,
           results: expect.arrayContaining([
-            expect.objectContaining({ scheduleId: 'schedule-1' }),
-            expect.objectContaining({ scheduleId: 'schedule-2' }),
+            expect.objectContaining({ scheduleId: 'schedule-1', status: 'started' }),
+            expect.objectContaining({ scheduleId: 'schedule-2', status: 'started' }),
           ]),
         })
       );
@@ -567,6 +598,167 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         processed: 0,
         results: [],
       });
+    });
+
+    it('should default to max 5 concurrent runs when MAX_CONCURRENT_RUNS is not set', async () => {
+      delete process.env.MAX_CONCURRENT_RUNS;
+      
+      const schedules = Array.from({ length: 7 }, (_, i) => ({
+        ...baseSchedule,
+        scheduleId: `schedule-${i + 1}`,
+        scheduleName: `Test Schedule ${i + 1}`,
+        frequency: 'daily',
+      }));
+
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue(schedules);
+
+      const mockReq = {} as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.runScheduledChats(mockReq, mockRes);
+
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      const startedCount = response.results.filter((r: any) => r.status === 'started').length;
+      const delayedCount = response.results.filter((r: any) => r.status === 'delayed').length;
+
+      expect(startedCount).toBe(5);
+      expect(delayedCount).toBe(2);
+    });
+
+    it('should use custom MAX_CONCURRENT_RUNS from environment variable', async () => {
+      process.env.MAX_CONCURRENT_RUNS = '3';
+      
+      const schedules = Array.from({ length: 5 }, (_, i) => ({
+        ...baseSchedule,
+        scheduleId: `schedule-${i + 1}`,
+        scheduleName: `Test Schedule ${i + 1}`,
+        frequency: 'daily',
+      }));
+
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue(schedules);
+
+      const mockReq = {} as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.runScheduledChats(mockReq, mockRes);
+
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      const startedCount = response.results.filter((r: any) => r.status === 'started').length;
+      const delayedCount = response.results.filter((r: any) => r.status === 'delayed').length;
+
+      expect(startedCount).toBe(3);
+      expect(delayedCount).toBe(2);
+    });
+
+    it('should delay schedules by 30 minutes when limit is reached', async () => {
+      process.env.MAX_CONCURRENT_RUNS = '2';
+      
+      const schedules = Array.from({ length: 4 }, (_, i) => ({
+        ...baseSchedule,
+        scheduleId: `schedule-${i + 1}`,
+        scheduleName: `Test Schedule ${i + 1}`,
+        frequency: 'daily',
+        lastRunTime: undefined,
+      }));
+
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue(schedules);
+
+      const mockReq = {} as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      const beforeTime = new Date();
+      await agentModeController.runScheduledChats(mockReq, mockRes);
+      const afterTime = new Date();
+
+      // Check that delayed schedules have nextRunTime set to ~30 minutes from now
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      const delayedResults = response.results.filter((r: any) => r.status === 'delayed');
+      
+      expect(delayedResults.length).toBe(2);
+      
+      delayedResults.forEach((result: any) => {
+        const delayedTime = new Date(result.nextRunTime);
+        const expectedMinTime = new Date(beforeTime.getTime() + 29 * 60 * 1000); // 29 minutes
+        const expectedMaxTime = new Date(afterTime.getTime() + 31 * 60 * 1000); // 31 minutes
+        
+        expect(delayedTime.getTime()).toBeGreaterThanOrEqual(expectedMinTime.getTime());
+        expect(delayedTime.getTime()).toBeLessThanOrEqual(expectedMaxTime.getTime());
+        expect(result.reason).toContain('Delayed due to concurrent run limit (2)');
+      });
+
+      // Verify updateScheduleAfterRun was called with delayed time
+      const delayedUpdateCalls = mockScheduleDb.updateScheduleAfterRun.mock.calls.filter((call: any) => {
+        const nextRunTime = new Date(call[2]);
+        const now = new Date();
+        const diffMinutes = (nextRunTime.getTime() - now.getTime()) / (1000 * 60);
+        return diffMinutes >= 29 && diffMinutes <= 31;
+      });
+      expect(delayedUpdateCalls.length).toBe(2);
+    });
+
+    it('should handle MAX_CONCURRENT_RUNS=0 correctly', async () => {
+      process.env.MAX_CONCURRENT_RUNS = '0';
+      
+      const schedules = Array.from({ length: 3 }, (_, i) => ({
+        ...baseSchedule,
+        scheduleId: `schedule-${i + 1}`,
+        scheduleName: `Test Schedule ${i + 1}`,
+        frequency: 'daily',
+      }));
+
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue(schedules);
+
+      const mockReq = {} as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.runScheduledChats(mockReq, mockRes);
+
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      const startedCount = response.results.filter((r: any) => r.status === 'started').length;
+      const delayedCount = response.results.filter((r: any) => r.status === 'delayed').length;
+
+      expect(startedCount).toBe(0);
+      expect(delayedCount).toBe(3);
+    });
+
+    it('should run all schedules when under the limit', async () => {
+      process.env.MAX_CONCURRENT_RUNS = '10';
+      
+      const schedules = Array.from({ length: 3 }, (_, i) => ({
+        ...baseSchedule,
+        scheduleId: `schedule-${i + 1}`,
+        scheduleName: `Test Schedule ${i + 1}`,
+        frequency: 'daily',
+      }));
+
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue(schedules);
+
+      const mockReq = {} as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.runScheduledChats(mockReq, mockRes);
+
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      const startedCount = response.results.filter((r: any) => r.status === 'started').length;
+      const delayedCount = response.results.filter((r: any) => r.status === 'delayed').length;
+
+      expect(startedCount).toBe(3);
+      expect(delayedCount).toBe(0);
     });
   });
 
