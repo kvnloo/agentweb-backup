@@ -138,6 +138,7 @@ export interface ChatSession {
     }>;
     createdAt: string;
     updatedAt: string;
+    welcomeMessage?: string; // Custom welcome message for this work plan
   };
   calledFunctions?: Record<string, number>; // Track count of each function call made in this session
 }
@@ -1053,6 +1054,7 @@ export class ChatbotDB {
       }>;
       createdAt: string;
       updatedAt: string;
+      welcomeMessage?: string;
     }
   ): Promise<ChatSession> {
     const timestamp = new Date().toISOString();

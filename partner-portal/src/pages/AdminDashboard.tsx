@@ -3769,6 +3769,7 @@ interface WorkPlanStep {
 interface PredefinedWorkPlan {
   title: string;
   steps: WorkPlanStep[];
+  welcomeMessage?: string;
 }
 
 interface AvailableFunctionCall {
@@ -3940,6 +3941,7 @@ const AgentModeSettings = () => {
 
   const getDefaultOnboardingPlan = (): PredefinedWorkPlan => ({
     title: 'Onboarding',
+    welcomeMessage: 'Welcome to the onboarding process! I\'m here to help you get set up. Let\'s get started!',
     steps: [
       {
         stepCount: 1,
@@ -4124,6 +4126,7 @@ const AgentModeSettings = () => {
       // Validate work plans
       const validatedWorkPlans = predefinedWorkPlans.map(workPlan => ({
         title: workPlan.title.trim(),
+        welcomeMessage: workPlan.welcomeMessage?.trim() || undefined,
         steps: workPlan.steps
           .filter(step => step.title.trim().length > 0)
           .map((step, index) => ({
@@ -4486,6 +4489,19 @@ const AgentModeSettings = () => {
                         <DeleteIcon />
                       </IconButton>
                     </Box>
+
+                    <TextField
+                      label="Welcome Message (Optional)"
+                      value={workPlan.welcomeMessage || ''}
+                      onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, welcomeMessage: e.target.value })}
+                      placeholder="Enter the welcome message to display when a session is created with this plan... (supports HTML formatting)"
+                      variant="outlined"
+                      fullWidth
+                      multiline
+                      rows={4}
+                      sx={{ mb: 2 }}
+                      helperText="This message will be displayed as the welcome message when a session is created with this plan. If not provided, the default Agent Mode welcome message will be used."
+                    />
 
                     <Typography variant="subtitle2" gutterBottom sx={{ mt: 2, mb: 1 }}>
                       Steps:

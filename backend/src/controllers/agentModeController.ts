@@ -7,6 +7,8 @@ import multer from 'multer';
 import crypto from 'crypto';
 import { uploadFileToS3 } from '../utils/s3Utils';
 import { emailService } from '../services/emailService';
+import { settingsService } from '../services/settingsService';
+import { v4 as uuidv4 } from 'uuid';
 // Common function: ensure a campaign execution exists and contains all HTML report URLs
 async function syncEmailCampaignExecution(
   userId: string,
@@ -1820,6 +1822,129 @@ export const agentModeController = {
       }
       
       res.status(500).json({ error: 'Failed to generate response' });
+    }
+  },
+
+  // Get predefined work plan by title (public)
+  async getPredefinedWorkPlan(req: Request, res: Response) {
+    try {
+      const { planTitle } = req.params;
+      
+      if (!planTitle) {
+        return res.status(400).json({ error: 'Plan title is required' });
+      }
+
+      // Load predefined work plans from settings
+      const setting = await settingsService.getSetting('agent-mode-predefined-workplans');
+      
+      if (!setting || !setting.settingValue) {
+        return res.status(404).json({ error: 'No predefined work plans found' });
+      }
+
+      const workPlans = JSON.parse(setting.settingValue);
+      
+      // Find work plan with matching title (case-insensitive)
+      const workPlan = workPlans.find((wp: any) => 
+        wp.title && wp.title.toLowerCase() === planTitle.toLowerCase()
+      );
+
+      if (!workPlan) {
+        return res.status(404).json({ error: `Work plan "${planTitle}" not found` });
+      }
+
+      res.json(workPlan);
+    } catch (error) {
+      console.error('AgentMode: Get predefined work plan error:', error);
+      res.status(500).json({ error: 'Failed to get predefined work plan' });
+    }
+  },
+
+  // Create session with predefined work plan (public)
+  async createSessionWithPlan(req: Request, res: Response) {
+    try {
+      const { planTitle } = req.params;
+      
+      if (!planTitle) {
+        return res.status(400).json({ error: 'Plan title is required' });
+      }
+
+      // Get predefined work plan
+      const setting = await settingsService.getSetting('agent-mode-predefined-workplans');
+      
+      if (!setting || !setting.settingValue) {
+        return res.status(404).json({ error: 'No predefined work plans found' });
+      }
+
+      const workPlans = JSON.parse(setting.settingValue);
+      
+      // Find work plan with matching title (case-insensitive)
+      const predefinedPlan = workPlans.find((wp: any) => 
+        wp.title && wp.title.toLowerCase() === planTitle.toLowerCase()
+      );
+
+      if (!predefinedPlan) {
+        return res.status(404).json({ error: `Work plan "${planTitle}" not found` });
+      }
+
+      // Generate anonymous userId
+      const anonymousUserId = `anon_${uuidv4()}`;
+
+      // Create session with anonymous userId
+      const session = await chatbotDb.createChatSession(
+        anonymousUserId,
+        undefined, // pageContent
+        'agent', // portalType
+        `plan-${planTitle}`, // pageIdentifier
+        undefined, // selectedStartupId
+        undefined, // workflowId
+        undefined, // executionId
+        undefined  // emailCampaignTaskId
+      );
+
+      // Convert predefined plan to session work plan format
+      const workPlan = {
+        title: predefinedPlan.title,
+        steps: predefinedPlan.steps.map((step: any) => ({
+          stepCount: step.stepCount,
+          title: step.title,
+          description: step.description,
+          status: 'pending' as const,
+          completedAt: undefined,
+          notes: undefined,
+          requiredFunctionCalls: step.requiredFunctionCalls
+        })),
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+
+      // Create work plan in session (include welcome message if defined)
+      const workPlanWithWelcome = {
+        ...workPlan,
+        welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined
+      };
+      await chatbotDb.updateSessionWorkPlan(session.sessionId, workPlanWithWelcome);
+
+      // Enable interactive sharing for the session
+      const conversableToken = crypto.randomBytes(32).toString('hex');
+      const interactiveShareMetadata = {
+        isActive: true,
+        token: conversableToken,
+        sharedAt: new Date().toISOString()
+      };
+      await chatbotDb.updateSessionInteractiveShareMetadata(session.sessionId, interactiveShareMetadata);
+
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      const redirectUrl = `${customerFrontendUrl}/plan/${encodeURIComponent(planTitle)}/${session.sessionId}?conversable=${conversableToken}`;
+
+      res.json({
+        sessionId: session.sessionId,
+        redirectUrl,
+        workPlan: workPlanWithWelcome,
+        conversableToken
+      });
+    } catch (error) {
+      console.error('AgentMode: Create session with plan error:', error);
+      res.status(500).json({ error: 'Failed to create session with plan' });
     }
   }
 };
