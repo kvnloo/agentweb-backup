@@ -30,12 +30,18 @@ export interface UserPayload {
   };
 }
 
-export async function authenticateToken(req: Request, res: Response, next: NextFunction) {
+// Common function to extract user from request token (returns null if no token or invalid)
+// Also returns the decoded payload for delegate info if needed
+export async function getUserFromToken(req: Request): Promise<{ 
+  user: { userId: string; email: string; isAdmin: boolean; roles?: ('partner' | 'customer' | 'free')[] } | null;
+  decoded?: UserPayload;
+  adminUser?: { userId: string; email: string };
+}> {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
   if (!token) {
-    return res.status(401).json({ message: 'No token provided' });
+    return { user: null };
   }
 
   try {
@@ -50,51 +56,73 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
       const adminUser = await userDb.getUserById(decoded.delegateAccess.adminUserId);
       const targetUser = await userDb.getUserById(decoded.delegateAccess.targetUserId);
       
-      if (!adminUser || !targetUser) {
-        return res.status(404).json({ message: 'User not found in delegation' });
-      }
-      
-      if (!adminUser.isAdmin) {
-        return res.status(403).json({ message: 'Delegation only allowed for admin users' });
+      if (!adminUser || !targetUser || !adminUser.isAdmin) {
+        return { user: null };
       }
 
-      // Set user properties to target user but preserve admin context
-      const authReq = req as AuthenticatedRequest;
-      authReq.user = {
-        userId: targetUser.userId,
-        email: targetUser.email,
-        isAdmin: false, // Target user permissions, not admin permissions
-        roles: (targetUser.roles && targetUser.roles.length > 0 ? targetUser.roles : ['customer']) as ('partner' | 'customer' | 'free')[]
-      };
-      
-      // Add delegation info for logging/audit purposes
-      authReq.delegateInfo = {
-        adminUserId: adminUser.userId,
-        adminEmail: adminUser.email,
-        isDelegated: true
+      return {
+        user: {
+          userId: targetUser.userId,
+          email: targetUser.email,
+          isAdmin: false, // Target user permissions, not admin permissions
+          roles: (targetUser.roles && targetUser.roles.length > 0 ? targetUser.roles : ['customer']) as ('partner' | 'customer' | 'free')[]
+        },
+        decoded,
+        adminUser: {
+          userId: adminUser.userId,
+          email: adminUser.email
+        }
       };
     } else {
       // Normal token - get the user data
       const user = await userDb.getUserById(decoded.userId);
       
       if (!user) {
-        return res.status(404).json({ message: 'User not found' });
+        return { user: null };
       }
 
-      // Assign user properties to the request object
-      const authReq = req as AuthenticatedRequest;
-      authReq.user = {
-        userId: user.userId,
-        email: user.email,
-        isAdmin: user.isAdmin || false,
-        roles: (user.roles && user.roles.length > 0 ? user.roles : ['partner']) as ('partner' | 'customer' | 'free')[] // Use roles array, default if empty
+      return {
+        user: {
+          userId: user.userId,
+          email: user.email,
+          isAdmin: user.isAdmin || false,
+          roles: (user.roles && user.roles.length > 0 ? user.roles : ['partner']) as ('partner' | 'customer' | 'free')[]
+        },
+        decoded
       };
     }
-
-    next();
   } catch (error) {
+    return { user: null };
+  }
+}
+
+export async function authenticateToken(req: Request, res: Response, next: NextFunction) {
+  const result = await getUserFromToken(req);
+
+  if (!result.user) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    
+    if (!token) {
+      return res.status(401).json({ message: 'No token provided' });
+    }
     return res.status(401).json({ message: 'Invalid token' });
   }
+
+  // Set user properties to the request object
+  const authReq = req as AuthenticatedRequest;
+  authReq.user = result.user;
+
+  // Handle delegate info if needed (for backward compatibility)
+  if (result.decoded?.delegateAccess && result.adminUser) {
+    authReq.delegateInfo = {
+      adminUserId: result.adminUser.userId,
+      adminEmail: result.adminUser.email,
+      isDelegated: true
+    };
+  }
+
+  next();
 }
 
 export function requireAdmin(req: Request, res: Response, next: NextFunction) {

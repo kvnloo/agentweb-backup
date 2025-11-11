@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import { AuthenticatedRequest, getUserFromToken } from '../middleware/auth';
 import { agentModeService, AgentModeService } from '../services/agentModeService';
 import { chatbotDb, updateTaskExecutionStatus } from '../services/chatbotService';
 import { scheduleDb, userDb, taskDb } from '../services/db';
@@ -1886,12 +1887,14 @@ export const agentModeController = {
         return res.status(404).json({ error: `Work plan "${planTitle}" not found` });
       }
 
-      // Generate anonymous userId
-      const anonymousUserId = `anon_${uuidv4()}`;
+      // Check if user is authenticated (optional - route is public)
+      // Use the common function to extract user from token
+      const result = await getUserFromToken(req);
+      const userId = result.user ? result.user.userId : `anon_${uuidv4()}`;
 
-      // Create session with anonymous userId
+      // Create session with userId (authenticated or anonymous)
       const session = await chatbotDb.createChatSession(
-        anonymousUserId,
+        userId,
         undefined, // pageContent
         'agent', // portalType
         `plan-${planTitle}`, // pageIdentifier
