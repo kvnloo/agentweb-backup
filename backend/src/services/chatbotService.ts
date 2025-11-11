@@ -1012,6 +1012,41 @@ export class ChatbotDB {
     }
   }
 
+  async updateSessionUserId(
+    sessionId: string,
+    newUserId: string
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    // First, get the session to verify it exists
+    const session = await this.getChatSession(sessionId);
+    if (!session) {
+      throw new Error('Session not found');
+    }
+
+    // Update the userId
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression: "SET userId = :userId, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":userId": newUserId,
+        ":updatedAt": timestamp,
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating session userId:", error);
+      throw error;
+    }
+  }
+
   async updateSessionInteractiveShareMetadata(
     sessionId: string,
     interactiveShareMetadata: { isActive: boolean; token?: string; sharedAt?: string }

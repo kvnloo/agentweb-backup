@@ -554,6 +554,9 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     });
 
     it('should process multiple scheduled chats with 6 iterations each', async () => {
+      // Set concurrent run limit to 2 to allow both schedules to run
+      process.env.MAX_CONCURRENT_RUNS = '2';
+      
       const schedules = [
         { ...baseSchedule, scheduleId: 'schedule-1', frequency: 'daily' },
         { ...baseSchedule, scheduleId: 'schedule-2', scheduleName: 'Test Schedule 2', frequency: 'daily' },

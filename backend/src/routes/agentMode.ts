@@ -57,6 +57,10 @@ router.post('/run-scheduled-chats', asyncHandler(agentModeController.runSchedule
 // All other routes require authentication
 router.use(authenticateToken);
 
+// PUT /api/agent-mode/session/:sessionId/transfer
+// Transfer anonymous session to authenticated user (requires authentication)
+router.put('/session/:sessionId/transfer', asyncHandler(agentModeController.transferSession));
+
 // Agent Mode Chat Routes
 
 // GET /api/agent-mode/sessions

@@ -313,7 +313,8 @@ describe('AgentModeController - createSessionWithPlan', () => {
           title: 'Onboarding',
           welcomeMessage: 'Welcome to onboarding!'
         }),
-        conversableToken: 'mock-conversable-token-123'
+        conversableToken: 'mock-conversable-token-123',
+        userId: 'test-user-123'
       });
     });
 

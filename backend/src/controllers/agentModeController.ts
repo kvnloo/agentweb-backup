@@ -1985,11 +1985,43 @@ export const agentModeController = {
         sessionId: session.sessionId,
         redirectUrl,
         workPlan: workPlanWithWelcome,
-        conversableToken
+        conversableToken,
+        userId: session.userId
       });
     } catch (error) {
       console.error('AgentMode: Create session with plan error:', error);
       res.status(500).json({ error: 'Failed to create session with plan' });
     }
-  }
+  },
+
+  // Transfer session from anonymous user to authenticated user
+  async transferSession(req: AuthenticatedRequest, res: Response) {
+    try {
+      const { sessionId } = req.params;
+      const user = req.user as User;
+
+      // Get the session to verify it exists and check if it's anonymous
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Check if the session belongs to an anonymous user
+      if (!session.userId.startsWith('anon_')) {
+        return res.status(400).json({ error: 'Session is not anonymous' });
+      }
+
+      // Update the session userId to the authenticated user's ID
+      await chatbotDb.updateSessionUserId(sessionId, user.userId);
+
+      res.json({ 
+        message: 'Session transferred successfully',
+        sessionId,
+        userId: user.userId
+      });
+    } catch (error) {
+      console.error('AgentMode: Transfer session error:', error);
+      res.status(500).json({ error: 'Failed to transfer session' });
+    }
+  },
 };
