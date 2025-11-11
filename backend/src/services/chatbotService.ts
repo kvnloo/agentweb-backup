@@ -139,6 +139,7 @@ export interface ChatSession {
     createdAt: string;
     updatedAt: string;
     welcomeMessage?: string; // Custom welcome message for this work plan
+    autocomplete?: boolean; // When true, Emma MUST complete each step before responding to the user
   };
   calledFunctions?: Record<string, number>; // Track count of each function call made in this session
 }
@@ -1055,6 +1056,7 @@ export class ChatbotDB {
       createdAt: string;
       updatedAt: string;
       welcomeMessage?: string;
+      autocomplete?: boolean;
     }
   ): Promise<ChatSession> {
     const timestamp = new Date().toISOString();

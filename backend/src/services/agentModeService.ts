@@ -516,6 +516,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
       workPlanContent += `[Current Active Work Plan: "${workPlan.title}"]\n\n`;
       workPlanContent += `You MUST continue working with this existing plan. DO NOT create a new work plan. Use modify_work_plan if you need to add or change steps.\n\n`;
       
+      // If autocomplete is enabled, add instruction to auto-complete steps
+      if (workPlan.autocomplete) {
+        workPlanContent += `⚠️ AUTOCOMPLETE MODE: After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.\n\n`;
+      }
+      
       workPlan.steps.forEach((step: any) => {
         const icon = statusIcons[step.status as keyof typeof statusIcons];
         workPlanContent += `${step.stepCount}. ${icon} ${step.title} (${step.status})\n`;

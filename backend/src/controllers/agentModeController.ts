@@ -1920,10 +1920,11 @@ export const agentModeController = {
         updatedAt: new Date().toISOString()
       };
 
-      // Create work plan in session (include welcome message if defined)
+      // Create work plan in session (include welcome message and autocomplete if defined)
       const workPlanWithWelcome = {
         ...workPlan,
-        welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined
+        welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
+        autocomplete: predefinedPlan.autocomplete || false
       };
       await chatbotDb.updateSessionWorkPlan(session.sessionId, workPlanWithWelcome);
 

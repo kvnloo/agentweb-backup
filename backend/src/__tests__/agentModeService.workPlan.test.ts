@@ -778,6 +778,87 @@ describe('AgentModeService - Work Plan', () => {
       expect(workPlanMessage.content).toContain('DO NOT create a new work plan');
       expect(workPlanMessage.content).toContain('Use modify_work_plan if you need to add or change steps');
     });
+
+    it('should include autocomplete instruction when autocomplete is enabled', () => {
+      const workPlan = {
+        title: 'Auto Onboarding',
+        steps: [
+          { stepCount: 1, title: 'Step 1', status: 'pending' as const },
+          { stepCount: 2, title: 'Step 2', status: 'pending' as const },
+        ],
+        createdAt: '2025-01-15T09:00:00.000Z',
+        updatedAt: '2025-01-15T10:00:00.000Z',
+        autocomplete: true,
+      };
+
+      const result = (agentModeService as any).buildMarketingContext(
+        'Continue',
+        [],
+        [],
+        workPlan
+      );
+
+      const workPlanMessage = result.find(
+        (msg: any) => msg.role === 'assistant' && (msg.content.includes('Current Active Work Plan') || msg.content.includes('WORK PLAN ALREADY EXISTS'))
+      );
+
+      expect(workPlanMessage).toBeDefined();
+      expect(workPlanMessage.content).toContain('⚠️ AUTOCOMPLETE MODE: After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.');
+    });
+
+    it('should not include autocomplete instruction when autocomplete is false', () => {
+      const workPlan = {
+        title: 'Manual Onboarding',
+        steps: [
+          { stepCount: 1, title: 'Step 1', status: 'pending' as const },
+        ],
+        createdAt: '2025-01-15T09:00:00.000Z',
+        updatedAt: '2025-01-15T10:00:00.000Z',
+        autocomplete: false,
+      };
+
+      const result = (agentModeService as any).buildMarketingContext(
+        'Continue',
+        [],
+        [],
+        workPlan
+      );
+
+      const workPlanMessage = result.find(
+        (msg: any) => msg.role === 'assistant' && (msg.content.includes('Current Active Work Plan') || msg.content.includes('WORK PLAN ALREADY EXISTS'))
+      );
+
+      expect(workPlanMessage).toBeDefined();
+      expect(workPlanMessage.content).not.toContain('AUTOCOMPLETE MODE');
+      expect(workPlanMessage.content).not.toContain('set_work_plan_status');
+    });
+
+    it('should not include autocomplete instruction when autocomplete is undefined', () => {
+      const workPlan = {
+        title: 'Default Onboarding',
+        steps: [
+          { stepCount: 1, title: 'Step 1', status: 'pending' as const },
+        ],
+        createdAt: '2025-01-15T09:00:00.000Z',
+        updatedAt: '2025-01-15T10:00:00.000Z',
+        // autocomplete is undefined
+      };
+
+      const result = (agentModeService as any).buildMarketingContext(
+        'Continue',
+        [],
+        [],
+        workPlan
+      );
+
+      const workPlanMessage = result.find(
+        (msg: any) => msg.role === 'assistant' && (msg.content.includes('Current Active Work Plan') || msg.content.includes('WORK PLAN ALREADY EXISTS'))
+      );
+
+      expect(workPlanMessage).toBeDefined();
+      expect(workPlanMessage.content).not.toContain('AUTOCOMPLETE MODE');
+      expect(workPlanMessage.content).not.toContain('set_work_plan_status');
+    });
   });
 
   describe('Required Function Calls', () => {

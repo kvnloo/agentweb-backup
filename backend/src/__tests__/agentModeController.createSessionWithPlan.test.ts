@@ -301,7 +301,8 @@ describe('AgentModeController - createSessionWithPlan', () => {
               status: 'pending'
             })
           ]),
-          welcomeMessage: 'Welcome to onboarding!'
+          welcomeMessage: 'Welcome to onboarding!',
+          autocomplete: false
         })
       );
       expect(mockChatbotDb.updateSessionInteractiveShareMetadata).toHaveBeenCalled();
@@ -371,6 +372,82 @@ describe('AgentModeController - createSessionWithPlan', () => {
 
       expect(res.status).toHaveBeenCalledWith(500);
       expect(res.json).toHaveBeenCalledWith({ error: 'Failed to create session with plan' });
+    });
+
+    it('should store autocomplete when predefined plan has autocomplete enabled', async () => {
+      // Update mock work plans to include autocomplete: true
+      const workPlansWithAutocomplete = [
+        {
+          title: 'Onboarding',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'Step 1',
+              description: 'First step',
+              requiredFunctionCalls: ['function1']
+            },
+            {
+              stepCount: 2,
+              title: 'Step 2',
+              description: 'Second step'
+            }
+          ],
+          welcomeMessage: 'Welcome to onboarding!',
+          autocomplete: true
+        }
+      ];
+      mockSettingsService.getSetting.mockResolvedValue({
+        settingKey: 'agent-mode-predefined-workplans',
+        settingValue: JSON.stringify(workPlansWithAutocomplete)
+      } as any);
+
+      const req = mockRequest(mockPlanTitle);
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      expect(mockChatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        'test-session-123',
+        expect.objectContaining({
+          title: 'Onboarding',
+          autocomplete: true
+        })
+      );
+    });
+
+    it('should default autocomplete to false when not specified in predefined plan', async () => {
+      // Work plan without autocomplete field
+      const workPlansWithoutAutocomplete = [
+        {
+          title: 'Onboarding',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'Step 1',
+              description: 'First step'
+            }
+          ],
+          welcomeMessage: 'Welcome!'
+          // autocomplete is not specified
+        }
+      ];
+      mockSettingsService.getSetting.mockResolvedValue({
+        settingKey: 'agent-mode-predefined-workplans',
+        settingValue: JSON.stringify(workPlansWithoutAutocomplete)
+      } as any);
+
+      const req = mockRequest(mockPlanTitle);
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      expect(mockChatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        'test-session-123',
+        expect.objectContaining({
+          title: 'Onboarding',
+          autocomplete: false
+        })
+      );
     });
   });
 });

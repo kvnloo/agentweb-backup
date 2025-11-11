@@ -3770,6 +3770,7 @@ interface PredefinedWorkPlan {
   title: string;
   steps: WorkPlanStep[];
   welcomeMessage?: string;
+  autocomplete?: boolean;
 }
 
 interface AvailableFunctionCall {
@@ -3940,6 +3941,7 @@ const AgentModeSettings = () => {
   };
 
   const getDefaultOnboardingPlan = (): PredefinedWorkPlan => ({
+    autocomplete: false,
     title: 'Onboarding',
     welcomeMessage: 'Welcome to the onboarding process! I\'m here to help you get set up. Let\'s get started!',
     steps: [
@@ -4127,6 +4129,7 @@ const AgentModeSettings = () => {
       const validatedWorkPlans = predefinedWorkPlans.map(workPlan => ({
         title: workPlan.title.trim(),
         welcomeMessage: workPlan.welcomeMessage?.trim() || undefined,
+        autocomplete: workPlan.autocomplete || false,
         steps: workPlan.steps
           .filter(step => step.title.trim().length > 0)
           .map((step, index) => ({
@@ -4159,7 +4162,8 @@ const AgentModeSettings = () => {
       ...predefinedWorkPlans,
       {
         title: '',
-        steps: [{ stepCount: 1, title: '' }]
+        steps: [{ stepCount: 1, title: '' }],
+        autocomplete: false
       }
     ]);
   };
@@ -4502,6 +4506,22 @@ const AgentModeSettings = () => {
                       sx={{ mb: 2 }}
                       helperText="This message will be displayed as the welcome message when a session is created with this plan. If not provided, the default Agent Mode welcome message will be used."
                     />
+
+                    <Box sx={{ mb: 2 }}>
+                      <FormControlLabel
+                        control={
+                          <Checkbox
+                            checked={workPlan.autocomplete || false}
+                            onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, autocomplete: e.target.checked })}
+                            disabled={savingWorkPlans}
+                          />
+                        }
+                        label="Autocomplete Steps"
+                      />
+                      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5, ml: 4 }}>
+                        When enabled, Emma MUST complete each step before responding to the user. Steps will be automatically completed when all required function calls are executed.
+                      </Typography>
+                    </Box>
 
                     <Typography variant="subtitle2" gutterBottom sx={{ mt: 2, mb: 1 }}>
                       Steps:
