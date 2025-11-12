@@ -739,13 +739,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
               },
               icp: {
                 type: 'array',
-                description: 'Array of Ideal Customer Profile objects with title, description, and value proposition',
+                description: 'Array of Ideal Customer Profile objects with title, description, value proposition, and buyer personas',
                 items: {
                   type: 'object',
                   properties: {
                     title: { type: 'string', description: 'ICP title or name' },
                     description: { type: 'string', description: 'ICP description or characteristics' },
-                    valueProposition: { type: 'string', description: 'Value proposition for this customer type' }
+                    valueProposition: { type: 'string', description: 'Value proposition for this customer type' },
+                    buyerPersonas: { type: 'array', description: 'List of buyer personas for this customer type', items: { type: 'string' } }
                   },
                   required: ['title']
                 }
@@ -1632,7 +1633,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             { name: 'Mock Competitor 1', description: 'A mock competitor description' }
           ],
           icp: [
-            { title: 'Mock ICP', description: 'Mock ideal customer profile', valueProposition: 'Mock value prop' }
+            { title: 'Mock ICP', description: 'Mock ideal customer profile', valueProposition: 'Mock value prop', buyerPersonas: ['Mock persona 1', 'Mock persona 2'] }
           ]
         };
       
@@ -4848,6 +4849,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
           formattedSummary += `• <strong>${icp.title}:</strong> ${icp.description || 'No description provided'}<br>`;
           if (icp.valueProposition) {
             formattedSummary += `  <em>Value Proposition:</em> ${icp.valueProposition}<br>`;
+          }
+          if (icp.buyerPersonas && Array.isArray(icp.buyerPersonas) && icp.buyerPersonas.length > 0) {
+            formattedSummary += `  <em>Buyer Personas:</em> ${icp.buyerPersonas.join(', ')}<br>`;
           }
         } else {
           formattedSummary += `• ${icp}<br>`;

@@ -187,5 +187,34 @@ describe('AgentModeService - Tool Descriptions', () => {
       expect(systemPrompt).toContain('web automation task with a raw prompt');
     });
   });
+
+  describe('Market Strategy Tool Descriptions', () => {
+    it('should have update_market_strategy tool with buyerPersonas field in ICP description', () => {
+      const tools = agentModeService.getAvailableTools();
+      const updateMarketStrategy = tools.find(
+        (tool: any) => tool.function?.name === 'update_market_strategy'
+      );
+
+      expect(updateMarketStrategy).toBeDefined();
+      
+      // Check that the tool description mentions buyer personas
+      const icpProperty = updateMarketStrategy?.function?.parameters?.properties?.icp;
+      expect(icpProperty).toBeDefined();
+      expect(icpProperty?.items?.properties).toHaveProperty('buyerPersonas');
+      expect(icpProperty?.items?.properties?.buyerPersonas).toBeDefined();
+      expect(icpProperty?.items?.properties?.buyerPersonas?.type).toBe('array');
+      expect(icpProperty?.items?.properties?.buyerPersonas?.description).toContain('buyer personas');
+    });
+
+    it('should have read_market_strategy tool available', () => {
+      const tools = agentModeService.getAvailableTools();
+      const readMarketStrategy = tools.find(
+        (tool: any) => tool.function?.name === 'read_market_strategy'
+      );
+
+      expect(readMarketStrategy).toBeDefined();
+      expect(readMarketStrategy?.function?.description).toContain('market strategy');
+    });
+  });
 });
 

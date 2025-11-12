@@ -105,6 +105,7 @@ export interface User {
       title: string;
       description: string;
       valueProposition: string;
+      buyerPersonas: string[];
     }>;
     createdAt: string;
     updatedAt: string;
