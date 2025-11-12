@@ -7,6 +7,18 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-11-12',
+    changes: [
+      'Supported Predefined Work Plans in Agent Mode',
+      '- Users can now access predefined work plans through plan routes (e.g., /plan/<plan_title>)',
+      '- Anonymous users can complete work plans and transfer sessions to authenticated accounts after signup',
+      '- Work plan progress is tracked and displayed with completion indicators',
+      'Improved Output Format in Agent Mode',
+      '- Enhanced message formatting with better line spacing for improved readability',
+      '- Messages now have more comfortable vertical spacing between lines for easier reading',
+    ],
+  },
+  {
     date: '2025-11-09',
     changes: [
       'Added Concurrency Limiting for Scheduled Chats in Agent Mode',
