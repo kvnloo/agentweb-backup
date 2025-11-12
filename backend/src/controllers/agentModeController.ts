@@ -1998,7 +1998,7 @@ export const agentModeController = {
   async transferSession(req: AuthenticatedRequest, res: Response) {
     try {
       const { sessionId } = req.params;
-      const user = req.user as User;
+      const user = req.user;
 
       // Get the session to verify it exists and check if it's anonymous
       const session = await chatbotDb.getChatSession(sessionId);

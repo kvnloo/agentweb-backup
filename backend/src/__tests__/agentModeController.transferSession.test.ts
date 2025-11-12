@@ -1,6 +1,6 @@
 import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
-import { User } from '../types/auth';
+import { AuthenticatedRequest } from '../middleware/auth';
 
 // Mock dependencies
 jest.mock('../services/chatbotService', () => ({
@@ -11,9 +11,10 @@ jest.mock('../services/chatbotService', () => ({
 }));
 
 describe('Agent Mode Controller - Transfer Session', () => {
-  const mockUser: User = {
+  const mockUser: AuthenticatedRequest['user'] = {
     userId: 'user-123',
     email: 'test@example.com',
+    isAdmin: false,
     roles: ['customer']
   };
 
@@ -35,10 +36,10 @@ describe('Agent Mode Controller - Transfer Session', () => {
     updatedAt: '2024-01-01T00:00:00Z'
   };
 
-  const mockRequest = (user: User, sessionId: string) => ({
+  const mockRequest = (user: AuthenticatedRequest['user'], sessionId: string): AuthenticatedRequest => ({
     user,
     params: { sessionId }
-  } as any);
+  } as unknown as AuthenticatedRequest);
 
   const mockResponse = () => {
     const res: any = {};

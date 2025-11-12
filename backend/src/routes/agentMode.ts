@@ -14,6 +14,13 @@ const asyncHandler = (fn: (req: Request, res: Response, next: express.NextFuncti
   };
 };
 
+// Helper function to wrap async handlers for authenticated routes
+const asyncHandlerAuth = (fn: (req: AuthenticatedRequest, res: Response) => Promise<any>) => {
+  return (req: Request, res: Response, next: express.NextFunction) => {
+    Promise.resolve(fn(req as AuthenticatedRequest, res)).catch(next);
+  };
+};
+
 
 // Public routes (no authentication required)
 // GET /api/agent-mode/share/:shareId
@@ -59,7 +66,7 @@ router.use(authenticateToken);
 
 // PUT /api/agent-mode/session/:sessionId/transfer
 // Transfer anonymous session to authenticated user (requires authentication)
-router.put('/session/:sessionId/transfer', asyncHandler(agentModeController.transferSession));
+router.put('/session/:sessionId/transfer', asyncHandlerAuth(agentModeController.transferSession));
 
 // Agent Mode Chat Routes
 
