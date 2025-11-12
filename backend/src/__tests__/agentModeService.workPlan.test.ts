@@ -547,7 +547,7 @@ describe('AgentModeService - Work Plan', () => {
 
       // Find the work plan status message
       const workPlanMessage = result.find(
-        (msg: any) => msg.role === 'assistant' && msg.content.includes('Current Work Plan')
+        (msg: any) => msg.role === 'assistant' && (msg.content.includes('Current Active Work Plan') || msg.content.includes('Current Work Plan') || msg.content.includes('WORK PLAN ALREADY EXISTS'))
       );
 
       expect(workPlanMessage).toBeDefined();
@@ -577,9 +577,10 @@ describe('AgentModeService - Work Plan', () => {
       );
 
       const workPlanMessage = result.find(
-        (msg: any) => msg.role === 'assistant' && msg.content.includes('Current Work Plan')
+        (msg: any) => msg.role === 'assistant' && (msg.content.includes('Current Active Work Plan') || msg.content.includes('Current Work Plan') || msg.content.includes('WORK PLAN ALREADY EXISTS'))
       );
 
+      expect(workPlanMessage).toBeDefined();
       expect(workPlanMessage.content).toContain('1. ✓ Step 1 (completed)');
       expect(workPlanMessage.content).toContain('2. ⊘ Step 2 (skipped)');
       expect(workPlanMessage.content).toContain('3. ○ Step 3 (pending)');
@@ -594,10 +595,269 @@ describe('AgentModeService - Work Plan', () => {
       );
 
       const workPlanMessage = result.find(
-        (msg: any) => msg.role === 'assistant' && msg.content.includes('Current Work Plan')
+        (msg: any) => msg.role === 'assistant' && (msg.content.includes('Current Active Work Plan') || msg.content.includes('Current Work Plan') || msg.content.includes('WORK PLAN ALREADY EXISTS'))
       );
 
       expect(workPlanMessage).toBeUndefined();
+    });
+
+    it('should include step descriptions in work plan context', () => {
+      const workPlan = {
+        title: 'Client Onboarding',
+        steps: [
+          {
+            stepCount: 1,
+            title: 'Analyze website',
+            description: 'Research and analyze the client\'s website and business',
+            status: 'pending' as const,
+          },
+          {
+            stepCount: 2,
+            title: 'Create brand guidelines',
+            description: 'Establish brand guidelines including colors and fonts',
+            status: 'pending' as const,
+          },
+          {
+            stepCount: 3,
+            title: 'Create strategy',
+            // No description for this step
+            status: 'pending' as const,
+          },
+        ],
+        createdAt: '2025-01-15T09:00:00.000Z',
+        updatedAt: '2025-01-15T10:00:00.000Z',
+      };
+
+      const result = (agentModeService as any).buildMarketingContext(
+        'What should I do next?',
+        [],
+        [],
+        workPlan
+      );
+
+      const workPlanMessage = result.find(
+        (msg: any) => msg.role === 'assistant' && (msg.content.includes('Current Active Work Plan') || msg.content.includes('WORK PLAN ALREADY EXISTS'))
+      );
+
+      expect(workPlanMessage).toBeDefined();
+      expect(workPlanMessage.content).toContain('Description: Research and analyze the client\'s website and business');
+      expect(workPlanMessage.content).toContain('Description: Establish brand guidelines including colors and fonts');
+      // Step 3 should not have a description line
+      expect(workPlanMessage.content).toContain('3. ○ Create strategy (pending)');
+      const step3Index = workPlanMessage.content.indexOf('3. ○ Create strategy (pending)');
+      const afterStep3 = workPlanMessage.content.substring(step3Index);
+      // After step 3, there should be no "Description:" line before the next step or end
+      expect(afterStep3).not.toMatch(/Description:.*Create strategy/);
+    });
+
+    it('should include required function calls in work plan context', () => {
+      const workPlan = {
+        title: 'Content Creation Plan',
+        steps: [
+          {
+            stepCount: 1,
+            title: 'Research topic',
+            requiredFunctionCalls: ['search_web'],
+            status: 'pending' as const,
+          },
+          {
+            stepCount: 2,
+            title: 'Create blog articles',
+            requiredFunctionCalls: ['create_blog_article', 'create_blog_article', 'create_blog_article'],
+            status: 'pending' as const,
+          },
+          {
+            stepCount: 3,
+            title: 'Generate images',
+            requiredFunctionCalls: ['generate_image'],
+            status: 'pending' as const,
+          },
+          {
+            stepCount: 4,
+            title: 'Finalize content',
+            // No required function calls
+            status: 'pending' as const,
+          },
+        ],
+        createdAt: '2025-01-15T09:00:00.000Z',
+        updatedAt: '2025-01-15T10:00:00.000Z',
+      };
+
+      const result = (agentModeService as any).buildMarketingContext(
+        'Continue with the plan',
+        [],
+        [],
+        workPlan
+      );
+
+      const workPlanMessage = result.find(
+        (msg: any) => msg.role === 'assistant' && (msg.content.includes('Current Active Work Plan') || msg.content.includes('WORK PLAN ALREADY EXISTS'))
+      );
+
+      expect(workPlanMessage).toBeDefined();
+      expect(workPlanMessage.content).toContain('Required Functions: search_web');
+      expect(workPlanMessage.content).toContain('Required Functions: create_blog_article, create_blog_article, create_blog_article');
+      expect(workPlanMessage.content).toContain('Required Functions: generate_image');
+      // Step 4 should not have required functions
+      expect(workPlanMessage.content).toContain('4. ○ Finalize content (pending)');
+      const step4Index = workPlanMessage.content.indexOf('4. ○ Finalize content (pending)');
+      const afterStep4 = workPlanMessage.content.substring(step4Index);
+      // After step 4, there should be no "Required Functions:" line before the next step or end
+      expect(afterStep4).not.toMatch(/Required Functions:.*Finalize content/);
+    });
+
+    it('should include both descriptions and required function calls when both are present', () => {
+      const workPlan = {
+        title: 'Complete Onboarding',
+        steps: [
+          {
+            stepCount: 1,
+            title: 'Analyze website and business',
+            description: 'Research and analyze the client\'s website and business to understand their industry',
+            requiredFunctionCalls: ['search_web'],
+            status: 'pending' as const,
+          },
+          {
+            stepCount: 2,
+            title: 'Create brand guidelines',
+            description: 'Establish brand guidelines',
+            requiredFunctionCalls: ['update_brand_guidelines'],
+            status: 'completed' as const,
+          },
+        ],
+        createdAt: '2025-01-15T09:00:00.000Z',
+        updatedAt: '2025-01-15T10:00:00.000Z',
+      };
+
+      const result = (agentModeService as any).buildMarketingContext(
+        'What is the next step?',
+        [],
+        [],
+        workPlan
+      );
+
+      const workPlanMessage = result.find(
+        (msg: any) => msg.role === 'assistant' && (msg.content.includes('Current Active Work Plan') || msg.content.includes('WORK PLAN ALREADY EXISTS'))
+      );
+
+      expect(workPlanMessage).toBeDefined();
+      // Check step 1 has both description and required functions
+      expect(workPlanMessage.content).toContain('1. ○ Analyze website and business (pending)');
+      expect(workPlanMessage.content).toContain('Description: Research and analyze the client\'s website and business to understand their industry');
+      expect(workPlanMessage.content).toContain('Required Functions: search_web');
+      // Check step 2 has both description and required functions
+      expect(workPlanMessage.content).toContain('2. ✓ Create brand guidelines (completed)');
+      expect(workPlanMessage.content).toContain('Description: Establish brand guidelines');
+      expect(workPlanMessage.content).toContain('Required Functions: update_brand_guidelines');
+    });
+
+    it('should include warning message about existing work plan', () => {
+      const workPlan = {
+        title: 'Project Plan',
+        steps: [
+          { stepCount: 1, title: 'Step 1', status: 'pending' as const },
+        ],
+        createdAt: '2025-01-15T09:00:00.000Z',
+        updatedAt: '2025-01-15T10:00:00.000Z',
+      };
+
+      const result = (agentModeService as any).buildMarketingContext(
+        'Hello',
+        [],
+        [],
+        workPlan
+      );
+
+      const workPlanMessage = result.find(
+        (msg: any) => msg.role === 'assistant' && (msg.content.includes('Current Active Work Plan') || msg.content.includes('WORK PLAN ALREADY EXISTS'))
+      );
+
+      expect(workPlanMessage).toBeDefined();
+      expect(workPlanMessage.content).toContain('⚠️ IMPORTANT: A WORK PLAN ALREADY EXISTS FOR THIS SESSION ⚠️');
+      expect(workPlanMessage.content).toContain('You MUST continue working with this existing plan');
+      expect(workPlanMessage.content).toContain('DO NOT create a new work plan');
+      expect(workPlanMessage.content).toContain('Use modify_work_plan if you need to add or change steps');
+    });
+
+    it('should include autocomplete instruction when autocomplete is enabled', () => {
+      const workPlan = {
+        title: 'Auto Onboarding',
+        steps: [
+          { stepCount: 1, title: 'Step 1', status: 'pending' as const },
+          { stepCount: 2, title: 'Step 2', status: 'pending' as const },
+        ],
+        createdAt: '2025-01-15T09:00:00.000Z',
+        updatedAt: '2025-01-15T10:00:00.000Z',
+        autocomplete: true,
+      };
+
+      const result = (agentModeService as any).buildMarketingContext(
+        'Continue',
+        [],
+        [],
+        workPlan
+      );
+
+      const workPlanMessage = result.find(
+        (msg: any) => msg.role === 'assistant' && (msg.content.includes('Current Active Work Plan') || msg.content.includes('WORK PLAN ALREADY EXISTS'))
+      );
+
+      expect(workPlanMessage).toBeDefined();
+      expect(workPlanMessage.content).toContain('⚠️ AUTOCOMPLETE MODE: After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.');
+    });
+
+    it('should not include autocomplete instruction when autocomplete is false', () => {
+      const workPlan = {
+        title: 'Manual Onboarding',
+        steps: [
+          { stepCount: 1, title: 'Step 1', status: 'pending' as const },
+        ],
+        createdAt: '2025-01-15T09:00:00.000Z',
+        updatedAt: '2025-01-15T10:00:00.000Z',
+        autocomplete: false,
+      };
+
+      const result = (agentModeService as any).buildMarketingContext(
+        'Continue',
+        [],
+        [],
+        workPlan
+      );
+
+      const workPlanMessage = result.find(
+        (msg: any) => msg.role === 'assistant' && (msg.content.includes('Current Active Work Plan') || msg.content.includes('WORK PLAN ALREADY EXISTS'))
+      );
+
+      expect(workPlanMessage).toBeDefined();
+      expect(workPlanMessage.content).not.toContain('AUTOCOMPLETE MODE');
+      expect(workPlanMessage.content).not.toContain('set_work_plan_status');
+    });
+
+    it('should not include autocomplete instruction when autocomplete is undefined', () => {
+      const workPlan = {
+        title: 'Default Onboarding',
+        steps: [
+          { stepCount: 1, title: 'Step 1', status: 'pending' as const },
+        ],
+        createdAt: '2025-01-15T09:00:00.000Z',
+        updatedAt: '2025-01-15T10:00:00.000Z',
+        // autocomplete is undefined
+      };
+
+      const result = (agentModeService as any).buildMarketingContext(
+        'Continue',
+        [],
+        [],
+        workPlan
+      );
+
+      const workPlanMessage = result.find(
+        (msg: any) => msg.role === 'assistant' && (msg.content.includes('Current Active Work Plan') || msg.content.includes('WORK PLAN ALREADY EXISTS'))
+      );
+
+      expect(workPlanMessage).toBeDefined();
+      expect(workPlanMessage.content).not.toContain('AUTOCOMPLETE MODE');
+      expect(workPlanMessage.content).not.toContain('set_work_plan_status');
     });
   });
 

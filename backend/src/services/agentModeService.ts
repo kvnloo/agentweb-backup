@@ -322,11 +322,11 @@ When updating HTML files, follow this process:
 
 ## Work Plan Capabilities
 You can create and manage multi-step work plans using these tools:
-- **create_work_plan**: Create a structured plan with a title and numbered steps. Each step can include optional requiredFunctionCalls to enforce validation.
-- **modify_work_plan**: Add new steps or modify existing step details (does not change status). Can also add or modify requiredFunctionCalls for steps.
+- **create_work_plan**: Create a structured plan with a title and numbered steps. Each step can include optional requiredFunctionCalls to enforce validation. **CRITICAL: Always check your context messages for an existing work plan before creating a new one. If a work plan already exists (you'll see a message starting with "⚠️ IMPORTANT: A WORK PLAN ALREADY EXISTS"), DO NOT create a new plan - use modify_work_plan instead.**
+- **modify_work_plan**: Add new steps or modify existing step details (does not change status). Can also add or modify requiredFunctionCalls for steps. Use this when a work plan already exists and you need to make changes.
 - **set_work_plan_status**: Update step status (pending/completed/skipped) with optional notes. **IMPORTANT**: If a step has requiredFunctionCalls defined, you MUST have called those functions before marking it as completed, or you'll get an error.
 
-Work plans help organize complex multi-step projects like client onboarding, campaign planning, or content creation workflows. The current work plan status (if any) is automatically provided in your context.
+Work plans help organize complex multi-step projects like client onboarding, campaign planning, or content creation workflows. The current work plan status (if any) is automatically provided in your context. **If you see a work plan in your context, you MUST continue working with that existing plan - never create a duplicate.**
 
 ### Required Function Calls
 You can specify required function calls for any step to ensure proper validation:
@@ -512,12 +512,35 @@ Use the available tools to create tasks in the agent-engine when complex work is
         pending: '○',
         skipped: '⊘'
       };
-      const workPlanContent = `[Current Work Plan: "${workPlan.title}"]\n` +
-        workPlan.steps.map((step: any) => {
-          const icon = statusIcons[step.status as keyof typeof statusIcons];
-          return `${step.stepCount}. ${icon} ${step.title} (${step.status})`;
-        }).join('\n');
-      messages.push({ role: 'assistant', content: workPlanContent });
+      let workPlanContent = `⚠️ IMPORTANT: A WORK PLAN ALREADY EXISTS FOR THIS SESSION ⚠️\n\n`;
+      workPlanContent += `[Current Active Work Plan: "${workPlan.title}"]\n\n`;
+      workPlanContent += `You MUST continue working with this existing plan. DO NOT create a new work plan. Use modify_work_plan if you need to add or change steps.\n\n`;
+      
+      // If autocomplete is enabled, add instruction to auto-complete steps
+      if (workPlan.autocomplete) {
+        workPlanContent += `⚠️ AUTOCOMPLETE MODE: After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.\n\n`;
+      }
+      
+      workPlan.steps.forEach((step: any) => {
+        const icon = statusIcons[step.status as keyof typeof statusIcons];
+        workPlanContent += `${step.stepCount}. ${icon} ${step.title} (${step.status})\n`;
+        
+        // Include step description if available
+        if (step.description) {
+          workPlanContent += `   Description: ${step.description}\n`;
+        }
+        
+        // Include required function calls if available
+        if (step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
+          workPlanContent += `   Required Functions: ${step.requiredFunctionCalls.join(', ')}\n`;
+        }
+        
+        workPlanContent += '\n';
+      });
+
+      console.log('workPlanContent', workPlanContent);
+      
+      messages.push({ role: 'assistant', content: workPlanContent.trim() });
     }
 
     // Append the current user message at the end
@@ -1164,11 +1187,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
             }
           }
         },
-      {
+        {
         type: 'function' as const,
         function: {
           name: 'create_work_plan',
-          description: 'Create a multi-step work plan for the current chat session. Use this to organize complex projects like client onboarding, campaign planning, or content creation workflows.',
+          description: 'Create a multi-step work plan for the current chat session. Use this to organize complex projects like client onboarding, campaign planning, or content creation workflows. IMPORTANT: Check if a work plan already exists in the session context before creating a new one. If a work plan already exists, use modify_work_plan instead to add or update steps.',
           parameters: {
             type: 'object',
             properties: {

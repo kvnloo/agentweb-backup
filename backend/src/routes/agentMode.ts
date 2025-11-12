@@ -14,6 +14,13 @@ const asyncHandler = (fn: (req: Request, res: Response, next: express.NextFuncti
   };
 };
 
+// Helper function to wrap async handlers for authenticated routes
+const asyncHandlerAuth = (fn: (req: AuthenticatedRequest, res: Response) => Promise<any>) => {
+  return (req: Request, res: Response, next: express.NextFunction) => {
+    Promise.resolve(fn(req as AuthenticatedRequest, res)).catch(next);
+  };
+};
+
 
 // Public routes (no authentication required)
 // GET /api/agent-mode/share/:shareId
@@ -40,6 +47,14 @@ router.get('/public/welcome-message', asyncHandler(agentModeController.getWelcom
 // Get current conversation starters (public)
 router.get('/public/conversation-starters', asyncHandler(agentModeController.getConversationStarters));
 
+// GET /api/agent-mode/public/plan/:planTitle
+// Get predefined work plan by title (public)
+router.get('/public/plan/:planTitle', asyncHandler(agentModeController.getPredefinedWorkPlan));
+
+// POST /api/agent-mode/public/plan/:planTitle/session
+// Create session with predefined work plan (public)
+router.post('/public/plan/:planTitle/session', asyncHandler(agentModeController.createSessionWithPlan));
+
 // POST /api/agent-mode/run-scheduled-chats
 // Run all scheduled chats that are ready to execute (called by agent-engine)
 router.post('/run-scheduled-chats', asyncHandler(agentModeController.runScheduledChats));
@@ -48,6 +63,10 @@ router.post('/run-scheduled-chats', asyncHandler(agentModeController.runSchedule
 
 // All other routes require authentication
 router.use(authenticateToken);
+
+// PUT /api/agent-mode/session/:sessionId/transfer
+// Transfer anonymous session to authenticated user (requires authentication)
+router.put('/session/:sessionId/transfer', asyncHandlerAuth(agentModeController.transferSession));
 
 // Agent Mode Chat Routes
 
