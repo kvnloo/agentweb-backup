@@ -1669,15 +1669,6 @@ async function getExecutionsWithAssets(
                   // Check if this execution already exists
                   let execution = result[sessionKey].executions.find((exec: any) => exec.executionId === executionId);
                   
-                  if (!execution) {
-                    execution = {
-                      executionId: executionId,
-                      startTime: session.createdAt, // Use session creation time
-                      result_files: []
-                    };
-                    result[sessionKey].executions.push(execution);
-                  }
-                  
                   // Check favorites and archives from session fields
                   const isFavorited = session.favorites?.[imageUrl] || false;
                   const isArchived = session.archives?.[imageUrl] || false;
@@ -1685,6 +1676,20 @@ async function getExecutionsWithAssets(
                   // Skip archived images (they will be filtered out, similar to task executions)
                   if (isArchived) {
                     return; // Skip this image
+                  }
+                  
+                  if (!execution) {
+                    execution = {
+                      executionId: executionId,
+                      startTime: timestamp, // Use the image generation timestamp
+                      result_files: []
+                    };
+                    result[sessionKey].executions.push(execution);
+                  } else {
+                    // Update startTime to the latest image generation time
+                    if (timestamp && (!execution.startTime || timestamp > execution.startTime)) {
+                      execution.startTime = timestamp;
+                    }
                   }
                   
                   // Add the image file with its generation timestamp and status
