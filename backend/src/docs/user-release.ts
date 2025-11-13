@@ -16,6 +16,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Improved Output Format in Agent Mode',
       '- Enhanced message formatting with better line spacing for improved readability',
       '- Messages now have more comfortable vertical spacing between lines for easier reading',
+      'Improved Market Strategy Page',
+      '- Added Buyer Personas support to ICP entries - each ICP can now have multiple buyer personas defined as a list',
+      '- Buyer Personas help better define and target specific customer segments within each ideal customer profile',
+      '- Market Strategy page now supports individual entry editing for competitors and ICPs',
+      '- Each competitor and ICP can be edited, added, or deleted independently without affecting other entries',
     ],
   },
   {

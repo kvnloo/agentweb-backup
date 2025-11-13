@@ -133,6 +133,21 @@ describe('AgentModeService - Mock Responses', () => {
       expect(mockResponse.taskId).toBeUndefined();
       expect(mockResponse.executionId).toBeUndefined();
     });
+
+    it('should return correct mock response for read_market_strategy with buyerPersonas field', async () => {
+      const mockResponse = (agentModeService as any).getMockToolResult('read_market_strategy', {});
+
+      expect(mockResponse.success).toBe(true);
+      expect(mockResponse.exists).toBe(true);
+      expect(mockResponse.icp).toBeDefined();
+      expect(Array.isArray(mockResponse.icp)).toBe(true);
+      expect(mockResponse.icp.length).toBeGreaterThan(0);
+      
+      // Verify buyerPersonas field exists as an array
+      expect(mockResponse.icp[0]).toHaveProperty('buyerPersonas');
+      expect(Array.isArray(mockResponse.icp[0].buyerPersonas)).toBe(true);
+      expect(mockResponse.icp[0].buyerPersonas.length).toBeGreaterThan(0);
+    });
   });
 
   describe('Tool response validation', () => {

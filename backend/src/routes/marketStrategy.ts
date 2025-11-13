@@ -72,7 +72,7 @@ router.get("/", authenticateToken, async (req, res) => {
   }
 });
 
-// Save user's market strategy
+// Save user's market strategy (supports partial updates)
 router.post("/", authenticateToken, async (req, res) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
@@ -85,12 +85,12 @@ router.post("/", authenticateToken, async (req, res) => {
       return res.status(401).json({ error: "User ID not provided" });
     }
 
-    // Validate required fields
-    if (businessOverview === undefined || competitors === undefined || icp === undefined) {
-      console.log(`[MARKET STRATEGY DEBUG] Missing required fields in request body`);
+    // At least one field must be provided
+    if (businessOverview === undefined && competitors === undefined && icp === undefined) {
+      console.log(`[MARKET STRATEGY DEBUG] No fields provided in request body`);
       return res.status(400).json({
         success: false,
-        error: "Missing required fields: businessOverview, competitors, icp",
+        error: "At least one field must be provided: businessOverview, competitors, or icp",
       });
     }
 
@@ -123,11 +123,18 @@ router.post("/", authenticateToken, async (req, res) => {
     const user = users[0];
     console.log(`[MARKET STRATEGY DEBUG] Found user: ${user.email}`);
 
-    // Prepare market strategy data
+    // Get existing market strategy or default
+    const existingMarketStrategy = user.marketStrategy || {
+      businessOverview: "",
+      competitors: [],
+      icp: [],
+    };
+
+    // Merge: only update fields that are provided
     const marketStrategy = {
-      businessOverview: businessOverview || "",
-      competitors: competitors || [],
-      icp: icp || [],
+      businessOverview: businessOverview !== undefined ? businessOverview : existingMarketStrategy.businessOverview,
+      competitors: competitors !== undefined ? competitors : existingMarketStrategy.competitors,
+      icp: icp !== undefined ? icp : existingMarketStrategy.icp,
     };
 
     // Update user record with market strategy data
