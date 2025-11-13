@@ -449,7 +449,7 @@ export class ImageService {
         };
         
       } else if (inputImageCount === 1) {
-        // Single image editing
+        // Single image editing - use streaming for image generation
         // Process the input image (download, convert SVG if needed, determine MIME type)
         let processedImage;
         try {
@@ -464,7 +464,8 @@ export class ImageService {
         
         const imageBase64 = processedImage.buffer.toString('base64');
         
-        const result = await model.generateContent({
+        // Use streaming for image generation
+        const streamResult = model.generateContentStream({
           contents: [
             {
               role: "user",
@@ -484,9 +485,35 @@ export class ImageService {
           ]
         });
         
-        const response = await result.response;
+        // Get the async iterable stream - handle promise if needed
+        let stream: any = streamResult;
+        if (streamResult && typeof (streamResult as any).then === 'function') {
+          stream = await streamResult;
+        }
+        if (!stream || typeof stream[Symbol.asyncIterator] !== 'function') {
+          stream = (stream as any)?.stream || stream;
+        }
         
-        const imageData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        // Process streaming response to find image data
+        let imageData: string | undefined;
+        for await (const chunk of stream) {
+          if (chunk.candidates && chunk.candidates.length > 0) {
+            const candidate = chunk.candidates[0];
+            if (candidate.content && candidate.content.parts) {
+              for (const part of candidate.content.parts) {
+                // Check for inlineData (camelCase) or inline_data (snake_case)
+                if ((part as any).inlineData?.data) {
+                  imageData = (part as any).inlineData.data;
+                  break;
+                } else if ((part as any).inline_data?.data) {
+                  imageData = (part as any).inline_data.data;
+                  break;
+                }
+              }
+              if (imageData) break;
+            }
+          }
+        }
         
         if (!imageData) {
           console.error("❌ No image data in Google Gemini response");
@@ -506,7 +533,7 @@ export class ImageService {
         };
         
       } else {
-        // Multiple image editing
+        // Multiple image editing - use streaming for image generation
         const parts = [];
         
         // Add all input images as parts
@@ -537,20 +564,48 @@ export class ImageService {
           text: params.prompt
         });
         
-        const result = await model.generateContent({
+        // Use streaming for image generation
+        const streamResult = model.generateContentStream({
           contents: [{
             role: "user",
             parts: parts
           }]
         });
         
-        const response = await result.response;
+        // Get the async iterable stream - handle promise if needed
+        let stream: any = streamResult;
+        if (streamResult && typeof (streamResult as any).then === 'function') {
+          stream = await streamResult;
+        }
+        if (!stream || typeof stream[Symbol.asyncIterator] !== 'function') {
+          stream = (stream as any)?.stream || stream;
+        }
         
-        const imageData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        // Process streaming response to find image data
+        let imageData: string | undefined;
+        for await (const chunk of stream) {
+          if (chunk.candidates && chunk.candidates.length > 0) {
+            const candidate = chunk.candidates[0];
+            if (candidate.content && candidate.content.parts) {
+              for (const part of candidate.content.parts) {
+                // Check for inlineData (camelCase) or inline_data (snake_case)
+                if ((part as any).inlineData?.data) {
+                  imageData = (part as any).inlineData.data;
+                  break;
+                } else if ((part as any).inline_data?.data) {
+                  imageData = (part as any).inline_data.data;
+                  break;
+                }
+              }
+              if (imageData) break;
+            }
+          }
+        }
         
         if (!imageData) {
-        return {
-          success: false,
+          console.error("❌ No image data in Google Gemini response");
+          return {
+            success: false,
             error: "No image data received from Google Gemini API"
           };
         }
