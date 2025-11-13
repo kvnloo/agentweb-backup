@@ -993,6 +993,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
                   items: {
                     type: 'string'
                   }
+                },
+                imageModel: {
+                  type: 'string',
+                  description: 'Optional: Specific image generation model to use. Must be one of: gpt-image-1, gemini-2.5-flash-image-preview. Note: If more than 1 input image is provided, gemini-2.5-flash-image-preview will be used automatically.',
+                  enum: ['gpt-image-1', 'gemini-2.5-flash-image-preview']
                 }
               },
               required: ['prompt', 'filename']
@@ -1939,7 +1944,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'read_page_source':
         return await this.readFileContent(args.url);
       case 'generate_image':
-        return await this.generateImage(args.prompt, args.filename, args.size || '1024x1024', args.quality || 'medium', args.inputImages || [], userId, sessionId);
+        return await this.generateImage(args.prompt, args.filename, args.size || '1024x1024', args.quality || 'medium', args.inputImages || [], userId, sessionId, args.imageModel);
         case 'create_blog_article':
           return await this.createBlogArticle(args.topic, args.keywords || '', args.tone || 'professional', args.length || 'medium', args.researchContext || '', args.requirements || '', userId, sessionId);
       case 'get_task_subscriber_metrics':
@@ -5181,10 +5186,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
     quality: string,
     inputImages: string[],
     userId: string,
-    sessionId: string
+    sessionId: string,
+    imageModel?: string
   ): Promise<any> {
     try {
-      console.log('AgentMode: Generating image with prompt:', prompt, 'filename:', filename, 'size:', size, 'quality:', quality, 'inputImages:', inputImages, 'userId:', userId, 'sessionId:', sessionId);
+      console.log('AgentMode: Generating image with prompt:', prompt, 'filename:', filename, 'size:', size, 'quality:', quality, 'inputImages:', inputImages, 'imageModel:', imageModel, 'userId:', userId, 'sessionId:', sessionId);
       
       // Import the image generation service
       const { imageService } = await import('./imageGeneration');
@@ -5206,7 +5212,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         size,
         quality,
         inputImages: inputImages || [],
-        userId
+        userId,
+        imageModel
       });
 
       if (result.success && result.imageUrl) {

@@ -10,6 +10,14 @@ interface ImageGenerationResult {
   error?: string;
 }
 
+// Supported image generation models
+const SUPPORTED_MODELS = [
+  "gpt-image-1",
+  "gemini-2.5-flash-image-preview",
+] as const;
+
+type SupportedModel = typeof SUPPORTED_MODELS[number];
+
 interface ImageGenerationParams {
   prompt: string;
   filename: string;
@@ -17,6 +25,7 @@ interface ImageGenerationParams {
   quality?: string;
   inputImages?: string[];
   userId: string;
+  imageModel?: string; // Optional model parameter - must be one of the supported models
 }
 
 export class ImageService {
@@ -31,7 +40,7 @@ export class ImageService {
     try {
       let secretName: string;
       
-      if (model === "FLUX.1-Kontext-pro" || model === "gpt-image-1") {
+      if (model === "gpt-image-1") {
         // Azure AI Services
         secretName = process.env.NODE_ENV === "development" 
           ? "dev/AgentWeb/Azure/Image" 
@@ -83,9 +92,19 @@ export class ImageService {
       
       // Determine which model to use
       let modelToUse: string;
+      
+      // Force Gemini model when there is more than 1 input image (only model that supports multiple images)
       if (inputImageCount > 1) {
-        // Multiple input images - use Google Gemini as it supports multiple images
         modelToUse = "gemini-2.5-flash-image-preview";
+      } else if (params.imageModel) {
+        // Validate the provided model
+        if (!SUPPORTED_MODELS.includes(params.imageModel as SupportedModel)) {
+          return {
+            success: false,
+            error: `Invalid imageModel '${params.imageModel}'. Must be one of: ${SUPPORTED_MODELS.join(", ")}`,
+          };
+        }
+        modelToUse = params.imageModel;
       } else if (inputImageCount === 1) {
         // Single input image - use Azure AI Services for image editing
         modelToUse = "gpt-image-1";
@@ -98,8 +117,6 @@ export class ImageService {
       let result: ImageGenerationResult;
       try {
         if (modelToUse === "gpt-image-1") {
-          result = await this.generateWithAzureAI(params, modelToUse, hasInputImages);
-        } else if (modelToUse === "FLUX.1-Kontext-pro") {
           result = await this.generateWithAzureAI(params, modelToUse, hasInputImages);
         } else if (modelToUse === "gemini-2.5-flash-image-preview") {
           result = await this.generateWithGoogleGemini(params);
@@ -174,7 +191,7 @@ export class ImageService {
     const axios = require('axios');
     
     const azureEndpoint = "https://ai-ruiwangwarm7085ai345967089938.services.ai.azure.com";
-    const deploymentName = model === "FLUX.1-Kontext-pro" ? "FLUX.1-Kontext-pro" : "gpt-image-1";
+    const deploymentName = "gpt-image-1";
     
     if (hasInputImages) {
       // Image editing mode
@@ -374,8 +391,8 @@ export class ImageService {
       const inputImageCount = params.inputImages ? params.inputImages.length : 0;
       
       if (inputImageCount === 0) {
-        // Text-to-image generation
-        const result = await model.generateContent({
+        // Text-to-image generation - use streaming
+        const streamResult = model.generateContentStream({
           contents: [{
             role: "user",
             parts: [{
@@ -384,9 +401,35 @@ export class ImageService {
           }]
         });
         
-        const response = await result.response;
+        // Get the async iterable stream - handle promise if needed
+        let stream: any = streamResult;
+        if (streamResult && typeof (streamResult as any).then === 'function') {
+          stream = await streamResult;
+        }
+        if (!stream || typeof stream[Symbol.asyncIterator] !== 'function') {
+          stream = (stream as any)?.stream || stream;
+        }
         
-        const imageData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        // Process streaming response to find image data
+        let imageData: string | undefined;
+        for await (const chunk of stream) {
+          if (chunk.candidates && chunk.candidates.length > 0) {
+            const candidate = chunk.candidates[0];
+            if (candidate.content && candidate.content.parts) {
+              for (const part of candidate.content.parts) {
+                // Check for inlineData (camelCase) or inline_data (snake_case)
+                if ((part as any).inlineData?.data) {
+                  imageData = (part as any).inlineData.data;
+                  break;
+                } else if ((part as any).inline_data?.data) {
+                  imageData = (part as any).inline_data.data;
+                  break;
+                }
+              }
+              if (imageData) break;
+            }
+          }
+        }
         
         if (!imageData) {
           console.error("❌ No image data in Google Gemini response");
