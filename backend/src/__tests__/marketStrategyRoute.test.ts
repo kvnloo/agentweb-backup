@@ -1,6 +1,33 @@
 // Unit tests for market strategy route partial update functionality
 // This tests the core logic without HTTP requests
 
+// Type definitions
+interface Competitor {
+  id: string;
+  name: string;
+  description: string;
+}
+
+interface ICP {
+  id: string;
+  title: string;
+  description: string;
+  valueProposition: string;
+  buyerPersonas: string[];
+}
+
+interface MarketStrategy {
+  businessOverview: string;
+  competitors: Competitor[];
+  icp: ICP[];
+}
+
+interface PartialMarketStrategyUpdate {
+  businessOverview?: string;
+  competitors?: Competitor[];
+  icp?: ICP[];
+}
+
 // Mock AWS SDK
 jest.mock('aws-sdk', () => {
   const mockQuery = jest.fn();
@@ -52,13 +79,13 @@ describe('Market Strategy Route - Partial Update Tests', () => {
       };
 
       // Simulate incoming request with only businessOverview
-      const incomingData = {
+      const incomingData: PartialMarketStrategyUpdate = {
         businessOverview: "Updated business overview",
         // competitors and icp are undefined (not provided)
       };
 
       // Test the fixed logic (this is what the market strategy route now does)
-      const marketStrategy = {
+      const marketStrategy: MarketStrategy = {
         businessOverview: incomingData.businessOverview !== undefined 
           ? incomingData.businessOverview 
           : existingMarketStrategy.businessOverview,
@@ -89,7 +116,7 @@ describe('Market Strategy Route - Partial Update Tests', () => {
       };
 
       // Simulate incoming request with only competitors
-      const incomingData = {
+      const incomingData: PartialMarketStrategyUpdate = {
         competitors: [
           { id: "1", name: "Updated Competitor 1", description: "Updated Description 1" },
           { id: "3", name: "New Competitor", description: "New Description" },
@@ -98,7 +125,7 @@ describe('Market Strategy Route - Partial Update Tests', () => {
       };
 
       // Test the fixed logic
-      const marketStrategy = {
+      const marketStrategy: MarketStrategy = {
         businessOverview: incomingData.businessOverview !== undefined 
           ? incomingData.businessOverview 
           : existingMarketStrategy.businessOverview,
@@ -129,7 +156,7 @@ describe('Market Strategy Route - Partial Update Tests', () => {
       };
 
       // Simulate incoming request with only icp
-      const incomingData = {
+      const incomingData: PartialMarketStrategyUpdate = {
         icp: [
           { id: "1", title: "Updated ICP 1", description: "Updated Description 1", valueProposition: "Updated VP 1", buyerPersonas: ["Persona 1"] },
           { id: "2", title: "New ICP", description: "New Description", valueProposition: "New VP", buyerPersonas: [] },
@@ -138,7 +165,7 @@ describe('Market Strategy Route - Partial Update Tests', () => {
       };
 
       // Test the fixed logic
-      const marketStrategy = {
+      const marketStrategy: MarketStrategy = {
         businessOverview: incomingData.businessOverview !== undefined 
           ? incomingData.businessOverview 
           : existingMarketStrategy.businessOverview,
@@ -169,7 +196,7 @@ describe('Market Strategy Route - Partial Update Tests', () => {
       };
 
       // Simulate incoming request with businessOverview and competitors
-      const incomingData = {
+      const incomingData: PartialMarketStrategyUpdate = {
         businessOverview: "Updated business overview",
         competitors: [
           { id: "1", name: "Updated Competitor 1", description: "Updated Description 1" },
@@ -178,7 +205,7 @@ describe('Market Strategy Route - Partial Update Tests', () => {
       };
 
       // Test the fixed logic
-      const marketStrategy = {
+      const marketStrategy: MarketStrategy = {
         businessOverview: incomingData.businessOverview !== undefined 
           ? incomingData.businessOverview 
           : existingMarketStrategy.businessOverview,
@@ -209,13 +236,13 @@ describe('Market Strategy Route - Partial Update Tests', () => {
       };
 
       // Simulate incoming request with empty competitors array
-      const incomingData = {
+      const incomingData: PartialMarketStrategyUpdate = {
         competitors: [],
         // businessOverview and icp are undefined (not provided)
       };
 
       // Test the fixed logic
-      const marketStrategy = {
+      const marketStrategy: MarketStrategy = {
         businessOverview: incomingData.businessOverview !== undefined 
           ? incomingData.businessOverview 
           : existingMarketStrategy.businessOverview,
@@ -246,13 +273,13 @@ describe('Market Strategy Route - Partial Update Tests', () => {
       };
 
       // Simulate incoming request with empty businessOverview string
-      const incomingData = {
+      const incomingData: PartialMarketStrategyUpdate = {
         businessOverview: "",
         // competitors and icp are undefined (not provided)
       };
 
       // Test the fixed logic
-      const marketStrategy = {
+      const marketStrategy: MarketStrategy = {
         businessOverview: incomingData.businessOverview !== undefined 
           ? incomingData.businessOverview 
           : existingMarketStrategy.businessOverview,
@@ -272,31 +299,34 @@ describe('Market Strategy Route - Partial Update Tests', () => {
 
     it('should handle missing existing market strategy (new user)', () => {
       // Simulate user with no existing market strategy
-      const existingMarketStrategy = null;
+      const existingMarketStrategy: MarketStrategy | null = null;
 
       // Simulate incoming request with only businessOverview
-      const incomingData = {
+      const incomingData: PartialMarketStrategyUpdate = {
         businessOverview: "New business overview",
         // competitors and icp are undefined (not provided)
       };
 
       // Test the fixed logic with default values
-      const defaultMarketStrategy = {
+      const defaultMarketStrategy: MarketStrategy = {
         businessOverview: "",
         competitors: [],
         icp: [],
       };
 
-      const marketStrategy = {
+      // Get existing or default values
+      const existingOrDefault: MarketStrategy = existingMarketStrategy || defaultMarketStrategy;
+
+      const marketStrategy: MarketStrategy = {
         businessOverview: incomingData.businessOverview !== undefined 
           ? incomingData.businessOverview 
-          : (existingMarketStrategy?.businessOverview || defaultMarketStrategy.businessOverview),
+          : existingOrDefault.businessOverview,
         competitors: incomingData.competitors !== undefined 
           ? incomingData.competitors 
-          : (existingMarketStrategy?.competitors || defaultMarketStrategy.competitors),
+          : existingOrDefault.competitors,
         icp: incomingData.icp !== undefined 
           ? incomingData.icp 
-          : (existingMarketStrategy?.icp || defaultMarketStrategy.icp),
+          : existingOrDefault.icp,
       };
 
       // Verify the fix works
