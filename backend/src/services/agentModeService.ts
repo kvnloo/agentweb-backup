@@ -265,7 +265,7 @@ When updating HTML files, follow this process:
 - Templates provide structured, proven approaches to common web automation marketing tasks
 - **Fallback Method**: If no suitable template is available, use 'create_task_from_prompt' to create a web automation task with a raw prompt
 - The 'create_task_from_prompt' tool allows you to create custom web automation tasks with specific instructions when templates don't fit
- - **Image Generation**: For real-time (~30s) image generation, use 'generate_image'. For longer-running, fully tracked jobs that may take a couple of minutes, use 'create_image_task_from_prompt' to create an image generation task (ad creatives, social media images, marketing visuals).
+ - **Image Generation**: Use 'generate_image' for creating and revising images. This provides real-time (~30s) image generation. [DEPRECATED: 'create_image_task_from_prompt' is deprecated - use 'generate_image' instead]
  - **Blog Articles**: When creating blog articles, prefer using the 'create_blog_article' tool. It generates the article content, creates a high-quality hero image via imageService, formats the article into clean HTML, uploads it to S3, and returns the final HTML URL. Avoid ad-hoc content + image flows when this tool fits the request.
  - **Meta Ads Metrics**: Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data
 - When metrics data is loaded, provide contextual analysis based on the conversation history and user's business goals
@@ -801,7 +801,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'create_image_task_from_prompt',
-          description: 'Create an image generation task using a raw prompt for creating visual content',
+          description: '[DEPRECATED] Create an image generation task using a raw prompt for creating visual content. Use \'generate_image\' instead for creating and revising images.',
           parameters: {
             type: 'object',
             properties: {
