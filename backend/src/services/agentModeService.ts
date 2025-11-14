@@ -970,9 +970,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 },
                 size: {
                   type: 'string',
-                  description: 'Image size in pixels (1024x1024, 1536x1024, 1024x1536, or auto)',
-                  enum: ['1024x1024', '1536x1024', '1024x1536', 'auto'],
-                  default: '1024x1024'
+                  description: 'Image size or ratio. For GPT models: 1024x1024, 1536x1024, 1024x1536, or auto. For Runway models: use ratio format like 1344:768, 768:1344, 1024:1024, 832x1248, etc. Use "auto" for automatic sizing.',
+                  default: 'auto'
                 },
                 quality: {
                   type: 'string',
@@ -989,8 +988,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 },
                 imageModel: {
                   type: 'string',
-                  description: 'Optional: Specific image generation model to use. Must be one of: gpt-image-1, gemini-2.5-flash-image-preview. Note: If more than 1 input image is provided, gemini-2.5-flash-image-preview will be used automatically.',
-                  enum: ['gpt-image-1', 'gemini-2.5-flash-image-preview']
+                  description: 'Optional: Specific image generation model to use. Must be one of: gpt-image-1 (by Azure), gemini-2.5-flash-image-preview (by Google), gen4_image (by Runway), gemini_2.5_flash (by Runway).',
+                  enum: ['gpt-image-1', 'gemini-2.5-flash-image-preview', 'gen4_image', 'gemini_2.5_flash']
                 }
               },
               required: ['prompt', 'filename']

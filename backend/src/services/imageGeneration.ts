@@ -14,6 +14,8 @@ interface ImageGenerationResult {
 const SUPPORTED_MODELS = [
   "gpt-image-1",
   "gemini-2.5-flash-image-preview",
+  "gen4_image",
+  "gemini_2.5_flash",
 ] as const;
 
 type SupportedModel = typeof SUPPORTED_MODELS[number];
@@ -50,6 +52,11 @@ export class ImageService {
         secretName = process.env.NODE_ENV === "development" 
           ? "dev/AgentWeb/Google/Image" 
           : "prod/AgentWeb/Google/Image";
+      } else if (model === "gen4_image" || model === "gemini_2.5_flash") {
+        // Runway ML
+        secretName = process.env.NODE_ENV === "development" 
+          ? "dev/AgentWeb/Runway/Image" 
+          : "prod/AgentWeb/Runway/Image";
       } else {
         // Default to OpenAI
         secretName = process.env.NODE_ENV === "development" 
@@ -77,7 +84,30 @@ export class ImageService {
     params: ImageGenerationParams
   ): Promise<ImageGenerationResult> {
     try {
-      // Validate parameters
+      // Check if we have input images for editing
+      const hasInputImages = params.inputImages && params.inputImages.length > 0;
+      const inputImageCount = params.inputImages ? params.inputImages.length : 0;
+      
+      // Determine which model to use before validation
+      // If model not defined, use gpt-image-1 if there is no input image or less than 1 input image.
+      // Otherwise (2+ input images), use the gemini model from google.
+      if (!params.imageModel) {
+        if (inputImageCount >= 2) {
+          params.imageModel = "gemini-2.5-flash-image-preview";
+        } else {
+          params.imageModel = "gpt-image-1";
+        }
+      }
+      
+      // Validate the provided model
+      if (!SUPPORTED_MODELS.includes(params.imageModel as SupportedModel)) {
+        return {
+          success: false,
+          error: `Invalid imageModel '${params.imageModel}'. Must be one of: ${SUPPORTED_MODELS.join(", ")}`,
+        };
+      }
+      
+      // Validate parameters (now that model is determined)
       const validationResult = this.validateParams(params);
       if (!validationResult.valid) {
         return {
@@ -85,33 +115,9 @@ export class ImageService {
           error: validationResult.error,
         };
       }
-
-      // Check if we have input images for editing
-      const hasInputImages = params.inputImages && params.inputImages.length > 0;
-      const inputImageCount = params.inputImages ? params.inputImages.length : 0;
       
-      // Determine which model to use
-      let modelToUse: string;
-      
-      // Force Gemini model when there is more than 1 input image (only model that supports multiple images)
-      if (inputImageCount > 1) {
-        modelToUse = "gemini-2.5-flash-image-preview";
-      } else if (params.imageModel) {
-        // Validate the provided model
-        if (!SUPPORTED_MODELS.includes(params.imageModel as SupportedModel)) {
-          return {
-            success: false,
-            error: `Invalid imageModel '${params.imageModel}'. Must be one of: ${SUPPORTED_MODELS.join(", ")}`,
-          };
-        }
-        modelToUse = params.imageModel;
-      } else if (inputImageCount === 1) {
-        // Single input image - use Azure AI Services for image editing
-        modelToUse = "gpt-image-1";
-      } else {
-        // No input images - use default model for text-to-image generation
-        modelToUse = "gpt-image-1";
-      }
+      // Determine which model to use for generation
+      const modelToUse = params.imageModel;
       
       // Generate or edit image
       let result: ImageGenerationResult;
@@ -120,6 +126,8 @@ export class ImageService {
           result = await this.generateWithAzureAI(params, modelToUse, hasInputImages);
         } else if (modelToUse === "gemini-2.5-flash-image-preview") {
           result = await this.generateWithGoogleGemini(params);
+        } else if (modelToUse === "gen4_image" || modelToUse === "gemini_2.5_flash") {
+          result = await this.generateWithRunwayML(params, modelToUse);
         } else {
           result = await this.generateWithOpenAI(params, modelToUse);
         }
@@ -630,6 +638,114 @@ export class ImageService {
   }
 
   /**
+   * Generate image using Runway ML (Gen-4 or Gemini 2.5 Flash)
+   */
+  private async generateWithRunwayML(params: ImageGenerationParams, model: string = "gen4_image"): Promise<ImageGenerationResult> {
+    try {
+      const apiKey = await this.getApiKey(model);
+      
+      // Dynamically import Runway ML SDK
+      const { default: RunwayML } = await import('@runwayml/sdk');
+      
+      const inputImageCount = params.inputImages ? params.inputImages.length : 0;
+      
+      // Initialize Runway ML client with API key
+      const client = new RunwayML({ apiKey: apiKey });
+      
+      // Prepare request options
+      const requestOptions: any = {
+        model: model === 'gemini_2.5_flash' ? 'gemini_2.5_flash' : 'gen4_image',
+        promptText: params.prompt,
+      };
+      
+      // Handle size parameter - use ratio string as-is from client
+      if (params.size && params.size !== 'auto') {
+        requestOptions.ratio = params.size;
+      }
+      
+      // Add reference images if provided (for image editing)
+      if (inputImageCount > 0) {
+        const referenceImages: { uri: string }[] = [];
+        
+        // Process each input image
+        for (const imageUrl of params.inputImages!) {
+          try {
+            // Check if it's already a data URL
+            if (imageUrl.startsWith('data:image/')) {
+              referenceImages.push({ uri: imageUrl });
+            } else {
+              // Download and convert to base64 data URL
+              const processedImage = await this.processInputImage(imageUrl);
+              const imageBase64 = processedImage.buffer.toString('base64');
+              const mimeType = processedImage.mimeType;
+              const dataUrl = `data:${mimeType};base64,${imageBase64}`;
+              referenceImages.push({ uri: dataUrl });
+            }
+          } catch (error: any) {
+            console.error(`❌ Failed to process input image ${imageUrl}:`, error.message);
+            return {
+              success: false,
+              error: `Failed to process input image: ${error.message}. Please check if the image URL is accessible.`
+            };
+          }
+        }
+        
+        requestOptions.referenceImages = referenceImages;
+      }
+      
+      // Create task and wait for output
+      const task = await client.textToImage
+        .create(requestOptions)
+        .waitForTaskOutput();
+      
+      // Extract image URL from task output
+      const taskAny = task as any;
+      const imageUrl = taskAny.output[0];
+      
+      if (!imageUrl) {
+        console.error("❌ Runway ML task output structure:", JSON.stringify(taskAny, null, 2));
+        throw new Error("No image URL found in Runway ML task output");
+      }
+      
+      return {
+        success: true,
+        imageUrl: imageUrl,
+        filename: params.filename
+      };
+      
+    } catch (error: any) {
+      console.error("Error with Runway ML image generation:", error);
+      
+      // Provide more detailed error information
+      let errorMessage = error.message || 'Unknown error';
+      
+      // Handle SDK-specific errors
+      if (error.taskDetails) {
+        errorMessage = `Task failed: ${JSON.stringify(error.taskDetails)}`;
+      } else if (error.response) {
+        errorMessage = `API returned ${error.response.status}: ${error.response.statusText}`;
+        if (error.response.data) {
+          try {
+            const errorData = typeof error.response.data === 'string' 
+              ? JSON.parse(error.response.data) 
+              : error.response.data;
+            if (errorData.message || errorData.error) {
+              errorMessage += ` - ${errorData.message || errorData.error}`;
+            }
+          } catch {
+            // Ignore JSON parse errors
+          }
+        }
+      }
+      
+      return {
+        success: false,
+        error: `Runway ML image generation failed: ${errorMessage}`
+      };
+    }
+  }
+
+  /**
    * Generate image using OpenAI
    */
   private async generateWithOpenAI(params: ImageGenerationParams, model: string): Promise<ImageGenerationResult> {
@@ -689,14 +805,6 @@ export class ImageService {
       };
     }
 
-    // Validate size
-    const validSizes = ["1024x1024", "1536x1024", "1024x1536", "auto"];
-    if (params.size && !validSizes.includes(params.size)) {
-      return {
-        valid: false,
-        error: `Invalid size '${params.size}'. Must be one of: ${validSizes.join(", ")}`,
-      };
-    }
 
     // Filename validation - just ensure it's not empty
     if (!params.filename || params.filename.trim() === "") {

@@ -20,6 +20,7 @@
     "@google-cloud/storage": "^7.16.0",
     "@google/generative-ai": "^0.24.1",
     "@reactflow/core": "^11.11.4",
+    "@runwayml/sdk": "^3.7.0",
     "@slack/web-api": "^7.9.3",
     "@types/aws-sdk": "^2.7.4",
     "@types/axios": "^0.9.36",
