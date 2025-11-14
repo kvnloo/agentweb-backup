@@ -287,14 +287,7 @@ When updating HTML files, follow this process:
 - **Previous Task Results**: Previous task results are automatically attached by default to provide context
 - This includes the latest HTML results from previous completed tasks in the same conversation
 - Set attach_previous_task_results to false only if you don't want previous results included
-- **Revision Method**: Use 'create_revision' tool to revise existing completed task executions
-- Supports both HTML reports and images for revision
-- Provide the task_id, execution_id, and detailed revision_prompt
-- Use the execution_id from the Current Task Statuses context above
-- If execution has multiple results, specify target_result_name to choose which one to revise
-- If multiple results exist and no target specified, the tool will return available options
-- This creates a new execution with the revision instructions
-- Only completed executions can be revised
+- **Revision Method**: [DEPRECATED: 'create_revision' is deprecated] For image revision, use 'generate_image' with the original image as an input image. For HTML report revision, use 'update_html_file' to update the HTML file content.
 
 ## Task Execution
 - When you create tasks, they will show execution status in the UI (pending, running, completed, failed)
@@ -856,7 +849,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'create_revision',
-          description: 'Create a revision of an existing completed task execution (supports both reports and images)',
+          description: '[DEPRECATED] Create a revision of an existing completed task execution (supports both reports and images). For image revision, use \'generate_image\' instead. For HTML report revision, use \'update_html_file\' instead.',
           parameters: {
             type: 'object',
             properties: {
