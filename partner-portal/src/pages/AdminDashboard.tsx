@@ -2774,7 +2774,7 @@ export default function AdminDashboard() {
                           size="small"
                           onClick={() => handleViewChat(session)}
                         >
-                          View Chat
+                          Debug Chat
                         </Button>
                       </TableCell>
                     </TableRow>
