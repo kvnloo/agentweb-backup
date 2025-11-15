@@ -1822,11 +1822,11 @@ router.post('/executions/:executionId/favorite-image', authenticateToken, async 
       }
 
       // Update favorites field (Record<string, boolean> where key is imageUrl)
-      const currentFavorites = session.favorites || {};
+      const currentFavorites: Record<string, boolean> = session.favorites || {};
       const currentStatus = currentFavorites[imageUrl] || false;
       const newFavoriteStatus = !currentStatus;
       
-      const updatedFavorites = {
+      const updatedFavorites: Record<string, boolean> = {
         ...currentFavorites,
         [imageUrl]: newFavoriteStatus
       };
