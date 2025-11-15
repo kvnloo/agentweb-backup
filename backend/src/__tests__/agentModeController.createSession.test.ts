@@ -1,0 +1,126 @@
+import { Request, Response } from 'express';
+import { agentModeController } from '../controllers/agentModeController';
+import { chatbotDb } from '../services/chatbotService';
+
+// Mock dependencies
+jest.mock('../services/chatbotService', () => ({
+  chatbotDb: {
+    createChatSession: jest.fn(),
+    getChatSession: jest.fn(),
+    getUserSessions: jest.fn(),
+  }
+}));
+
+const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
+
+describe('AgentModeController - createSession', () => {
+  const mockUserId = 'test-user-123';
+  const mockSession = {
+    sessionId: 'test-session-123',
+    userId: mockUserId,
+    title: 'New Chat Session',
+    messages: [],
+    createdAt: '2024-01-01T00:00:00Z',
+    updatedAt: '2024-01-01T00:00:00Z',
+    portalType: 'agent' as const,
+    pageIdentifier: 'agent-mode',
+    sessionType: 'regular' as const,
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockChatbotDb.createChatSession.mockResolvedValue(mockSession as any);
+  });
+
+  it('should create session with default sessionType "regular"', async () => {
+    const mockReq = {
+      user: { userId: mockUserId },
+      body: {
+        portalType: 'agent',
+        pageIdentifier: 'agent-mode'
+      }
+    } as unknown as Request;
+
+    const mockRes = {
+      json: jest.fn(),
+      status: jest.fn().mockReturnThis(),
+    } as unknown as Response;
+
+    await agentModeController.createSession(mockReq, mockRes);
+
+    expect(mockChatbotDb.createChatSession).toHaveBeenCalledWith(
+      mockUserId,
+      undefined,
+      'agent',
+      'agent-mode',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'regular'
+    );
+    expect(mockRes.status).toHaveBeenCalledWith(201);
+    expect(mockRes.json).toHaveBeenCalledWith(mockSession);
+  });
+
+  it('should create session with sessionType "image-generation" when provided', async () => {
+    const mockSessionWithImageType = {
+      ...mockSession,
+      sessionType: 'image-generation' as const,
+    };
+    mockChatbotDb.createChatSession.mockResolvedValue(mockSessionWithImageType as any);
+
+    const mockReq = {
+      user: { userId: mockUserId },
+      body: {
+        portalType: 'agent',
+        pageIdentifier: 'agent-mode',
+        sessionType: 'image-generation'
+      }
+    } as unknown as Request;
+
+    const mockRes = {
+      json: jest.fn(),
+      status: jest.fn().mockReturnThis(),
+    } as unknown as Response;
+
+    await agentModeController.createSession(mockReq, mockRes);
+
+    expect(mockChatbotDb.createChatSession).toHaveBeenCalledWith(
+      mockUserId,
+      undefined,
+      'agent',
+      'agent-mode',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'image-generation'
+    );
+    expect(mockRes.status).toHaveBeenCalledWith(201);
+    expect(mockRes.json).toHaveBeenCalledWith(mockSessionWithImageType);
+  });
+
+  it('should handle errors gracefully', async () => {
+    mockChatbotDb.createChatSession.mockRejectedValue(new Error('Database error'));
+
+    const mockReq = {
+      user: { userId: mockUserId },
+      body: {
+        portalType: 'agent',
+        pageIdentifier: 'agent-mode'
+      }
+    } as unknown as Request;
+
+    const mockRes = {
+      json: jest.fn(),
+      status: jest.fn().mockReturnThis(),
+    } as unknown as Response;
+
+    await agentModeController.createSession(mockReq, mockRes);
+
+    expect(mockRes.status).toHaveBeenCalledWith(500);
+    expect(mockRes.json).toHaveBeenCalledWith({ error: 'Failed to create session' });
+  });
+});
+

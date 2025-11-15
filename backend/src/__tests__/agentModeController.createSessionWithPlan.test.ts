@@ -130,7 +130,8 @@ describe('AgentModeController - createSessionWithPlan', () => {
         undefined,
         undefined,
         undefined,
-        undefined
+        undefined,
+        'predefined-work-plan'
       );
       expect(res.json).toHaveBeenCalled();
     });
@@ -156,7 +157,8 @@ describe('AgentModeController - createSessionWithPlan', () => {
         undefined,
         undefined,
         undefined,
-        undefined
+        undefined,
+        'predefined-work-plan'
       );
       expect(res.json).toHaveBeenCalled();
     });
@@ -184,7 +186,8 @@ describe('AgentModeController - createSessionWithPlan', () => {
         undefined,
         undefined,
         undefined,
-        undefined
+        undefined,
+        'predefined-work-plan'
       );
       expect(res.json).toHaveBeenCalled();
     });
@@ -212,7 +215,8 @@ describe('AgentModeController - createSessionWithPlan', () => {
         undefined,
         undefined,
         undefined,
-        undefined
+        undefined,
+        'predefined-work-plan'
       );
       expect(res.json).toHaveBeenCalled();
     });
@@ -263,7 +267,8 @@ describe('AgentModeController - createSessionWithPlan', () => {
         undefined,
         undefined,
         undefined,
-        undefined
+        undefined,
+        'predefined-work-plan'
       );
       expect(res.json).toHaveBeenCalled();
     });

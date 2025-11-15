@@ -651,6 +651,7 @@ The tests are located in `backend/src/__tests__/` and include:
 ```bash
 cd partner-portal && \
 VITE_API_URL=https://api.agentweb.pro \
+VITE_CUSTOMER_FRONTEND_URL=https://app.agentweb.pro \
 VITE_DEBUG=false \
 VITE_LIST_FULL_LLM_NAMES="azure->openai->gpt-4.1,google->google->gemini-2.5-pro-preview-05-06,azure->openai->gpt-4o,aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0,openai->openai->gpt-4o,aws->anthropic->us.anthropic.claude-3-7-sonnet-20250219-v1:0,google->google->gemini-2.5-flash,google->google->gemini-2.5-flash-lite,azure->openai->gpt-5-chat,google->google->gemini-2.5-pro" \
 VITE_DEEP_RESEARCH_LLM_NAMES="azure->openai->o1-mini,azure->openai->gpt-4o" \

@@ -8,6 +8,15 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-11-15",
+    changes: [
+      "Enhanced Admin Dashboard Chat History",
+      "- Chat sessions are now categorized by type: Regular, Predefined Work Plan, Scheduled, and Image Generation",
+      "- Added \"Shared Chat\" buttons to quickly access shared sessions directly from the admin dashboard",
+      "- View-only and interactive share links are now easily accessible for sessions with sharing enabled",
+    ],
+  },
+  {
     date: "2025-10-13",
     changes: [
       "Added search_web function call to browser agent",

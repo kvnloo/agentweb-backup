@@ -317,7 +317,8 @@ async function runScheduledChat(
       undefined,
       undefined,
       undefined,
-      schedule.emailCampaignTaskId
+      schedule.emailCampaignTaskId,
+      'scheduled' // sessionType
     );
     const sessionId = testSession.sessionId;
 
@@ -717,8 +718,11 @@ export const agentModeController = {
   async createSession(req: Request, res: Response) {
     try {
       const user = req.user as User;
-      const { portalType = 'agent', pageIdentifier = 'agent-mode' } = req.body;
+      const { portalType = 'agent', pageIdentifier = 'agent-mode', sessionType } = req.body;
 
+      // Determine sessionType: if explicitly provided, use it; otherwise default to 'regular'
+      // For ad image generation from Images page, sessionType should be 'image-generation'
+      const finalSessionType = sessionType || 'regular';
 
       const session = await chatbotDb.createChatSession(
         user.userId,
@@ -727,7 +731,9 @@ export const agentModeController = {
         pageIdentifier,
         undefined, // selectedStartupId
         undefined, // workflowId
-        undefined  // executionId
+        undefined, // executionId
+        undefined, // emailCampaignTaskId
+        finalSessionType as "regular" | "predefined-work-plan" | "scheduled" | "image-generation"
       );
 
       res.status(201).json(session);
@@ -1942,7 +1948,8 @@ export const agentModeController = {
         undefined, // selectedStartupId
         undefined, // workflowId
         undefined, // executionId
-        undefined  // emailCampaignTaskId
+        undefined, // emailCampaignTaskId
+        'predefined-work-plan' // sessionType
       );
 
       // Convert predefined plan to session work plan format
