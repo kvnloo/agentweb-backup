@@ -27,7 +27,17 @@ export const createChatSession = async (req: AuthenticatedRequest, res: Response
       return res.status(400).json({ error: 'Invalid pageIdentifier format' });
     }
 
-    const session = await chatbotDb.createChatSession(userId, pageContext, portalType, pageIdentifier);
+    const session = await chatbotDb.createChatSession(
+      userId, 
+      pageContext, 
+      portalType, 
+      pageIdentifier,
+      undefined, // selectedStartupId
+      undefined, // workflowId
+      undefined, // executionId
+      undefined, // emailCampaignTaskId
+      'regular' // sessionType
+    );
     
     res.status(201).json(session);
   } catch (error) {

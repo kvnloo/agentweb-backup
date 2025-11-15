@@ -127,6 +127,7 @@ interface AdminChatSession {
   pageContent?: string;
   contextChunks?: any[];
   portalType?: "customer" | "partner";
+  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation";
   // Add other fields if the backend sends more for the session list
 }
 
@@ -2703,6 +2704,7 @@ export default function AdminDashboard() {
                   <TableCell>Session ID</TableCell>
                   <TableCell>User ID</TableCell>
                   <TableCell>Portal Type</TableCell>
+                  <TableCell>Session Type</TableCell>
                   <TableCell>Created At</TableCell>
                   <TableCell>Updated At</TableCell>
                   <TableCell>Message Count</TableCell>
@@ -2712,7 +2714,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {loading ? (
                   <TableRow>
-                    <TableCell colSpan={6} align="center">
+                    <TableCell colSpan={8} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -2753,6 +2755,33 @@ export default function AdminDashboard() {
                           />
                         ) : (
                           <Chip label="Partner" color="primary" size="small" />
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        {session.sessionType ? (
+                          <Chip
+                            label={
+                              session.sessionType === "predefined-work-plan"
+                                ? "Predefined Work Plan"
+                                : session.sessionType === "scheduled"
+                                ? "Scheduled"
+                                : session.sessionType === "image-generation"
+                                ? "Image Generation"
+                                : "Regular"
+                            }
+                            color={
+                              session.sessionType === "predefined-work-plan"
+                                ? "primary"
+                                : session.sessionType === "scheduled"
+                                ? "secondary"
+                                : session.sessionType === "image-generation"
+                                ? "success"
+                                : "default"
+                            }
+                            size="small"
+                          />
+                        ) : (
+                          <Chip label="Undefined" color="default" size="small" />
                         )}
                       </TableCell>
                       <TableCell>

@@ -18,7 +18,11 @@ export const growthGeniusController = {
         title || 'Growth Strategy Session',
         'genius', // portalType
         'growth-genius-chat',
-        selectedStartupId
+        selectedStartupId,
+        undefined, // workflowId
+        undefined, // executionId
+        undefined, // emailCampaignTaskId
+        'regular' // sessionType
       );
 
       // Add context message based on startup selection
