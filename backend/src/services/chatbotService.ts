@@ -142,6 +142,8 @@ export interface ChatSession {
     autocomplete?: boolean; // When true, Emma MUST complete each step before responding to the user
   };
   calledFunctions?: Record<string, number>; // Track count of each function call made in this session
+  favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
+  archives?: Record<string, boolean>; // Track archived assets by URL (key: assetUrl, value: true if archived)
 }
 
 // Interface for context chunks

@@ -14,6 +14,7 @@ import axios from 'axios';
 import AWS from 'aws-sdk';
 import { dynamodb } from '../config/aws';
 import { TABLE_PREFIX } from '../config/constants';
+import { ChatbotDB } from '../services/chatbotService';
 
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
@@ -1566,6 +1567,7 @@ async function getExecutionsWithAssets(
           taskId: taskId,
           taskName: task.name,
           createdAt: task.createdAt,
+          source: 'task',
           executions: []
         };
       }
@@ -1573,7 +1575,10 @@ async function getExecutionsWithAssets(
       result[taskId].executions.push({
         executionId: execution.executionId,
         startTime: execution.startTime || null,
-        result_files: execution.result_files?.filter(fileFilter) || []
+        result_files: execution.result_files?.filter(fileFilter).map((file: ResultFile) => ({
+          ...file,
+          source: 'task'
+        })) || []
       });
     }
   });
@@ -1612,6 +1617,122 @@ async function getExecutionsWithAssets(
       task.latestPendingOrRunningExecution = null;
     }
   });
+
+  // For images, also search Agent Mode sessions for generate_image function calls
+  if (assetType === 'images') {
+    try {
+      const chatbotDb = new ChatbotDB();
+      // Get all Agent Mode sessions for the user
+      const agentSessionsResult = await chatbotDb.getUserSessions(userId, 'agent');
+      const agentSessions = agentSessionsResult.sessions || [];
+      
+      // Process each session to find generate_image tool calls
+      agentSessions.forEach((session: any) => {
+        if (!session.messages || session.archived) {
+          return;
+        }
+        
+        // Search through messages for generate_image tool calls
+        session.messages.forEach((message: any) => {
+          if (message.metadata?.toolCalls) {
+            message.metadata.toolCalls.forEach((toolCall: any) => {
+              if (toolCall.name === 'generate_image' && toolCall.result?.success && toolCall.result?.imageUrl) {
+                const imageUrl = toolCall.result.imageUrl;
+                const filename = toolCall.result.filename || 'generated-image.png';
+                
+                // Extract timestamp from message or use session updatedAt
+                const timestamp = message.timestamp || message.metadata?.timestamp || session.updatedAt || session.createdAt;
+                
+                // Create a unique key for this session (using sessionId)
+                const sessionKey = `agent-mode-${session.sessionId}`;
+                
+                if (!result[sessionKey]) {
+                  result[sessionKey] = {
+                    taskId: sessionKey,
+                    taskName: session.title || 'Agent Mode Session',
+                    createdAt: session.createdAt,
+                    source: 'agent-mode',
+                    sessionId: session.sessionId,
+                    executions: []
+                  };
+                }
+                
+                // Check if this image already exists in the executions (avoid duplicates)
+                const existingImage = result[sessionKey].executions.some((exec: any) => 
+                  exec.result_files.some((file: any) => file.url === imageUrl)
+                );
+                
+                if (!existingImage) {
+                  // Use a single execution per session to group all images
+                  const executionId = `${session.sessionId}-images`;
+                  
+                  // Check if this execution already exists
+                  let execution = result[sessionKey].executions.find((exec: any) => exec.executionId === executionId);
+                  
+                  // Check favorites and archives from session fields
+                  const isFavorited = session.favorites?.[imageUrl] || false;
+                  const isArchived = session.archives?.[imageUrl] || false;
+                  
+                  // Skip archived images (they will be filtered out, similar to task executions)
+                  if (isArchived) {
+                    return; // Skip this image
+                  }
+                  
+                  if (!execution) {
+                    execution = {
+                      executionId: executionId,
+                      startTime: timestamp, // Use the image generation timestamp
+                      result_files: []
+                    };
+                    result[sessionKey].executions.push(execution);
+                  } else {
+                    // Update startTime to the latest image generation time
+                    if (timestamp && (!execution.startTime || timestamp > execution.startTime)) {
+                      execution.startTime = timestamp;
+                    }
+                  }
+                  
+                  // Add the image file with its generation timestamp and status
+                  execution.result_files.push({
+                    url: imageUrl,
+                    filename: filename,
+                    token: '', // Not applicable for agent mode images
+                    source: 'agent-mode',
+                    sessionId: session.sessionId,
+                    generatedAt: timestamp, // Store when this specific image was generated
+                    is_favorited: isFavorited,
+                    is_archived: false // Always false since we filter out archived images
+                  });
+                }
+              }
+            });
+          }
+        });
+      });
+      
+      // Calculate latest execution time for agent mode sessions
+      Object.keys(result).forEach(key => {
+        if (result[key].source === 'agent-mode') {
+          const task = result[key];
+          const executionTimes = task.executions
+            .map((execution: any) => execution.startTime)
+            .filter((time: string) => time !== null);
+          
+          if (executionTimes.length > 0) {
+            task.latestExecutionTime = executionTimes.sort().pop();
+          } else {
+            task.latestExecutionTime = null;
+          }
+          
+          // Agent mode sessions don't have pending/running executions
+          task.latestPendingOrRunningExecution = null;
+        }
+      });
+    } catch (error) {
+      console.error('Error fetching Agent Mode images:', error);
+      // Don't fail the whole request if agent mode image fetching fails
+    }
+  }
 
   return result;
 }
@@ -1667,7 +1788,7 @@ router.get('/executions/with-html-reports', authenticateToken, async (req: Reque
   }
 });
 
-// Toggle favorite status for an image in a task execution
+// Toggle favorite status for an image in a task execution or agent mode session
 router.post('/executions/:executionId/favorite-image', authenticateToken, async (req: Request, res: Response) => {
   try {
     const { executionId } = req.params;
@@ -1682,6 +1803,60 @@ router.post('/executions/:executionId/favorite-image', authenticateToken, async 
       return res.status(400).json({ message: 'Execution ID and image URL are required' });
     }
 
+    // Check if this is an agent mode image (executionId pattern: ${sessionId}-images)
+    const isAgentModeImage = executionId.endsWith('-images');
+    const agentSessionId = isAgentModeImage ? executionId.replace('-images', '') : null;
+
+    if (agentSessionId) {
+      // Handle agent mode image - update session favorites field
+      const chatbotDb = new ChatbotDB();
+      const session = await chatbotDb.getChatSession(agentSessionId);
+      
+      if (!session) {
+        return res.status(404).json({ message: 'Session not found' });
+      }
+
+      // Verify the user owns this session
+      if (session.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+        return res.status(403).json({ message: 'Not authorized to modify this session' });
+      }
+
+      // Update favorites field (Record<string, boolean> where key is imageUrl)
+      const currentFavorites: Record<string, boolean> = session.favorites || {};
+      const currentStatus = currentFavorites[imageUrl] || false;
+      const newFavoriteStatus = !currentStatus;
+      
+      const updatedFavorites: Record<string, boolean> = {
+        ...currentFavorites,
+        [imageUrl]: newFavoriteStatus
+      };
+
+      // If unfavoriting, remove the key instead of setting to false
+      if (!newFavoriteStatus) {
+        delete updatedFavorites[imageUrl];
+      }
+
+      // Update the session with the modified favorites
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-ChatSessions`,
+        Key: { sessionId: agentSessionId },
+        UpdateExpression: "SET favorites = :favorites, updatedAt = :updatedAt",
+        ExpressionAttributeValues: {
+          ":favorites": updatedFavorites,
+          ":updatedAt": new Date().toISOString()
+        }
+      };
+
+      await dynamodb.update(params).promise();
+
+      res.json({ 
+        success: true, 
+        is_favorited: newFavoriteStatus 
+      });
+      return;
+    }
+
+    // Handle regular task execution
     // Get the execution to verify ownership and get current result_files
     const execution = await taskDb.getTaskExecutionById(executionId);
     if (!execution) {
@@ -1723,7 +1898,7 @@ router.post('/executions/:executionId/favorite-image', authenticateToken, async 
   }
 });
 
-// Archive an image in a task execution
+// Archive an image in a task execution or agent mode session
 router.post('/executions/:executionId/archive-image', authenticateToken, async (req: Request, res: Response) => {
   try {
     const { executionId } = req.params;
@@ -1738,6 +1913,52 @@ router.post('/executions/:executionId/archive-image', authenticateToken, async (
       return res.status(400).json({ message: 'Execution ID and image URL are required' });
     }
 
+    // Check if this is an agent mode image (executionId pattern: ${sessionId}-images)
+    const isAgentModeImage = executionId.endsWith('-images');
+    const agentSessionId = isAgentModeImage ? executionId.replace('-images', '') : null;
+
+    if (agentSessionId) {
+      // Handle agent mode image - update session archives field
+      const chatbotDb = new ChatbotDB();
+      const session = await chatbotDb.getChatSession(agentSessionId);
+      
+      if (!session) {
+        return res.status(404).json({ message: 'Session not found' });
+      }
+
+      // Verify the user owns this session
+      if (session.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+        return res.status(403).json({ message: 'Not authorized to modify this session' });
+      }
+
+      // Update archives field (Record<string, boolean> where key is imageUrl)
+      const currentArchives = session.archives || {};
+      const updatedArchives = {
+        ...currentArchives,
+        [imageUrl]: true
+      };
+
+      // Update the session with the modified archives
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-ChatSessions`,
+        Key: { sessionId: agentSessionId },
+        UpdateExpression: "SET archives = :archives, updatedAt = :updatedAt",
+        ExpressionAttributeValues: {
+          ":archives": updatedArchives,
+          ":updatedAt": new Date().toISOString()
+        }
+      };
+
+      await dynamodb.update(params).promise();
+
+      res.json({ 
+        success: true, 
+        message: 'Image archived successfully' 
+      });
+      return;
+    }
+
+    // Handle regular task execution
     // Get the execution to verify ownership and get current result_files
     const execution = await taskDb.getTaskExecutionById(executionId);
     if (!execution) {

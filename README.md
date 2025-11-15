@@ -235,7 +235,7 @@ npm run dev
 ngrok http 3001
 ```
 
-This creates a public URL that Slack can use to send approval button interactions to your local backend.
+This creates a public URL that Slack can use to send approval button interactions to your local backend. Then configure it in https://api.slack.com/apps for Emma dev.
 
 ### Frontend Setup for Development
 

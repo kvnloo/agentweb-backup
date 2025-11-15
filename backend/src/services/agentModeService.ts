@@ -265,7 +265,7 @@ When updating HTML files, follow this process:
 - Templates provide structured, proven approaches to common web automation marketing tasks
 - **Fallback Method**: If no suitable template is available, use 'create_task_from_prompt' to create a web automation task with a raw prompt
 - The 'create_task_from_prompt' tool allows you to create custom web automation tasks with specific instructions when templates don't fit
- - **Image Generation**: For real-time (~30s) image generation, use 'generate_image'. For longer-running, fully tracked jobs that may take a couple of minutes, use 'create_image_task_from_prompt' to create an image generation task (ad creatives, social media images, marketing visuals).
+ - **Image Generation**: Use 'generate_image' for creating and revising images. This provides real-time (~30s) image generation. [DEPRECATED: 'create_image_task_from_prompt' is deprecated - use 'generate_image' instead]
  - **Blog Articles**: When creating blog articles, prefer using the 'create_blog_article' tool. It generates the article content, creates a high-quality hero image via imageService, formats the article into clean HTML, uploads it to S3, and returns the final HTML URL. Avoid ad-hoc content + image flows when this tool fits the request.
  - **Meta Ads Metrics**: Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data
 - When metrics data is loaded, provide contextual analysis based on the conversation history and user's business goals
@@ -287,14 +287,7 @@ When updating HTML files, follow this process:
 - **Previous Task Results**: Previous task results are automatically attached by default to provide context
 - This includes the latest HTML results from previous completed tasks in the same conversation
 - Set attach_previous_task_results to false only if you don't want previous results included
-- **Revision Method**: Use 'create_revision' tool to revise existing completed task executions
-- Supports both HTML reports and images for revision
-- Provide the task_id, execution_id, and detailed revision_prompt
-- Use the execution_id from the Current Task Statuses context above
-- If execution has multiple results, specify target_result_name to choose which one to revise
-- If multiple results exist and no target specified, the tool will return available options
-- This creates a new execution with the revision instructions
-- Only completed executions can be revised
+- **Revision Method**: [DEPRECATED: 'create_revision' is deprecated] For image revision, use 'generate_image' with the original image as an input image. For HTML report revision, use 'update_html_file' to update the HTML file content.
 
 ## Task Execution
 - When you create tasks, they will show execution status in the UI (pending, running, completed, failed)
@@ -801,7 +794,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'create_image_task_from_prompt',
-          description: 'Create an image generation task using a raw prompt for creating visual content',
+          description: '[DEPRECATED] Create an image generation task using a raw prompt for creating visual content. Use \'generate_image\' instead for creating and revising images.',
           parameters: {
             type: 'object',
             properties: {
@@ -856,7 +849,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'create_revision',
-          description: 'Create a revision of an existing completed task execution (supports both reports and images)',
+          description: '[DEPRECATED] Create a revision of an existing completed task execution (supports both reports and images). For image revision, use \'generate_image\' instead. For HTML report revision, use \'update_html_file\' instead.',
           parameters: {
             type: 'object',
             properties: {
@@ -977,9 +970,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 },
                 size: {
                   type: 'string',
-                  description: 'Image size in pixels (1024x1024, 1536x1024, 1024x1536, or auto)',
-                  enum: ['1024x1024', '1536x1024', '1024x1536', 'auto'],
-                  default: '1024x1024'
+                  description: 'Image size or ratio. For GPT models: 1024x1024, 1536x1024, 1024x1536, or auto. For Runway models: use ratio format like 1344:768, 768:1344, 1024:1024, 832x1248, etc. Use "auto" for automatic sizing.',
+                  default: 'auto'
                 },
                 quality: {
                   type: 'string',
@@ -993,6 +985,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
                   items: {
                     type: 'string'
                   }
+                },
+                imageModel: {
+                  type: 'string',
+                  description: 'Optional: Specific image generation model to use. Must be one of: gpt-image-1 (by Azure), gemini-2.5-flash-image-preview (by Google), gen4_image (by Runway), gemini_2.5_flash (by Runway).',
+                  enum: ['gpt-image-1', 'gemini-2.5-flash-image-preview', 'gen4_image', 'gemini_2.5_flash']
                 }
               },
               required: ['prompt', 'filename']
@@ -1939,7 +1936,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'read_page_source':
         return await this.readFileContent(args.url);
       case 'generate_image':
-        return await this.generateImage(args.prompt, args.filename, args.size || '1024x1024', args.quality || 'medium', args.inputImages || [], userId, sessionId);
+        return await this.generateImage(args.prompt, args.filename, args.size || '1024x1024', args.quality || 'medium', args.inputImages || [], userId, sessionId, args.imageModel);
         case 'create_blog_article':
           return await this.createBlogArticle(args.topic, args.keywords || '', args.tone || 'professional', args.length || 'medium', args.researchContext || '', args.requirements || '', userId, sessionId);
       case 'get_task_subscriber_metrics':
@@ -5181,10 +5178,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
     quality: string,
     inputImages: string[],
     userId: string,
-    sessionId: string
+    sessionId: string,
+    imageModel?: string
   ): Promise<any> {
     try {
-      console.log('AgentMode: Generating image with prompt:', prompt, 'filename:', filename, 'size:', size, 'quality:', quality, 'inputImages:', inputImages, 'userId:', userId, 'sessionId:', sessionId);
+      console.log('AgentMode: Generating image with prompt:', prompt, 'filename:', filename, 'size:', size, 'quality:', quality, 'inputImages:', inputImages, 'imageModel:', imageModel, 'userId:', userId, 'sessionId:', sessionId);
       
       // Import the image generation service
       const { imageService } = await import('./imageGeneration');
@@ -5206,7 +5204,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         size,
         quality,
         inputImages: inputImages || [],
-        userId
+        userId,
+        imageModel
       });
 
       if (result.success && result.imageUrl) {
