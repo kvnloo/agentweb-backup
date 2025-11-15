@@ -7,6 +7,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-11-14',
+    changes: [
+      'Supported creating and revising ad images with Agent Mode',
+      '- Users can now create ad images directly in Agent Mode and the images will be available in the Ad Images page',
+      '- Support for uploading reference images as attachments when creating images',
+      '- Image revision requests are now processed in Agent Mode with support for model and size selection',
+      '- Users can select from multiple image models: GPT Image 1, Gemini 2.5 Flash Image, Runway ML Gen-4, and Runway ML Gemini 2.5',
+      '- Image size selection available for specific models with model-specific aspect ratios',
+    ],
+  },
+  {
     date: '2025-11-12',
     changes: [
       'Supported Predefined Work Plans in Agent Mode',
