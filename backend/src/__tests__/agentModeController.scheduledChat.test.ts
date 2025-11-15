@@ -424,7 +424,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         undefined,
         undefined,
         undefined,
-        undefined
+        undefined,
+        'scheduled'
       );
     });
 
@@ -461,7 +462,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         undefined,
         undefined,
         undefined,
-        'campaign-task-123'
+        'campaign-task-123',
+        'scheduled'
       );
     });
 
@@ -498,7 +500,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         undefined,
         undefined,
         undefined,
-        null
+        null,
+        'scheduled'
       );
     });
 
