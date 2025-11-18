@@ -1145,13 +1145,15 @@ router.put('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
       return res.status(403).json({ message: 'Not authorized to modify this task' });
     }
 
+    // Set knowledgeBaseType to 'private' if not defined
+    const knowledgeBaseType = task.knowledgeBaseType || 'private';
     if (!task.knowledgeBaseType) {
-      return res.status(400).json({ message: 'Knowledge base type not defined' });
+      await taskDb.updateTask(taskId, { knowledgeBaseType: 'private' });
     }
 
     // Use the appropriate bucket based on knowledgeBaseType
     const storageInstance = await initializeStorage();
-    const bucket = storageInstance.bucket(task.knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
+    const bucket = storageInstance.bucket(knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
     const filePath = `tasks/${taskId}/knowledge-base.txt`;
     const file = bucket.file(filePath);
 
