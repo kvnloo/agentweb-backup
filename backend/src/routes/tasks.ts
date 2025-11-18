@@ -1318,6 +1318,56 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
   }
 });
 
+// Delete knowledge base endpoint
+router.delete('/:taskId/knowledge-base', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { taskId } = req.params;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+      return res.status(403).json({ message: 'Not authorized to modify this task' });
+    }
+
+    if (!task.knowledgeBaseType) {
+      return res.status(400).json({ message: 'Knowledge base does not exist for this task' });
+    }
+
+    // Delete file from GCS bucket
+    const storageInstance = await initializeStorage();
+    const bucket = storageInstance.bucket(task.knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
+    const filePath = `tasks/${taskId}/knowledge-base.txt`;
+    const file = bucket.file(filePath);
+    
+    // Check if file exists and delete it
+    const [exists] = await file.exists();
+    if (exists) {
+      await file.delete();
+    }
+
+    // Update task to remove knowledge base information
+    await taskDb.updateTask(taskId, {
+      knowledgeBaseSize: 0,
+      knowledgeBase: null,
+      knowledgeBaseType: null,
+      knowledgeBaseUpdatedAt: null
+    });
+
+    res.json({ message: 'Knowledge base deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting knowledge base:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
 // Add the knowledge base type toggle endpoint
 router.put('/:id/knowledge-base-type', authenticateToken, async (req: Request, res: Response) => {
   const taskId = req.params.id;
