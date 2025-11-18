@@ -993,6 +993,59 @@ async function getFileSize(bucket: Bucket, filePath: string): Promise<number> {
 }
 
 // Knowledge Base routes
+// Get all knowledge bases for the authenticated user
+router.get('/knowledge-base/all', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Get all tasks for the user
+    const tasks = await taskDb.getTasksByUserId(userId);
+
+    if (!tasks) {
+      return res.json([]);
+    }
+
+    // Filter tasks with non-empty knowledge base
+    const tasksWithKnowledgeBase = tasks.filter((task: any) => {
+      const size = typeof task.knowledgeBaseSize === 'string' 
+        ? parseInt(task.knowledgeBaseSize) 
+        : task.knowledgeBaseSize || 0;
+      return size > 0;
+    });
+
+    // Map to return only necessary fields
+    const knowledgeBaseTasks = tasksWithKnowledgeBase.map((task: any) => ({
+      taskId: task.taskId,
+      name: task.name,
+      knowledgeBaseSize: typeof task.knowledgeBaseSize === 'string' 
+        ? parseInt(task.knowledgeBaseSize) 
+        : task.knowledgeBaseSize || 0,
+      knowledgeBaseType: task.knowledgeBaseType || 'private',
+      knowledgeBaseUpdatedAt: task.knowledgeBaseUpdatedAt,
+    }));
+
+    // Sort by last updated (most recent first)
+    knowledgeBaseTasks.sort((a, b) => {
+      const dateA = a.knowledgeBaseUpdatedAt 
+        ? new Date(a.knowledgeBaseUpdatedAt).getTime() 
+        : 0;
+      const dateB = b.knowledgeBaseUpdatedAt 
+        ? new Date(b.knowledgeBaseUpdatedAt).getTime() 
+        : 0;
+      return dateB - dateA;
+    });
+
+    res.json(knowledgeBaseTasks);
+  } catch (error) {
+    console.error('Error in knowledge base all GET:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
 router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, res: Response) => {
   try {
     const { taskId } = req.params;
@@ -1096,13 +1149,15 @@ router.put('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
       return res.status(403).json({ message: 'Not authorized to modify this task' });
     }
 
+    // Set knowledgeBaseType to 'private' if not defined
+    const knowledgeBaseType = task.knowledgeBaseType || 'private';
     if (!task.knowledgeBaseType) {
-      return res.status(400).json({ message: 'Knowledge base type not defined' });
+      await taskDb.updateTask(taskId, { knowledgeBaseType: 'private' });
     }
 
     // Use the appropriate bucket based on knowledgeBaseType
     const storageInstance = await initializeStorage();
-    const bucket = storageInstance.bucket(task.knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
+    const bucket = storageInstance.bucket(knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
     const filePath = `tasks/${taskId}/knowledge-base.txt`;
     const file = bucket.file(filePath);
 
@@ -1265,6 +1320,56 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
     });
   } catch (error) {
     console.error('Error updating knowledge base from execution:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Delete knowledge base endpoint
+router.delete('/:taskId/knowledge-base', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { taskId } = req.params;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+      return res.status(403).json({ message: 'Not authorized to modify this task' });
+    }
+
+    if (!task.knowledgeBaseType) {
+      return res.status(400).json({ message: 'Knowledge base does not exist for this task' });
+    }
+
+    // Delete file from GCS bucket
+    const storageInstance = await initializeStorage();
+    const bucket = storageInstance.bucket(task.knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
+    const filePath = `tasks/${taskId}/knowledge-base.txt`;
+    const file = bucket.file(filePath);
+    
+    // Check if file exists and delete it
+    const [exists] = await file.exists();
+    if (exists) {
+      await file.delete();
+    }
+
+    // Update task to remove knowledge base information
+    await taskDb.updateTask(taskId, {
+      knowledgeBaseSize: 0,
+      knowledgeBase: undefined,
+      knowledgeBaseType: undefined,
+      knowledgeBaseUpdatedAt: undefined
+    });
+
+    res.json({ message: 'Knowledge base deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting knowledge base:', error);
     res.status(500).json({ message: 'Internal server error' });
   }
 });

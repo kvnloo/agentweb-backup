@@ -3,7 +3,7 @@ import OpenAI from 'openai';
 import { google } from 'googleapis';
 import { createHash } from 'crypto';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { chatbotDb, ChatMessage } from './chatbotService';
+import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
 import { taskDb, taskTemplateDb } from './db';
 import { settingsService } from './settingsService';
 import { getSecret } from '../utils/secretsManager';
@@ -274,15 +274,18 @@ When updating HTML files, follow this process:
 - Compare metrics against industry benchmarks and identify specific optimization opportunities
 - If a user asks about a specific ad that doesn't appear in the metrics data, explain that the ad may be disabled, paused, or have no activity in the selected timeframe
 - **Important**: You cannot pull metrics for individual ads by name - the metrics function returns all active ads in the timeframe. If a user asks for specific ad metrics, explain that you can only analyze the ads that appear in the current data set
-- **Web Search**: Use 'search_web' proactively to gather current information before asking users for clarification
+- **Web Search**: Use 'search_web' proactively to gather information from the internet before asking users for clarification
 - **Automatic and fast**: Web search does NOT require user confirmation - use it automatically to improve your responses
-- **When to search**: Before asking users for more details, search for current market data, industry trends, competitor information, or recent developments
-- **Search first, ask second**: Use web search to gather background information and context before requesting additional details from users
-- **Search topics include**: Market trends, industry benchmarks, competitor analysis, recent news, regulatory changes, technology updates, or any current information that would help provide better recommendations
-- **Search strategy**: Use specific, targeted search queries to find the most relevant and recent information
+- **When to search**: Before asking users for more details, search for market data, industry trends, competitor information, or other information available on the internet
+- **Search first, ask second**: Use web search to gather background information and context from the internet before requesting additional details from users
+- **Search topics include**: Market trends, industry benchmarks, competitor analysis, news, regulatory information, technology updates, or any information from the internet that would help provide better recommendations
+- **Search strategy**: Use specific, targeted search queries to find the most relevant information
 - **Integration**: Incorporate search results into your analysis and recommendations to provide data-driven insights
 - **Search result presentation**: Always provide a tailored summary of search results that directly answers the user's question
 - **Synthesize findings**: Analyze and synthesize search results to provide actionable insights relevant to the user's specific needs
+- **Knowledge Base Search**: Use 'search_knowledge_base' to find information stored in the knowledge base. The knowledge base contains private knowledge (user-specific) and public knowledge (shared by all users and the platform). This is complementary to web search - use knowledge base for stored information and web search for information from the internet
+- **When to use knowledge base**: Search the knowledge base when you need stored information that may have been added manually by users or captured from past work
+- **Knowledge base vs web search**: Use knowledge base search for stored information (private or public), and web search for information from the internet
 
 - **Previous Task Results**: Previous task results are automatically attached by default to provide context
 - This includes the latest HTML results from previous completed tasks in the same conversation
@@ -879,13 +882,35 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'search_web',
-          description: 'Search the web for current information when you need up-to-date data or real-time information',
+          description: 'Search the web for information from the internet',
           parameters: {
             type: 'object',
             properties: {
               query: {
                 type: 'string',
                 description: 'The search query to find relevant information on the web'
+              },
+              max_results: {
+                type: 'number',
+                description: 'Maximum number of search results to return (default: 5, max: 10)',
+                default: 5
+              }
+            },
+            required: ['query']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'search_knowledge_base',
+          description: 'Search the knowledge base for relevant information. The knowledge base contains private knowledge (user-specific) and public knowledge (shared by all users and the platform). This is complementary to web search - use knowledge base for stored information and web search for information from the internet.',
+          parameters: {
+            type: 'object',
+            properties: {
+              query: {
+                type: 'string',
+                description: 'The search query to find relevant information in the knowledge base'
               },
               max_results: {
                 type: 'number',
@@ -1602,6 +1627,24 @@ Use the available tools to create tasks in the agent-engine when complex work is
           ]
         };
       
+      case 'search_knowledge_base':
+        return {
+          success: true,
+          message: `Found 2 mock knowledge base results for "${args.query}"`,
+          query: args.query,
+          results: [
+            {
+              content: `This is a mock knowledge base result for "${args.query}". It contains information that was previously stored from a task execution.`,
+              source: 'public-knowledge-base'
+            },
+            {
+              content: `Another mock knowledge base result for "${args.query}". This information comes from a private knowledge base entry.`,
+              source: 'private-knowledge-base'
+            }
+          ],
+          totalResults: 2
+        };
+      
       case 'read_brand_guidelines':
         return {
           success: true,
@@ -1921,6 +1964,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.createRevision(args.task_id, args.execution_id, args.revision_prompt, userId, args.target_result_name);
       case 'search_web':
         return await this.searchWeb(args.query, args.max_results || 10);
+      case 'search_knowledge_base':
+        return await this.searchKnowledgeBase(args.query, args.max_results || 5, userId);
       case 'read_brand_guidelines':
         return await this.readBrandGuidelines(userId);
       case 'update_brand_guidelines':
@@ -4487,6 +4532,47 @@ Use the available tools to create tasks in the agent-engine when complex work is
   private formatToolError(toolName: string, errorMessage: string): string {
     const safeMessage = typeof errorMessage === 'string' ? errorMessage : 'Unknown error';
     return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nNext: Adjust the plan or ask the user for missing info.`;
+  }
+
+  // Knowledge base search functionality
+  private async searchKnowledgeBase(query: string, maxResults: number = 5, userId?: string): Promise<any> {
+    try {
+      console.log('AgentMode: Searching knowledge base for query:', query, 'maxResults:', maxResults);
+      
+      // Limit max results to 10
+      const limitedMaxResults = Math.min(maxResults, 10);
+      
+      // Search platform knowledge base (both public and private)
+      const searchResults = await searchPlatformKnowledgeBase(query, limitedMaxResults, userId);
+      
+      if (!searchResults || searchResults.length === 0) {
+        return {
+          success: true,
+          message: `No knowledge base results found for "${query}"`,
+          query,
+          results: [],
+          totalResults: 0
+        };
+      }
+      
+      return {
+        success: true,
+        message: `Found ${searchResults.length} knowledge base results for "${query}"`,
+        query,
+        results: searchResults.map(result => ({
+          content: result.content,
+          source: result.metadata?.source || 'unknown'
+        })),
+        totalResults: searchResults.length
+      };
+    } catch (error) {
+      console.error('AgentMode: Error searching knowledge base:', error);
+      return {
+        success: false,
+        message: 'Failed to search the knowledge base. Please try again.',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
   }
 
   // Web search functionality
