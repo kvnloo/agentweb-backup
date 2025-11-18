@@ -256,7 +256,9 @@ describe('AgentModeService - search_knowledge_base', () => {
         {
           id: 'kb-1',
           content: 'Test content',
-          metadata: {}
+          metadata: {
+            source: 'test-source'
+          }
         }
       ];
 

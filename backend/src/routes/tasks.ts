@@ -1005,8 +1005,12 @@ router.get('/knowledge-base/all', authenticateToken, async (req: Request, res: R
     // Get all tasks for the user
     const tasks = await taskDb.getTasksByUserId(userId);
 
+    if (!tasks) {
+      return res.json([]);
+    }
+
     // Filter tasks with non-empty knowledge base
-    const tasksWithKnowledgeBase = tasks.filter((task) => {
+    const tasksWithKnowledgeBase = tasks.filter((task: any) => {
       const size = typeof task.knowledgeBaseSize === 'string' 
         ? parseInt(task.knowledgeBaseSize) 
         : task.knowledgeBaseSize || 0;
@@ -1014,7 +1018,7 @@ router.get('/knowledge-base/all', authenticateToken, async (req: Request, res: R
     });
 
     // Map to return only necessary fields
-    const knowledgeBaseTasks = tasksWithKnowledgeBase.map((task) => ({
+    const knowledgeBaseTasks = tasksWithKnowledgeBase.map((task: any) => ({
       taskId: task.taskId,
       name: task.name,
       knowledgeBaseSize: typeof task.knowledgeBaseSize === 'string' 
@@ -1358,9 +1362,9 @@ router.delete('/:taskId/knowledge-base', authenticateToken, async (req: Request,
     // Update task to remove knowledge base information
     await taskDb.updateTask(taskId, {
       knowledgeBaseSize: 0,
-      knowledgeBase: null,
-      knowledgeBaseType: null,
-      knowledgeBaseUpdatedAt: null
+      knowledgeBase: undefined,
+      knowledgeBaseType: undefined,
+      knowledgeBaseUpdatedAt: undefined
     });
 
     res.json({ message: 'Knowledge base deleted successfully' });

@@ -178,7 +178,7 @@ describe('Knowledge Base Delete Endpoint - DELETE /api/tasks/:taskId/knowledge-b
     });
 
     it('should return 404 when task is not found', async () => {
-      mockedTaskDb.getTaskById.mockResolvedValue(null);
+      mockedTaskDb.getTaskById.mockResolvedValue(undefined);
 
       const response = await request(app)
         .delete('/api/tasks/task-123/knowledge-base')

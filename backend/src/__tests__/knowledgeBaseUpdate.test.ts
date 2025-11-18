@@ -175,7 +175,7 @@ describe('Knowledge Base Update Endpoint - PUT /api/tasks/:taskId/knowledge-base
     });
 
     it('should return 404 when task is not found', async () => {
-      mockedTaskDb.getTaskById.mockResolvedValue(null);
+      mockedTaskDb.getTaskById.mockResolvedValue(undefined);
 
       const response = await request(app)
         .put('/api/tasks/task-123/knowledge-base')
