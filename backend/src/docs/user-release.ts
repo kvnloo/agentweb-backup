@@ -7,6 +7,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-11-18',
+    changes: [
+      'Added Knowledge Base page',
+      '- Lists all knowledge base files, sorted by most recently updated',
+      '- Toggle between public and private knowledge bases by clicking the lock icon',
+      '- Create new knowledge bases with custom names and content',
+      '- Delete knowledge bases with confirmation dialog',
+      '- Knowledge bases can be searched in Agent Mode using the search_knowledge_base function',
+    ],
+  },
+  {
     date: '2025-11-14',
     changes: [
       'Supported creating and revising ad images with Agent Mode',
