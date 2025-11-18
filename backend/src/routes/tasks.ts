@@ -993,6 +993,55 @@ async function getFileSize(bucket: Bucket, filePath: string): Promise<number> {
 }
 
 // Knowledge Base routes
+// Get all knowledge bases for the authenticated user
+router.get('/knowledge-base/all', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Get all tasks for the user
+    const tasks = await taskDb.getTasksByUserId(userId);
+
+    // Filter tasks with non-empty knowledge base
+    const tasksWithKnowledgeBase = tasks.filter((task) => {
+      const size = typeof task.knowledgeBaseSize === 'string' 
+        ? parseInt(task.knowledgeBaseSize) 
+        : task.knowledgeBaseSize || 0;
+      return size > 0;
+    });
+
+    // Map to return only necessary fields
+    const knowledgeBaseTasks = tasksWithKnowledgeBase.map((task) => ({
+      taskId: task.taskId,
+      name: task.name,
+      knowledgeBaseSize: typeof task.knowledgeBaseSize === 'string' 
+        ? parseInt(task.knowledgeBaseSize) 
+        : task.knowledgeBaseSize || 0,
+      knowledgeBaseType: task.knowledgeBaseType || 'private',
+      knowledgeBaseUpdatedAt: task.knowledgeBaseUpdatedAt,
+    }));
+
+    // Sort by last updated (most recent first)
+    knowledgeBaseTasks.sort((a, b) => {
+      const dateA = a.knowledgeBaseUpdatedAt 
+        ? new Date(a.knowledgeBaseUpdatedAt).getTime() 
+        : 0;
+      const dateB = b.knowledgeBaseUpdatedAt 
+        ? new Date(b.knowledgeBaseUpdatedAt).getTime() 
+        : 0;
+      return dateB - dateA;
+    });
+
+    res.json(knowledgeBaseTasks);
+  } catch (error) {
+    console.error('Error in knowledge base all GET:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
 router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, res: Response) => {
   try {
     const { taskId } = req.params;
