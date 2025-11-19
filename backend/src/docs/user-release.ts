@@ -7,6 +7,18 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-11-19',
+    changes: [
+      'Improved the work plan UI',
+      '- Enhanced work plan progress display with better mobile-friendly design',
+      '- Plan flow page is optimized for mobile devices with responsive layouts',
+      'Removed Dashboard and Templates page',
+      '- Dashboard and Templates sections are now hidden from navigation to streamline the user experience',
+      '- You can still run web tasks with custom prompt or templates directly in Agent Mode',
+      '- Agent Mode is now the primary interface for all task creation and execution',
+    ],
+  },
+  {
     date: '2025-11-18',
     changes: [
       'Added Knowledge Base page',
