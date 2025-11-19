@@ -16,6 +16,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Dashboard and Templates sections are now hidden from navigation to streamline the user experience',
       '- You can still run web tasks with custom prompt or templates directly in Agent Mode',
       '- Agent Mode is now the primary interface for all task creation and execution',
+      'Added Knowledge Base File Access in Agent Mode',
+      '- Emma can now list all available knowledge base files using list_knowledge_base_files function',
+      '- Emma can read specific knowledge base files by their unique identifier using read_knowledge_base_file function',
+      '- Knowledge base files are automatically truncated to 50KB to ensure optimal performance',
+      '- These functions complement the existing search_knowledge_base function for comprehensive knowledge base access',
     ],
   },
   {

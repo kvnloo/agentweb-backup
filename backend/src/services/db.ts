@@ -1329,6 +1329,59 @@ export const taskDb = {
       return [];
     }
   },
+
+  async getTasksWithKnowledgeBase(userId: string) {
+    try {
+      // Get all tasks for the user
+      const tasks = await this.getTasksByUserId(userId);
+
+      if (!tasks || tasks.length === 0) {
+        return [];
+      }
+
+      // Filter tasks with non-empty knowledge base
+      const tasksWithKnowledgeBase = tasks.filter((task: any) => {
+        const size = typeof task.knowledgeBaseSize === 'string' 
+          ? parseInt(task.knowledgeBaseSize) 
+          : task.knowledgeBaseSize || 0;
+        return size > 0;
+      });
+
+      // Map to return standardized fields
+      const knowledgeBaseTasks = tasksWithKnowledgeBase.map((task: any) => {
+        const size = typeof task.knowledgeBaseSize === 'string' 
+          ? parseInt(task.knowledgeBaseSize) 
+          : task.knowledgeBaseSize || 0;
+        
+        return {
+          taskId: task.taskId,
+          name: task.name,
+          knowledgeBaseSize: size,
+          knowledgeBaseType: task.knowledgeBaseType || 'private',
+          knowledgeBaseUpdatedAt: task.knowledgeBaseUpdatedAt || task.updatedAt || task.createdAt,
+          // Include additional fields that might be useful
+          updatedAt: task.updatedAt || task.createdAt,
+          createdAt: task.createdAt
+        };
+      });
+
+      // Sort by last updated (most recent first)
+      knowledgeBaseTasks.sort((a, b) => {
+        const dateA = a.knowledgeBaseUpdatedAt 
+          ? new Date(a.knowledgeBaseUpdatedAt).getTime() 
+          : 0;
+        const dateB = b.knowledgeBaseUpdatedAt 
+          ? new Date(b.knowledgeBaseUpdatedAt).getTime() 
+          : 0;
+        return dateB - dateA;
+      });
+
+      return knowledgeBaseTasks;
+    } catch (error) {
+      handleDynamoDbError(error, "getTasksWithKnowledgeBase");
+      return [];
+    }
+  },
 };
 
 export const waitlistDb = {

@@ -3,10 +3,11 @@ import OpenAI from 'openai';
 import { google } from 'googleapis';
 import { createHash } from 'crypto';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { Storage } from '@google-cloud/storage';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
 import { taskDb, taskTemplateDb } from './db';
 import { settingsService } from './settingsService';
-import { getSecret } from '../utils/secretsManager';
+import { getSecret, getGCSPPrivateKey } from '../utils/secretsManager';
 
 // Type declaration for pdf-parse module
 interface PDFData {
@@ -925,6 +926,35 @@ Use the available tools to create tasks in the agent-engine when complex work is
       {
         type: 'function' as const,
         function: {
+          name: 'list_knowledge_base_files',
+          description: 'List all available knowledge base files for the current user. Returns a list of files with their unique identifiers, names, sizes, types (public/private), and last updated timestamps.',
+          parameters: {
+            type: 'object',
+            properties: {},
+            required: []
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'read_knowledge_base_file',
+          description: 'Read a knowledge base file based on its unique identifier. Returns the full content of the knowledge base file.',
+          parameters: {
+            type: 'object',
+            properties: {
+              file_identifier: {
+                type: 'string',
+                description: 'The unique identifier of the knowledge base file to read'
+              }
+            },
+            required: ['file_identifier']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
           name: 'save_file',
           description: 'Create and save a file with the provided content to S3, then return the file URL for sharing or reference',
           parameters: {
@@ -1645,6 +1675,41 @@ Use the available tools to create tasks in the agent-engine when complex work is
           totalResults: 2
         };
       
+      case 'list_knowledge_base_files':
+        return {
+          success: true,
+          message: 'Found 2 mock knowledge base file(s)',
+          files: [
+            {
+              file_identifier: 'mock-task-1',
+              name: 'Mock Product Specifications',
+              size: 1024,
+              type: 'private',
+              updatedAt: new Date().toISOString()
+            },
+            {
+              file_identifier: 'mock-task-2',
+              name: 'Mock Company Guidelines',
+              size: 2048,
+              type: 'public',
+              updatedAt: new Date(Date.now() - 86400000).toISOString()
+            }
+          ],
+          totalFiles: 2
+        };
+      
+      case 'read_knowledge_base_file':
+        return {
+          success: true,
+          message: `Successfully read knowledge base file "Mock Product Specifications"`,
+          file_identifier: args.file_identifier || 'mock-task-1',
+          name: 'Mock Product Specifications',
+          content: `This is mock knowledge base content for file identifier "${args.file_identifier}".\n\nIt contains information that was previously stored from a task execution.\n\nThis content can include:\n- Product specifications\n- Company guidelines\n- Process documentation\n- Any other relevant information stored in the knowledge base.`,
+          size: 1024,
+          type: 'private',
+          updatedAt: new Date().toISOString()
+        };
+      
       case 'read_brand_guidelines':
         return {
           success: true,
@@ -1966,6 +2031,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.searchWeb(args.query, args.max_results || 10);
       case 'search_knowledge_base':
         return await this.searchKnowledgeBase(args.query, args.max_results || 5, userId);
+      case 'list_knowledge_base_files':
+        return await this.listKnowledgeBaseFiles(userId);
+      case 'read_knowledge_base_file':
+        return await this.readKnowledgeBaseFile(args.file_identifier, userId);
       case 'read_brand_guidelines':
         return await this.readBrandGuidelines(userId);
       case 'update_brand_guidelines':
@@ -4570,6 +4639,150 @@ Use the available tools to create tasks in the agent-engine when complex work is
       return {
         success: false,
         message: 'Failed to search the knowledge base. Please try again.',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // List all knowledge base files for a user
+  private async listKnowledgeBaseFiles(userId: string): Promise<any> {
+    try {
+      console.log('AgentMode: Listing knowledge base files for user:', userId);
+      
+      // Use the common function to get tasks with knowledge base
+      const knowledgeBaseTasks = await taskDb.getTasksWithKnowledgeBase(userId);
+      
+      if (!knowledgeBaseTasks || knowledgeBaseTasks.length === 0) {
+        return {
+          success: true,
+          message: 'No knowledge base files found',
+          files: [],
+          totalFiles: 0
+        };
+      }
+
+      // Map to return file information in the format expected by Agent Mode
+      const files = knowledgeBaseTasks.map((task: any) => ({
+        file_identifier: task.taskId,
+        name: task.name,
+        size: task.knowledgeBaseSize,
+        type: task.knowledgeBaseType,
+        updatedAt: task.knowledgeBaseUpdatedAt
+      }));
+
+      return {
+        success: true,
+        message: `Found ${files.length} knowledge base file(s)`,
+        files,
+        totalFiles: files.length
+      };
+    } catch (error) {
+      console.error('AgentMode: Error listing knowledge base files:', error);
+      return {
+        success: false,
+        message: 'Failed to list knowledge base files. Please try again.',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // Read a knowledge base file by its unique identifier
+  private async readKnowledgeBaseFile(fileIdentifier: string, userId: string): Promise<any> {
+    try {
+      console.log('AgentMode: Reading knowledge base file:', fileIdentifier, 'for user:', userId);
+      
+      if (!fileIdentifier) {
+        return {
+          success: false,
+          message: 'File identifier is required'
+        };
+      }
+
+      // Get the task
+      const task = await taskDb.getTaskById(fileIdentifier);
+      
+      if (!task) {
+        return {
+          success: false,
+          message: `Knowledge base file with identifier "${fileIdentifier}" not found`
+        };
+      }
+
+      // Check authorization
+      if (task.userId !== userId) {
+        return {
+          success: false,
+          message: 'Not authorized to access this knowledge base file'
+        };
+      }
+
+      // Check if knowledge base exists
+      const size = typeof task.knowledgeBaseSize === 'string' 
+        ? parseInt(task.knowledgeBaseSize) 
+        : task.knowledgeBaseSize || 0;
+      
+      if (size === 0) {
+        return {
+          success: false,
+          message: `Knowledge base file "${task.name}" is empty or does not exist`
+        };
+      }
+
+      // Initialize storage
+      const privateKey = await getGCSPPrivateKey();
+      const storage = new Storage({
+        projectId: process.env.GCS_PROJECT_ID,
+        credentials: {
+          client_email: process.env.GCS_CLIENT_EMAIL,
+          private_key: privateKey
+        }
+      });
+
+      const BUCKET_NAME = process.env.GCS_BUCKET_NAME || 'agentweb-knowledge-base-dev';
+      const PRIVATE_BUCKET_NAME = process.env.GCS_BUCKET_NAME_PRIVATE || 'agentweb-knowledge-base-private-dev';
+
+      // Determine which bucket to use
+      const bucketType = task.knowledgeBaseType || 'private';
+      const bucket = storage.bucket(bucketType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
+      const filePath = `tasks/${fileIdentifier}/knowledge-base.txt`;
+      const file = bucket.file(filePath);
+
+      // Check if file exists
+      const [exists] = await file.exists();
+      
+      if (!exists) {
+        return {
+          success: false,
+          message: `Knowledge base file "${task.name}" not found in storage`
+        };
+      }
+
+      // Download and read the file content
+      const [content] = await file.download();
+      let contentStr = content.toString();
+
+      // Limit content size to prevent overwhelming the LLM and session storage
+      const maxContentLength = 50000; // 50KB limit for tool results
+      if (contentStr.length > maxContentLength) {
+        contentStr = contentStr.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]';
+        console.log(`AgentMode: Knowledge base content truncated to ${maxContentLength} characters`);
+      }
+
+      return {
+        success: true,
+        message: `Successfully read knowledge base file "${task.name}"`,
+        file_identifier: fileIdentifier,
+        name: task.name,
+        content: contentStr,
+        size: size,
+        type: bucketType,
+        updatedAt: task.knowledgeBaseUpdatedAt || task.updatedAt || task.createdAt
+      };
+    } catch (error) {
+      console.error('AgentMode: Error reading knowledge base file:', error);
+      return {
+        success: false,
+        message: 'Failed to read knowledge base file. Please try again.',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
