@@ -185,7 +185,7 @@ describe('AgentModeService - Knowledge Base Files', () => {
       });
 
       it('should return error when task not found', async () => {
-        mockedTaskDb.getTaskById.mockResolvedValue(null);
+        mockedTaskDb.getTaskById.mockResolvedValue(undefined);
 
         const result = await (agentModeService as any).readKnowledgeBaseFile('invalid-id', 'user-123');
 
