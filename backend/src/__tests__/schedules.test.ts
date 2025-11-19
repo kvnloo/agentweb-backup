@@ -61,7 +61,8 @@ describe('Schedules Controller', () => {
         frequency: 'daily',
         status: 'active',
         nextRunTime: new Date().toISOString(),
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
       },
       {
         scheduleId: 'schedule-2',
@@ -70,7 +71,8 @@ describe('Schedules Controller', () => {
         frequency: 'weekly',
         status: 'active',
         nextRunTime: new Date().toISOString(),
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
       }
     ];
 
@@ -135,7 +137,7 @@ describe('Schedules Controller', () => {
     });
 
     it('should return 404 when task does not exist', async () => {
-      mockTaskDb.getTaskById.mockResolvedValue(null);
+      mockTaskDb.getTaskById.mockResolvedValue(undefined);
 
       const response = await request(app)
         .get(`/api/schedules/task/${taskId}`)
@@ -148,7 +150,7 @@ describe('Schedules Controller', () => {
 
     it('should return 404 when user does not exist', async () => {
       mockTaskDb.getTaskById.mockResolvedValue(mockTask);
-      mockUserDb.getUserById.mockResolvedValue(null);
+      mockUserDb.getUserById.mockResolvedValue(undefined);
 
       const response = await request(app)
         .get(`/api/schedules/task/${taskId}`)
@@ -172,7 +174,8 @@ describe('Schedules Controller', () => {
       frequency: 'daily',
       status: 'active',
       nextRunTime: new Date().toISOString(),
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
     };
 
     const mockTask = {
@@ -248,7 +251,7 @@ describe('Schedules Controller', () => {
     });
 
     it('should return 404 when schedule does not exist', async () => {
-      mockScheduleDb.getScheduleById.mockResolvedValue(null);
+      mockScheduleDb.getScheduleById.mockResolvedValue(null as any);
 
       const response = await request(app)
         .put(`/api/schedules/${scheduleId}`)
@@ -261,7 +264,7 @@ describe('Schedules Controller', () => {
 
     it('should return 404 when task does not exist', async () => {
       mockScheduleDb.getScheduleById.mockResolvedValue(mockSchedule);
-      mockTaskDb.getTaskById.mockResolvedValue(null);
+      mockTaskDb.getTaskById.mockResolvedValue(undefined);
 
       const response = await request(app)
         .put(`/api/schedules/${scheduleId}`)
@@ -325,7 +328,8 @@ describe('Schedules Controller', () => {
       frequency: 'daily',
       status: 'active',
       nextRunTime: new Date().toISOString(),
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
     };
 
     const mockTask = {
@@ -398,7 +402,7 @@ describe('Schedules Controller', () => {
     });
 
     it('should return 404 when schedule does not exist', async () => {
-      mockScheduleDb.getScheduleById.mockResolvedValue(null);
+      mockScheduleDb.getScheduleById.mockResolvedValue(null as any);
 
       const response = await request(app)
         .delete(`/api/schedules/${scheduleId}`)
@@ -410,7 +414,7 @@ describe('Schedules Controller', () => {
 
     it('should return 404 when task does not exist', async () => {
       mockScheduleDb.getScheduleById.mockResolvedValue(mockSchedule);
-      mockTaskDb.getTaskById.mockResolvedValue(null);
+      mockTaskDb.getTaskById.mockResolvedValue(undefined);
 
       const response = await request(app)
         .delete(`/api/schedules/${scheduleId}`)
@@ -423,7 +427,7 @@ describe('Schedules Controller', () => {
     it('should return 404 when user does not exist', async () => {
       mockScheduleDb.getScheduleById.mockResolvedValue(mockSchedule);
       mockTaskDb.getTaskById.mockResolvedValue(mockTask);
-      mockUserDb.getUserById.mockResolvedValue(null);
+      mockUserDb.getUserById.mockResolvedValue(undefined);
 
       const response = await request(app)
         .delete(`/api/schedules/${scheduleId}`)
@@ -448,7 +452,8 @@ describe('Schedules Controller', () => {
       frequency: 'daily',
       status: 'active',
       nextRunTime: new Date().toISOString(),
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
     };
 
     const mockTask = {
@@ -597,7 +602,8 @@ describe('Schedules Controller', () => {
           frequency: 'daily',
           status: 'active',
           nextRunTime: new Date().toISOString(),
-          createdAt: new Date().toISOString()
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
         },
         {
           scheduleId: 'schedule-2',
@@ -606,7 +612,8 @@ describe('Schedules Controller', () => {
           frequency: 'weekly',
           status: 'active',
           nextRunTime: new Date().toISOString(),
-          createdAt: new Date().toISOString()
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
         }
       ];
 
