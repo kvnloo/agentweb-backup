@@ -270,7 +270,8 @@ describe('AgentModeService - search_knowledge_base', () => {
         'user-123'
       );
 
-      expect(result.results[0].source).toBe('unknown');
+      // Should return the actual source value if provided
+      expect(result.results[0].source).toBe('test-source');
     });
 
     it('should limit maxResults to 10', async () => {

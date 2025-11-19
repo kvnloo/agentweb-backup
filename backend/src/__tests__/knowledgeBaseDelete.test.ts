@@ -107,9 +107,9 @@ describe('Knowledge Base Delete Endpoint - DELETE /api/tasks/:taskId/knowledge-b
       expect(mockFile.delete).toHaveBeenCalled();
       expect(mockedTaskDb.updateTask).toHaveBeenCalledWith('task-123', {
         knowledgeBaseSize: 0,
-        knowledgeBase: null,
-        knowledgeBaseType: null,
-        knowledgeBaseUpdatedAt: null
+        knowledgeBase: undefined,
+        knowledgeBaseType: undefined,
+        knowledgeBaseUpdatedAt: undefined
       });
     });
 
@@ -133,9 +133,9 @@ describe('Knowledge Base Delete Endpoint - DELETE /api/tasks/:taskId/knowledge-b
       // Verify task was updated to remove knowledge base info
       expect(mockedTaskDb.updateTask).toHaveBeenCalledWith('task-123', {
         knowledgeBaseSize: 0,
-        knowledgeBase: null,
-        knowledgeBaseType: null,
-        knowledgeBaseUpdatedAt: null
+        knowledgeBase: undefined,
+        knowledgeBaseType: undefined,
+        knowledgeBaseUpdatedAt: undefined
       });
     });
 

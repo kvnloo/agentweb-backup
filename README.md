@@ -104,6 +104,19 @@ Example task prompt that uses an API integration:
 Get my latest GitHub repositories and create a report. Use my GitHub API integration to access the data.
 ```
 
+### Knowledge Base Functions
+
+In Agent Mode, Emma can access knowledge base files using the following function calls:
+
+- `list_knowledge_base_files`: Provides a list of all available knowledge base files to Emma, including file names, unique references, and metadata
+- `read_knowledge_base_file`: Reads a knowledge base file based on a unique reference identifier, returning the full content of the file
+
+Example usage in Agent Mode:
+
+```
+List all available knowledge base files and then read the file about product specifications.
+```
+
 For detailed documentation, please refer to our [Design Document](./design.md).
 
 ## Security

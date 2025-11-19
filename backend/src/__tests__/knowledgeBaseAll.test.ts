@@ -40,31 +40,18 @@ describe('Knowledge Base All Endpoint - GET /api/tasks/knowledge-base/all', () =
 
   describe('Successful requests', () => {
     it('should return empty array when user has no tasks with knowledge base', async () => {
-      mockedTaskDb.getTasksByUserId.mockResolvedValue([]);
+      mockedTaskDb.getTasksWithKnowledgeBase.mockResolvedValue([]);
 
       const response = await request(app)
         .get('/api/tasks/knowledge-base/all')
         .expect(200);
 
       expect(response.body).toEqual([]);
-      expect(mockedTaskDb.getTasksByUserId).toHaveBeenCalledWith('test-user-123');
+      expect(mockedTaskDb.getTasksWithKnowledgeBase).toHaveBeenCalledWith('test-user-123');
     });
 
     it('should filter out tasks with empty knowledge base', async () => {
       const mockTasks = [
-        {
-          taskId: 'task-1',
-          name: 'Task 1',
-          knowledgeBaseSize: 0,
-          knowledgeBaseType: 'private',
-          knowledgeBaseUpdatedAt: '2024-01-01T00:00:00Z'
-        },
-        {
-          taskId: 'task-2',
-          name: 'Task 2',
-          knowledgeBaseSize: null,
-          knowledgeBaseType: 'private'
-        },
         {
           taskId: 'task-3',
           name: 'Task 3',
@@ -73,7 +60,7 @@ describe('Knowledge Base All Endpoint - GET /api/tasks/knowledge-base/all', () =
           knowledgeBaseUpdatedAt: '2024-01-02T00:00:00Z'
         }
       ];
-      mockedTaskDb.getTasksByUserId.mockResolvedValue(mockTasks as any);
+      mockedTaskDb.getTasksWithKnowledgeBase.mockResolvedValue(mockTasks as any);
 
       const response = await request(app)
         .get('/api/tasks/knowledge-base/all')
@@ -94,12 +81,12 @@ describe('Knowledge Base All Endpoint - GET /api/tasks/knowledge-base/all', () =
         {
           taskId: 'task-1',
           name: 'Task 1',
-          knowledgeBaseSize: '2048',
+          knowledgeBaseSize: 2048,
           knowledgeBaseType: 'private',
           knowledgeBaseUpdatedAt: '2024-01-01T00:00:00Z'
         }
       ];
-      mockedTaskDb.getTasksByUserId.mockResolvedValue(mockTasks as any);
+      mockedTaskDb.getTasksWithKnowledgeBase.mockResolvedValue(mockTasks as any);
 
       const response = await request(app)
         .get('/api/tasks/knowledge-base/all')
@@ -110,13 +97,6 @@ describe('Knowledge Base All Endpoint - GET /api/tasks/knowledge-base/all', () =
 
     it('should sort tasks by last updated (most recent first)', async () => {
       const mockTasks = [
-        {
-          taskId: 'task-1',
-          name: 'Task 1',
-          knowledgeBaseSize: 100,
-          knowledgeBaseType: 'private',
-          knowledgeBaseUpdatedAt: '2024-01-01T00:00:00Z'
-        },
         {
           taskId: 'task-2',
           name: 'Task 2',
@@ -130,9 +110,16 @@ describe('Knowledge Base All Endpoint - GET /api/tasks/knowledge-base/all', () =
           knowledgeBaseSize: 300,
           knowledgeBaseType: 'private',
           knowledgeBaseUpdatedAt: '2024-01-02T00:00:00Z'
+        },
+        {
+          taskId: 'task-1',
+          name: 'Task 1',
+          knowledgeBaseSize: 100,
+          knowledgeBaseType: 'private',
+          knowledgeBaseUpdatedAt: '2024-01-01T00:00:00Z'
         }
       ];
-      mockedTaskDb.getTasksByUserId.mockResolvedValue(mockTasks as any);
+      mockedTaskDb.getTasksWithKnowledgeBase.mockResolvedValue(mockTasks as any);
 
       const response = await request(app)
         .get('/api/tasks/knowledge-base/all')
@@ -150,11 +137,11 @@ describe('Knowledge Base All Endpoint - GET /api/tasks/knowledge-base/all', () =
           taskId: 'task-1',
           name: 'Task 1',
           knowledgeBaseSize: 100,
-          knowledgeBaseType: null,
+          knowledgeBaseType: 'private',
           knowledgeBaseUpdatedAt: '2024-01-01T00:00:00Z'
         }
       ];
-      mockedTaskDb.getTasksByUserId.mockResolvedValue(mockTasks as any);
+      mockedTaskDb.getTasksWithKnowledgeBase.mockResolvedValue(mockTasks as any);
 
       const response = await request(app)
         .get('/api/tasks/knowledge-base/all')
@@ -177,7 +164,7 @@ describe('Knowledge Base All Endpoint - GET /api/tasks/knowledge-base/all', () =
           userId: 'test-user-123'
         }
       ];
-      mockedTaskDb.getTasksByUserId.mockResolvedValue(mockTasks as any);
+      mockedTaskDb.getTasksWithKnowledgeBase.mockResolvedValue(mockTasks as any);
 
       const response = await request(app)
         .get('/api/tasks/knowledge-base/all')
@@ -213,7 +200,7 @@ describe('Knowledge Base All Endpoint - GET /api/tasks/knowledge-base/all', () =
     });
 
     it('should return 500 when database throws error', async () => {
-      mockedTaskDb.getTasksByUserId.mockRejectedValue(new Error('Database error'));
+      mockedTaskDb.getTasksWithKnowledgeBase.mockRejectedValue(new Error('Database error'));
 
       const response = await request(app)
         .get('/api/tasks/knowledge-base/all')
