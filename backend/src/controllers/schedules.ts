@@ -3,7 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { AuthenticatedRequest } from '../middleware/auth';
 import { scheduleDb, Schedule } from '../services/scheduleDb';
 import { calculateNextRunTime, isValidFrequency, Frequency } from '../utils/scheduleUtils';
-import { userDb } from '../services/db';
+import { userDb, taskDb } from '../services/db';
 
 export async function createSchedule(req: AuthenticatedRequest, res: Response) {
   try {
@@ -46,21 +46,26 @@ export async function getSchedulesByTaskId(req: AuthenticatedRequest, res: Respo
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    // Check if user is admin
+    // Get the task to check ownership
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+
+    // Verify user exists and check task ownership
     const user = await userDb.getUserById(userId);
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    const schedules = await scheduleDb.getSchedulesByTaskId(taskId);
-    
-    // If user is admin, return all schedules, otherwise filter by userId
-    if (user.isAdmin) {
-      res.json(schedules);
-    } else {
-      const userSchedules = schedules.filter(schedule => schedule.userId === userId);
-      res.json(userSchedules);
+    // Check if user is admin or owns the task
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ error: 'Not authorized to view schedules for this task' });
     }
+
+    // Return all schedules for the task
+    const schedules = await scheduleDb.getSchedulesByTaskId(taskId);
+    res.json(schedules);
   } catch (error) {
     console.error('Error getting schedules:', error);
     res.status(500).json({ error: 'Failed to get schedules' });
@@ -83,48 +88,40 @@ export async function updateSchedule(req: AuthenticatedRequest, res: Response) {
       return res.status(404).json({ error: 'Schedule not found' });
     }
 
-    // Check if user is admin
+    // Get the task to check ownership
+    const task = await taskDb.getTaskById(schedule.taskId);
+    if (!task) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+
+    // Verify user exists and check task ownership
     const user = await userDb.getUserById(userId);
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Check if user is admin or owns the task
+    if (!user.isAdmin && task.userId !== userId) {
+      return res.status(403).json({ error: 'Not authorized to update this schedule' });
     }
 
     const updates: Partial<Schedule> = {
       updatedAt: new Date().toISOString()
     };
 
-    // Admin can only pause schedules they don't own
-    if (user.isAdmin && schedule.userId !== userId) {
-      // Admin can only update status to paused
-      if (status && status !== 'paused') {
-        return res.status(403).json({ error: 'Admins can only pause schedules they don\'t own' });
+    if (frequency) {
+      if (!isValidFrequency(frequency)) {
+        return res.status(400).json({ error: 'Invalid frequency' });
       }
-      
-      if (status === 'paused') {
-        updates.status = 'paused';
-      } else if (frequency) {
-        // Admin cannot update frequency of schedules they don't own
-        return res.status(403).json({ error: 'Not authorized to update frequency of this schedule' });
-      }
-    } else if (schedule.userId !== userId) {
-      // Non-admin users cannot update schedules they don't own
-      return res.status(403).json({ error: 'Not authorized to update this schedule' });
-    } else {
-      // Owner can update all properties
-      if (frequency) {
-        if (!isValidFrequency(frequency)) {
-          return res.status(400).json({ error: 'Invalid frequency' });
-        }
-        updates.frequency = frequency;
-        updates.nextRunTime = calculateNextRunTime(frequency as Frequency);
-      }
+      updates.frequency = frequency;
+      updates.nextRunTime = calculateNextRunTime(frequency as Frequency);
+    }
 
-      if (status) {
-        if (!['active', 'paused'].includes(status)) {
-          return res.status(400).json({ error: 'Invalid status' });
-        }
-        updates.status = status;
+    if (status) {
+      if (!['active', 'paused'].includes(status)) {
+        return res.status(400).json({ error: 'Invalid status' });
       }
+      updates.status = status;
     }
 
     // Only proceed if there are actual updates to apply
@@ -155,8 +152,20 @@ export async function deleteSchedule(req: AuthenticatedRequest, res: Response) {
       return res.status(404).json({ error: 'Schedule not found' });
     }
 
-    // Only the owner can delete their schedule
-    if (schedule.userId !== userId) {
+    // Get the task to check ownership
+    const task = await taskDb.getTaskById(schedule.taskId);
+    if (!task) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+
+    // Verify user exists and check task ownership
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Check if user is admin or owns the task
+    if (!user.isAdmin && task.userId !== userId) {
       return res.status(403).json({ error: 'Not authorized to delete this schedule' });
     }
 

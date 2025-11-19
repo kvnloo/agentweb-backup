@@ -21,6 +21,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Emma can read specific knowledge base files by their unique identifier using read_knowledge_base_file function',
       '- Knowledge base files are automatically truncated to 50KB to ensure optimal performance',
       '- These functions complement the existing search_knowledge_base function for comprehensive knowledge base access',
+      'Fixed Task Schedule Access Control Bug',
+      '- Task schedules are now properly managed based on task ownership rather than schedule creator',
+      '- Task owners can view, update, and delete all schedules for their tasks, regardless of who created them',
     ],
   },
   {
