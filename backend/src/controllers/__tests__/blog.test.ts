@@ -323,5 +323,136 @@ describe('Blog Controller - generateBlogHtml', () => {
       expect(html).toContain('src="https://example.com/image.png"');
     });
   });
+
+  describe('Image and Video Styling', () => {
+    it('should include CSS styling for images in Substack style', () => {
+      const html = generateBlogHtml(
+        'Test Title',
+        'Test description',
+        '![Alt text](https://example.com/image.jpg)',
+        'https://example.com/hero.png',
+        'substack'
+      );
+
+      // Verify image CSS is present
+      expect(html).toContain('.content img {');
+      expect(html).toContain('width: 100%');
+      expect(html).toContain('max-width: 100%');
+      expect(html).toContain('height: auto');
+      expect(html).toContain('border-radius: 4px');
+      expect(html).toContain('margin: 32px 0');
+    });
+
+    it('should include CSS styling for images in default style', () => {
+      const html = generateBlogHtml(
+        'Test Title',
+        'Test description',
+        '![Alt text](https://example.com/image.jpg)',
+        'https://example.com/hero.png',
+        'default'
+      );
+
+      // Verify image CSS is present
+      expect(html).toContain('.content img {');
+      expect(html).toContain('width: 100%');
+      expect(html).toContain('max-width: 100%');
+      expect(html).toContain('height: auto');
+      expect(html).toContain('border-radius: 8px');
+      expect(html).toContain('margin: 20px 0');
+      expect(html).toContain('box-shadow: 0 2px 8px rgba(0,0,0,0.1)');
+    });
+
+    it('should include CSS styling for iframes in Substack style', () => {
+      const html = generateBlogHtml(
+        'Test Title',
+        'Test description',
+        'Content with iframe',
+        'https://example.com/hero.png',
+        'substack'
+      );
+
+      // Verify iframe CSS is present
+      expect(html).toContain('.content iframe');
+      expect(html).toContain('aspect-ratio: 16 / 9');
+      expect(html).toContain('min-height: 400px');
+    });
+
+    it('should include CSS styling for iframes in default style', () => {
+      const html = generateBlogHtml(
+        'Test Title',
+        'Test description',
+        'Content with iframe',
+        'https://example.com/hero.png',
+        'default'
+      );
+
+      // Verify iframe CSS is present
+      expect(html).toContain('.content iframe');
+      expect(html).toContain('aspect-ratio: 16 / 9');
+      expect(html).toContain('min-height: 400px');
+      expect(html).toContain('box-shadow: 0 2px 8px rgba(0,0,0,0.1)');
+    });
+
+    it('should include CSS styling for video tags in Substack style', () => {
+      const html = generateBlogHtml(
+        'Test Title',
+        'Test description',
+        'Content with video',
+        'https://example.com/hero.png',
+        'substack'
+      );
+
+      // Verify video CSS is present
+      expect(html).toContain('.content video {');
+      expect(html).toContain('width: 100%');
+      expect(html).toContain('height: auto');
+    });
+
+    it('should include CSS styling for video tags in default style', () => {
+      const html = generateBlogHtml(
+        'Test Title',
+        'Test description',
+        'Content with video',
+        'https://example.com/hero.png',
+        'default'
+      );
+
+      // Verify video CSS is present
+      expect(html).toContain('.content video {');
+      expect(html).toContain('width: 100%');
+      expect(html).toContain('height: auto');
+      expect(html).toContain('box-shadow: 0 2px 8px rgba(0,0,0,0.1)');
+    });
+
+    it('should style images and videos in both Substack and default styles', () => {
+      const substackHtml = generateBlogHtml(
+        'Test',
+        'Desc',
+        '![Image](https://example.com/img.jpg)',
+        'https://example.com/hero.png',
+        'substack'
+      );
+
+      const defaultHtml = generateBlogHtml(
+        'Test',
+        'Desc',
+        '![Image](https://example.com/img.jpg)',
+        'https://example.com/hero.png',
+        'default'
+      );
+
+      // Both should have image styling
+      expect(substackHtml).toContain('.content img {');
+      expect(defaultHtml).toContain('.content img {');
+
+      // Both should have iframe styling
+      expect(substackHtml).toContain('.content iframe');
+      expect(defaultHtml).toContain('.content iframe');
+
+      // Both should have video styling
+      expect(substackHtml).toContain('.content video {');
+      expect(defaultHtml).toContain('.content video {');
+    });
+  });
 });
 
