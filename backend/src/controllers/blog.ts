@@ -84,7 +84,8 @@ export async function generateBlogContent(
   tone: string = "professional",
   length: string = "medium",
   researchContext: string = "",
-  requirements: string = ""
+  requirements: string = "",
+  style: string = "default"
 ): Promise<{
   title: string;
   description: string;
@@ -96,6 +97,23 @@ export async function generateBlogContent(
   const targetWords = targetWordCounts[length] ?? 1000;
   const isLongForm = length === 'medium' || length === 'long';
 
+  // Substack-style writing guidelines
+  const substackGuidelines = style === 'substack' ? `
+
+Substack-Style Writing Guidelines:
+- Write in a personal, newsletter-like tone - as if you're writing directly to your subscribers
+- Use first-person perspective ("I", "we", "my experience") to make it personal and relatable
+- Start with an engaging hook - a question, story, or surprising insight that draws readers in
+- Be conversational and approachable - write like you're talking to a friend, not giving a formal presentation
+- Include personal anecdotes, observations, or experiences when relevant
+- Address the reader directly ("you", "your") to create connection
+- Use rhetorical questions to engage readers and make them think
+- Break up content with clear, friendly section headers that feel like natural conversation points
+- End with a clear takeaway or call-to-action that feels personal, not salesy
+- Avoid overly corporate or formal language - be authentic and genuine
+- Use shorter paragraphs and sentences for better readability
+- Include transitions that feel natural, like "Here's what I've learned..." or "Let me share..."` : '';
+
   // Generic blog prompt for content generation
   let blogPrompt = `You are an expert marketing strategist and content writer. Create a high-quality, engaging blog post about: ${topic}
 
@@ -103,6 +121,7 @@ Requirements:
 - Tone: ${tone} (be conversational but professional, avoid overly formal language)
 - Target length: approximately ${targetWords} words (±10%)
 - Keywords to naturally include: ${keywords || "relevant industry keywords"}
+${substackGuidelines}
 
 Content Guidelines:
 1. Write in a natural, human voice - avoid AI-generated patterns
@@ -263,7 +282,8 @@ export function generateBlogHtml(
   title: string,
   description: string,
   content: string,
-  imageUrl: string
+  imageUrl: string,
+  style: string = 'default'
 ): string {
   // Convert markdown content to HTML using remark with enhanced plugins
   const processor = remark()
@@ -273,6 +293,178 @@ export function generateBlogHtml(
 
   const htmlContent = processor.processSync(content).toString();
 
+  if (style === 'substack') {
+    // Substack-style: clean, minimal, elegant design with serif body font
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${title}</title>
+    <meta name="description" content="${description}">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: Georgia, 'Times New Roman', serif;
+            line-height: 1.75;
+            color: #1a1a1a;
+            max-width: 680px;
+            margin: 0 auto;
+            padding: 40px 20px;
+            background-color: #ffffff;
+        }
+        .hero-image {
+            width: 100%;
+            max-width: 100%;
+            height: auto;
+            margin: 0 0 48px 0;
+            border-radius: 0;
+        }
+        h1 {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-size: 42px;
+            font-weight: 700;
+            line-height: 1.2;
+            color: #1a1a1a;
+            margin: 0 0 16px 0;
+            padding: 0;
+            border: none;
+        }
+        h2 {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-size: 28px;
+            font-weight: 600;
+            line-height: 1.3;
+            color: #1a1a1a;
+            margin: 48px 0 16px 0;
+        }
+        h3 {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-size: 22px;
+            font-weight: 600;
+            line-height: 1.4;
+            color: #1a1a1a;
+            margin: 32px 0 12px 0;
+        }
+        p {
+            font-size: 20px;
+            line-height: 1.75;
+            color: #1a1a1a;
+            margin: 0 0 24px 0;
+        }
+        ul, ol {
+            font-size: 20px;
+            line-height: 1.75;
+            margin: 0 0 24px 0;
+            padding-left: 32px;
+        }
+        li {
+            margin: 0 0 8px 0;
+        }
+        a {
+            color: #1a1a1a;
+            text-decoration: underline;
+            text-decoration-color: rgba(26, 26, 26, 0.3);
+            text-underline-offset: 2px;
+        }
+        a:hover {
+            text-decoration-color: rgba(26, 26, 26, 0.6);
+        }
+        .meta {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-size: 14px;
+            color: #757575;
+            margin: 0 0 32px 0;
+            letter-spacing: 0.01em;
+        }
+        .content {
+            margin-top: 0;
+        }
+        .content > *:first-child {
+            margin-top: 0;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 32px 0;
+            font-size: 18px;
+            line-height: 1.6;
+        }
+        th, td {
+            padding: 12px 16px;
+            text-align: left;
+            border-bottom: 1px solid #e5e5e5;
+        }
+        th {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-weight: 600;
+            color: #1a1a1a;
+            background-color: transparent;
+        }
+        tr:last-child td {
+            border-bottom: none;
+        }
+        pre {
+            background-color: #f8f8f8;
+            border: none;
+            border-radius: 4px;
+            padding: 20px;
+            margin: 32px 0;
+            overflow-x: auto;
+            font-family: 'Courier New', 'Monaco', 'Menlo', monospace;
+            font-size: 16px;
+            line-height: 1.6;
+            white-space: pre;
+        }
+        pre code {
+            background: none;
+            padding: 0;
+            border: none;
+            font-family: 'Courier New', 'Monaco', 'Menlo', monospace;
+            color: #1a1a1a;
+        }
+        blockquote {
+            border-left: 3px solid #e5e5e5;
+            padding-left: 20px;
+            margin: 32px 0;
+            font-style: italic;
+            color: #4a4a4a;
+        }
+        @media (max-width: 768px) {
+            body {
+                padding: 24px 16px;
+            }
+            h1 {
+                font-size: 32px;
+            }
+            h2 {
+                font-size: 24px;
+            }
+            h3 {
+                font-size: 20px;
+            }
+            p, ul, ol {
+                font-size: 18px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <h1>${title}</h1>
+    <div class="meta">Published on ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}</div>
+    <img src="${imageUrl}" alt="${title}" class="hero-image">
+    <div class="content">
+        ${htmlContent}
+    </div>
+</body>
+</html>`;
+  }
+
+  // Default style: original design
   return `<!DOCTYPE html>
 <html lang="en">
 <head>

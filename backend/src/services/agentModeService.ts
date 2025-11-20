@@ -1089,6 +1089,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
                   type: 'string',
                   description: 'Specific requirements for the blog article (e.g., internal links, CTAs, branding guidelines)',
                   default: ''
+                },
+                style: {
+                  type: 'string',
+                  description: 'The writing style of the blog article. Use "substack" for a personal, newsletter-like writing style with first-person perspective, engaging hooks, and conversational tone. Use "default" for standard blog post style.',
+                  enum: ['default', 'substack'],
+                  default: 'default'
                 }
             },
             required: ['topic']
@@ -2052,7 +2058,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'generate_image':
         return await this.generateImage(args.prompt, args.filename, args.size || '1024x1024', args.quality || 'medium', args.inputImages || [], userId, sessionId, args.imageModel);
         case 'create_blog_article':
-          return await this.createBlogArticle(args.topic, args.keywords || '', args.tone || 'professional', args.length || 'medium', args.researchContext || '', args.requirements || '', userId, sessionId);
+          return await this.createBlogArticle(args.topic, args.keywords || '', args.tone || 'professional', args.length || 'medium', args.researchContext || '', args.requirements || '', userId, sessionId, args.style || 'default');
       case 'get_task_subscriber_metrics':
         return await this.getTaskSubscriberMetrics(args.task_id, userId);
       case 'get_task_subscriber_engagement_events':
@@ -5566,7 +5572,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
     researchContext: string,
     requirements: string,
     userId: string,
-    sessionId: string
+    sessionId: string,
+    style: string = 'default'
   ): Promise<any> {
     try {
       console.log('AgentMode: Creating blog article for topic:', topic, 'tone:', tone, 'length:', length, 'userId:', userId);
@@ -5578,8 +5585,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       console.log('AgentMode: Generating blog content using existing blog service...');
       const { generateBlogContent } = await import('../controllers/blog');
       
-      // Use the requirements passed from the LLM
-      const blogData = await generateBlogContent(topic, keywords, tone, length, researchContext, requirements);
+      // Use the requirements passed from the LLM, and include style for Substack-style writing
+      const blogData = await generateBlogContent(topic, keywords, tone, length, researchContext, requirements, style);
 
       if (!blogData.title || !blogData.content) {
         throw new Error("Blog content generation failed");
@@ -5599,9 +5606,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
       console.log('AgentMode: Hero image generated successfully');
 
       // Step 3: Generate HTML file using existing blog.ts utility function
-      console.log('AgentMode: Generating HTML file...');
+      console.log('AgentMode: Generating HTML file with style:', style);
       const { generateBlogHtml } = await import('../controllers/blog');
-      const htmlContent = generateBlogHtml(blogData.title, blogData.description, blogData.content, imageData.imageUrl);
+      const htmlContent = generateBlogHtml(blogData.title, blogData.description, blogData.content, imageData.imageUrl, style);
       
       // Step 4: Upload HTML file to S3
       console.log('AgentMode: Uploading HTML file to S3...');
