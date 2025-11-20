@@ -14,6 +14,7 @@ interface ImageGenerationResult {
 const SUPPORTED_MODELS = [
   "gpt-image-1",
   "gemini-2.5-flash-image-preview",
+  "gemini-3-pro-image-preview",
   "gen4_image",
   "gemini_2.5_flash",
 ] as const;
@@ -47,7 +48,7 @@ export class ImageService {
         secretName = process.env.NODE_ENV === "development" 
           ? "dev/AgentWeb/Azure/Image" 
           : "prod/AgentWeb/Azure/Image";
-      } else if (model === "gemini-2.5-flash-image-preview") {
+      } else if (model === "gemini-2.5-flash-image-preview" || model === "gemini-3-pro-image-preview") {
         // Google Gemini
         secretName = process.env.NODE_ENV === "development" 
           ? "dev/AgentWeb/Google/Image" 
@@ -126,6 +127,8 @@ export class ImageService {
           result = await this.generateWithAzureAI(params, modelToUse, hasInputImages);
         } else if (modelToUse === "gemini-2.5-flash-image-preview") {
           result = await this.generateWithGoogleGemini(params);
+        } else if (modelToUse === "gemini-3-pro-image-preview") {
+          result = await this.generateWithGoogleGemini3Pro(params);
         } else if (modelToUse === "gen4_image" || modelToUse === "gemini_2.5_flash") {
           result = await this.generateWithRunwayML(params, modelToUse);
         } else {
@@ -633,6 +636,210 @@ export class ImageService {
       return {
         success: false,
         error: `Google Gemini image generation failed: ${error.message || 'Unknown error'}`
+      };
+    }
+  }
+
+  /**
+   * Convert size parameter to aspect ratio for Gemini 3 Pro
+   * Supports: 1:1, 9:16, 16:9, 3:4, 4:3, 3:2, 2:3, 5:4, 4:5, 21:9
+   */
+  private convertSizeToAspectRatio(size?: string): string {
+    if (!size || size === 'auto') {
+      return '1:1'; // Default aspect ratio
+    }
+
+    // If already in aspect ratio format (e.g., "16:9"), validate and return
+    if (size.includes(':')) {
+      const validRatios = ['1:1', '9:16', '16:9', '3:4', '4:3', '3:2', '2:3', '5:4', '4:5', '21:9'];
+      if (validRatios.includes(size)) {
+        return size;
+      }
+      // If it's a ratio format but not in the valid list, default to 1:1
+      console.warn(`⚠️ Aspect ratio ${size} not supported, defaulting to 1:1`);
+      return '1:1';
+    }
+
+    // Convert common size formats to aspect ratios
+    // Format: "WIDTHxHEIGHT" (e.g., "1024x1024", "1536x1024")
+    if (size.includes('x')) {
+      const [width, height] = size.split('x').map(Number);
+      if (!isNaN(width) && !isNaN(height) && width > 0 && height > 0) {
+        // Calculate the ratio
+        const ratio = width / height;
+        
+        // Map to closest supported aspect ratio
+        const ratioMap: { [key: number]: string } = {
+          1.0: '1:1',        // 1024x1024, 512x512, etc.
+          0.5625: '9:16',    // 576x1024, 1080x1920, etc.
+          1.7778: '16:9',    // 1920x1080, 1024x576, etc.
+          0.75: '3:4',       // 768x1024, etc.
+          1.3333: '4:3',     // 1024x768, etc.
+          1.5: '3:2',        // 1536x1024, etc.
+          0.6667: '2:3',     // 1024x1536, etc.
+          1.25: '5:4',       // 1280x1024, etc.
+          0.8: '4:5',        // 1024x1280, etc.
+          2.3333: '21:9'     // 2560x1080, etc.
+        };
+
+        // Find closest ratio
+        let closestRatio = '1:1';
+        let minDiff = Infinity;
+        for (const [targetRatio, aspectRatio] of Object.entries(ratioMap)) {
+          const diff = Math.abs(ratio - parseFloat(targetRatio));
+          if (diff < minDiff) {
+            minDiff = diff;
+            closestRatio = aspectRatio;
+          }
+        }
+
+        return closestRatio;
+      }
+    }
+
+    // Default to 1:1 if we can't parse the size
+    console.warn(`⚠️ Could not parse size ${size}, defaulting to 1:1`);
+    return '1:1';
+  }
+
+  /**
+   * Generate image using Google Gemini 3 Pro Image
+   */
+  private async generateWithGoogleGemini3Pro(params: ImageGenerationParams): Promise<ImageGenerationResult> {
+    try {
+      const { GoogleGenAI } = require('@google/genai');
+      const mime = require('mime');
+      
+      const apiKey = await this.getApiKey("gemini-3-pro-image-preview");
+      const ai = new GoogleGenAI({
+        apiKey: apiKey,
+      });
+
+      const model = 'gemini-3-pro-image-preview';
+      const inputImageCount = params.inputImages ? params.inputImages.length : 0;
+      
+      // Convert size to aspect ratio
+      const aspectRatio = this.convertSizeToAspectRatio(params.size);
+      
+      // Configure image generation
+      const config = {
+        responseModalities: ['IMAGE', 'TEXT'],
+        imageConfig: {
+          aspectRatio: aspectRatio,
+          imageSize: '1K', // Fixed to 1K as per requirements
+        },
+      };
+
+      // Build contents array
+      const contents: any[] = [];
+      
+      if (inputImageCount === 0) {
+        // Text-to-image generation
+        contents.push({
+          role: 'user',
+          parts: [{
+            text: params.prompt,
+          }],
+        });
+      } else {
+        // Image editing with input images
+        const parts: any[] = [];
+        
+        // Add all input images as parts
+        for (let i = 0; i < params.inputImages!.length; i++) {
+          const imageUrl = params.inputImages![i];
+          
+          try {
+            const processedImage = await this.processInputImage(imageUrl);
+            const imageBase64 = processedImage.buffer.toString('base64');
+            
+            parts.push({
+              inlineData: {
+                mimeType: processedImage.mimeType,
+                data: imageBase64
+              }
+            });
+          } catch (error: any) {
+            console.error(`❌ Failed to process input image ${i + 1}:`, error.message);
+            return {
+              success: false,
+              error: `Failed to process input image ${i + 1} (${imageUrl}): ${error.message}. Please check if the image URL is accessible.`
+            };
+          }
+        }
+        
+        // Add the text prompt as the last part
+        parts.push({
+          text: params.prompt
+        });
+        
+        contents.push({
+          role: 'user',
+          parts: parts
+        });
+      }
+
+      // Generate content stream
+      const response = await ai.models.generateContentStream({
+        model,
+        config,
+        contents,
+      });
+
+      // Process streaming response to find image data
+      let imageData: string | undefined;
+      let mimeType: string | undefined;
+      
+      for await (const chunk of response) {
+        if (!chunk.candidates || !chunk.candidates[0]?.content?.parts) {
+          continue;
+        }
+
+        const parts = chunk.candidates[0].content.parts;
+        for (const part of parts) {
+          if ((part as any).inlineData) {
+            const inlineData = (part as any).inlineData;
+            if (inlineData.data) {
+              imageData = inlineData.data;
+              mimeType = inlineData.mimeType || 'image/png';
+              break;
+            }
+          } else if ((part as any).inline_data) {
+            const inlineData = (part as any).inline_data;
+            if (inlineData.data) {
+              imageData = inlineData.data;
+              mimeType = inlineData.mimeType || 'image/png';
+              break;
+            }
+          }
+        }
+        
+        if (imageData) break;
+      }
+
+      if (!imageData) {
+        console.error("❌ No image data in Google Gemini 3 Pro response");
+        return {
+          success: false,
+          error: "No image data received from Google Gemini 3 Pro API. The model may not support image generation or the prompt may not be suitable for image generation."
+        };
+      }
+
+      // Convert base64 to data URL
+      const finalMimeType = mimeType || 'image/png';
+      const imageUrl = `data:${finalMimeType};base64,${imageData}`;
+      
+      return {
+        success: true,
+        imageUrl: imageUrl,
+        filename: params.filename
+      };
+      
+    } catch (error: any) {
+      console.error("Error with Google Gemini 3 Pro image generation:", error);
+      return {
+        success: false,
+        error: `Google Gemini 3 Pro image generation failed: ${error.message || 'Unknown error'}`
       };
     }
   }

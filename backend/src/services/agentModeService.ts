@@ -267,6 +267,7 @@ When updating HTML files, follow this process:
 - **Fallback Method**: If no suitable template is available, use 'create_task_from_prompt' to create a web automation task with a raw prompt
 - The 'create_task_from_prompt' tool allows you to create custom web automation tasks with specific instructions when templates don't fit
  - **Image Generation**: Use 'generate_image' for creating and revising images. This provides real-time (~30s) image generation. [DEPRECATED: 'create_image_task_from_prompt' is deprecated - use 'generate_image' instead]
+ - **Image Editing Tips**: When using 'generate_image' with inputImages, you can include multiple image URLs to create combined images. For example, to add a logo to an existing image, include both the current image URL and the logo image URL in the inputImages array. The AI will combine elements from all provided images based on your prompt. This is useful for tasks like adding logos, combining multiple images, or creating composite visuals.
  - **Blog Articles**: When creating blog articles, prefer using the 'create_blog_article' tool. It generates the article content, creates a high-quality hero image via imageService, formats the article into clean HTML, uploads it to S3, and returns the final HTML URL. Avoid ad-hoc content + image flows when this tool fits the request.
  - **Meta Ads Metrics**: Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data
 - When metrics data is loaded, provide contextual analysis based on the conversation history and user's business goals
@@ -1025,7 +1026,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 },
                 size: {
                   type: 'string',
-                  description: 'Image size or ratio. For GPT models: 1024x1024, 1536x1024, 1024x1536, or auto. For Runway models: use ratio format like 1344:768, 768:1344, 1024:1024, 832x1248, etc. Use "auto" for automatic sizing.',
+                  description: 'Image size or ratio. For GPT models: 1024x1024, 1536x1024, 1024x1536, or auto. For Runway models: use ratio format like 1344:768, 768:1344, 1024:1024, 832x1248, etc. For Gemini 3 Pro Image (gemini-3-pro-image-preview): use ratio format like 1:1, 9:16, 16:9, 3:4, 4:3, 3:2, 2:3, 5:4, 4:5, 21:9, or auto. Use "auto" for automatic sizing.',
                   default: 'auto'
                 },
                 quality: {
@@ -1043,8 +1044,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 },
                 imageModel: {
                   type: 'string',
-                  description: 'Optional: Specific image generation model to use. Must be one of: gpt-image-1 (by Azure), gemini-2.5-flash-image-preview (by Google), gen4_image (by Runway), gemini_2.5_flash (by Runway).',
-                  enum: ['gpt-image-1', 'gemini-2.5-flash-image-preview', 'gen4_image', 'gemini_2.5_flash']
+                  description: 'Optional: Specific image generation model to use. Must be one of: gpt-image-1 (by Azure), gemini-2.5-flash-image-preview (by Google), gemini-3-pro-image-preview (by Google), gen4_image (by Runway), gemini_2.5_flash (by Runway).',
+                  enum: ['gpt-image-1', 'gemini-2.5-flash-image-preview', 'gemini-3-pro-image-preview', 'gen4_image', 'gemini_2.5_flash']
                 }
               },
               required: ['prompt', 'filename']
