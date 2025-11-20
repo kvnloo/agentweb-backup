@@ -185,7 +185,8 @@ describe('ImageService', () => {
 
       // Verify that the correct API key was requested (indicating Gemini 3 Pro routing)
       // The code should route to Gemini 3 Pro even if the API call fails
-      if (secretsManager.getSecret.mock.calls.length > 0) {
+      const getSecretMock = secretsManager.getSecret as jest.Mock;
+      if (getSecretMock.mock.calls.length > 0) {
         expect(secretsManager.getSecret).toHaveBeenCalledWith(
           expect.stringContaining('Google/Image')
         );
@@ -328,7 +329,8 @@ describe('ImageService', () => {
 
       // Verify that the correct API key was requested (indicating Gemini 3 Pro routing)
       // The code should route to Gemini 3 Pro even if the API call fails
-      if (secretsManager.getSecret.mock.calls.length > 0) {
+      const getSecretMock = secretsManager.getSecret as jest.Mock;
+      if (getSecretMock.mock.calls.length > 0) {
         expect(secretsManager.getSecret).toHaveBeenCalledWith(
           expect.stringContaining('Google/Image')
         );
@@ -360,7 +362,8 @@ describe('ImageService', () => {
         // The service should attempt to process the request
         // Verify that it routes to Gemini 3 Pro by checking API key request
         // (may fail due to mocking, but should at least recognize the model)
-        if (secretsManager.getSecret.mock.calls.length > 0) {
+        const getSecretMock = secretsManager.getSecret as jest.Mock;
+        if (getSecretMock.mock.calls.length > 0) {
           expect(secretsManager.getSecret).toHaveBeenCalledWith(
             expect.stringContaining('Google/Image')
           );
@@ -390,7 +393,8 @@ describe('ImageService', () => {
 
         // Verify that Gemini 3 Pro was used by checking API key request
         // (may fail due to mocking, but should at least recognize the model)
-        if (secretsManager.getSecret.mock.calls.length > 0) {
+        const getSecretMock = secretsManager.getSecret as jest.Mock;
+        if (getSecretMock.mock.calls.length > 0) {
           expect(secretsManager.getSecret).toHaveBeenCalledWith(
             expect.stringContaining('Google/Image')
           );
@@ -501,7 +505,8 @@ describe('ImageService', () => {
 
       // The service should attempt to process multiple images
       // Verify that it routes to Gemini 3 Pro (even if image processing fails)
-      if (secretsManager.getSecret.mock.calls.length > 0) {
+      const getSecretMock = secretsManager.getSecret as jest.Mock;
+      if (getSecretMock.mock.calls.length > 0) {
         expect(secretsManager.getSecret).toHaveBeenCalledWith(
           expect.stringContaining('Google/Image')
         );
