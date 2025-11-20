@@ -24,6 +24,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fixed Task Schedule Access Control Bug',
       '- Task schedules are now properly managed based on task ownership rather than schedule creator',
       '- Task owners can view, update, and delete all schedules for their tasks, regardless of who created them',
+      'Added Substack-style Support for Blog Articles',
+      '- create_blog_article function now supports "substack" style option for newsletter-like writing',
+      '- Substack style produces personal, first-person content with engaging hooks and conversational tone',
+      'Improved Image and Video Display in Blog Articles',
+      '- Images and videos in blog article content are now automatically styled for optimal display',
     ],
   },
   {
