@@ -189,7 +189,7 @@ describe('AgentModeService - generate_image function', () => {
     });
 
     it('should handle all supported models', async () => {
-      const models = ['gpt-image-1', 'gemini-2.5-flash-image-preview', 'gen4_image', 'gemini_2.5_flash'];
+      const models = ['gpt-image-1', 'gemini-2.5-flash-image-preview', 'gemini-3-pro-image-preview', 'gen4_image', 'gemini_2.5_flash'];
       
       for (const model of models) {
         mockImageService.generateImage.mockResolvedValue({
@@ -214,6 +214,41 @@ describe('AgentModeService - generate_image function', () => {
             imageModel: model
           })
         );
+
+        expect(result.success).toBe(true);
+      }
+    });
+
+    it('should handle Gemini 3 Pro Image model with aspect ratio sizes', async () => {
+      mockImageService.generateImage.mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/image.png',
+        filename: 'test.png'
+      });
+
+      const aspectRatios = ['1:1', '9:16', '16:9', '3:4', '4:3', '3:2', '2:3', '5:4', '4:5', '21:9'];
+      
+      for (const ratio of aspectRatios) {
+        const result = await (agentModeService as any).generateImage(
+          'Test prompt',
+          'test.png',
+          ratio,
+          'medium',
+          [],
+          'user123',
+          'session123',
+          'gemini-3-pro-image-preview'
+        );
+
+        expect(mockImageService.generateImage).toHaveBeenCalledWith({
+          prompt: 'Test prompt',
+          filename: 'test.png',
+          size: ratio,
+          quality: 'medium',
+          inputImages: [],
+          userId: 'user123',
+          imageModel: 'gemini-3-pro-image-preview'
+        });
 
         expect(result.success).toBe(true);
       }
@@ -281,6 +316,81 @@ describe('AgentModeService - generate_image function', () => {
       });
 
       expect(result.success).toBe(true);
+    });
+
+    it('should handle multiple input images for combined image generation', async () => {
+      mockImageService.generateImage.mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/combined-image.png',
+        filename: 'combined.png'
+      });
+
+      // Example: combining current image with logo
+      const inputImages = [
+        'https://example.com/current-image.jpg',
+        'https://example.com/logo.png'
+      ];
+
+      const result = await (agentModeService as any).generateImage(
+        'Add the logo to the top right corner of the image',
+        'combined.png',
+        '1024x1024',
+        'medium',
+        inputImages,
+        'user123',
+        'session123',
+        'gemini-3-pro-image-preview'
+      );
+
+      expect(mockImageService.generateImage).toHaveBeenCalledWith({
+        prompt: 'Add the logo to the top right corner of the image',
+        filename: 'combined.png',
+        size: '1024x1024',
+        quality: 'medium',
+        inputImages: inputImages,
+        userId: 'user123',
+        imageModel: 'gemini-3-pro-image-preview'
+      });
+
+      expect(result.success).toBe(true);
+    });
+
+    it('should handle multiple input images with different models', async () => {
+      mockImageService.generateImage.mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/combined-image.png',
+        filename: 'combined.png'
+      });
+
+      const inputImages = [
+        'https://example.com/image1.jpg',
+        'https://example.com/image2.jpg',
+        'https://example.com/image3.jpg'
+      ];
+
+      const models = ['gemini-2.5-flash-image-preview', 'gemini-3-pro-image-preview'];
+      
+      for (const model of models) {
+        const result = await (agentModeService as any).generateImage(
+          'Combine these images into one',
+          'combined.png',
+          'auto',
+          'medium',
+          inputImages,
+          'user123',
+          'session123',
+          model
+        );
+
+        expect(mockImageService.generateImage).toHaveBeenCalledWith(
+          expect.objectContaining({
+            inputImages: inputImages,
+            imageModel: model
+          })
+        );
+
+        expect(result.success).toBe(true);
+      }
     });
   });
 
