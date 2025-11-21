@@ -7,6 +7,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-11-21',
+    changes: [
+      'Added Social Media Posts Creation in Agent Mode',
+      '- Emma can now create multiple social media posts using the create_social_media_posts function',
+      '- Supports posts for LinkedIn, X (Twitter), Instagram, Facebook, and custom platforms',
+      '- Each post can include rich text content (with markdown support) and optional images',
+      '- Posts are automatically formatted into a beautiful HTML file with platform-specific styling',
+      '- Each post includes a copy button to easily copy the raw content for use on social media platforms',
+    ],
+  },
+  {
     date: '2025-11-20',
     changes: [
       'Added Gemini 3 Pro Image Model Support',
