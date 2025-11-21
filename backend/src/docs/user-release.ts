@@ -14,6 +14,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Supports fixed 1K image size with aspect ratio options: 1:1, 9:16, 16:9, 3:4, 4:3, 3:2, 2:3, 5:4, 4:5, 21:9',
       '- Available in both Ad Images page and Agent Mode for image generation',
       '- Supports input images for combined image generation (e.g., adding logos to existing images)',
+      'Improved Work Plan Progress Display in Agent Mode',
+      '- Step details (description, notes, required functions) are hidden by default and can be expanded by clicking the step title',
+      '- Status indicators (Pending, Skipped, Completed with date) are displayed on the right side of each step title',
+      '- Progress dots use color coding: green for completed, yellow for skipped, purple for pending steps',
     ],
   },
   {
