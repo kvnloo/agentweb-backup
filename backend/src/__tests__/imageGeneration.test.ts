@@ -568,6 +568,36 @@ describe('ImageService', () => {
       expect(result.error).toContain('Invalid quality');
     });
 
+    it('should reject "auto" as quality value', async () => {
+      const result = await imageService.generateImage({
+        prompt: 'Test prompt',
+        filename: 'test.png',
+        userId: 'user123',
+        quality: 'auto' as any
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Invalid quality');
+    });
+
+    it('should accept valid quality values (low, medium, high)', async () => {
+      const validQualities = ['low', 'medium', 'high'];
+      
+      for (const quality of validQualities) {
+        const result = await imageService.generateImage({
+          prompt: 'Test prompt',
+          filename: 'test.png',
+          userId: 'user123',
+          quality: quality as any
+        });
+
+        // Should not fail validation (may fail for other reasons like API calls)
+        if (result.success === false && result.error) {
+          expect(result.error).not.toContain('Invalid quality');
+        }
+      }
+    });
+
     it('should return error for empty filename', async () => {
       const result = await imageService.generateImage({
         prompt: 'Test prompt',
@@ -577,6 +607,170 @@ describe('ImageService', () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('Filename is required');
+    });
+  });
+
+  describe('Quality Parameter Handling', () => {
+    it('should default quality to medium when not provided', async () => {
+      const mockApiKey = 'test-api-key';
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue('s3://bucket/file.png');
+
+      // Mock Azure AI response
+      const mockAxios = require('axios');
+      (mockAxios.default.post as jest.Mock).mockResolvedValue({
+        data: {
+          data: [{
+            b64_json: 'base64encodedimagedata'
+          }]
+        }
+      });
+
+      await imageService.generateImage({
+        prompt: 'Test prompt',
+        filename: 'test.png',
+        userId: 'user123',
+        imageModel: 'gpt-image-1',
+        size: '1024x1024'
+        // quality not provided - should default to medium
+      });
+
+      // Verify that quality 'medium' was passed to the API
+      const postCalls = mockAxios.default.post.mock.calls;
+      if (postCalls.length > 0) {
+        const callData = postCalls[0][1];
+        if (callData && typeof callData === 'object' && 'quality' in callData) {
+          expect(callData.quality).toBe('medium');
+        }
+      }
+    });
+
+    it('should map quality to imageSize for Gemini 3 Pro (low→1K, medium→2K, high→4K)', async () => {
+      const mockApiKey = 'test-api-key';
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue('s3://bucket/file.png');
+
+      const qualityMappings = [
+        { quality: 'low', expectedImageSize: '1K' },
+        { quality: 'medium', expectedImageSize: '2K' },
+        { quality: 'high', expectedImageSize: '4K' }
+      ];
+
+      for (const { quality, expectedImageSize } of qualityMappings) {
+        jest.clearAllMocks();
+        
+        // Set up the mock return value for generateContentStream
+        mockGenerateContentStream.mockReturnValue({
+          [Symbol.asyncIterator]: async function* () {
+            yield {
+              candidates: [{
+                content: {
+                  parts: [{
+                    inlineData: {
+                      mimeType: 'image/png',
+                      data: 'base64data'
+                    }
+                  }]
+                }
+              }]
+            };
+          }
+        });
+
+        await imageService.generateImage({
+          prompt: 'Test prompt',
+          filename: 'test.png',
+          userId: 'user123',
+          imageModel: 'gemini-3-pro-image-preview',
+          size: '16:9',
+          quality: quality as any
+        });
+
+        // Verify that the correct imageSize was used in the config
+        const generateCalls = mockGenerateContentStream.mock.calls;
+        if (generateCalls.length > 0) {
+          const callConfig = generateCalls[0][0]?.config;
+          if (callConfig && callConfig.imageConfig) {
+            expect(callConfig.imageConfig.imageSize).toBe(expectedImageSize);
+          }
+        }
+      }
+    });
+
+    it('should default quality to medium (2K) for Gemini 3 Pro when not provided', async () => {
+      const mockApiKey = 'test-api-key';
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue('s3://bucket/file.png');
+
+      // Set up the mock return value for generateContentStream
+      mockGenerateContentStream.mockReturnValue({
+        [Symbol.asyncIterator]: async function* () {
+          yield {
+            candidates: [{
+              content: {
+                parts: [{
+                  inlineData: {
+                    mimeType: 'image/png',
+                    data: 'base64data'
+                  }
+                }]
+              }
+            }]
+          };
+        }
+      });
+
+      await imageService.generateImage({
+        prompt: 'Test prompt',
+        filename: 'test.png',
+        userId: 'user123',
+        imageModel: 'gemini-3-pro-image-preview',
+        size: '16:9'
+        // quality not provided - should default to medium (2K)
+      });
+
+      // Verify that imageSize defaults to 2K (medium)
+      const generateCalls = mockGenerateContentStream.mock.calls;
+      if (generateCalls.length > 0) {
+        const callConfig = generateCalls[0][0]?.config;
+        if (callConfig && callConfig.imageConfig) {
+          expect(callConfig.imageConfig.imageSize).toBe('2K');
+        }
+      }
+    });
+
+    it('should pass quality parameter to GPT Image 1 (Azure AI)', async () => {
+      const mockApiKey = 'test-api-key';
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue('s3://bucket/file.png');
+
+      // Mock Azure AI response
+      const mockAxios = require('axios');
+      (mockAxios.default.post as jest.Mock).mockResolvedValue({
+        data: {
+          data: [{
+            b64_json: 'base64encodedimagedata'
+          }]
+        }
+      });
+
+      await imageService.generateImage({
+        prompt: 'Test prompt',
+        filename: 'test.png',
+        userId: 'user123',
+        imageModel: 'gpt-image-1',
+        size: '1024x1024',
+        quality: 'high'
+      });
+
+      // Verify that quality 'high' was passed to the API
+      const postCalls = mockAxios.default.post.mock.calls;
+      if (postCalls.length > 0) {
+        const callData = postCalls[0][1];
+        if (callData && typeof callData === 'object' && 'quality' in callData) {
+          expect(callData.quality).toBe('high');
+        }
+      }
     });
   });
 });

@@ -266,7 +266,7 @@ export class ImageService {
         prompt: params.prompt,
         size: params.size,
         n: 1,
-        quality: params.quality,
+        quality: params.quality || 'medium',
         output_format: "png"
       };
       
@@ -721,12 +721,22 @@ export class ImageService {
       // Convert size to aspect ratio
       const aspectRatio = this.convertSizeToAspectRatio(params.size);
       
+      // Map quality parameter to imageSize for Gemini 3 Pro
+      // low → 1K, medium → 2K, high → 4K
+      // Default to medium (2K) if quality is not provided
+      const qualityToImageSize: Record<string, string> = {
+        'low': '1K',
+        'medium': '2K',
+        'high': '4K'
+      };
+      const imageSize = qualityToImageSize[params.quality || 'medium'] || '2K';
+      
       // Configure image generation
       const config = {
         responseModalities: ['IMAGE', 'TEXT'],
         imageConfig: {
           aspectRatio: aspectRatio,
-          imageSize: '1K', // Fixed to 1K as per requirements
+          imageSize: imageSize,
         },
       };
 
@@ -967,7 +977,7 @@ export class ImageService {
       model: model,
           prompt: params.prompt,
           size: params.size as any,
-          quality: params.quality as any,
+          quality: (params.quality || 'medium') as any,
         });
 
         // Return the image URL directly from OpenAI
@@ -1004,7 +1014,7 @@ export class ImageService {
    */
   private validateParams(params: ImageGenerationParams): { valid: boolean; error?: string } {
     // Validate quality
-    const validQualities = ["low", "medium", "high", "auto"];
+    const validQualities = ["low", "medium", "high"];
     if (params.quality && !validQualities.includes(params.quality)) {
       return {
         valid: false,
