@@ -15,6 +15,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Each post can include rich text content (with markdown support) and optional images',
       '- Posts are automatically formatted into a beautiful HTML file with platform-specific styling',
       '- Each post includes a copy button to easily copy the raw content for use on social media platforms',
+      'Added Image Quality Parameter Support',
+      '- Users can now select image quality (Low, Medium, High) when creating ad images or revising images',
+      'Changed Default Image Model to Gemini 3 Pro',
+      '- When image model is set to "auto", the system now defaults to Gemini 3 Pro Image model',
     ],
   },
   {

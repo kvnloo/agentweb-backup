@@ -90,14 +90,9 @@ export class ImageService {
       const inputImageCount = params.inputImages ? params.inputImages.length : 0;
       
       // Determine which model to use before validation
-      // If model not defined, use gpt-image-1 if there is no input image or less than 1 input image.
-      // Otherwise (2+ input images), use the gemini model from google.
+      // If model not defined, use gemini-3-pro-image-preview as default (supports multiple input images)
       if (!params.imageModel) {
-        if (inputImageCount >= 2) {
-          params.imageModel = "gemini-2.5-flash-image-preview";
-        } else {
-          params.imageModel = "gpt-image-1";
-        }
+        params.imageModel = "gemini-3-pro-image-preview";
       }
       
       // Validate the provided model
@@ -266,7 +261,7 @@ export class ImageService {
         prompt: params.prompt,
         size: params.size,
         n: 1,
-        quality: params.quality,
+        quality: params.quality || 'medium',
         output_format: "png"
       };
       
@@ -721,12 +716,22 @@ export class ImageService {
       // Convert size to aspect ratio
       const aspectRatio = this.convertSizeToAspectRatio(params.size);
       
+      // Map quality parameter to imageSize for Gemini 3 Pro
+      // low → 1K, medium → 2K, high → 4K
+      // Default to medium (2K) if quality is not provided
+      const qualityToImageSize: Record<string, string> = {
+        'low': '1K',
+        'medium': '2K',
+        'high': '4K'
+      };
+      const imageSize = qualityToImageSize[params.quality || 'medium'] || '2K';
+      
       // Configure image generation
       const config = {
         responseModalities: ['IMAGE', 'TEXT'],
         imageConfig: {
           aspectRatio: aspectRatio,
-          imageSize: '1K', // Fixed to 1K as per requirements
+          imageSize: imageSize,
         },
       };
 
@@ -967,7 +972,7 @@ export class ImageService {
       model: model,
           prompt: params.prompt,
           size: params.size as any,
-          quality: params.quality as any,
+          quality: (params.quality || 'medium') as any,
         });
 
         // Return the image URL directly from OpenAI
@@ -1004,7 +1009,7 @@ export class ImageService {
    */
   private validateParams(params: ImageGenerationParams): { valid: boolean; error?: string } {
     // Validate quality
-    const validQualities = ["low", "medium", "high", "auto"];
+    const validQualities = ["low", "medium", "high"];
     if (params.quality && !validQualities.includes(params.quality)) {
       return {
         valid: false,
@@ -1030,7 +1035,7 @@ export class ImageService {
   async isAvailable(): Promise<boolean> {
     try {
       // Try to get API key from Secrets Manager for the default model
-      const defaultModel = "gpt-image-1";
+      const defaultModel = "gemini-3-pro-image-preview";
       await this.getApiKey(defaultModel);
       return true;
     } catch (error) {

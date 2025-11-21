@@ -1031,8 +1031,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 },
                 quality: {
                   type: 'string',
-                  description: 'Image quality setting (low, medium, high, or auto)',
-                  enum: ['low', 'medium', 'high', 'auto'],
+                  description: 'Image quality setting (low, medium, high). Defaults to medium if not specified.',
+                  enum: ['low', 'medium', 'high'],
                   default: 'medium'
                 },
                 inputImages: {
@@ -2102,7 +2102,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.readFileContent(args.url);
       case 'generate_image':
         return await this.generateImage(args.prompt, args.filename, args.size || '1024x1024', args.quality || 'medium', args.inputImages || [], userId, sessionId, args.imageModel);
-        case 'create_blog_article':
+      case 'create_blog_article':
           return await this.createBlogArticle(args.topic, args.keywords || '', args.tone || 'professional', args.length || 'medium', args.researchContext || '', args.requirements || '', userId, sessionId, args.style || 'default');
       case 'create_social_media_posts':
         return await this.createSocialMediaPosts(args.posts, userId, sessionId);
@@ -3404,7 +3404,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     try {
 
       // Format the prompt using the same format as handleCreateAdImageTask
-      let formattedPrompt = "Please create high-quality ad images that align with the below context and target the specified audience. The images should be professional, engaging, and suitable for various marketing channels. Use download_image to download reference images and generate_image to create the result images. Valid size values for generate_image include \"1024x1024\", \"1536x1024\", \"1024x1536\", \"auto\". Valid quality values for generate_image include \"low\", \"medium\", \"high\", \"auto\". DO NOT browse the internet for other images.\n\n";
+      let formattedPrompt = "Please create high-quality ad images that align with the below context and target the specified audience. The images should be professional, engaging, and suitable for various marketing channels. Use download_image to download reference images and generate_image to create the result images. Valid size values for generate_image include \"1024x1024\", \"1536x1024\", \"1024x1536\", \"auto\". Valid quality values for generate_image include \"low\", \"medium\", \"high\" (defaults to medium if not specified). DO NOT browse the internet for other images.\n\n";
       
       // Add the user's image prompt
       if (prompt.trim()) {

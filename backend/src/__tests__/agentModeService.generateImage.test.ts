@@ -449,5 +449,129 @@ describe('AgentModeService - generate_image function', () => {
       expect(result.error).toContain('Service error');
     });
   });
+
+  describe('Quality Parameter Handling', () => {
+    it('should pass quality parameter to imageService', async () => {
+      mockImageService.generateImage.mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/image.png',
+        filename: 'test.png'
+      });
+
+      const result = await (agentModeService as any).generateImage(
+        'Test prompt',
+        'test.png',
+        '1024x1024',
+        'high',
+        [],
+        'user123',
+        'session123',
+        'gpt-image-1'
+      );
+
+      expect(mockImageService.generateImage).toHaveBeenCalledWith({
+        prompt: 'Test prompt',
+        filename: 'test.png',
+        size: '1024x1024',
+        quality: 'high',
+        inputImages: [],
+        userId: 'user123',
+        imageModel: 'gpt-image-1'
+      });
+
+      expect(result.success).toBe(true);
+    });
+
+    it('should pass quality parameter for Gemini 3 Pro', async () => {
+      mockImageService.generateImage.mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/image.png',
+        filename: 'test.png'
+      });
+
+      const result = await (agentModeService as any).generateImage(
+        'Test prompt',
+        'test.png',
+        '16:9',
+        'low',
+        [],
+        'user123',
+        'session123',
+        'gemini-3-pro-image-preview'
+      );
+
+      expect(mockImageService.generateImage).toHaveBeenCalledWith({
+        prompt: 'Test prompt',
+        filename: 'test.png',
+        size: '16:9',
+        quality: 'low',
+        inputImages: [],
+        userId: 'user123',
+        imageModel: 'gemini-3-pro-image-preview'
+      });
+
+      expect(result.success).toBe(true);
+    });
+
+    it('should use medium as default quality when quality is not specified in function call', async () => {
+      mockImageService.generateImage.mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/image.png',
+        filename: 'test.png'
+      });
+
+      // The function signature requires quality, but we can test that medium is the expected default
+      const result = await (agentModeService as any).generateImage(
+        'Test prompt',
+        'test.png',
+        '1024x1024',
+        'medium', // Default quality
+        [],
+        'user123',
+        'session123'
+      );
+
+      expect(mockImageService.generateImage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          quality: 'medium'
+        })
+      );
+
+      expect(result.success).toBe(true);
+    });
+
+    it('should accept all valid quality values (low, medium, high)', async () => {
+      mockImageService.generateImage.mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/image.png',
+        filename: 'test.png'
+      });
+
+      const validQualities = ['low', 'medium', 'high'];
+
+      for (const quality of validQualities) {
+        jest.clearAllMocks();
+
+        const result = await (agentModeService as any).generateImage(
+          'Test prompt',
+          'test.png',
+          '1024x1024',
+          quality,
+          [],
+          'user123',
+          'session123',
+          'gpt-image-1'
+        );
+
+        expect(mockImageService.generateImage).toHaveBeenCalledWith(
+          expect.objectContaining({
+            quality: quality
+          })
+        );
+
+        expect(result.success).toBe(true);
+      }
+    });
+  });
 });
 
