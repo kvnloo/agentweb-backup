@@ -2102,7 +2102,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.readFileContent(args.url);
       case 'generate_image':
         return await this.generateImage(args.prompt, args.filename, args.size || '1024x1024', args.quality || 'medium', args.inputImages || [], userId, sessionId, args.imageModel);
-        case 'create_blog_article':
+      case 'create_blog_article':
           return await this.createBlogArticle(args.topic, args.keywords || '', args.tone || 'professional', args.length || 'medium', args.researchContext || '', args.requirements || '', userId, sessionId, args.style || 'default');
       case 'create_social_media_posts':
         return await this.createSocialMediaPosts(args.posts, userId, sessionId);

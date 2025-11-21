@@ -90,14 +90,9 @@ export class ImageService {
       const inputImageCount = params.inputImages ? params.inputImages.length : 0;
       
       // Determine which model to use before validation
-      // If model not defined, use gpt-image-1 if there is no input image or less than 1 input image.
-      // Otherwise (2+ input images), use the gemini model from google.
+      // If model not defined, use gemini-3-pro-image-preview as default (supports multiple input images)
       if (!params.imageModel) {
-        if (inputImageCount >= 2) {
-          params.imageModel = "gemini-2.5-flash-image-preview";
-        } else {
-          params.imageModel = "gpt-image-1";
-        }
+        params.imageModel = "gemini-3-pro-image-preview";
       }
       
       // Validate the provided model
@@ -1040,7 +1035,7 @@ export class ImageService {
   async isAvailable(): Promise<boolean> {
     try {
       // Try to get API key from Secrets Manager for the default model
-      const defaultModel = "gpt-image-1";
+      const defaultModel = "gemini-3-pro-image-preview";
       await this.getApiKey(defaultModel);
       return true;
     } catch (error) {
