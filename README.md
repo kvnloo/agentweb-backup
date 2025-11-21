@@ -117,6 +117,22 @@ Example usage in Agent Mode:
 List all available knowledge base files and then read the file about product specifications.
 ```
 
+### Social Media Functions
+
+In Agent Mode, Emma can create social media posts using the following function call:
+
+- `create_social_media_posts`: Creates a list of social media posts and generates an HTML file containing all posts. Each post includes:
+  - **Type**: The social media platform type (`linkedin`, `x/twitter`, `instagram`, `facebook`, or `custom`)
+  - **Content**: Rich text content that can be transformed to HTML for display and copied for use
+  - **Image URL**: Optional image URL for posts that include images
+  - The output is an HTML file stored in S3 with all the posts formatted for easy viewing and copying
+
+Example usage in Agent Mode:
+
+```
+Create 5 LinkedIn posts about our new product launch, each with different angles and include relevant images.
+```
+
 For detailed documentation, please refer to our [Design Document](./design.md).
 
 ## Security

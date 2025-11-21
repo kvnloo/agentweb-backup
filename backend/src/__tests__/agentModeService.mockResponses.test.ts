@@ -148,6 +148,21 @@ describe('AgentModeService - Mock Responses', () => {
       expect(Array.isArray(mockResponse.icp[0].buyerPersonas)).toBe(true);
       expect(mockResponse.icp[0].buyerPersonas.length).toBeGreaterThan(0);
     });
+
+    it('should return correct mock response for create_social_media_posts', async () => {
+      const mockResponse = (agentModeService as any).getMockToolResult('create_social_media_posts', {
+        posts: [
+          { type: 'linkedin', content: 'Test post 1' },
+          { type: 'x/twitter', content: 'Test post 2' }
+        ]
+      });
+
+      expect(mockResponse.success).toBe(true);
+      expect(mockResponse.message).toBe('Successfully created 2 social media post(s)');
+      expect(mockResponse.htmlUrl).toContain('mock-social-media-posts-');
+      expect(mockResponse.htmlUrl).toContain('.html');
+      expect(mockResponse.postsCount).toBe(2);
+    });
   });
 
   describe('Tool response validation', () => {
