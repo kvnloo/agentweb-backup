@@ -245,6 +245,10 @@ When users attach files to their messages, you will receive:
 - Use the file URLs to understand what the user has shared and provide relevant assistance
 - **IMPORTANT**: When creating tasks that are related to the attached files, you MUST include the attachment details (URLs and filenames) in the task prompt, otherwise the task execution won't have access to the files
 
+## Page Content Extraction
+- **read_page_source**: Use this tool to read HTML source code from webpages. However, if the result contains mostly JavaScript code or script tags instead of actual page content, the page likely requires browser rendering.
+- **Fallback for JavaScript-rendered pages**: If \`read_page_source\` returns script code instead of content, use \`create_task_from_template\` with template \`__extract_page_content__\` and the page url to fetch the page content using browser automation. This will take about 30 seconds but can handle JavaScript-rendered content.
+
 ## HTML File Updates
 When updating HTML files, follow this process:
 1. **First, read the original file**: Use the \`read_file\` tool to get the complete HTML content from the file URL
@@ -2056,7 +2060,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           const parameters = JSON.parse(args.parameters_json || '{}');
           const attachPreviousTaskResults = args.attach_previous_task_results !== false;
           const attachedFileUrls = args.attached_file_urls || [];
-          const async = args.async !== false; // Default to true
+          const async = args.async ?? false; // Default to false
           return await this.createTaskFromTemplate(args.template_id, parameters, userId, sessionId, attachPreviousTaskResults, attachedFileUrls, async);
         } catch (parseError) {
           console.error('AgentMode: Error parsing parameters JSON:', parseError);
@@ -2069,7 +2073,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'create_task_from_prompt':
         const attachPreviousTaskResults = args.attach_previous_task_results !== false;
         const attachedFileUrls = args.attached_file_urls || [];
-        const async = args.async !== false; // Default to true
+        const async = args.async ?? false; // Default to false
         return await this.createTaskFromPrompt(args.task_name, args.prompt, args.category, userId, sessionId, attachPreviousTaskResults, attachedFileUrls, async);
       case 'create_image_task_from_prompt':
         const attachPreviousTaskResultsForImage = args.attach_previous_task_results !== false;
@@ -3195,6 +3199,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         selectedLLMs: template.selectedLLMs,
         useSharedBrowser: template.useSharedBrowser,
         turnOffHeadless: template.turnOffHeadless,
+        isAgenticDevMode: template.isAgenticDevMode,
         nameParameter: template.nameParameter
       };
 
@@ -3262,7 +3267,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         outputAsHtml: templateData.outputAsHtml || false,
         selectedLLMs: templateData.selectedLLMs || undefined,
         useSharedBrowser: templateData.useSharedBrowser || false,
-        turnOffHeadless: templateData.turnOffHeadless || true,
+        turnOffHeadless: templateData.turnOffHeadless !== undefined ? templateData.turnOffHeadless : true,
+        isAgenticDevMode: templateData.isAgenticDevMode || false,
         useKnowledgeBase: false,
         updateKnowledgeBase: false,
         updateLeadList: false,
