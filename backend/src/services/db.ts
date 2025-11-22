@@ -169,6 +169,7 @@ interface TaskTemplate {
   createVideo?: boolean;
   requireApproval?: boolean;
   slackChannel?: string;
+  isAgenticDevMode?: boolean;
 }
 
 interface UserWithCounts extends User {

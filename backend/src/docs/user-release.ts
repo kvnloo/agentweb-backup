@@ -7,6 +7,21 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-11-22',
+    changes: [
+      'Fixed Task Creation Execution Mode Default',
+      '- create_task_from_template and create_task_from_prompt now default to synchronous execution (async=false)',
+      '- Tasks will wait for completion before returning results, ensuring immediate feedback',
+      '- Explicitly set async=true if you need background task execution',
+      'Enhanced Page Content Extraction in Agent Mode',
+      '- Emma now automatically detects when web pages require browser rendering',
+      '- If read_page_source returns script code instead of content, Emma uses browser automation to extract the actual page content',
+      'Fixed Template Settings Inheritance',
+      '- Template settings (Turn Off Headless, Agentic Dev Mode) are now properly copied when creating tasks from templates',
+      '- Both true and false values are correctly preserved from templates to tasks',
+    ],
+  },
+  {
     date: '2025-11-21',
     changes: [
       'Added Social Media Posts Creation in Agent Mode',
