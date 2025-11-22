@@ -77,6 +77,7 @@ interface Template {
   selectedLLMs?: string[]; // Added for LLM selection
   useSharedBrowser?: boolean; // ADDED: Flag for using shared browser
   turnOffHeadless?: boolean;
+  isAgenticDevMode?: boolean;
 }
 
 // Helper function to extract parameters from prompt
@@ -115,6 +116,7 @@ export default function Templates() {
   const [selectedLLMs, setSelectedLLMs] = useState<string[]>([]); // New state for selected LLMs
   const [useSharedBrowser, setUseSharedBrowser] = useState(false); // ADDED: State for the toggle
   const [turnOffHeadless, setTurnOffHeadless] = useState(false);
+  const [isAgenticDevMode, setIsAgenticDevMode] = useState(false);
 
   const { token, user } = useAuth();
   const navigate = useNavigate();
@@ -190,6 +192,7 @@ export default function Templates() {
       setSelectedLLMs(template.selectedLLMs || []);
       setUseSharedBrowser(template.useSharedBrowser || false);
       setTurnOffHeadless(template.turnOffHeadless || false);
+      setIsAgenticDevMode(template.isAgenticDevMode || false);
       if (template.category && !SUPPORTED_CATEGORIES.includes(template.category)) {
         setCustomCategory(template.category);
         setCategory("Custom");
@@ -212,6 +215,7 @@ export default function Templates() {
       setSelectedLLMs([]);
       setUseSharedBrowser(false);
       setTurnOffHeadless(false);
+      setIsAgenticDevMode(false);
     }
     setOpenEditDialog(true);
   };
@@ -247,6 +251,7 @@ export default function Templates() {
         selectedLLMs: selectedLLMs,
         useSharedBrowser: useSharedBrowser,
         turnOffHeadless: turnOffHeadless,
+        isAgenticDevMode: isAgenticDevMode,
       };
 
       // Set category - if empty, set to empty string
@@ -888,6 +893,17 @@ export default function Templates() {
               label="Turn Off Headless"
               disabled={isDeepResearch}
             />
+            <Tooltip title="Enable Agentic Dev Mode for running templated tasks successfully">
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={isAgenticDevMode}
+                    onChange={(e) => setIsAgenticDevMode(e.target.checked)}
+                  />
+                }
+                label="Agentic Dev Mode"
+              />
+            </Tooltip>
           </Box>
         </DialogContent>
         <DialogActions>
