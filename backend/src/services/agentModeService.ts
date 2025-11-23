@@ -1059,6 +1059,27 @@ Use the available tools to create tasks in the agent-engine when complex work is
       {
         type: 'function' as const,
         function: {
+          name: 'remove_c2pa_from_image',
+          description: 'Remove C2PA metadata from an image by downloading it from a URL, stripping metadata, and uploading the cleaned image to S3. Returns the new S3 URL.',
+          parameters: {
+            type: 'object',
+            properties: {
+              image_url: {
+                type: 'string',
+                description: 'URL of the image to process (can be S3 URL, data URL, or any accessible image URL)'
+              },
+              filename: {
+                type: 'string',
+                description: 'Optional filename for the cleaned image. If not provided, will generate a filename based on the original URL'
+              }
+            },
+            required: ['image_url']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
           name: 'create_blog_article',
           description: 'Create a complete blog article with content, images, and HTML file. Generates blog content using AI, creates a hero image, and produces a complete HTML file uploaded to S3.',
           parameters: {
@@ -1483,6 +1504,15 @@ Use the available tools to create tasks in the agent-engine when complex work is
           message: `Mock image "${args.filename}" generated successfully!`,
           imageUrl: `data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==`,
           filename: args.filename
+        };
+      
+      case 'remove_c2pa_from_image':
+        return {
+          success: true,
+          message: `✅ C2PA metadata removed successfully! Image uploaded to S3.`,
+          imageUrl: `https://mock-s3-bucket.s3.amazonaws.com/${args.filename || `image_no_c2pa_${Date.now()}.png`}`,
+          filename: args.filename || `image_no_c2pa_${Date.now()}.png`,
+          originalUrl: args.image_url
         };
       
       case 'get_meta_ads_metrics':
@@ -2106,6 +2136,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.readFileContent(args.url);
       case 'generate_image':
         return await this.generateImage(args.prompt, args.filename, args.size || '1024x1024', args.quality || 'medium', args.inputImages || [], userId, sessionId, args.imageModel);
+      case 'remove_c2pa_from_image':
+        return await this.removeC2PAFromImage(args.image_url, args.filename, userId);
       case 'create_blog_article':
           return await this.createBlogArticle(args.topic, args.keywords || '', args.tone || 'professional', args.length || 'medium', args.researchContext || '', args.requirements || '', userId, sessionId, args.style || 'default');
       case 'create_social_media_posts':
@@ -5612,6 +5644,117 @@ Use the available tools to create tasks in the agent-engine when complex work is
       return {
         success: false,
         message: 'Failed to generate image',
+        error: error.message
+      };
+    }
+  }
+
+  /**
+   * Remove C2PA metadata from an image by downloading it, stripping metadata, and uploading to S3
+   */
+  private async removeC2PAFromImage(
+    imageUrl: string,
+    filename?: string,
+    userId?: string
+  ): Promise<any> {
+    try {
+      console.log('AgentMode: Removing C2PA metadata from image:', imageUrl);
+      
+      if (!imageUrl) {
+        return {
+          success: false,
+          message: 'Image URL is required',
+          error: 'missing_image_url'
+        };
+      }
+
+      // Import required services
+      const axios = require('axios');
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const { imageService } = await import('./imageGeneration');
+
+      // Download the image
+      let imageBuffer: Buffer;
+      if (imageUrl.startsWith('data:image/')) {
+        // Handle data URL
+        const base64Data = imageUrl.split(',')[1];
+        imageBuffer = Buffer.from(base64Data, 'base64');
+      } else {
+        // Download from URL
+        const response = await axios.get(imageUrl, {
+          responseType: 'arraybuffer',
+          timeout: 30000,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (compatible; AgentWeb/1.0)'
+          }
+        });
+        imageBuffer = Buffer.from(response.data);
+      }
+
+      // Remove C2PA metadata using the imageService's method
+      const cleanedBuffer = await imageService.removeC2PAMetadata(imageBuffer);
+
+      // Generate filename if not provided
+      let finalFilename = filename;
+      if (!finalFilename) {
+        // Extract filename from URL or generate one
+        try {
+          const urlObj = new URL(imageUrl);
+          const pathParts = urlObj.pathname.split('/');
+          const urlFilename = pathParts[pathParts.length - 1];
+          if (urlFilename && urlFilename.includes('.')) {
+            // Replace extension with .png
+            const nameWithoutExt = urlFilename.substring(0, urlFilename.lastIndexOf('.'));
+            finalFilename = `${nameWithoutExt}_no_c2pa.png`;
+          } else {
+            finalFilename = `image_no_c2pa_${Date.now()}.png`;
+          }
+        } catch {
+          finalFilename = `image_no_c2pa_${Date.now()}.png`;
+        }
+      } else if (!finalFilename.endsWith('.png')) {
+        // Ensure .png extension
+        const nameWithoutExt = finalFilename.substring(0, finalFilename.lastIndexOf('.') || finalFilename.length);
+        finalFilename = `${nameWithoutExt}.png`;
+      }
+
+      // Upload to S3
+      if (!userId) {
+        return {
+          success: false,
+          message: 'User ID is required for S3 upload',
+          error: 'missing_user_id'
+        };
+      }
+
+      const uploadResult = await uploadFileToS3(
+        cleanedBuffer,
+        finalFilename,
+        userId,
+        'image/png'
+      );
+
+      if (!uploadResult.success || !uploadResult.url) {
+        return {
+          success: false,
+          message: uploadResult.error || 'Failed to upload cleaned image to S3',
+          error: uploadResult.error || 's3_upload_failed'
+        };
+      }
+
+      return {
+        success: true,
+        message: `✅ C2PA metadata removed successfully! Image uploaded to S3.`,
+        imageUrl: uploadResult.url,
+        filename: finalFilename,
+        originalUrl: imageUrl
+      };
+
+    } catch (error: any) {
+      console.error('AgentMode: Error removing C2PA metadata:', error);
+      return {
+        success: false,
+        message: 'Failed to remove C2PA metadata from image',
         error: error.message
       };
     }

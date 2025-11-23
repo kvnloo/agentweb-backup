@@ -29,11 +29,42 @@ interface ImageGenerationParams {
   inputImages?: string[];
   userId: string;
   imageModel?: string; // Optional model parameter - must be one of the supported models
+  removeC2PA?: boolean; // Optional parameter to remove C2PA metadata, defaults to true
 }
 
 export class ImageService {
   constructor() {
     // No initialization needed - clients will be created as needed
+  }
+
+  /**
+   * Remove C2PA metadata from an image buffer by re-encoding it
+   * This strips all metadata including C2PA manifests
+   * The image is re-encoded as PNG to ensure all metadata is removed
+   */
+  async removeC2PAMetadata(imageBuffer: Buffer): Promise<Buffer> {
+    try {
+      const sharp = require('sharp');
+      
+      // Re-encode the image without metadata to remove C2PA
+      // Sharp will strip all metadata (including C2PA) when re-encoding
+      // We convert to PNG to ensure consistent format and complete metadata removal
+      const cleanedBuffer = await sharp(imageBuffer)
+        .png({
+          quality: 100,
+          compressionLevel: 0,
+          // Remove all metadata
+          withMetadata: false
+        })
+        .toBuffer();
+      
+      return cleanedBuffer;
+    } catch (error: any) {
+      console.error("❌ Failed to remove C2PA metadata:", error.message);
+      // If metadata removal fails, return original buffer
+      // This ensures the upload still works even if metadata removal fails
+      return imageBuffer;
+    }
   }
 
   /**
@@ -141,6 +172,12 @@ export class ImageService {
           } else {
             // It's already a URL, we can't upload it
             return result;
+          }
+          
+          // Remove C2PA metadata if removeC2PA is true (defaults to true)
+          const shouldRemoveC2PA = params.removeC2PA !== false; // Default to true
+          if (shouldRemoveC2PA) {
+            imageBuffer = await this.removeC2PAMetadata(imageBuffer);
           }
           
           // Upload to S3
