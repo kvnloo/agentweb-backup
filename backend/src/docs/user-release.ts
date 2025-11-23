@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-11-23',
+    changes: [
+      'Fixed Environment Outage Issue with Long-Running Scheduled Chats',
+      '- Added event loop yielding in generateMarketingResponse to allow health checks and other requests to be processed during long-running LLM operations',
+      '- Health checks now continue to work even during scheduled chat executions that take 10-20+ minutes',
+    ],
+  },
+  {
     date: '2025-11-22',
     changes: [
       'Fixed Task Creation Execution Mode Default',

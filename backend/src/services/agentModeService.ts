@@ -89,6 +89,10 @@ export class AgentModeService {
           max_completion_tokens: 12384
         });
         
+        // Yield control back to event loop after LLM call to allow health checks and other requests
+        // This prevents blocking the main thread during long-running generateResponse operations
+        await new Promise(resolve => setImmediate(resolve));
+        
         responseMessage = response.choices[0].message;
         const responseContent = responseMessage.content || '';
         
@@ -162,6 +166,10 @@ export class AgentModeService {
             });
           }
         }
+        
+        // Yield control before next iteration to allow health checks to be processed
+        // This ensures the event loop can handle other requests between LLM call iterations
+        await new Promise(resolve => setImmediate(resolve));
         
         // Do not append an assistant message; tool messages above are sufficient for model continuation
       }
