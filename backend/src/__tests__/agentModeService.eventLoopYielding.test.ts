@@ -81,7 +81,7 @@ describe('AgentModeService - Event Loop Yielding', () => {
       global.setImmediate = jest.fn((callback: () => void) => {
         setImmediateCalls.push(Date.now());
         return originalSetImmediate(callback);
-      }) as typeof setImmediate;
+      }) as unknown as typeof setImmediate;
 
       // Mock OpenAI to simulate multiple LLM calls with tool calls
       let callCount = 0;
@@ -202,7 +202,7 @@ describe('AgentModeService - Event Loop Yielding', () => {
       global.setImmediate = jest.fn((callback: () => void) => {
         setImmediateCallTimes.push(Date.now());
         return originalSetImmediate(callback);
-      }) as typeof setImmediate;
+      }) as unknown as typeof setImmediate;
 
       // Mock OpenAI to return multiple iterations with tool calls
       let iteration = 0;
