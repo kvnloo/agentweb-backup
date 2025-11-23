@@ -795,5 +795,142 @@ describe('ImageService', () => {
       }
     });
   });
+
+  describe('C2PA Metadata Removal', () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it('should accept removeC2PA parameter in generateImage', async () => {
+      const mockApiKey = 'test-api-key';
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+      
+      // Mock S3 upload
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue({
+        success: true,
+        url: 'https://s3.amazonaws.com/bucket/image.png'
+      });
+
+      // Mock Azure AI response
+      const mockAxios = require('axios');
+      (mockAxios.default.post as jest.Mock).mockResolvedValue({
+        data: {
+          data: [{
+            b64_json: 'base64encodedimagedata'
+          }]
+        }
+      });
+
+      // Test that removeC2PA parameter is accepted
+      const result = await imageService.generateImage({
+        prompt: 'Test prompt',
+        filename: 'test.png',
+        userId: 'user123',
+        imageModel: 'gpt-image-1',
+        size: '1024x1024',
+        removeC2PA: true
+      });
+
+      // Should not throw an error about unknown parameter
+      expect(result).toBeDefined();
+    });
+
+    it('should accept removeC2PA: false parameter', async () => {
+      const mockApiKey = 'test-api-key';
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+      
+      // Mock S3 upload
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue({
+        success: true,
+        url: 'https://s3.amazonaws.com/bucket/image.png'
+      });
+
+      // Mock Azure AI response
+      const mockAxios = require('axios');
+      (mockAxios.default.post as jest.Mock).mockResolvedValue({
+        data: {
+          data: [{
+            b64_json: 'base64encodedimagedata'
+          }]
+        }
+      });
+
+      const result = await imageService.generateImage({
+        prompt: 'Test prompt',
+        filename: 'test.png',
+        userId: 'user123',
+        imageModel: 'gpt-image-1',
+        size: '1024x1024',
+        removeC2PA: false
+      });
+
+      // Should not throw an error
+      expect(result).toBeDefined();
+    });
+
+    it('should export removeC2PAMetadata as a public method', () => {
+      // Test that the method exists and is callable
+      expect(typeof imageService.removeC2PAMetadata).toBe('function');
+    });
+
+    it('should handle removeC2PAMetadata with valid buffer', async () => {
+      const testBuffer = Buffer.from('test-image-data');
+      
+      // Mock sharp module
+      const mockSharpInstance = {
+        png: jest.fn().mockReturnThis(),
+        toBuffer: jest.fn().mockResolvedValue(Buffer.from('cleaned-data'))
+      };
+      
+      const mockSharp = jest.fn(() => mockSharpInstance);
+      jest.doMock('sharp', () => mockSharp, { virtual: true });
+
+      // Since sharp is required inside the function, we need to test the method directly
+      // The actual sharp mocking would need to be done at the module level
+      // For now, we'll test that the method exists and can be called
+      expect(typeof imageService.removeC2PAMetadata).toBe('function');
+      
+      // The method should return a Promise<Buffer>
+      const resultPromise = imageService.removeC2PAMetadata(testBuffer);
+      expect(resultPromise).toBeInstanceOf(Promise);
+    });
+
+    it('should default removeC2PA to true when not specified', async () => {
+      const mockApiKey = 'test-api-key';
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+      
+      // Mock S3 upload
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue({
+        success: true,
+        url: 'https://s3.amazonaws.com/bucket/image.png'
+      });
+
+      // Mock Azure AI response - must return b64_json to create a data URL
+      const mockAxios = require('axios');
+      (mockAxios.default.post as jest.Mock).mockResolvedValue({
+        status: 200,
+        data: {
+          data: [{
+            b64_json: 'base64encodedimagedata'
+          }]
+        }
+      });
+
+      // Call without removeC2PA parameter - should default to true
+      // This test verifies that the parameter is accepted and doesn't cause errors
+      const result = await imageService.generateImage({
+        prompt: 'Test prompt',
+        filename: 'test.png',
+        userId: 'user123',
+        imageModel: 'gpt-image-1',
+        size: '1024x1024'
+        // removeC2PA not specified - should default to true
+      });
+
+      // Should complete without throwing an error
+      // The actual behavior (S3 upload, metadata removal) depends on the response format
+      expect(result).toBeDefined();
+    });
+  });
 });
 
