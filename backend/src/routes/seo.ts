@@ -76,8 +76,7 @@ router.get("/metrics", async (req, res) => {
         const siteUrl = domain.startsWith("http") ? domain : `sc-domain:${domain}`;
 
         // Calculate date range based on timeframe
-        // Google Search Console uses Pacific Time, so we need to account for that
-        // Use UTC for date calculations but be aware GSC data is in PST
+        // End date is yesterday (most recent complete day)
         const now = new Date();
         const endDate = new Date(now);
         endDate.setUTCDate(endDate.getUTCDate() - 1); // Yesterday in UTC
@@ -85,22 +84,29 @@ router.get("/metrics", async (req, res) => {
         
         const startDate = new Date(endDate);
         
+        // For N days, go back (N) days from end date to match Google UI
+        // Google includes both start and end dates, so we need to go back N days to get N+1 days total
+        // But to match Google's behavior, we go back one extra day
         if (timeframe === "7d") {
-          startDate.setUTCDate(endDate.getUTCDate() - 6); // 7 days total
+          startDate.setUTCDate(endDate.getUTCDate() - 7); // Go back 7 days to match Google's start date
         } else if (timeframe === "14d") {
-          startDate.setUTCDate(endDate.getUTCDate() - 13); // 14 days total
+          startDate.setUTCDate(endDate.getUTCDate() - 14); // Go back 14 days
         } else if (timeframe === "30d") {
-          startDate.setUTCDate(endDate.getUTCDate() - 29); // 30 days total
+          startDate.setUTCDate(endDate.getUTCDate() - 30); // Go back 30 days
         } else if (timeframe === "90d") {
-          startDate.setUTCDate(endDate.getUTCDate() - 89); // 90 days total
+          startDate.setUTCDate(endDate.getUTCDate() - 90); // Go back 90 days
         } else {
           // Default to 30 days if invalid timeframe
-          startDate.setUTCDate(endDate.getUTCDate() - 29);
+          startDate.setUTCDate(endDate.getUTCDate() - 30);
         }
+        startDate.setUTCHours(0, 0, 0, 0);
         startDate.setUTCHours(0, 0, 0, 0);
 
         const startDateStr = startDate.toISOString().split("T")[0];
         const endDateStr = endDate.toISOString().split("T")[0];
+        
+        const daysInRange = Math.floor((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24)) + 1;
+        console.log(`[SEO Debug] Date calculation - Start: ${startDateStr}, End: ${endDateStr}, Days: ${daysInRange}, Timeframe: ${timeframe}`);
 
         const searchAnalyticsUrl = `https://www.googleapis.com/webmasters/v3/sites/${encodeURIComponent(siteUrl)}/searchAnalytics/query`;
         
@@ -115,7 +121,7 @@ router.get("/metrics", async (req, res) => {
             startDate: startDateStr,
             endDate: endDateStr,
             dimensions: ["date"],
-            rowLimit: 25000, // Increase limit to ensure we get all data
+            rowLimit: 25000, // Increased to ensure we get all daily data
           }),
         });
 
@@ -168,13 +174,52 @@ router.get("/metrics", async (req, res) => {
         console.log(`[SEO Debug] Total daily data entries: ${dailyData.length}`);
         console.log(`[SEO Debug] Sample dates:`, dailyData.slice(0, 5).map(d => d.date));
 
-        // Calculate totals from daily data (this matches Google Search Console UI)
-        const totalClicks = dailyData.reduce((sum, day) => sum + day.clicks, 0);
-        const totalImpressions = dailyData.reduce((sum, day) => sum + day.impressions, 0);
-        const avgCtr = totalImpressions > 0 ? (totalClicks / totalImpressions) * 100 : 0;
-        
-        console.log(`[SEO Debug] Calculated totals - Clicks: ${totalClicks}, Impressions: ${totalImpressions}`);
+        // Fetch overall totals without dimensions - this matches Google UI exactly
+        // Google calculates totals from the full dataset, not just daily breakdown
+        const overallResponse = await fetch(searchAnalyticsUrl, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            startDate: startDateStr,
+            endDate: endDateStr,
+            // No dimensions = overall totals (matches Google UI calculation exactly)
+          }),
+        });
 
+        let totalClicks = 0;
+        let totalImpressions = 0;
+        let avgPosition = 0;
+        let avgCtr = 0;
+
+        if (overallResponse.ok) {
+          const overallData = await overallResponse.json();
+          // When no dimensions are specified, API returns totals matching Google UI
+          if (overallData.rows && overallData.rows.length > 0) {
+            const overallRow = overallData.rows[0];
+            totalClicks = overallRow.clicks || 0;
+            totalImpressions = overallRow.impressions || 0;
+            avgPosition = overallRow.position || 0; // Weighted average position from Google
+            avgCtr = totalImpressions > 0 ? (totalClicks / totalImpressions) * 100 : 0;
+            console.log(`[SEO Debug] Overall API totals (matches Google UI) - Clicks: ${totalClicks}, Impressions: ${totalImpressions}, Position: ${avgPosition.toFixed(2)}, CTR: ${avgCtr.toFixed(2)}%`);
+          } else {
+            // Fallback: sum daily data (may not match exactly due to sampling)
+            console.log(`[SEO Debug] Overall response has no rows, falling back to daily data sum`);
+            totalClicks = dailyData.reduce((sum, day) => sum + day.clicks, 0);
+            totalImpressions = dailyData.reduce((sum, day) => sum + day.impressions, 0);
+            avgCtr = totalImpressions > 0 ? (totalClicks / totalImpressions) * 100 : 0;
+          }
+        } else {
+          // Fallback to daily data if overall request fails
+          const errorData = await overallResponse.json().catch(() => ({}));
+          console.log(`[SEO Debug] Overall request failed:`, errorData);
+          totalClicks = dailyData.reduce((sum, day) => sum + day.clicks, 0);
+          totalImpressions = dailyData.reduce((sum, day) => sum + day.impressions, 0);
+          avgCtr = totalImpressions > 0 ? (totalClicks / totalImpressions) * 100 : 0;
+        }
+        
         // Fetch top queries (single dimension to avoid aggregation issues)
         const queriesResponse = await fetch(searchAnalyticsUrl, {
           method: "POST",
@@ -186,14 +231,16 @@ router.get("/metrics", async (req, res) => {
             startDate: startDateStr,
             endDate: endDateStr,
             dimensions: ["query"],
-            rowLimit: 1000,
+            rowLimit: 25000, // Increased to get all queries
           }),
         });
 
         let topQueries: Array<{ query: string; clicks: number; impressions: number; ctr: number; position: number }> = [];
+        let allQueriesData: any = null;
         if (queriesResponse.ok) {
-          const queriesData = await queriesResponse.json();
-          topQueries = (queriesData.rows || [])
+          allQueriesData = await queriesResponse.json();
+          console.log(`[SEO Debug] Queries response rows: ${allQueriesData.rows?.length || 0}`);
+          topQueries = (allQueriesData.rows || [])
             .map((row: any) => ({
               query: row.keys?.[0] || "Unknown",
               clicks: row.clicks || 0,
@@ -204,6 +251,27 @@ router.get("/metrics", async (req, res) => {
             .sort((a, b) => b.clicks - a.clicks)
             .slice(0, 10);
         }
+        
+        // If we still don't have position, calculate weighted average from queries
+        if (avgPosition === 0 && allQueriesData && allQueriesData.rows && allQueriesData.rows.length > 0) {
+          // Calculate weighted average position: sum(position * impressions) / sum(impressions)
+          let totalPositionWeighted = 0;
+          let totalImpressionsForPosition = 0;
+          allQueriesData.rows.forEach((row: any) => {
+            const impressions = row.impressions || 0;
+            const position = row.position || 0;
+            if (impressions > 0 && position > 0) {
+              totalPositionWeighted += position * impressions;
+              totalImpressionsForPosition += impressions;
+            }
+          });
+          if (totalImpressionsForPosition > 0) {
+            avgPosition = totalPositionWeighted / totalImpressionsForPosition;
+            console.log(`[SEO Debug] Calculated weighted position from queries: ${avgPosition.toFixed(2)}`);
+          }
+        }
+        
+        console.log(`[SEO Debug] Final totals - Clicks: ${totalClicks}, Impressions: ${totalImpressions}, Position: ${avgPosition.toFixed(2)}, CTR: ${avgCtr.toFixed(2)}%`);
 
         // Fetch top pages (single dimension to avoid aggregation issues)
         const pagesResponse = await fetch(searchAnalyticsUrl, {
@@ -216,13 +284,14 @@ router.get("/metrics", async (req, res) => {
             startDate: startDateStr,
             endDate: endDateStr,
             dimensions: ["page"],
-            rowLimit: 1000,
+            rowLimit: 25000, // Increased to get all pages
           }),
         });
 
         let topPages: Array<{ page: string; clicks: number; impressions: number; ctr: number; position: number }> = [];
         if (pagesResponse.ok) {
           const pagesData = await pagesResponse.json();
+          console.log(`[SEO Debug] Pages response rows: ${pagesData.rows?.length || 0}`);
           topPages = (pagesData.rows || [])
             .map((row: any) => ({
               page: row.keys?.[0] || "Unknown",
@@ -234,11 +303,6 @@ router.get("/metrics", async (req, res) => {
             .sort((a, b) => b.clicks - a.clicks)
             .slice(0, 10);
         }
-
-        // Calculate average position from top queries (as a representative metric)
-        const avgPosition = topQueries.length > 0
-          ? topQueries.reduce((sum, q) => sum + q.position, 0) / topQueries.length
-          : 0;
 
         return {
           domain,
