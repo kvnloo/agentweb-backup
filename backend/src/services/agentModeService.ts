@@ -1166,7 +1166,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
                     },
                     content: {
                       type: 'string',
-                      description: 'Rich text content for the post (supports markdown formatting)'
+                      description: 'Rich text content for the post (supports markdown formatting). IMPORTANT: Do not include image URLs in the content text as the format will not look good. Use the image_url parameter separately for images.'
                     },
                     image_url: {
                       type: 'string',
@@ -6051,6 +6051,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
         }
         .post-content a:hover {
             text-decoration: underline;
+        }
+        .post-content img {
+            max-width: 100%;
+            height: auto;
+            border-radius: 4px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+            margin: 15px 0;
+            display: block;
         }
         .post-image {
             margin: 15px 0;

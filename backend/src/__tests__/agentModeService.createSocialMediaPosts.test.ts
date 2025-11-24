@@ -536,6 +536,70 @@ describe('AgentModeService - create_social_media_posts function', () => {
       expect(htmlContent).toContain('Post 2');
       expect(htmlContent).toContain('Post 3');
     });
+
+    it('should style images in post content with proper CSS', async () => {
+      const mockPosts = [
+        {
+          type: 'linkedin',
+          content: 'Check out this image: ![Alt text](https://example.com/image-in-content.jpg)'
+        }
+      ];
+
+      mockUploadFileToS3.mockResolvedValue({
+        success: true,
+        url: 'https://s3.example.com/posts.html'
+      });
+
+      await (agentModeService as any).createSocialMediaPosts(
+        mockPosts,
+        'user123',
+        'session123'
+      );
+
+      const uploadCall = mockUploadFileToS3.mock.calls[0];
+      const htmlContent = uploadCall[0];
+      
+      // Verify CSS styling for images in post content exists
+      expect(htmlContent).toContain('.post-content img');
+      expect(htmlContent).toContain('max-width: 100%');
+      expect(htmlContent).toContain('height: auto');
+      expect(htmlContent).toContain('border-radius: 4px');
+      expect(htmlContent).toContain('box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1)');
+      expect(htmlContent).toContain('margin: 15px 0');
+      expect(htmlContent).toContain('display: block');
+    });
+
+    it('should style images in content even when image_url parameter is also provided', async () => {
+      const mockPosts = [
+        {
+          type: 'linkedin',
+          content: 'Post with both: ![Image in content](https://example.com/content-image.jpg)',
+          image_url: 'https://example.com/parameter-image.jpg'
+        }
+      ];
+
+      mockUploadFileToS3.mockResolvedValue({
+        success: true,
+        url: 'https://s3.example.com/posts.html'
+      });
+
+      await (agentModeService as any).createSocialMediaPosts(
+        mockPosts,
+        'user123',
+        'session123'
+      );
+
+      const uploadCall = mockUploadFileToS3.mock.calls[0];
+      const htmlContent = uploadCall[0];
+      
+      // Verify both image styling classes exist
+      expect(htmlContent).toContain('.post-content img');
+      expect(htmlContent).toContain('.post-image img');
+      
+      // Verify CSS properties for content images
+      expect(htmlContent).toContain('max-width: 100%');
+      expect(htmlContent).toContain('border-radius: 4px');
+    });
   });
 });
 

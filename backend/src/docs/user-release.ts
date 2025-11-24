@@ -13,6 +13,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Implemented worker process architecture to run generateMarketingResponse in a separate process, preventing blocking of the main event loop',
       '- This architecture completely isolates CPU-intensive LLM operations from the main application thread, providing better system stability and responsiveness',
       '- Health checks and API requests remain fully responsive even during intensive Agent Mode operations',
+      'Improved Social Media Posts Image Display',
+      '- Images included in post content text are now automatically styled with responsive sizing, rounded corners, and proper spacing',
     ],
   },
   {
