@@ -585,6 +585,60 @@ Store your Google Search API credentials in AWS Secrets Manager:
 - If Google Search API credentials are not found in Secrets Manager or the API fails, the system automatically falls back to mock search results
 - This ensures Agent Mode continues to work even without the API configured
 
+### Google Search Console API Configuration
+
+To enable SEO metrics tracking in the customer portal, you need to set up Google Search Console API.
+
+#### 1. Create a Google Cloud Project
+
+1. **Go to Google Cloud Console**:
+   - Visit [Google Cloud Console](https://console.cloud.google.com/)
+   - Select your existing project or create a new one
+
+2. **Enable Search Console API**:
+   - Go to "APIs & Services" > "Library"
+   - Search for "Google Search Console API" and enable it
+
+#### 2. Create Service Account
+
+1. **Create Service Account**:
+   - Go to "APIs & Services" > "Credentials"
+   - Click "Create Credentials" > "Service account"
+   - Enter a name (e.g., "AgentWeb SEO Service")
+   - Click "Create and Continue"
+   - Skip optional steps and click "Done"
+
+2. **Create Service Account Key**:
+   - Click on the service account you just created
+   - Go to the "Keys" tab
+   - Click "Add Key" > "Create new key"
+   - Choose "JSON" format
+   - Click "Create"
+   - The JSON key file will be downloaded - **keep this secure!**
+
+3. **Grant Service Account Access to Search Console Properties**:
+   - Visit [Google Search Console](https://search.google.com/search-console)
+   - For each domain you want to track:
+     - Select the property
+     - Go to Settings > Users and permissions
+     - Click "Add user"
+     - Enter the service account email (found in the JSON key file as `client_email`)
+     - Select permission level: "Full" or "Restricted" (Restricted is sufficient for read-only access)
+     - Click "Add"
+   - **Note**: Users should grant access to the service account email for their domains
+
+#### 3. Store Service Account JSON in AWS Secrets Manager
+
+Store your Google Search Console API credentials in AWS Secrets Manager:
+
+**For Development:**
+- Secret Name: `dev/AgentWeb/Google/SearchConsole`
+- Secret Value: Paste the entire contents of the service account JSON key file you downloaded
+
+**For Production:**
+- Secret Name: `prod/AgentWeb/Google/SearchConsole`
+- Secret Value: Paste the entire contents of the service account JSON key file you downloaded
+
 ## Testing
 
 ### Running Backend Unit Tests

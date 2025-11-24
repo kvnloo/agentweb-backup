@@ -161,6 +161,46 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
   }
 });
 
+// Update user SEO domains
+router.put("/users/:userId/seo-domains", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { seoDomains } = req.body;
+
+    // Check if user exists
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Validate seoDomains is an array
+    if (seoDomains && !Array.isArray(seoDomains)) {
+      return res.status(400).json({ message: "seoDomains must be an array" });
+    }
+
+    // Validate each domain format
+    if (seoDomains) {
+      const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
+      for (const domain of seoDomains) {
+        if (typeof domain !== 'string' || !domainRegex.test(domain.trim())) {
+          return res.status(400).json({ 
+            message: `Invalid domain format: ${domain}. Please use format like example.com` 
+          });
+        }
+      }
+    }
+
+    // Update the user's SEO domains
+    const updatedUser = await userDb.updateUser(userId, { 
+      seoDomains: seoDomains || [] 
+    });
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error updating user SEO domains:", error);
+    res.status(500).json({ message: "Error updating SEO domains" });
+  }
+});
+
 // Update user password
 router.put("/users/:userId/password", async (req, res) => {
   try {
