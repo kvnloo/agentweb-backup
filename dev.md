@@ -211,3 +211,6 @@ export BROWSER_USE_MEMORY_DISABLED="true"
 - `agent-engine/memory_fix_v2.py` - Enhanced memory fix script
 - `agent-engine/tests/test_memory_fix_v2.py` - Comprehensive tests
 - `agent-engine/MEMORY_FIX_V2_SUMMARY.md` - Detailed documentation
+
+November 23, 2025
+There was two outages in recent three days. To debug, I downloaded the full log files and then asked Cursor to look into and she found that Emma was running workflows for too long and thus blocked health checks from AWS which then got Elastic Beanstalk to go unhealthy and go crazy to mess up.
