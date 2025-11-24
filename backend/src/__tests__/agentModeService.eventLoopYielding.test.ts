@@ -337,5 +337,251 @@ describe('AgentModeService - Event Loop Yielding', () => {
       expect(result.toolCalls[0].name).toBe('search_knowledge_base');
     });
   });
+
+  describe('Tool execution event loop yielding', () => {
+    it('should yield control before tool execution starts', async () => {
+      const setImmediateCalls: number[] = [];
+      const originalSetImmediate = global.setImmediate;
+      
+      // Mock setImmediate to track calls
+      global.setImmediate = jest.fn((callback: () => void) => {
+        setImmediateCalls.push(Date.now());
+        return originalSetImmediate(callback);
+      }) as unknown as typeof setImmediate;
+
+      // Mock OpenAI to return tool calls
+      mockOpenAI.chat.completions.create = jest.fn()
+        .mockResolvedValueOnce({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [{
+                id: 'call_1',
+                function: {
+                  name: 'search_knowledge_base',
+                  arguments: JSON.stringify({ query: 'test query' })
+                }
+              }]
+            }
+          }]
+        })
+        .mockResolvedValueOnce({
+          choices: [{
+            message: {
+              content: 'Final response',
+              tool_calls: null
+            }
+          }]
+        });
+
+      // Mock executeTool with a delay to simulate long-running operation
+      let toolExecutionStarted = false;
+      (agentModeService as any).executeTool = jest.fn().mockImplementation(async () => {
+        toolExecutionStarted = true;
+        await new Promise(resolve => setTimeout(resolve, 10));
+        return { formattedContent: 'Tool result' };
+      });
+
+      await agentModeService.generateMarketingResponse(
+        'Test message',
+        [],
+        'test-user',
+        'test-session'
+      );
+
+      // Verify setImmediate was called before tool execution
+      // We expect at least 2 calls: one after LLM call, one before tool execution
+      expect(setImmediateCalls.length).toBeGreaterThanOrEqual(2);
+      
+      // Verify tool was executed
+      expect((agentModeService as any).executeTool).toHaveBeenCalled();
+
+      // Restore original setImmediate
+      global.setImmediate = originalSetImmediate;
+    });
+
+    it('should yield control after tool execution completes', async () => {
+      const setImmediateCalls: number[] = [];
+      const originalSetImmediate = global.setImmediate;
+      
+      // Mock setImmediate to track calls
+      global.setImmediate = jest.fn((callback: () => void) => {
+        setImmediateCalls.push(Date.now());
+        return originalSetImmediate(callback);
+      }) as unknown as typeof setImmediate;
+
+      // Mock OpenAI to return tool calls
+      mockOpenAI.chat.completions.create = jest.fn()
+        .mockResolvedValueOnce({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [{
+                id: 'call_1',
+                function: {
+                  name: 'search_knowledge_base',
+                  arguments: JSON.stringify({ query: 'test query' })
+                }
+              }]
+            }
+          }]
+        })
+        .mockResolvedValueOnce({
+          choices: [{
+            message: {
+              content: 'Final response',
+              tool_calls: null
+            }
+          }]
+        });
+
+      // Mock executeTool with a delay
+      (agentModeService as any).executeTool = jest.fn().mockImplementation(async () => {
+        await new Promise(resolve => setTimeout(resolve, 10));
+        return { formattedContent: 'Tool result' };
+      });
+
+      await agentModeService.generateMarketingResponse(
+        'Test message',
+        [],
+        'test-user',
+        'test-session'
+      );
+
+      // Verify setImmediate was called after tool execution
+      // We expect calls: after LLM call, before tool, after tool, before next iteration
+      expect(setImmediateCalls.length).toBeGreaterThanOrEqual(3);
+
+      // Restore original setImmediate
+      global.setImmediate = originalSetImmediate;
+    });
+
+    it('should yield control even when tool execution fails', async () => {
+      const setImmediateCalls: number[] = [];
+      const originalSetImmediate = global.setImmediate;
+      
+      // Mock setImmediate to track calls
+      global.setImmediate = jest.fn((callback: () => void) => {
+        setImmediateCalls.push(Date.now());
+        return originalSetImmediate(callback);
+      }) as unknown as typeof setImmediate;
+
+      // Mock OpenAI to return tool calls
+      mockOpenAI.chat.completions.create = jest.fn()
+        .mockResolvedValueOnce({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [{
+                id: 'call_1',
+                function: {
+                  name: 'search_knowledge_base',
+                  arguments: JSON.stringify({ query: 'test query' })
+                }
+              }]
+            }
+          }]
+        })
+        .mockResolvedValueOnce({
+          choices: [{
+            message: {
+              content: 'Final response after error',
+              tool_calls: null
+            }
+          }]
+        });
+
+      // Mock executeTool to throw an error
+      (agentModeService as any).executeTool = jest.fn().mockRejectedValue(
+        new Error('Tool execution failed')
+      );
+
+      await agentModeService.generateMarketingResponse(
+        'Test message',
+        [],
+        'test-user',
+        'test-session'
+      );
+
+      // Verify setImmediate was called even after error handling
+      // We expect calls: after LLM call, before tool, after error handling
+      expect(setImmediateCalls.length).toBeGreaterThanOrEqual(3);
+
+      // Restore original setImmediate
+      global.setImmediate = originalSetImmediate;
+    });
+  });
+
+  describe('Multiple tool calls event loop yielding', () => {
+    it('should yield control between multiple tool executions', async () => {
+      const setImmediateCalls: number[] = [];
+      const originalSetImmediate = global.setImmediate;
+      
+      // Mock setImmediate to track calls
+      global.setImmediate = jest.fn((callback: () => void) => {
+        setImmediateCalls.push(Date.now());
+        return originalSetImmediate(callback);
+      }) as unknown as typeof setImmediate;
+
+      // Mock OpenAI to return multiple tool calls
+      mockOpenAI.chat.completions.create = jest.fn()
+        .mockResolvedValueOnce({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [
+                {
+                  id: 'call_1',
+                  function: {
+                    name: 'search_knowledge_base',
+                    arguments: JSON.stringify({ query: 'query 1' })
+                  }
+                },
+                {
+                  id: 'call_2',
+                  function: {
+                    name: 'search_knowledge_base',
+                    arguments: JSON.stringify({ query: 'query 2' })
+                  }
+                }
+              ]
+            }
+          }]
+        })
+        .mockResolvedValueOnce({
+          choices: [{
+            message: {
+              content: 'Final response',
+              tool_calls: null
+            }
+          }]
+        });
+
+      // Mock executeTool with delays to simulate long-running operations
+      let toolCallCount = 0;
+      (agentModeService as any).executeTool = jest.fn().mockImplementation(async () => {
+        toolCallCount++;
+        await new Promise(resolve => setTimeout(resolve, 10));
+        return { formattedContent: `Tool result ${toolCallCount}` };
+      });
+
+      await agentModeService.generateMarketingResponse(
+        'Test message',
+        [],
+        'test-user',
+        'test-session'
+      );
+
+      // Verify setImmediate was called multiple times
+      // We expect: after LLM call, before tool 1, after tool 1, before tool 2, after tool 2, before next iteration
+      expect(setImmediateCalls.length).toBeGreaterThanOrEqual(5);
+      
+      // Verify both tools were executed
+      expect((agentModeService as any).executeTool).toHaveBeenCalledTimes(2);
+
+      // Restore original setImmediate
+      global.setImmediate = originalSetImmediate;
+    });
+  });
 });
 
