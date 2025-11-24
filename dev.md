@@ -214,3 +214,6 @@ export BROWSER_USE_MEMORY_DISABLED="true"
 
 November 23, 2025
 There was two outages in recent three days. To debug, I downloaded the full log files and then asked Cursor to look into and she found that Emma was running workflows for too long and thus blocked health checks from AWS which then got Elastic Beanstalk to go unhealthy and go crazy to mess up.
+
+November 24, 2025
+Added oncall alert on Agentweb-backend-env-prod-3 env as it is currently the prod backend and most risky outage.

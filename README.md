@@ -939,6 +939,60 @@ When you need to update your staging environment:
 5. Enter a version label (e.g., "v0.22-stage")
 6. Click "Deploy"
 
+### Setting Up Oncall Alerts for Elastic Beanstalk Services
+
+This section describes how to set up monitoring and oncall alerts when Elastic Beanstalk services become unhealthy.
+
+#### Prerequisites
+
+- AWS Account with CloudWatch and SNS permissions
+- Access to AWS Management Console
+- Email address for receiving alerts
+
+#### 1. Create CloudWatch Alarms for Elastic Beanstalk Health
+
+For each Elastic Beanstalk environment (backend, frontend, customer-portal, growth-genius-chat), create health monitoring alarms directly in the Elastic Beanstalk console:
+
+1. **Go to Elastic Beanstalk Console**:
+   - Navigate to [Elastic Beanstalk Console](https://console.aws.amazon.com/elasticbeanstalk/)
+   - Select your environment (e.g., `agentweb-backend`)
+
+2. **Navigate to Alarms**:
+   - In the left navigation pane, click **Alarms** (under the Monitoring section)
+   - Click **Create alarm** button
+
+3. **Configure Alarm for Environment Health**:
+   - **Period**: Select **5 minutes** from the dropdown
+     - This is the evaluation period for the metric
+   - **Change state after**: Select **5 minutes** from the dropdown
+     - **This is the key setting**: The alarm will only change state (trigger) after the unhealthy condition persists for 5 minutes
+     - This prevents false alarms from temporary glitches
+   - **Threshold**: 
+     - Select **<** (less than) from the dropdown
+     - Enter `-1` in the text field
+     - Health status values: `1` = Ok, `0` = Warning, `-1` = Degraded, `-2` = Severe
+     - **This alarm will trigger only when health is Severe** (value is -2, which is less than -1)
+     - This means you'll only be alerted for the most critical issues, not warnings or degraded states
+   - **Notify**: 
+     - Select **Create a new SNS topic** from the dropdown
+   - **Topic name**: Enter `agentweb-oncall-alerts` (or your preferred name)
+   - **Email**: Enter the email address for oncall notifications (e.g., `founders@agentweb.pro`)
+     - The SNS topic and email subscription will be created automatically
+     - You'll need to confirm the email subscription by clicking the link in the confirmation email
+   - **Notify when state changes to**: 
+     - Check **Alarm** (required - this sends notification when environment becomes unhealthy)
+     - Uncheck **Ok** (optional - you typically don't need notifications when it recovers)
+     - Uncheck **Insufficient data** (optional - only needed if you want alerts for missing metrics)
+
+4. **Create the Alarm**:
+   - Review the alarm configuration
+   - Click **Create alarm** button (orange button at bottom right)
+   - The alarm will be created and the SNS topic will be set up automatically
+
+**Note on configuration**: 
+- **Threshold of `-1`**: This alarm will only trigger when the environment health is **Severe** (value -2), not for Warning or Degraded states. This ensures you're only alerted for the most critical issues.
+- **5-minute delay**: The "Change state after" setting of 5 minutes means the alarm will only trigger after the environment has been in Severe status for 5 consecutive minutes. This helps reduce false alarms while still alerting you to sustained critical issues. If you want immediate alerts, set this to `1 minute` instead.
+
 ### Agent Engine Deployment to Google Cloud VM
 
 This section describes how to deploy the agent-engine on a single Google Cloud VM instance, suitable for development, testing, or lower-scale production use.
