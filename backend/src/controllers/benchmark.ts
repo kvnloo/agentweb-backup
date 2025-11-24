@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { benchmarkTestDb } from '../services/db';
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
+import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { AuthenticatedRequest } from '../middleware/auth';
 import { BenchmarkTest, CreateBenchmarkTestRequest, RunBenchmarkTestRequest } from '../types/benchmark';
 import { v4 as uuidv4 } from 'uuid';
@@ -328,14 +329,15 @@ export async function runBenchmarkTest(req: AuthenticatedRequest, res: Response)
       const sessionHistory = messages.slice(0, -1);
 
 
-      // Call the agent to generate response with mock mode enabled
-      const agentResponse = await agentModeService.generateMarketingResponse(
+      // Call the agent to generate response with mock mode enabled using worker process
+      // This prevents blocking the main event loop during benchmark testing
+      const agentResponse = await generateMarketingResponseWorkerService.runInWorker({
         messageContent,
         sessionHistory,
-        test.userId, // Use the original user's ID
-        test.sessionId, // Use the original session ID
-        true // Enable mock mode for benchmark testing
-      );
+        userId: test.userId, // Use the original user's ID
+        sessionId: test.sessionId, // Use the original session ID
+        mockMode: true // Enable mock mode for benchmark testing
+      });
 
       const executionTime = Date.now() - startTime;
 

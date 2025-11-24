@@ -32,6 +32,19 @@ jest.mock('../../services/agentModeService', () => ({
   }))
 }));
 
+// Mock the worker service used by generateSessionResponse
+jest.mock('../../services/generateMarketingResponseWorkerService', () => ({
+  generateMarketingResponseWorkerService: {
+    runInWorker: jest.fn().mockResolvedValue({
+      content: 'AI response here',
+      toolCalls: [],
+      knowledgeBaseQueries: [],
+      sources: [],
+      responseMessages: [ { role: 'assistant', content: 'AI response here' } ]
+    })
+  }
+}));
+
 // Mock the User type
 interface User {
   userId: string;
@@ -58,6 +71,14 @@ const mockResponse = (): Partial<Response> => {
 describe('AgentMode Sharing Controller', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    jest.clearAllTimers();
+    jest.useRealTimers();
+  });
+
+  afterEach(() => {
+    // Clean up to prevent memory leaks
+    jest.clearAllTimers();
+    jest.useRealTimers();
   });
 
   describe('createShareLink', () => {

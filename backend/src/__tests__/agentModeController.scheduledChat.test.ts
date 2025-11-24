@@ -19,6 +19,12 @@ jest.mock('../services/agentModeService', () => ({
   },
 }));
 
+jest.mock('../services/generateMarketingResponseWorkerService', () => ({
+  generateMarketingResponseWorkerService: {
+    runInWorker: jest.fn(),
+  },
+}));
+
 jest.mock('../services/db', () => ({
   scheduleDb: {
     addRunResult: jest.fn(),
@@ -50,6 +56,7 @@ import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { scheduleDb, taskDb } from '../services/db';
 import { emailService } from '../services/emailService';
+import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { agentModeController } from '../controllers/agentModeController';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
@@ -57,6 +64,7 @@ const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeSer
 const mockScheduleDb = scheduleDb as jest.Mocked<typeof scheduleDb>;
 const mockTaskDb = taskDb as jest.Mocked<typeof taskDb>;
 const mockEmailService = emailService as jest.Mocked<typeof emailService>;
+const mockGenerateMarketingResponseWorkerService = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
 
 describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
   const mockUserId = 'test-user-123';
@@ -99,11 +107,18 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession);
     mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
     mockAgentModeService.generateSessionTitle.mockResolvedValue('Generated Title');
-    mockAgentModeService.generateMarketingResponse.mockResolvedValue(mockResponse);
+    // Use worker service instead of direct generateMarketingResponse
+    mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(mockResponse);
     mockScheduleDb.addRunResult.mockResolvedValue(undefined);
     mockScheduleDb.getScheduleById.mockResolvedValue(baseSchedule);
     mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([]);
     mockScheduleDb.updateScheduleAfterRun.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    // Clean up to prevent memory leaks
+    jest.clearAllTimers();
+    jest.useRealTimers();
   });
 
   describe('runScheduledChat function', () => {
@@ -118,7 +133,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         ],
       };
       
-      mockAgentModeService.generateMarketingResponse.mockResolvedValue(successfulResponse);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
 
       // Test through the testScheduledChat endpoint
       const mockReq = {
@@ -155,7 +170,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         toolCalls: [{ name: 'get_marketing_tips', arguments: {} }], // Missing analyze_competitors
       };
       
-      mockAgentModeService.generateMarketingResponse.mockResolvedValue(incompleteResponse);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(incompleteResponse);
 
       const mockReq = {
         user: { userId: mockUserId },
@@ -170,7 +185,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
       // Should have been called 20 times (maxTries = 20)
-      expect(mockAgentModeService.generateMarketingResponse).toHaveBeenCalledTimes(20);
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
       
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -188,7 +203,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
     it('should succeed on 4th attempt when criteria are met', async () => {
       let callCount = 0;
-      mockAgentModeService.generateMarketingResponse.mockImplementation(() => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(() => {
         callCount++;
         if (callCount <= 3) {
           // First 3 attempts fail
@@ -223,7 +238,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
       // Should have been called 4 times (stopped after success)
-      expect(mockAgentModeService.generateMarketingResponse).toHaveBeenCalledTimes(4);
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(4);
       
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -241,7 +256,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
     it('should handle partial success across multiple attempts', async () => {
       let callCount = 0;
-      mockAgentModeService.generateMarketingResponse.mockImplementation(() => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(() => {
         callCount++;
         if (callCount === 1) {
           // First attempt: only keywords, no function calls
@@ -287,7 +302,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
       // Should have been called 20 times (all attempts)
-      expect(mockAgentModeService.generateMarketingResponse).toHaveBeenCalledTimes(20);
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
       
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -325,7 +340,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
       // Should succeed immediately since no criteria to meet
-      expect(mockAgentModeService.generateMarketingResponse).toHaveBeenCalledTimes(1);
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
       
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -343,7 +358,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
     it('should handle errors during individual attempts', async () => {
       let callCount = 0;
-      mockAgentModeService.generateMarketingResponse.mockImplementation(() => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(() => {
         callCount++;
         if (callCount === 2) {
           // Second attempt throws an error
@@ -369,7 +384,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
       // Should have been called 20 times (error on attempt 2, but continued)
-      expect(mockAgentModeService.generateMarketingResponse).toHaveBeenCalledTimes(20);
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
       
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -382,7 +397,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     });
 
     it('should handle critical errors that stop execution', async () => {
-      mockAgentModeService.generateMarketingResponse.mockRejectedValue(new Error('Critical database error'));
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(new Error('Critical database error'));
 
       const mockReq = {
         user: { userId: mockUserId },
@@ -401,7 +416,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     });
 
     it('should create correct session title for test vs production', async () => {
-      mockAgentModeService.generateMarketingResponse.mockResolvedValue(mockResponse);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(mockResponse);
 
       const mockReq = {
         user: { userId: mockUserId },
@@ -436,7 +451,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       };
 
       mockScheduleDb.getScheduleById.mockResolvedValue(scheduleWithCampaignId);
-      mockAgentModeService.generateMarketingResponse.mockResolvedValue({
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
         ...mockResponse,
         content: 'Here are some marketing strategy and tips for your business.',
       });
@@ -474,7 +489,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       };
 
       mockScheduleDb.getScheduleById.mockResolvedValue(scheduleWithoutCampaignId);
-      mockAgentModeService.generateMarketingResponse.mockResolvedValue({
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
         ...mockResponse,
         content: 'Here are some marketing strategy and tips for your business.',
       });
@@ -506,7 +521,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     });
 
     it('should save run result to database', async () => {
-      mockAgentModeService.generateMarketingResponse.mockResolvedValue(mockResponse);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(mockResponse);
 
       const mockReq = {
         user: { userId: mockUserId },
@@ -543,7 +558,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       // Setup default mocks needed for runScheduledChat
       mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
       mockAgentModeService.generateSessionTitle.mockResolvedValue('Generated Title');
-      mockAgentModeService.generateMarketingResponse.mockResolvedValue(mockResponse);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(mockResponse);
       mockChatbotDb.createChatSession.mockResolvedValue(mockSession);
       mockChatbotDb.getChatSession.mockResolvedValue(mockSession);
       mockScheduleDb.addRunResult.mockResolvedValue(undefined);
@@ -813,7 +828,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         emailCampaignTaskId: 'campaign-task-456',
       } as any;
 
-      mockAgentModeService.generateMarketingResponse.mockResolvedValue({
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
         content: 'Report: https://agentweb-user-files.s3.us-west-2.amazonaws.com/reports/report1.html',
         toolCalls: [],
         knowledgeBaseQueries: [],
@@ -867,7 +882,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     it('should not sync if schedule has no emailCampaignTaskId', async () => {
       const scheduleWithoutCampaign = { ...baseSchedule, emailCampaignTaskId: undefined };
       mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([scheduleWithoutCampaign]);
-      mockAgentModeService.generateMarketingResponse.mockResolvedValue({
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
         content: 'Some content',
         toolCalls: [],
         knowledgeBaseQueries: [],
@@ -910,7 +925,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         emailCampaignTaskId: 'campaign-task-456',
       } as any;
 
-      mockAgentModeService.generateMarketingResponse.mockResolvedValue({
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
         content: 'New report: https://agentweb-user-files.s3.us-west-2.amazonaws.com/reports/new.html',
         toolCalls: [],
         knowledgeBaseQueries: [],
@@ -974,7 +989,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         emailCampaignTaskId: 'campaign-task-456',
       };
 
-      mockAgentModeService.generateMarketingResponse.mockResolvedValue({
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
         content: 'Some content',
         toolCalls: [],
         knowledgeBaseQueries: [],

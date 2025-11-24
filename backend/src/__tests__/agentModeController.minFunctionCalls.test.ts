@@ -19,6 +19,12 @@ jest.mock('../services/agentModeService', () => ({
   },
 }));
 
+jest.mock('../services/generateMarketingResponseWorkerService', () => ({
+  generateMarketingResponseWorkerService: {
+    runInWorker: jest.fn(),
+  },
+}));
+
 jest.mock('../services/db', () => ({
   scheduleDb: {
     addRunResult: jest.fn(),
@@ -38,11 +44,13 @@ jest.mock('uuid', () => ({
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { scheduleDb } from '../services/db';
+import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { agentModeController } from '../controllers/agentModeController';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
 const mockScheduleDb = scheduleDb as jest.Mocked<typeof scheduleDb>;
+const mockGenerateMarketingResponseWorkerService = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
 
 describe('AgentModeController - Minimum Function Call Requirements', () => {
   const mockUserId = 'test-user-123';
@@ -78,10 +86,24 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession);
     mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
     mockAgentModeService.generateSessionTitle.mockResolvedValue('Generated Title');
+    // Use worker service instead of direct generateMarketingResponse
+    mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+      content: 'Test response',
+      toolCalls: [],
+      knowledgeBaseQueries: [],
+      sources: [],
+      responseMessages: [],
+    });
     mockScheduleDb.addRunResult.mockResolvedValue(undefined);
     mockScheduleDb.getScheduleById.mockResolvedValue(baseSchedule);
     mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([]);
     mockScheduleDb.updateScheduleAfterRun.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    // Clean up to prevent memory leaks
+    jest.clearAllTimers();
+    jest.useRealTimers();
   });
 
 
@@ -99,7 +121,7 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
         responseMessages: [],
       };
       
-      mockAgentModeService.generateMarketingResponse.mockResolvedValue(successfulResponse);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
 
       const mockReq = {
         user: { userId: mockUserId },
@@ -133,7 +155,7 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
 
     it('should retry when minimum call requirements are not met', async () => {
       let callCount = 0;
-      mockAgentModeService.generateMarketingResponse.mockImplementation(() => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(() => {
         callCount++;
         if (callCount === 1) {
           // First attempt: only 1 call to get_marketing_tips, needs 2
@@ -183,7 +205,7 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
       // The function should be called multiple times due to retry logic
-      expect(mockAgentModeService.generateMarketingResponse).toHaveBeenCalledTimes(20);
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
       
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -200,12 +222,15 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
     });
 
     it('should provide correct reminder messages with remaining call counts', async () => {
+      // Clear any default mocks first
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockClear();
+      
       let callCount = 0;
       const capturedMessages: string[] = [];
       
-      mockAgentModeService.generateMarketingResponse.mockImplementation((messageContent, messages, userId) => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation((params) => {
         callCount++;
-        capturedMessages.push(messageContent || '');
+        capturedMessages.push(params.messageContent || '');
         
         if (callCount === 1) {
           // First attempt: only 1 call to get_marketing_tips, needs 2
@@ -278,7 +303,7 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
         responseMessages: [],
       };
       
-      mockAgentModeService.generateMarketingResponse.mockResolvedValue(incompleteResponse);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(incompleteResponse);
 
       const mockReq = {
         user: { userId: mockUserId },
@@ -293,7 +318,7 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
       // Should have been called 20 times (maxTries = 20)
-      expect(mockAgentModeService.generateMarketingResponse).toHaveBeenCalledTimes(20);
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
       
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -328,7 +353,7 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
         responseMessages: [],
       };
       
-      mockAgentModeService.generateMarketingResponse.mockResolvedValue(successfulResponse);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
 
       const mockReq = {
         user: { userId: mockUserId },
@@ -358,7 +383,7 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
 
     it('should handle mixed success - some functions meet requirements, others do not', async () => {
       let callCount = 0;
-      mockAgentModeService.generateMarketingResponse.mockImplementation(() => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(() => {
         callCount++;
         if (callCount <= 3) {
           // First 3 attempts: only get_marketing_tips once per attempt
@@ -396,7 +421,7 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
       // Should have been called 20 times (all attempts)
-      expect(mockAgentModeService.generateMarketingResponse).toHaveBeenCalledTimes(20);
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
       
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({

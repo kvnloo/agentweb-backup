@@ -19,6 +19,12 @@ jest.mock('../services/agentModeService', () => ({
   },
 }));
 
+jest.mock('../services/generateMarketingResponseWorkerService', () => ({
+  generateMarketingResponseWorkerService: {
+    runInWorker: jest.fn(),
+  },
+}));
+
 jest.mock('../services/db', () => ({
   scheduleDb: {
     addRunResult: jest.fn(),
@@ -42,12 +48,14 @@ jest.mock('uuid', () => ({
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { scheduleDb, taskDb } from '../services/db';
+import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { agentModeController } from '../controllers/agentModeController';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
 const mockScheduleDb = scheduleDb as jest.Mocked<typeof scheduleDb>;
 const mockTaskDb = taskDb as jest.Mocked<typeof taskDb>;
+const mockGenerateMarketingResponseWorkerService = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
 
 describe('AgentModeController - Scheduled Chat with Work Plan', () => {
   const mockUserId = 'test-user-123';
@@ -90,11 +98,18 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession);
     mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
     mockAgentModeService.generateSessionTitle.mockResolvedValue('Generated Title');
-    mockAgentModeService.generateMarketingResponse.mockResolvedValue(mockResponse);
+    // Use worker service instead of direct generateMarketingResponse
+    mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(mockResponse);
     mockScheduleDb.addRunResult.mockResolvedValue(undefined);
     mockScheduleDb.getScheduleById.mockResolvedValue(baseSchedule);
     mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([]);
     mockScheduleDb.updateScheduleAfterRun.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    // Clean up to prevent memory leaks
+    jest.clearAllTimers();
+    jest.useRealTimers();
   });
 
   describe('Work Plan Integration', () => {
@@ -123,7 +138,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       };
 
       let callCount = 0;
-      mockAgentModeService.generateMarketingResponse.mockImplementation(() => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(() => {
         callCount++;
         return Promise.resolve(responseWithWorkPlan);
       });
@@ -141,16 +156,16 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
       // Should have been called multiple times (work plan not completed)
-      expect(mockAgentModeService.generateMarketingResponse).toHaveBeenCalledTimes(20);
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
       
       // Check that retry messages focus on work plan steps
-      const calls = mockAgentModeService.generateMarketingResponse.mock.calls;
+      const calls = mockGenerateMarketingResponseWorkerService.runInWorker.mock.calls;
       // First call uses starting message
-      expect(calls[0][0]).toBe(baseSchedule.startingMessage);
+      expect(calls[0][0].messageContent).toBe(baseSchedule.startingMessage);
       // Subsequent calls should remind to complete pending steps
       for (let i = 1; i < calls.length; i++) {
-        expect(calls[i][0]).toContain('Please perform the work on pending steps');
-        expect(calls[i][0]).toContain('set_work_plan_status');
+        expect(calls[i][0].messageContent).toContain('Please perform the work on pending steps');
+        expect(calls[i][0].messageContent).toContain('set_work_plan_status');
       }
 
       expect(mockRes.json).toHaveBeenCalledWith(
@@ -191,7 +206,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
         ],
       };
 
-      mockAgentModeService.generateMarketingResponse.mockResolvedValue(responseWithWorkPlan);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(responseWithWorkPlan);
 
       const mockReq = {
         user: { userId: mockUserId },
@@ -275,7 +290,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       });
 
       let responseCallCount = 0;
-      mockAgentModeService.generateMarketingResponse.mockImplementation(() => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(() => {
         responseCallCount++;
         if (responseCallCount === 1) {
           return Promise.resolve({ ...mockResponse, workPlan: workPlanStep2 });
@@ -298,12 +313,12 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
 
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
-      const calls = mockAgentModeService.generateMarketingResponse.mock.calls;
+      const calls = mockGenerateMarketingResponseWorkerService.runInWorker.mock.calls;
       // First call uses starting message
-      expect(calls[0][0]).toBe(baseSchedule.startingMessage);
+      expect(calls[0][0].messageContent).toBe(baseSchedule.startingMessage);
       // Second call should remind to complete pending steps
-      expect(calls[1][0]).toContain('Please perform the work on pending steps');
-      expect(calls[1][0]).toContain('set_work_plan_status');
+      expect(calls[1][0].messageContent).toContain('Please perform the work on pending steps');
+      expect(calls[1][0].messageContent).toContain('set_work_plan_status');
     });
 
     it('should skip completed and skipped steps to find next pending step', async () => {
@@ -331,7 +346,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
         workPlan,
       };
 
-      mockAgentModeService.generateMarketingResponse.mockResolvedValue(responseWithWorkPlan);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(responseWithWorkPlan);
 
       const mockReq = {
         user: { userId: mockUserId },
@@ -345,10 +360,10 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
 
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
-      const calls = mockAgentModeService.generateMarketingResponse.mock.calls;
+      const calls = mockGenerateMarketingResponseWorkerService.runInWorker.mock.calls;
       // Second call should remind to complete pending steps
-      expect(calls[1][0]).toContain('Please perform the work on pending steps');
-      expect(calls[1][0]).toContain('set_work_plan_status');
+      expect(calls[1][0].messageContent).toContain('Please perform the work on pending steps');
+      expect(calls[1][0].messageContent).toContain('set_work_plan_status');
     });
 
     it('should work normally when no work plan exists', async () => {
@@ -363,7 +378,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
         ],
       };
 
-      mockAgentModeService.generateMarketingResponse.mockResolvedValue(successfulResponse);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
 
       const mockReq = {
         user: { userId: mockUserId },
@@ -417,7 +432,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
         ],
       };
 
-      mockAgentModeService.generateMarketingResponse.mockResolvedValue(responseWithWorkPlan);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(responseWithWorkPlan);
 
       const mockReq = {
         user: { userId: mockUserId },
@@ -466,7 +481,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
         toolCalls: [{ name: 'get_marketing_tips', arguments: {} }], // Missing analyze_competitors
       };
 
-      mockAgentModeService.generateMarketingResponse.mockResolvedValue(responseWithWorkPlan);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(responseWithWorkPlan);
 
       const mockReq = {
         user: { userId: mockUserId },
@@ -481,7 +496,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
       // Should retry because requirements not met
-      expect(mockAgentModeService.generateMarketingResponse).toHaveBeenCalledTimes(20);
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
       
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -528,7 +543,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       });
 
       let responseCallCount = 0;
-      mockAgentModeService.generateMarketingResponse.mockImplementation(() => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(() => {
         responseCallCount++;
         if (responseCallCount === 1) {
           return Promise.resolve({ 
@@ -561,12 +576,12 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
 
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
-      const calls = mockAgentModeService.generateMarketingResponse.mock.calls;
+      const calls = mockGenerateMarketingResponseWorkerService.runInWorker.mock.calls;
       // First call uses starting message
-      expect(calls[0][0]).toBe(baseSchedule.startingMessage);
+      expect(calls[0][0].messageContent).toBe(baseSchedule.startingMessage);
       // Second call should check keywords and function calls (work plan completed)
-      expect(calls[1][0]).toContain('Please try again');
-      expect(calls[1][0]).toContain('marketing');
+      expect(calls[1][0].messageContent).toContain('Please try again');
+      expect(calls[1][0].messageContent).toContain('marketing');
     });
 
     it('should handle empty work plan steps array', async () => {
@@ -594,7 +609,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
         ],
       };
 
-      mockAgentModeService.generateMarketingResponse.mockResolvedValue(responseWithWorkPlan);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(responseWithWorkPlan);
 
       const mockReq = {
         user: { userId: mockUserId },
@@ -646,7 +661,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
         ],
       };
 
-      mockAgentModeService.generateMarketingResponse.mockResolvedValue(responseWithWorkPlan);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(responseWithWorkPlan);
 
       const mockReq = {
         user: { userId: mockUserId },

@@ -3,6 +3,7 @@ import express from 'express';
 import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
+import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 
 // Mock the chatbotDb service
 jest.mock('../services/chatbotService', () => ({
@@ -23,6 +24,13 @@ jest.mock('../services/agentModeService', () => ({
     getMarketingSystemPrompt: jest.fn(),
     generateSessionTitle: jest.fn(),
     generateMarketingResponse: jest.fn(),
+  },
+}));
+
+// Mock worker service
+jest.mock('../services/generateMarketingResponseWorkerService', () => ({
+  generateMarketingResponseWorkerService: {
+    runInWorker: jest.fn(),
   },
 }));
 
@@ -58,6 +66,8 @@ describe('Sharing Integration Tests', () => {
   let app: express.Application;
 
   beforeEach(() => {
+    jest.clearAllTimers();
+    jest.useRealTimers();
     app = createTestApp();
     jest.clearAllMocks();
     
@@ -549,7 +559,7 @@ describe('Sharing Integration Tests', () => {
         }
       });
 
-      (agentModeService.generateMarketingResponse as jest.Mock).mockResolvedValue({
+      (generateMarketingResponseWorkerService.runInWorker as jest.Mock).mockResolvedValue({
         content: 'Response with work plan',
         toolCalls: [],
         knowledgeBaseQueries: [],
