@@ -115,7 +115,14 @@ export class AgentModeService {
           try {
             const functionArgs = JSON.parse(toolCall.function.arguments);
             
+            // Yield control before starting tool execution to allow health checks to be processed
+            await new Promise(resolve => setImmediate(resolve));
+            
             const result = await this.executeTool(toolCall.function.name, functionArgs, userId, sessionId, mockMode);
+            
+            // Yield control after tool execution to allow health checks during long-running tool operations
+            // This is critical for tools like generate_image which can take 30-60+ seconds
+            await new Promise(resolve => setImmediate(resolve));
             
             // Store only the necessary data for the frontend
             const minimalResult = this.extractMinimalToolResult(result, toolCall.function.name);
@@ -164,6 +171,9 @@ export class AgentModeService {
               name: toolCall.function.name,
               content: errorContent
             });
+            
+            // Yield control after error handling as well
+            await new Promise(resolve => setImmediate(resolve));
           }
         }
         
@@ -5595,6 +5605,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
         };
       }
 
+      // Yield control before starting long-running image generation
+      // This allows health checks to be processed even during the image generation API call
+      await new Promise(resolve => setImmediate(resolve));
+      
       // Generate the image
       const result = await imageService.generateImage({
         prompt,
@@ -5605,6 +5619,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
         userId,
         imageModel
       });
+      
+      // Yield control after image generation completes
+      await new Promise(resolve => setImmediate(resolve));
 
       if (result.success && result.imageUrl) {
         // Save the image URL to the session for reference

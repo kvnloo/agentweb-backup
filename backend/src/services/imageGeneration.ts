@@ -455,7 +455,14 @@ export class ImageService {
         
         // Process streaming response to find image data
         let imageData: string | undefined;
+        let chunkCount = 0;
         for await (const chunk of stream) {
+          chunkCount++;
+          // Yield control every 10 chunks to allow health checks and other requests to be processed
+          if (chunkCount % 10 === 0) {
+            await new Promise(resolve => setImmediate(resolve));
+          }
+          
           if (chunk.candidates && chunk.candidates.length > 0) {
             const candidate = chunk.candidates[0];
             if (candidate.content && candidate.content.parts) {
@@ -539,7 +546,14 @@ export class ImageService {
         
         // Process streaming response to find image data
         let imageData: string | undefined;
+        let chunkCount = 0;
         for await (const chunk of stream) {
+          chunkCount++;
+          // Yield control every 10 chunks to allow health checks and other requests to be processed
+          if (chunkCount % 10 === 0) {
+            await new Promise(resolve => setImmediate(resolve));
+          }
+          
           if (chunk.candidates && chunk.candidates.length > 0) {
             const candidate = chunk.candidates[0];
             if (candidate.content && candidate.content.parts) {
@@ -626,7 +640,14 @@ export class ImageService {
         
         // Process streaming response to find image data
         let imageData: string | undefined;
+        let chunkCount = 0;
         for await (const chunk of stream) {
+          chunkCount++;
+          // Yield control every 10 chunks to allow health checks and other requests to be processed
+          if (chunkCount % 10 === 0) {
+            await new Promise(resolve => setImmediate(resolve));
+          }
+          
           if (chunk.candidates && chunk.candidates.length > 0) {
             const candidate = chunk.candidates[0];
             if (candidate.content && candidate.content.parts) {
@@ -831,8 +852,15 @@ export class ImageService {
       // Process streaming response to find image data
       let imageData: string | undefined;
       let mimeType: string | undefined;
+      let chunkCount = 0;
       
       for await (const chunk of response) {
+        chunkCount++;
+        // Yield control every 10 chunks to allow health checks and other requests to be processed
+        if (chunkCount % 10 === 0) {
+          await new Promise(resolve => setImmediate(resolve));
+        }
+        
         if (!chunk.candidates || !chunk.candidates[0]?.content?.parts) {
           continue;
         }
