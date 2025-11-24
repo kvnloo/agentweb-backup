@@ -10,8 +10,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
     date: '2025-11-23',
     changes: [
       'Fixed Environment Outage Issue with Long-Running Scheduled Chats',
-      '- Added event loop yielding in generateMarketingResponse to allow health checks and other requests to be processed during long-running LLM operations',
-      '- Health checks now continue to work even during scheduled chat executions that take 10-20+ minutes',
+      '- Implemented worker process architecture to run generateMarketingResponse in a separate process, preventing blocking of the main event loop',
+      '- This architecture completely isolates CPU-intensive LLM operations from the main application thread, providing better system stability and responsiveness',
+      '- Health checks and API requests remain fully responsive even during intensive Agent Mode operations',
     ],
   },
   {

@@ -10,6 +10,7 @@ import { uploadFileToS3 } from '../utils/s3Utils';
 import { emailService } from '../services/emailService';
 import { settingsService } from '../services/settingsService';
 import { v4 as uuidv4 } from 'uuid';
+import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 // Common function: ensure a campaign execution exists and contains all HTML report URLs
 async function syncEmailCampaignExecution(
   userId: string,
@@ -358,6 +359,7 @@ async function runScheduledChat(
       }
 
       // Generate response using the common function (same as /generateResponse)
+      // Generate response using worker process to prevent blocking main event loop
       const response = await generateSessionResponse(
         sessionId,
         userMessage,
@@ -541,6 +543,7 @@ async function runScheduledChat(
 }
 
 // Common function to generate AI response for a session
+// Always uses worker process to prevent blocking the main event loop
 async function generateSessionResponse(
   sessionId: string,
   userMessage: string,
@@ -634,13 +637,15 @@ async function generateSessionResponse(
     throw new Error('Session not found after update');
   }
 
-  // Generate AI response
-  const response = await agentModeService.generateMarketingResponse(
+  // Generate AI response using worker process to prevent blocking the main event loop
+  // This allows health checks to continue working during long-running operations
+  const response = await generateMarketingResponseWorkerService.runInWorker({
     messageContent,
-    updatedSession.messages,
+    sessionHistory: updatedSession.messages,
     userId,
-    sessionId
-  );
+    sessionId,
+    mockMode: false
+  });
 
   // Add all response messages to session (includes assistant responses and tool calls)
   await chatbotDb.addMessagesToSession(sessionId, response.responseMessages);
