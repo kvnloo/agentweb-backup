@@ -66,25 +66,46 @@ router.get("/metrics", async (req, res) => {
       });
     }
 
+    // Get timeframe from query parameter (default to 30d)
+    const timeframe = (req.query.timeframe as string) || "30d";
+
     // Fetch metrics for each domain
     const metricsPromises = user.seoDomains.map(async (domain: string) => {
       try {
         // Format domain for Search Console API (sc-domain:example.com or https://example.com)
         const siteUrl = domain.startsWith("http") ? domain : `sc-domain:${domain}`;
 
-        // Calculate date range (last 30 days)
-        const endDate = new Date();
-        endDate.setDate(endDate.getDate() - 1); // Yesterday
+        // Calculate date range based on timeframe
+        // Google Search Console uses Pacific Time, so we need to account for that
+        // Use UTC for date calculations but be aware GSC data is in PST
+        const now = new Date();
+        const endDate = new Date(now);
+        endDate.setUTCDate(endDate.getUTCDate() - 1); // Yesterday in UTC
+        endDate.setUTCHours(0, 0, 0, 0);
+        
         const startDate = new Date(endDate);
-        startDate.setDate(startDate.getDate() - 29); // 30 days total
+        
+        if (timeframe === "7d") {
+          startDate.setUTCDate(endDate.getUTCDate() - 6); // 7 days total
+        } else if (timeframe === "14d") {
+          startDate.setUTCDate(endDate.getUTCDate() - 13); // 14 days total
+        } else if (timeframe === "30d") {
+          startDate.setUTCDate(endDate.getUTCDate() - 29); // 30 days total
+        } else if (timeframe === "90d") {
+          startDate.setUTCDate(endDate.getUTCDate() - 89); // 90 days total
+        } else {
+          // Default to 30 days if invalid timeframe
+          startDate.setUTCDate(endDate.getUTCDate() - 29);
+        }
+        startDate.setUTCHours(0, 0, 0, 0);
 
         const startDateStr = startDate.toISOString().split("T")[0];
         const endDateStr = endDate.toISOString().split("T")[0];
 
-        // Fetch search analytics data using OAuth access token
         const searchAnalyticsUrl = `https://www.googleapis.com/webmasters/v3/sites/${encodeURIComponent(siteUrl)}/searchAnalytics/query`;
         
-        const searchAnalyticsResponse = await fetch(searchAnalyticsUrl, {
+        // Fetch daily data for timeline chart
+        const dailyDataResponse = await fetch(searchAnalyticsUrl, {
           method: "POST",
           headers: {
             "Authorization": `Bearer ${accessToken}`,
@@ -93,81 +114,131 @@ router.get("/metrics", async (req, res) => {
           body: JSON.stringify({
             startDate: startDateStr,
             endDate: endDateStr,
-            dimensions: ["query", "page", "device", "country"],
-            rowLimit: 1000,
+            dimensions: ["date"],
+            rowLimit: 25000, // Increase limit to ensure we get all data
           }),
         });
 
-        if (!searchAnalyticsResponse.ok) {
-          const errorData = await searchAnalyticsResponse.json();
-          console.error(`Error fetching search analytics for ${domain}:`, errorData);
+        let dailyData: Array<{ date: string; clicks: number; impressions: number }> = [];
+        if (!dailyDataResponse.ok) {
+          const errorData = await dailyDataResponse.json();
+          console.error(`Error fetching daily data for ${domain}:`, errorData);
           return {
             domain,
-            error: errorData.error?.message || "Failed to fetch search analytics",
+            error: errorData.error?.message || "Failed to fetch daily search analytics",
             clicks: 0,
             impressions: 0,
             ctr: 0,
             position: 0,
+            dailyData: [],
             topQueries: [],
             topPages: [],
           };
         }
 
-        const searchAnalyticsData = await searchAnalyticsResponse.json();
+        const dailyDataResult = await dailyDataResponse.json();
+        
+        // Debug logging
+        console.log(`[SEO Debug] Domain: ${domain}`);
+        console.log(`[SEO Debug] Date range: ${startDateStr} to ${endDateStr}`);
+        console.log(`[SEO Debug] Raw API response rows count: ${dailyDataResult.rows?.length || 0}`);
+        if (dailyDataResult.rows && dailyDataResult.rows.length > 0) {
+          console.log(`[SEO Debug] First row sample:`, JSON.stringify(dailyDataResult.rows[0], null, 2));
+          // Check for November 10 specifically
+          const nov10Row = dailyDataResult.rows.find((r: any) => r.keys?.[0] === "2025-11-10" || r.keys?.[0] === "2024-11-10");
+          if (nov10Row) {
+            console.log(`[SEO Debug] November 10 row found:`, JSON.stringify(nov10Row, null, 2));
+          }
+        }
+        
+        dailyData = (dailyDataResult.rows || [])
+          .map((row: any) => ({
+            date: row.keys?.[0] || "",
+            clicks: row.clicks || 0,
+            impressions: row.impressions || 0,
+          }))
+          .filter((item: any) => item.date)
+          .sort((a: any, b: any) => a.date.localeCompare(b.date));
 
-        // Calculate totals
-        const totalClicks = searchAnalyticsData.rows?.reduce((sum: number, row: any) => sum + (row.clicks || 0), 0) || 0;
-        const totalImpressions = searchAnalyticsData.rows?.reduce((sum: number, row: any) => sum + (row.impressions || 0), 0) || 0;
+        // Debug: Check specific date
+        const nov10Data = dailyData.find(d => d.date === "2025-11-10" || d.date === "2024-11-10");
+        if (nov10Data) {
+          console.log(`[SEO Debug] November 10 processed data:`, nov10Data);
+        }
+        console.log(`[SEO Debug] Total daily data entries: ${dailyData.length}`);
+        console.log(`[SEO Debug] Sample dates:`, dailyData.slice(0, 5).map(d => d.date));
+
+        // Calculate totals from daily data (this matches Google Search Console UI)
+        const totalClicks = dailyData.reduce((sum, day) => sum + day.clicks, 0);
+        const totalImpressions = dailyData.reduce((sum, day) => sum + day.impressions, 0);
         const avgCtr = totalImpressions > 0 ? (totalClicks / totalImpressions) * 100 : 0;
-        const avgPosition = searchAnalyticsData.rows?.reduce((sum: number, row: any) => sum + (row.position || 0), 0) / (searchAnalyticsData.rows?.length || 1) || 0;
+        
+        console.log(`[SEO Debug] Calculated totals - Clicks: ${totalClicks}, Impressions: ${totalImpressions}`);
 
-        // Get top queries (grouped by query)
-        const queryMap = new Map<string, { clicks: number; impressions: number; ctr: number; position: number }>();
-        searchAnalyticsData.rows?.forEach((row: any) => {
-          const query = row.keys?.[0] || "Unknown";
-          if (!queryMap.has(query)) {
-            queryMap.set(query, { clicks: 0, impressions: 0, ctr: 0, position: 0 });
-          }
-          const existing = queryMap.get(query)!;
-          existing.clicks += row.clicks || 0;
-          existing.impressions += row.impressions || 0;
-          existing.position += row.position || 0;
+        // Fetch top queries (single dimension to avoid aggregation issues)
+        const queriesResponse = await fetch(searchAnalyticsUrl, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            startDate: startDateStr,
+            endDate: endDateStr,
+            dimensions: ["query"],
+            rowLimit: 1000,
+          }),
         });
 
-        const topQueries = Array.from(queryMap.entries())
-          .map(([query, data]) => ({
-            query,
-            clicks: data.clicks,
-            impressions: data.impressions,
-            ctr: data.impressions > 0 ? (data.clicks / data.impressions) * 100 : 0,
-            position: data.position / (searchAnalyticsData.rows?.filter((r: any) => r.keys?.[0] === query).length || 1),
-          }))
-          .sort((a, b) => b.clicks - a.clicks)
-          .slice(0, 10);
+        let topQueries: Array<{ query: string; clicks: number; impressions: number; ctr: number; position: number }> = [];
+        if (queriesResponse.ok) {
+          const queriesData = await queriesResponse.json();
+          topQueries = (queriesData.rows || [])
+            .map((row: any) => ({
+              query: row.keys?.[0] || "Unknown",
+              clicks: row.clicks || 0,
+              impressions: row.impressions || 0,
+              ctr: row.impressions > 0 ? ((row.clicks || 0) / row.impressions) * 100 : 0,
+              position: row.position || 0,
+            }))
+            .sort((a, b) => b.clicks - a.clicks)
+            .slice(0, 10);
+        }
 
-        // Get top pages (grouped by page)
-        const pageMap = new Map<string, { clicks: number; impressions: number; ctr: number; position: number }>();
-        searchAnalyticsData.rows?.forEach((row: any) => {
-          const page = row.keys?.[1] || "Unknown";
-          if (!pageMap.has(page)) {
-            pageMap.set(page, { clicks: 0, impressions: 0, ctr: 0, position: 0 });
-          }
-          const existing = pageMap.get(page)!;
-          existing.clicks += row.clicks || 0;
-          existing.impressions += row.impressions || 0;
-          existing.position += row.position || 0;
+        // Fetch top pages (single dimension to avoid aggregation issues)
+        const pagesResponse = await fetch(searchAnalyticsUrl, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            startDate: startDateStr,
+            endDate: endDateStr,
+            dimensions: ["page"],
+            rowLimit: 1000,
+          }),
         });
 
-        const topPages = Array.from(pageMap.entries())
-          .map(([page, data]) => ({
-            page,
-            clicks: data.clicks,
-            impressions: data.impressions,
-            ctr: data.impressions > 0 ? (data.clicks / data.impressions) * 100 : 0,
-            position: data.position / (searchAnalyticsData.rows?.filter((r: any) => r.keys?.[1] === page).length || 1),
-          }))
-          .sort((a, b) => b.clicks - a.clicks)
-          .slice(0, 10);
+        let topPages: Array<{ page: string; clicks: number; impressions: number; ctr: number; position: number }> = [];
+        if (pagesResponse.ok) {
+          const pagesData = await pagesResponse.json();
+          topPages = (pagesData.rows || [])
+            .map((row: any) => ({
+              page: row.keys?.[0] || "Unknown",
+              clicks: row.clicks || 0,
+              impressions: row.impressions || 0,
+              ctr: row.impressions > 0 ? ((row.clicks || 0) / row.impressions) * 100 : 0,
+              position: row.position || 0,
+            }))
+            .sort((a, b) => b.clicks - a.clicks)
+            .slice(0, 10);
+        }
+
+        // Calculate average position from top queries (as a representative metric)
+        const avgPosition = topQueries.length > 0
+          ? topQueries.reduce((sum, q) => sum + q.position, 0) / topQueries.length
+          : 0;
 
         return {
           domain,
@@ -175,6 +246,7 @@ router.get("/metrics", async (req, res) => {
           impressions: totalImpressions,
           ctr: avgCtr,
           position: avgPosition,
+          dailyData,
           topQueries,
           topPages,
           dateRange: {
@@ -191,6 +263,7 @@ router.get("/metrics", async (req, res) => {
           impressions: 0,
           ctr: 0,
           position: 0,
+          dailyData: [],
           topQueries: [],
           topPages: [],
         };
@@ -209,6 +282,67 @@ router.get("/metrics", async (req, res) => {
       message: "Error fetching SEO metrics",
       error: error.message || "Unknown error"
     });
+  }
+});
+
+// Debug endpoint to test Google Search Console API directly
+router.get("/debug", async (req, res) => {
+  try {
+    const userId = (req as any).user.userId;
+    const user = await userDb.getUserById(userId);
+    if (!user || !user.seoDomains || user.seoDomains.length === 0) {
+      return res.status(400).json({ message: "No SEO domains configured" });
+    }
+
+    const accessToken = await getGoogleSearchConsoleAccessToken();
+    if (!accessToken) {
+      return res.status(500).json({ message: "Google Search Console API not configured" });
+    }
+
+    const domain = user.seoDomains[0];
+    const siteUrl = domain.startsWith("http") ? domain : `sc-domain:${domain}`;
+    
+    // Test with a specific date range around November 10
+    const startDateStr = "2024-11-01";
+    const endDateStr = "2024-11-20";
+    
+    const searchAnalyticsUrl = `https://www.googleapis.com/webmasters/v3/sites/${encodeURIComponent(siteUrl)}/searchAnalytics/query`;
+    
+    const response = await fetch(searchAnalyticsUrl, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        startDate: startDateStr,
+        endDate: endDateStr,
+        dimensions: ["date"],
+        rowLimit: 1000,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      return res.status(response.status).json({ error: errorData });
+    }
+
+    const data = await response.json();
+    
+    // Find November 10 specifically
+    const nov10Row = data.rows?.find((r: any) => r.keys?.[0] === "2024-11-10");
+    
+    res.json({
+      domain,
+      dateRange: { startDate: startDateStr, endDate: endDateStr },
+      totalRows: data.rows?.length || 0,
+      nov10Data: nov10Row || null,
+      allRows: data.rows || [],
+      rawResponse: data,
+    });
+  } catch (error: any) {
+    console.error("Debug endpoint error:", error);
+    res.status(500).json({ error: error.message });
   }
 });
 
