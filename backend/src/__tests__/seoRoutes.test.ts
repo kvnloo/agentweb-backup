@@ -33,7 +33,6 @@ import request from 'supertest';
 import seoRoutes from '../routes/seo';
 import { userDb } from '../services/db';
 import { getSecret } from '../utils/secretsManager';
-import { authenticateToken } from '../middleware/auth';
 
 describe('SEO Routes', () => {
   let app: express.Application;

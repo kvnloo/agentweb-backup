@@ -248,7 +248,7 @@ router.get("/metrics", async (req, res) => {
               ctr: row.impressions > 0 ? ((row.clicks || 0) / row.impressions) * 100 : 0,
               position: row.position || 0,
             }))
-            .sort((a, b) => b.clicks - a.clicks)
+            .sort((a: { clicks: number }, b: { clicks: number }) => b.clicks - a.clicks)
             .slice(0, 10);
         }
         
@@ -300,7 +300,7 @@ router.get("/metrics", async (req, res) => {
               ctr: row.impressions > 0 ? ((row.clicks || 0) / row.impressions) * 100 : 0,
               position: row.position || 0,
             }))
-            .sort((a, b) => b.clicks - a.clicks)
+            .sort((a: { clicks: number }, b: { clicks: number }) => b.clicks - a.clicks)
             .slice(0, 10);
         }
 
