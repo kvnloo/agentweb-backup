@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-11-24',
+    changes: [
+      'Added SEO Metrics Page',
+      '- New SEO page in Customer Portal for tracking website search engine performance',
+      '- Supports period selection (7, 14, 30, 90 days) with default of 30 days',
+      '- SEO domains can be configured per user in the Admin Dashboard (Users tab)',
+      '- Page is automatically hidden from navigation if no domains are configured for the user',
+    ],
+  },
+  {
     date: '2025-11-23',
     changes: [
       'Fixed Environment Outage Issue with Long-Running Scheduled Chats',

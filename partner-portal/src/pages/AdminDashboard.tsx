@@ -168,6 +168,7 @@ interface User {
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
   fromName?: string; // From name for emails
   slackChannel?: string; // Default Slack channel for this user
+  seoDomains?: string[]; // SEO domains to track
 }
 
 // Define an interface for the task data shown in the admin tasks tab
@@ -548,6 +549,10 @@ export default function AdminDashboard() {
   const [editingSlackChannelUserId, setEditingSlackChannelUserId] = useState<string | null>(null);
   const [currentSlackChannelText, setCurrentSlackChannelText] = useState("");
   const [slackChannelEditLoading, setSlackChannelEditLoading] = useState(false);
+  const [seoDomainsDialogOpen, setSeoDomainsDialogOpen] = useState(false);
+  const [editingSeoDomainsUserId, setEditingSeoDomainsUserId] = useState<string | null>(null);
+  const [seoDomainsText, setSeoDomainsText] = useState("");
+  const [seoDomainsEditLoading, setSeoDomainsEditLoading] = useState(false);
   const [delegateAccessLoading, setDelegateAccessLoading] = useState<string | null>(null);
   const [emailToDelete, setEmailToDelete] = useState<string | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -1264,6 +1269,66 @@ export default function AdminDashboard() {
     }
   };
 
+  const handleSaveSeoDomains = async () => {
+    if (!editingSeoDomainsUserId) return;
+    
+    try {
+      setSeoDomainsEditLoading(true);
+      
+      // Parse domains from text (one per line or comma-separated)
+      const domainsText = seoDomainsText.trim();
+      let domains: string[] = [];
+      
+      if (domainsText) {
+        // Split by newlines or commas, then filter and validate
+        domains = domainsText
+          .split(/[\n,]+/)
+          .map(d => d.trim())
+          .filter(d => d.length > 0);
+        
+        // Validate each domain format
+        const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
+        for (const domain of domains) {
+          if (!domainRegex.test(domain)) {
+            setError(`Invalid domain format: ${domain}. Please use format like example.com`);
+            return;
+          }
+        }
+      }
+      
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/users/${editingSeoDomainsUserId}/seo-domains`),
+        { seoDomains: domains },
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+
+      if (response.status === 200) {
+        // Update the user in the local state without reloading
+        setUsers((prevUsers: User[]) => 
+          prevUsers.map((user: User) => 
+            user.userId === editingSeoDomainsUserId 
+              ? { 
+                  ...user, 
+                  seoDomains: response.data.seoDomains || []
+                }
+              : user
+          )
+        );
+        setSuccess("SEO domains updated successfully!");
+        setSeoDomainsDialogOpen(false);
+        setEditingSeoDomainsUserId(null);
+        setSeoDomainsText("");
+      }
+    } catch (error: any) {
+      console.error("Error updating SEO domains:", error);
+      setError(error.response?.data?.message || "Failed to update SEO domains");
+    } finally {
+      setSeoDomainsEditLoading(false);
+    }
+  };
+
   const handleAccessCustomerPortal = async (userId: string) => {
     try {
       setDelegateAccessLoading(userId);
@@ -1732,6 +1797,7 @@ export default function AdminDashboard() {
                   <TableCell>Ad Account</TableCell>
                   <TableCell>Email Sender</TableCell>
                   <TableCell>Slack Channel</TableCell>
+                  <TableCell>SEO Domains</TableCell>
                   <TableCell>Created</TableCell>
                   <TableCell>Last Login</TableCell>
                   <TableCell>Support Note</TableCell>
@@ -1856,6 +1922,37 @@ export default function AdminDashboard() {
                                 setSlackChannelDialogOpen(true);
                               }}
                               disabled={slackChannelEditLoading}
+                            >
+                              <EditIcon />
+                            </IconButton>
+                          </Box>
+                        </TableCell>
+                        <TableCell>
+                          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+                            {user.seoDomains && user.seoDomains.length > 0 ? (
+                              <Box>
+                                {user.seoDomains.map((domain: string, idx: number) => (
+                                  <Chip
+                                    key={idx}
+                                    label={domain}
+                                    size="small"
+                                    sx={{ mr: 0.5, mb: 0.5 }}
+                                  />
+                                ))}
+                              </Box>
+                            ) : (
+                              <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
+                                -
+                              </Typography>
+                            )}
+                            <IconButton
+                              size="small"
+                              onClick={() => {
+                                setEditingSeoDomainsUserId(user.userId);
+                                setSeoDomainsText(user.seoDomains?.join("\n") || "");
+                                setSeoDomainsDialogOpen(true);
+                              }}
+                              disabled={seoDomainsEditLoading}
                             >
                               <EditIcon />
                             </IconButton>
@@ -3684,6 +3781,71 @@ export default function AdminDashboard() {
             disabled={emailSenderEditLoading}
           >
             {emailSenderEditLoading ? "Saving..." : "Save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* SEO Domains Configuration Dialog */}
+      <Dialog
+        open={seoDomainsDialogOpen}
+        onClose={() => {
+          setSeoDomainsDialogOpen(false);
+          setEditingSeoDomainsUserId(null);
+          setSeoDomainsText("");
+        }}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>
+          Configure SEO Domains
+          <IconButton
+            aria-label="close"
+            onClick={() => {
+              setSeoDomainsDialogOpen(false);
+              setEditingSeoDomainsUserId(null);
+              setSeoDomainsText("");
+            }}
+            sx={{
+              position: 'absolute',
+              right: 8,
+              top: 8,
+            }}
+          >
+            <CloseIcon />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent dividers>
+          <TextField
+            autoFocus
+            fullWidth
+            multiline
+            rows={6}
+            label="SEO Domains"
+            value={seoDomainsText}
+            onChange={(e) => setSeoDomainsText(e.target.value)}
+            placeholder="example.com&#10;subdomain.example.com&#10;another-domain.com"
+            helperText="Enter one domain per line. These domains will be tracked for SEO metrics in the customer portal. Format: example.com (without http:// or https://)"
+            disabled={seoDomainsEditLoading}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button
+            onClick={() => {
+              setSeoDomainsDialogOpen(false);
+              setEditingSeoDomainsUserId(null);
+              setSeoDomainsText("");
+            }}
+            disabled={seoDomainsEditLoading}
+          >
+            Cancel
+          </Button>
+          <Button
+            onClick={handleSaveSeoDomains}
+            color="primary"
+            variant="contained"
+            disabled={seoDomainsEditLoading}
+          >
+            {seoDomainsEditLoading ? "Saving..." : "Save"}
           </Button>
         </DialogActions>
       </Dialog>
