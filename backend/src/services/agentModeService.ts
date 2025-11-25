@@ -1452,7 +1452,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           type: 'function' as const,
           function: {
             name: 'update_html_file',
-            description: 'Update an HTML file by replacing specific content with new content. Use update_type="full" with old_file_hash for entire file replacement, or update_type="part" with old_content for partial replacements',
+            description: 'Update an HTML file by replacing specific content with new content. Use update_type="full" with old_content_hash for entire file replacement, or update_type="part" with old_content for partial replacements',
             parameters: {
               type: 'object',
               properties: {
@@ -1463,11 +1463,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 update_type: {
                   type: 'string',
                   enum: ['part', 'full'],
-                  description: 'Type of update: "part" for partial content replacement using old_content, "full" for entire file replacement using old_file_hash'
+                  description: 'Type of update: "part" for partial content replacement using old_content, "full" for entire file replacement using old_content_hash'
                 },
                 replacement_json: {
                   type: 'string',
-                  description: 'JSON string containing a list of replacement instructions. For full replacement: [{"old_file_hash": "abc123...", "new_content": "<!DOCTYPE html>...", "expected_count": 1}]. For part replacement: [{"old_content": "<h1>Old Title</h1>", "new_content": "<h1>New Title</h1>", "expected_count": 1}]. Use empty string for new_content to delete the specified content.'
+                  description: 'JSON string containing a list of replacement instructions. For full replacement: [{"old_content_hash": "abc123...", "new_content": "<!DOCTYPE html>...", "expected_count": 1}]. For part replacement: [{"old_content": "<h1>Old Title</h1>", "new_content": "<h1>New Title</h1>", "expected_count": 1}]. Use empty string for new_content to delete the specified content.'
                 }
               },
               required: ['file_url', 'update_type', 'replacement_json']
@@ -2326,17 +2326,17 @@ Use the available tools to create tasks in the agent-engine when complex work is
             }
             
             if (args.update_type === 'full') {
-              // For full replacement, require old_file_hash
-              if (!instruction.old_file_hash) {
+              // For full replacement, require old_content_hash
+              if (!instruction.old_content_hash) {
                 return {
                   success: false,
-                  message: `Replacement instruction ${i + 1} missing old_file_hash. For update_type="full", old_file_hash is required`
+                  message: `Replacement instruction ${i + 1} missing old_content_hash. For update_type="full", old_content_hash is required`
                 };
               }
               if (instruction.old_content !== undefined) {
                 return {
                   success: false,
-                  message: `Replacement instruction ${i + 1} should not have old_content when update_type="full". Use old_file_hash instead`
+                  message: `Replacement instruction ${i + 1} should not have old_content when update_type="full". Use old_content_hash instead`
                 };
               }
             } else if (args.update_type === 'part') {
@@ -2347,10 +2347,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
                   message: `Replacement instruction ${i + 1} missing old_content. For update_type="part", old_content is required`
                 };
               }
-              if (instruction.old_file_hash !== undefined) {
+              if (instruction.old_content_hash !== undefined) {
                 return {
                   success: false,
-                  message: `Replacement instruction ${i + 1} should not have old_file_hash when update_type="part". Use old_content instead`
+                  message: `Replacement instruction ${i + 1} should not have old_content_hash when update_type="part". Use old_content instead`
                 };
               }
             }
@@ -2367,7 +2367,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             };
             
             if (args.update_type === 'full') {
-              result.old_file_hash = instruction.old_file_hash;
+              result.old_content_hash = instruction.old_content_hash;
             } else {
               result.old_content = instruction.old_content;
             }
@@ -7061,17 +7061,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         let errorMessage = replacementResult.error?.message || 'Failed to perform replacements';
         
         // Replace generic messages with HTML-specific ones for backward compatibility
-        if (errorMessage.includes('old_content_hash (or old_file_hash)')) {
-          // Extract instruction number and replace message
-          const match = errorMessage.match(/Replacement instruction (\d+)/);
-          const instructionNum = match ? match[1] : '1';
-          errorMessage = `Replacement instruction ${instructionNum} missing old_file_hash. For update_type="full", old_file_hash is required`;
-        }
         if (replacementResult.error?.isHashMismatch || errorMessage.includes('Content hash mismatch')) {
           errorMessage = errorMessage.replace('Content hash mismatch', 'File hash mismatch');
-        }
-        if (errorMessage.includes('should not have hash when update_type="part"')) {
-          errorMessage = errorMessage.replace('should not have hash when update_type="part". Use old_content instead', 'should not have old_file_hash when update_type="part"');
         }
         
         return {
@@ -7104,7 +7095,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         success: false,
         message: 'Failed to update HTML file',
         error: error instanceof Error ? error.message : 'Unknown error',
-        suggestion: 'For entire file replacement, use old_file_hash from read_file_content. For partial replacement, use old_content with the exact text to replace'
+        suggestion: 'For entire file replacement, use old_content_hash from read_file_content. For partial replacement, use old_content with the exact text to replace'
       };
     }
   }
@@ -7174,13 +7165,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
       }
       
       if (updateType === 'full') {
-        // For full replacement, require old_content_hash (or old_file_hash for HTML files)
-        const hashField = instruction.old_content_hash || instruction.old_file_hash;
-        if (!hashField) {
+        // For full replacement, require old_content_hash
+        if (!instruction.old_content_hash) {
           return {
             success: false,
             error: {
-              message: `Replacement instruction ${i + 1} missing hash. For update_type="full", old_content_hash (or old_file_hash) is required`
+              message: `Replacement instruction ${i + 1} missing old_content_hash. For update_type="full", old_content_hash is required`
             }
           };
         }
@@ -7202,11 +7192,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
             }
           };
         }
-        if (instruction.old_content_hash !== undefined || instruction.old_file_hash !== undefined) {
+        if (instruction.old_content_hash !== undefined) {
           return {
             success: false,
             error: {
-              message: `Replacement instruction ${i + 1} should not have hash when update_type="part". Use old_content instead`
+              message: `Replacement instruction ${i + 1} should not have old_content_hash when update_type="part". Use old_content instead`
             }
           };
         }
@@ -7221,9 +7211,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const instruction = replacementInstructions[i];
       const { new_content, expected_count } = instruction;
       
-      if (updateType === 'full') {
-        // Entire content replacement using hash
-        const providedHash = instruction.old_content_hash || instruction.old_file_hash;
+        if (updateType === 'full') {
+          // Entire content replacement using hash
+          const providedHash = instruction.old_content_hash;
         console.log(`AgentMode: Full replacement ${i + 1}: hash: ${providedHash}, new_content length: ${new_content.length}, expected_count: ${expected_count}`);
         
           // Verify that the provided hash matches the current content hash
@@ -7245,7 +7235,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
           replacementResults.push({
             index: i + 1,
             old_content_hash: instruction.old_content_hash,
-            old_file_hash: instruction.old_file_hash,
             new_content: new_content,
             expected_count: expected_count,
             actual_count: 1,
