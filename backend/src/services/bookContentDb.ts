@@ -14,6 +14,7 @@ export interface BookContent {
   sectionId?: string; // If null, it's a section content; if set, it's a chapter content
   chapterId?: string; // Only set if this is chapter content
   content: string; // Markdown content
+  sessionId?: string; // Agent Mode session ID for this content
   createdAt: string;
   updatedAt: string;
 }
@@ -37,6 +38,7 @@ export const bookContentDb = {
       sectionId?: string;
       chapterId?: string;
       content: string;
+      sessionId?: string;
     }
   ): Promise<BookContent> {
     try {
@@ -47,21 +49,32 @@ export const bookContentDb = {
       
       if (existing) {
         // Update existing content
+        const updateExpressions: string[] = ["#content = :content", "#updatedAt = :updatedAt"];
+        const expressionAttributeNames: { [key: string]: string } = {
+          "#content": "content",
+          "#updatedAt": "updatedAt",
+        };
+        const expressionAttributeValues: { [key: string]: any } = {
+          ":content": contentData.content,
+          ":updatedAt": now,
+        };
+
+        // Update sessionId if provided
+        if (contentData.sessionId !== undefined) {
+          updateExpressions.push("#sessionId = :sessionId");
+          expressionAttributeNames["#sessionId"] = "sessionId";
+          expressionAttributeValues[":sessionId"] = contentData.sessionId || null;
+        }
+
         const params: AWS.DynamoDB.DocumentClient.UpdateItemInput = {
           TableName: `${TABLE_PREFIX}AW-BookContents`,
           Key: {
             contentId: existing.contentId,
             bookId,
           },
-          UpdateExpression: "SET #content = :content, #updatedAt = :updatedAt",
-          ExpressionAttributeNames: {
-            "#content": "content",
-            "#updatedAt": "updatedAt",
-          },
-          ExpressionAttributeValues: {
-            ":content": contentData.content,
-            ":updatedAt": now,
-          },
+          UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+          ExpressionAttributeNames: expressionAttributeNames,
+          ExpressionAttributeValues: expressionAttributeValues,
           ReturnValues: "ALL_NEW",
         };
 
@@ -77,6 +90,7 @@ export const bookContentDb = {
           sectionId: contentData.sectionId,
           chapterId: contentData.chapterId,
           content: contentData.content,
+          sessionId: contentData.sessionId,
           createdAt: now,
           updatedAt: now,
         };
@@ -221,6 +235,46 @@ export const bookContentDb = {
       return true;
     } catch (error) {
       handleDynamoDbError(error, "deleteAllBookContents");
+      throw error;
+    }
+  },
+
+  async updateSessionId(
+    bookId: string,
+    userId: string,
+    sectionId: string | undefined,
+    chapterId: string | undefined,
+    sessionId: string | null
+  ): Promise<BookContent | null> {
+    try {
+      const content = await this.getContent(bookId, userId, sectionId, chapterId);
+      if (!content) {
+        return null;
+      }
+
+      const now = new Date().toISOString();
+      const params: AWS.DynamoDB.DocumentClient.UpdateItemInput = {
+        TableName: `${TABLE_PREFIX}AW-BookContents`,
+        Key: {
+          contentId: content.contentId,
+          bookId,
+        },
+        UpdateExpression: "SET #sessionId = :sessionId, #updatedAt = :updatedAt",
+        ExpressionAttributeNames: {
+          "#sessionId": "sessionId",
+          "#updatedAt": "updatedAt",
+        },
+        ExpressionAttributeValues: {
+          ":sessionId": sessionId || null,
+          ":updatedAt": now,
+        },
+        ReturnValues: "ALL_NEW",
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as BookContent;
+    } catch (error) {
+      handleDynamoDbError(error, "updateSessionId");
       throw error;
     }
   },

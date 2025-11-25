@@ -895,7 +895,7 @@ export const agentModeController = {
         undefined, // workflowId
         undefined, // executionId
         undefined, // emailCampaignTaskId
-        finalSessionType as "regular" | "predefined-work-plan" | "scheduled" | "image-generation"
+        finalSessionType as "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "book-generation"
       );
 
       res.status(201).json(session);

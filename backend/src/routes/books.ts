@@ -16,6 +16,8 @@ import {
   deleteChapter,
   getSectionContent,
   getChapterContent,
+  getBookContentSession,
+  updateBookContentSessionId,
 } from "../controllers/books";
 import multer from "multer";
 
@@ -68,6 +70,12 @@ router.delete("/:bookId/sections/:sectionId/chapters/:chapterId", authenticateTo
 // Content management
 router.get("/:bookId/sections/:sectionId/content", authenticateToken, getSectionContent);
 router.get("/:bookId/sections/:sectionId/chapters/:chapterId/content", authenticateToken, getChapterContent);
+
+// Agent Mode session management
+router.get("/:bookId/sections/:sectionId/session", authenticateToken, getBookContentSession);
+router.get("/:bookId/sections/:sectionId/chapters/:chapterId/session", authenticateToken, getBookContentSession);
+router.put("/:bookId/sections/:sectionId/session", authenticateToken, updateBookContentSessionId);
+router.put("/:bookId/sections/:sectionId/chapters/:chapterId/session", authenticateToken, updateBookContentSessionId);
 
 export default router;
 

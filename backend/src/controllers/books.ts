@@ -730,3 +730,93 @@ export async function getChapterContent(req: AuthenticatedRequest, res: Response
   }
 }
 
+// Get existing session for book content (if it exists)
+export async function getBookContentSession(req: AuthenticatedRequest, res: Response) {
+  try {
+    const userId = req.user?.userId;
+    const { bookId, sectionId, chapterId } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ error: "User ID not provided" });
+    }
+
+    if (!bookId || !sectionId) {
+      return res.status(400).json({ error: "Book ID and Section ID are required" });
+    }
+
+    // Verify book exists and belongs to user
+    const book = await bookDb.getBookById(bookId, userId);
+    if (!book) {
+      return res.status(404).json({ error: "Book not found" });
+    }
+
+    // Get existing content to check for sessionId
+    const content = await bookContentDb.getContent(bookId, userId, sectionId, chapterId);
+    
+    // If content exists and has a sessionId, try to get that session
+    if (content?.sessionId) {
+      const { chatbotDb } = await import("../services/chatbotService");
+      try {
+        const session = await chatbotDb.getChatSession(content.sessionId);
+        if (session && session.userId === userId) {
+          return res.json({ success: true, data: { session, content } });
+        }
+      } catch (error) {
+        // Session doesn't exist, clear the sessionId
+        await bookContentDb.updateSessionId(bookId, userId, sectionId, chapterId, null);
+      }
+    }
+
+    // No existing session
+    res.json({ success: true, data: { session: null, content: content || null } });
+  } catch (error) {
+    console.error("Error getting book content session:", error);
+    res.status(500).json({ error: "Failed to get session" });
+  }
+}
+
+// Update sessionId for book content
+export async function updateBookContentSessionId(req: AuthenticatedRequest, res: Response) {
+  try {
+    const userId = req.user?.userId;
+    const { bookId, sectionId, chapterId } = req.params;
+    const { sessionId } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ error: "User ID not provided" });
+    }
+
+    if (!bookId || !sectionId) {
+      return res.status(400).json({ error: "Book ID and Section ID are required" });
+    }
+
+    // Verify book exists and belongs to user
+    const book = await bookDb.getBookById(bookId, userId);
+    if (!book) {
+      return res.status(404).json({ error: "Book not found" });
+    }
+
+    // Create content entry if it doesn't exist, or update sessionId
+    const existingContent = await bookContentDb.getContent(bookId, userId, sectionId, chapterId);
+    if (existingContent) {
+      // Update only sessionId, preserve existing content
+      await bookContentDb.updateSessionId(bookId, userId, sectionId, chapterId, sessionId || null);
+    } else {
+      // Create new content entry with sessionId
+      await bookContentDb.createOrUpdateContent(bookId, userId, {
+        sectionId,
+        chapterId,
+        content: "",
+        sessionId: sessionId || undefined,
+      });
+    }
+
+    const updatedContent = await bookContentDb.getContent(bookId, userId, sectionId, chapterId);
+
+    res.json({ success: true, data: updatedContent });
+  } catch (error) {
+    console.error("Error updating book content session ID:", error);
+    res.status(500).json({ error: "Failed to update session ID" });
+  }
+}
+

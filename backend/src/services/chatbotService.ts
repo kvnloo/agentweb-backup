@@ -144,7 +144,7 @@ export interface ChatSession {
   calledFunctions?: Record<string, number>; // Track count of each function call made in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
   archives?: Record<string, boolean>; // Track archived assets by URL (key: assetUrl, value: true if archived)
-  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation"; // Type of session based on how it was created
+  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "book-generation"; // Type of session based on how it was created
 }
 
 // Interface for context chunks
@@ -472,7 +472,7 @@ export class ChatbotDB {
     workflowId?: string,
     executionId?: string,
     emailCampaignTaskId?: string,
-    sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation"
+    sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "book-generation"
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
