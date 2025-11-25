@@ -259,7 +259,7 @@ export async function generateBlogImage(
   const result = await imageService.generateImage({
     prompt: prompt,
     size: "1536x1024",
-    quality: "medium",
+    quality: "low",
     filename: filename || `blog-hero-${Date.now()}.png`,
     userId: userId,
     inputImages: []
@@ -787,7 +787,7 @@ export const generateImage = async (req: AuthRequest, res: Response) => {
     const result = await imageService.generateImage({
         prompt: prompt,
         size: "1536x1024",
-        quality: "medium",
+        quality: "low",
         filename: filename || "generated-blog-image.png",
         userId: userId,
         inputImages: []
