@@ -48,7 +48,7 @@ if (DEBUG) {
 }
 
 // File upload limits
-export const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB in bytes
+export const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB in bytes
 
 // Helper function to build API endpoints
 export const buildApiUrl = (endpoint: string) => {

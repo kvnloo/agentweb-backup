@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-11-25',
+    changes: [
+      'Increased File Upload Size Limit',
+      '- File attachment size limit increased from 5MB to 10MB per file',
+      'Optimized Blog Article Hero Images',
+      '- Blog article hero images now default to low quality for better social media sharing',
+    ],
+  },
+  {
     date: '2025-11-24',
     changes: [
       'Added SEO Metrics Page',

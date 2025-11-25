@@ -51,14 +51,18 @@ jest.mock('../../utils/secretsManager', () => ({
 }));
 
 // Mock imageGeneration service
+const mockGenerateImage = jest.fn().mockResolvedValue({
+  success: true,
+  imageUrl: 'https://example.com/image.png',
+  filename: 'test.png'
+});
+
+const mockIsAvailable = jest.fn().mockResolvedValue(true);
+
 jest.mock('../../services/imageGeneration', () => ({
   imageService: {
-    generateImage: jest.fn().mockResolvedValue({
-      success: true,
-      imageUrl: 'https://example.com/image.png',
-      filename: 'test.png'
-    }),
-    isAvailable: jest.fn().mockResolvedValue(true)
+    generateImage: mockGenerateImage,
+    isAvailable: mockIsAvailable
   }
 }));
 
@@ -71,7 +75,7 @@ process.env.AWS_ACCESS_KEY_ID = 'test-key';
 process.env.AWS_SECRET_ACCESS_KEY = 'test-secret';
 process.env.AWS_REGION = 'us-west-2';
 
-import { generateBlogContent, generateBlogHtml } from '../blog';
+import { generateBlogContent, generateBlogHtml, generateBlogImage, generateImage } from '../blog';
 
 describe('Blog Controller - generateBlogContent', () => {
   beforeEach(() => {
@@ -452,6 +456,182 @@ describe('Blog Controller - generateBlogHtml', () => {
       // Both should have video styling
       expect(substackHtml).toContain('.content video {');
       expect(defaultHtml).toContain('.content video {');
+    });
+  });
+});
+
+describe('Blog Controller - Image Quality Defaulting', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  describe('generateBlogImage', () => {
+    it('should default quality to "low" for blog article images', async () => {
+      mockGenerateImage.mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/image.png',
+        filename: 'blog-hero-123.png'
+      });
+
+      await generateBlogImage(
+        'A professional business illustration',
+        'user123',
+        'blog-hero-123.png'
+      );
+
+      // Verify that generateImage was called with quality: "low"
+      expect(mockGenerateImage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          prompt: 'A professional business illustration',
+          size: '1536x1024',
+          quality: 'low', // Should default to low for blog images
+          filename: 'blog-hero-123.png',
+          userId: 'user123',
+          inputImages: []
+        })
+      );
+    });
+
+    it('should use low quality even when filename is auto-generated', async () => {
+      mockGenerateImage.mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/image.png',
+        filename: 'blog-hero-123.png'
+      });
+
+      await generateBlogImage(
+        'A professional business illustration',
+        'user123'
+        // filename not provided - should auto-generate
+      );
+
+      // Verify that quality is still "low"
+      expect(mockGenerateImage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          quality: 'low'
+        })
+      );
+    });
+
+    it('should pass low quality to imageService for hero images', async () => {
+      mockGenerateImage.mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/image.png',
+        filename: 'test-hero.png'
+      });
+
+      const result = await generateBlogImage(
+        'Test image prompt',
+        'user456',
+        'test-hero.png'
+      );
+
+      expect(result.imageUrl).toBe('https://example.com/image.png');
+      expect(result.filename).toBe('test-hero.png');
+      
+      // Verify the call included quality: "low"
+      const callArgs = mockGenerateImage.mock.calls[0][0];
+      expect(callArgs.quality).toBe('low');
+    });
+  });
+
+  describe('generateImage endpoint', () => {
+    // Mock Express request and response
+    const createMockRequest = (body: any) => ({
+      body,
+      user: { userId: 'user123', email: 'test@example.com' }
+    } as any);
+
+    const createMockResponse = () => {
+      const res: any = {};
+      res.status = jest.fn().mockReturnValue(res);
+      res.json = jest.fn().mockReturnValue(res);
+      return res;
+    };
+
+    it('should default quality to "low" when generating blog images', async () => {
+      // Mock should return the filename that was requested
+      mockGenerateImage.mockImplementation((params) => {
+        return Promise.resolve({
+          success: true,
+          imageUrl: 'https://example.com/image.png',
+          filename: params.filename || 'generated-blog-image.png'
+        });
+      });
+
+      const req = createMockRequest({
+        prompt: 'A beautiful hero image for a blog post',
+        filename: 'blog-hero.png'
+      });
+      const res = createMockResponse();
+
+      await generateImage(req, res);
+
+      // Verify that generateImage was called with quality: "low"
+      expect(mockGenerateImage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          prompt: 'A beautiful hero image for a blog post',
+          size: '1536x1024',
+          quality: 'low', // Should default to low for blog images
+          filename: 'blog-hero.png',
+          userId: 'user123',
+          inputImages: []
+        })
+      );
+
+      // Verify response
+      expect(res.status).toHaveBeenCalledWith(200);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: true,
+          data: expect.objectContaining({
+            imageUrl: 'https://example.com/image.png',
+            filename: 'blog-hero.png'
+          })
+        })
+      );
+    });
+
+    it('should use low quality even when filename is auto-generated', async () => {
+      mockGenerateImage.mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/image.png',
+        filename: 'generated-blog-image.png'
+      });
+
+      const req = createMockRequest({
+        prompt: 'Test prompt'
+        // filename not provided
+      });
+      const res = createMockResponse();
+
+      await generateImage(req, res);
+
+      // Verify that quality is still "low"
+      const callArgs = mockGenerateImage.mock.calls[0][0];
+      expect(callArgs.quality).toBe('low');
+    });
+
+    it('should always use low quality for blog article hero images', async () => {
+      mockGenerateImage.mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/image.png',
+        filename: 'hero.png'
+      });
+
+      const req = createMockRequest({
+        prompt: 'A stunning hero image',
+        filename: 'hero.png'
+      });
+      const res = createMockResponse();
+
+      await generateImage(req, res);
+
+      // Verify quality is explicitly set to "low" (not medium or high)
+      const callArgs = mockGenerateImage.mock.calls[0][0];
+      expect(callArgs.quality).toBe('low');
+      expect(callArgs.quality).not.toBe('medium');
+      expect(callArgs.quality).not.toBe('high');
     });
   });
 });

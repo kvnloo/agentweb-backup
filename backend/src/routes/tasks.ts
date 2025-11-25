@@ -21,7 +21,12 @@ interface AuthRequest extends Request {
 }
 
 const router = express.Router();
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({ 
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB limit
+  },
+});
 
 // Initialize GCS with service account credentials
 import { getGCSPPrivateKey } from '../utils/secretsManager';
