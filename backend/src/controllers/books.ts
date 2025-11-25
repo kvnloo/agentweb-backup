@@ -32,9 +32,14 @@ async function uploadBookFileToS3(
     })
     .promise();
 
-  const url = `https://${
-    process.env.AWS_S3_BUCKET || "agentweb-user-files"
-  }.s3.${process.env.AWS_REGION || "us-west-2"}.amazonaws.com/${key}`;
+  // Properly encode the URL by encoding each path segment
+  const bucket = process.env.AWS_S3_BUCKET || "agentweb-user-files";
+  const region = process.env.AWS_REGION || "us-west-2";
+  const encodedKey = key
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+  const url = `https://${bucket}.s3.${region}.amazonaws.com/${encodedKey}`;
 
   return { url, key };
 }

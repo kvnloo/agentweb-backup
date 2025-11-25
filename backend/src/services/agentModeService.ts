@@ -998,6 +998,71 @@ Use the available tools to create tasks in the agent-engine when complex work is
       {
         type: 'function' as const,
         function: {
+          name: 'list_books',
+          description: 'List all books and white papers for the current user. Returns a list of books with their IDs, titles, types, authors, status, and creation dates.',
+          parameters: {
+            type: 'object',
+            properties: {
+              type: {
+                type: 'string',
+                enum: ['book', 'whitepaper'],
+                description: 'Optional filter by type: "book" or "whitepaper". If not provided, returns all types.'
+              },
+              status: {
+                type: 'string',
+                enum: ['draft', 'published', 'archived'],
+                description: 'Optional filter by status: "draft", "published", or "archived". If not provided, returns all statuses.'
+              }
+            },
+            required: []
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'get_book_details',
+          description: 'Get detailed information about a specific book or white paper including its outline (sections and chapters structure). Returns book metadata and the complete outline hierarchy.',
+          parameters: {
+            type: 'object',
+            properties: {
+              book_id: {
+                type: 'string',
+                description: 'The unique identifier (bookId) of the book to retrieve'
+              }
+            },
+            required: ['book_id']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'get_book_content',
+          description: 'Get the markdown content for a specific section or chapter in a book. If chapter_id is provided, returns chapter content. Otherwise, returns section content.',
+          parameters: {
+            type: 'object',
+            properties: {
+              book_id: {
+                type: 'string',
+                description: 'The unique identifier (bookId) of the book'
+              },
+              section_id: {
+                type: 'string',
+                description: 'The unique identifier (sectionId) of the section'
+              },
+              chapter_id: {
+                type: 'string',
+                description: 'Optional: The unique identifier (chapterId) of the chapter. If provided, returns chapter content. If not provided, returns section content.'
+              }
+            },
+            required: ['book_id', 'section_id']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
           name: 'save_file',
           description: 'Create and save a file with the provided content to S3, then return the file URL for sharing or reference',
           parameters: {
@@ -1854,6 +1919,91 @@ Use the available tools to create tasks in the agent-engine when complex work is
           updatedAt: new Date().toISOString()
         };
       
+      case 'list_books':
+        return {
+          success: true,
+          message: 'Found 2 book(s)',
+          books: [
+            {
+              book_id: 'mock-book-1',
+              title: 'Mock Marketing Guide',
+              description: 'A comprehensive guide to marketing strategies',
+              type: 'book',
+              author: 'John Doe',
+              status: 'published',
+              published_at: new Date(Date.now() - 86400000).toISOString(),
+              created_at: new Date(Date.now() - 172800000).toISOString(),
+              updated_at: new Date(Date.now() - 86400000).toISOString(),
+              tags: ['marketing', 'strategy'],
+              has_sections: true
+            },
+            {
+              book_id: 'mock-book-2',
+              title: 'Mock White Paper: AI Trends',
+              description: 'An analysis of current AI trends in business',
+              type: 'whitepaper',
+              author: 'Jane Smith',
+              status: 'draft',
+              published_at: null,
+              created_at: new Date(Date.now() - 86400000).toISOString(),
+              updated_at: new Date(Date.now() - 3600000).toISOString(),
+              tags: ['AI', 'technology'],
+              has_sections: false
+            }
+          ],
+          totalBooks: 2
+        };
+      
+      case 'get_book_details':
+        return {
+          success: true,
+          message: 'Book details retrieved successfully',
+          book: {
+            book_id: args.book_id || 'mock-book-1',
+            title: 'Mock Marketing Guide',
+            description: 'A comprehensive guide to marketing strategies',
+            type: 'book',
+            author: 'John Doe',
+            status: 'published',
+            published_at: new Date(Date.now() - 86400000).toISOString(),
+            created_at: new Date(Date.now() - 172800000).toISOString(),
+            updated_at: new Date(Date.now() - 86400000).toISOString(),
+            tags: ['marketing', 'strategy'],
+            cover_image_url: null,
+            outline: [
+              {
+                section_id: 'mock-section-1',
+                title: 'Introduction',
+                description: 'Introduction to marketing',
+                order: 1,
+                has_content: true,
+                chapters: [
+                  {
+                    chapter_id: 'mock-chapter-1',
+                    title: 'What is Marketing?',
+                    description: 'Basic concepts',
+                    order: 1,
+                    has_content: true
+                  }
+                ]
+              }
+            ]
+          }
+        };
+      
+      case 'get_book_content':
+        return {
+          success: true,
+          message: args.chapter_id ? 'Chapter content retrieved successfully' : 'Section content retrieved successfully',
+          content: args.chapter_id 
+            ? `# ${args.chapter_id ? 'Chapter' : 'Section'} Content\n\nThis is mock ${args.chapter_id ? 'chapter' : 'section'} content for testing purposes.\n\nIt contains markdown formatted text that can be used to demonstrate the content retrieval functionality.`
+            : `# Section Content\n\nThis is mock section content for section ${args.section_id}.\n\n## Overview\n\nThis section provides an overview of the topic.\n\n## Key Points\n\n- Point 1\n- Point 2\n- Point 3`,
+          content_type: args.chapter_id ? 'chapter' : 'section',
+          section_id: args.section_id || 'mock-section-1',
+          chapter_id: args.chapter_id || null,
+          has_content: true
+        };
+      
       case 'read_brand_guidelines':
         return {
           success: true,
@@ -2187,6 +2337,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.listKnowledgeBaseFiles(userId);
       case 'read_knowledge_base_file':
         return await this.readKnowledgeBaseFile(args.file_identifier, userId);
+      case 'list_books':
+        return await this.listBooks(userId, args.type, args.status);
+      case 'get_book_details':
+        return await this.getBookDetails(args.book_id, userId);
+      case 'get_book_content':
+        return await this.getBookContent(args.book_id, args.section_id, args.chapter_id, userId);
       case 'read_brand_guidelines':
         return await this.readBrandGuidelines(userId);
       case 'update_brand_guidelines':
@@ -7682,6 +7838,231 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       return {
         success: false,
         message: 'Failed to update work plan status',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async listBooks(userId: string, type?: string, status?: string): Promise<any> {
+    try {
+      console.log('AgentMode: Listing books for user:', userId);
+      
+      const { bookDb } = await import('./bookDb');
+      
+      const filters: {
+        type?: "book" | "whitepaper";
+        status?: "draft" | "published" | "archived";
+      } = {};
+      
+      if (type === "book" || type === "whitepaper") {
+        filters.type = type;
+      }
+      
+      if (status === "draft" || status === "published" || status === "archived") {
+        filters.status = status;
+      }
+      
+      const books = await bookDb.getBooksByUser(userId, filters);
+      
+      if (!books || books.length === 0) {
+        return {
+          success: true,
+          message: 'No books found',
+          books: [],
+          totalBooks: 0
+        };
+      }
+
+      // Format books for Agent Mode
+      const formattedBooks = books.map((book: any) => ({
+        book_id: book.bookId,
+        title: book.title,
+        description: book.description,
+        type: book.type,
+        author: book.author,
+        status: book.status,
+        published_at: book.publishedAt,
+        created_at: book.createdAt,
+        updated_at: book.updatedAt,
+        tags: book.tags || [],
+        has_sections: !!(book.sections && book.sections.length > 0)
+      }));
+
+      return {
+        success: true,
+        message: `Found ${formattedBooks.length} book(s)`,
+        books: formattedBooks,
+        totalBooks: formattedBooks.length
+      };
+    } catch (error) {
+      console.error('Error listing books:', error);
+      return {
+        success: false,
+        message: 'Failed to list books',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async getBookDetails(bookId: string, userId: string): Promise<any> {
+    try {
+      console.log('AgentMode: Getting book details for:', bookId);
+      
+      const { bookDb } = await import('./bookDb');
+      const { bookContentDb } = await import('./bookContentDb');
+      
+      const book = await bookDb.getBookById(bookId, userId);
+      
+      if (!book) {
+        return {
+          success: false,
+          message: 'Book not found',
+          error: 'Book not found or access denied'
+        };
+      }
+
+      // Load all contents for this book
+      const contents = await bookContentDb.getAllBookContents(bookId, userId);
+      
+      // Attach contents to sections and chapters
+      if (book.sections) {
+        for (const section of book.sections) {
+          const sectionContent = contents.find(
+            (c) => c.sectionId === section.sectionId && !c.chapterId
+          );
+          if (sectionContent) {
+            section.content = sectionContent.content;
+          }
+          
+          for (const chapter of section.chapters) {
+            const chapterContent = contents.find(
+              (c) => c.sectionId === section.sectionId && c.chapterId === chapter.chapterId
+            );
+            if (chapterContent) {
+              chapter.content = chapterContent.content;
+            }
+          }
+        }
+      }
+
+      // Format book details for Agent Mode
+      const formattedBook = {
+        book_id: book.bookId,
+        title: book.title,
+        description: book.description,
+        type: book.type,
+        author: book.author,
+        status: book.status,
+        published_at: book.publishedAt,
+        created_at: book.createdAt,
+        updated_at: book.updatedAt,
+        tags: book.tags || [],
+        cover_image_url: book.coverImageUrl,
+        outline: book.sections ? book.sections.map((section: any) => ({
+          section_id: section.sectionId,
+          title: section.title,
+          description: section.description,
+          order: section.order,
+          has_content: !!section.content,
+          chapters: section.chapters.map((chapter: any) => ({
+            chapter_id: chapter.chapterId,
+            title: chapter.title,
+            description: chapter.description,
+            order: chapter.order,
+            has_content: !!chapter.content
+          }))
+        })) : []
+      };
+
+      return {
+        success: true,
+        message: 'Book details retrieved successfully',
+        book: formattedBook
+      };
+    } catch (error) {
+      console.error('Error getting book details:', error);
+      return {
+        success: false,
+        message: 'Failed to get book details',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async getBookContent(
+    bookId: string,
+    sectionId: string,
+    chapterId: string | undefined,
+    userId: string
+  ): Promise<any> {
+    try {
+      console.log('AgentMode: Getting book content for:', { bookId, sectionId, chapterId });
+      
+      const { bookDb } = await import('./bookDb');
+      const { bookContentDb } = await import('./bookContentDb');
+      
+      // Verify book exists and belongs to user
+      const book = await bookDb.getBookById(bookId, userId);
+      if (!book) {
+        return {
+          success: false,
+          message: 'Book not found',
+          error: 'Book not found or access denied'
+        };
+      }
+
+      // Verify section exists
+      const section = book.sections?.find((s) => s.sectionId === sectionId);
+      if (!section) {
+        return {
+          success: false,
+          message: 'Section not found',
+          error: 'Section not found in this book'
+        };
+      }
+
+      // If chapterId provided, verify chapter exists
+      if (chapterId) {
+        const chapter = section.chapters.find((c) => c.chapterId === chapterId);
+        if (!chapter) {
+          return {
+            success: false,
+            message: 'Chapter not found',
+            error: 'Chapter not found in this section'
+          };
+        }
+      }
+
+      // Get content from bookContentDb
+      const content = await bookContentDb.getContent(bookId, userId, sectionId, chapterId);
+      
+      if (!content) {
+        return {
+          success: true,
+          message: chapterId ? 'Chapter content not found' : 'Section content not found',
+          content: '',
+          content_type: chapterId ? 'chapter' : 'section',
+          section_id: sectionId,
+          chapter_id: chapterId || null,
+          has_content: false
+        };
+      }
+
+      return {
+        success: true,
+        message: chapterId ? 'Chapter content retrieved successfully' : 'Section content retrieved successfully',
+        content: content.content,
+        content_type: chapterId ? 'chapter' : 'section',
+        section_id: sectionId,
+        chapter_id: chapterId || null,
+        updated_at: content.updatedAt,
+        has_content: true
+      };
+    } catch (error) {
+      console.error('Error getting book content:', error);
+      return {
+        success: false,
+        message: 'Failed to get book content',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
