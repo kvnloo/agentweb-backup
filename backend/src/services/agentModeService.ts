@@ -1063,6 +1063,40 @@ Use the available tools to create tasks in the agent-engine when complex work is
       {
         type: 'function' as const,
         function: {
+          name: 'update_book_content',
+          description: 'Update the markdown content for a specific section or chapter in a book. Use update_type="full" with old_content_hash for entire content replacement, or update_type="part" with old_content for partial replacements. IMPORTANT: Always use get_book_content first to retrieve the current content, then provide the exact old_content to replace.',
+          parameters: {
+            type: 'object',
+            properties: {
+              book_id: {
+                type: 'string',
+                description: 'The unique identifier (bookId) of the book'
+              },
+              section_id: {
+                type: 'string',
+                description: 'The unique identifier (sectionId) of the section'
+              },
+              chapter_id: {
+                type: 'string',
+                description: 'Optional: The unique identifier (chapterId) of the chapter. If provided, updates chapter content. If not provided, updates section content.'
+              },
+              update_type: {
+                type: 'string',
+                enum: ['part', 'full'],
+                description: 'Type of update: "part" for partial content replacement using old_content, "full" for entire content replacement using old_content_hash'
+              },
+              replacement_json: {
+                type: 'string',
+                description: 'JSON string containing a list of replacement instructions. For full replacement: [{"old_content_hash": "abc123...", "new_content": "# New Content\\n\\n...", "expected_count": 1}]. For part replacement: [{"old_content": "## Old Heading\\n\\nOld text...", "new_content": "## New Heading\\n\\nNew text...", "expected_count": 1}]. Use empty string for new_content to delete the specified content.'
+              }
+            },
+            required: ['book_id', 'section_id', 'update_type', 'replacement_json']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
           name: 'save_file',
           description: 'Create and save a file with the provided content to S3, then return the file URL for sharing or reference',
           parameters: {
@@ -1992,16 +2026,93 @@ Use the available tools to create tasks in the agent-engine when complex work is
         };
       
       case 'get_book_content':
+        const mockContent = args.chapter_id 
+          ? `# ${args.chapter_id ? 'Chapter' : 'Section'} Content\n\nThis is mock ${args.chapter_id ? 'chapter' : 'section'} content for testing purposes.\n\nIt contains markdown formatted text that can be used to demonstrate the content retrieval functionality.`
+          : `# Section Content\n\nThis is mock section content for section ${args.section_id}.\n\n## Overview\n\nThis section provides an overview of the topic.\n\n## Key Points\n\n- Point 1\n- Point 2\n- Point 3`;
+        const mockContentHash = createHash('sha256').update(mockContent).digest('hex');
         return {
           success: true,
           message: args.chapter_id ? 'Chapter content retrieved successfully' : 'Section content retrieved successfully',
-          content: args.chapter_id 
-            ? `# ${args.chapter_id ? 'Chapter' : 'Section'} Content\n\nThis is mock ${args.chapter_id ? 'chapter' : 'section'} content for testing purposes.\n\nIt contains markdown formatted text that can be used to demonstrate the content retrieval functionality.`
-            : `# Section Content\n\nThis is mock section content for section ${args.section_id}.\n\n## Overview\n\nThis section provides an overview of the topic.\n\n## Key Points\n\n- Point 1\n- Point 2\n- Point 3`,
+          content: mockContent,
+          content_hash: mockContentHash,
           content_type: args.chapter_id ? 'chapter' : 'section',
           section_id: args.section_id || 'mock-section-1',
           chapter_id: args.chapter_id || null,
           has_content: true
+        };
+      
+      case 'update_book_content':
+        // Mock validation for update_book_content
+        if (!args.update_type || !['part', 'full'].includes(args.update_type)) {
+          return {
+            success: false,
+            message: 'update_type must be either "part" or "full"'
+          };
+        }
+        
+        let mockBookReplacementInstructions = [];
+        try {
+          if (args.replacement_json) {
+            mockBookReplacementInstructions = JSON.parse(args.replacement_json);
+          }
+        } catch (error) {
+          return {
+            success: false,
+            message: 'Invalid JSON in replacement_json',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          };
+        }
+        
+        if (mockBookReplacementInstructions.length === 0) {
+          return {
+            success: false,
+            message: 'At least one replacement instruction is required'
+          };
+        }
+        
+        // Validate mock instructions
+        for (let i = 0; i < mockBookReplacementInstructions.length; i++) {
+          const instruction = mockBookReplacementInstructions[i];
+          if (instruction.new_content === undefined || instruction.expected_count === undefined) {
+            return {
+              success: false,
+              message: `Missing required fields in replacement instruction ${i + 1}: new_content and expected_count are required`
+            };
+          }
+          
+          if (args.update_type === 'full') {
+            if (!instruction.old_content_hash) {
+              return {
+                success: false,
+                message: `Replacement instruction ${i + 1} missing old_content_hash. For update_type="full", old_content_hash is required`
+              };
+            }
+          } else if (args.update_type === 'part') {
+            if (!instruction.old_content) {
+              return {
+                success: false,
+                message: `Replacement instruction ${i + 1} missing old_content. For update_type="part", old_content is required`
+              };
+            }
+          }
+        }
+        
+        return {
+          success: true,
+          message: `Content updated successfully with ${mockBookReplacementInstructions.length} replacement(s)`,
+          content_type: args.chapter_id ? 'chapter' : 'section',
+          section_id: args.section_id || 'mock-section-1',
+          chapter_id: args.chapter_id || null,
+          replacements: mockBookReplacementInstructions.map((inst: any, idx: number) => ({
+            index: idx + 1,
+            old_content: args.update_type === 'part' ? inst.old_content : undefined,
+            old_content_hash: args.update_type === 'full' ? inst.old_content_hash : undefined,
+            new_content: inst.new_content,
+            expected_count: inst.expected_count,
+            actual_count: inst.expected_count,
+            success: true
+          })),
+          updated_content_length: 1000
         };
       
       case 'read_brand_guidelines':
@@ -2343,6 +2454,28 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.getBookDetails(args.book_id, userId);
       case 'get_book_content':
         return await this.getBookContent(args.book_id, args.section_id, args.chapter_id, userId);
+      case 'update_book_content':
+        // Parse replacement_json
+        let bookReplacementInstructions = [];
+        try {
+          if (args.replacement_json) {
+            bookReplacementInstructions = JSON.parse(args.replacement_json);
+          }
+        } catch (error) {
+          return {
+            success: false,
+            message: 'Invalid JSON in replacement_json',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          };
+        }
+        return await this.updateBookContent(
+          args.book_id,
+          args.section_id,
+          args.chapter_id,
+          args.update_type,
+          bookReplacementInstructions,
+          userId
+        );
       case 'read_brand_guidelines':
         return await this.readBrandGuidelines(userId);
       case 'update_brand_guidelines':
@@ -6883,7 +7016,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     sessionId: string
   ): Promise<any> {
     try {
-      // Validate update_type
+      // Validate update_type first (before fetching file)
       if (!updateType || !['part', 'full'].includes(updateType)) {
         return {
           success: false,
@@ -6891,7 +7024,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         };
       }
       
-      // Validate that replacementInstructions is an array
+      // Validate replacement instructions (before fetching file)
+      // This is a quick validation to catch errors early
       if (!Array.isArray(replacementInstructions)) {
         return {
           success: false,
@@ -6906,48 +7040,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
         };
       }
       
-      // Validate each replacement instruction based on update_type
-      for (let i = 0; i < replacementInstructions.length; i++) {
-        const instruction = replacementInstructions[i];
-        
-        if (instruction.new_content === undefined || instruction.expected_count === undefined) {
-          return {
-            success: false,
-            message: `Missing required fields in replacement instruction ${i + 1}: new_content and expected_count are required`
-          };
-        }
-        
-        if (updateType === 'full') {
-          // For full replacement, require old_file_hash
-          if (!instruction.old_file_hash) {
-            return {
-              success: false,
-              message: `Replacement instruction ${i + 1} missing old_file_hash. For update_type="full", old_file_hash is required`
-            };
-          }
-          if (instruction.old_content !== undefined) {
-            return {
-              success: false,
-              message: `Replacement instruction ${i + 1} should not have old_content when update_type="full". Use old_file_hash instead`
-            };
-          }
-        } else if (updateType === 'part') {
-          // For part replacement, require old_content
-          if (!instruction.old_content) {
-            return {
-              success: false,
-              message: `Replacement instruction ${i + 1} missing old_content. For update_type="part", old_content is required`
-            };
-          }
-          if (instruction.old_file_hash !== undefined) {
-            return {
-              success: false,
-              message: `Replacement instruction ${i + 1} should not have old_file_hash when update_type="part". Use old_content instead`
-            };
-          }
-        }
-      }
-      
       // Fetch current file content
       const currentContent = await this.fetchFileContent(fileUrl);
       console.log(`AgentMode: Fetched file content, length: ${currentContent.length} characters`);
@@ -6956,88 +7048,37 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const currentContentHash = createHash('sha256').update(currentContent).digest('hex');
       console.log(`AgentMode: Computed current content hash: ${currentContentHash}`);
       
-      let updatedContent = currentContent;
+      // Use common replacement function
+      const replacementResult = this.performContentReplacements(
+        currentContent,
+        currentContentHash,
+        updateType,
+        replacementInstructions
+      );
       
-      // Perform all replacements
-      const replacementResults = [];
-      
-      for (let i = 0; i < replacementInstructions.length; i++) {
-        const instruction = replacementInstructions[i];
-        const { new_content, expected_count } = instruction;
+      if (!replacementResult.success) {
+        // Map error messages to match expected format for HTML files
+        let errorMessage = replacementResult.error?.message || 'Failed to perform replacements';
         
-        if (updateType === 'full') {
-          // Entire file replacement using hash
-          const { old_file_hash } = instruction;
-          console.log(`AgentMode: Full replacement ${i + 1}: old_file_hash: ${old_file_hash}, new_content length: ${new_content.length}, expected_count: ${expected_count}`);
-          
-          // Verify that the provided hash matches the current content hash
-          if (old_file_hash !== currentContentHash) {
-            return {
-              success: false,
-              message: `Replacement ${i + 1} failed: File hash mismatch. Expected: ${currentContentHash}, provided: ${old_file_hash}. The file may have been modified since it was last read.`,
-              suggestion: 'Use read_file_content to get the current content and hash, then retry the replacement'
-            };
-          }
-          
-          // For hash-based replacement, we replace the entire content
-          if (expected_count === 1) {
-            console.log(`AgentMode: Hash verification successful, replacing entire content`);
-            updatedContent = new_content;
-            replacementResults.push({
-              index: i + 1,
-              old_file_hash: old_file_hash,
-              new_content: new_content,
-              expected_count: expected_count,
-              actual_count: 1,
-              success: true
-            });
-          } else {
-            return {
-              success: false,
-              message: `Replacement ${i + 1} failed: Full replacement only supports expected_count of 1 (entire file replacement)`,
-              suggestion: 'Use expected_count: 1 for full file replacement'
-            };
-          }
-        } else if (updateType === 'part') {
-          // Partial content replacement using old_content
-          const { old_content } = instruction;
-          console.log(`AgentMode: Part replacement ${i + 1}: old_content length: ${old_content.length}, new_content length: ${new_content.length}, expected_count: ${expected_count}`);
-          
-          // Perform the replacement using the existing logic
-          const replacementResult = this.performDirectReplacement(
-            updatedContent,
-            old_content,
-            new_content,
-            true // exact_match = true for partial replacements
-          );
-          
-          if (replacementResult === null) {
-            return {
-              success: false,
-              message: `Replacement ${i + 1} failed: The old_content was not found in the file. No changes were made to the file.`,
-              suggestion: 'Check that the old_content exactly matches the content in the file'
-            };
-          }
-          
-          // Check if the actual change count matches expected count
-          if (replacementResult.changeCount !== expected_count) {
-            return {
-              success: false,
-              message: `Replacement ${i + 1} failed: Expected ${expected_count} occurrences of old_content, but found ${replacementResult.changeCount}. No changes were made to the file.`,
-              suggestion: 'Check the expected_count matches the actual number of occurrences in the file'
-            };
-          }
-          
-          updatedContent = replacementResult.content;
-          replacementResults.push({
-            index: i + 1,
-            old_content: old_content,
-            new_content: new_content,
-            expected_count: expected_count,
-            actual_count: replacementResult.changeCount,
-            success: true
-          });
+        // Replace generic messages with HTML-specific ones for backward compatibility
+        if (errorMessage.includes('old_content_hash (or old_file_hash)')) {
+          // Extract instruction number and replace message
+          const match = errorMessage.match(/Replacement instruction (\d+)/);
+          const instructionNum = match ? match[1] : '1';
+          errorMessage = `Replacement instruction ${instructionNum} missing old_file_hash. For update_type="full", old_file_hash is required`;
         }
+        if (replacementResult.error?.isHashMismatch || errorMessage.includes('Content hash mismatch')) {
+          errorMessage = errorMessage.replace('Content hash mismatch', 'File hash mismatch');
+        }
+        if (errorMessage.includes('should not have hash when update_type="part"')) {
+          errorMessage = errorMessage.replace('should not have hash when update_type="part". Use old_content instead', 'should not have old_file_hash when update_type="part"');
+        }
+        
+        return {
+          success: false,
+          message: errorMessage,
+          suggestion: replacementResult.error?.suggestion
+        };
       }
       
       // Create versioned filename and upload the updated content
@@ -7046,14 +7087,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
       console.log(`AgentMode: Generated versioned filename: ${versionedFilename}`);
       const originalPath = this.extractPathFromS3Url(fileUrl);
       console.log(`AgentMode: Original path: ${originalPath}`);
-      const uploadResult = await this.uploadUpdatedFile(updatedContent, versionedFilename, originalPath);
+      const uploadResult = await this.uploadUpdatedFile(replacementResult.updatedContent!, versionedFilename, originalPath);
       
       return {
         success: true,
         s3_url: uploadResult.url,
-        message: `File updated successfully with ${replacementResults.length} replacements`,
+        message: `File updated successfully with ${replacementResult.replacementResults!.length} replacements`,
         method: 'mixed_replacement',
-        replacements: replacementResults,
+        replacements: replacementResult.replacementResults,
         versioned_filename: versionedFilename
       };
       
@@ -7080,6 +7121,196 @@ Use the available tools to create tasks in the agent-engine when complex work is
       console.error('Error fetching file content:', error);
       throw new Error(`Failed to fetch file content: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
+  }
+
+  // Common function to validate and perform content replacements
+  // Used by both update_html_file and update_book_content
+  private performContentReplacements(
+    currentContent: string,
+    currentContentHash: string,
+    updateType: string,
+    replacementInstructions: any[]
+  ): { success: boolean; updatedContent?: string; replacementResults?: any[]; error?: any } {
+    // Validate update_type
+    if (!updateType || !['part', 'full'].includes(updateType)) {
+      return {
+        success: false,
+        error: {
+          message: 'update_type must be either "part" or "full"'
+        }
+      };
+    }
+    
+    // Validate that replacementInstructions is an array
+    if (!Array.isArray(replacementInstructions)) {
+      return {
+        success: false,
+        error: {
+          message: 'replacement_json must be an array of replacement instructions'
+        }
+      };
+    }
+    
+    if (replacementInstructions.length === 0) {
+      return {
+        success: false,
+        error: {
+          message: 'At least one replacement instruction is required'
+        }
+      };
+    }
+    
+    // Validate each replacement instruction based on update_type
+    for (let i = 0; i < replacementInstructions.length; i++) {
+      const instruction = replacementInstructions[i];
+      
+      if (instruction.new_content === undefined || instruction.expected_count === undefined) {
+        return {
+          success: false,
+          error: {
+            message: `Missing required fields in replacement instruction ${i + 1}: new_content and expected_count are required`
+          }
+        };
+      }
+      
+      if (updateType === 'full') {
+        // For full replacement, require old_content_hash (or old_file_hash for HTML files)
+        const hashField = instruction.old_content_hash || instruction.old_file_hash;
+        if (!hashField) {
+          return {
+            success: false,
+            error: {
+              message: `Replacement instruction ${i + 1} missing hash. For update_type="full", old_content_hash (or old_file_hash) is required`
+            }
+          };
+        }
+        if (instruction.old_content !== undefined) {
+          return {
+            success: false,
+            error: {
+              message: `Replacement instruction ${i + 1} should not have old_content when update_type="full". Use hash instead`
+            }
+          };
+        }
+      } else if (updateType === 'part') {
+        // For part replacement, require old_content
+        if (!instruction.old_content) {
+          return {
+            success: false,
+            error: {
+              message: `Replacement instruction ${i + 1} missing old_content. For update_type="part", old_content is required`
+            }
+          };
+        }
+        if (instruction.old_content_hash !== undefined || instruction.old_file_hash !== undefined) {
+          return {
+            success: false,
+            error: {
+              message: `Replacement instruction ${i + 1} should not have hash when update_type="part". Use old_content instead`
+            }
+          };
+        }
+      }
+    }
+    
+    let updatedContent = currentContent;
+    const replacementResults = [];
+    
+    // Perform all replacements
+    for (let i = 0; i < replacementInstructions.length; i++) {
+      const instruction = replacementInstructions[i];
+      const { new_content, expected_count } = instruction;
+      
+      if (updateType === 'full') {
+        // Entire content replacement using hash
+        const providedHash = instruction.old_content_hash || instruction.old_file_hash;
+        console.log(`AgentMode: Full replacement ${i + 1}: hash: ${providedHash}, new_content length: ${new_content.length}, expected_count: ${expected_count}`);
+        
+          // Verify that the provided hash matches the current content hash
+          if (providedHash !== currentContentHash) {
+            return {
+              success: false,
+              error: {
+                message: `Replacement ${i + 1} failed: Content hash mismatch. Expected: ${currentContentHash}, provided: ${providedHash}. The content may have been modified since it was last read.`,
+                suggestion: 'Use get_book_content or read_file_content to get the current content and hash, then retry the replacement',
+                isHashMismatch: true // Flag for HTML file error message mapping
+              }
+            };
+          }
+        
+        // For hash-based replacement, we replace the entire content
+        if (expected_count === 1) {
+          console.log(`AgentMode: Hash verification successful, replacing entire content`);
+          updatedContent = new_content;
+          replacementResults.push({
+            index: i + 1,
+            old_content_hash: instruction.old_content_hash,
+            old_file_hash: instruction.old_file_hash,
+            new_content: new_content,
+            expected_count: expected_count,
+            actual_count: 1,
+            success: true
+          });
+        } else {
+          return {
+            success: false,
+            error: {
+              message: `Replacement ${i + 1} failed: Full replacement only supports expected_count of 1 (entire content replacement)`,
+              suggestion: 'Use expected_count: 1 for full content replacement'
+            }
+          };
+        }
+      } else if (updateType === 'part') {
+        // Partial content replacement using old_content
+        const { old_content } = instruction;
+        console.log(`AgentMode: Part replacement ${i + 1}: old_content length: ${old_content.length}, new_content length: ${new_content.length}, expected_count: ${expected_count}`);
+        
+        // Perform the replacement using the existing logic
+        const replacementResult = this.performDirectReplacement(
+          updatedContent,
+          old_content,
+          new_content,
+          true // exact_match = true for partial replacements
+        );
+        
+        if (replacementResult === null) {
+          return {
+            success: false,
+            error: {
+              message: `Replacement ${i + 1} failed: The old_content was not found in the content. No changes were made.`,
+              suggestion: 'Check that the old_content exactly matches the content. Use get_book_content or read_file_content to retrieve the exact current content.'
+            }
+          };
+        }
+        
+        // Check if the actual change count matches expected count
+        if (replacementResult.changeCount !== expected_count) {
+          return {
+            success: false,
+            error: {
+              message: `Replacement ${i + 1} failed: Expected ${expected_count} occurrences of old_content, but found ${replacementResult.changeCount}. No changes were made.`,
+              suggestion: 'Check the expected_count matches the actual number of occurrences in the content'
+            }
+          };
+        }
+        
+        updatedContent = replacementResult.content;
+        replacementResults.push({
+          index: i + 1,
+          old_content: old_content,
+          new_content: new_content,
+          expected_count: expected_count,
+          actual_count: replacementResult.changeCount,
+          success: true
+        });
+      }
+    }
+    
+    return {
+      success: true,
+      updatedContent,
+      replacementResults
+    };
   }
 
   // Perform direct replacement of old content with new content
@@ -8037,10 +8268,12 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       const content = await bookContentDb.getContent(bookId, userId, sectionId, chapterId);
       
       if (!content) {
+        const emptyContentHash = createHash('sha256').update('').digest('hex');
         return {
           success: true,
           message: chapterId ? 'Chapter content not found' : 'Section content not found',
           content: '',
+          content_hash: emptyContentHash,
           content_type: chapterId ? 'chapter' : 'section',
           section_id: sectionId,
           chapter_id: chapterId || null,
@@ -8048,10 +8281,14 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         };
       }
 
+      // Compute content hash for full replacement verification
+      const contentHash = createHash('sha256').update(content.content).digest('hex');
+
       return {
         success: true,
         message: chapterId ? 'Chapter content retrieved successfully' : 'Section content retrieved successfully',
         content: content.content,
+        content_hash: contentHash,
         content_type: chapterId ? 'chapter' : 'section',
         section_id: sectionId,
         chapter_id: chapterId || null,
@@ -8064,6 +8301,170 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         success: false,
         message: 'Failed to get book content',
         error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async updateBookContent(
+    bookId: string,
+    sectionId: string,
+    chapterId: string | undefined,
+    updateType: string,
+    replacementInstructions: any[],
+    userId: string
+  ): Promise<any> {
+    try {
+      // Validate update_type
+      if (!updateType || !['part', 'full'].includes(updateType)) {
+        return {
+          success: false,
+          message: 'update_type must be either "part" or "full"'
+        };
+      }
+      
+      // Validate that replacementInstructions is an array
+      if (!Array.isArray(replacementInstructions)) {
+        return {
+          success: false,
+          message: 'replacement_json must be an array of replacement instructions'
+        };
+      }
+      
+      if (replacementInstructions.length === 0) {
+        return {
+          success: false,
+          message: 'At least one replacement instruction is required'
+        };
+      }
+      
+      // Validate each replacement instruction based on update_type
+      for (let i = 0; i < replacementInstructions.length; i++) {
+        const instruction = replacementInstructions[i];
+        
+        if (instruction.new_content === undefined || instruction.expected_count === undefined) {
+          return {
+            success: false,
+            message: `Missing required fields in replacement instruction ${i + 1}: new_content and expected_count are required`
+          };
+        }
+        
+        if (updateType === 'full') {
+          // For full replacement, require old_content_hash
+          if (!instruction.old_content_hash) {
+            return {
+              success: false,
+              message: `Replacement instruction ${i + 1} missing old_content_hash. For update_type="full", old_content_hash is required`
+            };
+          }
+          if (instruction.old_content !== undefined) {
+            return {
+              success: false,
+              message: `Replacement instruction ${i + 1} should not have old_content when update_type="full". Use old_content_hash instead`
+            };
+          }
+        } else if (updateType === 'part') {
+          // For part replacement, require old_content
+          if (!instruction.old_content) {
+            return {
+              success: false,
+              message: `Replacement instruction ${i + 1} missing old_content. For update_type="part", old_content is required`
+            };
+          }
+          if (instruction.old_content_hash !== undefined) {
+            return {
+              success: false,
+              message: `Replacement instruction ${i + 1} should not have old_content_hash when update_type="part". Use old_content instead`
+            };
+          }
+        }
+      }
+
+      // Get current content
+      const { bookDb } = await import('./bookDb');
+      const { bookContentDb } = await import('./bookContentDb');
+      
+      // Verify book exists and belongs to user
+      const book = await bookDb.getBookById(bookId, userId);
+      if (!book) {
+        return {
+          success: false,
+          message: 'Book not found',
+          error: 'Book not found or access denied'
+        };
+      }
+
+      // Verify section exists
+      const section = book.sections?.find((s) => s.sectionId === sectionId);
+      if (!section) {
+        return {
+          success: false,
+          message: 'Section not found',
+          error: 'Section not found in this book'
+        };
+      }
+
+      // If chapterId provided, verify chapter exists
+      if (chapterId) {
+        const chapter = section.chapters.find((c) => c.chapterId === chapterId);
+        if (!chapter) {
+          return {
+            success: false,
+            message: 'Chapter not found',
+            error: 'Chapter not found in this section'
+          };
+        }
+      }
+
+      // Get current content
+      const currentContentRecord = await bookContentDb.getContent(bookId, userId, sectionId, chapterId);
+      const currentContent = currentContentRecord?.content || '';
+      
+      console.log(`AgentMode: Current content length: ${currentContent.length} characters`);
+      
+      // Compute hash of current content for verification
+      const currentContentHash = createHash('sha256').update(currentContent).digest('hex');
+      console.log(`AgentMode: Computed current content hash: ${currentContentHash}`);
+      
+      // Use common replacement function
+      const replacementResult = this.performContentReplacements(
+        currentContent,
+        currentContentHash,
+        updateType,
+        replacementInstructions
+      );
+      
+      if (!replacementResult.success) {
+        return {
+          success: false,
+          message: replacementResult.error?.message || 'Failed to perform replacements',
+          suggestion: replacementResult.error?.suggestion
+        };
+      }
+      
+      // Save the updated content
+      await bookContentDb.createOrUpdateContent(bookId, userId, {
+        sectionId: sectionId,
+        chapterId: chapterId,
+        content: replacementResult.updatedContent!
+      });
+      
+      return {
+        success: true,
+        message: `Content updated successfully with ${replacementResult.replacementResults!.length} replacement(s)`,
+        content_type: chapterId ? 'chapter' : 'section',
+        section_id: sectionId,
+        chapter_id: chapterId || null,
+        replacements: replacementResult.replacementResults,
+        updated_content_length: replacementResult.updatedContent!.length
+      };
+      
+    } catch (error) {
+      console.error('Error updating book content:', error);
+      return {
+        success: false,
+        message: 'Failed to update book content',
+        error: error instanceof Error ? error.message : 'Unknown error',
+        suggestion: 'For entire content replacement, use old_content_hash from get_book_content. For partial replacement, use old_content with the exact text to replace.'
       };
     }
   }
