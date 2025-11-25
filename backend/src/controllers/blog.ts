@@ -29,7 +29,7 @@ const s3 = new AWS.S3({
 });
 
 // Function to get BaseHub configuration from Secrets Manager
-async function getBaseHubConfig(): Promise<{
+export async function getBaseHubConfig(): Promise<{
   apiUrl: string;
   token: string;
   postsCollectionId: string;
@@ -62,7 +62,7 @@ async function getBaseHubConfig(): Promise<{
 }
 
 // Function to get Webflow configuration from Secrets Manager
-async function getWebflowConfig(): Promise<{
+export async function getWebflowConfig(): Promise<{
   apiToken: string;
   siteId: string;
   collectionId: string;
@@ -521,7 +521,6 @@ export function generateBlogHtml(
     </style>
 </head>
 <body>
-    <h1>${title}</h1>
     <div class="meta">Published on ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}</div>
     <img src="${imageUrl}" alt="${title}" class="hero-image">
     <div class="content">
@@ -917,12 +916,15 @@ async function publishToWebflow(
   };
 
   // Add custom fields based on field mappings (only include if field exists in collection)
+  // Webflow API may strip HTML tags if newlines are present, so remove them
+  const cleanHtmlContent = htmlContent.replace(/\n/g, '').replace(/\r/g, '');
+  
   if (fieldMappings?.summary) {
     cmsItemData.fieldData[fieldMappings.summary] = description;
   }
   
   if (fieldMappings?.body) {
-    cmsItemData.fieldData[fieldMappings.body] = htmlContent;
+    cmsItemData.fieldData[fieldMappings.body] = cleanHtmlContent;
   }
 
   // Only include publish date if the field mapping is configured
