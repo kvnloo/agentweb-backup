@@ -40,7 +40,8 @@ export class AgentModeService {
     sessionHistory: ChatMessage[],
     userId: string,
     sessionId: string,
-    mockMode: boolean = false
+    mockMode: boolean = false,
+    onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] }) => void
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[] }> {
     try {
       
@@ -80,6 +81,15 @@ export class AgentModeService {
       while (iteration < maxIterations) {
         iteration++;
         
+        // Send progress update: starting iteration
+        if (onProgress) {
+          onProgress({ 
+            iteration, 
+            status: 'thinking',
+            toolCalls: iteration === 1 ? [] : toolCalls.slice()
+          });
+        }
+        
         // Make LLM call
         const response = await this.openai.chat.completions.create({
           model: process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
@@ -88,10 +98,6 @@ export class AgentModeService {
           tool_choice: 'auto',
           max_completion_tokens: 12384
         });
-        
-        // Yield control back to event loop after LLM call to allow health checks and other requests
-        // This prevents blocking the main thread during long-running generateResponse operations
-        await new Promise(resolve => setImmediate(resolve));
         
         responseMessage = response.choices[0].message;
         const responseContent = responseMessage.content || '';
@@ -106,23 +112,35 @@ export class AgentModeService {
         
         // If no tool calls, break the loop
         if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
+          // Send progress update: final response ready
+          if (onProgress) {
+            onProgress({ 
+              iteration, 
+              status: 'complete',
+              toolCalls: toolCalls.slice()
+            });
+          }
           break;
         }
         
+        // Send progress update: executing tools
+        // Include the names of tools that are about to be executed
+        const pendingToolNames = responseMessage.tool_calls?.map((tc: any) => tc.function.name) || [];
+        if (onProgress) {
+          onProgress({ 
+            iteration, 
+            status: 'executing_tools',
+            toolCalls: toolCalls.slice(),
+            pendingTools: pendingToolNames
+          });
+        }
         
         // Execute tool calls
         for (const toolCall of responseMessage.tool_calls) {
           try {
             const functionArgs = JSON.parse(toolCall.function.arguments);
             
-            // Yield control before starting tool execution to allow health checks to be processed
-            await new Promise(resolve => setImmediate(resolve));
-            
             const result = await this.executeTool(toolCall.function.name, functionArgs, userId, sessionId, mockMode);
-            
-            // Yield control after tool execution to allow health checks during long-running tool operations
-            // This is critical for tools like generate_image which can take 30-60+ seconds
-            await new Promise(resolve => setImmediate(resolve));
             
             // Store only the necessary data for the frontend
             const minimalResult = this.extractMinimalToolResult(result, toolCall.function.name);
@@ -133,6 +151,15 @@ export class AgentModeService {
               arguments: functionArgs,
               result: minimalResult
             });
+
+            // Send progress update: tool executed
+            if (onProgress) {
+              onProgress({ 
+                iteration, 
+                status: 'tool_executed',
+                toolCalls: toolCalls.slice()
+              });
+            }
 
             // Update the calledFunctions counter immediately after successful tool call
             try {
@@ -171,15 +198,8 @@ export class AgentModeService {
               name: toolCall.function.name,
               content: errorContent
             });
-            
-            // Yield control after error handling as well
-            await new Promise(resolve => setImmediate(resolve));
           }
         }
-        
-        // Yield control before next iteration to allow health checks to be processed
-        // This ensures the event loop can handle other requests between LLM call iterations
-        await new Promise(resolve => setImmediate(resolve));
         
         // Do not append an assistant message; tool messages above are sufficient for model continuation
       }
@@ -5605,10 +5625,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
         };
       }
 
-      // Yield control before starting long-running image generation
-      // This allows health checks to be processed even during the image generation API call
-      await new Promise(resolve => setImmediate(resolve));
-      
       // Generate the image
       const result = await imageService.generateImage({
         prompt,
@@ -5619,9 +5635,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
         userId,
         imageModel
       });
-      
-      // Yield control after image generation completes
-      await new Promise(resolve => setImmediate(resolve));
 
       if (result.success && result.imageUrl) {
         // Save the image URL to the session for reference

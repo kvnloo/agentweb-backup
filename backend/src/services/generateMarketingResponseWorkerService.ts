@@ -28,7 +28,8 @@ export class GenerateMarketingResponseWorkerService {
    * This prevents blocking the main event loop, allowing health checks to continue working
    */
   async runInWorker(
-    params: GenerateMarketingResponseParams
+    params: GenerateMarketingResponseParams,
+    onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] }) => void
   ): Promise<GenerateMarketingResponseResult> {
     return new Promise((resolve, reject) => {
       // Get the worker script path
@@ -61,6 +62,15 @@ export class GenerateMarketingResponseWorkerService {
 
       // Handle messages from worker
       worker.on('message', (message: any) => {
+        if (message.type === 'progress') {
+          // Forward progress updates to the callback
+          if (onProgress) {
+            onProgress(message.progress);
+          }
+          // Don't clear timeout on progress messages
+          return;
+        }
+        
         clearTimeout(timeout);
         
         if (message.type === 'success') {

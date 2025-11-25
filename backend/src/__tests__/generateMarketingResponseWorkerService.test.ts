@@ -297,5 +297,73 @@ describe('GenerateMarketingResponseWorkerService', () => {
 
       await promise;
     });
+
+    it('should forward progress updates from worker to callback', async () => {
+      const progressCallback = jest.fn();
+      let messageHandler: ((message: any) => void) | undefined;
+      
+      mockWorker.on.mockImplementation((event: string, handler: any) => {
+        if (event === 'message') {
+          messageHandler = handler;
+        }
+      });
+
+      const promise = workerService.runInWorker(mockParams, progressCallback);
+
+      // Simulate worker sending progress updates
+      if (messageHandler) {
+        const progress1 = { iteration: 1, status: 'thinking', toolCalls: [] };
+        messageHandler({ type: 'progress', progress: progress1 });
+        
+        const progress2 = { iteration: 1, status: 'executing_tools', toolCalls: [], pendingTools: ['test_tool'] };
+        messageHandler({ type: 'progress', progress: progress2 });
+        
+        // Finally send success
+        messageHandler({
+          type: 'success',
+          result: mockResult
+        });
+      }
+
+      await promise;
+
+      // Verify progress callbacks were called
+      expect(progressCallback).toHaveBeenCalledWith({ iteration: 1, status: 'thinking', toolCalls: [] });
+      expect(progressCallback).toHaveBeenCalledWith({ iteration: 1, status: 'executing_tools', toolCalls: [], pendingTools: ['test_tool'] });
+      expect(progressCallback).toHaveBeenCalledTimes(2);
+    });
+
+    it('should not clear timeout on progress messages', async () => {
+      jest.useFakeTimers();
+      const progressCallback = jest.fn();
+      let messageHandler: ((message: any) => void) | undefined;
+      
+      mockWorker.on.mockImplementation((event: string, handler: any) => {
+        if (event === 'message') {
+          messageHandler = handler;
+        }
+      });
+
+      const promise = workerService.runInWorker(mockParams, progressCallback);
+
+      // Send progress messages
+      if (messageHandler) {
+        messageHandler({ type: 'progress', progress: { iteration: 1, status: 'thinking' } });
+        messageHandler({ type: 'progress', progress: { iteration: 1, status: 'executing_tools' } });
+      }
+
+      // Fast-forward time - timeout should not trigger because progress messages don't clear it
+      jest.advanceTimersByTime(1000);
+
+      // Send success to complete
+      if (messageHandler) {
+        messageHandler({ type: 'success', result: mockResult });
+      }
+
+      await promise;
+
+      expect(progressCallback).toHaveBeenCalled();
+      jest.useRealTimers();
+    });
   });
 });

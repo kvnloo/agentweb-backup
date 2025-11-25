@@ -458,10 +458,6 @@ export class ImageService {
         let chunkCount = 0;
         for await (const chunk of stream) {
           chunkCount++;
-          // Yield control every 10 chunks to allow health checks and other requests to be processed
-          if (chunkCount % 10 === 0) {
-            await new Promise(resolve => setImmediate(resolve));
-          }
           
           if (chunk.candidates && chunk.candidates.length > 0) {
             const candidate = chunk.candidates[0];
@@ -549,10 +545,6 @@ export class ImageService {
         let chunkCount = 0;
         for await (const chunk of stream) {
           chunkCount++;
-          // Yield control every 10 chunks to allow health checks and other requests to be processed
-          if (chunkCount % 10 === 0) {
-            await new Promise(resolve => setImmediate(resolve));
-          }
           
           if (chunk.candidates && chunk.candidates.length > 0) {
             const candidate = chunk.candidates[0];
@@ -643,10 +635,6 @@ export class ImageService {
         let chunkCount = 0;
         for await (const chunk of stream) {
           chunkCount++;
-          // Yield control every 10 chunks to allow health checks and other requests to be processed
-          if (chunkCount % 10 === 0) {
-            await new Promise(resolve => setImmediate(resolve));
-          }
           
           if (chunk.candidates && chunk.candidates.length > 0) {
             const candidate = chunk.candidates[0];
@@ -856,10 +844,6 @@ export class ImageService {
       
       for await (const chunk of response) {
         chunkCount++;
-        // Yield control every 10 chunks to allow health checks and other requests to be processed
-        if (chunkCount % 10 === 0) {
-          await new Promise(resolve => setImmediate(resolve));
-        }
         
         if (!chunk.candidates || !chunk.candidates[0]?.content?.parts) {
           continue;

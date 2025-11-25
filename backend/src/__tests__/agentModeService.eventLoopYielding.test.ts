@@ -1,8 +1,8 @@
 /**
- * Tests for event loop yielding in generateMarketingResponse
+ * Tests for generateMarketingResponse
  * 
- * These tests verify that generateMarketingResponse yields control back to the event loop
- * during long-running operations, allowing health checks and other requests to be processed.
+ * Note: Event loop yielding has been removed as long-running operations
+ * are now handled by generateMarketingResponseWorker.
  */
 
 import { AgentModeService } from '../services/agentModeService';
@@ -43,7 +43,7 @@ jest.mock('aws-sdk', () => ({
   }
 }));
 
-describe('AgentModeService - Event Loop Yielding', () => {
+describe('AgentModeService - generateMarketingResponse', () => {
   let agentModeService: AgentModeService;
   let mockOpenAI: any;
 
@@ -71,18 +71,8 @@ describe('AgentModeService - Event Loop Yielding', () => {
     mockOpenAI = (agentModeService as any).openai;
   });
 
-  describe('generateMarketingResponse event loop yielding', () => {
-    it('should yield control to event loop after each LLM call', async () => {
-      // Track when setImmediate is called
-      const setImmediateCalls: number[] = [];
-      const originalSetImmediate = global.setImmediate;
-      
-      // Mock setImmediate to track calls
-      global.setImmediate = jest.fn((callback: () => void) => {
-        setImmediateCalls.push(Date.now());
-        return originalSetImmediate(callback);
-      }) as unknown as typeof setImmediate;
-
+  describe('generateMarketingResponse', () => {
+    it('should process LLM calls and tool calls correctly', async () => {
       // Mock OpenAI to simulate multiple LLM calls with tool calls
       let callCount = 0;
       mockOpenAI.chat.completions.create = jest.fn().mockImplementation(async () => {
@@ -123,42 +113,23 @@ describe('AgentModeService - Event Loop Yielding', () => {
       (agentModeService as any).executeTool = jest.fn().mockResolvedValue({
         formattedContent: 'Tool result'
       });
-
-      const startTime = Date.now();
       
       // Call generateMarketingResponse
-      await agentModeService.generateMarketingResponse(
+      const result = await agentModeService.generateMarketingResponse(
         'Test message',
         [],
         'test-user',
         'test-session'
       );
 
-      const endTime = Date.now();
-      const executionTime = endTime - startTime;
-
-      // Verify setImmediate was called (at least once per LLM call)
-      expect(setImmediateCalls.length).toBeGreaterThan(0);
-      
-      // Verify setImmediate was called after the first LLM call
-      // (The first call should have triggered a setImmediate)
-      expect(setImmediateCalls.length).toBeGreaterThanOrEqual(1);
-
-      // Restore original setImmediate
-      global.setImmediate = originalSetImmediate;
+      // Verify the response is correct
+      expect(result.content).toBe('Final response');
+      expect((agentModeService as any).executeTool).toHaveBeenCalled();
     });
 
-    it('should allow other operations to be processed during long-running generateResponse', async () => {
-      // Track if a concurrent operation can run
-      let concurrentOperationExecuted = false;
-      const concurrentOperation = () => {
-        concurrentOperationExecuted = true;
-      };
-
+    it('should handle long-running LLM calls', async () => {
       // Mock OpenAI to simulate a long-running LLM call
-      let llmCallStarted = false;
       mockOpenAI.chat.completions.create = jest.fn().mockImplementation(async () => {
-        llmCallStarted = true;
         // Simulate a longer delay
         await new Promise(resolve => setTimeout(resolve, 50));
         
@@ -172,38 +143,19 @@ describe('AgentModeService - Event Loop Yielding', () => {
         };
       });
 
-      // Start generateMarketingResponse
-      const responsePromise = agentModeService.generateMarketingResponse(
+      // Call generateMarketingResponse
+      const result = await agentModeService.generateMarketingResponse(
         'Test message',
         [],
         'test-user',
         'test-session'
       );
 
-      // Wait a bit, then schedule a concurrent operation
-      await new Promise(resolve => setTimeout(resolve, 10));
-      
-      // Schedule concurrent operation using setImmediate
-      setImmediate(concurrentOperation);
-
-      // Wait for the response
-      await responsePromise;
-
-      // Verify the concurrent operation was executed
-      // This proves that the event loop was able to process other operations
-      expect(concurrentOperationExecuted).toBe(true);
+      // Verify the response is correct
+      expect(result.content).toBe('Response');
     });
 
-    it('should yield control between loop iterations when multiple tool calls are made', async () => {
-      const setImmediateCallTimes: number[] = [];
-      const originalSetImmediate = global.setImmediate;
-      
-      // Track setImmediate calls
-      global.setImmediate = jest.fn((callback: () => void) => {
-        setImmediateCallTimes.push(Date.now());
-        return originalSetImmediate(callback);
-      }) as unknown as typeof setImmediate;
-
+    it('should handle multiple loop iterations with tool calls', async () => {
       // Mock OpenAI to return multiple iterations with tool calls
       let iteration = 0;
       mockOpenAI.chat.completions.create = jest.fn().mockImplementation(async () => {
@@ -244,22 +196,19 @@ describe('AgentModeService - Event Loop Yielding', () => {
         formattedContent: 'Tool result'
       });
 
-      await agentModeService.generateMarketingResponse(
+      const result = await agentModeService.generateMarketingResponse(
         'Test message',
         [],
         'test-user',
         'test-session'
       );
 
-      // Verify setImmediate was called multiple times (at least once per iteration)
-      // We expect at least 2 calls: one after first LLM call, one before second iteration
-      expect(setImmediateCallTimes.length).toBeGreaterThanOrEqual(2);
-
-      // Restore original setImmediate
-      global.setImmediate = originalSetImmediate;
+      // Verify the response is correct
+      expect(result.content).toBe('Final response');
+      expect((agentModeService as any).executeTool).toHaveBeenCalledTimes(2);
     });
 
-    it('should still return correct response despite event loop yielding', async () => {
+    it('should return correct response', async () => {
       // Mock OpenAI to return a simple response
       mockOpenAI.chat.completions.create = jest.fn().mockResolvedValue({
         choices: [{
@@ -284,7 +233,7 @@ describe('AgentModeService - Event Loop Yielding', () => {
       expect(result.sources).toEqual([]);
     });
 
-    it('should handle tool calls correctly with event loop yielding', async () => {
+    it('should handle tool calls correctly', async () => {
       // Mock OpenAI to return tool calls
       mockOpenAI.chat.completions.create = jest.fn()
         .mockResolvedValueOnce({
@@ -338,17 +287,8 @@ describe('AgentModeService - Event Loop Yielding', () => {
     });
   });
 
-  describe('Tool execution event loop yielding', () => {
-    it('should yield control before tool execution starts', async () => {
-      const setImmediateCalls: number[] = [];
-      const originalSetImmediate = global.setImmediate;
-      
-      // Mock setImmediate to track calls
-      global.setImmediate = jest.fn((callback: () => void) => {
-        setImmediateCalls.push(Date.now());
-        return originalSetImmediate(callback);
-      }) as unknown as typeof setImmediate;
-
+  describe('Tool execution', () => {
+    it('should execute tools correctly', async () => {
       // Mock OpenAI to return tool calls
       mockOpenAI.chat.completions.create = jest.fn()
         .mockResolvedValueOnce({
@@ -375,97 +315,24 @@ describe('AgentModeService - Event Loop Yielding', () => {
         });
 
       // Mock executeTool with a delay to simulate long-running operation
-      let toolExecutionStarted = false;
       (agentModeService as any).executeTool = jest.fn().mockImplementation(async () => {
-        toolExecutionStarted = true;
         await new Promise(resolve => setTimeout(resolve, 10));
         return { formattedContent: 'Tool result' };
       });
 
-      await agentModeService.generateMarketingResponse(
+      const result = await agentModeService.generateMarketingResponse(
         'Test message',
         [],
         'test-user',
         'test-session'
       );
-
-      // Verify setImmediate was called before tool execution
-      // We expect at least 2 calls: one after LLM call, one before tool execution
-      expect(setImmediateCalls.length).toBeGreaterThanOrEqual(2);
       
       // Verify tool was executed
       expect((agentModeService as any).executeTool).toHaveBeenCalled();
-
-      // Restore original setImmediate
-      global.setImmediate = originalSetImmediate;
+      expect(result.content).toBe('Final response');
     });
 
-    it('should yield control after tool execution completes', async () => {
-      const setImmediateCalls: number[] = [];
-      const originalSetImmediate = global.setImmediate;
-      
-      // Mock setImmediate to track calls
-      global.setImmediate = jest.fn((callback: () => void) => {
-        setImmediateCalls.push(Date.now());
-        return originalSetImmediate(callback);
-      }) as unknown as typeof setImmediate;
-
-      // Mock OpenAI to return tool calls
-      mockOpenAI.chat.completions.create = jest.fn()
-        .mockResolvedValueOnce({
-          choices: [{
-            message: {
-              content: null,
-              tool_calls: [{
-                id: 'call_1',
-                function: {
-                  name: 'search_knowledge_base',
-                  arguments: JSON.stringify({ query: 'test query' })
-                }
-              }]
-            }
-          }]
-        })
-        .mockResolvedValueOnce({
-          choices: [{
-            message: {
-              content: 'Final response',
-              tool_calls: null
-            }
-          }]
-        });
-
-      // Mock executeTool with a delay
-      (agentModeService as any).executeTool = jest.fn().mockImplementation(async () => {
-        await new Promise(resolve => setTimeout(resolve, 10));
-        return { formattedContent: 'Tool result' };
-      });
-
-      await agentModeService.generateMarketingResponse(
-        'Test message',
-        [],
-        'test-user',
-        'test-session'
-      );
-
-      // Verify setImmediate was called after tool execution
-      // We expect calls: after LLM call, before tool, after tool, before next iteration
-      expect(setImmediateCalls.length).toBeGreaterThanOrEqual(3);
-
-      // Restore original setImmediate
-      global.setImmediate = originalSetImmediate;
-    });
-
-    it('should yield control even when tool execution fails', async () => {
-      const setImmediateCalls: number[] = [];
-      const originalSetImmediate = global.setImmediate;
-      
-      // Mock setImmediate to track calls
-      global.setImmediate = jest.fn((callback: () => void) => {
-        setImmediateCalls.push(Date.now());
-        return originalSetImmediate(callback);
-      }) as unknown as typeof setImmediate;
-
+    it('should handle tool execution errors', async () => {
       // Mock OpenAI to return tool calls
       mockOpenAI.chat.completions.create = jest.fn()
         .mockResolvedValueOnce({
@@ -496,33 +363,20 @@ describe('AgentModeService - Event Loop Yielding', () => {
         new Error('Tool execution failed')
       );
 
-      await agentModeService.generateMarketingResponse(
+      const result = await agentModeService.generateMarketingResponse(
         'Test message',
         [],
         'test-user',
         'test-session'
       );
 
-      // Verify setImmediate was called even after error handling
-      // We expect calls: after LLM call, before tool, after error handling
-      expect(setImmediateCalls.length).toBeGreaterThanOrEqual(3);
-
-      // Restore original setImmediate
-      global.setImmediate = originalSetImmediate;
+      // Verify error was handled and response still returned
+      expect(result.content).toBe('Final response after error');
     });
   });
 
-  describe('Multiple tool calls event loop yielding', () => {
-    it('should yield control between multiple tool executions', async () => {
-      const setImmediateCalls: number[] = [];
-      const originalSetImmediate = global.setImmediate;
-      
-      // Mock setImmediate to track calls
-      global.setImmediate = jest.fn((callback: () => void) => {
-        setImmediateCalls.push(Date.now());
-        return originalSetImmediate(callback);
-      }) as unknown as typeof setImmediate;
-
+  describe('Multiple tool calls', () => {
+    it('should handle multiple tool executions', async () => {
       // Mock OpenAI to return multiple tool calls
       mockOpenAI.chat.completions.create = jest.fn()
         .mockResolvedValueOnce({
@@ -565,22 +419,16 @@ describe('AgentModeService - Event Loop Yielding', () => {
         return { formattedContent: `Tool result ${toolCallCount}` };
       });
 
-      await agentModeService.generateMarketingResponse(
+      const result = await agentModeService.generateMarketingResponse(
         'Test message',
         [],
         'test-user',
         'test-session'
       );
-
-      // Verify setImmediate was called multiple times
-      // We expect: after LLM call, before tool 1, after tool 1, before tool 2, after tool 2, before next iteration
-      expect(setImmediateCalls.length).toBeGreaterThanOrEqual(5);
       
       // Verify both tools were executed
       expect((agentModeService as any).executeTool).toHaveBeenCalledTimes(2);
-
-      // Restore original setImmediate
-      global.setImmediate = originalSetImmediate;
+      expect(result.content).toBe('Final response');
     });
   });
 });

@@ -9,10 +9,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2025-11-25',
     changes: [
+      'Added Streaming Support in Agent Mode',
+      '- Progress messages display current status: "Thinking...", "Executing: tool1, tool2...", and "Finalizing response..."',
+      '- Shows which tools are being executed in real-time for better transparency',
       'Increased File Upload Size Limit',
       '- File attachment size limit increased from 5MB to 10MB per file',
       'Optimized Blog Article Hero Images',
       '- Blog article hero images now default to low quality for better social media sharing',
+      'Improved Console Logging in Customer Portal',
+      '- Console logs (log, info, debug) are now suppressed in production when debug mode is disabled',
+      '- Error and warning messages remain visible for production error tracking',
+      '- Debug mode can be enabled via VITE_DEBUG environment variable for development',
     ],
   },
   {
