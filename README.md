@@ -639,6 +639,125 @@ Store your Google Search Console API credentials in AWS Secrets Manager:
 - Secret Name: `prod/AgentWeb/Google/SearchConsole`
 - Secret Value: Paste the entire contents of the service account JSON key file you downloaded
 
+### CMS Configuration (BaseHub and Webflow)
+
+The blog publishing feature supports publishing to both BaseHub and Webflow CMS. Users can be configured with a CMS Type in the admin dashboard, and the system will automatically route blog posts to the appropriate CMS.
+
+#### BaseHub CMS Configuration
+
+BaseHub configuration is stored in AWS Secrets Manager:
+
+**For Development:**
+- Secret Name: `dev/AgentWeb/BaseHub`
+- Secret Value (JSON format):
+```json
+{
+  "apiUrl": "https://api.basehub.com/graphql",
+  "token": "your_basehub_token_here",
+  "postsCollectionId": "your_posts_collection_id",
+  "imageComponentId": "your_image_component_id"
+}
+```
+
+**For Production:**
+- Secret Name: `prod/AgentWeb/BaseHub`
+- Secret Value (JSON format):
+```json
+{
+  "apiUrl": "https://api.basehub.com/graphql",
+  "token": "your_basehub_token_here",
+  "postsCollectionId": "your_posts_collection_id",
+  "imageComponentId": "your_image_component_id"
+}
+```
+
+**Steps to add BaseHub secret:**
+1. Go to AWS Secrets Manager in your AWS Console
+2. Click "Store a new secret"
+3. Choose "Other type of secret"
+4. Add the JSON with your BaseHub credentials
+5. Name the secret according to your environment (`dev/AgentWeb/BaseHub` or `prod/AgentWeb/BaseHub`)
+6. Click "Store"
+
+#### Webflow CMS Configuration
+
+Webflow configuration is stored in AWS Secrets Manager:
+
+**For Development:**
+- Secret Name: `dev/AgentWeb/Webflow`
+- Secret Value (JSON format):
+```json
+{
+  "apiToken": "your_webflow_api_token",
+  "siteId": "your_webflow_site_id",
+  "collectionId": "your_webflow_collection_id"
+}
+```
+
+**For Production:**
+- Secret Name: `prod/AgentWeb/Webflow`
+- Secret Value (JSON format):
+```json
+{
+  "apiToken": "your_webflow_api_token",
+  "siteId": "your_webflow_site_id",
+  "collectionId": "your_webflow_collection_id"
+}
+```
+
+**How to get Webflow credentials:**
+
+1. **Get Site API Token:**
+   - Go to your Webflow site dashboard
+   - Navigate to **Site Settings** > **Apps & integrations** tab
+   - Under **API access**, click **Generate API token**
+   - Provide a name for your token (e.g., "AgentWeb Blog Publishing")
+   - Assign the necessary permissions (read and write for CMS collections)
+   - Click **Generate token** and securely copy the token
+   - **Note:** This is a Site API Token (not Workspace API), which is ideal for single-site integrations like this one
+
+2. **Get Site ID:**
+   - Go to your Webflow site dashboard
+   - The Site ID is in the URL: `https://webflow.com/design/your-site-name?siteId=YOUR_SITE_ID`
+   - Or go to Site Settings > General > Site ID
+
+3. **Get Collection ID:**
+   - Go to your Webflow site dashboard
+   - Navigate to CMS Collections
+   - Click on your blog posts collection
+   - The Collection ID is in the URL: `https://webflow.com/design/your-site-name/collections/YOUR_COLLECTION_ID`
+   - Or go to Collection Settings > General > Collection ID
+
+**Steps to add Webflow secret:**
+1. Go to AWS Secrets Manager in your AWS Console
+2. Click "Store a new secret"
+3. Choose "Other type of secret"
+4. Add the JSON with your Webflow credentials
+5. Name the secret according to your environment (`dev/AgentWeb/Webflow` or `prod/AgentWeb/Webflow`)
+6. Click "Store"
+
+#### Configuring User CMS Type
+
+After setting up the CMS secrets, you need to configure which CMS each user should use:
+
+1. **Access Admin Dashboard:**
+   - Log in to the partner portal as an admin
+   - Navigate to the Admin Dashboard
+   - Go to the "Users" tab
+
+2. **Set CMS Type:**
+   - Find the user you want to configure
+   - In the "CMS Type" column, click the edit icon
+   - Select either "Basehub" or "Webflow" from the dropdown
+   - Click the checkmark to save
+
+3. **Publishing Behavior:**
+   - If CMS Type is set to "Basehub": Blog posts will be published to BaseHub CMS
+   - If CMS Type is set to "Webflow": Blog posts will be published to Webflow CMS
+   - If CMS Type is not set: Publishing will be disabled with an error message
+
+**Note:** Users must have a CMS Type configured to publish blog posts. If not configured, the "Publish" button will show an error when attempting to publish.
+
 ## Testing
 
 ### Running Backend Unit Tests

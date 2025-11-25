@@ -169,6 +169,7 @@ interface User {
   fromName?: string; // From name for emails
   slackChannel?: string; // Default Slack channel for this user
   seoDomains?: string[]; // SEO domains to track
+  cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
 }
 
 // Define an interface for the task data shown in the admin tasks tab
@@ -553,6 +554,9 @@ export default function AdminDashboard() {
   const [editingSeoDomainsUserId, setEditingSeoDomainsUserId] = useState<string | null>(null);
   const [seoDomainsText, setSeoDomainsText] = useState("");
   const [seoDomainsEditLoading, setSeoDomainsEditLoading] = useState(false);
+  const [editingCmsTypeUserId, setEditingCmsTypeUserId] = useState<string | null>(null);
+  const [currentCmsType, setCurrentCmsType] = useState<"Basehub" | "Webflow" | "">("");
+  const [cmsTypeEditLoading, setCmsTypeEditLoading] = useState(false);
   const [delegateAccessLoading, setDelegateAccessLoading] = useState<string | null>(null);
   const [emailToDelete, setEmailToDelete] = useState<string | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -1329,6 +1333,44 @@ export default function AdminDashboard() {
     }
   };
 
+  const handleSaveCmsType = async () => {
+    if (!editingCmsTypeUserId) return;
+    
+    try {
+      setCmsTypeEditLoading(true);
+      
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/users/${editingCmsTypeUserId}/cms-type`),
+        { cmsType: currentCmsType || null },
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+
+      if (response.status === 200) {
+        // Update the user in the local state without reloading
+        setUsers((prevUsers: User[]) => 
+          prevUsers.map((user: User) => 
+            user.userId === editingCmsTypeUserId 
+              ? { 
+                  ...user, 
+                  cmsType: response.data.cmsType
+                }
+              : user
+          )
+        );
+        setSuccess("CMS Type updated successfully!");
+        setEditingCmsTypeUserId(null);
+        setCurrentCmsType("");
+      }
+    } catch (error: any) {
+      console.error("Error updating CMS Type:", error);
+      setError(error.response?.data?.message || "Failed to update CMS Type");
+    } finally {
+      setCmsTypeEditLoading(false);
+    }
+  };
+
   const handleAccessCustomerPortal = async (userId: string) => {
     try {
       setDelegateAccessLoading(userId);
@@ -1798,6 +1840,7 @@ export default function AdminDashboard() {
                   <TableCell>Email Sender</TableCell>
                   <TableCell>Slack Channel</TableCell>
                   <TableCell>SEO Domains</TableCell>
+                  <TableCell>CMS Type</TableCell>
                   <TableCell>Created</TableCell>
                   <TableCell>Last Login</TableCell>
                   <TableCell>Support Note</TableCell>
@@ -1813,7 +1856,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={16} align="center">
+                    <TableCell colSpan={17} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -1956,6 +1999,59 @@ export default function AdminDashboard() {
                             >
                               <EditIcon />
                             </IconButton>
+                          </Box>
+                        </TableCell>
+                        <TableCell>
+                          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+                            {editingCmsTypeUserId === user.userId ? (
+                              <>
+                                <FormControl size="small" sx={{ minWidth: 120 }}>
+                                  <Select
+                                    value={currentCmsType}
+                                    onChange={(e) => setCurrentCmsType(e.target.value as "Basehub" | "Webflow" | "")}
+                                    disabled={cmsTypeEditLoading}
+                                  >
+                                    <MenuItem value="">None</MenuItem>
+                                    <MenuItem value="Basehub">Basehub</MenuItem>
+                                    <MenuItem value="Webflow">Webflow</MenuItem>
+                                  </Select>
+                                </FormControl>
+                                <IconButton
+                                  size="small"
+                                  onClick={handleSaveCmsType}
+                                  disabled={cmsTypeEditLoading}
+                                  color="primary"
+                                >
+                                  <CheckIcon />
+                                </IconButton>
+                                <IconButton
+                                  size="small"
+                                  onClick={() => {
+                                    setEditingCmsTypeUserId(null);
+                                    setCurrentCmsType("");
+                                  }}
+                                  disabled={cmsTypeEditLoading}
+                                >
+                                  <CloseIcon />
+                                </IconButton>
+                              </>
+                            ) : (
+                              <>
+                                <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
+                                  {user.cmsType || "-"}
+                                </Typography>
+                                <IconButton
+                                  size="small"
+                                  onClick={() => {
+                                    setEditingCmsTypeUserId(user.userId);
+                                    setCurrentCmsType(user.cmsType || "");
+                                  }}
+                                  disabled={cmsTypeEditLoading}
+                                >
+                                  <EditIcon />
+                                </IconButton>
+                              </>
+                            )}
                           </Box>
                         </TableCell>
                         <TableCell>

@@ -61,6 +61,49 @@ async function getBaseHubConfig(): Promise<{
   }
 }
 
+// Function to get Webflow configuration from Secrets Manager
+async function getWebflowConfig(): Promise<{
+  apiToken: string;
+  siteId: string;
+  collectionId: string;
+  fieldMappings?: {
+    summary?: string;
+    body?: string;
+    image?: string;
+    publishDate?: string;
+  };
+}> {
+  try {
+    const secretName = process.env.NODE_ENV === "development" 
+      ? "dev/AgentWeb/Webflow" 
+      : "prod/AgentWeb/Webflow";
+    
+    const { getSecret } = await import("../utils/secretsManager");
+    const configJson = await getSecret(secretName);
+    
+    const config = JSON.parse(configJson);
+    
+    if (!config.apiToken || !config.siteId || !config.collectionId) {
+      throw new Error("Webflow configuration missing required fields");
+    }
+    
+    return {
+      apiToken: config.apiToken,
+      siteId: config.siteId,
+      collectionId: config.collectionId,
+      fieldMappings: config.fieldMappings || {
+        summary: "post-summary",
+        body: "post-body",
+        image: "main-image",
+        publishDate: undefined, // Optional - only include if field exists in collection
+      }
+    };
+  } catch (error) {
+    console.error("Error fetching Webflow configuration from Secrets Manager:", error);
+    throw new Error("Failed to fetch Webflow configuration from Secrets Manager");
+  }
+}
+
 // Author IDs from your BaseHub setup
 const AUTHORS = {
   HARSH: "B7hR0AMxxh8HyBOLRKfiU",
@@ -843,6 +886,160 @@ export const generateImage = async (req: AuthRequest, res: Response) => {
   }
 };
 
+// Function to publish to Webflow CMS
+async function publishToWebflow(
+  title: string,
+  description: string,
+  content: string,
+  imageUrl: string | undefined,
+  userId: string
+): Promise<any> {
+  const { apiToken, siteId, collectionId, fieldMappings } = await getWebflowConfig();
+
+  // Convert markdown content to HTML
+  const processor = remark()
+    .use(remarkGfm)
+    .use(remarkBreaks)
+    .use(remarkHtml, { sanitize: false });
+  const htmlContent = processor.processSync(content).toString();
+
+  // Prepare the CMS item data
+  // Field names must match the actual field slugs in your Webflow collection
+  const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+  
+  const cmsItemData: any = {
+    fieldData: {
+      name: title,
+      slug: slug,
+      _archived: false,
+      _draft: false,
+    }
+  };
+
+  // Add custom fields based on field mappings (only include if field exists in collection)
+  if (fieldMappings?.summary) {
+    cmsItemData.fieldData[fieldMappings.summary] = description;
+  }
+  
+  if (fieldMappings?.body) {
+    cmsItemData.fieldData[fieldMappings.body] = htmlContent;
+  }
+
+  // Only include publish date if the field mapping is configured
+  if (fieldMappings?.publishDate) {
+    cmsItemData.fieldData[fieldMappings.publishDate] = new Date().toISOString();
+  }
+
+  // Add image if provided and field mapping is configured
+  if (imageUrl && fieldMappings?.image) {
+    cmsItemData.fieldData[fieldMappings.image] = imageUrl;
+  }
+
+  const headers = {
+    Authorization: `Bearer ${apiToken}`,
+    "Content-Type": "application/json",
+    "accept-version": "2.0.0"
+  };
+
+  console.log("🌐 Publishing to Webflow CMS...");
+  
+  try {
+    const response = await axios.post(
+      `https://api.webflow.com/v2/sites/${siteId}/collections/${collectionId}/items`,
+      cmsItemData,
+      { headers }
+    );
+
+    console.log("✅ Blog post published successfully to Webflow");
+    return response.data;
+  } catch (error: any) {
+    // Extract only relevant error information
+    const errorInfo: any = {
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+    };
+
+    if (error.response?.data) {
+      const errorData = error.response.data;
+      
+      // Extract error message - Webflow often has nested error structures
+      if (errorData.msg) {
+        errorInfo.message = errorData.msg;
+      } else if (errorData.message) {
+        errorInfo.message = errorData.message;
+      } else if (errorData.error) {
+        errorInfo.message = errorData.error;
+      } else if (typeof errorData === 'string') {
+        errorInfo.message = errorData;
+      }
+
+      // Extract detailed validation errors - Webflow may nest them
+      if (errorData.errors) {
+        errorInfo.fieldErrors = errorData.errors;
+        // If errors is an array, format it nicely
+        if (Array.isArray(errorData.errors)) {
+          errorInfo.message = errorData.errors.join(', ') || errorInfo.message;
+        } else if (typeof errorData.errors === 'object') {
+          // If errors is an object, extract all error messages
+          const errorMessages = Object.entries(errorData.errors)
+            .map(([key, value]) => {
+              if (Array.isArray(value)) {
+                return `${key}: ${value.join(', ')}`;
+              }
+              return `${key}: ${value}`;
+            })
+            .join('; ');
+          if (errorMessages) {
+            errorInfo.message = errorMessages;
+          }
+        }
+      }
+
+      // Extract nested error details (Webflow validation errors)
+      if (errorData.details && Array.isArray(errorData.details)) {
+        errorInfo.details = errorData.details;
+        // Format details into readable error messages
+        const detailMessages = errorData.details
+          .map((detail: any) => {
+            if (detail.param && detail.description) {
+              return `${detail.param}: ${detail.description}`;
+            }
+            return JSON.stringify(detail);
+          })
+          .join('; ');
+        if (detailMessages) {
+          errorInfo.message = `${errorInfo.message || 'Validation Error'}. ${detailMessages}`;
+        }
+      }
+
+      // Extract code if present
+      if (errorData.code) {
+        errorInfo.code = errorData.code;
+      }
+    } else {
+      errorInfo.message = error.message || 'Unknown error';
+    }
+
+    // Log concise error summary
+    if (errorInfo.details && errorInfo.details.length > 0) {
+      const errorDetails = errorInfo.details
+        .map((d: any) => `${d.param}: ${d.description}`)
+        .join(', ');
+      console.error(`❌ Webflow API error (${errorInfo.status}): ${errorDetails}`);
+    } else {
+      console.error(`❌ Webflow API error (${errorInfo.status}): ${errorInfo.message}`);
+    }
+    
+    // Create a more user-friendly error message
+    const errorMessage = errorInfo.message || `Webflow API error: ${errorInfo.status} ${errorInfo.statusText}`;
+    const webflowError = new Error(errorMessage);
+    (webflowError as any).status = errorInfo.status;
+    (webflowError as any).fieldErrors = errorInfo.fieldErrors;
+    (webflowError as any).details = errorInfo.details;
+    throw webflowError;
+  }
+}
+
 export const publishBlogPost = async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.user?.userId;
@@ -861,7 +1058,25 @@ export const publishBlogPost = async (req: AuthRequest, res: Response) => {
         .json({ message: "Title, description, and content are required" });
     }
 
-    console.log("🚀 Starting BaseHub publishing workflow...");
+    // Get user's CMS Type
+    const { userDb } = await import('../services/db');
+    const user = await userDb.getUserById(userId);
+    
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const cmsType = user.cmsType;
+
+    // Check if CMS Type is configured
+    if (!cmsType) {
+      return res.status(400).json({
+        success: false,
+        message: "CMS Type is not configured for this user. Please contact an administrator to set up CMS publishing.",
+      });
+    }
+
+    console.log(`🚀 Starting ${cmsType} publishing workflow...`);
     console.log("📰 Blog Title:", title);
     console.log("📝 Description length:", description.length, "characters");
     console.log("📄 Content length:", content.length, "characters");
@@ -871,120 +1086,139 @@ export const publishBlogPost = async (req: AuthRequest, res: Response) => {
     console.log("📊 HTML Report URL:", htmlReportUrl);
     console.log("---");
 
-    const { apiUrl, token, postsCollectionId, imageComponentId } = await getBaseHubConfig();
+    let response: any;
+    let publishedField: string;
 
-    if (!token) {
-      return res.status(500).json({
-        success: false,
-        message: "BaseHub token is not configured",
-      });
-    }
+    if (cmsType === "Webflow") {
+      // Publish to Webflow
+      response = await publishToWebflow(title, description, content, imageUrl, userId);
+      publishedField = "publishedToWebflow";
+    } else if (cmsType === "Basehub") {
+      // Publish to BaseHub (existing logic)
+      const { apiUrl, token, postsCollectionId, imageComponentId } = await getBaseHubConfig();
 
-    // Randomly select an author (you can modify this logic)
-    console.log("👤 Selecting author for this blog post...");
-    const authorIds = Object.values(AUTHORS);
-    const randomAuthorId =
-      authorIds[Math.floor(Math.random() * authorIds.length)];
-    console.log("✅ Author assigned:", randomAuthorId);
+      if (!token) {
+        return res.status(500).json({
+          success: false,
+          message: "BaseHub token is not configured",
+        });
+      }
 
-    // Create the transaction data structure
-    console.log("🏗️ Building BaseHub transaction structure...");
-    const transactionData = {
-      type: "create",
-      parentId: postsCollectionId,
-      data: {
-        title: title,
-        type: "instance",
-        value: {
-          description: {
-            type: "text",
-            value: description,
-          },
-          publishedAt: {
-            type: "date",
-            value: new Date().toISOString(),
-          },
-          body: {
-            type: "rich-text",
-            value: {
-              format: "markdown",
-              value: content,
+      // Randomly select an author (you can modify this logic)
+      console.log("👤 Selecting author for this blog post...");
+      const authorIds = Object.values(AUTHORS);
+      const randomAuthorId =
+        authorIds[Math.floor(Math.random() * authorIds.length)];
+      console.log("✅ Author assigned:", randomAuthorId);
+
+      // Create the transaction data structure
+      console.log("🏗️ Building BaseHub transaction structure...");
+      const transactionData = {
+        type: "create",
+        parentId: postsCollectionId,
+        data: {
+          title: title,
+          type: "instance",
+          value: {
+            description: {
+              type: "text",
+              value: description,
             },
-          },
-          authors: {
-            type: "reference",
-            value: [randomAuthorId],
-          },
-        },
-      },
-    };
-
-    // Add image if provided - using the correct BaseHub structure from working Python code
-    if (imageUrl && imageFilename) {
-      console.log("🖼️ Adding image data to transaction...");
-      console.log("🖼️ Image URL to add:", imageUrl);
-      console.log("🖼️ Image filename to add:", imageFilename);
-
-      // This is the correct structure based on the working Python code
-      (transactionData.data.value as any).image = {
-        type: "instance",
-        mainComponentId: imageComponentId, // This is the image component ID from BaseHub
-        value: {
-          light: {
-            type: "media",
-            value: {
-              url: imageUrl,
-              fileName: imageFilename,
+            publishedAt: {
+              type: "date",
+              value: new Date().toISOString(),
+            },
+            body: {
+              type: "rich-text",
+              value: {
+                format: "markdown",
+                value: content,
+              },
+            },
+            authors: {
+              type: "reference",
+              value: [randomAuthorId],
             },
           },
         },
       };
-      console.log("✅ Image data integrated into transaction");
-      console.log(
-        "🖼️ Final image data structure:",
-        (transactionData.data.value as any).image
+
+      // Add image if provided - using the correct BaseHub structure from working Python code
+      if (imageUrl && imageFilename) {
+        console.log("🖼️ Adding image data to transaction...");
+        console.log("🖼️ Image URL to add:", imageUrl);
+        console.log("🖼️ Image filename to add:", imageFilename);
+
+        // This is the correct structure based on the working Python code
+        (transactionData.data.value as any).image = {
+          type: "instance",
+          mainComponentId: imageComponentId, // This is the image component ID from BaseHub
+          value: {
+            light: {
+              type: "media",
+              value: {
+                url: imageUrl,
+                fileName: imageFilename,
+              },
+            },
+          },
+        };
+        console.log("✅ Image data integrated into transaction");
+        console.log(
+          "🖼️ Final image data structure:",
+          (transactionData.data.value as any).image
+        );
+      } else {
+        console.log(
+          "⚠️ No image data provided - imageUrl:",
+          imageUrl,
+          "imageFilename:",
+          imageFilename
+        );
+      }
+
+      const mutation = `
+        mutation CreateBlogPost($data: String!) {
+          transaction(data: $data)
+        }
+      `;
+
+      const variables = { data: JSON.stringify(transactionData) };
+
+      // Debug: Log summary of what we're sending to BaseHub
+      console.log("📤 Sending to BaseHub - Title:", title, "Content length:", content.length);
+
+      const headers = {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      };
+
+      console.log("🌐 Initiating BaseHub API request...");
+      const basehubResponse = await axios.post(
+        apiUrl,
+        { query: mutation, variables },
+        { headers }
       );
+
+      // Log BaseHub response summary
+      const responseData = basehubResponse.data as any;
+      if (responseData?.errors) {
+        console.error("📥 BaseHub Response Errors:", JSON.stringify(responseData.errors, null, 2));
+      } else {
+        console.log("📥 BaseHub Response: Success");
+      }
+
+      console.log("✅ Blog post published successfully to BaseHub");
+      response = basehubResponse.data;
+      publishedField = "publishedToBasehub";
     } else {
-      console.log(
-        "⚠️ No image data provided - imageUrl:",
-        imageUrl,
-        "imageFilename:",
-        imageFilename
-      );
+      return res.status(400).json({
+        success: false,
+        message: `Unsupported CMS Type: ${cmsType}. Supported types are 'Basehub' and 'Webflow'.`,
+      });
     }
 
-    const mutation = `
-      mutation CreateBlogPost($data: String!) {
-        transaction(data: $data)
-      }
-    `;
-
-    const variables = { data: JSON.stringify(transactionData) };
-
-    // Debug: Log what we're sending to BaseHub
-    console.log(
-      "📤 Sending to BaseHub:",
-      JSON.stringify(transactionData, null, 2)
-    );
-
-    const headers = {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    };
-
-    console.log("🌐 Initiating BaseHub API request...");
-    const response = await axios.post(
-      apiUrl,
-      { query: mutation, variables },
-      { headers }
-    );
-
-    // Debug: Log BaseHub response
-    console.log("📥 BaseHub Response:", JSON.stringify(response.data, null, 2));
-
-    console.log("✅ Blog post published successfully to BaseHub");
-
-    // Update the existing execution record with publishedToBasehub timestamp
+    // Update the existing execution record with published timestamp
     if (executionId && htmlReportUrl) {
       try {
         const { taskDb } = await import('../services/db');
@@ -993,16 +1227,16 @@ export const publishBlogPost = async (req: AuthRequest, res: Response) => {
         const existingExecution = await taskDb.getTaskExecutionById(executionId);
         
         if (existingExecution && existingExecution.userId === userId) {
-          console.log("✅ Found existing execution, updating with publishedToBasehub timestamp");
+          console.log(`✅ Found existing execution, updating with ${publishedField} timestamp`);
           
-          // Find the HTML report file in result_files by URL and add publishedToBasehub timestamp
+          // Find the HTML report file in result_files by URL and add published timestamp
           const currentResultFiles = existingExecution.result_files || [];
           const updatedResultFiles = currentResultFiles.map((file: any) => {
             if (file.url === htmlReportUrl) {
-              // Add publishedToBasehub timestamp to this file
+              // Add published timestamp to this file
               return {
                 ...file,
-                publishedToBasehub: new Date().toISOString()
+                [publishedField]: new Date().toISOString()
               };
             }
             return file;
@@ -1013,29 +1247,63 @@ export const publishBlogPost = async (req: AuthRequest, res: Response) => {
             result_files: updatedResultFiles
           });
           
-          console.log("✅ publishedToBasehub timestamp added to existing execution record");
+          console.log(`✅ ${publishedField} timestamp added to existing execution record`);
         } else {
           console.log("⚠️ Execution not found or access denied, cannot update record");
         }
       } catch (dbError) {
-        console.error("⚠️ Failed to update execution record with publishedToBasehub timestamp:", dbError);
+        console.error(`⚠️ Failed to update execution record with ${publishedField} timestamp:`, dbError);
         // Don't fail the request if database update fails
       }
     }
 
     return res.status(200).json({
       success: true,
-      message: "Blog post published successfully",
+      message: `Blog post published successfully to ${cmsType}`,
       data: {
-        basehubResponse: response.data,
+        cmsResponse: response,
       },
     });
   } catch (error: any) {
     console.error("Error publishing blog post:", error);
-    return res.status(500).json({
+    
+    // Extract meaningful error information
+    let errorMessage = "Error publishing blog post";
+    let statusCode = 500;
+    
+    if (error.message) {
+      errorMessage = error.message;
+    }
+    
+    // Handle Webflow field validation errors
+    if (error.details && Array.isArray(error.details)) {
+      const fieldErrors = error.details
+        .map((detail: any) => {
+          if (detail.param && detail.description) {
+            return `${detail.param}: ${detail.description}`;
+          }
+          return JSON.stringify(detail);
+        })
+        .join('; ');
+      errorMessage = `Webflow validation error: ${fieldErrors}`;
+      statusCode = 400;
+    } else if (error.fieldErrors) {
+      const fieldErrors = Object.entries(error.fieldErrors)
+        .map(([field, msg]) => `${field}: ${msg}`)
+        .join(', ');
+      errorMessage = `Webflow validation error: ${fieldErrors}`;
+      statusCode = 400;
+    }
+    
+    // Handle HTTP status codes from CMS APIs
+    if (error.status) {
+      statusCode = error.status >= 400 && error.status < 600 ? error.status : 500;
+    }
+    
+    return res.status(statusCode).json({
       success: false,
-      message: "Error publishing blog post",
-      error: error.message,
+      message: errorMessage,
+      error: error.message || "Unknown error occurred",
     });
   }
 };
