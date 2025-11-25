@@ -39,6 +39,12 @@ router.post('/share/:shareId/generate', asyncHandler(agentModeController.generat
 // Generate response for interactive shared conversation (with conversable token)
 router.post('/ishare/:shareId/generate', asyncHandler(agentModeController.generateSharedResponse));
 
+// GET /api/agent-mode/ishare/:shareId/progress
+// SSE endpoint for progress updates (public, with conversable token)
+router.get('/ishare/:shareId/progress', asyncHandler(agentModeController.getProgressPublic));
+
+// Note: Plan links also use ishare endpoint with conversable token, so they're covered by the above route
+
 // GET /api/agent-mode/public/welcome-message
 // Get current welcome message (public)
 router.get('/public/welcome-message', asyncHandler(agentModeController.getWelcomeMessage));
@@ -85,6 +91,10 @@ router.get('/session/:sessionId', asyncHandler(agentModeController.getSession));
 // GET /api/agent-mode/function-calls
 // Get available function calls for benchmark tests
 router.get('/function-calls', asyncHandler(agentModeController.getAvailableFunctionCalls));
+
+// GET /api/agent-mode/session/:sessionId/progress
+// SSE endpoint for progress updates
+router.get('/session/:sessionId/progress', authenticateToken, asyncHandlerAuth(agentModeController.getProgress));
 
 // POST /api/agent-mode/generate
 // Generate AI response for marketing conversation

@@ -11,6 +11,7 @@ import { emailService } from '../services/emailService';
 import { settingsService } from '../services/settingsService';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
+import { emitProgress, registerProgressCallback, getLatestProgress, progressStore } from '../utils/sseProgress';
 // Common function: ensure a campaign execution exists and contains all HTML report URLs
 async function syncEmailCampaignExecution(
   userId: string,
@@ -542,6 +543,74 @@ async function runScheduledChat(
   }
 }
 
+// Helper function to set up SSE connection
+function setupSSEConnectionForSession(sessionId: string, res: Response, req: Request) {
+  try {
+    // Set up SSE headers
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+
+    // Send initial connection message
+    res.write(': connected\n\n');
+
+    // Send latest progress if available
+    const latestProgress = getLatestProgress(sessionId);
+    if (latestProgress) {
+      res.write(`data: ${JSON.stringify(latestProgress)}\n\n`);
+    }
+
+    // Register callback for progress updates
+    const cleanup = registerProgressCallback(sessionId, (progress) => {
+      try {
+        console.log(`[SSE] Writing progress for session ${sessionId}:`, progress);
+        res.write(`data: ${JSON.stringify(progress)}\n\n`);
+        // Flush the response to ensure it's sent immediately
+        if (typeof (res as any).flush === 'function') {
+          (res as any).flush();
+        }
+      } catch (error) {
+        console.error('Error writing SSE data:', error);
+        cleanup();
+      }
+    });
+    
+    console.log(`[SSE] Progress callback registered for session ${sessionId}`);
+
+    // Handle client disconnect
+    req.on('close', () => {
+      cleanup();
+      res.end();
+    });
+
+    // Keep connection alive with periodic ping
+    const pingInterval = setInterval(() => {
+      try {
+        res.write(': ping\n\n');
+      } catch (error) {
+        clearInterval(pingInterval);
+        cleanup();
+        res.end();
+      }
+    }, 30000); // Every 30 seconds
+
+    // Clean up on error
+    req.on('error', (error) => {
+      console.error(`[SSE] Request error for session ${sessionId}:`, error);
+      clearInterval(pingInterval);
+      cleanup();
+      res.end();
+    });
+  } catch (error) {
+    console.error(`[SSE] Error setting up connection for session ${sessionId}:`, error);
+    console.error('Error stack:', error instanceof Error ? error.stack : 'No stack trace');
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to establish progress stream' });
+    }
+  }
+}
+
 // Common function to generate AI response for a session
 // Always uses worker process to prevent blocking the main event loop
 async function generateSessionResponse(
@@ -639,13 +708,19 @@ async function generateSessionResponse(
 
   // Generate AI response using worker process to prevent blocking the main event loop
   // This allows health checks to continue working during long-running operations
-  const response = await generateMarketingResponseWorkerService.runInWorker({
-    messageContent,
-    sessionHistory: updatedSession.messages,
-    userId,
-    sessionId,
-    mockMode: false
-  });
+  const response = await generateMarketingResponseWorkerService.runInWorker(
+    {
+      messageContent,
+      sessionHistory: updatedSession.messages,
+      userId,
+      sessionId,
+      mockMode: false
+    },
+    (progress) => {
+      // Emit progress updates via SSE
+      emitProgress(sessionId, progress);
+    }
+  );
 
   // Add all response messages to session (includes assistant responses and tool calls)
   await chatbotDb.addMessagesToSession(sessionId, response.responseMessages);
@@ -819,6 +894,10 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found' });
       }
 
+      // Clear old progress store (but keep active connections)
+      // Don't call cleanupProgress here as it removes active SSE connections
+      progressStore.delete(sessionId);
+
       // Generate AI response using common function
       const response = await generateSessionResponse(
         sessionId,
@@ -826,6 +905,9 @@ export const agentModeController = {
         user.userId,
         attachments
       );
+
+      // Clear progress store after completion (keep connections open for future messages)
+      progressStore.delete(sessionId);
 
       res.json({
         content: response.content,
@@ -1164,6 +1246,9 @@ export const agentModeController = {
         return res.status(401).json({ error: 'Invalid or expired conversable token' });
       }
 
+      // Clear old progress store (but keep active connections)
+      progressStore.delete(session.sessionId);
+
       // Use the same generateSessionResponse logic as the regular generateResponse
       const response = await generateSessionResponse(
         session.sessionId,
@@ -1171,6 +1256,9 @@ export const agentModeController = {
         session.userId,
         attachments
       );
+
+      // Clear progress store after completion (keep connections open for future messages)
+      progressStore.delete(session.sessionId);
 
       res.json({
         content: response.content,
@@ -2005,6 +2093,73 @@ export const agentModeController = {
       res.status(500).json({ error: 'Failed to create session with plan' });
     }
   },
+
+  // SSE endpoint for progress updates (authenticated)
+  async getProgress(req: AuthenticatedRequest, res: Response) {
+    try {
+      const { sessionId } = req.params;
+      const user = req.user as User;
+
+      if (!sessionId) {
+        return res.status(400).json({ error: 'Session ID is required' });
+      }
+
+      // Verify session exists and user has access
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      if (session.userId !== user.userId) {
+        return res.status(403).json({ error: 'Unauthorized access to session' });
+      }
+
+      // Set up SSE connection - inline the logic since we can't use 'this' in object literal
+      setupSSEConnectionForSession(sessionId, res, req);
+    } catch (error) {
+      console.error('AgentMode: SSE progress error:', error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Failed to establish progress stream' });
+      }
+    }
+  },
+
+  // SSE endpoint for progress updates (public, with conversable token)
+  async getProgressPublic(req: Request, res: Response) {
+    try {
+      const { shareId } = req.params;
+      const { conversable } = req.query;
+
+      if (!shareId) {
+        return res.status(400).json({ error: 'Session ID is required' });
+      }
+
+      if (!conversable) {
+        return res.status(401).json({ error: 'Conversable token required' });
+      }
+
+      // Verify session exists and conversable token is valid
+      const session = await chatbotDb.getChatSession(shareId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      const interactiveShare = session.interactiveShareMetadata;
+      if (!interactiveShare?.isActive || interactiveShare.token !== conversable) {
+        return res.status(401).json({ error: 'Invalid or expired conversable token' });
+      }
+
+      // Set up SSE connection - inline the logic since we can't use 'this' in object literal
+      setupSSEConnectionForSession(shareId, res, req);
+    } catch (error) {
+      console.error('AgentMode: SSE progress error (public):', error);
+      console.error('Error stack:', error instanceof Error ? error.stack : 'No stack trace');
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Failed to establish progress stream' });
+      }
+    }
+  },
+
 
   // Transfer session from anonymous user to authenticated user
   async transferSession(req: AuthenticatedRequest, res: Response) {

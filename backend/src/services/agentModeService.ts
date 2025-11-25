@@ -40,7 +40,8 @@ export class AgentModeService {
     sessionHistory: ChatMessage[],
     userId: string,
     sessionId: string,
-    mockMode: boolean = false
+    mockMode: boolean = false,
+    onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] }) => void
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[] }> {
     try {
       
@@ -80,6 +81,15 @@ export class AgentModeService {
       while (iteration < maxIterations) {
         iteration++;
         
+        // Send progress update: starting iteration
+        if (onProgress) {
+          onProgress({ 
+            iteration, 
+            status: 'thinking',
+            toolCalls: iteration === 1 ? [] : toolCalls.slice()
+          });
+        }
+        
         // Make LLM call
         const response = await this.openai.chat.completions.create({
           model: process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
@@ -102,9 +112,28 @@ export class AgentModeService {
         
         // If no tool calls, break the loop
         if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
+          // Send progress update: final response ready
+          if (onProgress) {
+            onProgress({ 
+              iteration, 
+              status: 'complete',
+              toolCalls: toolCalls.slice()
+            });
+          }
           break;
         }
         
+        // Send progress update: executing tools
+        // Include the names of tools that are about to be executed
+        const pendingToolNames = responseMessage.tool_calls?.map((tc: any) => tc.function.name) || [];
+        if (onProgress) {
+          onProgress({ 
+            iteration, 
+            status: 'executing_tools',
+            toolCalls: toolCalls.slice(),
+            pendingTools: pendingToolNames
+          });
+        }
         
         // Execute tool calls
         for (const toolCall of responseMessage.tool_calls) {
@@ -122,6 +151,15 @@ export class AgentModeService {
               arguments: functionArgs,
               result: minimalResult
             });
+
+            // Send progress update: tool executed
+            if (onProgress) {
+              onProgress({ 
+                iteration, 
+                status: 'tool_executed',
+                toolCalls: toolCalls.slice()
+              });
+            }
 
             // Update the calledFunctions counter immediately after successful tool call
             try {
