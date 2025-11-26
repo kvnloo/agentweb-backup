@@ -762,7 +762,7 @@ describe('Blog Controller - Image Quality Defaulting', () => {
     });
 
     it('should throw error with details when secret fetch fails', async () => {
-      const error = new Error('Secret not found');
+      const error: any = new Error('Secret not found');
       error.code = 'ResourceNotFoundException';
       mockGetSecret.mockRejectedValueOnce(error);
 
