@@ -1,6 +1,5 @@
 // Unit tests for CMS Type functionality in AdminDashboard
 
-import React from 'react';
 import axios from 'axios';
 
 // Mock axios
