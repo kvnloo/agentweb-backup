@@ -247,6 +247,257 @@ async function sendDailyDigestEmail(schedule: any, emailNotifications: string[])
   }
 }
 
+// Common function to run verified chat with work plan, keywords, and function call verification
+// Used by both scheduled chat and verified-generate
+async function runVerifiedChat(
+  params: {
+    sessionId: string;
+    userId: string;
+    startingMessage: string;
+    keywords: string[];
+    requiredFunctions: Array<{ functionName: string; minCount: number }>;
+    maxAttempts?: number;
+    attachments?: any[];
+  }
+): Promise<{
+  success: boolean;
+  content: string;
+  toolCalls: any[];
+  keywordMatches: string[];
+  keywordMisses: string[];
+  functionCallMatches: string[];
+  functionCallMisses: string[];
+  functionStatus: Array<{
+    functionName: string;
+    requiredCount: number;
+    actualCount: number;
+    met: boolean;
+  }>;
+  attempts: number;
+  workPlanCompleted: boolean;
+}> {
+  const {
+    sessionId,
+    userId,
+    startingMessage,
+    keywords = [],
+    requiredFunctions = [],
+    maxAttempts = 20,
+    attachments = []
+  } = params;
+
+  let attempt = 0;
+  let allContent = '';
+  const allToolCalls: any[] = [];
+  
+  // Track remaining keywords and function calls
+  let remainingKeywords = [...keywords];
+  const remainingFunctionCallCounts: Record<string, number> = {};
+  requiredFunctions.forEach((reqFunc) => {
+    remainingFunctionCallCounts[reqFunc.functionName] = reqFunc.minCount;
+  });
+
+  // Track all function calls for reporting (array format)
+  const allActualFunctionCallsForReporting: string[] = [];
+  // Track function calls for evaluation (key-value format, modified during evaluation)
+  const allActualFunctionCalls: Record<string, number> = {};
+
+  while (attempt < maxAttempts) {
+    attempt++;
+
+    try {
+      // Prepare user message for this attempt
+      let userMessage = startingMessage;
+
+      if (attempt > 1) {
+        // Check work plan status
+        const session = await chatbotDb.getChatSession(sessionId);
+        const workPlan = session?.workPlan;
+        const workPlanCompleted = workPlan && workPlan.steps.every((step: any) => step.status === 'completed' || step.status === 'skipped');
+
+        if (workPlan && !workPlanCompleted) {
+          // Remind to complete pending steps
+          userMessage = `Please perform the work on pending steps. After you are done, mark the steps as completed with set_work_plan_status.`;
+        } else {
+          // Work plan completed or doesn't exist - check keywords and function calls
+          const keywordText = remainingKeywords.length > 0
+            ? `include these keywords: ${remainingKeywords.join(', ')}`
+            : '';
+          const functionCallText = requiredFunctions
+            .filter(reqFunc => {
+              const currentCount = allActualFunctionCalls[reqFunc.functionName] || 0;
+              return currentCount < reqFunc.minCount;
+            })
+            .map(reqFunc => {
+              const currentCount = allActualFunctionCalls[reqFunc.functionName] || 0;
+              const remaining = reqFunc.minCount - currentCount;
+              return `${reqFunc.functionName} (${remaining} more time${remaining > 1 ? 's' : ''} needed)`;
+            })
+            .join(', ');
+
+          const parts = [keywordText, functionCallText].filter(Boolean);
+          userMessage = parts.length > 0
+            ? `Please try again. Make sure to ${parts.join(' and ')}.`
+            : startingMessage;
+        }
+      }
+
+      // Generate response
+      const response = await generateSessionResponse(
+        sessionId,
+        userMessage,
+        userId,
+        attachments
+      );
+
+      // Update content
+      if (response.content) {
+        allContent += (allContent ? '\n\n' : '') + response.content;
+      }
+
+      // Extract function calls from the response
+      const toolCalls = response.toolCalls || [];
+      allToolCalls.push(...toolCalls);
+      const actualFunctionCalls = toolCalls.map((call: any) => call.name).filter(Boolean);
+
+      // Add to reporting array
+      allActualFunctionCallsForReporting.push(...actualFunctionCalls);
+
+      // Add to key-value format for easy updates
+      actualFunctionCalls.forEach((callName: string) => {
+        allActualFunctionCalls[callName] = (allActualFunctionCalls[callName] || 0) + 1;
+      });
+
+      // Check work plan status
+      const workPlan = response.workPlan;
+      const workPlanCompleted = workPlan && workPlan.steps.every((step: any) => step.status === 'completed' || step.status === 'skipped');
+
+      // Only evaluate keywords and function calls if work plan is completed or doesn't exist
+      let keywordMatches: string[] = [];
+      let keywordMisses: string[] = [];
+      let functionCallMatches: string[] = [];
+      let functionCallMisses: string[] = [];
+
+      if (!workPlan || workPlanCompleted) {
+        // Evaluate keywords
+        remainingKeywords.forEach((keyword: string) => {
+          if (allContent.toLowerCase().includes(keyword.toLowerCase())) {
+            keywordMatches.push(keyword);
+          } else {
+            keywordMisses.push(keyword);
+          }
+        });
+
+        // Remove matched keywords
+        remainingKeywords = remainingKeywords.filter(keyword =>
+          !keywordMatches.includes(keyword)
+        );
+
+        // Evaluate function calls
+        requiredFunctions.forEach((reqFunc) => {
+          const actualCount = allActualFunctionCalls[reqFunc.functionName] || 0;
+          if (actualCount >= reqFunc.minCount) {
+            functionCallMatches.push(reqFunc.functionName);
+            // Update remaining counts and remove matched calls from allActualFunctionCalls
+            // This prevents double-counting in future evaluations
+            if (remainingFunctionCallCounts.hasOwnProperty(reqFunc.functionName)) {
+              remainingFunctionCallCounts[reqFunc.functionName] -= reqFunc.minCount;
+              if (remainingFunctionCallCounts[reqFunc.functionName] < 0) {
+                remainingFunctionCallCounts[reqFunc.functionName] = 0;
+              }
+            }
+            // Decrement the count of matched calls from allActualFunctionCalls
+            if (allActualFunctionCalls.hasOwnProperty(reqFunc.functionName)) {
+              allActualFunctionCalls[reqFunc.functionName] -= reqFunc.minCount;
+              if (allActualFunctionCalls[reqFunc.functionName] <= 0) {
+                delete allActualFunctionCalls[reqFunc.functionName];
+              }
+            }
+          } else {
+            functionCallMisses.push(reqFunc.functionName);
+          }
+        });
+      }
+
+      // Check if all requirements are met
+      const allKeywordsMet = remainingKeywords.length === 0;
+      const allFunctionCallsMet = requiredFunctions.every(reqFunc => {
+        const actualCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
+        return actualCount >= reqFunc.minCount;
+      });
+      const allRequirementsMet = (!workPlan || workPlanCompleted) && allKeywordsMet && allFunctionCallsMet;
+
+      if (allRequirementsMet) {
+        // Build final function status
+        const functionStatus = requiredFunctions.map((reqFunc) => {
+          const actualCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
+          return {
+            functionName: reqFunc.functionName,
+            requiredCount: reqFunc.minCount,
+            actualCount: actualCount,
+            met: actualCount >= reqFunc.minCount
+          };
+        });
+
+        return {
+          success: true,
+          content: allContent,
+          toolCalls: allToolCalls,
+          keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
+          keywordMisses: remainingKeywords,
+          functionCallMatches: requiredFunctions.filter(reqFunc => {
+            const actualCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
+            return actualCount >= reqFunc.minCount;
+          }).map(reqFunc => reqFunc.functionName),
+          functionCallMisses: requiredFunctions.filter(reqFunc => {
+            const actualCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
+            return actualCount < reqFunc.minCount;
+          }).map(reqFunc => reqFunc.functionName),
+          functionStatus,
+          attempts: attempt,
+          workPlanCompleted: workPlanCompleted || !workPlan
+        };
+      }
+
+    } catch (error) {
+      console.error(`Run verified chat attempt ${attempt} failed:`, error);
+      if (attempt === maxAttempts) {
+        throw error;
+      }
+    }
+  }
+
+  // If we get here, we've exhausted all attempts
+  const functionStatus = requiredFunctions.map((reqFunc) => {
+    const actualCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
+    return {
+      functionName: reqFunc.functionName,
+      requiredCount: reqFunc.minCount,
+      actualCount: actualCount,
+      met: actualCount >= reqFunc.minCount
+    };
+  });
+
+  return {
+    success: false,
+    content: allContent,
+    toolCalls: allToolCalls,
+    keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
+    keywordMisses: remainingKeywords,
+    functionCallMatches: requiredFunctions.filter(reqFunc => {
+      const actualCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
+      return actualCount >= reqFunc.minCount;
+    }).map(reqFunc => reqFunc.functionName),
+    functionCallMisses: requiredFunctions.filter(reqFunc => {
+      const actualCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
+      return actualCount < reqFunc.minCount;
+    }).map(reqFunc => reqFunc.functionName),
+    functionStatus,
+    attempts: attempt,
+    workPlanCompleted: false
+  };
+}
+
 // Common function to run a scheduled chat (used by both test and actual execution)
 async function runScheduledChat(
   schedule: any,
@@ -269,44 +520,6 @@ async function runScheduledChat(
   createdAt: string;
 }> {
   const now = new Date();
-  const maxTries = 20;
-  let attempt = 0;
-  let finalResult: {
-    scheduleId: string;
-    runId: string;
-    status: 'success' | 'failure';
-    passed: boolean;
-    actualResponse: string;
-    actualFunctionCalls: string[];
-    keywordMatches: string[];
-    keywordMisses: string[];
-    functionCallMatches: string[];
-    functionCallMisses: string[];
-    functionCallDetails?: { [functionName: string]: { actual: number; required: number } };
-    executionTime: number;
-    sessionId: string;
-    attempt: number;
-    createdAt: string;
-  } | null = null;
-
-  // Track missing items across all attempts
-  const expectedKeywords = schedule.keywords || [];
-  const expectedFunctionCalls = schedule.requiredFunctionCalls || [];
-  const functionCallMinCalls = schedule.functionCallMinCalls || {};
-  let remainingKeywords = [...expectedKeywords];
-  let remainingFunctionCalls = [...expectedFunctionCalls];
-  
-  // Track remaining function call counts
-  const remainingFunctionCallCounts: { [functionName: string]: number } = {};
-  expectedFunctionCalls.forEach((funcName: string) => {
-    remainingFunctionCallCounts[funcName] = functionCallMinCalls[funcName] || 1;
-  });
-  
-  // Track all function calls across all attempts
-  // allActualFunctionCallsForReporting: never modified, used for final reporting (array format)
-  // allActualFunctionCalls: modified during evaluation to prevent double-counting (key-value format for easy updates)
-  const allActualFunctionCallsForReporting: string[] = [];
-  const allActualFunctionCalls: Record<string, number> = {};
 
   try {
     // Create a session for the run
@@ -324,194 +537,63 @@ async function runScheduledChat(
     );
     const sessionId = testSession.sessionId;
 
-  while (attempt < maxTries) {
-    attempt++;
+    // Convert schedule format to runVerifiedChat format
+    const expectedKeywords = schedule.keywords || [];
+    const expectedFunctionCalls = schedule.requiredFunctionCalls || [];
+    const functionCallMinCalls = schedule.functionCallMinCalls || {};
     
-    try {
-      // Prepare user message for this attempt
-      let userMessage = schedule.startingMessage;
-      
-      if (attempt > 1) {
-        // Check work plan status
-        const session = await chatbotDb.getChatSession(sessionId);
-        const workPlan = session?.workPlan;
-        const workPlanCompleted = workPlan && workPlan.steps.every((step: any) => step.status === 'completed' || step.status === 'skipped');
-        
-        if (workPlan && !workPlanCompleted) {
-          // Remind to complete pending steps
-          userMessage = `Please perform the work on pending steps. After you are done, mark the steps as completed with set_work_plan_status.`;
-        } else {
-          // Work plan completed or doesn't exist - check keywords and function calls
-          const keywordText = remainingKeywords.length > 0 
-            ? `include these keywords: ${remainingKeywords.join(', ')}` 
-            : '';
-          const functionCallText = remainingFunctionCalls.length > 0
-            ? `use these function calls: ${remainingFunctionCalls.map(funcName => {
-                const remainingCount = remainingFunctionCallCounts[funcName] || 0;
-                return `${funcName} (${remainingCount} more time${remainingCount > 1 ? 's' : ''} needed)`;
-              }).join(', ')}`
-            : '';
-          
-          const parts = [keywordText, functionCallText].filter(Boolean);
-          userMessage = parts.length > 0
-            ? `Please try again. Make sure to ${parts.join(' and ')}.`
-            : schedule.startingMessage;
-        }
-      }
+    const requiredFunctions = expectedFunctionCalls.map((funcName: string) => ({
+      functionName: funcName,
+      minCount: functionCallMinCalls[funcName] || 1
+    }));
 
-      // Generate response using the common function (same as /generateResponse)
-      // Generate response using worker process to prevent blocking main event loop
-      const response = await generateSessionResponse(
-        sessionId,
-        userMessage,
-        userId
-      );
+    // Run verified chat
+    const result = await runVerifiedChat({
+      sessionId,
+      userId,
+      startingMessage: schedule.startingMessage,
+      keywords: expectedKeywords,
+      requiredFunctions,
+      maxAttempts: 20,
+      attachments: []
+    });
 
-      // Extract function calls from the response
-      const actualFunctionCalls = response.toolCalls?.map((call: any) => call.name).filter(Boolean) || [];
-      
-      // Add to reporting array
-      allActualFunctionCallsForReporting.push(...actualFunctionCalls);
-      
-      // Add to key-value format for easy updates
-      actualFunctionCalls.forEach((callName: string) => {
-        allActualFunctionCalls[callName] = (allActualFunctionCalls[callName] || 0) + 1;
-      });
-
-      // Check work plan status
-      const workPlan = response.workPlan;
-      const workPlanCompleted = workPlan && workPlan.steps.every((step: any) => step.status === 'completed' || step.status === 'skipped');
-
-      // Only evaluate keywords and function calls if work plan is completed or doesn't exist
-      let evaluation = {
-        passed: true,
-        keywordMatches: [] as string[],
-        keywordMisses: [] as string[],
-        functionCallMatches: [] as string[],
-        functionCallMisses: [] as string[]
+    // Convert result to scheduled chat format
+    const actualFunctionCalls = result.toolCalls.map((call: any) => call.name).filter(Boolean);
+    
+    // Calculate final function call details
+    const finalFunctionCallDetails: { [functionName: string]: { actual: number; required: number } } = {};
+    const actualFunctionCallCounts: { [functionName: string]: number } = {};
+    actualFunctionCalls.forEach((call: string) => {
+      actualFunctionCallCounts[call] = (actualFunctionCallCounts[call] || 0) + 1;
+    });
+    
+    expectedFunctionCalls.forEach((funcCall: string) => {
+      const actualCount = actualFunctionCallCounts[funcCall] || 0;
+      const requiredCount = functionCallMinCalls[funcCall] || 1;
+      finalFunctionCallDetails[funcCall] = {
+        actual: actualCount,
+        required: requiredCount
       };
+    });
 
-      if (!workPlan || workPlanCompleted) {
-        // Convert Record to array for evaluation
-        const allActualFunctionCallsArray: string[] = [];
-        Object.keys(allActualFunctionCalls).forEach((funcName: string) => {
-          const count = allActualFunctionCalls[funcName] || 0;
-          for (let i = 0; i < count; i++) {
-            allActualFunctionCallsArray.push(funcName);
-          }
-        });
-
-        // Evaluate against cumulative calls to check if requirements are met
-        evaluation = evaluateScheduleResponse(
-          response.content,
-          allActualFunctionCallsArray,
-          {
-            keywords: remainingKeywords,
-            functionCalls: remainingFunctionCalls,
-            functionCallMinCalls: functionCallMinCalls
-          }
-        );
-
-        // Update remaining function call counts and remove matched calls from allActualFunctionCalls
-        // This prevents double-counting in future evaluations
-        evaluation.functionCallMatches.forEach((matchedFunc: string) => {
-          const requiredCount = functionCallMinCalls[matchedFunc] || 1;
-          
-          // Update remaining counts
-          if (remainingFunctionCallCounts.hasOwnProperty(matchedFunc)) {
-            remainingFunctionCallCounts[matchedFunc] -= requiredCount;
-            if (remainingFunctionCallCounts[matchedFunc] < 0) {
-              remainingFunctionCallCounts[matchedFunc] = 0;
-            }
-          }
-          
-          // Decrement the count of matched calls from allActualFunctionCalls
-          // This prevents them from being counted again in future evaluations
-          if (allActualFunctionCalls.hasOwnProperty(matchedFunc)) {
-            allActualFunctionCalls[matchedFunc] -= requiredCount;
-            if (allActualFunctionCalls[matchedFunc] <= 0) {
-              delete allActualFunctionCalls[matchedFunc];
-            }
-          }
-        });
-
-        // Remove matched keywords
-        remainingKeywords = remainingKeywords.filter(keyword => 
-          !evaluation.keywordMatches.includes(keyword)
-        );
-        
-        // Remove function calls from remaining list when their count reaches zero
-        remainingFunctionCalls = remainingFunctionCalls.filter(funcCall => 
-          remainingFunctionCallCounts[funcCall] > 0
-        );
-      }
-
-      // Calculate cumulative results across all attempts
-      const totalKeywordMatches = expectedKeywords.filter((keyword: string) => 
-        !remainingKeywords.includes(keyword)
-      );
-      const totalFunctionCallMatches = expectedFunctionCalls.filter((funcCall: string) => 
-        !remainingFunctionCalls.includes(funcCall)
-      );
-
-      // Calculate final function call details using cumulative counts from reporting array
-      const finalFunctionCallDetails: { [functionName: string]: { actual: number; required: number } } = {};
-      const actualFunctionCallCounts: { [functionName: string]: number } = {};
-      allActualFunctionCallsForReporting.forEach((call: string) => {
-        actualFunctionCallCounts[call] = (actualFunctionCallCounts[call] || 0) + 1;
-      });
-      
-      expectedFunctionCalls.forEach((funcCall: string) => {
-        const actualCount = actualFunctionCallCounts[funcCall] || 0;
-        const requiredCount = functionCallMinCalls[funcCall] || 1;
-        finalFunctionCallDetails[funcCall] = {
-          actual: actualCount,
-          required: requiredCount
-        };
-      });
-
-      // Check if all requirements are met
-      // If work plan exists and is not completed, requirements are not met
-      // Otherwise, check keywords and function calls
-      const allRequirementsMet = (!workPlan || workPlanCompleted) && 
-        remainingKeywords.length === 0 && 
-        remainingFunctionCalls.length === 0;
-
-      finalResult = {
-        scheduleId: schedule.scheduleId,
-        runId: require('uuid').v4(),
-        status: allRequirementsMet ? 'success' : 'failure',
-        passed: allRequirementsMet,
-        actualResponse: response.content,
-        actualFunctionCalls: allActualFunctionCallsForReporting,
-        keywordMatches: totalKeywordMatches,
-        keywordMisses: remainingKeywords,
-        functionCallMatches: totalFunctionCallMatches,
-        functionCallMisses: remainingFunctionCalls,
-        functionCallDetails: finalFunctionCallDetails,
-        executionTime: Date.now() - now.getTime(),
-        sessionId: sessionId,
-        attempt,
-        createdAt: new Date().toISOString()
-      };
-
-      // If all requirements met, break out of loop
-      if (allRequirementsMet) {
-        break;
-      }
-
-    } catch (error) {
-      console.error(`Run attempt ${attempt} failed:`, error);
-      if (attempt === maxTries) {
-        throw error;
-      }
-    }
-  }
-
-  // Ensure we always return a result
-  if (!finalResult) {
-    throw new Error('Failed to generate result after all attempts');
-  }
+    const finalResult = {
+      scheduleId: schedule.scheduleId,
+      runId: require('uuid').v4(),
+      status: (result.success ? 'success' : 'failure') as 'success' | 'failure',
+      passed: result.success,
+      actualResponse: result.content,
+      actualFunctionCalls: actualFunctionCalls,
+      keywordMatches: result.keywordMatches,
+      keywordMisses: result.keywordMisses,
+      functionCallMatches: result.functionCallMatches,
+      functionCallMisses: result.functionCallMisses,
+      functionCallDetails: finalFunctionCallDetails,
+      executionTime: Date.now() - now.getTime(),
+      sessionId: sessionId,
+      attempt: result.attempts,
+      createdAt: new Date().toISOString()
+    };
 
     // Save the result to database
     try {
@@ -521,17 +603,17 @@ async function runScheduledChat(
       // Continue even if saving fails - we still want to return the result
     }
 
-  // Also sync Research Reports execution for email campaigns
-  try {
-    if (schedule.emailCampaignTaskId) {
-      await syncEmailCampaignExecution(userId, finalResult.sessionId, schedule.emailCampaignTaskId);
+    // Also sync Research Reports execution for email campaigns
+    try {
+      if (schedule.emailCampaignTaskId) {
+        await syncEmailCampaignExecution(userId, finalResult.sessionId, schedule.emailCampaignTaskId);
+      }
+    } catch (err) {
+      console.error('AgentMode: Email campaign execution sync after run error:', err);
     }
-  } catch (err) {
-    console.error('AgentMode: Email campaign execution sync after run error:', err);
-  }
-    
+
     return finalResult;
-  
+
   } catch (error) {
     console.error(`Error in runScheduledChat for ${schedule.scheduleName}:`, error);
     console.error('Full error details:', {
@@ -2189,6 +2271,95 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Transfer session error:', error);
       res.status(500).json({ error: 'Failed to transfer session' });
+    }
+  },
+
+  // Verified generate - ensures required functions are called minimum number of times
+  async verifiedGenerate(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { sessionId, startingMessage, requiredFunctions, keywords, attachments, maxAttempts: maxAttemptsParam } = req.body;
+
+      // Validate required fields
+      if (!sessionId) {
+        return res.status(400).json({ error: 'Session ID is required' });
+      }
+
+      if (!startingMessage || !startingMessage.trim()) {
+        return res.status(400).json({ error: 'Starting message is required' });
+      }
+
+      if (!requiredFunctions || !Array.isArray(requiredFunctions) || requiredFunctions.length === 0) {
+        return res.status(400).json({ error: 'Required functions array is required and must not be empty' });
+      }
+
+      // Validate requiredFunctions format: [{ functionName: string, minCount: number }]
+      for (const reqFunc of requiredFunctions) {
+        if (!reqFunc.functionName || typeof reqFunc.functionName !== 'string') {
+          return res.status(400).json({ error: 'Each required function must have a functionName (string)' });
+        }
+        if (typeof reqFunc.minCount !== 'number' || reqFunc.minCount < 1) {
+          return res.status(400).json({ error: 'Each required function must have a minCount (number >= 1)' });
+        }
+      }
+
+      // Get session and verify ownership
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      if (session.userId !== user.userId) {
+        return res.status(403).json({ error: 'Access denied to this session' });
+      }
+
+      // Track if client disconnected (user navigated away)
+      let clientDisconnected = false;
+      req.on('close', () => {
+        clientDisconnected = true;
+        console.log('AgentMode: Client disconnected, but continuing verified generation...');
+      });
+
+      // Run verified chat
+      const result = await runVerifiedChat({
+        sessionId,
+        userId: user.userId,
+        startingMessage: startingMessage.trim(),
+        keywords: keywords || [],
+        requiredFunctions,
+        maxAttempts: maxAttemptsParam || 5,
+        attachments: attachments || []
+      });
+
+      // If client disconnected, don't try to send response
+      // The results are already saved to the session
+      if (clientDisconnected) {
+        console.log('AgentMode: Client disconnected before response could be sent, but verified generation completed');
+        return;
+      }
+
+      res.status(200).json({
+        success: result.success,
+        message: result.success
+          ? `All required functions were called successfully.`
+          : `Some required functions were not called enough times after ${result.attempts} attempt${result.attempts !== 1 ? 's' : ''}.`,
+        content: result.content,
+        toolCalls: result.toolCalls,
+        keywordMatches: result.keywordMatches,
+        keywordMisses: result.keywordMisses,
+        functionCallMatches: result.functionCallMatches,
+        functionCallMisses: result.functionCallMisses,
+        functionStatus: result.functionStatus,
+        attempts: result.attempts,
+        workPlanCompleted: result.workPlanCompleted,
+        sessionId: sessionId
+      });
+    } catch (error: any) {
+      console.error('AgentMode: Verified generate error:', error);
+      res.status(500).json({ 
+        error: 'Failed to perform verified generation',
+        message: error.message || 'Unknown error'
+      });
     }
   },
 };

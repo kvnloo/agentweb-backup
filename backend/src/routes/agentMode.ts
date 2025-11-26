@@ -100,6 +100,10 @@ router.get('/session/:sessionId/progress', authenticateToken, asyncHandlerAuth(a
 // Generate AI response for marketing conversation
 router.post('/generate', asyncHandler(agentModeController.generateResponse));
 
+// POST /api/agent-mode/verified-generate
+// Generate response with verification that required functions are called minimum number of times
+router.post('/verified-generate', asyncHandler(agentModeController.verifiedGenerate));
+
 // POST /api/agent-mode/upload
 // Upload file attachment for Agent Mode
 router.post('/upload', upload.single('file'), asyncHandler(agentModeController.uploadAttachment));

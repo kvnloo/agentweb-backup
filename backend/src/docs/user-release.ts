@@ -16,6 +16,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- publish_blog_article function in Agent Mode now supports Webflow CMS publishing',
       'Mitigated Double Title Issue with create_blog_article',
       '- LLM is instructed not to include title in content to avoid duplication',
+      'Moved Ad Images Creation to Backend for Improved Reliability',
+      '- Ad image creation and revision processes now run on the backend using the new /verified-generate endpoint',
+      '- Image generation continues processing even if users navigate away from the page',
+      '- Multiple ICP image generation now uses AI-driven work plans for better organization and execution',
     ],
   },
   {
