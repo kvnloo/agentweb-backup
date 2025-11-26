@@ -204,8 +204,9 @@ Content Guidelines:
 3. Structure with clear H2 and H3 headings (no H4+)
 4. If research context is provided, use it as a foundation but rewrite in your own voice
 5. Avoid generic AI language - be specific, use real examples, and sound like a human expert
- 6. Use tables, bullet points, numbered lists, or paragraphs for data presentation${isLongForm ? `
- 7. For ${length} articles, focus on clear, well-structured content:
+6. Do NOT include the title as an H1 heading in the content - the title will be added separately
+7. Use tables, bullet points, numbered lists, or paragraphs for data presentation${isLongForm ? `
+8. For ${length} articles, focus on clear, well-structured content:
     - Create markdown tables for structured data when it adds value
     - Use bullet points, numbered lists, and clear headings for organization
     - Avoid ASCII art, diagrams, or complex visual elements
@@ -553,6 +554,7 @@ export function generateBlogHtml(
     </style>
 </head>
 <body>
+    <h1>${title}</h1>
     <div class="meta">Published on ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}</div>
     <img src="${imageUrl}" alt="${title}" class="hero-image">
     <div class="content">
