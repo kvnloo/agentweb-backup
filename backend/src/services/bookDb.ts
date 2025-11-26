@@ -40,6 +40,7 @@ export interface Book {
   content: string; // Keep for backward compatibility
   type: "book" | "whitepaper";
   author: string;
+  language?: string;
   coverImageUrl?: string;
   attachments?: BookAttachment[];
   tags?: string[];

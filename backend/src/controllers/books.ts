@@ -143,6 +143,7 @@ export async function createBook(req: AuthenticatedRequest, res: Response) {
       content,
       type,
       author,
+      language,
       coverImageUrl,
       tags,
       status,
@@ -168,6 +169,7 @@ export async function createBook(req: AuthenticatedRequest, res: Response) {
       content: content || "",
       type,
       author: author.trim(),
+      language: language || "English",
       coverImageUrl: coverImageUrl || undefined,
       attachments: [],
       tags: tags && Array.isArray(tags) ? tags : [],
@@ -203,6 +205,7 @@ export async function updateBook(req: AuthenticatedRequest, res: Response) {
       content,
       type,
       author,
+      language,
       coverImageUrl,
       tags,
       status,
@@ -220,6 +223,7 @@ export async function updateBook(req: AuthenticatedRequest, res: Response) {
       updates.type = type;
     }
     if (author !== undefined) updates.author = author.trim();
+    if (language !== undefined) updates.language = language;
     if (coverImageUrl !== undefined) updates.coverImageUrl = coverImageUrl || undefined;
     if (tags !== undefined) updates.tags = Array.isArray(tags) ? tags : [];
     if (status !== undefined) {
