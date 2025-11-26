@@ -76,7 +76,7 @@ describe('AgentModeController - Verified Generate', () => {
     
     // Setup default mocks
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession);
-    mockChatbotDb.addMessageToSession.mockResolvedValue(undefined);
+    mockChatbotDb.addMessageToSession.mockResolvedValue(undefined as any);
     mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(mockResponse);
   });
 
@@ -531,10 +531,13 @@ describe('AgentModeController - Verified Generate', () => {
       const sessionWithWorkPlan = {
         ...mockSession,
         workPlan: {
+          title: 'Test Work Plan',
           steps: [
-            { id: '1', status: 'completed' },
-            { id: '2', status: 'completed' },
+            { stepCount: 1, title: 'Step 1', status: 'completed' as const },
+            { stepCount: 2, title: 'Step 2', status: 'completed' as const },
           ],
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
         },
       };
       mockChatbotDb.getChatSession.mockResolvedValue(sessionWithWorkPlan);
@@ -546,10 +549,13 @@ describe('AgentModeController - Verified Generate', () => {
           { name: 'generate_image', arguments: { prompt: 'test' } },
         ],
         workPlan: {
+          title: 'Test Work Plan',
           steps: [
-            { id: '1', status: 'completed' },
-            { id: '2', status: 'completed' },
+            { stepCount: 1, title: 'Step 1', status: 'completed' as const },
+            { stepCount: 2, title: 'Step 2', status: 'completed' as const },
           ],
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
         },
       };
       
