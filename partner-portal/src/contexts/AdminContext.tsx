@@ -37,6 +37,7 @@ interface User {
   fromName?: string; // From name for emails
   slackChannel?: string; // Default Slack channel for this user
   seoDomains?: string[]; // SEO domains to track
+  cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
 }
 
 interface AdminContextType {

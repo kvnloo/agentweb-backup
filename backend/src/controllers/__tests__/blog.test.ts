@@ -46,8 +46,12 @@ jest.mock('aws-sdk', () => ({
 }));
 
 // Mock secretsManager utility
+const mockGetSecret = jest.fn().mockResolvedValue('test-secret-value');
+const mockSecretExists = jest.fn().mockResolvedValue(false);
+
 jest.mock('../../utils/secretsManager', () => ({
-  getSecret: jest.fn().mockResolvedValue('test-secret-value')
+  getSecret: mockGetSecret,
+  secretExists: mockSecretExists
 }));
 
 // Mock imageGeneration service
@@ -631,7 +635,138 @@ describe('Blog Controller - Image Quality Defaulting', () => {
       const callArgs = mockGenerateImage.mock.calls[0][0];
       expect(callArgs.quality).toBe('low');
       expect(callArgs.quality).not.toBe('medium');
+      expect(callArgs.quality).not.toBe('medium');
       expect(callArgs.quality).not.toBe('high');
+    });
+  });
+
+  describe('getWebflowConfig', () => {
+    const { getWebflowConfig } = require('../blog');
+    const mockWebflowConfig = {
+      apiToken: 'test-api-token',
+      siteId: 'test-site-id',
+      collectionId: 'test-collection-id',
+      fieldMappings: {
+        summary: 'post-summary',
+        body: 'post-body',
+        image: 'main-image'
+      }
+    };
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+      process.env.NODE_ENV = 'development';
+      mockGetSecret.mockClear();
+      mockSecretExists.mockClear();
+    });
+
+    it('should use per-user secret when userId is provided and secret exists', async () => {
+      const userId = 'test-user-123';
+      mockSecretExists.mockResolvedValueOnce(true);
+      mockGetSecret.mockResolvedValueOnce(JSON.stringify(mockWebflowConfig));
+
+      const config = await getWebflowConfig(userId);
+
+      expect(mockSecretExists).toHaveBeenCalledWith('dev/AgentWeb/Webflow/test-user-123');
+      expect(mockGetSecret).toHaveBeenCalledWith('dev/AgentWeb/Webflow/test-user-123');
+      expect(mockGetSecret).not.toHaveBeenCalledWith('dev/AgentWeb/Webflow');
+      expect(config).toEqual({
+        apiToken: 'test-api-token',
+        siteId: 'test-site-id',
+        collectionId: 'test-collection-id',
+        fieldMappings: {
+          summary: 'post-summary',
+          body: 'post-body',
+          image: 'main-image'
+        }
+      });
+    });
+
+    it('should fall back to global secret when userId is provided but per-user secret does not exist', async () => {
+      const userId = 'test-user-123';
+      mockSecretExists.mockResolvedValueOnce(false);
+      mockGetSecret.mockResolvedValueOnce(JSON.stringify(mockWebflowConfig));
+
+      const config = await getWebflowConfig(userId);
+
+      expect(mockSecretExists).toHaveBeenCalledWith('dev/AgentWeb/Webflow/test-user-123');
+      expect(mockGetSecret).toHaveBeenCalledWith('dev/AgentWeb/Webflow');
+      expect(mockGetSecret).not.toHaveBeenCalledWith('dev/AgentWeb/Webflow/test-user-123');
+      expect(config).toEqual({
+        apiToken: 'test-api-token',
+        siteId: 'test-site-id',
+        collectionId: 'test-collection-id',
+        fieldMappings: {
+          summary: 'post-summary',
+          body: 'post-body',
+          image: 'main-image'
+        }
+      });
+    });
+
+    it('should use global secret when userId is not provided', async () => {
+      mockGetSecret.mockResolvedValueOnce(JSON.stringify(mockWebflowConfig));
+
+      const config = await getWebflowConfig();
+
+      expect(mockSecretExists).not.toHaveBeenCalled();
+      expect(mockGetSecret).toHaveBeenCalledWith('dev/AgentWeb/Webflow');
+      expect(config).toEqual({
+        apiToken: 'test-api-token',
+        siteId: 'test-site-id',
+        collectionId: 'test-collection-id',
+        fieldMappings: {
+          summary: 'post-summary',
+          body: 'post-body',
+          image: 'main-image'
+        }
+      });
+    });
+
+    it('should use production secret name in production environment', async () => {
+      process.env.NODE_ENV = 'production';
+      mockGetSecret.mockResolvedValueOnce(JSON.stringify(mockWebflowConfig));
+
+      const config = await getWebflowConfig();
+
+      expect(mockGetSecret).toHaveBeenCalledWith('prod/AgentWeb/Webflow');
+      expect(config).toBeDefined();
+    });
+
+    it('should use default field mappings when not provided in secret', async () => {
+      const configWithoutMappings = {
+        apiToken: 'test-api-token',
+        siteId: 'test-site-id',
+        collectionId: 'test-collection-id'
+      };
+      mockGetSecret.mockResolvedValueOnce(JSON.stringify(configWithoutMappings));
+
+      const config = await getWebflowConfig();
+
+      expect(config.fieldMappings).toEqual({
+        summary: 'post-summary',
+        body: 'post-body',
+        image: 'main-image',
+        publishDate: undefined
+      });
+    });
+
+    it('should throw error when required fields are missing', async () => {
+      const invalidConfig = {
+        apiToken: 'test-api-token'
+        // Missing siteId and collectionId
+      };
+      mockGetSecret.mockResolvedValueOnce(JSON.stringify(invalidConfig));
+
+      await expect(getWebflowConfig()).rejects.toThrow('Webflow configuration missing required fields');
+    });
+
+    it('should throw error with details when secret fetch fails', async () => {
+      const error: any = new Error('Secret not found');
+      error.code = 'ResourceNotFoundException';
+      mockGetSecret.mockRejectedValueOnce(error);
+
+      await expect(getWebflowConfig()).rejects.toThrow('Failed to fetch Webflow configuration from Secrets Manager');
     });
   });
 });

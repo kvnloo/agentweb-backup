@@ -1168,6 +1168,35 @@ Use the available tools to create tasks in the agent-engine when complex work is
       {
         type: 'function' as const,
         function: {
+          name: 'publish_blog_article',
+          description: 'Publish a blog article to CMS (Basehub or Webflow) based on the user\'s configured CMS type. Takes the title, description, hero image URL, and blog HTML URL from a previously created blog article (via create_blog_article), extracts the HTML body content, then publishes to the appropriate CMS.',
+          parameters: {
+            type: 'object',
+            properties: {
+              title: {
+                type: 'string',
+                description: 'The title of the blog article'
+              },
+              description: {
+                type: 'string',
+                description: 'The description/meta description of the blog article'
+              },
+              hero_image_url: {
+                type: 'string',
+                description: 'The URL of the hero image for the blog article'
+              },
+              blog_html_url: {
+                type: 'string',
+                description: 'The URL of the HTML file created by create_blog_article function'
+              }
+            },
+            required: ['title', 'description', 'hero_image_url', 'blog_html_url']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
           name: 'create_social_media_posts',
           description: 'Create a list of social media posts and generate an HTML file containing all posts. Each post includes type (linkedin, x/twitter, instagram, facebook, or custom), rich text content that can be transformed to HTML for display and copied for use, and optional image URL. The output is an HTML file stored in S3 with all posts formatted for easy viewing and copying.',
           parameters: {
@@ -2178,6 +2207,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.removeC2PAFromImage(args.image_url, args.filename, userId);
       case 'create_blog_article':
           return await this.createBlogArticle(args.topic, args.keywords || '', args.tone || 'professional', args.length || 'medium', args.researchContext || '', args.requirements || '', userId, sessionId, args.style || 'default');
+      case 'publish_blog_article':
+        return await this.publishBlogArticle(args.title, args.description, args.hero_image_url, args.blog_html_url, userId, sessionId);
       case 'create_social_media_posts':
         return await this.createSocialMediaPosts(args.posts, userId, sessionId);
       case 'get_task_subscriber_metrics':
@@ -5880,6 +5911,244 @@ Use the available tools to create tasks in the agent-engine when complex work is
         success: false,
         message: 'Failed to create blog article',
         error: error.message
+      };
+    }
+  }
+
+  private async publishBlogArticle(
+    title: string,
+    description: string,
+    heroImageUrl: string,
+    blogHtmlUrl: string,
+    userId: string,
+    sessionId: string
+  ): Promise<any> {
+    try {
+      console.log('AgentMode: Publishing blog article - Title:', title);
+      
+      // Step 1: Fetch HTML and extract body content
+      const htmlResponse = await axios.get(blogHtmlUrl, {
+        timeout: 30000,
+        responseType: 'text',
+        headers: {
+          'User-Agent': 'AgentWeb-Backend/1.0',
+        },
+      });
+
+      const htmlContent = htmlResponse.data as string;
+      
+      // Extract content from <div class="content"> - find first opening tag and last closing tag before </body>
+      const contentDivStart = htmlContent.search(/<div[^>]*class=["'][^"']*content[^"']*["'][^>]*>/i);
+      if (contentDivStart === -1) {
+        throw new Error('Could not extract content from HTML. Expected <div class="content"> element.');
+      }
+      
+      // Find the position after the opening tag
+      const afterOpenTag = htmlContent.indexOf('>', contentDivStart) + 1;
+      
+      // Find the last </div> before </body>
+      const bodyEnd = htmlContent.lastIndexOf('</body>');
+      if (bodyEnd === -1) {
+        throw new Error('Could not find </body> tag in HTML');
+      }
+      
+      // Find the last </div> before </body>
+      const lastDivClose = htmlContent.lastIndexOf('</div>', bodyEnd);
+      if (lastDivClose === -1) {
+        throw new Error('Could not find closing </div> tag for content');
+      }
+      
+      // Extract everything between the opening tag and the last </div>
+      let bodyHtml = htmlContent.substring(afterOpenTag, lastDivClose).trim();
+      
+      if (!bodyHtml) {
+        throw new Error('Content is empty after cleaning');
+      }
+      
+      // Extract image filename from URL
+      let imageFilename: string | undefined;
+      if (heroImageUrl) {
+        const urlParts = heroImageUrl.split('/');
+        imageFilename = urlParts[urlParts.length - 1];
+      }
+      
+      // Step 3: Get user's CMS type
+      const { userDb } = await import('./db');
+      const user = await userDb.getUserById(userId);
+      
+      if (!user) {
+        throw new Error('User not found');
+      }
+      
+      const cmsType = user.cmsType;
+      
+      if (!cmsType) {
+        return {
+          success: false,
+          message: 'CMS Type is not configured for this user. Please contact an administrator to set up CMS publishing.',
+          error: 'CMS Type not configured'
+        };
+      }
+      
+      console.log('AgentMode: User CMS Type:', cmsType);
+      
+      // Step 4: Publish to CMS
+      // Only Webflow is supported for publish_blog_article function
+      if (cmsType === 'Webflow') {
+        const { getWebflowConfig } = await import('../controllers/blog');
+        const { apiToken, siteId, collectionId, fieldMappings } = await getWebflowConfig(userId);
+        
+        // Call Webflow publishing
+        const axios = (await import('axios')).default;
+        const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+        
+        const cmsItemData: any = {
+          fieldData: {
+            name: title,
+            slug: slug,
+            _archived: false,
+            _draft: false,
+          }
+        };
+
+        // Use body HTML directly for Webflow
+        // Webflow API may strip HTML tags if newlines are present, so remove them
+        const cleanBodyHtml = bodyHtml.replace(/\n/g, '').replace(/\r/g, '');
+        
+        if (fieldMappings?.summary) {
+          cmsItemData.fieldData[fieldMappings.summary] = description;
+        }
+        
+        if (fieldMappings?.body) {
+          cmsItemData.fieldData[fieldMappings.body] = cleanBodyHtml;
+        }
+
+        if (heroImageUrl && fieldMappings?.image) {
+          cmsItemData.fieldData[fieldMappings.image] = heroImageUrl;
+        }
+
+        const headers = {
+          Authorization: `Bearer ${apiToken}`,
+          'Content-Type': 'application/json',
+          'accept-version': '2.0.0'
+        };
+
+        try {
+          const response = await axios.post(
+            `https://api.webflow.com/v2/sites/${siteId}/collections/${collectionId}/items`,
+            cmsItemData,
+            { headers }
+          );
+
+          console.log('AgentMode: Blog article published successfully to Webflow');
+          
+          // Sanitize response to remove large content fields before sending to LLM
+          const responseData = response.data as any;
+          const sanitizedResponse = responseData && typeof responseData === 'object' 
+            ? { ...responseData } 
+            : responseData;
+          
+          if (sanitizedResponse && sanitizedResponse.fieldData && typeof sanitizedResponse.fieldData === 'object') {
+            const sanitizedFieldData = { ...sanitizedResponse.fieldData };
+            // Remove large content fields that aren't needed by the LLM
+            delete sanitizedFieldData['post-body'];
+            delete sanitizedFieldData['body'];
+            sanitizedResponse.fieldData = sanitizedFieldData;
+          }
+          
+          return {
+            success: true,
+            message: 'Blog article published successfully to Webflow',
+            data: {
+              title,
+              cmsType: 'Webflow',
+              cmsResponse: sanitizedResponse
+            }
+          };
+        } catch (webflowError: any) {
+          // Extract detailed error information
+          const errorInfo: any = {
+            status: webflowError.response?.status,
+            statusText: webflowError.response?.statusText,
+          };
+
+          if (webflowError.response?.data) {
+            const errorData = webflowError.response.data;
+            
+            if (errorData.message) {
+              errorInfo.message = errorData.message;
+            }
+
+            // Extract validation error details
+            if (errorData.details && Array.isArray(errorData.details)) {
+              errorInfo.details = errorData.details;
+              const detailMessages = errorData.details
+                .map((d: any) => `${d.param}: ${d.description}`)
+                .join('; ');
+              if (detailMessages) {
+                errorInfo.message = `${errorInfo.message || 'Validation Error'}. ${detailMessages}`;
+              }
+            }
+          }
+
+          // Log concise error summary
+          if (errorInfo.details && errorInfo.details.length > 0) {
+            const errorDetails = errorInfo.details
+              .map((d: any) => `${d.param}: ${d.description}`)
+              .join(', ');
+            console.error(`AgentMode: Webflow API error (${errorInfo.status}): ${errorDetails}`);
+          } else {
+            console.error(`AgentMode: Webflow API error (${errorInfo.status}): ${errorInfo.message}`);
+          }
+          
+          // Create a more user-friendly error message
+          const errorMessage = errorInfo.message || `Webflow API error: ${errorInfo.status} ${errorInfo.statusText}`;
+          throw new Error(errorMessage);
+        }
+      } else if (cmsType === 'Basehub') {
+        return {
+          success: false,
+          message: 'Basehub CMS is not supported for publish_blog_article function. Please use the Research Reports page to publish to Basehub.',
+          error: 'Basehub not supported'
+        };
+      } else {
+        return {
+          success: false,
+          message: `Unsupported CMS Type: ${cmsType}. Supported types are 'Basehub' and 'Webflow'.`,
+          error: 'Unsupported CMS Type'
+        };
+      }
+    } catch (error: any) {
+      console.error('AgentMode: Error publishing blog article:', error);
+      
+      // Extract detailed error information for better user feedback
+      let errorMessage = error.message || 'Failed to publish blog article';
+      
+      if (error.response?.data) {
+        const errorData = error.response.data;
+        
+        // Extract validation error details
+        if (errorData.details && Array.isArray(errorData.details)) {
+          const detailMessages = errorData.details
+            .map((d: any) => {
+              if (d.param && d.description) {
+                return `${d.param}: ${d.description}`;
+              }
+              return JSON.stringify(d);
+            })
+            .join('; ');
+          if (detailMessages) {
+            errorMessage = `Webflow validation error: ${detailMessages}`;
+          }
+        } else if (errorData.message) {
+          errorMessage = errorData.message;
+        }
+      }
+      
+      return {
+        success: false,
+        message: errorMessage,
+        error: error.message || 'Unknown error'
       };
     }
   }

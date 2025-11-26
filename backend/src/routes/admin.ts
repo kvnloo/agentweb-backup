@@ -201,6 +201,34 @@ router.put("/users/:userId/seo-domains", async (req, res) => {
   }
 });
 
+// Update user CMS Type
+router.put("/users/:userId/cms-type", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { cmsType } = req.body;
+
+    // Validate cmsType
+    if (cmsType && cmsType !== "Basehub" && cmsType !== "Webflow") {
+      return res.status(400).json({ message: "cmsType must be either 'Basehub' or 'Webflow'" });
+    }
+
+    // Check if user exists
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Update the user's CMS Type
+    const updatedUser = await userDb.updateUser(userId, { 
+      cmsType: cmsType || undefined 
+    });
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error updating user CMS Type:", error);
+    res.status(500).json({ message: "Error updating CMS Type" });
+  }
+});
+
 // Update user password
 router.put("/users/:userId/password", async (req, res) => {
   try {
