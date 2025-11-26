@@ -7,6 +7,18 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-11-26',
+    changes: [
+      'Added Webflow CMS Support for Blog Publishing',
+      '- Blog posts can now be published to Webflow CMS in addition to BaseHub',
+      '- Admins can configure CMS Type (BaseHub or Webflow) per user in the Admin Dashboard Users tab',
+      '- Per-user Webflow configuration support: each user can have their own Webflow credentials stored securely',
+      '- publish_blog_article function in Agent Mode now supports Webflow CMS publishing',
+      'Mitigated Double Title Issue with create_blog_article',
+      '- LLM is instructed not to include title in content to avoid duplication',
+    ],
+  },
+  {
     date: '2025-11-25',
     changes: [
       'Added Streaming Support in Agent Mode',
