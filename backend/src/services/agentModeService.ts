@@ -6042,13 +6042,27 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
           console.log('AgentMode: Blog article published successfully to Webflow');
           
+          // Sanitize response to remove large content fields before sending to LLM
+          const responseData = response.data as any;
+          const sanitizedResponse = responseData && typeof responseData === 'object' 
+            ? { ...responseData } 
+            : responseData;
+          
+          if (sanitizedResponse && sanitizedResponse.fieldData && typeof sanitizedResponse.fieldData === 'object') {
+            const sanitizedFieldData = { ...sanitizedResponse.fieldData };
+            // Remove large content fields that aren't needed by the LLM
+            delete sanitizedFieldData['post-body'];
+            delete sanitizedFieldData['body'];
+            sanitizedResponse.fieldData = sanitizedFieldData;
+          }
+          
           return {
             success: true,
             message: 'Blog article published successfully to Webflow',
             data: {
               title,
               cmsType: 'Webflow',
-              cmsResponse: response.data
+              cmsResponse: sanitizedResponse
             }
           };
         } catch (webflowError: any) {
