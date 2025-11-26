@@ -5972,8 +5972,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
         imageFilename = urlParts[urlParts.length - 1];
       }
       
-      console.log('AgentMode: Extracted body HTML, length:', bodyHtml.length);
-      
       // Step 3: Get user's CMS type
       const { userDb } = await import('./db');
       const user = await userDb.getUserById(userId);
@@ -6029,35 +6027,70 @@ Use the available tools to create tasks in the agent-engine when complex work is
           cmsItemData.fieldData[fieldMappings.image] = heroImageUrl;
         }
 
-        // Log a sample of the HTML being sent (first 500 chars) to debug
-        console.log('AgentMode: Sending HTML to Webflow (first 500 chars):', cleanBodyHtml.substring(0, 500));
-        console.log('AgentMode: HTML contains <ul> tags:', cleanBodyHtml.includes('<ul>'));
-        console.log('AgentMode: HTML contains <li> tags:', cleanBodyHtml.includes('<li>'));
-
         const headers = {
           Authorization: `Bearer ${apiToken}`,
           'Content-Type': 'application/json',
           'accept-version': '2.0.0'
         };
 
-        const response = await axios.post(
-          `https://api.webflow.com/v2/sites/${siteId}/collections/${collectionId}/items`,
-          cmsItemData,
-          { headers }
-        );
+        try {
+          const response = await axios.post(
+            `https://api.webflow.com/v2/sites/${siteId}/collections/${collectionId}/items`,
+            cmsItemData,
+            { headers }
+          );
 
-        console.log('AgentMode: Blog article published successfully to Webflow');
-        
-        return {
-          success: true,
-          message: 'Blog article published successfully to Webflow',
-          formattedContent: `Blog article "${title}" published successfully to Webflow CMS.`,
-          data: {
-            title,
-            cmsType: 'Webflow',
-            cmsResponse: response.data
+          console.log('AgentMode: Blog article published successfully to Webflow');
+          
+          return {
+            success: true,
+            message: 'Blog article published successfully to Webflow',
+            data: {
+              title,
+              cmsType: 'Webflow',
+              cmsResponse: response.data
+            }
+          };
+        } catch (webflowError: any) {
+          // Extract detailed error information
+          const errorInfo: any = {
+            status: webflowError.response?.status,
+            statusText: webflowError.response?.statusText,
+          };
+
+          if (webflowError.response?.data) {
+            const errorData = webflowError.response.data;
+            
+            if (errorData.message) {
+              errorInfo.message = errorData.message;
+            }
+
+            // Extract validation error details
+            if (errorData.details && Array.isArray(errorData.details)) {
+              errorInfo.details = errorData.details;
+              const detailMessages = errorData.details
+                .map((d: any) => `${d.param}: ${d.description}`)
+                .join('; ');
+              if (detailMessages) {
+                errorInfo.message = `${errorInfo.message || 'Validation Error'}. ${detailMessages}`;
+              }
+            }
           }
-        };
+
+          // Log concise error summary
+          if (errorInfo.details && errorInfo.details.length > 0) {
+            const errorDetails = errorInfo.details
+              .map((d: any) => `${d.param}: ${d.description}`)
+              .join(', ');
+            console.error(`AgentMode: Webflow API error (${errorInfo.status}): ${errorDetails}`);
+          } else {
+            console.error(`AgentMode: Webflow API error (${errorInfo.status}): ${errorInfo.message}`);
+          }
+          
+          // Create a more user-friendly error message
+          const errorMessage = errorInfo.message || `Webflow API error: ${errorInfo.status} ${errorInfo.statusText}`;
+          throw new Error(errorMessage);
+        }
       } else if (cmsType === 'Basehub') {
         return {
           success: false,
@@ -6073,9 +6106,34 @@ Use the available tools to create tasks in the agent-engine when complex work is
       }
     } catch (error: any) {
       console.error('AgentMode: Error publishing blog article:', error);
+      
+      // Extract detailed error information for better user feedback
+      let errorMessage = error.message || 'Failed to publish blog article';
+      
+      if (error.response?.data) {
+        const errorData = error.response.data;
+        
+        // Extract validation error details
+        if (errorData.details && Array.isArray(errorData.details)) {
+          const detailMessages = errorData.details
+            .map((d: any) => {
+              if (d.param && d.description) {
+                return `${d.param}: ${d.description}`;
+              }
+              return JSON.stringify(d);
+            })
+            .join('; ');
+          if (detailMessages) {
+            errorMessage = `Webflow validation error: ${detailMessages}`;
+          }
+        } else if (errorData.message) {
+          errorMessage = errorData.message;
+        }
+      }
+      
       return {
         success: false,
-        message: 'Failed to publish blog article',
+        message: errorMessage,
         error: error.message || 'Unknown error'
       };
     }
