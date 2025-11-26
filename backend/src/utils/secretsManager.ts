@@ -28,6 +28,30 @@ export async function getSecret(secretName: string): Promise<string> {
 }
 
 /**
+ * Check if a secret exists in AWS Secrets Manager
+ * @param secretName - The name of the secret to check
+ * @returns true if the secret exists, false if not
+ */
+export async function secretExists(secretName: string): Promise<boolean> {
+  try {
+    // Try to get the secret value - if it exists, this will succeed
+    await secretsManager.getSecretValue({
+      SecretId: secretName
+    }).promise();
+    return true;
+  } catch (error: any) {
+    // If the secret is not found, AWS throws a ResourceNotFoundException
+    if (error.code === 'ResourceNotFoundException') {
+      return false;
+    }
+    // For other errors, log but don't throw - let the caller try getSecret which will handle it properly
+    console.log(`Error checking existence of secret ${secretName}:`, error.code || error.message || error);
+    // Return false to fall back to base secret, rather than throwing
+    return false;
+  }
+}
+
+/**
  * Get Meta API access token from Secrets Manager
  * @returns The Meta access token as a string
  */

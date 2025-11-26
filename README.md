@@ -681,11 +681,16 @@ BaseHub configuration is stored in AWS Secrets Manager:
 
 #### Webflow CMS Configuration
 
-Webflow configuration is stored in AWS Secrets Manager:
+Webflow configuration is stored in AWS Secrets Manager. You can configure either:
 
-**For Development:**
+- A **global secret** (used when no per-user config is defined)
+- A **per-user secret** for each user (recommended for multi-tenant setups)
+
+**Global Configuration (fallback when no user-specific secret is used):**
+
+**For Development (global):**
 - Secret Name: `dev/AgentWeb/Webflow`
-- Secret Value (JSON format):
+- Secret Value (JSON format, shared across all users who don’t have their own Webflow config):
 ```json
 {
   "apiToken": "your_webflow_api_token",
@@ -694,9 +699,9 @@ Webflow configuration is stored in AWS Secrets Manager:
 }
 ```
 
-**For Production:**
+**For Production (global):**
 - Secret Name: `prod/AgentWeb/Webflow`
-- Secret Value (JSON format):
+- Secret Value (JSON format, shared across all users who don’t have their own Webflow config):
 ```json
 {
   "apiToken": "your_webflow_api_token",
@@ -704,6 +709,36 @@ Webflow configuration is stored in AWS Secrets Manager:
   "collectionId": "your_webflow_collection_id"
 }
 ```
+
+**Per-User Webflow Configuration (preferred):**
+
+When a user has `CMS Type = Webflow`, you can give them their **own** Webflow site/collection by creating a per-user secret. In this case, the backend will **require** the per-user secret and will **not** fall back to the global one.
+
+- Secret name pattern (Development):  
+  `dev/AgentWeb/Webflow/<user_id>`
+
+- Secret name pattern (Production):  
+  `prod/AgentWeb/Webflow/<user_id>`
+
+Example per-user secret value:
+
+```json
+{
+  "apiToken": "user_specific_webflow_api_token",
+  "siteId": "user_specific_webflow_site_id",
+  "collectionId": "user_specific_webflow_collection_id",
+  "fieldMappings": {
+    "summary": "post-summary",
+    "body": "post-body",
+    "image": "main-image",
+    "publishDate": null
+  }
+}
+```
+
+Notes:
+- When a `userId` is provided, the backend will **only** read from `dev/AgentWeb/Webflow/<user_id>` or `prod/AgentWeb/Webflow/<user_id>` and will **not** fall back to the global secret.
+- When no `userId` is provided (legacy flows), the global secret (`dev/AgentWeb/Webflow` or `prod/AgentWeb/Webflow`) is used.
 
 **How to get Webflow credentials:**
 

@@ -62,7 +62,11 @@ export async function getBaseHubConfig(): Promise<{
 }
 
 // Function to get Webflow configuration from Secrets Manager
-export async function getWebflowConfig(): Promise<{
+// Supports per-user secrets when userId is provided:
+// - Per-user secret: dev/AgentWeb/Webflow/<userId> or prod/AgentWeb/Webflow/<userId>
+// If the per-user secret does not exist, falls back to the global secret:
+// - Global secret:   dev/AgentWeb/Webflow or prod/AgentWeb/Webflow
+export async function getWebflowConfig(userId?: string): Promise<{
   apiToken: string;
   siteId: string;
   collectionId: string;
@@ -74,12 +78,34 @@ export async function getWebflowConfig(): Promise<{
   };
 }> {
   try {
-    const secretName = process.env.NODE_ENV === "development" 
+    console.log('getWebflowConfig called with userId:', userId);
+
+    const baseSecretName = process.env.NODE_ENV === "development" 
       ? "dev/AgentWeb/Webflow" 
       : "prod/AgentWeb/Webflow";
-    
-    const { getSecret } = await import("../utils/secretsManager");
-    const configJson = await getSecret(secretName);
+
+    const { getSecret, secretExists } = await import("../utils/secretsManager");
+    let configJson: string;
+
+    // When a userId is provided, prefer a per-user secret; if it doesn't exist, fall back to global
+    if (userId) {
+      const userSecretName = `${baseSecretName}/${userId}`;
+      const hasUserSecret = await secretExists(userSecretName);
+      if (hasUserSecret) {
+        configJson = await getSecret(userSecretName);
+        console.log(`Using per-user Webflow config from Secrets Manager: ${userSecretName}`);
+      } else {
+        console.log(
+          `Per-user Webflow config not found for user ${userId} at ${userSecretName}, using global secret ${baseSecretName}`,
+        );
+        configJson = await getSecret(baseSecretName);
+      }
+    } else {
+      console.log(
+        `No user ID provided, using global secret ${baseSecretName}`,
+      );
+      configJson = await getSecret(baseSecretName);
+    }
     
     const config = JSON.parse(configJson);
     
@@ -98,9 +124,15 @@ export async function getWebflowConfig(): Promise<{
         publishDate: undefined, // Optional - only include if field exists in collection
       }
     };
-  } catch (error) {
-    console.error("Error fetching Webflow configuration from Secrets Manager:", error);
-    throw new Error("Failed to fetch Webflow configuration from Secrets Manager");
+  } catch (error: any) {
+    // IMPORTANT: use console.log so it shows up in the same stream as other logs
+    console.log("Error fetching Webflow configuration from Secrets Manager:", error);
+    const details =
+      (error && (error.code || error.message)) ||
+      (typeof error === "string" ? error : JSON.stringify(error));
+    throw new Error(
+      `Failed to fetch Webflow configuration from Secrets Manager: ${details}`,
+    );
   }
 }
 
@@ -893,7 +925,13 @@ async function publishToWebflow(
   imageUrl: string | undefined,
   userId: string
 ): Promise<any> {
-  const { apiToken, siteId, collectionId, fieldMappings } = await getWebflowConfig();
+  console.log('publishToWebflow called with:', {
+    userId,
+    titleSnippet: title?.substring(0, 60),
+    hasImage: !!imageUrl,
+  });
+
+  const { apiToken, siteId, collectionId, fieldMappings } = await getWebflowConfig(userId);
 
   // Convert markdown content to HTML
   const processor = remark()

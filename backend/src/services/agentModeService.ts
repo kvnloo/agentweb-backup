@@ -5996,7 +5996,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       // Only Webflow is supported for publish_blog_article function
       if (cmsType === 'Webflow') {
         const { getWebflowConfig } = await import('../controllers/blog');
-        const { apiToken, siteId, collectionId, fieldMappings } = await getWebflowConfig();
+        const { apiToken, siteId, collectionId, fieldMappings } = await getWebflowConfig(userId);
         
         // Call Webflow publishing
         const axios = (await import('axios')).default;
