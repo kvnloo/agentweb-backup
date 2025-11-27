@@ -8558,7 +8558,10 @@ ${existingContentText}
 
 Instructions: Use the existing content above as a foundation, and enhance or expand it based on the content description. Maintain consistency with the existing style and structure while incorporating the new requirements.` : 'Instructions: Create comprehensive, well-structured content from scratch based on the content description.'}
 
-Format the response as valid markdown content. Do not include a title in the content (the title is already provided above). Start directly with the main content.`;
+Format the response as JSON with this structure:
+{
+  "content": "Full content in markdown format. Do not include a title in the content (the title is already provided above). Start directly with the main content."
+}`;
 
       // Generate content using OpenAI
       const completion = await this.openai.chat.completions.create({
@@ -8566,21 +8569,36 @@ Format the response as valid markdown content. Do not include a title in the con
         messages: [
           {
             role: "system",
-            content: `You are a seasoned content writer specializing in ${book.type === 'book' ? 'books' : 'white papers'}. Write naturally, avoid AI patterns, and focus on providing comprehensive, well-structured content. Always respond with valid markdown content. ${book.language === '中文' ? 'Write in Chinese (中文).' : 'Write in English.'}`
+            content: `You are a seasoned content writer specializing in ${book.type === 'book' ? 'books' : 'white papers'}. Write naturally, avoid AI patterns, and focus on providing comprehensive, well-structured content. Always respond with valid JSON. ${book.language === '中文' ? 'Write in Chinese (中文).' : 'Write in English.'}`
           },
           { role: "user", content: contentPrompt }
         ],
         temperature: 0.8,
-        max_tokens: 4000, // Allow enough tokens for long content
+        max_tokens: 4000 // Allow enough tokens for long content
       });
 
-      const generatedContent = completion.choices[0].message.content;
-      if (!generatedContent) {
+      const responseContent = completion.choices[0].message.content;
+      if (!responseContent) {
         throw new Error("No content generated from LLM");
       }
 
-      // Clean up the content (remove any JSON wrapper if present)
-      let finalContent = generatedContent.trim();
+      // Parse the JSON response
+      let contentData;
+      try {
+        const cleanedContent = responseContent.replace(/```json\s*|\s*```/g, "").trim();
+        contentData = JSON.parse(cleanedContent);
+      } catch (parseError) {
+        // Return parse error instead of fallback
+        const errorMessage = parseError instanceof Error ? parseError.message : 'Unknown JSON parse error';
+        throw new Error(`Failed to parse JSON response: ${errorMessage}. Response: ${responseContent.substring(0, 200)}`);
+      }
+
+      // Extract content from JSON
+      if (!contentData.content) {
+        throw new Error('JSON response missing "content" field');
+      }
+      let finalContent = contentData.content;
+      finalContent = finalContent.trim();
       // Remove markdown code blocks if present
       finalContent = finalContent.replace(/^```markdown\s*|\s*```$/g, '').trim();
       finalContent = finalContent.replace(/^```\s*|\s*```$/g, '').trim();
@@ -8597,7 +8615,7 @@ Format the response as valid markdown content. Do not include a title in the con
       );
 
       // Count words (approximate)
-      const wordCountActual = finalContent.split(/\s+/).filter(word => word.length > 0).length;
+      const wordCountActual = finalContent.split(/\s+/).filter((word: string) => word.length > 0).length;
 
       return {
         success: true,
