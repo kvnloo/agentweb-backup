@@ -6202,7 +6202,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       // Step 3: Generate HTML file using existing blog.ts utility function
       console.log('AgentMode: Generating HTML file with style:', style);
       const { generateBlogHtml } = await import('../controllers/blog');
-      const htmlContent = generateBlogHtml(blogData.title, blogData.description, blogData.content, imageData.imageUrl, style);
+      const htmlContent = await generateBlogHtml(blogData.title, blogData.description, blogData.content, imageData.imageUrl, style);
       
       // Step 4: Upload HTML file to S3
       console.log('AgentMode: Uploading HTML file to S3...');

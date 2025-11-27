@@ -4,10 +4,7 @@ import OpenAI from "openai";
 import axios from "axios";
 import AWS from "aws-sdk";
 import { v4 as uuidv4 } from "uuid";
-import { remark } from 'remark';
-import remarkHtml from 'remark-html';
-import remarkGfm from 'remark-gfm';
-import remarkBreaks from 'remark-breaks';
+// remark and its plugins are ES modules, will be imported dynamically
 
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
@@ -354,14 +351,20 @@ export async function generateBlogImage(
 
 
 // Utility function to generate HTML from blog content
-export function generateBlogHtml(
+export async function generateBlogHtml(
   title: string,
   description: string,
   content: string,
   imageUrl: string,
   style: string = 'default'
-): string {
+): Promise<string> {
   // Convert markdown content to HTML using remark with enhanced plugins
+  // Use dynamic import for ES modules
+  const { remark } = await import('remark');
+  const remarkHtml = (await import('remark-html')).default;
+  const remarkGfm = (await import('remark-gfm')).default;
+  const remarkBreaks = (await import('remark-breaks')).default;
+  
   const processor = remark()
     .use(remarkGfm) // GitHub Flavored Markdown support (tables, strikethrough, etc.)
     .use(remarkBreaks) // Convert line breaks to <br> tags
@@ -936,6 +939,12 @@ async function publishToWebflow(
   const { apiToken, siteId, collectionId, fieldMappings } = await getWebflowConfig(userId);
 
   // Convert markdown content to HTML
+  // Use dynamic import for ES modules
+  const { remark } = await import('remark');
+  const remarkHtml = (await import('remark-html')).default;
+  const remarkGfm = (await import('remark-gfm')).default;
+  const remarkBreaks = (await import('remark-breaks')).default;
+  
   const processor = remark()
     .use(remarkGfm)
     .use(remarkBreaks)

@@ -251,8 +251,8 @@ describe('Blog Controller - generateBlogContent', () => {
 
 describe('Blog Controller - generateBlogHtml', () => {
   describe('Style Parameter', () => {
-    it('should generate Substack-style HTML when style is "substack"', () => {
-      const html = generateBlogHtml(
+    it('should generate Substack-style HTML when style is "substack"', async () => {
+      const html = await generateBlogHtml(
         'Test Title',
         'Test description',
         '# Test Content\n\nThis is test content.',
@@ -269,8 +269,8 @@ describe('Blog Controller - generateBlogHtml', () => {
       expect(html).toContain('Published on'); // Date format
     });
 
-    it('should generate default-style HTML when style is "default"', () => {
-      const html = generateBlogHtml(
+    it('should generate default-style HTML when style is "default"', async () => {
+      const html = await generateBlogHtml(
         'Test Title',
         'Test description',
         '# Test Content\n\nThis is test content.',
@@ -285,8 +285,8 @@ describe('Blog Controller - generateBlogHtml', () => {
       expect(html).not.toContain('font-family: Georgia');
     });
 
-    it('should default to default style when style parameter is not provided', () => {
-      const html = generateBlogHtml(
+    it('should default to default style when style parameter is not provided', async () => {
+      const html = await generateBlogHtml(
         'Test Title',
         'Test description',
         '# Test Content',
@@ -301,8 +301,8 @@ describe('Blog Controller - generateBlogHtml', () => {
   });
 
   describe('HTML Structure', () => {
-    it('should include all required elements in Substack style', () => {
-      const html = generateBlogHtml(
+    it('should include all required elements in Substack style', async () => {
+      const html = await generateBlogHtml(
         'My Newsletter Article',
         'A personal take on the topic',
         '# Introduction\n\nThis is my story.',
@@ -317,8 +317,8 @@ describe('Blog Controller - generateBlogHtml', () => {
       expect(html).toContain('class="hero-image"');
     });
 
-    it('should include all required elements in default style', () => {
-      const html = generateBlogHtml(
+    it('should include all required elements in default style', async () => {
+      const html = await generateBlogHtml(
         'Blog Article',
         'A standard blog post',
         '# Content',
@@ -333,8 +333,8 @@ describe('Blog Controller - generateBlogHtml', () => {
   });
 
   describe('Image and Video Styling', () => {
-    it('should include CSS styling for images in Substack style', () => {
-      const html = generateBlogHtml(
+    it('should include CSS styling for images in Substack style', async () => {
+      const html = await generateBlogHtml(
         'Test Title',
         'Test description',
         '![Alt text](https://example.com/image.jpg)',
@@ -351,8 +351,8 @@ describe('Blog Controller - generateBlogHtml', () => {
       expect(html).toContain('margin: 32px 0');
     });
 
-    it('should include CSS styling for images in default style', () => {
-      const html = generateBlogHtml(
+    it('should include CSS styling for images in default style', async () => {
+      const html = await generateBlogHtml(
         'Test Title',
         'Test description',
         '![Alt text](https://example.com/image.jpg)',
@@ -370,8 +370,8 @@ describe('Blog Controller - generateBlogHtml', () => {
       expect(html).toContain('box-shadow: 0 2px 8px rgba(0,0,0,0.1)');
     });
 
-    it('should include CSS styling for iframes in Substack style', () => {
-      const html = generateBlogHtml(
+    it('should include CSS styling for iframes in Substack style', async () => {
+      const html = await generateBlogHtml(
         'Test Title',
         'Test description',
         'Content with iframe',
@@ -385,8 +385,8 @@ describe('Blog Controller - generateBlogHtml', () => {
       expect(html).toContain('min-height: 400px');
     });
 
-    it('should include CSS styling for iframes in default style', () => {
-      const html = generateBlogHtml(
+    it('should include CSS styling for iframes in default style', async () => {
+      const html = await generateBlogHtml(
         'Test Title',
         'Test description',
         'Content with iframe',
@@ -401,8 +401,8 @@ describe('Blog Controller - generateBlogHtml', () => {
       expect(html).toContain('box-shadow: 0 2px 8px rgba(0,0,0,0.1)');
     });
 
-    it('should include CSS styling for video tags in Substack style', () => {
-      const html = generateBlogHtml(
+    it('should include CSS styling for video tags in Substack style', async () => {
+      const html = await generateBlogHtml(
         'Test Title',
         'Test description',
         'Content with video',
@@ -416,8 +416,8 @@ describe('Blog Controller - generateBlogHtml', () => {
       expect(html).toContain('height: auto');
     });
 
-    it('should include CSS styling for video tags in default style', () => {
-      const html = generateBlogHtml(
+    it('should include CSS styling for video tags in default style', async () => {
+      const html = await generateBlogHtml(
         'Test Title',
         'Test description',
         'Content with video',
@@ -432,8 +432,8 @@ describe('Blog Controller - generateBlogHtml', () => {
       expect(html).toContain('box-shadow: 0 2px 8px rgba(0,0,0,0.1)');
     });
 
-    it('should style images and videos in both Substack and default styles', () => {
-      const substackHtml = generateBlogHtml(
+    it('should style images and videos in both Substack and default styles', async () => {
+      const substackHtml = await generateBlogHtml(
         'Test',
         'Desc',
         '![Image](https://example.com/img.jpg)',
@@ -441,7 +441,7 @@ describe('Blog Controller - generateBlogHtml', () => {
         'substack'
       );
 
-      const defaultHtml = generateBlogHtml(
+      const defaultHtml = await generateBlogHtml(
         'Test',
         'Desc',
         '![Image](https://example.com/img.jpg)',
