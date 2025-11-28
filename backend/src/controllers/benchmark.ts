@@ -335,6 +335,7 @@ export async function runBenchmarkTest(req: AuthenticatedRequest, res: Response)
         messageContent,
         sessionHistory,
         userId: test.userId, // Use the original user's ID
+        llmModel: llmName || 'gpt-5.1', // Use the provided LLM name or default to gpt-5.1
         sessionId: test.sessionId, // Use the original session ID
         mockMode: true // Enable mock mode for benchmark testing
       });
