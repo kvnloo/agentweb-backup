@@ -12,7 +12,7 @@ const agentModeService = new AgentModeService();
 process.on('message', async (message: any) => {
   try {
     if (message.type === 'generateMarketingResponse') {
-      const { messageContent, sessionHistory, userId, sessionId, mockMode } = message.params;
+      const { messageContent, sessionHistory, userId,llmModel, sessionId, mockMode } = message.params;
       
       // Progress callback to forward progress updates to parent process
       const onProgress = (progress: { iteration: number; status: string; toolCalls?: any[] }) => {
@@ -26,6 +26,7 @@ process.on('message', async (message: any) => {
         messageContent,
         sessionHistory,
         userId,
+        llmModel,
         sessionId,
         mockMode,
         onProgress

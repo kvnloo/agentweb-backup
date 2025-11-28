@@ -79,7 +79,7 @@ describe('AgentModeService - search_knowledge_base', () => {
       expect(params?.properties).toHaveProperty('query');
       expect(params?.properties).toHaveProperty('max_results');
       expect(params?.required).toContain('query');
-      
+
       expect(params?.properties?.query?.type).toBe('string');
       expect(params?.properties?.max_results?.type).toBe('number');
       expect(params?.properties?.max_results?.default).toBe(5);
@@ -104,6 +104,7 @@ describe('AgentModeService - search_knowledge_base', () => {
       mockSearchPlatformKnowledgeBase.mockResolvedValue(mockResults);
 
       const result = await (agentModeService as any).executeTool(
+        agentModeService.default_model,
         'search_knowledge_base',
         { query: 'test query', max_results: 5 },
         'user-123',
@@ -136,6 +137,7 @@ describe('AgentModeService - search_knowledge_base', () => {
       mockSearchPlatformKnowledgeBase.mockResolvedValue(mockResults);
 
       await (agentModeService as any).executeTool(
+        agentModeService.default_model,
         'search_knowledge_base',
         { query: 'test query' },
         'user-123',
@@ -151,6 +153,7 @@ describe('AgentModeService - search_knowledge_base', () => {
       mockSearchPlatformKnowledgeBase.mockResolvedValue(mockResults);
 
       await (agentModeService as any).executeTool(
+        agentModeService.default_model,
         'search_knowledge_base',
         { query: 'test query', max_results: 20 },
         'user-123',

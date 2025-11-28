@@ -10,6 +10,7 @@ interface GenerateMarketingResponseParams {
   messageContent: string;
   sessionHistory: any[];
   userId: string;
+  llmModel: string;
   sessionId: string;
   mockMode?: boolean;
 }

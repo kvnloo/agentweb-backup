@@ -45,11 +45,11 @@ jest.mock('aws-sdk', () => ({
 
 describe('AgentModeService - generateMarketingResponse', () => {
   let agentModeService: AgentModeService;
-  let mockOpenAI: any;
+  let llmCallSpy: jest.SpyInstance;
 
   beforeEach(() => {
     jest.clearAllMocks();
-    
+
     // Mock chatbotDb
     (chatbotDb.getChatSession as jest.Mock) = jest.fn().mockResolvedValue({
       sessionId: 'test-session',
@@ -57,29 +57,29 @@ describe('AgentModeService - generateMarketingResponse', () => {
       messages: [],
       workPlan: null
     });
-    
+
     (chatbotDb.addMessageToSession as jest.Mock) = jest.fn().mockResolvedValue({});
     (chatbotDb.incrementCalledFunctions as jest.Mock) = jest.fn().mockResolvedValue({});
-    
+
     // Mock settingsService.getSetting (used by getMarketingSystemPrompt)
     (settingsService.getSetting as jest.Mock) = jest.fn().mockResolvedValue(null);
-    
+
     // Create service instance
     agentModeService = new AgentModeService();
-    
-    // Get the OpenAI client from the service
-    mockOpenAI = (agentModeService as any).openai;
+
+    // Spy on llm_call method
+    llmCallSpy = jest.spyOn(agentModeService as any, 'llm_call');
   });
 
   describe('generateMarketingResponse', () => {
     it('should process LLM calls and tool calls correctly', async () => {
-      // Mock OpenAI to simulate multiple LLM calls with tool calls
+      // Mock llm_call to simulate multiple LLM calls with tool calls
       let callCount = 0;
-      mockOpenAI.chat.completions.create = jest.fn().mockImplementation(async () => {
+      llmCallSpy.mockImplementation(async () => {
         callCount++;
         // Simulate a delay to represent a real LLM call
         await new Promise(resolve => setTimeout(resolve, 10));
-        
+
         if (callCount === 1) {
           // First call returns with tool calls
           return {
@@ -113,12 +113,13 @@ describe('AgentModeService - generateMarketingResponse', () => {
       (agentModeService as any).executeTool = jest.fn().mockResolvedValue({
         formattedContent: 'Tool result'
       });
-      
+
       // Call generateMarketingResponse
       const result = await agentModeService.generateMarketingResponse(
         'Test message',
         [],
         'test-user',
+        agentModeService.default_model,
         'test-session'
       );
 
@@ -128,11 +129,11 @@ describe('AgentModeService - generateMarketingResponse', () => {
     });
 
     it('should handle long-running LLM calls', async () => {
-      // Mock OpenAI to simulate a long-running LLM call
-      mockOpenAI.chat.completions.create = jest.fn().mockImplementation(async () => {
+      // Mock llm_call to simulate a long-running LLM call
+      llmCallSpy.mockImplementation(async () => {
         // Simulate a longer delay
         await new Promise(resolve => setTimeout(resolve, 50));
-        
+
         return {
           choices: [{
             message: {
@@ -148,6 +149,7 @@ describe('AgentModeService - generateMarketingResponse', () => {
         'Test message',
         [],
         'test-user',
+        agentModeService.default_model,
         'test-session'
       );
 
@@ -156,12 +158,12 @@ describe('AgentModeService - generateMarketingResponse', () => {
     });
 
     it('should handle multiple loop iterations with tool calls', async () => {
-      // Mock OpenAI to return multiple iterations with tool calls
+      // Mock llm_call to return multiple iterations with tool calls
       let iteration = 0;
-      mockOpenAI.chat.completions.create = jest.fn().mockImplementation(async () => {
+      llmCallSpy.mockImplementation(async () => {
         iteration++;
         await new Promise(resolve => setTimeout(resolve, 5));
-        
+
         if (iteration < 3) {
           // First two iterations return tool calls
           return {
@@ -200,6 +202,7 @@ describe('AgentModeService - generateMarketingResponse', () => {
         'Test message',
         [],
         'test-user',
+        agentModeService.default_model,
         'test-session'
       );
 
@@ -209,8 +212,8 @@ describe('AgentModeService - generateMarketingResponse', () => {
     });
 
     it('should return correct response', async () => {
-      // Mock OpenAI to return a simple response
-      mockOpenAI.chat.completions.create = jest.fn().mockResolvedValue({
+      // Mock llm_call to return a simple response
+      llmCallSpy.mockResolvedValue({
         choices: [{
           message: {
             content: 'Test response content',
@@ -223,6 +226,7 @@ describe('AgentModeService - generateMarketingResponse', () => {
         'Test message',
         [],
         'test-user',
+        agentModeService.default_model,
         'test-session'
       );
 
@@ -234,8 +238,8 @@ describe('AgentModeService - generateMarketingResponse', () => {
     });
 
     it('should handle tool calls correctly', async () => {
-      // Mock OpenAI to return tool calls
-      mockOpenAI.chat.completions.create = jest.fn()
+      // Mock llm_call to return tool calls
+      llmCallSpy
         .mockResolvedValueOnce({
           choices: [{
             message: {
@@ -268,11 +272,13 @@ describe('AgentModeService - generateMarketingResponse', () => {
         'Test message',
         [],
         'test-user',
+        agentModeService.default_model,
         'test-session'
       );
 
       // Verify tool was executed
       expect((agentModeService as any).executeTool).toHaveBeenCalledWith(
+        agentModeService.default_model,
         'search_knowledge_base',
         { query: 'test query' },
         'test-user',
@@ -289,8 +295,8 @@ describe('AgentModeService - generateMarketingResponse', () => {
 
   describe('Tool execution', () => {
     it('should execute tools correctly', async () => {
-      // Mock OpenAI to return tool calls
-      mockOpenAI.chat.completions.create = jest.fn()
+      // Mock llm_call to return tool calls
+      llmCallSpy
         .mockResolvedValueOnce({
           choices: [{
             message: {
@@ -324,17 +330,18 @@ describe('AgentModeService - generateMarketingResponse', () => {
         'Test message',
         [],
         'test-user',
+        agentModeService.default_model,
         'test-session'
       );
-      
+
       // Verify tool was executed
       expect((agentModeService as any).executeTool).toHaveBeenCalled();
       expect(result.content).toBe('Final response');
     });
 
     it('should handle tool execution errors', async () => {
-      // Mock OpenAI to return tool calls
-      mockOpenAI.chat.completions.create = jest.fn()
+      // Mock llm_call to return tool calls
+      llmCallSpy
         .mockResolvedValueOnce({
           choices: [{
             message: {
@@ -367,6 +374,7 @@ describe('AgentModeService - generateMarketingResponse', () => {
         'Test message',
         [],
         'test-user',
+        agentModeService.default_model,
         'test-session'
       );
 
@@ -377,8 +385,8 @@ describe('AgentModeService - generateMarketingResponse', () => {
 
   describe('Multiple tool calls', () => {
     it('should handle multiple tool executions', async () => {
-      // Mock OpenAI to return multiple tool calls
-      mockOpenAI.chat.completions.create = jest.fn()
+      // Mock llm_call to return multiple tool calls
+      llmCallSpy
         .mockResolvedValueOnce({
           choices: [{
             message: {
@@ -423,9 +431,10 @@ describe('AgentModeService - generateMarketingResponse', () => {
         'Test message',
         [],
         'test-user',
+        agentModeService.default_model,
         'test-session'
       );
-      
+
       // Verify both tools were executed
       expect((agentModeService as any).executeTool).toHaveBeenCalledTimes(2);
       expect(result.content).toBe('Final response');

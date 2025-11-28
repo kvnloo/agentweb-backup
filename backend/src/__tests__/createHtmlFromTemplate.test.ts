@@ -60,42 +60,15 @@ jest.mock('../utils/s3Utils', () => ({
   })
 }));
 
-// Mock OpenAI
-jest.mock('openai', () => ({
-  __esModule: true,
-  default: jest.fn(() => ({
-    chat: {
-      completions: {
-        create: jest.fn()
-      }
-    }
-  }))
-}));
+
 
 describe('AgentModeService - createHtmlFromTemplate', () => {
   let agentModeService: AgentModeService;
-  let mockOpenAI: any;
-  let mockAxios: any;
   let mockS3: any;
 
   beforeEach(() => {
     // Clear all mocks
     jest.clearAllMocks();
-
-    // Setup OpenAI mock
-    const OpenAI = require('openai').default;
-    mockOpenAI = {
-      chat: {
-        completions: {
-          create: jest.fn()
-        }
-      }
-    };
-    OpenAI.mockImplementation(() => mockOpenAI);
-
-    // Setup axios mock
-    const axios = require('axios');
-    mockAxios = axios;
 
     // Setup S3 mock
     const AWS = require('aws-sdk');
@@ -128,8 +101,8 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
         settingValue: JSON.stringify([mockTemplate])
       });
 
-      // Mock OpenAI response
-      mockOpenAI.chat.completions.create.mockResolvedValue({
+      // Mock llm_call to return a successful response
+      jest.spyOn(agentModeService as any, 'llm_call').mockResolvedValue({
         choices: [{
           message: {
             content: JSON.stringify({
@@ -147,7 +120,9 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
     });
 
     it('should create HTML from template with valid parameters', async () => {
+
       const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
         'test-template',
         { title: 'Test Title', content: 'Test Content' },
         {},
@@ -158,17 +133,21 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       expect(result.success).toBe(true);
       expect(result.s3_url).toBe('https://s3.amazonaws.com/bucket/test-template.html');
       expect(result.final_subject).toBe('Test Subject: Test Title');
-      expect(mockOpenAI.chat.completions.create).toHaveBeenCalledWith({
-        model: 'gpt-5-chat-2',
-        messages: expect.arrayContaining([
+      expect(agentModeService.llm_call).toHaveBeenCalledWith(
+        agentModeService.default_model,
+        expect.arrayContaining([
           expect.objectContaining({
             role: 'user',
             content: expect.stringContaining('You are a template engine')
           })
         ]),
-        temperature: 0.1,
-        response_format: { type: 'json_object' }
-      });
+        expect.objectContaining({
+          max_completion_tokens: 2000,
+          temperature: 0.1,
+          response_format: { type: 'json_object' }
+        })
+      );
+
     });
 
     it('should handle array variables correctly', async () => {
@@ -183,6 +162,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       });
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
         'test-template',
         { title: 'Test Title', content: 'Test Content' },
         { items: [{ item: 'Item 1' }, { item: 'Item 2' }] },
@@ -191,11 +171,12 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(mockOpenAI.chat.completions.create).toHaveBeenCalled();
+      expect(agentModeService.llm_call).toHaveBeenCalled();
     });
 
     it('should validate that all required variables are provided', async () => {
       const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
         'test-template',
         { title: 'Test Title' }, // Missing 'content'
         {},
@@ -210,6 +191,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
     it('should validate that no extra variables are provided', async () => {
       const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
         'test-template',
         { title: 'Test Title', content: 'Test Content', extra: 'Extra' },
         {},
@@ -233,6 +215,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       });
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
         'test-template',
         { title: 'Test Title', content: 'Test Content' },
         { items: 'not-an-array' }, // Should be array
@@ -250,6 +233,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       });
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
         'nonexistent-template',
         { title: 'Test Title', content: 'Test Content' },
         {},
@@ -261,10 +245,11 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       expect(result.message).toContain('Template \'nonexistent-template\' not found');
     });
 
-    it('should handle OpenAI API errors', async () => {
-      mockOpenAI.chat.completions.create.mockRejectedValue(new Error('OpenAI API error'));
+    it('should handle LLM API errors', async () => {
+      jest.spyOn(agentModeService as any, 'llm_call').mockRejectedValue(new Error('OpenAI API error'));
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
         'test-template',
         { title: 'Test Title', content: 'Test Content' },
         {},
@@ -277,15 +262,19 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
     });
 
     it('should handle invalid LLM response', async () => {
-      mockOpenAI.chat.completions.create.mockResolvedValue({
-        choices: [{
-          message: {
-            content: 'invalid-json-response'
+      jest.spyOn(agentModeService as any, 'llm_call').mockResolvedValue({
+        choices: [
+          {
+            message: {
+              content: 'invalid-json-response'
+            }
           }
-        }]
+        ]
       });
 
+
       const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
         'test-template',
         { title: 'Test Title', content: 'Test Content' },
         {},
@@ -298,7 +287,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
     });
 
     it('should handle missing final_html in LLM response', async () => {
-      mockOpenAI.chat.completions.create.mockResolvedValue({
+      jest.spyOn(agentModeService as any, 'llm_call').mockResolvedValue({
         choices: [{
           message: {
             content: JSON.stringify({
@@ -310,6 +299,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       });
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
         'test-template',
         { title: 'Test Title', content: 'Test Content' },
         {},
@@ -329,6 +319,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       });
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
         'test-template',
         { title: 'Test Title', content: 'Test Content' },
         {},
@@ -342,8 +333,9 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
     it('should include proper metadata in S3 upload', async () => {
       const { uploadFileToS3 } = require('../utils/s3Utils');
-      
+
       await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
         'test-template',
         { title: 'Test Title', content: 'Test Content' },
         {},
@@ -361,6 +353,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
     it('should handle undefined variable_values and array_variable_values', async () => {
       const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
         'test-template',
         undefined,
         undefined,
@@ -383,6 +376,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       });
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
         'test-template',
         { title: 'Test Title', content: 'Test Content' },
         {},
@@ -407,6 +401,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       });
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
         'test-template',
         { title: 'Test Title', content: 'Test Content' },
         {
@@ -418,7 +413,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(mockOpenAI.chat.completions.create).toHaveBeenCalled();
+      expect(agentModeService.llm_call).toHaveBeenCalled();
     });
 
     it('should handle empty array variables and prompt for placeholder text', async () => {
@@ -434,7 +429,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       });
 
       // Mock LLM response with placeholder for empty array
-      mockOpenAI.chat.completions.create.mockResolvedValue({
+      jest.spyOn(agentModeService as any, 'llm_call').mockResolvedValue({
         choices: [{
           message: {
             content: JSON.stringify({
@@ -446,6 +441,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       });
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
         'test-template',
         { title: 'Test Title', content: 'Test Content' },
         { features_n: [] }, // Empty array
@@ -454,14 +450,14 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       );
 
       expect(result.success).toBe(true);
-      
+
       // Verify the prompt includes empty array handling instructions
-      const callArgs = mockOpenAI.chat.completions.create.mock.calls[0][0];
-      expect(callArgs.messages[0].content).toContain('EMPTY ARRAY VARIABLES');
-      expect(callArgs.messages[0].content).toContain('remove the array variables from the HTML structure');
-      
+      const callArgs = (agentModeService.llm_call as jest.Mock).mock.calls[0];
+      expect(callArgs[1][0].content).toContain('EMPTY ARRAY VARIABLES');
+      expect(callArgs[1][0].content).toContain('remove the array variables from the HTML structure');
+
       // Verify the array variable values are passed as empty
-      expect(callArgs.messages[0].content).toContain('"features_n": []');
+      expect(callArgs[1][0].content).toContain('"features_n": []');
     });
 
     it('should handle partial empty array variables', async () => {
@@ -477,7 +473,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       });
 
       // Mock LLM response with one empty array handled
-      mockOpenAI.chat.completions.create.mockResolvedValue({
+      jest.spyOn(agentModeService as any, 'llm_call').mockResolvedValue({
         choices: [{
           message: {
             content: JSON.stringify({
@@ -489,6 +485,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       });
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
         'test-template',
         { title: 'Test Title', content: 'Test Content' },
         {
@@ -500,11 +497,11 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       );
 
       expect(result.success).toBe(true);
-      
+
       // Verify the prompt includes both populated and empty arrays
-      const callArgs = mockOpenAI.chat.completions.create.mock.calls[0][0];
-      expect(callArgs.messages[0].content).toContain('"features_n"');
-      expect(callArgs.messages[0].content).toContain('"links_n": []');
+      const callArgs = (agentModeService.llm_call as jest.Mock).mock.calls[0];
+      expect(callArgs[1][0].content).toContain('"features_n"');
+      expect(callArgs[1][0].content).toContain('"links_n": []');
     });
 
     it('should require array variables even if empty', async () => {
@@ -520,6 +517,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       });
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
         'test-template',
         { title: 'Test Title', content: 'Test Content' },
         {}, // Missing array variable entirely
