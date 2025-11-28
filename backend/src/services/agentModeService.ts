@@ -1064,7 +1064,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'update_book_content',
-          description: 'Update the markdown content for a specific section or chapter in a book using partial replacements. This function performs partial content updates only. For generating full content, use generate_book_content instead. IMPORTANT: Always use get_book_content first to retrieve the current content, then provide the exact old_content to replace.',
+          description: 'Update the markdown content for a specific section or chapter in a book using partial replacements. This function performs partial content updates only. For generating full content, use generate_book_content instead. IMPORTANT: Always use get_book_content first to retrieve the current content, then provide the exact old_content to replace. Note: Full content replacement will not work if the current content is empty - use generate_book_content to create new content instead.',
           parameters: {
             type: 'object',
             properties: {
@@ -6223,6 +6223,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       console.log('AgentMode: HTML file uploaded successfully to:', htmlUrl);
 
+      // Calculate word count from the content
+      const wordCount = blogData.content.split(/\s+/).filter((word: string) => word.length > 0).length;
+
       return {
         success: true,
         message: 'Blog article created successfully',
@@ -6230,7 +6233,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
           title: blogData.title,
           description: blogData.description,
           imageUrl: imageData.imageUrl,
-          htmlUrl: htmlUrl
+          htmlUrl: htmlUrl,
+          wordCount: wordCount
         }
       };
 
@@ -8559,40 +8563,19 @@ ${existingContentText}
 Instructions: Use the existing content above as a foundation, and enhance or expand it based on the content description. Maintain consistency with the existing style and structure while incorporating the new requirements.` : 'Instructions: Create comprehensive, well-structured content from scratch based on the content description.'}
 
 Format the response as JSON with this structure:
-{
+{{
   "content": "Full content in markdown format. Do not include a title in the content (the title is already provided above). Start directly with the main content."
-}`;
+}}`;
 
-      // Generate content using OpenAI
-      const completion = await this.openai.chat.completions.create({
-        model: process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4",
-        messages: [
-          {
-            role: "system",
-            content: `You are a seasoned content writer specializing in ${book.type === 'book' ? 'books' : 'white papers'}. Write naturally, avoid AI patterns, and focus on providing comprehensive, well-structured content. Always respond with valid JSON. ${book.language === '中文' ? 'Write in Chinese (中文).' : 'Write in English.'}`
-          },
-          { role: "user", content: contentPrompt }
-        ],
-        temperature: 0.8,
-        max_tokens: 4000 // Allow enough tokens for long content
-      });
-
-      const responseContent = completion.choices[0].message.content;
-      if (!responseContent) {
-        throw new Error("No content generated from LLM");
-      }
-
-      // Parse the JSON response
-      let contentData;
-      try {
-        const cleanedContent = responseContent.replace(/```json\s*|\s*```/g, "").trim();
-        contentData = JSON.parse(cleanedContent);
-      } catch (parseError) {
-        // Return parse error instead of fallback
-        const errorMessage = parseError instanceof Error ? parseError.message : 'Unknown JSON parse error';
-        throw new Error(`Failed to parse JSON response: ${errorMessage}. Response: ${responseContent.substring(0, 200)}`);
-      }
-
+      // Generate content using LangChain LLM service
+      const { createLLMService } = await import('../utils/llmService');
+      const llmService = createLLMService(undefined, 0.8, 4000);
+      
+      const systemPrompt = `You are a seasoned content writer specializing in ${book.type === 'book' ? 'books' : 'white papers'}. Write naturally, avoid AI patterns, and focus on providing comprehensive, well-structured content. Always respond with valid JSON. ${book.language === '中文' ? 'Write in Chinese (中文).' : 'Write in English.'}`;
+      
+      // Generate JSON content using LangChain
+      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt);
+      
       // Extract content from JSON
       if (!contentData.content) {
         throw new Error('JSON response missing "content" field');

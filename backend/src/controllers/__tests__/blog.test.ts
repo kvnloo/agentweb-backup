@@ -14,20 +14,13 @@ jest.mock('remark-html', () => ({}));
 jest.mock('remark-gfm', () => ({}));
 jest.mock('remark-breaks', () => ({}));
 
-// Mock OpenAI before importing blog module
-const mockCreate = jest.fn();
-jest.mock('openai', () => {
-  return {
-    __esModule: true,
-    default: jest.fn().mockImplementation(() => ({
-      chat: {
-        completions: {
-          create: mockCreate
-        }
-      }
-    }))
-  };
-});
+// Mock LangChain LLMService before importing blog module
+const mockGenerateJSONContent = jest.fn();
+jest.mock('../../utils/llmService', () => ({
+  createLLMService: jest.fn(() => ({
+    generateJSONContent: mockGenerateJSONContent
+  }))
+}));
 
 // Mock AWS SDK
 jest.mock('aws-sdk', () => ({
@@ -89,21 +82,15 @@ describe('Blog Controller - generateBlogContent', () => {
   describe('Style Parameter', () => {
     it('should include Substack-style guidelines when style is "substack"', async () => {
       const mockResponse = {
-        choices: [{
-          message: {
-            content: JSON.stringify({
-              title: 'My Personal Take on Test Topic',
-              description: 'A personal newsletter-style article',
-              content: '# My Experience\n\nI\'ve been thinking about this topic...',
-              imagePrompt: 'A personal, newsletter-style image'
-            })
-          }
-        }]
+        title: 'My Personal Take on Test Topic',
+        description: 'A personal newsletter-style article',
+        content: '# My Experience\n\nI\'ve been thinking about this topic...',
+        imagePrompt: 'A personal, newsletter-style image'
       };
 
-      mockCreate.mockResolvedValue(mockResponse as any);
+      mockGenerateJSONContent.mockResolvedValue(mockResponse);
 
-      await generateBlogContent(
+      const result = await generateBlogContent(
         'Test Topic',
         'keyword1',
         'conversational',
@@ -113,40 +100,38 @@ describe('Blog Controller - generateBlogContent', () => {
         'substack'
       );
 
-      // Verify OpenAI was called
-      expect(mockCreate).toHaveBeenCalled();
+      // Verify LLMService was called
+      expect(mockGenerateJSONContent).toHaveBeenCalled();
 
-      // Get the prompt that was sent
-      const callArgs = mockCreate.mock.calls[0];
-      const messages = callArgs[0].messages;
-      const userMessage = messages.find((m: any) => m.role === 'user');
+      // Get the prompts that were sent
+      const callArgs = mockGenerateJSONContent.mock.calls[0];
+      const systemPrompt = callArgs[0];
+      const userPrompt = callArgs[1];
 
-      // Verify Substack-style guidelines are included
-      expect(userMessage.content).toContain('Substack-Style Writing Guidelines');
-      expect(userMessage.content).toContain('newsletter-like tone');
-      expect(userMessage.content).toContain('first-person perspective');
-      expect(userMessage.content).toContain('engaging hook');
-      expect(userMessage.content).toContain('personal anecdotes');
-      expect(userMessage.content).toContain('Address the reader directly');
+      // Verify Substack-style guidelines are included in user prompt
+      expect(userPrompt).toContain('Substack-Style Writing Guidelines');
+      expect(userPrompt).toContain('newsletter-like tone');
+      expect(userPrompt).toContain('first-person perspective');
+      expect(userPrompt).toContain('engaging hook');
+      expect(userPrompt).toContain('personal anecdotes');
+      expect(userPrompt).toContain('Address the reader directly');
+
+      // Verify result
+      expect(result.title).toBe(mockResponse.title);
+      expect(result.content).toBe(mockResponse.content);
     });
 
     it('should not include Substack-style guidelines when style is "default"', async () => {
       const mockResponse = {
-        choices: [{
-          message: {
-            content: JSON.stringify({
-              title: 'Test Blog Title',
-              description: 'Test description',
-              content: '# Test Content',
-              imagePrompt: 'Test image prompt'
-            })
-          }
-        }]
+        title: 'Test Blog Title',
+        description: 'Test description',
+        content: '# Test Content',
+        imagePrompt: 'Test image prompt'
       };
 
-      mockCreate.mockResolvedValue(mockResponse as any);
+      mockGenerateJSONContent.mockResolvedValue(mockResponse);
 
-      await generateBlogContent(
+      const result = await generateBlogContent(
         'Test Topic',
         '',
         'professional',
@@ -156,37 +141,33 @@ describe('Blog Controller - generateBlogContent', () => {
         'default'
       );
 
-      // Verify OpenAI was called
-      expect(mockCreate).toHaveBeenCalled();
+      // Verify LLMService was called
+      expect(mockGenerateJSONContent).toHaveBeenCalled();
 
-      // Get the prompt that was sent
-      const callArgs = mockCreate.mock.calls[0];
-      const messages = callArgs[0].messages;
-      const userMessage = messages.find((m: any) => m.role === 'user');
+      // Get the prompts that were sent
+      const callArgs = mockGenerateJSONContent.mock.calls[0];
+      const userPrompt = callArgs[1];
 
       // Verify Substack-style guidelines are NOT included
-      expect(userMessage.content).not.toContain('Substack-Style Writing Guidelines');
-      expect(userMessage.content).not.toContain('newsletter-like tone');
-      expect(userMessage.content).not.toContain('first-person perspective');
+      expect(userPrompt).not.toContain('Substack-Style Writing Guidelines');
+      expect(userPrompt).not.toContain('newsletter-like tone');
+      expect(userPrompt).not.toContain('first-person perspective');
+
+      // Verify result
+      expect(result.title).toBe(mockResponse.title);
     });
 
     it('should default to "default" style when style parameter is not provided', async () => {
       const mockResponse = {
-        choices: [{
-          message: {
-            content: JSON.stringify({
-              title: 'Test Blog Title',
-              description: 'Test description',
-              content: '# Test Content',
-              imagePrompt: 'Test image prompt'
-            })
-          }
-        }]
+        title: 'Test Blog Title',
+        description: 'Test description',
+        content: '# Test Content',
+        imagePrompt: 'Test image prompt'
       };
 
-      mockCreate.mockResolvedValue(mockResponse as any);
+      mockGenerateJSONContent.mockResolvedValue(mockResponse);
 
-      await generateBlogContent(
+      const result = await generateBlogContent(
         'Test Topic',
         '',
         'professional',
@@ -196,34 +177,30 @@ describe('Blog Controller - generateBlogContent', () => {
         // style parameter not provided
       );
 
-      // Get the prompt that was sent
-      const callArgs = mockCreate.mock.calls[0];
-      const messages = callArgs[0].messages;
-      const userMessage = messages.find((m: any) => m.role === 'user');
+      // Get the prompts that were sent
+      const callArgs = mockGenerateJSONContent.mock.calls[0];
+      const userPrompt = callArgs[1];
 
       // Verify Substack-style guidelines are NOT included (default behavior)
-      expect(userMessage.content).not.toContain('Substack-Style Writing Guidelines');
+      expect(userPrompt).not.toContain('Substack-Style Writing Guidelines');
+
+      // Verify result
+      expect(result.title).toBe(mockResponse.title);
     });
   });
 
   describe('Parameter Passing', () => {
     it('should pass all parameters correctly to the prompt', async () => {
       const mockResponse = {
-        choices: [{
-          message: {
-            content: JSON.stringify({
-              title: 'Test Title',
-              description: 'Test description',
-              content: 'Test content',
-              imagePrompt: 'Test prompt'
-            })
-          }
-        }]
+        title: 'Test Title',
+        description: 'Test description',
+        content: 'Test content',
+        imagePrompt: 'Test prompt'
       };
 
-      mockCreate.mockResolvedValue(mockResponse as any);
+      mockGenerateJSONContent.mockResolvedValue(mockResponse);
 
-      await generateBlogContent(
+      const result = await generateBlogContent(
         'My Topic',
         'seo, keywords',
         'casual',
@@ -233,18 +210,20 @@ describe('Blog Controller - generateBlogContent', () => {
         'substack'
       );
 
-      const callArgs = mockCreate.mock.calls[0];
-      const messages = callArgs[0].messages;
-      const userMessage = messages.find((m: any) => m.role === 'user');
+      const callArgs = mockGenerateJSONContent.mock.calls[0];
+      const userPrompt = callArgs[1];
 
       // Verify all parameters are in the prompt
-      expect(userMessage.content).toContain('My Topic');
-      expect(userMessage.content).toContain('seo, keywords');
-      expect(userMessage.content).toContain('casual');
-      expect(userMessage.content).toContain('long');
-      expect(userMessage.content).toContain('Research context here');
-      expect(userMessage.content).toContain('Special requirements');
-      expect(userMessage.content).toContain('Substack-Style Writing Guidelines');
+      expect(userPrompt).toContain('My Topic');
+      expect(userPrompt).toContain('seo, keywords');
+      expect(userPrompt).toContain('casual');
+      expect(userPrompt).toContain('long');
+      expect(userPrompt).toContain('Research context here');
+      expect(userPrompt).toContain('Special requirements');
+      expect(userPrompt).toContain('Substack-Style Writing Guidelines');
+
+      // Verify result
+      expect(result.title).toBe(mockResponse.title);
     });
   });
 });
