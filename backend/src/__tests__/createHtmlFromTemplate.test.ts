@@ -101,8 +101,8 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
         settingValue: JSON.stringify([mockTemplate])
       });
 
-      // Mock llm_call to return a successful response
-      jest.spyOn(agentModeService as any, 'llm_call').mockResolvedValue({
+      // Mock callLLM to return a successful response
+      jest.spyOn(agentModeService as any, 'callLLM').mockResolvedValue({
         choices: [{
           message: {
             content: JSON.stringify({
@@ -133,7 +133,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       expect(result.success).toBe(true);
       expect(result.s3_url).toBe('https://s3.amazonaws.com/bucket/test-template.html');
       expect(result.final_subject).toBe('Test Subject: Test Title');
-      expect(agentModeService.llm_call).toHaveBeenCalledWith(
+      expect(agentModeService.callLLM).toHaveBeenCalledWith(
         agentModeService.default_model,
         expect.arrayContaining([
           expect.objectContaining({
@@ -142,7 +142,6 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
           })
         ]),
         expect.objectContaining({
-          max_completion_tokens: 2000,
           temperature: 0.1,
           response_format: { type: 'json_object' }
         })
@@ -171,7 +170,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(agentModeService.llm_call).toHaveBeenCalled();
+      expect(agentModeService.callLLM).toHaveBeenCalled();
     });
 
     it('should validate that all required variables are provided', async () => {
@@ -246,7 +245,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
     });
 
     it('should handle LLM API errors', async () => {
-      jest.spyOn(agentModeService as any, 'llm_call').mockRejectedValue(new Error('OpenAI API error'));
+      jest.spyOn(agentModeService as any, 'callLLM').mockRejectedValue(new Error('OpenAI API error'));
 
       const result = await (agentModeService as any).createHtmlFromTemplate(
         agentModeService.default_model,
@@ -262,7 +261,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
     });
 
     it('should handle invalid LLM response', async () => {
-      jest.spyOn(agentModeService as any, 'llm_call').mockResolvedValue({
+      jest.spyOn(agentModeService as any, 'callLLM').mockResolvedValue({
         choices: [
           {
             message: {
@@ -287,7 +286,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
     });
 
     it('should handle missing final_html in LLM response', async () => {
-      jest.spyOn(agentModeService as any, 'llm_call').mockResolvedValue({
+      jest.spyOn(agentModeService as any, 'callLLM').mockResolvedValue({
         choices: [{
           message: {
             content: JSON.stringify({
@@ -413,7 +412,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(agentModeService.llm_call).toHaveBeenCalled();
+      expect(agentModeService.callLLM).toHaveBeenCalled();
     });
 
     it('should handle empty array variables and prompt for placeholder text', async () => {
@@ -429,7 +428,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       });
 
       // Mock LLM response with placeholder for empty array
-      jest.spyOn(agentModeService as any, 'llm_call').mockResolvedValue({
+      jest.spyOn(agentModeService as any, 'callLLM').mockResolvedValue({
         choices: [{
           message: {
             content: JSON.stringify({
@@ -452,7 +451,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       expect(result.success).toBe(true);
 
       // Verify the prompt includes empty array handling instructions
-      const callArgs = (agentModeService.llm_call as jest.Mock).mock.calls[0];
+      const callArgs = (agentModeService.callLLM as jest.Mock).mock.calls[0];
       expect(callArgs[1][0].content).toContain('EMPTY ARRAY VARIABLES');
       expect(callArgs[1][0].content).toContain('remove the array variables from the HTML structure');
 
@@ -473,7 +472,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       });
 
       // Mock LLM response with one empty array handled
-      jest.spyOn(agentModeService as any, 'llm_call').mockResolvedValue({
+      jest.spyOn(agentModeService as any, 'callLLM').mockResolvedValue({
         choices: [{
           message: {
             content: JSON.stringify({
@@ -499,7 +498,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       expect(result.success).toBe(true);
 
       // Verify the prompt includes both populated and empty arrays
-      const callArgs = (agentModeService.llm_call as jest.Mock).mock.calls[0];
+      const callArgs = (agentModeService.callLLM as jest.Mock).mock.calls[0];
       expect(callArgs[1][0].content).toContain('"features_n"');
       expect(callArgs[1][0].content).toContain('"links_n": []');
     });

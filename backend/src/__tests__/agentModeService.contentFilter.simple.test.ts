@@ -20,8 +20,8 @@ describe('AgentModeService - Content Filtering Error Handling', () => {
 
   describe('Error handling in generateMarketingResponse', () => {
     it('should throw user-friendly error for content filtering', async () => {
-      // Mock llm_call to throw content filter error
-      jest.spyOn(agentModeService as any, 'llm_call').mockRejectedValue({
+      // Mock callLLM to throw content filter error
+      jest.spyOn(agentModeService as any, 'callLLM').mockRejectedValue({
         code: 'content_filter',
         status: 400,
         error: {
@@ -60,8 +60,8 @@ describe('AgentModeService - Content Filtering Error Handling', () => {
     });
 
     it('should throw user-friendly error for ResponsibleAIPolicyViolation', async () => {
-      // Mock llm_call to throw ResponsibleAIPolicyViolation error
-      jest.spyOn(agentModeService as any, 'llm_call').mockRejectedValue({
+      // Mock callLLM to throw ResponsibleAIPolicyViolation error
+      jest.spyOn(agentModeService as any, 'callLLM').mockRejectedValue({
         status: 400,
         error: {
           code: 'ResponsibleAIPolicyViolation',
@@ -99,8 +99,8 @@ describe('AgentModeService - Content Filtering Error Handling', () => {
     });
 
     it('should throw user-friendly error for general 400 errors', async () => {
-      // Mock llm_call to throw general 400 error
-      jest.spyOn(agentModeService as any, 'llm_call').mockRejectedValue({
+      // Mock callLLM to throw general 400 error
+      jest.spyOn(agentModeService as any, 'callLLM').mockRejectedValue({
         status: 400,
         message: 'Bad request'
       });
@@ -135,8 +135,8 @@ describe('AgentModeService - Content Filtering Error Handling', () => {
     });
 
     it('should throw user-friendly error for rate limiting', async () => {
-      // Mock llm_call to throw rate limiting error
-      jest.spyOn(agentModeService as any, 'llm_call').mockRejectedValue({
+      // Mock callLLM to throw rate limiting error
+      jest.spyOn(agentModeService as any, 'callLLM').mockRejectedValue({
         status: 429,
         message: 'Rate limit exceeded'
       });
@@ -171,8 +171,8 @@ describe('AgentModeService - Content Filtering Error Handling', () => {
     });
 
     it('should throw generic error for other errors', async () => {
-      // Mock llm_call to throw generic error
-      jest.spyOn(agentModeService as any, 'llm_call').mockRejectedValue(new Error('Something went wrong'));
+      // Mock callLLM to throw generic error
+      jest.spyOn(agentModeService as any, 'callLLM').mockRejectedValue(new Error('Something went wrong'));
 
       // Mock other required dependencies
       const mockDb = require('../services/db');
@@ -206,8 +206,8 @@ describe('AgentModeService - Content Filtering Error Handling', () => {
 
   describe('Error handling in generateSessionTitle', () => {
     it('should return default title for content filtering errors', async () => {
-      // Mock llm_call to throw content filter error
-      jest.spyOn(agentModeService as any, 'llm_call').mockRejectedValue({
+      // Mock callLLM to throw content filter error
+      jest.spyOn(agentModeService as any, 'callLLM').mockRejectedValue({
         code: 'content_filter',
         status: 400,
         error: {
@@ -222,8 +222,8 @@ describe('AgentModeService - Content Filtering Error Handling', () => {
     });
 
     it('should return default title for other errors', async () => {
-      // Mock llm_call to throw generic error
-      jest.spyOn(agentModeService as any, 'llm_call').mockRejectedValue(new Error('Network error'));
+      // Mock callLLM to throw generic error
+      jest.spyOn(agentModeService as any, 'callLLM').mockRejectedValue(new Error('Network error'));
 
       const result = await agentModeService.generateSessionTitle('Test message');
 
@@ -231,7 +231,7 @@ describe('AgentModeService - Content Filtering Error Handling', () => {
     });
 
     it('should return generated title on success', async () => {
-      jest.spyOn(agentModeService as any, 'llm_call').mockResolvedValue({
+      jest.spyOn(agentModeService as any, 'callLLM').mockResolvedValue({
         choices: [
           {
             message: {

@@ -48,7 +48,7 @@ export class AgentModeService {
     baseURL: process.env.GEMINI_BASE_URL,
   });
 
-  private llm_models: Record<string, LLMModelConfig> = {
+  private llmModels: Record<string, LLMModelConfig> = {
     // List openai models
     'gpt-5': { client: this.openai_client, supportsTemperature: false }, // Assuming gpt-5 does not support temperature
     'gpt-5.1': { client: this.openai_client, supportsTemperature: true },
@@ -57,7 +57,7 @@ export class AgentModeService {
   };
 
   async getSupportedModels() {
-    return Object.keys(this.llm_models);
+    return Object.keys(this.llmModels);
   }
   /**
    * Make an LLM call with the specified model and parameters
@@ -66,16 +66,17 @@ export class AgentModeService {
    * @param options - Optional parameters for the LLM call
    * @returns The LLM response
    */
-  async llm_call(
+
+
+  async callLLM(
     model: string,
     messages: any[],
     options?: LLMCallOptions
   ) {
-    console.log("inside llm_call, model", model);
-
+    
     // Validate that the model exists
-    if (!this.llm_models[model]) {
-      const availableModels = Object.keys(this.llm_models).join(', ');
+    if (!this.llmModels[model]) {
+      const availableModels = Object.keys(this.llmModels).join(', ');
       throw new Error(`Invalid model '${model}'. Available models: ${availableModels}`);
     }
 
@@ -106,11 +107,11 @@ export class AgentModeService {
     }
 
     // Only add temperature if model supports it and value is provided
-    if (this.llm_models[model].supportsTemperature && temperature !== null) {
+    if (this.llmModels[model].supportsTemperature && temperature !== null) {
       params.temperature = temperature;
     }
 
-    const res = await this.llm_models[model].client.chat.completions.create(params);
+    const res = await this.llmModels[model].client.chat.completions.create(params);
     return res;
   }
 
@@ -172,7 +173,7 @@ export class AgentModeService {
         }
 
         // Make LLM call
-        const response = await this.llm_call(llmModel, messages, {
+        const response = await this.callLLM(llmModel, messages, {
           tools: this.getAvailableTools(),
           tool_choice: 'auto',
           max_completion_tokens: 12384,
@@ -2422,7 +2423,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       ];
 
       // Call OpenAI Vision API using the same model as agent mode
-      const response = await this.llm_call(llmModel, messages, {
+      const response = await this.callLLM(llmModel, messages, {
         max_completion_tokens: 2000
       });
 
@@ -3670,7 +3671,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   async generateSessionTitle(userMessage: string): Promise<string> {
     try {
 
-      const response = await this.llm_call(this.default_model, [
+      const response = await this.callLLM(this.default_model, [
         {
           role: 'system',
           content: `You are a session title generator for AgentWeb's Agent Mode. Based on the user's first message, generate a concise, descriptive title (max 60 characters) that captures the main marketing topic or task. Return ONLY the title, nothing else.`
@@ -7320,7 +7321,7 @@ You must return a valid JSON object with exactly these two fields:
 
 IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
 
-      const substitutionResponse = await this.llm_call(llmModel, [
+      const substitutionResponse = await this.callLLM(llmModel, [
         {
           role: 'user',
           content: substitutionPrompt

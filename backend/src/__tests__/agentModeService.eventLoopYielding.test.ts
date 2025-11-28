@@ -67,13 +67,13 @@ describe('AgentModeService - generateMarketingResponse', () => {
     // Create service instance
     agentModeService = new AgentModeService();
 
-    // Spy on llm_call method
-    llmCallSpy = jest.spyOn(agentModeService as any, 'llm_call');
+    // Spy on callLLM method
+    llmCallSpy = jest.spyOn(agentModeService as any, 'callLLM');
   });
 
   describe('generateMarketingResponse', () => {
     it('should process LLM calls and tool calls correctly', async () => {
-      // Mock llm_call to simulate multiple LLM calls with tool calls
+      // Mock callLLM to simulate multiple LLM calls with tool calls
       let callCount = 0;
       llmCallSpy.mockImplementation(async () => {
         callCount++;
@@ -129,7 +129,7 @@ describe('AgentModeService - generateMarketingResponse', () => {
     });
 
     it('should handle long-running LLM calls', async () => {
-      // Mock llm_call to simulate a long-running LLM call
+      // Mock callLLMto simulate a long-running LLM call
       llmCallSpy.mockImplementation(async () => {
         // Simulate a longer delay
         await new Promise(resolve => setTimeout(resolve, 50));
@@ -158,7 +158,7 @@ describe('AgentModeService - generateMarketingResponse', () => {
     });
 
     it('should handle multiple loop iterations with tool calls', async () => {
-      // Mock llm_call to return multiple iterations with tool calls
+      // Mock callLLMto return multiple iterations with tool calls
       let iteration = 0;
       llmCallSpy.mockImplementation(async () => {
         iteration++;
@@ -212,7 +212,7 @@ describe('AgentModeService - generateMarketingResponse', () => {
     });
 
     it('should return correct response', async () => {
-      // Mock llm_call to return a simple response
+      // Mock callLLM to return a simple response
       llmCallSpy.mockResolvedValue({
         choices: [{
           message: {
@@ -238,7 +238,7 @@ describe('AgentModeService - generateMarketingResponse', () => {
     });
 
     it('should handle tool calls correctly', async () => {
-      // Mock llm_call to return tool calls
+      // Mock callLLM to return tool calls
       llmCallSpy
         .mockResolvedValueOnce({
           choices: [{
@@ -295,7 +295,7 @@ describe('AgentModeService - generateMarketingResponse', () => {
 
   describe('Tool execution', () => {
     it('should execute tools correctly', async () => {
-      // Mock llm_call to return tool calls
+      // Mock callLLM to return tool calls
       llmCallSpy
         .mockResolvedValueOnce({
           choices: [{
@@ -340,7 +340,7 @@ describe('AgentModeService - generateMarketingResponse', () => {
     });
 
     it('should handle tool execution errors', async () => {
-      // Mock llm_call to return tool calls
+      // Mock callLLM to return tool calls
       llmCallSpy
         .mockResolvedValueOnce({
           choices: [{
@@ -385,7 +385,7 @@ describe('AgentModeService - generateMarketingResponse', () => {
 
   describe('Multiple tool calls', () => {
     it('should handle multiple tool executions', async () => {
-      // Mock llm_call to return multiple tool calls
+      // Mock callLLM to return multiple tool calls
       llmCallSpy
         .mockResolvedValueOnce({
           choices: [{
