@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom';
-import { describe, it, expect, beforeEach, jest } from '@jest/globals';
+import { describe, it, expect, jest } from '@jest/globals';
 
 // Test the model selection and display logic for BenchmarksTab
 describe('BenchmarksTab - Model Selection', () => {
