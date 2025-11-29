@@ -54,6 +54,20 @@ export class GenerateMarketingResponseWorkerService {
         execArgv: execArgv.length > 0 ? execArgv : undefined
       });
 
+      // Forward stdout from worker to parent process
+      if (worker.stdout) {
+        worker.stdout.on('data', (data: Buffer) => {
+          process.stdout.write(`[Worker] ${data}`);
+        });
+      }
+
+      // Forward stderr from worker to parent process
+      if (worker.stderr) {
+        worker.stderr.on('data', (data: Buffer) => {
+          process.stderr.write(`[Worker] ${data}`);
+        });
+      }
+
       // Set a timeout for the worker (30 minutes max)
       const timeout = setTimeout(() => {
         worker.kill('SIGTERM');
