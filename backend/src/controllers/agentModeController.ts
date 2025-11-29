@@ -2413,12 +2413,12 @@ export const agentModeController = {
     }
   },
 
-  // Update session LLM model
+  // Update session LLM model (for authenticated users)
   async updateSessionLlmModel(req: AuthenticatedRequest, res: Response) {
     try {
       const { sessionId } = req.params;
       const { llmModel } = req.body;
-      const user = req.user as User;
+      const user = req.user;
 
       if (!llmModel) {
         return res.status(400).json({ error: 'llmModel is required' });
@@ -2441,6 +2441,43 @@ export const agentModeController = {
       res.json({ llmModel: updatedSession.llmModel });
     } catch (error) {
       console.error('AgentMode: Update session LLM model error:', error);
+      res.status(500).json({ error: 'Failed to update session LLM model' });
+    }
+  },
+
+  // Update session LLM model for shared conversation (with conversable token)
+  async updateSharedSessionLlmModel(req: Request, res: Response) {
+    try {
+      const { shareId } = req.params;
+      const { conversable } = req.query;
+      const { llmModel } = req.body;
+
+      if (!llmModel) {
+        return res.status(400).json({ error: 'llmModel is required' });
+      }
+
+      // Get the session to verify the conversable token
+      const session = await chatbotDb.getChatSession(shareId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Check if conversable sharing is active and token matches
+      if (!conversable) {
+        return res.status(401).json({ error: 'Conversable token required' });
+      }
+
+      const interactiveShare = session.interactiveShareMetadata;
+      if (!interactiveShare?.isActive || interactiveShare.token !== conversable) {
+        return res.status(401).json({ error: 'Invalid or expired conversable token' });
+      }
+
+      // Update the session's llmModel
+      const updatedSession = await chatbotDb.updateSessionLlmModel(shareId, llmModel);
+
+      res.json({ llmModel: updatedSession.llmModel });
+    } catch (error) {
+      console.error('AgentMode: Update shared session LLM model error:', error);
       res.status(500).json({ error: 'Failed to update session LLM model' });
     }
   },

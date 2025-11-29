@@ -163,7 +163,8 @@ describe('BenchmarkTestDb - Model Selection and Size Limit Handling', () => {
 
       // Verify retry update was called
       expect(mockDocClient.update).toHaveBeenCalledTimes(3);
-      expect(result.testHistory).toHaveLength(11); // 10 kept + 1 new
+      expect(result).toBeDefined();
+      expect(result!.testHistory).toHaveLength(11); // 10 kept + 1 new
     });
 
     it('should handle size limit error when test has less than 10 records', async () => {
@@ -228,7 +229,8 @@ describe('BenchmarkTestDb - Model Selection and Size Limit Handling', () => {
       const result = await benchmarkTestDb.addTestResult(testId, testResult);
 
       expect(mockDocClient.update).toHaveBeenCalledTimes(3);
-      expect(result.testHistory).toHaveLength(6); // 5 kept + 1 new
+      expect(result).toBeDefined();
+      expect(result!.testHistory).toHaveLength(6); // 5 kept + 1 new
     });
 
     it('should throw error if test not found during cleanup', async () => {

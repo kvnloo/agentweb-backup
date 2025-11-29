@@ -26,7 +26,7 @@ jest.mock('../services/generateMarketingResponseWorkerService', () => ({
 
 jest.mock('../utils/sseProgress', () => ({
   progressStore: {
-    delete: jest.fn(),
+    delete: jest.fn().mockReturnValue(true),
   },
 }));
 
@@ -79,7 +79,7 @@ describe('AgentModeController - ishare Model Selection', () => {
     mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
     mockAgentModeService.generateSessionTitle.mockResolvedValue('Generated Title');
     mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(mockResponse);
-    mockProgressStore.delete.mockReturnValue(undefined);
+    mockProgressStore.delete.mockReturnValue(true);
   });
 
   describe('getSharedConversation', () => {

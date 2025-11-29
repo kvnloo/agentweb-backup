@@ -39,6 +39,10 @@ router.post('/share/:shareId/generate', asyncHandler(agentModeController.generat
 // Generate response for interactive shared conversation (with conversable token)
 router.post('/ishare/:shareId/generate', asyncHandler(agentModeController.generateSharedResponse));
 
+// PATCH /api/agent-mode/ishare/:shareId/llm-model
+// Update session LLM model for interactive shared conversation (with conversable token)
+router.patch('/ishare/:shareId/llm-model', asyncHandler(agentModeController.updateSharedSessionLlmModel));
+
 // GET /api/agent-mode/ishare/:shareId/progress
 // SSE endpoint for progress updates (public, with conversable token)
 router.get('/ishare/:shareId/progress', asyncHandler(agentModeController.getProgressPublic));
@@ -95,7 +99,7 @@ router.get('/session/:sessionId', asyncHandler(agentModeController.getSession));
 
 // PATCH /api/agent-mode/session/:sessionId/llm-model
 // Update session LLM model
-router.patch('/session/:sessionId/llm-model', asyncHandler(agentModeController.updateSessionLlmModel));
+router.patch('/session/:sessionId/llm-model', asyncHandlerAuth(agentModeController.updateSessionLlmModel));
 
 // GET /api/agent-mode/function-calls
 // Get available function calls for benchmark tests
