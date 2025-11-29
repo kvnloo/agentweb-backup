@@ -145,6 +145,7 @@ export interface ChatSession {
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
   archives?: Record<string, boolean>; // Track archived assets by URL (key: assetUrl, value: true if archived)
   sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation"; // Type of session based on how it was created
+  llmModel?: string; // Selected LLM model for this session
 }
 
 // Interface for context chunks
@@ -1135,6 +1136,35 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session work plan:", error);
+      throw error;
+    }
+  }
+
+  async updateSessionLlmModel(
+    sessionId: string,
+    llmModel: string
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression:
+        "SET llmModel = :llmModel, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":llmModel": llmModel,
+        ":updatedAt": timestamp,
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating session LLM model:", error);
       throw error;
     }
   }

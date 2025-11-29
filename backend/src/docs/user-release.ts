@@ -7,6 +7,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-11-28',
+    changes: [
+      'Supported Multiple LLM Models for Agent Mode',
+      '- Users can now select from multiple LLM models (GPT-5 Chat 2, Gemini 3 Pro Preview) in Agent Mode',
+      '- Model selection is saved per session and persists across page reloads',
+      '- Scheduled chats support model selection and use the selected model when running',
+      '- Benchmark tests support model selection with model tracking in test history',
+      '- Interactive shared conversations (ishare) now respect the session\'s selected model',
+    ],
+  },
+  {
     date: '2025-11-26',
     changes: [
       'Added Webflow CMS Support for Blog Publishing',

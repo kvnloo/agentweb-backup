@@ -132,7 +132,7 @@ function evaluateScheduleResponse(
   // Evaluate keywords
   const keywordMatches: string[] = [];
   const keywordMisses: string[] = [];
-  
+
   expectedKeywords.forEach((keyword: string) => {
     if (actualResponse.toLowerCase().includes(keyword.toLowerCase())) {
       keywordMatches.push(keyword);
@@ -145,22 +145,22 @@ function evaluateScheduleResponse(
   const functionCallMatches: string[] = [];
   const functionCallMisses: string[] = [];
   const functionCallDetails: { [functionName: string]: { actual: number; required: number } } = {};
-  
+
   // Count actual function calls using a hash map
   const actualFunctionCallCounts: { [functionName: string]: number } = {};
   actualFunctionCalls.forEach((call: string) => {
     actualFunctionCallCounts[call] = (actualFunctionCallCounts[call] || 0) + 1;
   });
-  
+
   expectedFunctionCalls.forEach((expectedCall: string) => {
     const actualCount = actualFunctionCallCounts[expectedCall] || 0;
     const requiredCount = functionCallMinCalls[expectedCall] || 1; // Default to 1 if not specified
-    
+
     functionCallDetails[expectedCall] = {
       actual: actualCount,
       required: requiredCount
     };
-    
+
     if (actualCount >= requiredCount) {
       functionCallMatches.push(expectedCall);
     } else {
@@ -190,12 +190,12 @@ const filterMessagesForClient = (messages: any[]) => {
     if (message.role === 'tool') {
       return false;
     }
-    
+
     // Remove assistant messages that have tool calls
     if (message.role === 'assistant' && message.tool_calls && message.tool_calls.length > 0) {
       return false;
     }
-    
+
     return true;
   });
 };
@@ -208,7 +208,7 @@ function isLastRunOfDayForHourlySchedule(currentTime: Date, nextRunTime: Date): 
   const nextMonth = nextRunTime.getMonth();
   const currentYear = currentTime.getFullYear();
   const nextYear = nextRunTime.getFullYear();
-  
+
   // If the next run is on a different day, month, or year, this is the last run of the current day
   return nextDay !== currentDay || nextMonth !== currentMonth || nextYear !== currentYear;
 }
@@ -220,18 +220,18 @@ async function sendDailyDigestEmail(schedule: any, emailNotifications: string[])
     const today = new Date();
     const startOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate());
     const endOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
-    
+
     const runResults = await scheduleDb.getRunResults(schedule.scheduleId);
     const todaysResults = runResults.filter((result: any) => {
       const resultDate = new Date(result.createdAt);
       return resultDate >= startOfDay && resultDate < endOfDay;
     });
-    
+
     if (todaysResults.length === 0) {
       console.log(`No run results found for today for schedule ${schedule.scheduleName}`);
       return;
     }
-    
+
     // Send daily digest email
     await emailService.sendDailyDigestEmail(
       emailNotifications,
@@ -239,7 +239,7 @@ async function sendDailyDigestEmail(schedule: any, emailNotifications: string[])
       todaysResults,
       schedule.scheduleId
     );
-    
+
     console.log(`Daily digest email sent for schedule ${schedule.scheduleName} with ${todaysResults.length} results`);
   } catch (error) {
     console.error(`Error sending daily digest email for schedule ${schedule.scheduleName}:`, error);
@@ -258,6 +258,7 @@ async function runVerifiedChat(
     requiredFunctions: Array<{ functionName: string; minCount: number }>;
     maxAttempts?: number;
     attachments?: any[];
+    llmModel?: string;
   }
 ): Promise<{
   success: boolean;
@@ -289,7 +290,7 @@ async function runVerifiedChat(
   let attempt = 0;
   let allContent = '';
   const allToolCalls: any[] = [];
-  
+
   // Track remaining keywords and function calls
   let remainingKeywords = [...keywords];
   const remainingFunctionCallCounts: Record<string, number> = {};
@@ -347,6 +348,7 @@ async function runVerifiedChat(
         sessionId,
         userMessage,
         userId,
+        params.llmModel || agentModeService.default_model,
         attachments
       );
 
@@ -525,9 +527,9 @@ async function runScheduledChat(
     // Create a session for the run
     const sessionTitle = isTest ? `Test: ${schedule.scheduleName}` : `Scheduled: ${schedule.scheduleName}`;
     const testSession = await chatbotDb.createChatSession(
-      userId, 
-      undefined, 
-      "agent", 
+      userId,
+      undefined,
+      "agent",
       sessionTitle,
       undefined,
       undefined,
@@ -537,11 +539,15 @@ async function runScheduledChat(
     );
     const sessionId = testSession.sessionId;
 
+    // Update the session with the selected model from the schedule
+    const modelToUse = schedule.llmModel || agentModeService.default_model;
+    await chatbotDb.updateSessionLlmModel(sessionId, modelToUse);
+
     // Convert schedule format to runVerifiedChat format
     const expectedKeywords = schedule.keywords || [];
     const expectedFunctionCalls = schedule.requiredFunctionCalls || [];
     const functionCallMinCalls = schedule.functionCallMinCalls || {};
-    
+
     const requiredFunctions = expectedFunctionCalls.map((funcName: string) => ({
       functionName: funcName,
       minCount: functionCallMinCalls[funcName] || 1
@@ -555,19 +561,20 @@ async function runScheduledChat(
       keywords: expectedKeywords,
       requiredFunctions,
       maxAttempts: 20,
-      attachments: []
+      attachments: [],
+      llmModel: schedule.llmModel || agentModeService.default_model
     });
 
     // Convert result to scheduled chat format
     const actualFunctionCalls = result.toolCalls.map((call: any) => call.name).filter(Boolean);
-    
+
     // Calculate final function call details
     const finalFunctionCallDetails: { [functionName: string]: { actual: number; required: number } } = {};
     const actualFunctionCallCounts: { [functionName: string]: number } = {};
     actualFunctionCalls.forEach((call: string) => {
       actualFunctionCallCounts[call] = (actualFunctionCallCounts[call] || 0) + 1;
     });
-    
+
     expectedFunctionCalls.forEach((funcCall: string) => {
       const actualCount = actualFunctionCallCounts[funcCall] || 0;
       const requiredCount = functionCallMinCalls[funcCall] || 1;
@@ -657,7 +664,7 @@ function setupSSEConnectionForSession(sessionId: string, res: Response, req: Req
         cleanup();
       }
     });
-    
+
     console.log(`[SSE] Progress callback registered for session ${sessionId}`);
 
     // Handle client disconnect
@@ -699,6 +706,7 @@ async function generateSessionResponse(
   sessionId: string,
   userMessage: string,
   userId: string,
+  llmModel: string,
   attachments?: any[]
 ): Promise<{
   content: string;
@@ -745,7 +753,7 @@ async function generateSessionResponse(
       // Get the current system prompt version
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
       const systemPromptHash = require('crypto').createHash('md5').update(systemPrompt).digest('hex').substring(0, 8);
-      
+
       // Add system message with version info (hash only in metadata)
       const systemMessage = {
         role: 'system' as const,
@@ -756,7 +764,7 @@ async function generateSessionResponse(
           systemPromptVersion: systemPromptHash
         }
       };
-      
+
       await chatbotDb.addMessageToSession(sessionId, systemMessage);
     } catch (error) {
       console.error('AgentMode: Failed to add system message:', error);
@@ -795,6 +803,7 @@ async function generateSessionResponse(
       messageContent,
       sessionHistory: updatedSession.messages,
       userId,
+      llmModel,
       sessionId,
       mockMode: false
     },
@@ -809,7 +818,7 @@ async function generateSessionResponse(
 
   // Get the updated session to include workPlan if it was modified
   const finalSession = await chatbotDb.getChatSession(sessionId);
-  
+
   return {
     ...response,
     workPlan: finalSession?.workPlan
@@ -819,7 +828,7 @@ async function generateSessionResponse(
 // Helper function to calculate next run time based on frequency
 const calculateNextRunTime = (frequency: string, fromDate: Date): Date => {
   const nextRun = new Date(fromDate);
-  
+
   switch (frequency) {
     case 'hourly':
       nextRun.setHours(nextRun.getHours() + 1);
@@ -842,7 +851,7 @@ const calculateNextRunTime = (frequency: string, fromDate: Date): Date => {
       nextRun.setDate(nextRun.getDate() + 1);
       nextRun.setHours(9, 0, 0, 0);
   }
-  
+
   return nextRun;
 };
 
@@ -851,20 +860,20 @@ export const agentModeController = {
   async getSessions(req: Request, res: Response) {
     try {
       const user = req.user as User;
-      
+
       // Parse pagination parameters
       const lastEvaluatedKey = req.query.lastEvaluatedKey as string;
       const limit = Math.min(parseInt(req.query.limit as string) || 50, 100); // Max 100 per request
-      
+
       // Get sessions with pagination
       const result = await chatbotDb.getUserSessions(user.userId, 'agent', limit, true, lastEvaluatedKey);
-      
+
       // Filter out tool messages and assistant messages with tool calls for user display
       const filteredSessions = result.sessions.map(session => ({
         ...session,
         messages: filterMessagesForClient(session.messages)
       }));
-      
+
       res.json({
         sessions: filteredSessions,
         lastEvaluatedKey: result.lastEvaluatedKey,
@@ -898,7 +907,11 @@ export const agentModeController = {
         finalSessionType as "regular" | "predefined-work-plan" | "scheduled" | "image-generation"
       );
 
-      res.status(201).json(session);
+      // Set default model for new sessions
+      const defaultModel = agentModeService.default_model;
+      const sessionWithModel = await chatbotDb.updateSessionLlmModel(session.sessionId, defaultModel);
+
+      res.status(201).json(sessionWithModel);
     } catch (error) {
       console.error('AgentMode: Create session error:', error);
       res.status(500).json({ error: 'Failed to create session' });
@@ -946,7 +959,7 @@ export const agentModeController = {
     try {
       const agentModeService = new AgentModeService();
       const tools = agentModeService.getAvailableTools();
-      
+
       // Extract function names and descriptions
       const functionCalls = tools.map((tool: any) => ({
         name: tool.function.name,
@@ -964,7 +977,7 @@ export const agentModeController = {
   async generateResponse(req: Request, res: Response) {
     try {
       const user = req.user as User;
-      const { sessionId, userMessage, attachments } = req.body;
+      const { sessionId, userMessage, llmModel, attachments } = req.body;
 
       if (!sessionId || !userMessage) {
         return res.status(400).json({ error: 'Session ID and user message are required' });
@@ -985,6 +998,7 @@ export const agentModeController = {
         sessionId,
         userMessage,
         user.userId,
+        llmModel,
         attachments
       );
 
@@ -1000,11 +1014,11 @@ export const agentModeController = {
       });
     } catch (error) {
       console.error('AgentMode: Generate response error:', error);
-      
+
       // Handle specific error types
       if (error instanceof Error) {
         if (error.message.includes('SESSION_SIZE_LIMIT_EXCEEDED')) {
-          res.status(413).json({ 
+          res.status(413).json({
             error: 'Session size limit exceeded',
             message: 'Please start a new session to continue the conversation.',
             code: 'SESSION_SIZE_LIMIT_EXCEEDED',
@@ -1012,9 +1026,9 @@ export const agentModeController = {
           });
           return;
         }
-        
+
         if (error.message.includes('MESSAGE_TOO_LARGE')) {
-          res.status(413).json({ 
+          res.status(413).json({
             error: 'Message too large',
             message: 'The message content is too large to be saved. Please try with shorter content.',
             code: 'MESSAGE_TOO_LARGE',
@@ -1022,9 +1036,9 @@ export const agentModeController = {
           });
           return;
         }
-        
+
         if (error.message.includes('content policies') || error.message.includes('violate content policies')) {
-          res.status(400).json({ 
+          res.status(400).json({
             error: 'Content policy violation',
             message: error.message,
             code: 'CONTENT_FILTER',
@@ -1032,9 +1046,9 @@ export const agentModeController = {
           });
           return;
         }
-        
+
         if (error.message.includes('high demand')) {
-          res.status(429).json({ 
+          res.status(429).json({
             error: 'Rate limit exceeded',
             message: error.message,
             code: 'RATE_LIMIT',
@@ -1043,8 +1057,19 @@ export const agentModeController = {
           return;
         }
       }
-      
+
       res.status(500).json({ error: 'Failed to generate response' });
+    }
+  },
+
+  async getSupportedModels(req: Request, res: Response) {
+    try {
+      const agentModeService = new AgentModeService();
+      const models = await agentModeService.getSupportedModels();
+      res.json(models);
+    } catch (error) {
+      console.error('AgentMode: Get supported models error:', error);
+      res.status(500).json({ error: 'Failed to get supported models' });
     }
   },
 
@@ -1099,7 +1124,7 @@ export const agentModeController = {
 
       // Use session ID as share ID
       const shareId = sessionId;
-      
+
       // Add share metadata to the session (no expiration by default)
       const shareMetadata = {
         isShared: true,
@@ -1110,7 +1135,7 @@ export const agentModeController = {
       // Update the session with share metadata
       await chatbotDb.updateSessionShareMetadata(sessionId, shareMetadata);
 
-      res.status(200).json({ 
+      res.status(200).json({
         shareId,
         shareUrl: `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5176'}/share/${shareId}`
       });
@@ -1134,9 +1159,9 @@ export const agentModeController = {
 
       // Update share metadata to disable sharing while preserving other fields
       const currentShareMetadata = session.shareMetadata || {};
-      await chatbotDb.updateSessionShareMetadata(sessionId, { 
+      await chatbotDb.updateSessionShareMetadata(sessionId, {
         ...currentShareMetadata,
-        isShared: false 
+        isShared: false
       });
 
       res.status(200).json({ success: true });
@@ -1195,7 +1220,7 @@ export const agentModeController = {
 
       // Use the common function to create or reuse interactive share
       const conversableUrl = await chatbotDb.createOrReuseInteractiveShare(sessionId);
-      
+
       // Extract the token from the URL for backward compatibility
       const urlParams = new URL(conversableUrl).searchParams;
       const conversableToken = urlParams.get('conversable') || '';
@@ -1229,7 +1254,7 @@ export const agentModeController = {
         ...currentInteractiveShareMetadata,
         isActive: false
       };
-      
+
       await chatbotDb.updateSessionInteractiveShareMetadata(sessionId, interactiveShareMetadata);
 
       res.status(200).json({ success: true });
@@ -1254,7 +1279,7 @@ export const agentModeController = {
       // Check sharing status
       const hasViewOnlyShare = session.shareMetadata?.isShared;
       const hasInteractiveShare = session.interactiveShareMetadata?.isActive;
-      
+
       // If it's a conversable request (interactive share), ensure there's a valid interactive share
       if (conversable) {
         if (!hasInteractiveShare) {
@@ -1282,6 +1307,9 @@ export const agentModeController = {
         }
       }
 
+      // Use session's llmModel if available, otherwise use default
+      const modelToUse = session.llmModel || agentModeService.default_model;
+
       res.status(200).json({
         session: {
           sessionId: session.sessionId,
@@ -1292,6 +1320,7 @@ export const agentModeController = {
           shareMetadata: session.shareMetadata,
           interactiveShareMetadata: session.interactiveShareMetadata,
           workPlan: session.workPlan,
+          llmModel: modelToUse,
           isConversable: !!conversable
         }
       });
@@ -1306,7 +1335,7 @@ export const agentModeController = {
     try {
       const { shareId } = req.params;
       const { conversable } = req.query;
-      const { userMessage, attachments = [] } = req.body;
+      const { userMessage, llmModel, attachments = [] } = req.body;
 
       if (!userMessage) {
         return res.status(400).json({ error: 'User message is required' });
@@ -1331,11 +1360,16 @@ export const agentModeController = {
       // Clear old progress store (but keep active connections)
       progressStore.delete(session.sessionId);
 
+      // Always use session's llmModel for ishare endpoints (ignore request body's llmModel)
+      // This ensures anonymous users get the correct model from the session
+      const modelToUse = session.llmModel || agentModeService.default_model;
+
       // Use the same generateSessionResponse logic as the regular generateResponse
       const response = await generateSessionResponse(
         session.sessionId,
         userMessage,
         session.userId,
+        modelToUse,
         attachments
       );
 
@@ -1351,11 +1385,11 @@ export const agentModeController = {
       });
     } catch (error) {
       console.error('AgentMode: Generate shared response error:', error);
-      
+
       // Handle specific error types (same as generateResponse)
       if (error instanceof Error) {
         if (error.message.includes('SESSION_SIZE_LIMIT_EXCEEDED')) {
-          res.status(413).json({ 
+          res.status(413).json({
             error: 'Session size limit exceeded',
             message: 'Please start a new session to continue the conversation.',
             code: 'SESSION_SIZE_LIMIT_EXCEEDED',
@@ -1363,9 +1397,9 @@ export const agentModeController = {
           });
           return;
         }
-        
+
         if (error.message.includes('MESSAGE_TOO_LARGE')) {
-          res.status(413).json({ 
+          res.status(413).json({
             error: 'Message too large',
             message: 'The message content is too large to be saved. Please try with shorter content.',
             code: 'MESSAGE_TOO_LARGE',
@@ -1373,9 +1407,9 @@ export const agentModeController = {
           });
           return;
         }
-        
+
         if (error.message.includes('content policies') || error.message.includes('violate content policies')) {
-          res.status(400).json({ 
+          res.status(400).json({
             error: 'Content policy violation',
             message: error.message,
             code: 'CONTENT_FILTER',
@@ -1383,9 +1417,9 @@ export const agentModeController = {
           });
           return;
         }
-        
+
         if (error.message.includes('high demand')) {
-          res.status(429).json({ 
+          res.status(429).json({
             error: 'Rate limit exceeded',
             message: error.message,
             code: 'RATE_LIMIT',
@@ -1394,7 +1428,7 @@ export const agentModeController = {
           return;
         }
       }
-      
+
       res.status(500).json({ error: 'Failed to generate response' });
     }
   },
@@ -1420,7 +1454,7 @@ export const agentModeController = {
       const { sessionId, taskId, executionId } = req.params;
       const { status } = req.body;
       const user = req.user as User;
-      
+
 
       await updateTaskExecutionStatus(sessionId, taskId, executionId, status);
       res.json({ message: 'Task status updated successfully' });
@@ -1467,73 +1501,75 @@ export const agentModeController = {
   },
 
   // Create scheduled chat
-        async createScheduledChat(req: Request, res: Response) {
-          try {
-            const user = req.user as User;
-            const {
-              sessionId,
-              scheduleName,
-              description,
-              startingMessage,
-              scheduleFrequency,
-              keywords,
-              requiredFunctionCalls,
-              functionCallMinCalls,
-              emailNotifications,
-              emailCampaignTaskId
-            } = req.body;
+  async createScheduledChat(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const {
+        sessionId,
+        scheduleName,
+        description,
+        startingMessage,
+        scheduleFrequency,
+        keywords,
+        requiredFunctionCalls,
+        functionCallMinCalls,
+        emailNotifications,
+        emailCampaignTaskId,
+        llmModel
+      } = req.body;
 
-            if (!scheduleName || !startingMessage || !scheduleFrequency) {
-              return res.status(400).json({ error: 'Missing required fields' });
-            }
+      if (!scheduleName || !startingMessage || !scheduleFrequency) {
+        return res.status(400).json({ error: 'Missing required fields' });
+      }
 
-            // If sessionId is provided, verify it exists and belongs to user
-            if (sessionId) {
-              const session = await chatbotDb.getChatSession(sessionId);
-              if (!session || session.userId !== user.userId) {
-                return res.status(404).json({ error: 'Session not found' });
-              }
-            }
+      // If sessionId is provided, verify it exists and belongs to user
+      if (sessionId) {
+        const session = await chatbotDb.getChatSession(sessionId);
+        if (!session || session.userId !== user.userId) {
+          return res.status(404).json({ error: 'Session not found' });
+        }
+      }
 
-            // Create scheduled chat using the existing scheduleDb
-            const scheduleId = require('uuid').v4();
-            const now = new Date();
-            const nextRunTime = calculateNextRunTime(scheduleFrequency, now);
+      // Create scheduled chat using the existing scheduleDb
+      const scheduleId = require('uuid').v4();
+      const now = new Date();
+      const nextRunTime = calculateNextRunTime(scheduleFrequency, now);
 
-            const scheduledChat = {
-              scheduleId,
-              taskId: sessionId || 'global', // Use sessionId if provided, otherwise 'global'
-              userId: user.userId,
-              frequency: scheduleFrequency, // Map scheduleFrequency to frequency
-              scheduleName,
-              description: description || '',
-              startingMessage,
-              keywords: keywords || [],
-              requiredFunctionCalls: requiredFunctionCalls || [],
-              functionCallMinCalls: functionCallMinCalls || {},
-              emailNotifications: emailNotifications || [],
-              dailyDigest: scheduleFrequency === 'hourly' ? (req.body.dailyDigest || false) : false, // Only allow daily digest for hourly schedules
-              status: 'active',
-              nextRunTime: nextRunTime.toISOString(),
-              createdAt: now.toISOString(),
-              updatedAt: now.toISOString(),
-              sessionId: sessionId || null, // Store original sessionId for reference (can be null)
-              type: 'scheduled_chat', // Distinguish from regular task schedules
-              emailCampaignTaskId: emailCampaignTaskId || null
-            };
+      const scheduledChat = {
+        scheduleId,
+        taskId: sessionId || 'global', // Use sessionId if provided, otherwise 'global'
+        userId: user.userId,
+        frequency: scheduleFrequency, // Map scheduleFrequency to frequency
+        scheduleName,
+        description: description || '',
+        startingMessage,
+        keywords: keywords || [],
+        requiredFunctionCalls: requiredFunctionCalls || [],
+        functionCallMinCalls: functionCallMinCalls || {},
+        emailNotifications: emailNotifications || [],
+        dailyDigest: scheduleFrequency === 'hourly' ? (req.body.dailyDigest || false) : false, // Only allow daily digest for hourly schedules
+        status: 'active',
+        nextRunTime: nextRunTime.toISOString(),
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+        sessionId: sessionId || null, // Store original sessionId for reference (can be null)
+        type: 'scheduled_chat', // Distinguish from regular task schedules
+        emailCampaignTaskId: emailCampaignTaskId || null,
+        llmModel: llmModel || agentModeService.default_model // Use provided model or default
+      };
 
-            await scheduleDb.createSchedule(scheduledChat);
+      await scheduleDb.createSchedule(scheduledChat);
 
-            res.status(201).json({
-              scheduleId,
-              message: 'Scheduled chat created successfully',
-              nextRunTime: nextRunTime.toISOString()
-            });
-          } catch (error) {
-            console.error('AgentMode: Create scheduled chat error:', error);
-            res.status(500).json({ error: 'Failed to create scheduled chat' });
-          }
-        },
+      res.status(201).json({
+        scheduleId,
+        message: 'Scheduled chat created successfully',
+        nextRunTime: nextRunTime.toISOString()
+      });
+    } catch (error) {
+      console.error('AgentMode: Create scheduled chat error:', error);
+      res.status(500).json({ error: 'Failed to create scheduled chat' });
+    }
+  },
 
   // Get user's scheduled chats
   async getScheduledChats(req: Request, res: Response) {
@@ -1542,7 +1578,7 @@ export const agentModeController = {
 
       // Get all schedules for the user and filter for scheduled chats
       const schedules = await scheduleDb.getSchedulesByUserId(user.userId);
-      const scheduledChats = schedules?.filter(schedule => 
+      const scheduledChats = schedules?.filter(schedule =>
         schedule.type === 'scheduled_chat'
       ) || [];
 
@@ -1554,395 +1590,397 @@ export const agentModeController = {
   },
 
   // Delete scheduled chat
-        async updateScheduledChat(req: Request, res: Response) {
-          try {
-            const user = req.user as User;
-            const { scheduleId } = req.params;
-            const {
-              scheduleName,
-              description,
-              startingMessage,
-              scheduleFrequency,
-              keywords,
-              requiredFunctionCalls,
-              functionCallMinCalls,
-              emailNotifications,
-              dailyDigest,
-              emailCampaignTaskId
-            } = req.body;
+  async updateScheduledChat(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { scheduleId } = req.params;
+      const {
+        scheduleName,
+        description,
+        startingMessage,
+        scheduleFrequency,
+        keywords,
+        requiredFunctionCalls,
+        functionCallMinCalls,
+        emailNotifications,
+        dailyDigest,
+        emailCampaignTaskId,
+        llmModel
+      } = req.body;
 
-            if (!scheduleName || !startingMessage || !scheduleFrequency) {
-              return res.status(400).json({ error: 'Missing required fields' });
-            }
+      if (!scheduleName || !startingMessage || !scheduleFrequency) {
+        return res.status(400).json({ error: 'Missing required fields' });
+      }
 
-            // Verify schedule exists and belongs to user
-            const existingSchedule = await scheduleDb.getScheduleById(scheduleId);
-            if (!existingSchedule || existingSchedule.userId !== user.userId) {
-              return res.status(404).json({ error: 'Scheduled chat not found' });
-            }
+      // Verify schedule exists and belongs to user
+      const existingSchedule = await scheduleDb.getScheduleById(scheduleId);
+      if (!existingSchedule || existingSchedule.userId !== user.userId) {
+        return res.status(404).json({ error: 'Scheduled chat not found' });
+      }
 
-            // Update the schedule without modifying nextRunTime
-            // nextRunTime should only be updated when the schedule actually runs
-            const now = new Date();
+      // Update the schedule without modifying nextRunTime
+      // nextRunTime should only be updated when the schedule actually runs
+      const now = new Date();
 
-            // Update the schedule
-            const updates = {
-              scheduleName,
-              description: description || '',
-              startingMessage,
-              frequency: scheduleFrequency,
-              keywords: keywords || [],
-              requiredFunctionCalls: requiredFunctionCalls || [],
-              functionCallMinCalls: functionCallMinCalls || {},
-              emailNotifications: emailNotifications || [],
-              dailyDigest: scheduleFrequency === 'hourly' ? (dailyDigest || false) : false, // Only allow daily digest for hourly schedules
-              updatedAt: now.toISOString(),
-              emailCampaignTaskId: emailCampaignTaskId || null
-            };
+      // Update the schedule
+      const updates = {
+        scheduleName,
+        description: description || '',
+        startingMessage,
+        frequency: scheduleFrequency,
+        keywords: keywords || [],
+        requiredFunctionCalls: requiredFunctionCalls || [],
+        functionCallMinCalls: functionCallMinCalls || {},
+        emailNotifications: emailNotifications || [],
+        dailyDigest: scheduleFrequency === 'hourly' ? (dailyDigest || false) : false, // Only allow daily digest for hourly schedules
+        updatedAt: now.toISOString(),
+        emailCampaignTaskId: emailCampaignTaskId || null,
+        llmModel: llmModel || agentModeService.default_model // Use provided model or default
+      };
 
-            await scheduleDb.updateSchedule(scheduleId, updates);
+      await scheduleDb.updateSchedule(scheduleId, updates);
 
-            // Return the existing nextRunTime from the schedule
-            res.json({
-              message: 'Scheduled chat updated successfully',
-              nextRunTime: existingSchedule.nextRunTime
-            });
-          } catch (error) {
-            console.error('AgentMode: Update scheduled chat error:', error);
-            res.status(500).json({ error: 'Failed to update scheduled chat' });
-          }
-        },
+      // Return the existing nextRunTime from the schedule
+      res.json({
+        message: 'Scheduled chat updated successfully',
+        nextRunTime: existingSchedule.nextRunTime
+      });
+    } catch (error) {
+      console.error('AgentMode: Update scheduled chat error:', error);
+      res.status(500).json({ error: 'Failed to update scheduled chat' });
+    }
+  },
 
-        async testScheduledChat(req: Request, res: Response) {
-          try {
-            const user = req.user as User;
-            const { scheduleId } = req.params;
+  async testScheduledChat(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { scheduleId } = req.params;
 
-            // Verify schedule exists and belongs to user
-            const schedule = await scheduleDb.getScheduleById(scheduleId);
-            if (!schedule || schedule.userId !== user.userId) {
-              return res.status(404).json({ error: 'Scheduled chat not found' });
-            }
+      // Verify schedule exists and belongs to user
+      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      if (!schedule || schedule.userId !== user.userId) {
+        return res.status(404).json({ error: 'Scheduled chat not found' });
+      }
 
-            // Run the scheduled chat as a test
-            const result = await runScheduledChat(schedule, user.userId, true);
+      // Run the scheduled chat as a test
+      const result = await runScheduledChat(schedule, user.userId, true);
 
-            res.json(result);
+      res.json(result);
 
-          } catch (error) {
-            console.error('AgentMode: Test scheduled chat error:', error);
-            res.status(500).json({ error: 'Failed to test scheduled chat' });
-          }
-        },
+    } catch (error) {
+      console.error('AgentMode: Test scheduled chat error:', error);
+      res.status(500).json({ error: 'Failed to test scheduled chat' });
+    }
+  },
 
-        async toggleScheduledChatStatus(req: Request, res: Response) {
-          try {
-            const user = req.user as User;
-            const { scheduleId } = req.params;
-            const { status } = req.body;
+  async toggleScheduledChatStatus(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { scheduleId } = req.params;
+      const { status } = req.body;
 
-            if (!status || !['active', 'paused'].includes(status)) {
-              return res.status(400).json({ error: 'Invalid status. Must be "active" or "paused"' });
-            }
+      if (!status || !['active', 'paused'].includes(status)) {
+        return res.status(400).json({ error: 'Invalid status. Must be "active" or "paused"' });
+      }
 
-            // Verify schedule exists and belongs to user
-            const schedule = await scheduleDb.getScheduleById(scheduleId);
-            if (!schedule || schedule.userId !== user.userId) {
-              return res.status(404).json({ error: 'Scheduled chat not found' });
-            }
+      // Verify schedule exists and belongs to user
+      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      if (!schedule || schedule.userId !== user.userId) {
+        return res.status(404).json({ error: 'Scheduled chat not found' });
+      }
 
-            // Update the schedule status
-            await scheduleDb.updateSchedule(scheduleId, { 
-              status,
-              updatedAt: new Date().toISOString()
-            });
+      // Update the schedule status
+      await scheduleDb.updateSchedule(scheduleId, {
+        status,
+        updatedAt: new Date().toISOString()
+      });
 
-            res.json({ message: `Scheduled chat ${status === 'active' ? 'enabled' : 'paused'} successfully` });
+      res.json({ message: `Scheduled chat ${status === 'active' ? 'enabled' : 'paused'} successfully` });
 
-          } catch (error) {
-            console.error('AgentMode: Toggle scheduled chat status error:', error);
-            res.status(500).json({ error: 'Failed to toggle scheduled chat status' });
-          }
-        },
+    } catch (error) {
+      console.error('AgentMode: Toggle scheduled chat status error:', error);
+      res.status(500).json({ error: 'Failed to toggle scheduled chat status' });
+    }
+  },
 
-        async deleteScheduledChat(req: Request, res: Response) {
-          try {
-            const user = req.user as User;
-            const { scheduleId } = req.params;
+  async deleteScheduledChat(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { scheduleId } = req.params;
 
-            // Verify schedule exists and belongs to user
-            const schedule = await scheduleDb.getScheduleById(scheduleId);
-            if (!schedule || schedule.userId !== user.userId) {
-              return res.status(404).json({ error: 'Scheduled chat not found' });
-            }
+      // Verify schedule exists and belongs to user
+      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      if (!schedule || schedule.userId !== user.userId) {
+        return res.status(404).json({ error: 'Scheduled chat not found' });
+      }
 
-            // Delete the schedule
-            await scheduleDb.deleteSchedule(scheduleId);
+      // Delete the schedule
+      await scheduleDb.deleteSchedule(scheduleId);
 
-            res.json({ message: 'Scheduled chat deleted successfully' });
-          } catch (error) {
-            console.error('AgentMode: Delete scheduled chat error:', error);
-            res.status(500).json({ error: 'Failed to delete scheduled chat' });
-          }
-        },
+      res.json({ message: 'Scheduled chat deleted successfully' });
+    } catch (error) {
+      console.error('AgentMode: Delete scheduled chat error:', error);
+      res.status(500).json({ error: 'Failed to delete scheduled chat' });
+    }
+  },
 
-        async getScheduledChatTestHistory(req: Request, res: Response) {
-          try {
-            const user = req.user as User;
-            const { scheduleId } = req.params;
+  async getScheduledChatTestHistory(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { scheduleId } = req.params;
 
-            // Verify schedule exists and belongs to user
-            const schedule = await scheduleDb.getScheduleById(scheduleId);
-            if (!schedule || schedule.userId !== user.userId) {
-              return res.status(404).json({ error: 'Scheduled chat not found' });
-            }
+      // Verify schedule exists and belongs to user
+      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      if (!schedule || schedule.userId !== user.userId) {
+        return res.status(404).json({ error: 'Scheduled chat not found' });
+      }
 
-            // Get test history
-            const testHistory = await scheduleDb.getRunResults(scheduleId);
+      // Get test history
+      const testHistory = await scheduleDb.getRunResults(scheduleId);
 
-            res.json(testHistory);
-          } catch (error) {
-            console.error('AgentMode: Get test history error:', error);
-            res.status(500).json({ error: 'Failed to get test history' });
-          }
-        },
+      res.json(testHistory);
+    } catch (error) {
+      console.error('AgentMode: Get test history error:', error);
+      res.status(500).json({ error: 'Failed to get test history' });
+    }
+  },
 
-        async sendScheduledChatTestEmail(req: Request, res: Response) {
-          try {
-            const user = req.user as User;
-            const { scheduleId, runId } = req.params as { scheduleId: string; runId: string };
-            const { toEmail } = req.body as { toEmail: string };
+  async sendScheduledChatTestEmail(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { scheduleId, runId } = req.params as { scheduleId: string; runId: string };
+      const { toEmail } = req.body as { toEmail: string };
 
-            if (!toEmail) {
-              return res.status(400).json({ error: 'toEmail is required' });
-            }
+      if (!toEmail) {
+        return res.status(400).json({ error: 'toEmail is required' });
+      }
 
-            // Verify schedule exists and belongs to user
-            const schedule = await scheduleDb.getScheduleById(scheduleId);
-            if (!schedule || schedule.userId !== user.userId) {
-              return res.status(404).json({ error: 'Scheduled chat not found' });
-            }
+      // Verify schedule exists and belongs to user
+      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      if (!schedule || schedule.userId !== user.userId) {
+        return res.status(404).json({ error: 'Scheduled chat not found' });
+      }
 
-            // Load test history and find the record
-            const testHistory = await scheduleDb.getRunResults(scheduleId);
-            const record = (testHistory || []).find((r: any) => r.runId === runId);
-            if (!record) {
-              return res.status(404).json({ error: 'Test record not found' });
-            }
+      // Load test history and find the record
+      const testHistory = await scheduleDb.getRunResults(scheduleId);
+      const record = (testHistory || []).find((r: any) => r.runId === runId);
+      if (!record) {
+        return res.status(404).json({ error: 'Test record not found' });
+      }
 
-            // Check if this is an hourly schedule with daily digest enabled
-            if (schedule.frequency === 'hourly' && schedule.dailyDigest) {
-              // For hourly schedules with daily digest, send a daily digest email
-              // Get all run results for the same date as the selected test entry
-              const selectedResultDate = new Date(record.createdAt);
-              const startOfDay = new Date(selectedResultDate.getFullYear(), selectedResultDate.getMonth(), selectedResultDate.getDate());
-              const endOfDay = new Date(selectedResultDate.getFullYear(), selectedResultDate.getMonth(), selectedResultDate.getDate() + 1);
-              
-              const sameDayResults = testHistory.filter((result: any) => {
-                const resultDate = new Date(result.createdAt);
-                return resultDate >= startOfDay && resultDate < endOfDay;
-              });
-              
-              if (sameDayResults.length > 0) {
-                // Send daily digest email for the specific date
-                await emailService.sendDailyDigestEmail(
-                  [toEmail],
-                  schedule.scheduleName,
-                  sameDayResults,
-                  schedule.scheduleId,
-                  selectedResultDate
-                );
-                
-                const dateStr = selectedResultDate.toLocaleDateString('en-US', { 
-                  year: 'numeric', 
-                  month: 'long', 
-                  day: 'numeric' 
-                });
-                
-                res.json({ 
-                  success: true, 
-                  message: `Daily digest email sent with all results from ${dateStr}`,
-                  resultCount: sameDayResults.length,
-                  date: dateStr
-                });
-                return;
-              }
-            }
+      // Check if this is an hourly schedule with daily digest enabled
+      if (schedule.frequency === 'hourly' && schedule.dailyDigest) {
+        // For hourly schedules with daily digest, send a daily digest email
+        // Get all run results for the same date as the selected test entry
+        const selectedResultDate = new Date(record.createdAt);
+        const startOfDay = new Date(selectedResultDate.getFullYear(), selectedResultDate.getMonth(), selectedResultDate.getDate());
+        const endOfDay = new Date(selectedResultDate.getFullYear(), selectedResultDate.getMonth(), selectedResultDate.getDate() + 1);
 
-            // For non-hourly schedules or hourly without daily digest, send individual email
-            // Build a result object compatible with emailService
-            const resultForEmail = {
-              passed: !!record.passed,
-              actualResponse: record.actualResponse || record.response || '',
-              keywordMatches: record.keywordMatches || [],
-              keywordMisses: record.keywordMisses || [],
-              functionCallMatches: record.functionCallMatches || [],
-              functionCallMisses: record.functionCallMisses || [],
-              executionTime: record.executionTime || 0,
-              sessionId: record.sessionId,
-              attempt: record.attempt || 1,
-              createdAt: record.createdAt || new Date().toISOString(),
-            };
+        const sameDayResults = testHistory.filter((result: any) => {
+          const resultDate = new Date(result.createdAt);
+          return resultDate >= startOfDay && resultDate < endOfDay;
+        });
 
-            await emailService.sendScheduledChatResultEmail(
-              [toEmail],
-              schedule.scheduleName,
-              resultForEmail,
-              schedule.scheduleId
-            );
+        if (sameDayResults.length > 0) {
+          // Send daily digest email for the specific date
+          await emailService.sendDailyDigestEmail(
+            [toEmail],
+            schedule.scheduleName,
+            sameDayResults,
+            schedule.scheduleId,
+            selectedResultDate
+          );
 
-            res.json({ success: true });
-          } catch (error) {
-            console.error('AgentMode: Send scheduled chat test email error:', error);
-            res.status(500).json({ error: 'Failed to send test email' });
-          }
-        },
+          const dateStr = selectedResultDate.toLocaleDateString('en-US', {
+            year: 'numeric',
+            month: 'long',
+            day: 'numeric'
+          });
 
-        async runScheduledChats(req: Request, res: Response) {
-          try {
-            // Get all scheduled chats that are ready to run
-            const scheduledChats = await scheduleDb.getSchedulesReadyToRun();
+          res.json({
+            success: true,
+            message: `Daily digest email sent with all results from ${dateStr}`,
+            resultCount: sameDayResults.length,
+            date: dateStr
+          });
+          return;
+        }
+      }
 
-            if (scheduledChats.length === 0) {
-              return res.json({ 
-                message: 'No scheduled chats ready to run',
-                processed: 0,
-                results: []
-              });
-            }
+      // For non-hourly schedules or hourly without daily digest, send individual email
+      // Build a result object compatible with emailService
+      const resultForEmail = {
+        passed: !!record.passed,
+        actualResponse: record.actualResponse || record.response || '',
+        keywordMatches: record.keywordMatches || [],
+        keywordMisses: record.keywordMisses || [],
+        functionCallMatches: record.functionCallMatches || [],
+        functionCallMisses: record.functionCallMisses || [],
+        executionTime: record.executionTime || 0,
+        sessionId: record.sessionId,
+        attempt: record.attempt || 1,
+        createdAt: record.createdAt || new Date().toISOString(),
+      };
 
-            // Get max concurrent runs from environment (default 5)
-            const maxConcurrentRuns = process.env.MAX_CONCURRENT_RUNS ? parseInt(process.env.MAX_CONCURRENT_RUNS) : 5;
-            
-            // Track concurrent runs
-            let currentConcurrentRuns = 0;
-            const results = [];
+      await emailService.sendScheduledChatResultEmail(
+        [toEmail],
+        schedule.scheduleName,
+        resultForEmail,
+        schedule.scheduleId
+      );
 
-        for (const schedule of scheduledChats) {
-          try {
-            const now = new Date();
-            
-            // Check if we've reached the concurrent run limit
-            if (currentConcurrentRuns >= maxConcurrentRuns) {
-              // Delay the run for half an hour
-              const delayedRunTime = new Date(now);
-              delayedRunTime.setMinutes(delayedRunTime.getMinutes() + 30);
-              
-              // Update the schedule with delayed run time
-              await scheduleDb.updateScheduleAfterRun(
-                schedule.scheduleId,
-                schedule.lastRunTime || now.toISOString(),
-                delayedRunTime.toISOString()
-              );
+      res.json({ success: true });
+    } catch (error) {
+      console.error('AgentMode: Send scheduled chat test email error:', error);
+      res.status(500).json({ error: 'Failed to send test email' });
+    }
+  },
 
-              console.log(`Delayed scheduled chat ${schedule.scheduleName} for 30 minutes due to concurrent run limit (${maxConcurrentRuns})`);
-              
-              results.push({
-                scheduleId: schedule.scheduleId,
-                scheduleName: schedule.scheduleName,
-                status: 'delayed',
-                nextRunTime: delayedRunTime.toISOString(),
-                reason: `Delayed due to concurrent run limit (${maxConcurrentRuns})`
-              });
-              
-              continue;
-            }
-            
-            // Update the schedule with next run time FIRST (synchronously)
-            // This prevents agent-engine from repeatedly calling the same schedule
-            const nextRunTime = calculateNextRunTime(schedule.frequency, now);
-            
+  async runScheduledChats(req: Request, res: Response) {
+    try {
+      // Get all scheduled chats that are ready to run
+      const scheduledChats = await scheduleDb.getSchedulesReadyToRun();
+
+      if (scheduledChats.length === 0) {
+        return res.json({
+          message: 'No scheduled chats ready to run',
+          processed: 0,
+          results: []
+        });
+      }
+
+      // Get max concurrent runs from environment (default 5)
+      const maxConcurrentRuns = process.env.MAX_CONCURRENT_RUNS ? parseInt(process.env.MAX_CONCURRENT_RUNS) : 5;
+
+      // Track concurrent runs
+      let currentConcurrentRuns = 0;
+      const results = [];
+
+      for (const schedule of scheduledChats) {
+        try {
+          const now = new Date();
+
+          // Check if we've reached the concurrent run limit
+          if (currentConcurrentRuns >= maxConcurrentRuns) {
+            // Delay the run for half an hour
+            const delayedRunTime = new Date(now);
+            delayedRunTime.setMinutes(delayedRunTime.getMinutes() + 30);
+
+            // Update the schedule with delayed run time
             await scheduleDb.updateScheduleAfterRun(
               schedule.scheduleId,
-              now.toISOString(),
-              nextRunTime.toISOString()
+              schedule.lastRunTime || now.toISOString(),
+              delayedRunTime.toISOString()
             );
-            
-            // Increment concurrent run counter
-            currentConcurrentRuns++;
-            
-             // Start the scheduled chat run asynchronously (don't await)
-             runScheduledChat(schedule, schedule.userId, false).then(async (result) => {
-               // Decrement concurrent run counter when done
-               currentConcurrentRuns--;
-               
-               // Send email notification with the result
-               try {
-                 // Only send emails if email notifications are specified
-                 const emailNotifications = schedule.emailNotifications || [];
-                 if (emailNotifications.length > 0) {
-                   // Check if this is an hourly schedule with daily digest enabled
-                   if (schedule.frequency === 'hourly' && schedule.dailyDigest) {
-                     // Check if this is the last run of the day
-                     const now = new Date();
-                     const nextRunTime = calculateNextRunTime('hourly', now);
-                     const isLastRunOfDay = isLastRunOfDayForHourlySchedule(now, nextRunTime);
-                     
-                     if (isLastRunOfDay) {
-                       // Send daily digest instead of individual email
-                       await sendDailyDigestEmail(schedule, emailNotifications);
-                     }
-                     // For hourly schedules with daily digest, don't send individual emails
-                     // Only send the daily digest on the last run of the day
-                   } else {
-                     // Send individual email as usual for non-hourly schedules or hourly without daily digest
-                     await emailService.sendScheduledChatResultEmail(
-                       emailNotifications,
-                       schedule.scheduleName,
-                       result,
-                       schedule.scheduleId
-                     );
-                   }
-                 } else {
-                   console.log(`No email notifications configured for schedule ${schedule.scheduleName}, skipping email send`);
-                 }
-               } catch (error) {
-                 console.error('Error sending scheduled chat result email:', error);
-                 // Don't throw error - email failure shouldn't break the scheduled chat execution
-               }
-             }).catch((error) => {
-               // Decrement concurrent run counter on error
-               currentConcurrentRuns--;
-               
-               console.error(`Error running scheduled chat ${schedule.scheduleName}:`, error);
-               // Log the full error details for debugging
-               console.error('Full error details:', {
-                 message: error.message,
-                 stack: error.stack,
-                 name: error.name
-               });
-             });
-                
-                results.push({
-                  scheduleId: schedule.scheduleId,
-                  scheduleName: schedule.scheduleName,
-                  status: 'started',
-                  nextRunTime: nextRunTime.toISOString()
-                });
-                
-              } catch (error) {
-                console.error(`Error processing schedule ${schedule.scheduleName}:`, error);
-                
-                results.push({
-                  scheduleId: schedule.scheduleId,
-                  scheduleName: schedule.scheduleName,
-                  status: 'error',
-                  error: error instanceof Error ? error.message : 'Unknown error'
-                });
-              }
-            }
 
-            res.json({
-              message: `Processed ${scheduledChats.length} scheduled chats`,
-              processed: scheduledChats.length,
-              results: results
+            console.log(`Delayed scheduled chat ${schedule.scheduleName} for 30 minutes due to concurrent run limit (${maxConcurrentRuns})`);
+
+            results.push({
+              scheduleId: schedule.scheduleId,
+              scheduleName: schedule.scheduleName,
+              status: 'delayed',
+              nextRunTime: delayedRunTime.toISOString(),
+              reason: `Delayed due to concurrent run limit (${maxConcurrentRuns})`
             });
 
-          } catch (error) {
-            console.error('AgentMode: Run scheduled chats error:', error);
-            res.status(500).json({ error: 'Failed to run scheduled chats' });
+            continue;
           }
-        },
+
+          // Update the schedule with next run time FIRST (synchronously)
+          // This prevents agent-engine from repeatedly calling the same schedule
+          const nextRunTime = calculateNextRunTime(schedule.frequency, now);
+
+          await scheduleDb.updateScheduleAfterRun(
+            schedule.scheduleId,
+            now.toISOString(),
+            nextRunTime.toISOString()
+          );
+
+          // Increment concurrent run counter
+          currentConcurrentRuns++;
+
+          // Start the scheduled chat run asynchronously (don't await)
+          runScheduledChat(schedule, schedule.userId, false).then(async (result) => {
+            // Decrement concurrent run counter when done
+            currentConcurrentRuns--;
+
+            // Send email notification with the result
+            try {
+              // Only send emails if email notifications are specified
+              const emailNotifications = schedule.emailNotifications || [];
+              if (emailNotifications.length > 0) {
+                // Check if this is an hourly schedule with daily digest enabled
+                if (schedule.frequency === 'hourly' && schedule.dailyDigest) {
+                  // Check if this is the last run of the day
+                  const now = new Date();
+                  const nextRunTime = calculateNextRunTime('hourly', now);
+                  const isLastRunOfDay = isLastRunOfDayForHourlySchedule(now, nextRunTime);
+
+                  if (isLastRunOfDay) {
+                    // Send daily digest instead of individual email
+                    await sendDailyDigestEmail(schedule, emailNotifications);
+                  }
+                  // For hourly schedules with daily digest, don't send individual emails
+                  // Only send the daily digest on the last run of the day
+                } else {
+                  // Send individual email as usual for non-hourly schedules or hourly without daily digest
+                  await emailService.sendScheduledChatResultEmail(
+                    emailNotifications,
+                    schedule.scheduleName,
+                    result,
+                    schedule.scheduleId
+                  );
+                }
+              } else {
+                console.log(`No email notifications configured for schedule ${schedule.scheduleName}, skipping email send`);
+              }
+            } catch (error) {
+              console.error('Error sending scheduled chat result email:', error);
+              // Don't throw error - email failure shouldn't break the scheduled chat execution
+            }
+          }).catch((error) => {
+            // Decrement concurrent run counter on error
+            currentConcurrentRuns--;
+
+            console.error(`Error running scheduled chat ${schedule.scheduleName}:`, error);
+            // Log the full error details for debugging
+            console.error('Full error details:', {
+              message: error.message,
+              stack: error.stack,
+              name: error.name
+            });
+          });
+
+          results.push({
+            scheduleId: schedule.scheduleId,
+            scheduleName: schedule.scheduleName,
+            status: 'started',
+            nextRunTime: nextRunTime.toISOString()
+          });
+
+        } catch (error) {
+          console.error(`Error processing schedule ${schedule.scheduleName}:`, error);
+
+          results.push({
+            scheduleId: schedule.scheduleId,
+            scheduleName: schedule.scheduleName,
+            status: 'error',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          });
+        }
+      }
+
+      res.json({
+        message: `Processed ${scheduledChats.length} scheduled chats`,
+        processed: scheduledChats.length,
+        results: results
+      });
+
+    } catch (error) {
+      console.error('AgentMode: Run scheduled chats error:', error);
+      res.status(500).json({ error: 'Failed to run scheduled chats' });
+    }
+  },
 
   // Get session for conversable access
   async getConversableSession(req: Request, res: Response) {
@@ -1954,6 +1992,9 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found' });
       }
 
+      // Use session's llmModel if available, otherwise use default
+      const modelToUse = session.llmModel || agentModeService.default_model;
+
       res.json({
         sessionId: session.sessionId,
         title: session.title,
@@ -1961,6 +2002,7 @@ export const agentModeController = {
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
         workPlan: session.workPlan,
+        llmModel: modelToUse,
         isConversable: true
       });
     } catch (error) {
@@ -1983,11 +2025,15 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found' });
       }
 
+      // Use session's llmModel if available, otherwise use default
+      const modelToUse = session.llmModel || agentModeService.default_model;
+
       // Generate AI response using the same function as regular users
       const response = await generateSessionResponse(
         session.sessionId,
         userMessage,
         session.userId, // Use the original session owner's userId
+        modelToUse,
         attachments
       );
 
@@ -2000,11 +2046,11 @@ export const agentModeController = {
       });
     } catch (error) {
       console.error('AgentMode: Generate conversable response error:', error);
-      
+
       // Handle specific error types (same as generateResponse)
       if (error instanceof Error) {
         if (error.message.includes('SESSION_SIZE_LIMIT_EXCEEDED')) {
-          res.status(413).json({ 
+          res.status(413).json({
             error: 'Session size limit exceeded',
             message: 'Please start a new session to continue the conversation.',
             code: 'SESSION_SIZE_LIMIT_EXCEEDED',
@@ -2012,9 +2058,9 @@ export const agentModeController = {
           });
           return;
         }
-        
+
         if (error.message.includes('MESSAGE_TOO_LARGE')) {
-          res.status(413).json({ 
+          res.status(413).json({
             error: 'Message too large',
             message: 'The message content is too large to be saved. Please try with shorter content.',
             code: 'MESSAGE_TOO_LARGE',
@@ -2022,9 +2068,9 @@ export const agentModeController = {
           });
           return;
         }
-        
+
         if (error.message.includes('content policies') || error.message.includes('violate content policies')) {
-          res.status(400).json({ 
+          res.status(400).json({
             error: 'Content policy violation',
             message: error.message,
             code: 'CONTENT_FILTER',
@@ -2032,9 +2078,9 @@ export const agentModeController = {
           });
           return;
         }
-        
+
         if (error.message.includes('high demand')) {
-          res.status(429).json({ 
+          res.status(429).json({
             error: 'Rate limit exceeded',
             message: error.message,
             code: 'RATE_LIMIT',
@@ -2043,7 +2089,7 @@ export const agentModeController = {
           return;
         }
       }
-      
+
       res.status(500).json({ error: 'Failed to generate response' });
     }
   },
@@ -2052,22 +2098,22 @@ export const agentModeController = {
   async getPredefinedWorkPlan(req: Request, res: Response) {
     try {
       const { planTitle } = req.params;
-      
+
       if (!planTitle) {
         return res.status(400).json({ error: 'Plan title is required' });
       }
 
       // Load predefined work plans from settings
       const setting = await settingsService.getSetting('agent-mode-predefined-workplans');
-      
+
       if (!setting || !setting.settingValue) {
         return res.status(404).json({ error: 'No predefined work plans found' });
       }
 
       const workPlans = JSON.parse(setting.settingValue);
-      
+
       // Find work plan with matching title (case-insensitive)
-      const workPlan = workPlans.find((wp: any) => 
+      const workPlan = workPlans.find((wp: any) =>
         wp.title && wp.title.toLowerCase() === planTitle.toLowerCase()
       );
 
@@ -2086,22 +2132,22 @@ export const agentModeController = {
   async createSessionWithPlan(req: Request, res: Response) {
     try {
       const { planTitle } = req.params;
-      
+
       if (!planTitle) {
         return res.status(400).json({ error: 'Plan title is required' });
       }
 
       // Get predefined work plan
       const setting = await settingsService.getSetting('agent-mode-predefined-workplans');
-      
+
       if (!setting || !setting.settingValue) {
         return res.status(404).json({ error: 'No predefined work plans found' });
       }
 
       const workPlans = JSON.parse(setting.settingValue);
-      
+
       // Find work plan with matching title (case-insensitive)
-      const predefinedPlan = workPlans.find((wp: any) => 
+      const predefinedPlan = workPlans.find((wp: any) =>
         wp.title && wp.title.toLowerCase() === planTitle.toLowerCase()
       );
 
@@ -2150,6 +2196,10 @@ export const agentModeController = {
         autocomplete: predefinedPlan.autocomplete || false
       };
       await chatbotDb.updateSessionWorkPlan(session.sessionId, workPlanWithWelcome);
+
+      // Set default model for new sessions
+      const defaultModel = agentModeService.default_model;
+      await chatbotDb.updateSessionLlmModel(session.sessionId, defaultModel);
 
       // Enable interactive sharing for the session
       const conversableToken = crypto.randomBytes(32).toString('hex');
@@ -2263,7 +2313,7 @@ export const agentModeController = {
       // Update the session userId to the authenticated user's ID
       await chatbotDb.updateSessionUserId(sessionId, user.userId);
 
-      res.json({ 
+      res.json({
         message: 'Session transferred successfully',
         sessionId,
         userId: user.userId
@@ -2356,10 +2406,79 @@ export const agentModeController = {
       });
     } catch (error: any) {
       console.error('AgentMode: Verified generate error:', error);
-      res.status(500).json({ 
+      res.status(500).json({
         error: 'Failed to perform verified generation',
         message: error.message || 'Unknown error'
       });
+    }
+  },
+
+  // Update session LLM model (for authenticated users)
+  async updateSessionLlmModel(req: AuthenticatedRequest, res: Response) {
+    try {
+      const { sessionId } = req.params;
+      const { llmModel } = req.body;
+      const user = req.user;
+
+      if (!llmModel) {
+        return res.status(400).json({ error: 'llmModel is required' });
+      }
+
+      // Get the session to verify ownership
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Check if user owns the session (or is admin)
+      if (session.userId !== user.userId && !user.isAdmin) {
+        return res.status(403).json({ error: 'Unauthorized access to session' });
+      }
+
+      // Update the session's llmModel
+      const updatedSession = await chatbotDb.updateSessionLlmModel(sessionId, llmModel);
+
+      res.json({ llmModel: updatedSession.llmModel });
+    } catch (error) {
+      console.error('AgentMode: Update session LLM model error:', error);
+      res.status(500).json({ error: 'Failed to update session LLM model' });
+    }
+  },
+
+  // Update session LLM model for shared conversation (with conversable token)
+  async updateSharedSessionLlmModel(req: Request, res: Response) {
+    try {
+      const { shareId } = req.params;
+      const { conversable } = req.query;
+      const { llmModel } = req.body;
+
+      if (!llmModel) {
+        return res.status(400).json({ error: 'llmModel is required' });
+      }
+
+      // Get the session to verify the conversable token
+      const session = await chatbotDb.getChatSession(shareId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Check if conversable sharing is active and token matches
+      if (!conversable) {
+        return res.status(401).json({ error: 'Conversable token required' });
+      }
+
+      const interactiveShare = session.interactiveShareMetadata;
+      if (!interactiveShare?.isActive || interactiveShare.token !== conversable) {
+        return res.status(401).json({ error: 'Invalid or expired conversable token' });
+      }
+
+      // Update the session's llmModel
+      const updatedSession = await chatbotDb.updateSessionLlmModel(shareId, llmModel);
+
+      res.json({ llmModel: updatedSession.llmModel });
+    } catch (error) {
+      console.error('AgentMode: Update shared session LLM model error:', error);
+      res.status(500).json({ error: 'Failed to update session LLM model' });
     }
   },
 };

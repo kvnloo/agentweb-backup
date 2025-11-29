@@ -10,7 +10,7 @@ import { v4 as uuidv4 } from 'uuid';
 // Create a new benchmark test from a session
 export async function createBenchmarkTest(req: AuthenticatedRequest, res: Response) {
   try {
-    const { sessionId, testName, description, expectedOutput }: CreateBenchmarkTestRequest = req.body;
+    const { sessionId, testName, description, expectedOutput, llmModel }: CreateBenchmarkTestRequest = req.body;
     const adminUserId = req.user.userId;
 
     // Check if user is admin (required for creating benchmark tests)
@@ -65,6 +65,7 @@ export async function createBenchmarkTest(req: AuthenticatedRequest, res: Respon
       conversationHistory,
       expectedOutput,
       status: 'draft',
+      llmModel: llmModel || agentModeService.default_model, // Use provided model or default
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       runCount: 0,
@@ -328,6 +329,8 @@ export async function runBenchmarkTest(req: AuthenticatedRequest, res: Response)
       // Use all messages except the last one as session history
       const sessionHistory = messages.slice(0, -1);
 
+      // Determine which model to use: override > saved model > default
+      const modelToUse = llmName || test.llmModel || agentModeService.default_model;
 
       // Call the agent to generate response with mock mode enabled using worker process
       // This prevents blocking the main event loop during benchmark testing
@@ -335,6 +338,7 @@ export async function runBenchmarkTest(req: AuthenticatedRequest, res: Response)
         messageContent,
         sessionHistory,
         userId: test.userId, // Use the original user's ID
+        llmModel: modelToUse,
         sessionId: test.sessionId, // Use the original session ID
         mockMode: true // Enable mock mode for benchmark testing
       });
@@ -367,12 +371,19 @@ export async function runBenchmarkTest(req: AuthenticatedRequest, res: Response)
         functionCallMatches: evaluation.functionCallMatches,
         functionCallMisses: evaluation.functionCallMisses,
         executionTime,
+        llmModel: modelToUse, // Save the model used in this run
         createdAt: new Date().toISOString()
       };
 
       // Update test statistics and save result to history
       await benchmarkTestDb.incrementRunCount(testId, status === 'success');
       await benchmarkTestDb.addTestResult(testId, result);
+      
+      // Update lastRunModel on the test
+      await benchmarkTestDb.updateBenchmarkTest(testId, {
+        lastRunModel: modelToUse,
+        lastRunAt: new Date().toISOString()
+      });
 
       res.json({
         message: 'Benchmark test executed successfully',
@@ -383,6 +394,9 @@ export async function runBenchmarkTest(req: AuthenticatedRequest, res: Response)
       console.error('Error during benchmark execution:', executionError);
       
       const executionTime = Date.now() - startTime;
+      // Determine which model was attempted (use same logic as success case)
+      const modelToUse = llmName || test.llmModel || agentModeService.default_model;
+      
       const errorResult = {
         testId,
         runId,
@@ -396,12 +410,19 @@ export async function runBenchmarkTest(req: AuthenticatedRequest, res: Response)
         functionCallMisses: test.expectedOutput.functionCalls || [],
         executionTime,
         errorMessage: executionError instanceof Error ? executionError.message : 'Unknown execution error',
+        llmModel: modelToUse, // Save the model used in this run
         createdAt: new Date().toISOString()
       };
 
       // Update test statistics and save result to history (count as failure)
       await benchmarkTestDb.incrementRunCount(testId, false);
       await benchmarkTestDb.addTestResult(testId, errorResult);
+      
+      // Update lastRunModel on the test even for failures
+      await benchmarkTestDb.updateBenchmarkTest(testId, {
+        lastRunModel: modelToUse,
+        lastRunAt: new Date().toISOString()
+      });
 
       res.json({
         message: 'Benchmark test execution failed',

@@ -19,19 +19,156 @@ interface PDFData {
   version: string;
 }
 
+// Type for LLM model configuration
+interface LLMModelConfig {
+  client: OpenAI | null; // null for lazy-loaded clients (e.g., Gemini)
+  supportsTemperature: boolean;
+}
+
+// Type for LLM call options
+interface LLMCallOptions {
+  tools?: any[] | null;
+  tool_choice?: 'auto' | 'none' | any | null;
+  max_completion_tokens?: number | null;
+  temperature?: number | null;
+  response_format?: { type: 'text' | 'json_object' } | null;
+}
+
+
 export class AgentModeService {
-  private openai: OpenAI;
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number }> = new Map();
+  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2';
   
-  constructor() {
-    this.openai = new OpenAI({
+  // Helper method to create Azure OpenAI client for a specific deployment
+  private getAzureOpenAIClient(deploymentName: string): OpenAI {
+    return new OpenAI({
       apiKey: process.env.AZURE_OPENAI_API_KEY,
-      baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2'}`,
+      baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${deploymentName}`,
       defaultQuery: {
-        "api-version": process.env.AZURE_OPENAI_API_VERSION_AGENT_MODE || "2025-01-01-preview",
+        "api-version": process.env.AZURE_OPENAI_API_VERSION_AGENT_MODE || process.env.AZURE_OPENAI_API_VERSION || "2025-01-01-preview",
       },
       defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
     });
+  }
+
+  private gemini_client: OpenAI | null = null;
+  private gemini_client_promise: Promise<OpenAI> | null = null;
+
+  // Helper method to get Gemini client (lazy-loaded from secrets manager)
+  private async getGeminiClient(): Promise<OpenAI> {
+    // Return cached client if available
+    if (this.gemini_client) {
+      return this.gemini_client;
+    }
+
+    // If already initializing, wait for that promise
+    if (this.gemini_client_promise) {
+      return this.gemini_client_promise;
+    }
+
+    // Initialize client
+    this.gemini_client_promise = (async () => {
+      try {
+        const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+        const geminiSecretName = `${environment}/AgentWeb/GeminiAPIKey`;
+        const geminiApiKey = await getSecret(geminiSecretName);
+
+        if (!geminiApiKey || !geminiApiKey.trim()) {
+          throw new Error('Gemini API key is empty');
+        }
+
+        this.gemini_client = new OpenAI({
+          apiKey: geminiApiKey.trim(),
+          baseURL: 'https://generativelanguage.googleapis.com/v1beta',
+        });
+
+        return this.gemini_client;
+      } catch (error) {
+        console.error('Error initializing Gemini client:', error);
+        this.gemini_client_promise = null; // Reset promise on error
+        throw error;
+      }
+    })();
+
+    return this.gemini_client_promise;
+  }
+
+  private llmModels: Record<string, LLMModelConfig> = {
+    // List openai models - create client dynamically for each deployment
+    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: true },
+    // List gemini models - client will be lazy-loaded
+    'gemini-3-pro-preview': { client: null, supportsTemperature: true },
+  };
+
+  async getSupportedModels() {
+    return Object.keys(this.llmModels);
+  }
+  /**
+   * Make an LLM call with the specified model and parameters
+   * @param model - The model to use (e.g., 'gpt-5.1', 'gemini-3-pro-preview')
+   * @param messages - Array of chat messages
+   * @param options - Optional parameters for the LLM call
+   * @returns The LLM response
+   */
+
+
+  async callLLM(
+    model: string,
+    messages: any[],
+    options?: LLMCallOptions
+  ) {
+    
+    // Validate that the model exists
+    if (!this.llmModels[model]) {
+      const availableModels = Object.keys(this.llmModels).join(', ');
+      throw new Error(`Invalid model '${model}'. Available models: ${availableModels}`);
+    }
+
+    // Extract options with defaults
+    const {
+      tools = null,
+      tool_choice = null,
+      max_completion_tokens = null,
+      temperature = null,
+      response_format = { type: "text" }
+    } = options || {};
+
+    const params: any = {
+      model: model,
+      messages: messages,
+      response_format: response_format || { type: "text" },
+    };
+
+    // Only add tools and tool_choice if tools are provided
+    if (tools && tools.length > 0) {
+      params.tools = tools;
+      params.tool_choice = tool_choice || 'auto';
+    }
+
+    // Only add max_completion_tokens if specified
+    if (max_completion_tokens) {
+      params.max_completion_tokens = max_completion_tokens;
+    }
+
+    // Only add temperature if model supports it and value is provided
+    if (this.llmModels[model].supportsTemperature && temperature !== null) {
+      params.temperature = temperature;
+    }
+
+    // Get the client - lazy-load Gemini client if needed
+    let client = this.llmModels[model].client;
+    if (!client) {
+      if (model === 'gemini-3-pro-preview') {
+        client = await this.getGeminiClient();
+        // Update the cached client for future use
+        this.llmModels[model].client = client;
+      } else {
+        throw new Error(`Client not initialized for model: ${model}`);
+      }
+    }
+
+    const res = await client.chat.completions.create(params);
+    return res;
   }
 
   // Generate AI response for marketing conversation
@@ -39,25 +176,26 @@ export class AgentModeService {
     messageContent: string,
     sessionHistory: ChatMessage[],
     userId: string,
+    llmModel: string,
     sessionId: string,
     mockMode: boolean = false,
     onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] }) => void
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[] }> {
     try {
-      
+
       const systemPrompt = await this.getMarketingSystemPrompt();
       const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
       const availableTemplates = await this.getAvailableTemplates();
-      
+
       // Get session to check for work plan
       const session = await chatbotDb.getChatSession(sessionId);
       const workPlan = session?.workPlan;
-      
+
       const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan);
-      
+
       // Build templates context message
       const templatesContext = this.buildTemplatesContext(availableTemplates);
-      
+
       // Build initial messages array (preserve structured history and tool messages)
       const messages: any[] = [
         { role: 'system', content: `${systemPrompt}\n\nCurrent time: ${new Date().toISOString()}` },
@@ -69,7 +207,7 @@ export class AgentModeService {
       const toolCalls: any[] = [];
       const knowledgeBaseQueries: string[] = [];
       const sources: string[] = [];
-      
+
       // Remember initial message count to slice response messages later
       const initialMessageCount = messages.length;
 
@@ -77,74 +215,77 @@ export class AgentModeService {
       let maxIterations = 20; // Prevent infinite loops
       let iteration = 0;
       let responseMessage: any = null;
-      
+
       while (iteration < maxIterations) {
         iteration++;
-        
+
         // Send progress update: starting iteration
         if (onProgress) {
-          onProgress({ 
-            iteration, 
+          onProgress({
+            iteration,
             status: 'thinking',
             toolCalls: iteration === 1 ? [] : toolCalls.slice()
           });
         }
-        
+
         // Make LLM call
-        const response = await this.openai.chat.completions.create({
-          model: process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
-          messages: messages,
+        const response = await this.callLLM(llmModel, messages, {
           tools: this.getAvailableTools(),
           tool_choice: 'auto',
-          max_completion_tokens: 12384
+          max_completion_tokens: 12384,
+          temperature: 0.1
         });
-        
+
+        // Yield control back to event loop after LLM call to allow health checks and other requests
+        // This prevents blocking the main thread during long-running generateResponse operations
+        await new Promise(resolve => setImmediate(resolve));
+        //print(re)
         responseMessage = response.choices[0].message;
         const responseContent = responseMessage.content || '';
-        
+
         // Update content with LLM's response
         if (responseContent) {
           content = responseContent;
         }
-        
+
         // Append the model's message to conversation before handling tool calls
         (messages as any[]).push(responseMessage);
-        
+
         // If no tool calls, break the loop
         if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
           // Send progress update: final response ready
           if (onProgress) {
-            onProgress({ 
-              iteration, 
+            onProgress({
+              iteration,
               status: 'complete',
               toolCalls: toolCalls.slice()
             });
           }
           break;
         }
-        
+
         // Send progress update: executing tools
         // Include the names of tools that are about to be executed
         const pendingToolNames = responseMessage.tool_calls?.map((tc: any) => tc.function.name) || [];
         if (onProgress) {
-          onProgress({ 
-            iteration, 
+          onProgress({
+            iteration,
             status: 'executing_tools',
             toolCalls: toolCalls.slice(),
             pendingTools: pendingToolNames
           });
         }
-        
+
         // Execute tool calls
         for (const toolCall of responseMessage.tool_calls) {
           try {
             const functionArgs = JSON.parse(toolCall.function.arguments);
-            
-            const result = await this.executeTool(toolCall.function.name, functionArgs, userId, sessionId, mockMode);
-            
+
+            const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode);
+
             // Store only the necessary data for the frontend
             const minimalResult = this.extractMinimalToolResult(result, toolCall.function.name);
-            
+
             toolCalls.push({
               id: toolCall.id,
               name: toolCall.function.name,
@@ -154,8 +295,8 @@ export class AgentModeService {
 
             // Send progress update: tool executed
             if (onProgress) {
-              onProgress({ 
-                iteration, 
+              onProgress({
+                iteration,
                 status: 'tool_executed',
                 toolCalls: toolCalls.slice()
               });
@@ -190,7 +331,7 @@ export class AgentModeService {
             // Ensure LLM receives the error to adjust its plan
             const errMsg = error instanceof Error ? error.message : String(error);
             const errorContent = this.formatToolError(toolCall.function.name, errMsg);
-            
+
             // Append error as tool message
             messages.push({
               tool_call_id: toolCall.id,
@@ -200,10 +341,10 @@ export class AgentModeService {
             });
           }
         }
-        
+
         // Do not append an assistant message; tool messages above are sufficient for model continuation
       }
-      
+
       if (iteration >= maxIterations) {
         console.warn('AgentMode: Reached maximum tool execution iterations');
       }
@@ -229,22 +370,22 @@ export class AgentModeService {
       };
     } catch (error: any) {
       console.error('AgentMode: Response generation failed:', error);
-      
+
       // Handle Azure OpenAI content filtering errors specifically
       if (error?.code === 'content_filter' || error?.error?.code === 'ResponsibleAIPolicyViolation') {
         throw new Error('I apologize, but I cannot respond to that request as it may violate content policies. Please try rephrasing your question or asking about something else.');
       }
-      
+
       // Handle other OpenAI API errors
       if (error?.status === 400) {
         throw new Error('I encountered an issue processing your request. Please try rephrasing your question.');
       }
-      
+
       // Handle rate limiting
       if (error?.status === 429) {
         throw new Error('I\'m currently experiencing high demand. Please wait a moment and try again.');
       }
-      
+
       // Generic error fallback
       throw new Error('I apologize, but I encountered an error processing your request. Please try again.');
     }
@@ -260,7 +401,7 @@ export class AgentModeService {
     } catch (error) {
       console.error('Error getting custom system prompt:', error);
     }
-    
+
     // Fallback to default system prompt
     return `You are Emma, an AI-powered assistant from AgentWeb. You help users execute marketing campaigns through natural conversation and task creation.
 
@@ -418,7 +559,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     } catch (error) {
       console.error('Error getting custom welcome message:', error);
     }
-    
+
     // Fallback to default welcome message
     return "I'm Emma, your team's new CMO 😎. I'll help you research, build, deploy, and measure Meta campaign insights in a blink of an eye.<br><br><strong>To get started, can you share your website URL?</strong>";
   }
@@ -433,7 +574,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     } catch (error) {
       console.error('Error getting custom conversation starters:', error);
     }
-    
+
     // Fallback to default conversation starters
     return [
       "Formulate marketing strategy for my product",
@@ -463,7 +604,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     };
 
     const toolDescription = toolDescriptions[toolName] || 'task';
-    
+
     switch (status) {
       case 'pending':
         return `${emoji} **${toolDescription}** is queued and will start shortly.`;
@@ -481,7 +622,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
-    
+
     // Determine slice starting at the 10th most recent user message over full history
     let userCount = 0;
     let startIdx = 1; // Assume the first message is the system message
@@ -495,11 +636,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
       }
     }
     const sliced = sessionHistory.slice(startIdx);
-    
+
     // Copy all sliced messages as-is
     for (const msg of sliced) {
       let content = msg.content;
-      
+
       // For user messages with attachments, reconstruct content to include attachment URLs
       // This matches how generateSessionResponse processes attachments (lines 495-502 in agentModeController)
       if (msg.role === 'user' && (msg as any).metadata?.attachments?.length > 0) {
@@ -509,9 +650,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
         }).join('\n');
         content = `${msg.content}\n\n**Attached Files:**\n${attachmentUrls}`;
       }
-      
+
       const messageObj: any = { role: msg.role, content: content };
-      
+
       // Add optional properties based on message type
       if ((msg as any).name) {
         messageObj.name = (msg as any).name;
@@ -522,10 +663,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
       if ((msg as any).tool_calls) {
         messageObj.tool_calls = (msg as any).tool_calls;
       }
-      
+
       messages.push(messageObj);
     }
-    
+
     // Insert current task statuses as an assistant message before the final user message
     const statusEmoji: Record<string, string> = {
       pending: '⏳',
@@ -555,37 +696,37 @@ Use the available tools to create tasks in the agent-engine when complex work is
       let workPlanContent = `⚠️ IMPORTANT: A WORK PLAN ALREADY EXISTS FOR THIS SESSION ⚠️\n\n`;
       workPlanContent += `[Current Active Work Plan: "${workPlan.title}"]\n\n`;
       workPlanContent += `You MUST continue working with this existing plan. DO NOT create a new work plan. Use modify_work_plan if you need to add or change steps.\n\n`;
-      
+
       // If autocomplete is enabled, add instruction to auto-complete steps
       if (workPlan.autocomplete) {
         workPlanContent += `⚠️ AUTOCOMPLETE MODE: After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.\n\n`;
       }
-      
+
       workPlan.steps.forEach((step: any) => {
         const icon = statusIcons[step.status as keyof typeof statusIcons];
         workPlanContent += `${step.stepCount}. ${icon} ${step.title} (${step.status})\n`;
-        
+
         // Include step description if available
         if (step.description) {
           workPlanContent += `   Description: ${step.description}\n`;
         }
-        
+
         // Include required function calls if available
         if (step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
           workPlanContent += `   Required Functions: ${step.requiredFunctionCalls.join(', ')}\n`;
         }
-        
+
         workPlanContent += '\n';
       });
 
       console.log('workPlanContent', workPlanContent);
-      
+
       messages.push({ role: 'assistant', content: workPlanContent.trim() });
     }
 
     // Append the current user message at the end
     messages.push({ role: 'user', content: messageContent });
-    
+
     return messages;
   }
 
@@ -595,7 +736,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
 
     let context = 'Available Templates:\n\n';
-    
+
     // Group templates by category
     const groupedTemplates: Record<string, any[]> = {};
     templates.forEach(template => {
@@ -621,7 +762,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     });
 
     context += `\nTo use a template, call the 'create_task_from_template' tool with the template_id and parameters_json string (JSON format where keys are parameter names and values are the actual values).`;
-    
+
     return context;
   }
 
@@ -697,15 +838,15 @@ Use the available tools to create tasks in the agent-engine when complex work is
                   toneOfVoice: { type: 'string', description: 'Brand tone of voice' },
                   brandPersonality: { type: 'string', description: 'Brand personality description' },
                   targetAudience: { type: 'string', description: 'Target audience description' },
-                  keyMessages: { 
-                    type: 'array', 
+                  keyMessages: {
+                    type: 'array',
                     items: { type: 'string' },
-                    description: 'Array of key brand messages' 
+                    description: 'Array of key brand messages'
                   },
-                  brandValues: { 
-                    type: 'array', 
+                  brandValues: {
+                    type: 'array',
                     items: { type: 'string' },
-                    description: 'Array of brand values' 
+                    description: 'Array of brand values'
                   },
                   isGradient: { type: 'boolean', description: 'Whether primary color uses gradient' },
                   founders: {
@@ -1050,50 +1191,50 @@ Use the available tools to create tasks in the agent-engine when complex work is
           }
         }
       },
-        {
-          type: 'function' as const,
-          function: {
-            name: 'generate_image',
-            description: 'Generate or edit images using AI image generation models. Supports both text-to-image generation and image editing with input images.',
-            parameters: {
-              type: 'object',
-              properties: {
-                prompt: {
-                  type: 'string',
-                  description: 'Detailed description of the image to generate or edit, including style, content, and visual specifications'
-                },
-                filename: {
-                  type: 'string',
-                  description: 'Name for the generated image file (should include .png extension)'
-                },
-                size: {
-                  type: 'string',
-                  description: 'Image size or ratio. For GPT models: 1024x1024, 1536x1024, 1024x1536, or auto. For Runway models: use ratio format like 1344:768, 768:1344, 1024:1024, 832x1248, etc. For Gemini 3 Pro Image (gemini-3-pro-image-preview): use ratio format like 1:1, 9:16, 16:9, 3:4, 4:3, 3:2, 2:3, 5:4, 4:5, 21:9, or auto. Use "auto" for automatic sizing.',
-                  default: 'auto'
-                },
-                quality: {
-                  type: 'string',
-                  description: 'Image quality setting (low, medium, high). Defaults to medium if not specified.',
-                  enum: ['low', 'medium', 'high'],
-                  default: 'medium'
-                },
-                inputImages: {
-                  type: 'array',
-                  description: 'List of input image URLs to use for image editing. Leave empty for text-to-image generation.',
-                  items: {
-                    type: 'string'
-                  }
-                },
-                imageModel: {
-                  type: 'string',
-                  description: 'Optional: Specific image generation model to use. Must be one of: gpt-image-1 (by Azure), gemini-2.5-flash-image-preview (by Google), gemini-3-pro-image-preview (by Google), gen4_image (by Runway), gemini_2.5_flash (by Runway).',
-                  enum: ['gpt-image-1', 'gemini-2.5-flash-image-preview', 'gemini-3-pro-image-preview', 'gen4_image', 'gemini_2.5_flash']
+      {
+        type: 'function' as const,
+        function: {
+          name: 'generate_image',
+          description: 'Generate or edit images using AI image generation models. Supports both text-to-image generation and image editing with input images.',
+          parameters: {
+            type: 'object',
+            properties: {
+              prompt: {
+                type: 'string',
+                description: 'Detailed description of the image to generate or edit, including style, content, and visual specifications'
+              },
+              filename: {
+                type: 'string',
+                description: 'Name for the generated image file (should include .png extension)'
+              },
+              size: {
+                type: 'string',
+                description: 'Image size or ratio. For GPT models: 1024x1024, 1536x1024, 1024x1536, or auto. For Runway models: use ratio format like 1344:768, 768:1344, 1024:1024, 832x1248, etc. For Gemini 3 Pro Image (gemini-3-pro-image-preview): use ratio format like 1:1, 9:16, 16:9, 3:4, 4:3, 3:2, 2:3, 5:4, 4:5, 21:9, or auto. Use "auto" for automatic sizing.',
+                default: 'auto'
+              },
+              quality: {
+                type: 'string',
+                description: 'Image quality setting (low, medium, high). Defaults to medium if not specified.',
+                enum: ['low', 'medium', 'high'],
+                default: 'medium'
+              },
+              inputImages: {
+                type: 'array',
+                description: 'List of input image URLs to use for image editing. Leave empty for text-to-image generation.',
+                items: {
+                  type: 'string'
                 }
               },
-              required: ['prompt', 'filename']
-            }
+              imageModel: {
+                type: 'string',
+                description: 'Optional: Specific image generation model to use. Must be one of: gpt-image-1 (by Azure), gemini-2.5-flash-image-preview (by Google), gemini-3-pro-image-preview (by Google), gen4_image (by Runway), gemini_2.5_flash (by Runway).',
+                enum: ['gpt-image-1', 'gemini-2.5-flash-image-preview', 'gemini-3-pro-image-preview', 'gen4_image', 'gemini_2.5_flash']
+              }
+            },
+            required: ['prompt', 'filename']
           }
-        },
+        }
+      },
       {
         type: 'function' as const,
         function: {
@@ -1144,22 +1285,22 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 enum: ['short', 'medium', 'long'],
                 default: 'medium'
               },
-                researchContext: {
-                  type: 'string',
-                  description: 'Optional research context or background information to include in the article',
-                  default: ''
-                },
-                requirements: {
-                  type: 'string',
-                  description: 'Specific requirements for the blog article (e.g., internal links, CTAs, branding guidelines)',
-                  default: ''
-                },
-                style: {
-                  type: 'string',
-                  description: 'The writing style of the blog article. Use "substack" for a personal, newsletter-like writing style with first-person perspective, engaging hooks, and conversational tone. Use "default" for standard blog post style.',
-                  enum: ['default', 'substack'],
-                  default: 'default'
-                }
+              researchContext: {
+                type: 'string',
+                description: 'Optional research context or background information to include in the article',
+                default: ''
+              },
+              requirements: {
+                type: 'string',
+                description: 'Specific requirements for the blog article (e.g., internal links, CTAs, branding guidelines)',
+                default: ''
+              },
+              style: {
+                type: 'string',
+                description: 'The writing style of the blog article. Use "substack" for a personal, newsletter-like writing style with first-person perspective, engaging hooks, and conversational tone. Use "default" for standard blog post style.',
+                enum: ['default', 'substack'],
+                default: 'default'
+              }
             },
             required: ['topic']
           }
@@ -1324,58 +1465,58 @@ Use the available tools to create tasks in the agent-engine when complex work is
           }
         }
       },
-        {
-          type: 'function' as const,
-          function: {
-            name: 'create_html_from_template',
-            description: 'Create final HTML from a template by providing variable values and array variable values as JSON strings, then upload to S3',
-            parameters: {
-              type: 'object',
-              properties: {
-                template_name: {
-                  type: 'string',
-                  description: 'Name of the HTML template to use'
-                },
-                variable_values_json: {
-                  type: 'string',
-                  description: 'JSON string containing regular variable values where keys are variable names and values are the actual values. Example: {"title": "Hello", "company_name": "Acme Corp"}'
-                },
-                array_variable_values_json: {
-                  type: 'string',
-                  description: 'JSON string containing array variable values where keys are array variable names and values are arrays of strings. If there is no data for an array variable, provide an empty array for that variable. Example: {"features_n": ["Feature 1", "Feature 2"], "links_n": []} for when links_n has no data.'
-                }
+      {
+        type: 'function' as const,
+        function: {
+          name: 'create_html_from_template',
+          description: 'Create final HTML from a template by providing variable values and array variable values as JSON strings, then upload to S3',
+          parameters: {
+            type: 'object',
+            properties: {
+              template_name: {
+                type: 'string',
+                description: 'Name of the HTML template to use'
               },
-              required: ['template_name', 'variable_values_json', 'array_variable_values_json']
-            }
-          }
-        },
-        {
-          type: 'function' as const,
-          function: {
-            name: 'update_html_file',
-            description: 'Update an HTML file by replacing specific content with new content. Use update_type="full" with old_file_hash for entire file replacement, or update_type="part" with old_content for partial replacements',
-            parameters: {
-              type: 'object',
-              properties: {
-                file_url: {
-                  type: 'string',
-                  description: 'URL of the HTML file to update (S3 URL or file path)'
-                },
-                update_type: {
-                  type: 'string',
-                  enum: ['part', 'full'],
-                  description: 'Type of update: "part" for partial content replacement using old_content, "full" for entire file replacement using old_file_hash'
-                },
-                replacement_json: {
-                  type: 'string',
-                  description: 'JSON string containing a list of replacement instructions. For full replacement: [{"old_file_hash": "abc123...", "new_content": "<!DOCTYPE html>...", "expected_count": 1}]. For part replacement: [{"old_content": "<h1>Old Title</h1>", "new_content": "<h1>New Title</h1>", "expected_count": 1}]. Use empty string for new_content to delete the specified content.'
-                }
+              variable_values_json: {
+                type: 'string',
+                description: 'JSON string containing regular variable values where keys are variable names and values are the actual values. Example: {"title": "Hello", "company_name": "Acme Corp"}'
               },
-              required: ['file_url', 'update_type', 'replacement_json']
-            }
+              array_variable_values_json: {
+                type: 'string',
+                description: 'JSON string containing array variable values where keys are array variable names and values are arrays of strings. If there is no data for an array variable, provide an empty array for that variable. Example: {"features_n": ["Feature 1", "Feature 2"], "links_n": []} for when links_n has no data.'
+              }
+            },
+            required: ['template_name', 'variable_values_json', 'array_variable_values_json']
           }
-        },
-        {
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'update_html_file',
+          description: 'Update an HTML file by replacing specific content with new content. Use update_type="full" with old_file_hash for entire file replacement, or update_type="part" with old_content for partial replacements',
+          parameters: {
+            type: 'object',
+            properties: {
+              file_url: {
+                type: 'string',
+                description: 'URL of the HTML file to update (S3 URL or file path)'
+              },
+              update_type: {
+                type: 'string',
+                enum: ['part', 'full'],
+                description: 'Type of update: "part" for partial content replacement using old_content, "full" for entire file replacement using old_file_hash'
+              },
+              replacement_json: {
+                type: 'string',
+                description: 'JSON string containing a list of replacement instructions. For full replacement: [{"old_file_hash": "abc123...", "new_content": "<!DOCTYPE html>...", "expected_count": 1}]. For part replacement: [{"old_content": "<h1>Old Title</h1>", "new_content": "<h1>New Title</h1>", "expected_count": 1}]. Use empty string for new_content to delete the specified content.'
+              }
+            },
+            required: ['file_url', 'update_type', 'replacement_json']
+          }
+        }
+      },
+      {
         type: 'function' as const,
         function: {
           name: 'create_work_plan',
@@ -1520,7 +1661,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         message: result.message || 'Task created'
       };
     }
-    
+
     // For image generation, return the essential fields
     if (toolName === 'generate_image') {
       return {
@@ -1530,7 +1671,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         filename: result.filename
       };
     }
-    
+
     // For other tools, return empty object to minimize storage
     return {};
   }
@@ -1546,7 +1687,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           message: `Mock task created from template ${args.template_id}`,
           status: 'pending'
         };
-      
+
       case 'create_task_from_prompt':
         return {
           success: true,
@@ -1555,7 +1696,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           message: `Mock task created: ${args.task_name}`,
           status: 'pending'
         };
-      
+
       case 'create_image_task_from_prompt':
         return {
           success: true,
@@ -1564,7 +1705,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           message: `Mock image task created: ${args.task_name}`,
           status: 'pending'
         };
-      
+
       case 'generate_image':
         return {
           success: true,
@@ -1572,7 +1713,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           imageUrl: `data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==`,
           filename: args.filename
         };
-      
+
       case 'remove_c2pa_from_image':
         return {
           success: true,
@@ -1581,7 +1722,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           filename: args.filename || `image_no_c2pa_${Date.now()}.png`,
           originalUrl: args.image_url
         };
-      
+
       case 'get_meta_ads_metrics':
         // Calculate attribution window based on timeframe
         const timeframe = args.timeframe || '7d';
@@ -1589,7 +1730,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         const endDate = new Date(now);
         let startDate = new Date(now);
         let days = 7;
-        
+
         // Parse timeframe - only valid values are 7d, 14d, 30d, 90d
         switch (timeframe) {
           case '7d':
@@ -1614,10 +1755,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
             startDate.setDate(now.getDate() - 7);
             break;
         }
-        
+
         // Format dates as YYYY-MM-DD
         const formatDate = (date: Date) => date.toISOString().split('T')[0];
-        
+
         return {
           success: true,
           data: {
@@ -1783,7 +1924,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           },
           timeframe: args.timeframe || '7d'
         };
-      
+
       case 'search_web':
         return {
           success: true,
@@ -1800,7 +1941,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             }
           ]
         };
-      
+
       case 'search_knowledge_base':
         return {
           success: true,
@@ -1818,7 +1959,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           ],
           totalResults: 2
         };
-      
+
       case 'list_knowledge_base_files':
         return {
           success: true,
@@ -1841,7 +1982,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           ],
           totalFiles: 2
         };
-      
+
       case 'read_knowledge_base_file':
         return {
           success: true,
@@ -1853,7 +1994,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           type: 'private',
           updatedAt: new Date().toISOString()
         };
-      
+
       case 'read_brand_guidelines':
         return {
           success: true,
@@ -1866,13 +2007,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
           },
           brandAssets: []
         };
-      
+
       case 'update_brand_guidelines':
         return {
           success: true,
           message: 'Mock brand guidelines updated successfully'
         };
-      
+
       case 'read_market_strategy':
         return {
           success: true,
@@ -1885,13 +2026,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
             { title: 'Mock ICP', description: 'Mock ideal customer profile', valueProposition: 'Mock value prop', buyerPersonas: ['Mock persona 1', 'Mock persona 2'] }
           ]
         };
-      
+
       case 'update_market_strategy':
         return {
           success: true,
           message: 'Mock market strategy updated successfully'
         };
-      
+
       case 'create_revision':
         return {
           success: true,
@@ -1902,7 +2043,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           assetType: 'report',
           targetFile: 'mock-report.html'
         };
-      
+
       case 'create_social_media_posts':
         return {
           success: true,
@@ -1910,7 +2051,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           htmlUrl: `https://agentweb-files.s3.us-east-1.amazonaws.com/mock-social-media-posts-${Date.now()}.html`,
           postsCount: args.posts?.length || 0
         };
-      
+
       case 'save_file':
         return {
           success: true,
@@ -1919,14 +2060,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
           file_name: args.file_name,
           file_size: args.file_content.length
         };
-      
+
       case 'read_file_content':
         return {
           success: true,
           content: `Mock file content for ${args.file_url}. This would be the actual content of the file in a real scenario.`,
           filename: 'mock-file.txt'
         };
-      
+
       case 'read_page_source':
         return {
           success: true,
@@ -1934,14 +2075,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
           file_type: 'html',
           file_url: args.url
         };
-      
+
       case 'describe_image':
         return {
           success: true,
           description: `Mock image analysis for ${args.image_url}${args.prompt ? ` with custom prompt: "${args.prompt}"` : ''}. This would contain detailed visual analysis including colors, composition, text content, and marketing elements in a real scenario.`,
           imageUrl: args.image_url
         };
-      
+
       case 'perform_data_analysis':
         return {
           success: true,
@@ -1949,7 +2090,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           analysis: `**Analysis:** Mock analysis results for ${args.file_urls?.length || 0} file(s).\n\nAnalysis task: ${args.analysis_instruction}\n\n**Code Executed:**\n\`\`\`python\n# Mock analysis code\nimport pandas as pd\nimport numpy as np\n\n# Analyze the data\nprint("Data analysis completed")\n\`\`\`\n\n**Code Output:**\n\`\`\`\nData analysis completed\nMock results would appear here in a real scenario.\n\`\`\``,
           codeExecuted: true
         };
-      
+
       case 'list_html_templates':
         return {
           success: true,
@@ -1972,18 +2113,18 @@ Use the available tools to create tasks in the agent-engine when complex work is
             }
           ]
         };
-      
+
       case 'create_html_from_template':
         // Mock validation - check if required variables are provided
         const mockTemplate = {
           variables: ['title', 'company_name'],
           arrayVariables: ['features_n']
         };
-        
+
         // Parse JSON strings for mock validation
         let mockVariableValues = {};
         let mockArrayVariableValues = {};
-        
+
         try {
           if (args.variable_values_json) {
             mockVariableValues = JSON.parse(args.variable_values_json);
@@ -1995,7 +2136,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             error: error instanceof Error ? error.message : 'Unknown error'
           };
         }
-        
+
         try {
           if (args.array_variable_values_json) {
             mockArrayVariableValues = JSON.parse(args.array_variable_values_json);
@@ -2007,10 +2148,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
             error: error instanceof Error ? error.message : 'Unknown error'
           };
         }
-        
+
         const missingVars = mockTemplate.variables.filter(v => !(v in mockVariableValues));
         const missingArrayVars = mockTemplate.arrayVariables.filter(v => !(v in mockArrayVariableValues));
-        
+
         if (missingVars.length > 0 || missingArrayVars.length > 0) {
           return {
             success: false,
@@ -2023,7 +2164,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             template_array_variables: mockTemplate.arrayVariables
           };
         }
-        
+
         return {
           success: true,
           s3_url: `https://mock-s3-bucket.s3.amazonaws.com/html_${args.template_name}_${Date.now()}.html`,
@@ -2032,12 +2173,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
           filename: `html_${args.template_name}_${Date.now()}.html`,
           message: 'Mock HTML generated using LLM variable substitution'
         };
-      
+
       case 'update_html_file':
         // Mock validation for update_html_file
         try {
           const instructions = JSON.parse(args.replacement_json);
-          
+
           // Validate that it's an array
           if (!Array.isArray(instructions)) {
             return {
@@ -2045,25 +2186,25 @@ Use the available tools to create tasks in the agent-engine when complex work is
               message: 'replacement_json must be an array of replacement instructions'
             };
           }
-          
+
           if (instructions.length === 0) {
             return {
               success: false,
               message: 'At least one replacement instruction is required'
             };
           }
-          
+
           // Validate each instruction based on update_type
           for (let i = 0; i < instructions.length; i++) {
             const instruction = instructions[i];
-            
+
             if (!instruction.new_content || instruction.expected_count === undefined) {
               return {
                 success: false,
                 message: `Missing required fields in replacement instruction ${i + 1}: new_content and expected_count are required`
               };
             }
-            
+
             if (args.update_type === 'full') {
               // For full replacement, require old_file_hash
               if (!instruction.old_file_hash) {
@@ -2094,7 +2235,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
               }
             }
           }
-          
+
           // Mock successful replacement
           const replacementResults = instructions.map((instruction, index) => {
             const result: any = {
@@ -2104,19 +2245,19 @@ Use the available tools to create tasks in the agent-engine when complex work is
               actual_count: instruction.expected_count, // Mock: assume count matches
               success: true
             };
-            
+
             if (args.update_type === 'full') {
               result.old_file_hash = instruction.old_file_hash;
             } else {
               result.old_content = instruction.old_content;
             }
-            
+
             return result;
           });
-          
+
           // Mock versioned filename
           const mockVersionedFilename = `updated_file_v2.html`;
-          
+
           return {
             success: true,
             s3_url: `https://mock-s3-bucket.s3.amazonaws.com/${mockVersionedFilename}`,
@@ -2132,7 +2273,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             error: error instanceof Error ? error.message : 'Unknown error'
           };
         }
-      
+
       default:
         return {
           success: true,
@@ -2142,15 +2283,15 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
-  private async executeTool(toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false): Promise<any> {
+  private async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false): Promise<any> {
     const argsStr = JSON.stringify(args, null, 2);
     const truncatedArgs = argsStr.length > 500 ? argsStr.substring(0, 500) + '...' : argsStr;
-    
+
     // Return mock data if in mock mode
     if (mockMode) {
       return this.getMockToolResult(toolName, args);
     }
-    
+
     switch (toolName) {
       case 'create_task_from_template':
         try {
@@ -2206,7 +2347,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'remove_c2pa_from_image':
         return await this.removeC2PAFromImage(args.image_url, args.filename, userId);
       case 'create_blog_article':
-          return await this.createBlogArticle(args.topic, args.keywords || '', args.tone || 'professional', args.length || 'medium', args.researchContext || '', args.requirements || '', userId, sessionId, args.style || 'default');
+        return await this.createBlogArticle(args.topic, args.keywords || '', args.tone || 'professional', args.length || 'medium', args.researchContext || '', args.requirements || '', userId, sessionId, args.style || 'default');
       case 'publish_blog_article':
         return await this.publishBlogArticle(args.title, args.description, args.hero_image_url, args.blog_html_url, userId, sessionId);
       case 'create_social_media_posts':
@@ -2216,7 +2357,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'get_task_subscriber_engagement_events':
         return await this.getTaskSubscriberEngagementEvents(args.task_id, args.email_subject, userId);
       case 'describe_image':
-        return await this.describeImage(args.image_url, args.prompt);
+        return await this.describeImage(llmModel, args.image_url, args.prompt);
       case 'perform_data_analysis':
         return await this.performDataAnalysis(args.file_urls, args.analysis_instruction, userId);
       case 'list_html_templates':
@@ -2229,11 +2370,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
             message: 'template_name is required'
           };
         }
-        
+
         // Parse JSON strings
         let variableValues = {};
         let arrayVariableValues = {};
-        
+
         try {
           if (args.variable_values_json) {
             variableValues = JSON.parse(args.variable_values_json);
@@ -2245,7 +2386,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             error: error instanceof Error ? error.message : 'Unknown error'
           };
         }
-        
+
         try {
           if (args.array_variable_values_json) {
             arrayVariableValues = JSON.parse(args.array_variable_values_json);
@@ -2257,31 +2398,31 @@ Use the available tools to create tasks in the agent-engine when complex work is
             error: error instanceof Error ? error.message : 'Unknown error'
           };
         }
-        
-        return await this.createHtmlFromTemplate(args.template_name, variableValues, arrayVariableValues, userId, sessionId);
-        case 'update_html_file':
-          // Ensure we have the required parameters
-          if (!args.file_url) {
-            return {
-              success: false,
-              message: 'file_url is required'
-            };
-          }
-          
-          if (!args.update_type) {
-            return {
-              success: false,
-              message: 'update_type is required'
-            };
-          }
-          
-          if (!args.replacement_json) {
-            return {
-              success: false,
-              message: 'replacement_json is required'
-            };
-          }
-        
+
+        return await this.createHtmlFromTemplate(llmModel, args.template_name, variableValues, arrayVariableValues, userId, sessionId);
+      case 'update_html_file':
+        // Ensure we have the required parameters
+        if (!args.file_url) {
+          return {
+            success: false,
+            message: 'file_url is required'
+          };
+        }
+
+        if (!args.update_type) {
+          return {
+            success: false,
+            message: 'update_type is required'
+          };
+        }
+
+        if (!args.replacement_json) {
+          return {
+            success: false,
+            message: 'replacement_json is required'
+          };
+        }
+
         // Parse replacement instructions
         let replacementInstructions;
         try {
@@ -2293,7 +2434,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             error: error instanceof Error ? error.message : 'Unknown error'
           };
         }
-        
+
         return await this.updateHtmlFile(args.file_url, args.update_type, replacementInstructions, userId, sessionId);
       case 'create_work_plan':
         return await this.createWorkPlan(args.title, args.steps, sessionId);
@@ -2306,7 +2447,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
-  private async describeImage(imageUrl: string, prompt?: string): Promise<any> {
+  private async describeImage(llmModel: string, imageUrl: string, prompt?: string): Promise<any> {
     try {
       if (!imageUrl) {
         return {
@@ -2314,7 +2455,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
           message: 'No image URL provided'
         };
       }
-
+      if (!llmModel) {
+        llmModel = this.default_model;
+      }
       // Use custom prompt or default
       const analysisPrompt = prompt || 'Please analyze and describe this image in detail. Focus on visual elements, composition, colors, text, and any marketing or branding elements you can identify.';
 
@@ -2336,9 +2479,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       ];
 
       // Call OpenAI Vision API using the same model as agent mode
-      const response = await this.openai.chat.completions.create({
-        model: process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
-        messages: messages,
+      const response = await this.callLLM(llmModel, messages, {
         max_completion_tokens: 2000
       });
 
@@ -2400,7 +2541,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Get the model name from environment or use default
       const modelName = process.env.DATA_ANALYSIS_LLM_NAME || 'gemini-2.5-flash';
-      
+
       // Get file size limit from environment or use default (50MB)
       const maxTotalSize = parseInt(process.env.DATA_ANALYSIS_FILE_SIZE || '52428800'); // 50MB in bytes
 
@@ -2429,7 +2570,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           // Determine MIME type from URL or response headers
           const contentType = response.headers['content-type'];
           const url = fileUrl.toLowerCase();
-          
+
           let mimeType = 'text/plain';
           if (contentType) {
             mimeType = contentType;
@@ -2457,7 +2598,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
           // Upload file to Gemini
           const base64Content = Buffer.from(fileData).toString('base64');
-          
+
           fileParts.push({
             inline_data: {
               data: base64Content,
@@ -2477,10 +2618,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Prepare content parts
       const parts: any[] = [];
-      
+
       // Add file parts
       fileParts.forEach(part => parts.push(part));
-      
+
       // Add text part with analysis instruction so the model knows how to proceed with or without files
       parts.push({
         text: `Please perform the following analysis task. ${urlsToProcess.length > 0 ? 'Use the attached files as primary data sources and incorporate any structured data included in the instruction text.' : 'No external files are attached; treat the information in the instruction as the complete dataset for this task.'}\n\n${analysisInstruction}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present.`
@@ -2488,7 +2629,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Call Gemini API directly via REST to enable code execution
       const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`;
-      const apiResponse = await axios.post(apiUrl, 
+      const apiResponse = await axios.post(apiUrl,
         {
           tools: [{ code_execution: {} }],
           contents: [
@@ -2507,7 +2648,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Extract and format the response
       const candidates = (apiResponse.data as any).candidates;
-      
+
       if (!candidates || candidates.length === 0) {
         return {
           success: false,
@@ -2520,7 +2661,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Extract parts from response
       const responseParts = candidates[0].content.parts || [];
-      
+
       for (const part of responseParts) {
         if (part.text) {
           resultParts.push(`**Analysis:** ${part.text}`);
@@ -2530,10 +2671,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
           try {
             const imageData = (part as any).inlineData.data;
             const mimeType = (part as any).inlineData.mimeType || 'image/png';
-            
+
             // Convert base64 string to Buffer for S3 upload
             const imageBuffer = Buffer.from(imageData, 'base64');
-            
+
             // Upload image to S3
             const { uploadFileToS3 } = await import('../utils/s3Utils');
             const imageFilename = `analysis_chart_${Date.now()}.png`;
@@ -2543,7 +2684,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
               userId,
               mimeType
             );
-            
+
             if (uploadResult.success && uploadResult.url) {
               resultParts.push(`**Chart/Image Generated:**\n![Analysis Result](${uploadResult.url})`);
             }
@@ -2556,10 +2697,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
           try {
             const imageData = (part as any).inline_data.data;
             const mimeType = (part as any).inline_data.mimeType || (part as any).inline_data.mime_type || 'image/png';
-            
+
             // Convert base64 string to Buffer for S3 upload
             const imageBuffer = Buffer.from(imageData, 'base64');
-            
+
             // Upload image to S3
             const { uploadFileToS3 } = await import('../utils/s3Utils');
             const imageFilename = `analysis_chart_${Date.now()}.png`;
@@ -2569,7 +2710,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
               userId,
               mimeType
             );
-            
+
             if (uploadResult.success && uploadResult.url) {
               resultParts.push(`**Chart/Image Generated:**\n![Analysis Result](${uploadResult.url})`);
             }
@@ -2589,7 +2730,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Combine all results
       const analysisResult = resultParts.join('\n\n');
-      
+
       return {
         success: true,
         message: 'Data analysis completed successfully',
@@ -2636,19 +2777,19 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Get executions for each specific task
       const completedExecutions: any[] = [];
-      
+
       for (const taskId of taskIds) {
         const taskExecutions = await taskDb.getTaskExecutions(taskId);
         if (taskExecutions && taskExecutions.length > 0) {
           // Find the latest completed execution with HTML results
           const latestCompleted = taskExecutions
-            .filter(execution => 
-              execution.status === 'completed' && 
-              execution.result_files && 
+            .filter(execution =>
+              execution.status === 'completed' &&
+              execution.result_files &&
               execution.result_files.length > 0
             )
             .sort((a, b) => new Date(b.createdAt || b.startTime).getTime() - new Date(a.createdAt || a.startTime).getTime())[0];
-          
+
           if (latestCompleted) {
             // Fetch task details to get the task name
             const task = await taskDb.getTaskById(taskId);
@@ -2669,10 +2810,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
       context += 'The following are results from your previous completed tasks that you can reference:\n\n';
 
       completedExecutions.forEach(execution => {
-        const htmlFiles = execution.result_files.filter((file: any) => 
+        const htmlFiles = execution.result_files.filter((file: any) =>
           file.is_html || file.view_type === 'html' || file.filename.toLowerCase().endsWith('.html')
         );
-        
+
         if (htmlFiles.length > 0) {
           context += `**Task ${execution.taskId}** (${execution.taskName || 'Unknown Task'}):\n`;
           htmlFiles.forEach((file: any) => {
@@ -2695,9 +2836,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const { userDb } = await import('./db');
       const user = await userDb.getUserById(userId);
       if (!user) {
-        return { 
-          success: false, 
-          message: 'User not found', 
+        return {
+          success: false,
+          message: 'User not found',
           exists: false,
           error: 'User not found'
         };
@@ -2705,9 +2846,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       const brand = user.brandGuidelines;
       if (!brand) {
-        return { 
-          success: true, 
-          exists: false, 
+        return {
+          success: true,
+          exists: false,
           message: 'No brand guidelines found',
           brandData: {},
           attachments: []
@@ -2734,8 +2875,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       };
     } catch (error) {
       console.error('AgentMode: Error reading brand guidelines:', error);
-      return { 
-        success: false, 
+      return {
+        success: false,
         message: 'Failed to read brand guidelines',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
@@ -2748,9 +2889,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const { userDb } = await import('./db');
       const user = await userDb.getUserById(userId);
       if (!user) {
-        return { 
-          success: false, 
-          message: 'User not found', 
+        return {
+          success: false,
+          message: 'User not found',
           exists: false,
           error: 'User not found'
         };
@@ -2758,9 +2899,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       const marketStrategy = user.marketStrategy;
       if (!marketStrategy) {
-        return { 
-          success: true, 
-          exists: false, 
+        return {
+          success: true,
+          exists: false,
           message: 'No market strategy found',
           marketData: {
             businessOverview: '',
@@ -2788,8 +2929,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       };
     } catch (error) {
       console.error('AgentMode: Error reading market strategy:', error);
-      return { 
-        success: false, 
+      return {
+        success: false,
         message: 'Failed to read market strategy',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
@@ -2811,15 +2952,15 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Get existing market strategy
       const existingMarketStrategy = user.marketStrategy;
-      
+
       // Extract market strategy fields from updateData
       const { businessOverview, competitors, icp, ...otherFields } = updateData;
-      
+
       // Merge competitors by name - preserve existing entries, update or add new ones
       let mergedCompetitors = [...(existingMarketStrategy?.competitors || [])];
       if (competitors !== undefined && Array.isArray(competitors)) {
         competitors.forEach(newCompetitor => {
-          const existingIndex = mergedCompetitors.findIndex(existing => 
+          const existingIndex = mergedCompetitors.findIndex(existing =>
             existing.name === newCompetitor.name
           );
           if (existingIndex >= 0) {
@@ -2834,12 +2975,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
           }
         });
       }
-      
+
       // Merge ICPs by title - preserve existing entries, update or add new ones
       let mergedICP = [...(existingMarketStrategy?.icp || [])];
       if (icp !== undefined && Array.isArray(icp)) {
         icp.forEach(newICP => {
-          const existingIndex = mergedICP.findIndex(existing => 
+          const existingIndex = mergedICP.findIndex(existing =>
             existing.title === newICP.title
           );
           if (existingIndex >= 0) {
@@ -2854,7 +2995,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           }
         });
       }
-      
+
       // Prepare market strategy data - merge with existing if available
       const marketStrategyData = {
         businessOverview: businessOverview !== undefined ? businessOverview : (existingMarketStrategy?.businessOverview || ''),
@@ -2872,10 +3013,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
       // Track what was updated vs added
       const updatedEntries: string[] = [];
       const addedEntries: string[] = [];
-      
+
       if (competitors !== undefined && Array.isArray(competitors)) {
         competitors.forEach(competitor => {
-          const wasExisting = existingMarketStrategy?.competitors?.some((existing: any) => 
+          const wasExisting = existingMarketStrategy?.competitors?.some((existing: any) =>
             existing.name === competitor.name
           );
           if (wasExisting) {
@@ -2885,10 +3026,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
           }
         });
       }
-      
+
       if (icp !== undefined && Array.isArray(icp)) {
         icp.forEach(profile => {
-          const wasExisting = existingMarketStrategy?.icp?.some((existing: any) => 
+          const wasExisting = existingMarketStrategy?.icp?.some((existing: any) =>
             existing.title === profile.title
           );
           if (wasExisting) {
@@ -2947,7 +3088,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Get existing brand guidelines
       let existingBrand = user.brandGuidelines;
-      
+
       // If no existing brand guidelines, create a new structure
       if (!existingBrand) {
         // Create initial brand guidelines structure
@@ -2971,19 +3112,19 @@ Use the available tools to create tasks in the agent-engine when complex work is
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
         };
-        
+
         // Update the user with initial brand guidelines
         await userDb.updateUser(userId, {
           brandGuidelines: initialBrandGuidelines
         });
-        
+
         // Use the initial structure as the base for updates
         existingBrand = initialBrandGuidelines;
       }
 
       // Extract brandData and brandAssets from updateData
       const { brandData, brandAssets, ...otherFields } = updateData;
-      
+
       // Merge with existing brandData - only update provided fields
       const updatedBrandData = {
         ...existingBrand.brandData,
@@ -3025,7 +3166,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       // Handle brandAssets update - merge by type to preserve existing assets
       let updatedAttachments = [...(existingBrand.attachments || [])];
       const updatedAssets: any[] = []; // Track which assets were actually updated
-      
+
       if (brandAssets !== undefined) {
         if (Array.isArray(brandAssets)) {
           // Merge by type: replace assets of the same type, keep others
@@ -3103,7 +3244,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   private getCurrentTaskStatusesInSession(sessionHistory: ChatMessage[]): any[] {
     try {
       const taskStatuses: any[] = [];
-      
+
       // Extract task statuses from session history
       sessionHistory.forEach(message => {
         if (message.metadata?.toolCalls) {
@@ -3124,7 +3265,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           });
         }
       });
-      
+
       // Remove duplicates and return unique task statuses
       const uniqueTaskStatuses = new Map();
       taskStatuses.forEach(task => {
@@ -3133,7 +3274,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           uniqueTaskStatuses.set(key, task);
         }
       });
-      
+
       return Array.from(uniqueTaskStatuses.values());
     } catch (error) {
       console.error('AgentMode: Error getting task statuses from session:', error);
@@ -3149,7 +3290,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const recentExecutions = (allExecutions || [])
         .sort((a, b) => new Date(b.createdAt || b.startTime).getTime() - new Date(a.createdAt || a.startTime).getTime())
         .slice(0, 10);
-      
+
       return recentExecutions.map(execution => ({
         taskId: execution.taskId,
         executionId: execution.executionId,
@@ -3213,15 +3354,15 @@ Use the available tools to create tasks in the agent-engine when complex work is
   // Helper function to wait for task completion
   private async waitForTaskCompletion(taskId: string, executionId: string, userId: string, maxWaitTime: number = 300000, additionalFields: any = {}, pollInterval: number = 2000): Promise<any> {
     const startTime = Date.now();
-    
+
     while (Date.now() - startTime < maxWaitTime) {
       try {
         const execution = await taskDb.getTaskExecutionById(executionId);
         if (execution && (execution.status === 'completed' || execution.status === 'failed')) {
           return {
             success: execution.status === 'completed',
-            message: execution.status === 'completed' 
-              ? 'Task completed successfully' 
+            message: execution.status === 'completed'
+              ? 'Task completed successfully'
               : `Task failed: ${execution.error || 'Unknown error'}`,
             status: execution.status,
             taskId: taskId,
@@ -3231,7 +3372,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             ...additionalFields
           };
         }
-        
+
         // Wait before next poll
         await new Promise(resolve => setTimeout(resolve, pollInterval));
       } catch (error) {
@@ -3239,7 +3380,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         await new Promise(resolve => setTimeout(resolve, pollInterval));
       }
     }
-    
+
     // Timeout reached - return async format
     return {
       success: true,
@@ -3512,7 +3653,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Format the prompt using the same format as handleCreateAdImageTask
       let formattedPrompt = "Please create high-quality ad images that align with the below context and target the specified audience. The images should be professional, engaging, and suitable for various marketing channels. Use download_image to download reference images and generate_image to create the result images. Valid size values for generate_image include \"1024x1024\", \"1536x1024\", \"1024x1536\", \"auto\". Valid quality values for generate_image include \"low\", \"medium\", \"high\" (defaults to medium if not specified). DO NOT browse the internet for other images.\n\n";
-      
+
       // Add the user's image prompt
       if (prompt.trim()) {
         formattedPrompt += `Image Prompt:\n${prompt.trim()}\n\n`;
@@ -3585,21 +3726,19 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
   async generateSessionTitle(userMessage: string): Promise<string> {
     try {
-      
-      const response = await this.openai.chat.completions.create({
-        model: process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
-        messages: [
-          { 
-            role: 'system', 
-            content: `You are a session title generator for AgentWeb's Agent Mode. Based on the user's first message, generate a concise, descriptive title (max 60 characters) that captures the main marketing topic or task. Return ONLY the title, nothing else.`
-          },
-          { role: 'user', content: userMessage }
-        ],
+
+      const response = await this.callLLM(this.default_model, [
+        {
+          role: 'system',
+          content: `You are a session title generator for AgentWeb's Agent Mode. Based on the user's first message, generate a concise, descriptive title (max 60 characters) that captures the main marketing topic or task. Return ONLY the title, nothing else.`
+        },
+        { role: 'user', content: userMessage }
+      ], {
         max_completion_tokens: 100
       });
 
       const title = response.choices[0]?.message?.content?.trim();
-      
+
       return title || 'Marketing Task';
     } catch (error) {
       console.error('AgentMode: Failed to generate session title:', error);
@@ -3611,12 +3750,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
   private async getMetaAdsMetrics(timeframe: string, userId: string, campaign_name?: string): Promise<any> {
     try {
-      
+
       // Import the Meta API functions directly to reuse the same logic
       const { getMetaAccessToken } = await import('../utils/secretsManager');
       const { userDb } = await import('./db');
       const { fetchWithRetryAndPaging } = await import('../utils/metaApiFetch');
-      
+
       // Get user from database
       const user = await userDb.getUserById(userId);
       if (!user) {
@@ -3651,7 +3790,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Get API version from environment or default to v18.0
       const apiVersion = process.env.META_API_VERSION || 'v18.0';
-      
+
       // Calculate date range based on timeframe
       // Exclude today since it's not fully complete - use yesterday as end date
       const endDate = new Date();
@@ -3675,16 +3814,16 @@ Use the available tools to create tasks in the agent-engine when complex work is
       if (campaign_name) {
         console.log('AgentMode: Getting campaigns to find matching IDs for:', campaign_name);
         const campaignsData = await fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`);
-        
+
         if (campaignsData.error) {
           console.error('AgentMode: Campaigns API Error:', campaignsData.error);
           throw new Error(`Campaigns API Error: ${campaignsData.error.message}`);
         }
-        
-        const matchingCampaigns = (campaignsData.data || []).filter((campaign: any) => 
+
+        const matchingCampaigns = (campaignsData.data || []).filter((campaign: any) =>
           campaign.name && campaign.name.toLowerCase().includes(campaign_name.toLowerCase())
         );
-        
+
         if (matchingCampaigns.length === 0) {
           return {
             success: false,
@@ -3692,16 +3831,16 @@ Use the available tools to create tasks in the agent-engine when complex work is
             error: 'Campaign not found'
           };
         }
-        
+
         campaignFilterIds = matchingCampaigns.map((c: any) => c.id);
         console.log('AgentMode: Found matching campaign IDs:', campaignFilterIds);
       }
 
       // Build filtering parameter for API calls
-      const filteringParam = campaignFilterIds.length > 0 
+      const filteringParam = campaignFilterIds.length > 0
         ? `&filtering=[{"field":"campaign.id","operator":"IN","value":["${campaignFilterIds.join('","')}"]}]`
         : '';
-      
+
 
       // Get campaigns, ad sets, ads, and insights using Graph API - fetch at multiple levels
       // Using fetchWithRetryAndPaging to automatically handle pagination if there are multiple pages
@@ -3771,23 +3910,23 @@ Use the available tools to create tasks in the agent-engine when complex work is
       let demographicsBreakdown = insightsDemographicsData?.data || [];
       let placementBreakdown = insightsPlacementData?.data || [];
       let deviceBreakdown = insightsDeviceData?.data || [];
-      
+
       if (campaignFilterIds.length > 0) {
-        demographicsBreakdown = demographicsBreakdown.filter((item: any) => 
+        demographicsBreakdown = demographicsBreakdown.filter((item: any) =>
           item.campaign_id && campaignFilterIds.includes(item.campaign_id)
         );
-        placementBreakdown = placementBreakdown.filter((item: any) => 
+        placementBreakdown = placementBreakdown.filter((item: any) =>
           item.campaign_id && campaignFilterIds.includes(item.campaign_id)
         );
-        deviceBreakdown = deviceBreakdown.filter((item: any) => 
+        deviceBreakdown = deviceBreakdown.filter((item: any) =>
           item.campaign_id && campaignFilterIds.includes(item.campaign_id)
         );
       }
-      
+
       const processedDemographicsBreakdown = this.processBreakdownData(demographicsBreakdown);
       const processedPlacementBreakdown = this.processBreakdownData(placementBreakdown);
       const processedDeviceBreakdown = this.processBreakdownData(deviceBreakdown);
-      
+
       // Format the data for LLM consumption
       const formattedContent = await this.formatMetricsSummary({
         adPerformance,
@@ -3817,7 +3956,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         },
         formattedContent
       };
-      
+
       return result;
     } catch (error) {
       console.error('AgentMode: Error fetching Meta ads metrics:', error);
@@ -3833,7 +3972,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   private async createRevision(taskId: string, executionId: string, revisionPrompt: string, userId: string, targetResultName?: string): Promise<any> {
     try {
       console.log('AgentMode: Creating revision for task:', taskId, 'execution:', executionId, 'targetResultName:', targetResultName);
-      
+
       // Get the task to verify ownership
       const task = await taskDb.getTaskById(taskId);
       if (!task) {
@@ -3864,15 +4003,15 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Analyze result files to find available reports and images
       const resultFiles = execution.result_files || [];
-      const htmlFiles = resultFiles.filter((file: any) => 
+      const htmlFiles = resultFiles.filter((file: any) =>
         file.is_html || file.view_type === 'html' || file.filename.toLowerCase().endsWith('.html')
       );
       const imageFiles = resultFiles.filter((file: any) => {
         const filename = file.filename.toLowerCase();
-        return file.view_type === 'image' || 
-               filename.endsWith('.jpg') || filename.endsWith('.jpeg') || 
-               filename.endsWith('.png') || filename.endsWith('.gif') || 
-               filename.endsWith('.webp') || filename.endsWith('.svg');
+        return file.view_type === 'image' ||
+          filename.endsWith('.jpg') || filename.endsWith('.jpeg') ||
+          filename.endsWith('.png') || filename.endsWith('.gif') ||
+          filename.endsWith('.webp') || filename.endsWith('.svg');
       });
 
       // If no results available, return error
@@ -3891,7 +4030,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           ...htmlFiles.map((f: any) => ({ name: f.filename, type: 'report', url: f.url })),
           ...imageFiles.map((f: any) => ({ name: f.filename, type: 'image', url: f.url }))
         ];
-        
+
         return {
           success: false,
           message: `Multiple results found. Please specify which result to revise by providing the target_result_name parameter. Available results: ${availableResults.map(r => `${r.name} (${r.type})`).join(', ')}`,
@@ -3996,13 +4135,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
   // Helper function to process campaign data from Meta API
   private processCampaignData(campaigns: any[], insights: any[], adSets: any[]): any[] {
     const campaignMap = new Map();
-    
+
     // Create ad set to campaign mapping
     const adSetToCampaignMap = new Map();
     for (const adSet of adSets) {
       adSetToCampaignMap.set(adSet.id, adSet.campaign_id);
     }
-    
+
     // Initialize campaigns with zero metrics
     for (const campaign of campaigns) {
       campaignMap.set(campaign.id, {
@@ -4026,20 +4165,20 @@ Use the available tools to create tasks in the agent-engine when complex work is
         lastUpdated: new Date().toISOString(),
       });
     }
-    
+
     // Process campaign-level insights directly
     for (const insight of insights) {
       const campaignId = insight.campaign_id;
-      
+
       if (campaignMap.has(campaignId)) {
         const campaign = campaignMap.get(campaignId);
-        
+
         // Use campaign-level metrics directly
         campaign.impressions = parseInt(insight.impressions) || 0;
         campaign.clicks = parseInt(insight.clicks) || 0;
         campaign.spend = parseFloat(insight.spend) || 0;
         campaign.reach = parseInt(insight.reach) || 0;
-        
+
         // Process lead generation metrics from actions and cost_per_action_type
         if (insight.actions && Array.isArray(insight.actions)) {
           for (const action of insight.actions) {
@@ -4051,7 +4190,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             }
           }
         }
-        
+
         if (insight.cost_per_action_type && Array.isArray(insight.cost_per_action_type)) {
           for (const costAction of insight.cost_per_action_type) {
             if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
@@ -4064,7 +4203,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         }
       }
     }
-    
+
     // Calculate derived metrics (CTR, CPC, Cost per Lead) after aggregation
     for (const campaign of campaignMap.values()) {
       if (campaign.impressions > 0) {
@@ -4076,7 +4215,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       if (campaign.reach > 0) {
         campaign.frequency = campaign.impressions / campaign.reach;
       }
-      
+
       // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
       if (campaign.websiteLeads > 0) {
         campaign.formLeads = 0; // Set form submissions to 0 when website leads exist
@@ -4085,13 +4224,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
       } else if (campaign.formLeads > 0) {
         campaign.costPerFormLead = campaign.costPerFormLead || (campaign.spend / campaign.formLeads);
       }
-      
+
       campaign.totalLeads = (campaign.websiteLeads || 0) + (campaign.formLeads || 0);
       if (campaign.totalLeads > 0) {
         campaign.costPerLead = campaign.spend / campaign.totalLeads;
       }
     }
-    
+
     // Return all campaigns regardless of activity
     return Array.from(campaignMap.values());
   }
@@ -4100,12 +4239,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
   private processAdSetsData(adSets: any[], insights: any[], campaigns: any[]): any[] {
     const adSetMap = new Map();
     const campaignMap = new Map();
-    
+
     // Create campaign mapping
     for (const campaign of campaigns) {
       campaignMap.set(campaign.id, campaign);
     }
-    
+
     // Initialize ad sets with zero metrics
     for (const adSet of adSets) {
       const campaign = campaignMap.get(adSet.campaign_id);
@@ -4131,7 +4270,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         lastUpdated: new Date().toISOString(),
       });
     }
-    
+
     // Process adset-level insights directly
     for (const insight of insights) {
       const adSetId = insight.adset_id;
@@ -4141,7 +4280,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         adSet.clicks = parseInt(insight.clicks) || 0;
         adSet.spend = parseFloat(insight.spend) || 0;
         adSet.reach = parseInt(insight.reach) || 0;
-        
+
         // Process lead generation metrics from actions and cost_per_action_type
         if (insight.actions && Array.isArray(insight.actions)) {
           for (const action of insight.actions) {
@@ -4153,7 +4292,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             }
           }
         }
-        
+
         if (insight.cost_per_action_type && Array.isArray(insight.cost_per_action_type)) {
           for (const costAction of insight.cost_per_action_type) {
             if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
@@ -4166,7 +4305,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         }
       }
     }
-    
+
     // Calculate derived metrics
     for (const adSet of adSetMap.values()) {
       if (adSet.impressions > 0) {
@@ -4178,7 +4317,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       if (adSet.reach > 0) {
         adSet.frequency = adSet.impressions / adSet.reach;
       }
-      
+
       // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
       if (adSet.websiteLeads > 0) {
         adSet.formLeads = 0; // Set form submissions to 0 when website leads exist
@@ -4187,13 +4326,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
       } else if (adSet.formLeads > 0) {
         adSet.costPerFormLead = adSet.costPerFormLead || (adSet.spend / adSet.formLeads);
       }
-      
+
       adSet.totalLeads = (adSet.websiteLeads || 0) + (adSet.formLeads || 0);
       if (adSet.totalLeads > 0) {
         adSet.costPerLead = adSet.spend / adSet.totalLeads;
       }
     }
-    
+
     // Return all ad sets regardless of activity
     return Array.from(adSetMap.values());
   }
@@ -4203,7 +4342,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     const adMap = new Map();
     const adSetMap = new Map();
     const campaignMap = new Map();
-    
+
     // Create mappings
     for (const adSet of adSets) {
       adSetMap.set(adSet.id, adSet);
@@ -4211,12 +4350,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
     for (const campaign of campaigns) {
       campaignMap.set(campaign.id, campaign);
     }
-    
+
     // Initialize ads with zero metrics
     for (const ad of ads) {
       const adSet = adSetMap.get(ad.adset_id);
       const campaign = campaignMap.get(ad.campaign_id);
-      
+
       adMap.set(ad.id, {
         id: ad.id,
         name: ad.name,
@@ -4242,7 +4381,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         lastUpdated: new Date().toISOString(),
       });
     }
-    
+
     // Aggregate insights data by ad
     for (const insight of insights) {
       const adId = insight.ad_id;
@@ -4252,7 +4391,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         ad.clicks += parseInt(insight.clicks) || 0;
         ad.spend += parseFloat(insight.spend) || 0;
         ad.reach += parseInt(insight.reach) || 0;
-        
+
         // Process lead generation metrics from actions and cost_per_action_type
         if (insight.actions && Array.isArray(insight.actions)) {
           for (const action of insight.actions) {
@@ -4264,7 +4403,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             }
           }
         }
-        
+
         if (insight.cost_per_action_type && Array.isArray(insight.cost_per_action_type)) {
           for (const costAction of insight.cost_per_action_type) {
             if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
@@ -4277,7 +4416,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         }
       }
     }
-    
+
     // Calculate derived metrics
     for (const ad of adMap.values()) {
       if (ad.impressions > 0) {
@@ -4289,7 +4428,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       if (ad.reach > 0) {
         ad.frequency = ad.impressions / ad.reach;
       }
-      
+
       // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
       if (ad.websiteLeads > 0) {
         ad.formLeads = 0; // Set form submissions to 0 when website leads exist
@@ -4298,13 +4437,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
       } else if (ad.formLeads > 0) {
         ad.costPerFormLead = ad.costPerFormLead || (ad.spend / ad.formLeads);
       }
-      
+
       ad.totalLeads = (ad.websiteLeads || 0) + (ad.formLeads || 0);
       if (ad.totalLeads > 0) {
         ad.costPerLead = ad.spend / ad.totalLeads;
       }
     }
-    
+
     // Return all ads regardless of activity
     return Array.from(adMap.values());
   }
@@ -4313,20 +4452,20 @@ Use the available tools to create tasks in the agent-engine when complex work is
   private generateCampaignSummary(adPerformance: any[]): any {
     const totalCampaigns = adPerformance.length;
     const activeCampaigns = adPerformance.filter(campaign => campaign.status === 'ACTIVE').length;
-    
+
     const totalSpend = adPerformance.reduce((sum, campaign) => sum + campaign.spend, 0);
     const totalImpressions = adPerformance.reduce((sum, campaign) => sum + campaign.impressions, 0);
     const totalClicks = adPerformance.reduce((sum, campaign) => sum + campaign.clicks, 0);
     const totalWebsiteLeads = adPerformance.reduce((sum, campaign) => sum + (campaign.websiteLeads || 0), 0);
     const totalFormLeads = adPerformance.reduce((sum, campaign) => sum + (campaign.formLeads || 0), 0);
     const totalLeads = totalWebsiteLeads + totalFormLeads;
-    
+
     const averageCtr = totalImpressions > 0 ? (totalClicks / totalImpressions) * 100 : 0;
     const averageCpc = totalClicks > 0 ? totalSpend / totalClicks : 0;
     const averageCostPerWebsiteLead = totalWebsiteLeads > 0 ? totalSpend / totalWebsiteLeads : 0;
     const averageCostPerFormLead = totalFormLeads > 0 ? totalSpend / totalFormLeads : 0;
     const averageCostPerLead = totalLeads > 0 ? totalSpend / totalLeads : 0;
-    
+
     return {
       totalCampaigns,
       activeCampaigns,
@@ -4368,7 +4507,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           }
         }
       }
-      
+
       if (item.cost_per_action_type && Array.isArray(item.cost_per_action_type)) {
         for (const costAction of item.cost_per_action_type) {
           if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
@@ -4379,13 +4518,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
           }
         }
       }
-      
+
       // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
       if (processedItem.websiteLeads > 0) {
         processedItem.formLeads = 0; // Set form submissions to 0 when website leads exist
         processedItem.costPerFormLead = 0;
       }
-      
+
       // Calculate totals
       processedItem.totalLeads = (processedItem.websiteLeads || 0) + (processedItem.formLeads || 0);
       if (processedItem.totalLeads > 0) {
@@ -4404,16 +4543,16 @@ Use the available tools to create tasks in the agent-engine when complex work is
   // Helper function to format metrics summary for AI analysis
   private async formatMetricsSummary(data: any, userId: string): Promise<string> {
     const { adPerformance, adSetsData, adsData, campaignSummary, demographicsBreakdown, placementBreakdown, deviceBreakdown, attributionWindow } = data;
-    
+
     try {
       const { uploadFileToS3 } = await import('../utils/s3Utils');
       const fileUrls: { url: string; name: string }[] = [];
-      
+
       // Create date range string for filenames
       const startDate = attributionWindow?.start || 'unknown';
       const endDate = attributionWindow?.end || 'unknown';
       const dateRange = `${startDate}_${endDate}`;
-      
+
       // Helper function to convert array to CSV
       const arrayToCSV = (headers: string[], rows: string[][]): string => {
         const csvRows = [headers.join(',')];
@@ -4429,7 +4568,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         });
         return csvRows.join('\n');
       };
-      
+
       // 1. Ad-Level Data CSV
       if (adsData && adsData.length > 0) {
         const adRows = adsData.map((ad: any) => [
@@ -4446,7 +4585,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           String(ad.totalLeads || 0),
           `$${(ad.costPerLead || 0).toFixed(2)}`
         ]);
-        
+
         const adCSV = arrayToCSV(
           ['Ad Name', 'Ad Set', 'Campaign', 'Impressions', 'Clicks', 'Spend', 'CTR', 'CPC', 'Website Leads', 'Form Leads', 'Total Leads', 'Cost/Lead'],
           adRows
@@ -4461,7 +4600,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           fileUrls.push({ url: adResult.url, name: 'Ad-Level Data (all individual ads)' });
         }
       }
-      
+
       // 2. Demographics Breakdown CSV
       if (demographicsBreakdown && demographicsBreakdown.length > 0) {
         // Group by age and gender, then aggregate metrics
@@ -4488,11 +4627,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
           demo.formLeads += parseInt(item.formLeads) || 0;
           demo.totalLeads = demo.websiteLeads + demo.formLeads;
         });
-        
+
         // Sort by spend descending
         const sortedDemographics = Array.from(demographicsMap.values())
           .sort((a, b) => b.spend - a.spend);
-        
+
         const demoRows = sortedDemographics.map((demo: any) => {
           const ctr = demo.impressions > 0 ? (demo.clicks / demo.impressions) * 100 : 0;
           const cpc = demo.clicks > 0 ? demo.spend / demo.clicks : 0;
@@ -4511,7 +4650,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             `$${costPerLead.toFixed(2)}`
           ];
         });
-        
+
         const demoCSV = arrayToCSV(
           ['Age', 'Gender', 'Impressions', 'Clicks', 'Spend', 'CTR', 'CPC', 'Website Leads', 'Form Leads', 'Total Leads', 'Cost/Lead'],
           demoRows
@@ -4526,7 +4665,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           fileUrls.push({ url: demoResult.url, name: 'Demographics Breakdown' });
         }
       }
-      
+
       // 3. Placement Breakdown CSV
       if (placementBreakdown && placementBreakdown.length > 0) {
         // Group by platform and position, then aggregate metrics
@@ -4553,11 +4692,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
           placement.formLeads += parseInt(item.formLeads) || 0;
           placement.totalLeads = placement.websiteLeads + placement.formLeads;
         });
-        
+
         // Sort by spend descending
         const sortedPlacements = Array.from(placementMap.values())
           .sort((a, b) => b.spend - a.spend);
-        
+
         const placementRows = sortedPlacements.map((placement: any) => {
           const ctr = placement.impressions > 0 ? (placement.clicks / placement.impressions) * 100 : 0;
           const cpc = placement.clicks > 0 ? placement.spend / placement.clicks : 0;
@@ -4576,7 +4715,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             `$${costPerLead.toFixed(2)}`
           ];
         });
-        
+
         const placementCSV = arrayToCSV(
           ['Platform', 'Position', 'Impressions', 'Clicks', 'Spend', 'CTR', 'CPC', 'Website Leads', 'Form Leads', 'Total Leads', 'Cost/Lead'],
           placementRows
@@ -4591,7 +4730,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           fileUrls.push({ url: placementResult.url, name: 'Placement Breakdown' });
         }
       }
-      
+
       // 4. Device Breakdown CSV
       if (deviceBreakdown && deviceBreakdown.length > 0) {
         // Group by device, then aggregate metrics
@@ -4617,11 +4756,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
           deviceData.formLeads += parseInt(item.formLeads) || 0;
           deviceData.totalLeads = deviceData.websiteLeads + deviceData.formLeads;
         });
-        
+
         // Sort by spend descending
         const sortedDevices = Array.from(deviceMap.values())
           .sort((a, b) => b.spend - a.spend);
-        
+
         const deviceRows = sortedDevices.map((device: any) => {
           const ctr = device.impressions > 0 ? (device.clicks / device.impressions) * 100 : 0;
           const cpc = device.clicks > 0 ? device.spend / device.clicks : 0;
@@ -4639,7 +4778,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             `$${costPerLead.toFixed(2)}`
           ];
         });
-        
+
         const deviceCSV = arrayToCSV(
           ['Device', 'Impressions', 'Clicks', 'Spend', 'CTR', 'CPC', 'Website Leads', 'Form Leads', 'Total Leads', 'Cost/Lead'],
           deviceRows
@@ -4654,15 +4793,15 @@ Use the available tools to create tasks in the agent-engine when complex work is
           fileUrls.push({ url: deviceResult.url, name: 'Device Breakdown' });
         }
       }
-      
+
       // Build summary with campaign and ad set data, plus file URLs
       let summary = `📊 **Meta Ads Performance Data**\n\n`;
-      
+
       // Attribution Window
       if (attributionWindow && attributionWindow.start && attributionWindow.end) {
         summary += `**Attribution Window:** ${attributionWindow.start} to ${attributionWindow.end} (${attributionWindow.days} days)\n\n`;
       }
-      
+
       // Campaign Summary
       if (campaignSummary) {
         summary += `**📈 Campaign Summary**\n\n`;
@@ -4681,46 +4820,46 @@ Use the available tools to create tasks in the agent-engine when complex work is
         summary += `| Cost per Form Lead | $${campaignSummary.averageCostPerFormLead.toFixed(2)} |\n`;
         summary += `| Cost per Lead | $${campaignSummary.averageCostPerLead.toFixed(2)} |\n\n`;
       }
-      
+
       // Campaign Performance (top 10 by spend)
       if (adPerformance && adPerformance.length > 0) {
         const topCampaigns = adPerformance.slice(0, 10);
         summary += `**🎯 Campaign Performance** (Top ${topCampaigns.length} by Spend)\n\n`;
         summary += `| Campaign Name | Spend | Impressions | Clicks | CTR | CPC | Website Leads | Form Leads | Total Leads | Cost/Lead |\n`;
         summary += `|---------------|-------|-------------|--------|-----|-----|---------------|------------|-------------|----------|\n`;
-        
+
         topCampaigns.forEach((campaign: any) => {
           summary += `| ${campaign.name} | $${campaign.spend.toFixed(2)} | ${campaign.impressions.toLocaleString()} | ${campaign.clicks.toLocaleString()} | ${campaign.ctr.toFixed(2)}% | $${campaign.cpc.toFixed(2)} | ${(campaign.websiteLeads || 0).toLocaleString()} | ${(campaign.formLeads || 0).toLocaleString()} | ${(campaign.totalLeads || 0).toLocaleString()} | $${(campaign.costPerLead || 0).toFixed(2)} |\n`;
         });
         summary += `\n`;
       }
-      
+
       // Ad Sets Performance (top 10 by spend)
       if (adSetsData && adSetsData.length > 0) {
         const topAdSets = adSetsData.slice(0, 10);
         summary += `**📦 Ad Sets Performance** (Top ${topAdSets.length} by Spend)\n\n`;
         summary += `| Ad Set Name | Campaign | Spend | Impressions | Clicks | CTR | CPC | Website Leads | Form Leads | Total Leads | Cost/Lead |\n`;
         summary += `|-------------|----------|-------|-------------|--------|-----|-----|---------------|------------|-------------|----------|\n`;
-        
+
         topAdSets.forEach((adSet: any) => {
           summary += `| ${adSet.name} | ${adSet.campaignName} | $${adSet.spend.toFixed(2)} | ${adSet.impressions.toLocaleString()} | ${adSet.clicks.toLocaleString()} | ${adSet.ctr.toFixed(2)}% | $${adSet.cpc.toFixed(2)} | ${(adSet.websiteLeads || 0).toLocaleString()} | ${(adSet.formLeads || 0).toLocaleString()} | ${(adSet.totalLeads || 0).toLocaleString()} | $${(adSet.costPerLead || 0).toFixed(2)} |\n`;
         });
         summary += `\n`;
       }
-      
+
       // CSV Files Section
       if (fileUrls.length > 0) {
         summary += `**📥 Detailed Data Files**\n\n`;
         summary += `The following CSV files contain detailed ad-level and breakdown data:\n\n`;
-        
+
         fileUrls.forEach((file, index) => {
           summary += `${index + 1}. **${file.name}**\n   📥 [Download CSV](${file.url})\n\n`;
         });
       }
-      
+
       summary += `*Data includes ${adPerformance?.length || 0} campaigns, ${adSetsData?.length || 0} ad sets, and ${adsData?.length || 0} individual ads.*\n`;
       summary += `*Note: Breakdown data (demographics, placement, device) only includes spend from ads with sufficient data for those breakdowns. Breakdown totals may not match campaign totals due to this limitation.*\n`;
-      
+
       return summary;
     } catch (error) {
       console.error('Error generating CSV files for Meta ads metrics:', error);
@@ -4733,14 +4872,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
   // Helper function to format web search results for AI analysis
   private formatWebSearchResults(searchResult: any): string {
     const { query, results, totalResults } = searchResult;
-    
+
     if (!results || results.length === 0) {
       return `<strong>🔍 Web Search Results for "${query}"</strong><br>No results found for your search query.`;
     }
-    
+
     let summary = `<strong>🔍 Web Search Results for "${query}"</strong><br>`;
     summary += `I found ${totalResults} relevant search results:<br><br>`;
-    
+
     results.forEach((result: any, index: number) => {
       summary += `<strong>${index + 1}. ${result.title}</strong><br>`;
       summary += `🔗 <a href="${result.url}" target="_blank">${result.url}</a><br>`;
@@ -4751,9 +4890,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
       }
       summary += `<br>`;
     });
-    
+
     summary += `<em>💡 I've gathered this current information to provide you with data-driven insights and recommendations.</em>`;
-    
+
     return summary;
   }
 
@@ -4767,13 +4906,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
   private async searchKnowledgeBase(query: string, maxResults: number = 5, userId?: string): Promise<any> {
     try {
       console.log('AgentMode: Searching knowledge base for query:', query, 'maxResults:', maxResults);
-      
+
       // Limit max results to 10
       const limitedMaxResults = Math.min(maxResults, 10);
-      
+
       // Search platform knowledge base (both public and private)
       const searchResults = await searchPlatformKnowledgeBase(query, limitedMaxResults, userId);
-      
+
       if (!searchResults || searchResults.length === 0) {
         return {
           success: true,
@@ -4783,7 +4922,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           totalResults: 0
         };
       }
-      
+
       return {
         success: true,
         message: `Found ${searchResults.length} knowledge base results for "${query}"`,
@@ -4808,10 +4947,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
   private async listKnowledgeBaseFiles(userId: string): Promise<any> {
     try {
       console.log('AgentMode: Listing knowledge base files for user:', userId);
-      
+
       // Use the common function to get tasks with knowledge base
       const knowledgeBaseTasks = await taskDb.getTasksWithKnowledgeBase(userId);
-      
+
       if (!knowledgeBaseTasks || knowledgeBaseTasks.length === 0) {
         return {
           success: true,
@@ -4850,7 +4989,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   private async readKnowledgeBaseFile(fileIdentifier: string, userId: string): Promise<any> {
     try {
       console.log('AgentMode: Reading knowledge base file:', fileIdentifier, 'for user:', userId);
-      
+
       if (!fileIdentifier) {
         return {
           success: false,
@@ -4860,7 +4999,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Get the task
       const task = await taskDb.getTaskById(fileIdentifier);
-      
+
       if (!task) {
         return {
           success: false,
@@ -4877,10 +5016,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
       }
 
       // Check if knowledge base exists
-      const size = typeof task.knowledgeBaseSize === 'string' 
-        ? parseInt(task.knowledgeBaseSize) 
+      const size = typeof task.knowledgeBaseSize === 'string'
+        ? parseInt(task.knowledgeBaseSize)
         : task.knowledgeBaseSize || 0;
-      
+
       if (size === 0) {
         return {
           success: false,
@@ -4909,7 +5048,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Check if file exists
       const [exists] = await file.exists();
-      
+
       if (!exists) {
         return {
           success: false,
@@ -4952,23 +5091,23 @@ Use the available tools to create tasks in the agent-engine when complex work is
   private async searchWeb(query: string, maxResults: number = 10): Promise<any> {
     try {
       console.log('AgentMode: Searching web for query:', query, 'maxResults:', maxResults);
-      
+
       // Limit max results to 10
       const limitedMaxResults = Math.min(maxResults, 10);
-      
+
       // Use a simple web search API - you can replace this with your preferred search service
       // For now, we'll use a mock implementation that returns structured results
       // In production, you might want to use Google Custom Search API, Bing Search API, or similar
-      
+
       const searchResults = await this.performWebSearch(query, limitedMaxResults);
-      
+
       // Format the results for LLM consumption
       const formattedContent = this.formatWebSearchResults({
         query,
         results: searchResults,
         totalResults: searchResults.length
       });
-      
+
       return {
         success: true,
         message: `Found ${searchResults.length} web search results for "${query}"`,
@@ -4990,18 +5129,18 @@ Use the available tools to create tasks in the agent-engine when complex work is
   // Get Google Search API credentials from AWS Secrets Manager
   private async getGoogleSearchCredentials(): Promise<{ apiKey: string; searchEngineId: string } | null> {
     try {
-      const secretName = process.env.NODE_ENV === 'development' 
-        ? 'dev/AgentWeb/Google/Search' 
+      const secretName = process.env.NODE_ENV === 'development'
+        ? 'dev/AgentWeb/Google/Search'
         : 'prod/AgentWeb/Google/Search';
-      
+
       const secretJson = await getSecret(secretName);
       const credentials = JSON.parse(secretJson);
-      
+
       if (!credentials.apiKey || !credentials.searchEngineId) {
         console.error('Google Search API credentials missing required fields');
         return null;
       }
-      
+
       return {
         apiKey: credentials.apiKey,
         searchEngineId: credentials.searchEngineId
@@ -5017,14 +5156,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
     try {
       // Get credentials from Secrets Manager
       const credentials = await this.getGoogleSearchCredentials();
-      
+
       if (!credentials) {
         throw new Error('Google Search API not configured in Secrets Manager');
       }
-      
+
       // Initialize Google Custom Search API
       const customsearch = google.customsearch('v1');
-      
+
       // Perform the search
       const response = await customsearch.cse.list({
         auth: credentials.apiKey,
@@ -5034,11 +5173,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
         safe: 'medium', // Safe search level
         fields: 'items(title,link,snippet,pagemap/metatags,pagemap/cse_thumbnail)'
       });
-      
+
       if (!response.data.items || response.data.items.length === 0) {
         throw new Error('No search results found');
       }
-      
+
       // Transform Google API results to our format
       const searchResults = response.data.items.map((item: any) => ({
         title: item.title || 'No title',
@@ -5047,10 +5186,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
         publishedDate: this.extractPublishedDate(item.pagemap?.metatags?.[0]) || new Date().toISOString(),
         thumbnail: item.pagemap?.cse_thumbnail?.[0]?.src || null
       }));
-      
+
       console.log(`Google Search API returned ${searchResults.length} results for query: "${query}"`);
       return searchResults;
-      
+
     } catch (error) {
       console.error('Error performing Google web search:', error);
       throw error;
@@ -5061,7 +5200,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   // Extract published date from page metadata
   private extractPublishedDate(metatags: any): string | null {
     if (!metatags) return null;
-    
+
     // Try different common meta tag formats for publication date
     const dateFields = [
       'article:published_time',
@@ -5073,7 +5212,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       'article:published',
       'publication_date'
     ];
-    
+
     for (const field of dateFields) {
       if (metatags[field]) {
         try {
@@ -5086,7 +5225,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         }
       }
     }
-    
+
     return null;
   }
 
@@ -5174,7 +5313,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     if (attachments && attachments.length > 0) {
       const logoAssets = attachments.filter((asset: any) => asset.type === 'logo' || asset.type === 'secondaryLogo');
       const brandGuideAssets = attachments.filter((asset: any) => asset.type === 'brandGuide');
-      
+
       if (logoAssets.length > 0) {
         logoAssets.forEach((asset: any) => {
           const logoType = asset.type === 'logo' ? 'Primary Logo' : 'Secondary Logo';
@@ -5184,7 +5323,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       } else {
         formattedSummary += `• No logos uploaded<br>`;
       }
-      
+
       if (brandGuideAssets.length > 0) {
         brandGuideAssets.forEach((asset: any) => {
           formattedSummary += `• <strong>Brand Guide:</strong> ${asset.filename}<br>`;
@@ -5225,15 +5364,15 @@ Use the available tools to create tasks in the agent-engine when complex work is
           // Handle brand data fields
           value = brandData[field];
         }
-        
+
         if (value !== undefined && value !== null) {
           if (field === 'brandAssets' && Array.isArray(value) && value.length > 0) {
             formattedSummary += `• <strong>Brand Assets:</strong> Updated ${value.length} asset(s)<br>`;
             value.forEach((asset: any) => {
-              const assetType = asset.type === 'logo' ? 'Primary Logo' : 
-                              asset.type === 'secondaryLogo' ? 'Secondary Logo' :
-                              asset.type === 'brandGuide' ? 'Brand Guide' : 
-                              asset.type === 'additionalAsset' ? 'Additional Asset' : asset.type;
+              const assetType = asset.type === 'logo' ? 'Primary Logo' :
+                asset.type === 'secondaryLogo' ? 'Secondary Logo' :
+                  asset.type === 'brandGuide' ? 'Brand Guide' :
+                    asset.type === 'additionalAsset' ? 'Additional Asset' : asset.type;
               formattedSummary += `  - ${assetType}: ${asset.filename}<br>`;
             });
           } else if (field === 'founders' && Array.isArray(value)) {
@@ -5378,19 +5517,19 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
 
     const { content, file_type, file_size, content_length, file_url } = fileResult;
-    
+
     let formattedContent = `📄 File Content Read Successfully\n`;
     formattedContent += `File Type: ${file_type}\n`;
     formattedContent += `File Size: ${file_size} bytes\n`;
     formattedContent += `Content Length: ${content_length} characters\n`;
     formattedContent += `Source URL: ${file_url}\n\n`;
-    
+
     // Add the actual content
     formattedContent += `📝 Extracted Content:\n`;
     formattedContent += `---\n`;
     formattedContent += content;
     formattedContent += `\n---`;
-    
+
     return formattedContent;
   }
 
@@ -5398,10 +5537,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
   private async saveFile(fileName: string, fileContent: string, userId: string, sessionId: string): Promise<any> {
     try {
       console.log('AgentMode: Saving file:', fileName, 'for user:', userId, 'session:', sessionId);
-      
+
       // Generate content hash for deduplication
       const contentHash = createHash('sha256').update(fileContent).digest('hex');
-      
+
       // Check if we already have this content cached
       const cachedFile = this.fileContentCache.get(contentHash);
       if (cachedFile) {
@@ -5418,9 +5557,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
           formattedContent
         };
       }
-      
+
       const { uploadFileToS3 } = await import('../utils/s3Utils');
-      
+
       // Determine content type based on file extension
       const extension = fileName.split('.').pop()?.toLowerCase();
       const contentTypes: { [key: string]: string } = {
@@ -5439,7 +5578,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
       };
       const contentType = contentTypes[extension || ''] || 'application/octet-stream';
-      
+
       // Upload to S3 using common utility
       const uploadResult = await uploadFileToS3(
         fileContent,
@@ -5447,7 +5586,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         userId,
         contentType
       );
-      
+
       if (uploadResult.success) {
         // Cache the file content hash to URL mapping
         this.fileContentCache.set(contentHash, {
@@ -5455,9 +5594,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
           file_name: fileName || 'unknown',
           file_size: fileContent.length
         });
-        
+
         console.log('AgentMode: File uploaded and cached with hash:', contentHash);
-        
+
         // Format the save result for LLM consumption
         const formattedContent = `📁 **File Saved Successfully**\nFile: ${fileName}\nSize: ${fileContent.length} bytes\nURL: ${uploadResult.url}\n\nThe file has been uploaded to S3 and is ready for sharing or reference.`;
 
@@ -5490,7 +5629,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   private async readFileContent(fileUrl: string): Promise<any> {
     try {
       console.log('AgentMode: Reading file content from URL:', fileUrl);
-      
+
       // Validate URL format
       if (!fileUrl.startsWith('http://') && !fileUrl.startsWith('https://')) {
         return {
@@ -5503,7 +5642,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       // Determine file type from URL
       const urlPath = new URL(fileUrl).pathname;
       const extension = urlPath.split('.').pop()?.toLowerCase() || '';
-      
+
       // Fetch the file content
       const response = await axios.get(fileUrl, {
         timeout: 30000, // 30 seconds timeout for larger files
@@ -5603,7 +5742,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
     } catch (error: any) {
       console.error('AgentMode: Error reading file content:', error);
-      
+
       let errorMessage = 'Failed to read file content';
       let statusCode = 500;
 
@@ -5642,10 +5781,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
   ): Promise<any> {
     try {
       console.log('AgentMode: Generating image with prompt:', prompt, 'filename:', filename, 'size:', size, 'quality:', quality, 'inputImages:', inputImages, 'imageModel:', imageModel, 'userId:', userId, 'sessionId:', sessionId);
-      
+
       // Import the image generation service
       const { imageService } = await import('./imageGeneration');
-      
+
       // Check if the service is available
       const isAvailable = await imageService.isAvailable();
       if (!isAvailable) {
@@ -5728,7 +5867,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   ): Promise<any> {
     try {
       console.log('AgentMode: Removing C2PA metadata from image:', imageUrl);
-      
+
       if (!imageUrl) {
         return {
           success: false,
@@ -5842,14 +5981,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
   ): Promise<any> {
     try {
       console.log('AgentMode: Creating blog article for topic:', topic, 'tone:', tone, 'length:', length, 'userId:', userId);
-      
+
       // Import required services
       const { uploadFileToS3 } = await import('../utils/s3Utils');
 
       // Step 1: Generate blog content using existing blog.ts utility function
       console.log('AgentMode: Generating blog content using existing blog service...');
       const { generateBlogContent } = await import('../controllers/blog');
-      
+
       // Use the requirements passed from the LLM, and include style for Substack-style writing
       const blogData = await generateBlogContent(topic, keywords, tone, length, researchContext, requirements, style);
 
@@ -5874,11 +6013,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
       console.log('AgentMode: Generating HTML file with style:', style);
       const { generateBlogHtml } = await import('../controllers/blog');
       const htmlContent = generateBlogHtml(blogData.title, blogData.description, blogData.content, imageData.imageUrl, style);
-      
+
       // Step 4: Upload HTML file to S3
       console.log('AgentMode: Uploading HTML file to S3...');
       const htmlFilename = `blog-${Date.now()}.html`;
-      
+
       const uploadResult = await uploadFileToS3(
         htmlContent,
         htmlFilename,
@@ -5925,7 +6064,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   ): Promise<any> {
     try {
       console.log('AgentMode: Publishing blog article - Title:', title);
-      
+
       // Step 1: Fetch HTML and extract body content
       const htmlResponse = await axios.get(blogHtmlUrl, {
         timeout: 30000,
@@ -5936,52 +6075,52 @@ Use the available tools to create tasks in the agent-engine when complex work is
       });
 
       const htmlContent = htmlResponse.data as string;
-      
+
       // Extract content from <div class="content"> - find first opening tag and last closing tag before </body>
       const contentDivStart = htmlContent.search(/<div[^>]*class=["'][^"']*content[^"']*["'][^>]*>/i);
       if (contentDivStart === -1) {
         throw new Error('Could not extract content from HTML. Expected <div class="content"> element.');
       }
-      
+
       // Find the position after the opening tag
       const afterOpenTag = htmlContent.indexOf('>', contentDivStart) + 1;
-      
+
       // Find the last </div> before </body>
       const bodyEnd = htmlContent.lastIndexOf('</body>');
       if (bodyEnd === -1) {
         throw new Error('Could not find </body> tag in HTML');
       }
-      
+
       // Find the last </div> before </body>
       const lastDivClose = htmlContent.lastIndexOf('</div>', bodyEnd);
       if (lastDivClose === -1) {
         throw new Error('Could not find closing </div> tag for content');
       }
-      
+
       // Extract everything between the opening tag and the last </div>
       let bodyHtml = htmlContent.substring(afterOpenTag, lastDivClose).trim();
-      
+
       if (!bodyHtml) {
         throw new Error('Content is empty after cleaning');
       }
-      
+
       // Extract image filename from URL
       let imageFilename: string | undefined;
       if (heroImageUrl) {
         const urlParts = heroImageUrl.split('/');
         imageFilename = urlParts[urlParts.length - 1];
       }
-      
+
       // Step 3: Get user's CMS type
       const { userDb } = await import('./db');
       const user = await userDb.getUserById(userId);
-      
+
       if (!user) {
         throw new Error('User not found');
       }
-      
+
       const cmsType = user.cmsType;
-      
+
       if (!cmsType) {
         return {
           success: false,
@@ -5989,19 +6128,19 @@ Use the available tools to create tasks in the agent-engine when complex work is
           error: 'CMS Type not configured'
         };
       }
-      
+
       console.log('AgentMode: User CMS Type:', cmsType);
-      
+
       // Step 4: Publish to CMS
       // Only Webflow is supported for publish_blog_article function
       if (cmsType === 'Webflow') {
         const { getWebflowConfig } = await import('../controllers/blog');
         const { apiToken, siteId, collectionId, fieldMappings } = await getWebflowConfig(userId);
-        
+
         // Call Webflow publishing
         const axios = (await import('axios')).default;
         const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
-        
+
         const cmsItemData: any = {
           fieldData: {
             name: title,
@@ -6014,11 +6153,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
         // Use body HTML directly for Webflow
         // Webflow API may strip HTML tags if newlines are present, so remove them
         const cleanBodyHtml = bodyHtml.replace(/\n/g, '').replace(/\r/g, '');
-        
+
         if (fieldMappings?.summary) {
           cmsItemData.fieldData[fieldMappings.summary] = description;
         }
-        
+
         if (fieldMappings?.body) {
           cmsItemData.fieldData[fieldMappings.body] = cleanBodyHtml;
         }
@@ -6041,13 +6180,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
           );
 
           console.log('AgentMode: Blog article published successfully to Webflow');
-          
+
           // Sanitize response to remove large content fields before sending to LLM
           const responseData = response.data as any;
-          const sanitizedResponse = responseData && typeof responseData === 'object' 
-            ? { ...responseData } 
+          const sanitizedResponse = responseData && typeof responseData === 'object'
+            ? { ...responseData }
             : responseData;
-          
+
           if (sanitizedResponse && sanitizedResponse.fieldData && typeof sanitizedResponse.fieldData === 'object') {
             const sanitizedFieldData = { ...sanitizedResponse.fieldData };
             // Remove large content fields that aren't needed by the LLM
@@ -6055,7 +6194,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             delete sanitizedFieldData['body'];
             sanitizedResponse.fieldData = sanitizedFieldData;
           }
-          
+
           return {
             success: true,
             message: 'Blog article published successfully to Webflow',
@@ -6074,7 +6213,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
           if (webflowError.response?.data) {
             const errorData = webflowError.response.data;
-            
+
             if (errorData.message) {
               errorInfo.message = errorData.message;
             }
@@ -6100,7 +6239,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           } else {
             console.error(`AgentMode: Webflow API error (${errorInfo.status}): ${errorInfo.message}`);
           }
-          
+
           // Create a more user-friendly error message
           const errorMessage = errorInfo.message || `Webflow API error: ${errorInfo.status} ${errorInfo.statusText}`;
           throw new Error(errorMessage);
@@ -6120,13 +6259,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
       }
     } catch (error: any) {
       console.error('AgentMode: Error publishing blog article:', error);
-      
+
       // Extract detailed error information for better user feedback
       let errorMessage = error.message || 'Failed to publish blog article';
-      
+
       if (error.response?.data) {
         const errorData = error.response.data;
-        
+
         // Extract validation error details
         if (errorData.details && Array.isArray(errorData.details)) {
           const detailMessages = errorData.details
@@ -6144,7 +6283,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           errorMessage = errorData.message;
         }
       }
-      
+
       return {
         success: false,
         message: errorMessage,
@@ -6160,7 +6299,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   ): Promise<any> {
     try {
       console.log('AgentMode: Creating social media posts, count:', posts?.length || 0);
-      
+
       if (!posts || !Array.isArray(posts) || posts.length === 0) {
         return {
           success: false,
@@ -6196,10 +6335,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
           'custom': 'Custom'
         };
         const typeLabel = typeLabelMap[post.type] || post.type.charAt(0).toUpperCase() + post.type.slice(1);
-        
+
         // Convert markdown content to HTML
         const htmlContent = processor.processSync(post.content || '').toString();
-        
+
         // Build post HTML
         let postHtml = `
       <div class="post" data-type="${post.type}">
@@ -6431,7 +6570,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       // Upload HTML file to S3
       console.log('AgentMode: Uploading social media posts HTML file to S3...');
       const htmlFilename = `social-media-posts-${Date.now()}.html`;
-      
+
       const uploadResult = await uploadFileToS3(
         htmlContent,
         htmlFilename,
@@ -6471,7 +6610,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     try {
       const { TaskSubscriberMetricsService } = await import('./taskSubscriberMetricsService');
       const metrics = await TaskSubscriberMetricsService.getTaskSubscriberMetrics(taskId, userId);
-      
+
       // Strip engagedEmails from subject metrics to reduce data for agent processing
       const cleanedMetrics = {
         ...metrics,
@@ -6487,7 +6626,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           )
         }
       };
-      
+
       return {
         success: true,
         message: 'Task subscriber metrics retrieved successfully',
@@ -6511,10 +6650,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
     try {
       const { TaskSubscriberMetricsService } = await import('./taskSubscriberMetricsService');
       const events = await TaskSubscriberMetricsService.getTaskSubscriberEngagementEvents(taskId, emailSubject, userId);
-      
+
       // Transform raw events into meaningful engagement metrics
       const engagementMetrics = this.calculateEngagementMetrics(events);
-      
+
       return {
         success: true,
         message: 'Task subscriber engagement metrics retrieved successfully',
@@ -6535,7 +6674,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
    */
   private calculateEngagementMetrics(events: any) {
     const { eventsByUser, totalEngagedUsers, taskId, emailSubject } = events;
-    
+
     if (totalEngagedUsers === 0) {
       return {
         taskId,
@@ -6571,7 +6710,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
     eventsByUser.forEach((user: any) => {
       const userEvents = user.events;
-      
+
       // Count event types for engagement analysis
       const eventTypes = new Set(userEvents.map((e: any) => e.eventType));
       userEvents.forEach((event: any) => {
@@ -6593,17 +6732,17 @@ Use the available tools to create tasks in the agent-engine when complex work is
         const firstEvent = userEvents[0];
         const firstEventTime = new Date(firstEvent.createdAt).getTime();
         const emailSentTime = firstEventTime; // Assuming first event is delivery
-        
+
         // Find first engagement (open or click)
-        const firstEngagement = userEvents.find((e: any) => 
+        const firstEngagement = userEvents.find((e: any) =>
           e.eventType === 'email.opened' || e.eventType === 'email.clicked'
         );
-        
+
         if (firstEngagement) {
           const engagementTime = new Date(firstEngagement.createdAt).getTime();
           const timeToEngagement = engagementTime - emailSentTime;
           engagementTimes.push(timeToEngagement);
-          
+
           // Categorize engagement timing
           if (timeToEngagement <= 3600000) { // 1 hour in milliseconds
             immediateEngagement++;
@@ -6615,22 +6754,22 @@ Use the available tools to create tasks in the agent-engine when complex work is
         // Find open and click times
         const openEvent = userEvents.find((e: any) => e.eventType === 'email.opened');
         const clickEvent = userEvents.find((e: any) => e.eventType === 'email.clicked');
-        
+
         if (openEvent) {
           const openTime = new Date(openEvent.createdAt).getTime();
           openTimes.push(openTime - emailSentTime);
         }
-        
+
         if (clickEvent) {
           const clickTime = new Date(clickEvent.createdAt).getTime();
           clickTimes.push(clickTime - emailSentTime);
         }
 
         // Categorize engagement depth based on opened/clicked events
-        const engagementEvents = userEvents.filter((event: any) => 
+        const engagementEvents = userEvents.filter((event: any) =>
           event.eventType === 'email.opened' || event.eventType === 'email.clicked'
         );
-        
+
         if (engagementEvents.length >= 2) {
           multiTouchEngagement++;
         } else if (engagementEvents.length === 1) {
@@ -6640,19 +6779,19 @@ Use the available tools to create tasks in the agent-engine when complex work is
     });
 
     // Calculate timing metrics
-    const averageTimeToOpen = openTimes.length > 0 
+    const averageTimeToOpen = openTimes.length > 0
       ? Math.round(openTimes.reduce((a, b) => a + b, 0) / openTimes.length / 1000 / 60) // Convert to minutes
       : null;
-    
-    const averageTimeToClick = clickTimes.length > 0 
+
+    const averageTimeToClick = clickTimes.length > 0
       ? Math.round(clickTimes.reduce((a, b) => a + b, 0) / clickTimes.length / 1000 / 60) // Convert to minutes
       : null;
 
-    const fastestEngagement = engagementTimes.length > 0 
+    const fastestEngagement = engagementTimes.length > 0
       ? Math.round(Math.min(...engagementTimes) / 1000 / 60) // Convert to minutes
       : null;
-    
-    const slowestEngagement = engagementTimes.length > 0 
+
+    const slowestEngagement = engagementTimes.length > 0
       ? Math.round(Math.max(...engagementTimes) / 1000 / 60) // Convert to minutes
       : null;
 
@@ -6686,7 +6825,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     try {
       const settingName = `email_templates_${userId}`;
       const setting = await settingsService.getSetting(settingName);
-      
+
       let templates = [];
       if (setting) {
         try {
@@ -6696,7 +6835,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           templates = [];
         }
       }
-      
+
       return {
         success: true,
         email_templates: templates.map((template: any) => ({
@@ -6734,7 +6873,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           message: 'update_type must be either "part" or "full"'
         };
       }
-      
+
       // Validate that replacementInstructions is an array
       if (!Array.isArray(replacementInstructions)) {
         return {
@@ -6742,25 +6881,25 @@ Use the available tools to create tasks in the agent-engine when complex work is
           message: 'replacement_json must be an array of replacement instructions'
         };
       }
-      
+
       if (replacementInstructions.length === 0) {
         return {
           success: false,
           message: 'At least one replacement instruction is required'
         };
       }
-      
+
       // Validate each replacement instruction based on update_type
       for (let i = 0; i < replacementInstructions.length; i++) {
         const instruction = replacementInstructions[i];
-        
+
         if (instruction.new_content === undefined || instruction.expected_count === undefined) {
           return {
             success: false,
             message: `Missing required fields in replacement instruction ${i + 1}: new_content and expected_count are required`
           };
         }
-        
+
         if (updateType === 'full') {
           // For full replacement, require old_file_hash
           if (!instruction.old_file_hash) {
@@ -6791,29 +6930,29 @@ Use the available tools to create tasks in the agent-engine when complex work is
           }
         }
       }
-      
+
       // Fetch current file content
       const currentContent = await this.fetchFileContent(fileUrl);
       console.log(`AgentMode: Fetched file content, length: ${currentContent.length} characters`);
-      
+
       // Compute hash of current content for verification
       const currentContentHash = createHash('sha256').update(currentContent).digest('hex');
       console.log(`AgentMode: Computed current content hash: ${currentContentHash}`);
-      
+
       let updatedContent = currentContent;
-      
+
       // Perform all replacements
       const replacementResults = [];
-      
+
       for (let i = 0; i < replacementInstructions.length; i++) {
         const instruction = replacementInstructions[i];
         const { new_content, expected_count } = instruction;
-        
+
         if (updateType === 'full') {
           // Entire file replacement using hash
           const { old_file_hash } = instruction;
           console.log(`AgentMode: Full replacement ${i + 1}: old_file_hash: ${old_file_hash}, new_content length: ${new_content.length}, expected_count: ${expected_count}`);
-          
+
           // Verify that the provided hash matches the current content hash
           if (old_file_hash !== currentContentHash) {
             return {
@@ -6822,7 +6961,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
               suggestion: 'Use read_file_content to get the current content and hash, then retry the replacement'
             };
           }
-          
+
           // For hash-based replacement, we replace the entire content
           if (expected_count === 1) {
             console.log(`AgentMode: Hash verification successful, replacing entire content`);
@@ -6846,7 +6985,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           // Partial content replacement using old_content
           const { old_content } = instruction;
           console.log(`AgentMode: Part replacement ${i + 1}: old_content length: ${old_content.length}, new_content length: ${new_content.length}, expected_count: ${expected_count}`);
-          
+
           // Perform the replacement using the existing logic
           const replacementResult = this.performDirectReplacement(
             updatedContent,
@@ -6854,7 +6993,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             new_content,
             true // exact_match = true for partial replacements
           );
-          
+
           if (replacementResult === null) {
             return {
               success: false,
@@ -6862,7 +7001,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
               suggestion: 'Check that the old_content exactly matches the content in the file'
             };
           }
-          
+
           // Check if the actual change count matches expected count
           if (replacementResult.changeCount !== expected_count) {
             return {
@@ -6871,7 +7010,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
               suggestion: 'Check the expected_count matches the actual number of occurrences in the file'
             };
           }
-          
+
           updatedContent = replacementResult.content;
           replacementResults.push({
             index: i + 1,
@@ -6883,7 +7022,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           });
         }
       }
-      
+
       // Create versioned filename and upload the updated content
       const versionedFilename = this.createVersionedFilename(fileUrl);
       console.log(`AgentMode: Original file URL: ${fileUrl}`);
@@ -6891,7 +7030,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const originalPath = this.extractPathFromS3Url(fileUrl);
       console.log(`AgentMode: Original path: ${originalPath}`);
       const uploadResult = await this.uploadUpdatedFile(updatedContent, versionedFilename, originalPath);
-      
+
       return {
         success: true,
         s3_url: uploadResult.url,
@@ -6900,7 +7039,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         replacements: replacementResults,
         versioned_filename: versionedFilename
       };
-      
+
     } catch (error) {
       console.error('Error updating HTML file:', error);
       return {
@@ -6951,7 +7090,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           // Use normalized whitespace comparison for flexible matching
           const normalizedContent = content.replace(/\s+/g, ' ').trim();
           const normalizedOldContent = oldContent.replace(/\s+/g, ' ').trim();
-          
+
           if (normalizedContent === normalizedOldContent) {
             console.log(`AgentMode: Normalized match found for entire file replacement`);
             return { content: newContent, changeCount: 1 };
@@ -6969,21 +7108,21 @@ Use the available tools to create tasks in the agent-engine when complex work is
           }
         }
       }
-      
+
       // For smaller content, use regex for more flexible matching
       const changeCount = (content.match(new RegExp(oldContent.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
-      
+
       // Check if old content exists
       if (changeCount === 0) {
         console.warn(`Old content not found. Content length: ${content.length}, old content length: ${oldContent.length}`);
         return null;
       }
-      
+
       // Perform replacement - replace all occurrences
       const updatedContent = content.replace(new RegExp(oldContent.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), newContent);
-      
+
       return { content: updatedContent, changeCount };
-      
+
     } catch (error) {
       console.error('Error in direct replacement:', error);
       return null;
@@ -6996,13 +7135,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
       // Parse the S3 URL to extract the key
       const url = new URL(s3Url);
       const key = url.pathname.substring(1); // Remove leading slash
-      
+
       // Extract path by removing the filename
       const lastSlashIndex = key.lastIndexOf('/');
       if (lastSlashIndex === -1) {
         return ''; // No path, just filename
       }
-      
+
       return key.substring(0, lastSlashIndex);
     } catch (error) {
       console.error('Error extracting path from S3 URL:', error);
@@ -7017,7 +7156,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const urlParts = originalUrl.split('/');
       const filename = urlParts[urlParts.length - 1];
       console.log(`AgentMode: Extracted filename: ${filename}`);
-      
+
       // Split filename into name and extension
       const lastDotIndex = filename.lastIndexOf('.');
       if (lastDotIndex === -1) {
@@ -7025,15 +7164,15 @@ Use the available tools to create tasks in the agent-engine when complex work is
         console.log(`AgentMode: No extension found, adding _v2`);
         return `${filename}_v2`;
       }
-      
+
       const nameWithoutExt = filename.substring(0, lastDotIndex);
       const extension = filename.substring(lastDotIndex);
       console.log(`AgentMode: Name without ext: ${nameWithoutExt}, extension: ${extension}`);
-      
+
       // Check if filename already has a version pattern (_v followed by digits)
       const versionMatch = nameWithoutExt.match(/^(.+)_v(\d+)$/);
       console.log(`AgentMode: Version match result:`, versionMatch);
-      
+
       if (versionMatch) {
         // Extract base name and current version number
         const baseName = versionMatch[1];
@@ -7053,7 +7192,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const urlParts = originalUrl.split('/');
       const filename = urlParts[urlParts.length - 1];
       const lastDotIndex = filename.lastIndexOf('.');
-      
+
       if (lastDotIndex === -1) {
         return `${filename}_v2_${timestamp}`;
       } else {
@@ -7074,11 +7213,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
       // Upload to S3 with the same path as the original file
       const { uploadFileToS3WithPath } = await import('../utils/s3Utils');
       const uploadResult = await uploadFileToS3WithPath(content, filename, 'text/html', path);
-      
+
       if (!uploadResult.success || !uploadResult.url) {
         throw new Error(uploadResult.error || 'Failed to upload updated file');
       }
-      
+
       return { url: uploadResult.url };
     } catch (error) {
       console.error('Error uploading updated file:', error);
@@ -7087,25 +7226,26 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   // Create HTML from template with variable substitution
-    private async createHtmlFromTemplate(
-      templateName: string,
-      variableValues: Record<string, string> | undefined,
-      arrayVariableValues: Record<string, string[]> | undefined,
-      userId: string,
-      sessionId: string
-    ): Promise<any> {
+  private async createHtmlFromTemplate(
+    llmModel: string,
+    templateName: string,
+    variableValues: Record<string, string> | undefined,
+    arrayVariableValues: Record<string, string[]> | undefined,
+    userId: string,
+    sessionId: string
+  ): Promise<any> {
     try {
       // Get the template
       const settingName = `email_templates_${userId}`;
       const setting = await settingsService.getSetting(settingName);
-      
+
       if (!setting) {
         return {
           success: false,
           message: 'No email templates found for user'
         };
       }
-      
+
       let templates = [];
       try {
         templates = JSON.parse(setting.settingValue);
@@ -7116,7 +7256,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           message: 'Failed to parse email templates'
         };
       }
-      
+
       // Find the specific template
       const template = templates.find((t: any) => t.template_name === templateName);
       if (!template) {
@@ -7133,62 +7273,64 @@ Use the available tools to create tasks in the agent-engine when complex work is
           message: 'Invalid template structure: missing html_content or subject'
         };
       }
-
+      if (!llmModel) {
+        llmModel = this.default_model;
+      }
       // Validate that all required variables are provided
       const templateVariables = template.variables || [];
       const templateArrayVariables = template.arrayVariables || [];
-      
+
       // Parameters are already objects
       const variableValuesObj = variableValues || {};
       const arrayVariableValuesObj = arrayVariableValues || {};
-      
+
       // Check for missing regular variables
-      const missingVariables = templateVariables.filter((variable: string) => 
+      const missingVariables = templateVariables.filter((variable: string) =>
         !(variable in variableValuesObj)
       );
-      
+
       // Check for missing array variables
-      const missingArrayVariables = templateArrayVariables.filter((variable: string) => 
+      const missingArrayVariables = templateArrayVariables.filter((variable: string) =>
         !(variable in arrayVariableValuesObj)
       );
-      
+
       // Check for extra variables that aren't in the template
-      const extraVariables = Object.keys(variableValuesObj).filter(variable => 
+      const extraVariables = Object.keys(variableValuesObj).filter(variable =>
         !templateVariables.includes(variable)
       );
-      
-      const extraArrayVariables = Object.keys(arrayVariableValuesObj).filter(variable => 
+
+      const extraArrayVariables = Object.keys(arrayVariableValuesObj).filter(variable =>
         !templateArrayVariables.includes(variable)
       );
-      
+
       // Build validation error message
       const validationErrors = [];
-      
+
       if (missingVariables.length > 0) {
         validationErrors.push(`Missing required variables: ${missingVariables.join(', ')}`);
       }
-      
+
       if (missingArrayVariables.length > 0) {
         validationErrors.push(`Missing required array variables: ${missingArrayVariables.join(', ')}`);
       }
-      
+
       if (extraVariables.length > 0) {
         validationErrors.push(`Extra variables provided: ${extraVariables.join(', ')}`);
       }
-      
+
       if (extraArrayVariables.length > 0) {
         validationErrors.push(`Extra array variables provided: ${extraArrayVariables.join(', ')}`);
       }
-      
+
       // Validate array variable values are actually arrays
-      const invalidArrayVariables = Object.entries(arrayVariableValuesObj).filter(([key, value]) => 
+      const invalidArrayVariables = Object.entries(arrayVariableValuesObj).filter(([key, value]) =>
         !Array.isArray(value)
       );
-      
+
       if (invalidArrayVariables.length > 0) {
         validationErrors.push(`Array variable items must be an array: ${invalidArrayVariables.map(([key]) => key).join(', ')}`);
       }
-      
+
       if (validationErrors.length > 0) {
         return {
           success: false,
@@ -7198,7 +7340,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           template_array_variables: templateArrayVariables
         };
       }
-      
+
       // Use LLM to handle variable substitution
       const substitutionPrompt = `You are a template engine. Your task is to replace variables in HTML templates with provided values while preserving the exact same format and structure.
 
@@ -7235,14 +7377,12 @@ You must return a valid JSON object with exactly these two fields:
 
 IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
 
-      const substitutionResponse = await this.openai.chat.completions.create({
-        model: process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
-        messages: [
-          {
-            role: 'user',
-            content: substitutionPrompt
-          }
-        ],
+      const substitutionResponse = await this.callLLM(llmModel, [
+        {
+          role: 'user',
+          content: substitutionPrompt
+        }
+      ], {
         temperature: 0.1,
         response_format: { type: 'json_object' }
       });
@@ -7265,22 +7405,22 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
 
       const finalHtml = substitutionData.final_html;
       const finalSubject = substitutionData.final_subject;
-      
+
       // Verify the substitution was correct
       const remainingPlaceholders = finalHtml.match(/\{\{[^}]+\}\}/g) || [];
       const remainingSubjectPlaceholders = finalSubject.match(/\{\{[^}]+\}\}/g) || [];
-      
+
       if (remainingPlaceholders.length > 0 || remainingSubjectPlaceholders.length > 0) {
         console.warn('Warning: Some variables were not substituted:', {
           htmlPlaceholders: remainingPlaceholders,
           subjectPlaceholders: remainingSubjectPlaceholders
         });
       }
-      
+
       // Verify HTML structure is preserved (basic check)
       const originalTagCount = (template.html_content.match(/<[^>]+>/g) || []).length;
       const finalTagCount = (finalHtml.match(/<[^>]+>/g) || []).length;
-      
+
       // Allow for some variation due to array repetition, but flag significant changes
       const tagDifference = Math.abs(originalTagCount - finalTagCount);
       if (tagDifference > originalTagCount * 0.5) { // More than 50% change in tag count
@@ -7290,18 +7430,18 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
           difference: tagDifference
         });
       }
-      
+
       // Upload to S3
       const { uploadFileToS3 } = await import('../utils/s3Utils');
       const filename = `html_${templateName}.html`;
       const uploadResult = await uploadFileToS3(finalHtml, filename, userId, 'text/html');
-      
+
       if (!uploadResult.success || !uploadResult.url) {
         throw new Error(uploadResult.error || 'Failed to upload to S3');
       }
-      
+
       const s3Url = uploadResult.url;
-      
+
       return {
         success: true,
         s3_url: s3Url,
@@ -7311,7 +7451,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       };
     } catch (error) {
       console.error('Error creating email HTML from template:', error);
-      
+
       // Return specific error messages based on the error type
       if (error instanceof Error) {
         if (error.message.includes('Failed to process template with LLM') || error.message.includes('OpenAI API error')) {
@@ -7340,7 +7480,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
           };
         }
       }
-      
+
       return {
         success: false,
         message: 'Failed to create email HTML from template',
@@ -7434,7 +7574,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
 
   // Work Plan Management Methods
 
-  private async createWorkPlan(title: string, steps: Array<{stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]}>, sessionId: string): Promise<any> {
+  private async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[] }>, sessionId: string): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -7480,7 +7620,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
     }
   }
 
-  private async modifyWorkPlan(steps: Array<{stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]}>, removeStepCounts: number[], sessionId: string): Promise<any> {
+  private async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[] }>, removeStepCounts: number[], sessionId: string): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session || !session.workPlan) {
@@ -7491,7 +7631,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       }
 
       const workPlan = { ...session.workPlan };
-      
+
       // Remove steps if specified
       if (removeStepCounts && removeStepCounts.length > 0) {
         workPlan.steps = workPlan.steps.filter(s => !removeStepCounts.includes(s.stepCount));
@@ -7546,7 +7686,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
   }
 
   private async setWorkPlanStatus(
-    updates: Array<{stepCount: number; status: 'pending' | 'completed' | 'skipped'; notes?: string}>, 
+    updates: Array<{ stepCount: number; status: 'pending' | 'completed' | 'skipped'; notes?: string }>,
     sessionId: string
   ): Promise<any> {
     try {
@@ -7559,9 +7699,9 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       }
 
       const workPlan = { ...session.workPlan };
-      const updatedSteps: Array<{stepCount: number; title: string; status: string}> = [];
+      const updatedSteps: Array<{ stepCount: number; title: string; status: string }> = [];
       const notFoundSteps: number[] = [];
-      const missingFunctionCalls: Array<{stepCount: number; title: string; missing: string[]}> = [];
+      const missingFunctionCalls: Array<{ stepCount: number; title: string; missing: string[] }> = [];
 
       // Get function call counts from session (make a copy to modify)
       const calledFunctionCounts = { ...(session.calledFunctions || {}) };
@@ -7570,7 +7710,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       // Process each update
       for (const update of updates) {
         const stepIndex = workPlan.steps.findIndex(s => s.stepCount === update.stepCount);
-        
+
         if (stepIndex < 0) {
           notFoundSteps.push(update.stepCount);
           continue;
@@ -7585,7 +7725,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
           for (const fn of step.requiredFunctionCalls) {
             requiredCounts[fn] = (requiredCounts[fn] || 0) + 1;
           }
-          
+
           // Check if we have enough calls for each required function
           const missing: string[] = [];
           for (const [fn, requiredCount] of Object.entries(requiredCounts)) {
@@ -7594,7 +7734,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
               missing.push(`${fn} (need ${requiredCount}, have ${availableCount})`);
             }
           }
-          
+
           if (missing.length > 0) {
             missingFunctionCalls.push({
               stepCount: update.stepCount,
@@ -7603,7 +7743,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
             });
             continue; // Skip updating this step
           }
-          
+
           // If validation passed and marking as completed, decrement the function counts
           for (const fn of step.requiredFunctionCalls) {
             calledFunctionCounts[fn] = (calledFunctionCounts[fn] || 0) - 1;
@@ -7628,10 +7768,10 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
 
       // Check if there are missing function calls - this is a critical error
       if (missingFunctionCalls.length > 0) {
-        const errorDetails = missingFunctionCalls.map(mfc => 
+        const errorDetails = missingFunctionCalls.map(mfc =>
           `Step ${mfc.stepCount} "${mfc.title}": missing required function calls: ${mfc.missing.join(', ')}`
         ).join('\n');
-        
+
         return {
           success: false,
           message: 'Cannot mark steps as completed. Required function calls have not been made yet.',
@@ -7653,7 +7793,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         workPlan.updatedAt = new Date().toISOString();
         // Update the session (will throw error if stepCount is not sequential)
         await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
-        
+
         // Update function counts if they were modified
         if (countsModified) {
           await chatbotDb.updateCalledFunctions(sessionId, calledFunctionCounts);
@@ -7664,13 +7804,13 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         ? `Step ${updatedSteps[0].stepCount} status updated to ${updatedSteps[0].status}`
         : `Updated ${updatedSteps.length} step${updatedSteps.length > 1 ? 's' : ''}`;
 
-      const formattedContent = updatedSteps.map(s => 
+      const formattedContent = updatedSteps.map(s =>
         `Updated step ${s.stepCount} "${s.title}" to ${s.status}`
       ).join('\n');
 
       return {
         success: updatedSteps.length > 0,
-        message: notFoundSteps.length > 0 
+        message: notFoundSteps.length > 0
           ? `${message}. Steps not found: ${notFoundSteps.join(', ')}`
           : message,
         updatedSteps,

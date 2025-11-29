@@ -8,6 +8,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessageToSession: jest.fn(),
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
+    updateSessionLlmModel: jest.fn(),
   },
 }));
 
@@ -96,6 +97,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
     // Setup default mocks
     mockChatbotDb.createChatSession.mockResolvedValue(mockSession);
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession);
+    mockChatbotDb.updateSessionLlmModel.mockResolvedValue(mockSession);
     mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
     mockAgentModeService.generateSessionTitle.mockResolvedValue('Generated Title');
     // Use worker service instead of direct generateMarketingResponse

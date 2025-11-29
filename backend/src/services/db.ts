@@ -2476,7 +2476,60 @@ class BenchmarkTestDB {
     try {
       const result = await this.docClient.update(params).promise();
       return result.Attributes;
-    } catch (error) {
+    } catch (error: any) {
+      // Handle DynamoDB item size limit error
+      if (error.code === 'ValidationException' && error.message?.includes('exceeded the maximum allowed size')) {
+        console.log(`Item size limit exceeded for test ${testId}. Keeping only last 10 test history records.`);
+        
+        try {
+          // Get the current test to access testHistory
+          const currentTest = await this.getBenchmarkTest(testId);
+          if (!currentTest) {
+            throw new Error('Test not found');
+          }
+
+          const testHistory = currentTest.testHistory || [];
+          
+          // Check if we have any history to work with
+          if (testHistory.length === 0) {
+            throw new Error('Item size limit exceeded but no test history to remove');
+          }
+          
+          // Keep only the last 10 records (most recent)
+          const updatedHistory = testHistory.slice(-10);
+          
+          console.log(`Reducing test history from ${testHistory.length} to ${updatedHistory.length} records.`);
+          
+          // Use a direct update to replace the entire testHistory array
+          const cleanupParams = {
+            TableName: this.tableName,
+            Key: {
+              testId,
+            },
+            UpdateExpression: 'SET #testHistory = :updatedHistory, #updatedAt = :updatedAt',
+            ExpressionAttributeNames: {
+              '#testHistory': 'testHistory',
+              '#updatedAt': 'updatedAt',
+            },
+            ExpressionAttributeValues: {
+              ':updatedHistory': updatedHistory,
+              ':updatedAt': new Date().toISOString(),
+            },
+            ReturnValues: 'ALL_NEW',
+          };
+          
+          await this.docClient.update(cleanupParams).promise();
+          
+          // Retry adding the new test result
+          const retryResult = await this.docClient.update(params).promise();
+          console.log(`Successfully added test result after cleanup. History now has ${updatedHistory.length + 1} records.`);
+          return retryResult.Attributes;
+        } catch (cleanupError) {
+          console.error('Error cleaning up test history:', cleanupError);
+          throw new Error(`Failed to add test result and cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : 'Unknown error'}`);
+        }
+      }
+      
       handleDynamoDbError(error, "addTestResult");
       throw error;
     }

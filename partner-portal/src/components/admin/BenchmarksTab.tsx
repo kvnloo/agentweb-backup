@@ -62,9 +62,11 @@ interface BenchmarkTest {
     functionCalls?: string[];
   };
   status: 'draft' | 'active' | 'archived';
+  llmModel?: string; // Selected LLM model for this test
   createdAt: string;
   updatedAt: string;
   lastRunAt?: string;
+  lastRunModel?: string; // Model used in the last run
   runCount: number;
   successCount: number;
   failureCount: number;
@@ -83,6 +85,7 @@ interface BenchmarkTest {
     functionCallMisses: string[];
     executionTime: number;
     errorMessage?: string;
+    llmModel?: string; // Model used in this test run
     createdAt: string;
   }>;
 }
@@ -93,6 +96,7 @@ interface CreateBenchmarkDialogProps {
   sessionId?: string;
   editTest?: BenchmarkTest | null;
   onSuccess: () => void;
+  onRunTest?: (testId: string, model?: string) => void;
 }
 
 const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
@@ -101,12 +105,15 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
   sessionId,
   editTest,
   onSuccess,
+  onRunTest,
 }) => {
   const { token } = useAuth();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [sessionMessages, setSessionMessages] = useState<any[]>([]);
   const [availableFunctionCalls, setAvailableFunctionCalls] = useState<Array<{name: string; description: string}>>([]);
+  const [supportedModels, setSupportedModels] = useState<string[]>([]);
+  const [selectedModel, setSelectedModel] = useState<string>('');
   const [formData, setFormData] = useState({
     testName: '',
     description: '',
@@ -119,6 +126,7 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
   useEffect(() => {
     if (open) {
       loadAvailableFunctionCalls();
+      loadSupportedModels();
       if (editTest) {
         // Populate form with existing test data
         setFormData({
@@ -138,6 +146,19 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
     }
   }, [open, sessionId, editTest]);
 
+  // Set selected model when supportedModels are loaded and editTest is available
+  useEffect(() => {
+    if (editTest && supportedModels.length > 0) {
+      // Set selected model from test if available and valid
+      if (editTest.llmModel && supportedModels.includes(editTest.llmModel)) {
+        setSelectedModel(editTest.llmModel);
+      } else if (!selectedModel) {
+        // If test has no model or model is not supported, use first available
+        setSelectedModel(supportedModels[0]);
+      }
+    }
+  }, [supportedModels, editTest]);
+
   const loadAvailableFunctionCalls = async () => {
     if (!token) return;
     
@@ -153,6 +174,26 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
     } catch (err: any) {
       console.error('Error loading function calls:', err);
       // Don't show error for function calls as it's not critical
+    }
+  };
+
+  const loadSupportedModels = async () => {
+    try {
+      const response = await axios.get(
+        buildApiUrl('/api/agent-mode/public/llm-models'),
+        { headers: { Authorization: token ? `Bearer ${token}` : undefined } }
+      );
+      
+      if (response.data && Array.isArray(response.data)) {
+        setSupportedModels(response.data);
+        // Set default model to first available if not set and not editing
+        if (!selectedModel && !editTest && response.data.length > 0) {
+          setSelectedModel(response.data[0]);
+        }
+      }
+    } catch (err: any) {
+      console.error('Error loading supported models:', err);
+      // Don't show error for models as it's not critical
     }
   };
 
@@ -228,6 +269,18 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
       setLoading(true);
       setError('');
 
+      // Ensure we have a valid model selected
+      // Priority: selectedModel > editTest.llmModel > first available model
+      const modelToUse = selectedModel || 
+                        (editTest?.llmModel && supportedModels.includes(editTest.llmModel) ? editTest.llmModel : null) ||
+                        (supportedModels.length > 0 ? supportedModels[0] : null);
+      
+      if (!modelToUse) {
+        setError('Please select an LLM model');
+        setLoading(false);
+        return;
+      }
+      
       const payload = {
         testName: formData.testName.trim(),
         description: formData.description.trim() || undefined,
@@ -236,6 +289,7 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
           keywords: formData.keywords.length > 0 ? formData.keywords : undefined,
           functionCalls: formData.functionCalls.length > 0 ? formData.functionCalls : undefined,
         },
+        llmModel: modelToUse, // Always include the model
       };
 
       if (editTest) {
@@ -265,6 +319,7 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
           conversationHistory: {
             messages: filteredMessages
           },
+          llmModel: selectedModel || (supportedModels.length > 0 ? supportedModels[0] : undefined),
         };
 
         await axios.post(buildApiUrl('/api/benchmark'), createPayload, {
@@ -293,6 +348,8 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
     });
     setNewKeyword('');
     setError('');
+    setSelectedModel('');
+    setSessionMessages([]);
   };
 
   const handleClose = () => {
@@ -353,6 +410,29 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
               </Select>
             </FormControl>
           )}
+
+          {/* Model Selection */}
+          <FormControl fullWidth variant="outlined">
+            <InputLabel id="model-label">LLM Model for Running Test</InputLabel>
+            <Select
+              labelId="model-label"
+              value={selectedModel}
+              onChange={(e) => setSelectedModel(e.target.value)}
+              disabled={loading || supportedModels.length === 0}
+              label="LLM Model for Running Test"
+            >
+              {supportedModels.map((model) => (
+                <MenuItem key={model} value={model}>
+                  {model}
+                </MenuItem>
+              ))}
+            </Select>
+            {supportedModels.length === 0 && (
+              <Typography variant="caption" color="text.secondary" sx={{ mt: 1 }}>
+                Loading models...
+              </Typography>
+            )}
+          </FormControl>
 
           {/* Expected Keywords */}
           <Box>
@@ -501,6 +581,20 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
         </Box>
       </DialogContent>
       <DialogActions>
+        {editTest && onRunTest && selectedModel && (
+          <Button
+            onClick={() => {
+              onRunTest(editTest.testId, selectedModel);
+              onClose();
+            }}
+            variant="outlined"
+            color="secondary"
+            disabled={loading || !selectedModel}
+            startIcon={<PlayIcon />}
+          >
+            Run Test with {selectedModel}
+          </Button>
+        )}
         <Button onClick={handleClose} disabled={loading}>
           Cancel
         </Button>
@@ -592,12 +686,14 @@ const BenchmarksTab: React.FC = () => {
     }
   };
 
-  const handleRun = async (testId: string) => {
+  const handleRun = async (testId: string, llmModel?: string) => {
     try {
       // Add test to running set
       setRunningTests(prev => new Set(prev).add(testId));
       
-      await axios.post(buildApiUrl(`/api/benchmark/${testId}/run`), {}, {
+      const payload = llmModel ? { llmName: llmModel } : {};
+      
+      await axios.post(buildApiUrl(`/api/benchmark/${testId}/run`), payload, {
         headers: { Authorization: `Bearer ${token}` },
       });
       
@@ -623,7 +719,7 @@ const BenchmarksTab: React.FC = () => {
     setError('');
     
     try {
-      // Run tests one by one
+      // Run tests one by one (using default model from backend)
       for (const benchmark of benchmarks) {
         try {
           // Add test to running set
@@ -881,6 +977,7 @@ const BenchmarksTab: React.FC = () => {
                 <TableCell>Last Run Result</TableCell>
                 <TableCell>Created</TableCell>
                 <TableCell>Last Run</TableCell>
+                <TableCell>Last Run Model</TableCell>
                 <TableCell>Actions</TableCell>
               </TableRow>
             </TableHead>
@@ -931,6 +1028,13 @@ const BenchmarksTab: React.FC = () => {
                     }
                   </TableCell>
                   <TableCell>
+                    {benchmark.lastRunModel ? (
+                      <Chip label={benchmark.lastRunModel} size="small" variant="outlined" />
+                    ) : (
+                      <Typography variant="body2" color="text.secondary">-</Typography>
+                    )}
+                  </TableCell>
+                  <TableCell>
                     <Box sx={{ display: 'flex', gap: 1 }}>
                       <Tooltip title={runningTests.has(benchmark.testId) ? "Running..." : "Run Test"}>
                         <IconButton
@@ -977,7 +1081,7 @@ const BenchmarksTab: React.FC = () => {
               ))}
               {(!Array.isArray(benchmarks) || benchmarks.length === 0) && (
                 <TableRow>
-                  <TableCell colSpan={8} align="center">
+                  <TableCell colSpan={9} align="center">
                     <Typography color="text.secondary">
                       No benchmark tests found. Create your first one!
                     </Typography>
@@ -1004,6 +1108,7 @@ const BenchmarksTab: React.FC = () => {
         }}
         editTest={selectedBenchmark}
         onSuccess={loadBenchmarks}
+        onRunTest={(testId, model) => handleRun(testId, model)}
       />
 
       {/* History Dialog */}
@@ -1038,6 +1143,9 @@ const BenchmarksTab: React.FC = () => {
                           <Typography variant="body2" color="text.secondary">
                             {new Date(result.createdAt).toLocaleString()}
                           </Typography>
+                          {result.llmModel && (
+                            <Chip label={result.llmModel} size="small" variant="outlined" />
+                          )}
                         </Box>
                         <Typography variant="body2" color="text.secondary">
                           {result.executionTime}ms

@@ -8,6 +8,7 @@ jest.mock('../services/chatbotService', () => ({
     createChatSession: jest.fn(),
     getChatSession: jest.fn(),
     getUserSessions: jest.fn(),
+    updateSessionLlmModel: jest.fn(),
   }
 }));
 
@@ -30,6 +31,11 @@ describe('AgentModeController - createSession', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockChatbotDb.createChatSession.mockResolvedValue(mockSession as any);
+    // Mock updateSessionLlmModel to return session with llmModel
+    mockChatbotDb.updateSessionLlmModel = jest.fn().mockResolvedValue({
+      ...mockSession,
+      llmModel: 'gpt-5-chat-2',
+    } as any);
   });
 
   it('should create session with default sessionType "regular"', async () => {
@@ -59,8 +65,15 @@ describe('AgentModeController - createSession', () => {
       undefined,
       'regular'
     );
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
+      mockSession.sessionId,
+      'gpt-5-chat-2'
+    );
     expect(mockRes.status).toHaveBeenCalledWith(201);
-    expect(mockRes.json).toHaveBeenCalledWith(mockSession);
+    expect(mockRes.json).toHaveBeenCalledWith({
+      ...mockSession,
+      llmModel: 'gpt-5-chat-2',
+    });
   });
 
   it('should create session with sessionType "image-generation" when provided', async () => {
@@ -69,6 +82,10 @@ describe('AgentModeController - createSession', () => {
       sessionType: 'image-generation' as const,
     };
     mockChatbotDb.createChatSession.mockResolvedValue(mockSessionWithImageType as any);
+    mockChatbotDb.updateSessionLlmModel = jest.fn().mockResolvedValue({
+      ...mockSessionWithImageType,
+      llmModel: 'gpt-5-chat-2',
+    } as any);
 
     const mockReq = {
       user: { userId: mockUserId },
@@ -97,8 +114,15 @@ describe('AgentModeController - createSession', () => {
       undefined,
       'image-generation'
     );
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
+      mockSessionWithImageType.sessionId,
+      'gpt-5-chat-2'
+    );
     expect(mockRes.status).toHaveBeenCalledWith(201);
-    expect(mockRes.json).toHaveBeenCalledWith(mockSessionWithImageType);
+    expect(mockRes.json).toHaveBeenCalledWith({
+      ...mockSessionWithImageType,
+      llmModel: 'gpt-5-chat-2',
+    });
   });
 
   it('should handle errors gracefully', async () => {

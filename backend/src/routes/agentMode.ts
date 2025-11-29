@@ -39,6 +39,10 @@ router.post('/share/:shareId/generate', asyncHandler(agentModeController.generat
 // Generate response for interactive shared conversation (with conversable token)
 router.post('/ishare/:shareId/generate', asyncHandler(agentModeController.generateSharedResponse));
 
+// PATCH /api/agent-mode/ishare/:shareId/llm-model
+// Update session LLM model for interactive shared conversation (with conversable token)
+router.patch('/ishare/:shareId/llm-model', asyncHandler(agentModeController.updateSharedSessionLlmModel));
+
 // GET /api/agent-mode/ishare/:shareId/progress
 // SSE endpoint for progress updates (public, with conversable token)
 router.get('/ishare/:shareId/progress', asyncHandler(agentModeController.getProgressPublic));
@@ -60,6 +64,11 @@ router.get('/public/plan/:planTitle', asyncHandler(agentModeController.getPredef
 // POST /api/agent-mode/public/plan/:planTitle/session
 // Create session with predefined work plan (public)
 router.post('/public/plan/:planTitle/session', asyncHandler(agentModeController.createSessionWithPlan));
+
+// GET /api/agent-mode/public/llm-models
+// Get supported LLM models (public)
+router.get('/public/llm-models', asyncHandler(agentModeController.getSupportedModels));
+
 
 // POST /api/agent-mode/run-scheduled-chats
 // Run all scheduled chats that are ready to execute (called by agent-engine)
@@ -87,6 +96,10 @@ router.post('/sessions', asyncHandler(agentModeController.createSession));
 // GET /api/agent-mode/session/:sessionId
 // Get specific chat session
 router.get('/session/:sessionId', asyncHandler(agentModeController.getSession));
+
+// PATCH /api/agent-mode/session/:sessionId/llm-model
+// Update session LLM model
+router.patch('/session/:sessionId/llm-model', asyncHandlerAuth(agentModeController.updateSessionLlmModel));
 
 // GET /api/agent-mode/function-calls
 // Get available function calls for benchmark tests
