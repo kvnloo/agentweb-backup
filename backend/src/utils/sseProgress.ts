@@ -48,7 +48,6 @@ export function emitProgress(sessionId: string, progress: ProgressUpdate) {
   // Notify all active connections
   const callbacks = activeConnections.get(sessionId);
   if (callbacks && callbacks.size > 0) {
-    console.log(`[SSE Progress] Emitting progress for session ${sessionId}:`, progress);
     callbacks.forEach(callback => {
       try {
         callback(progress);
@@ -56,8 +55,6 @@ export function emitProgress(sessionId: string, progress: ProgressUpdate) {
         console.error('Error in progress callback:', error);
       }
     });
-  } else {
-    console.log(`[SSE Progress] No active connections for session ${sessionId}, progress:`, progress);
   }
 }
 

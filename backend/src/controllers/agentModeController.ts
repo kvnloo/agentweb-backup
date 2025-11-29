@@ -646,7 +646,6 @@ function setupSSEConnectionForSession(sessionId: string, res: Response, req: Req
     // Register callback for progress updates
     const cleanup = registerProgressCallback(sessionId, (progress) => {
       try {
-        console.log(`[SSE] Writing progress for session ${sessionId}:`, progress);
         res.write(`data: ${JSON.stringify(progress)}\n\n`);
         // Flush the response to ensure it's sent immediately
         if (typeof (res as any).flush === 'function') {
@@ -657,8 +656,6 @@ function setupSSEConnectionForSession(sessionId: string, res: Response, req: Req
         cleanup();
       }
     });
-    
-    console.log(`[SSE] Progress callback registered for session ${sessionId}`);
 
     // Handle client disconnect
     req.on('close', () => {
