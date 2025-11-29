@@ -238,12 +238,12 @@ Content Guidelines:
     - Focus on readable, professional content that provides real value` : ''}
 
 Format the response as JSON with this structure:
-{
+{{
   "title": "Compelling, SEO-optimized title",
   "description": "1-2 sentence meta description for SEO",
   "content": "Full blog content in markdown format",
   "imagePrompt": "Detailed visual description for hero image (avoid text, be conceptual)"
-}`;
+}}`;
 
   // Add custom requirements if provided
   if (requirements) {
