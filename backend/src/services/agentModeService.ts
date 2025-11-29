@@ -21,7 +21,7 @@ interface PDFData {
 
 // Type for LLM model configuration
 interface LLMModelConfig {
-  client: OpenAI;
+  client: OpenAI | null; // null for lazy-loaded clients (e.g., Gemini)
   supportsTemperature: boolean;
 }
 
@@ -37,23 +37,67 @@ interface LLMCallOptions {
 
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number }> = new Map();
-  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5.1';
-  private openai_client = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-    baseURL: process.env.OPENAI_BASE_URL,
-  });
+  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2';
+  
+  // Helper method to create Azure OpenAI client for a specific deployment
+  private getAzureOpenAIClient(deploymentName: string): OpenAI {
+    return new OpenAI({
+      apiKey: process.env.AZURE_OPENAI_API_KEY,
+      baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${deploymentName}`,
+      defaultQuery: {
+        "api-version": process.env.AZURE_OPENAI_API_VERSION_AGENT_MODE || process.env.AZURE_OPENAI_API_VERSION || "2025-01-01-preview",
+      },
+      defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
+    });
+  }
 
-  private gemini_client = new OpenAI({
-    apiKey: process.env.GEMINI_API_KEY,
-    baseURL: process.env.GEMINI_BASE_URL,
-  });
+  private gemini_client: OpenAI | null = null;
+  private gemini_client_promise: Promise<OpenAI> | null = null;
+
+  // Helper method to get Gemini client (lazy-loaded from secrets manager)
+  private async getGeminiClient(): Promise<OpenAI> {
+    // Return cached client if available
+    if (this.gemini_client) {
+      return this.gemini_client;
+    }
+
+    // If already initializing, wait for that promise
+    if (this.gemini_client_promise) {
+      return this.gemini_client_promise;
+    }
+
+    // Initialize client
+    this.gemini_client_promise = (async () => {
+      try {
+        const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+        const geminiSecretName = `${environment}/AgentWeb/GeminiAPIKey`;
+        const geminiApiKey = await getSecret(geminiSecretName);
+
+        if (!geminiApiKey || !geminiApiKey.trim()) {
+          throw new Error('Gemini API key is empty');
+        }
+
+        this.gemini_client = new OpenAI({
+          apiKey: geminiApiKey.trim(),
+          baseURL: 'https://generativelanguage.googleapis.com/v1beta',
+        });
+
+        return this.gemini_client;
+      } catch (error) {
+        console.error('Error initializing Gemini client:', error);
+        this.gemini_client_promise = null; // Reset promise on error
+        throw error;
+      }
+    })();
+
+    return this.gemini_client_promise;
+  }
 
   private llmModels: Record<string, LLMModelConfig> = {
-    // List openai models
-    'gpt-5': { client: this.openai_client, supportsTemperature: false }, // Assuming gpt-5 does not support temperature
-    'gpt-5.1': { client: this.openai_client, supportsTemperature: true },
-    // List gemini models
-    'gemini-3-pro-preview': { client: this.gemini_client, supportsTemperature: true },
+    // List openai models - create client dynamically for each deployment
+    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: true },
+    // List gemini models - client will be lazy-loaded
+    'gemini-3-pro-preview': { client: null, supportsTemperature: true },
   };
 
   async getSupportedModels() {
@@ -111,7 +155,19 @@ export class AgentModeService {
       params.temperature = temperature;
     }
 
-    const res = await this.llmModels[model].client.chat.completions.create(params);
+    // Get the client - lazy-load Gemini client if needed
+    let client = this.llmModels[model].client;
+    if (!client) {
+      if (model === 'gemini-3-pro-preview') {
+        client = await this.getGeminiClient();
+        // Update the cached client for future use
+        this.llmModels[model].client = client;
+      } else {
+        throw new Error(`Client not initialized for model: ${model}`);
+      }
+    }
+
+    const res = await client.chat.completions.create(params);
     return res;
   }
 

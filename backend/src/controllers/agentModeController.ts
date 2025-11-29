@@ -258,6 +258,7 @@ async function runVerifiedChat(
     requiredFunctions: Array<{ functionName: string; minCount: number }>;
     maxAttempts?: number;
     attachments?: any[];
+    llmModel?: string;
   }
 ): Promise<{
   success: boolean;
@@ -347,7 +348,7 @@ async function runVerifiedChat(
         sessionId,
         userMessage,
         userId,
-        agentModeService.default_model,
+        params.llmModel || agentModeService.default_model,
         attachments
       );
 
@@ -538,6 +539,10 @@ async function runScheduledChat(
     );
     const sessionId = testSession.sessionId;
 
+    // Update the session with the selected model from the schedule
+    const modelToUse = schedule.llmModel || agentModeService.default_model;
+    await chatbotDb.updateSessionLlmModel(sessionId, modelToUse);
+
     // Convert schedule format to runVerifiedChat format
     const expectedKeywords = schedule.keywords || [];
     const expectedFunctionCalls = schedule.requiredFunctionCalls || [];
@@ -556,7 +561,8 @@ async function runScheduledChat(
       keywords: expectedKeywords,
       requiredFunctions,
       maxAttempts: 20,
-      attachments: []
+      attachments: [],
+      llmModel: schedule.llmModel || agentModeService.default_model
     });
 
     // Convert result to scheduled chat format
@@ -901,7 +907,11 @@ export const agentModeController = {
         finalSessionType as "regular" | "predefined-work-plan" | "scheduled" | "image-generation"
       );
 
-      res.status(201).json(session);
+      // Set default model for new sessions
+      const defaultModel = agentModeService.default_model;
+      const sessionWithModel = await chatbotDb.updateSessionLlmModel(session.sessionId, defaultModel);
+
+      res.status(201).json(sessionWithModel);
     } catch (error) {
       console.error('AgentMode: Create session error:', error);
       res.status(500).json({ error: 'Failed to create session' });
@@ -1297,6 +1307,9 @@ export const agentModeController = {
         }
       }
 
+      // Use session's llmModel if available, otherwise use default
+      const modelToUse = session.llmModel || agentModeService.default_model;
+
       res.status(200).json({
         session: {
           sessionId: session.sessionId,
@@ -1307,6 +1320,7 @@ export const agentModeController = {
           shareMetadata: session.shareMetadata,
           interactiveShareMetadata: session.interactiveShareMetadata,
           workPlan: session.workPlan,
+          llmModel: modelToUse,
           isConversable: !!conversable
         }
       });
@@ -1346,12 +1360,16 @@ export const agentModeController = {
       // Clear old progress store (but keep active connections)
       progressStore.delete(session.sessionId);
 
+      // Always use session's llmModel for ishare endpoints (ignore request body's llmModel)
+      // This ensures anonymous users get the correct model from the session
+      const modelToUse = session.llmModel || agentModeService.default_model;
+
       // Use the same generateSessionResponse logic as the regular generateResponse
       const response = await generateSessionResponse(
         session.sessionId,
         userMessage,
         session.userId,
-        llmModel,
+        modelToUse,
         attachments
       );
 
@@ -1496,7 +1514,8 @@ export const agentModeController = {
         requiredFunctionCalls,
         functionCallMinCalls,
         emailNotifications,
-        emailCampaignTaskId
+        emailCampaignTaskId,
+        llmModel
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
@@ -1535,7 +1554,8 @@ export const agentModeController = {
         updatedAt: now.toISOString(),
         sessionId: sessionId || null, // Store original sessionId for reference (can be null)
         type: 'scheduled_chat', // Distinguish from regular task schedules
-        emailCampaignTaskId: emailCampaignTaskId || null
+        emailCampaignTaskId: emailCampaignTaskId || null,
+        llmModel: llmModel || agentModeService.default_model // Use provided model or default
       };
 
       await scheduleDb.createSchedule(scheduledChat);
@@ -1584,7 +1604,8 @@ export const agentModeController = {
         functionCallMinCalls,
         emailNotifications,
         dailyDigest,
-        emailCampaignTaskId
+        emailCampaignTaskId,
+        llmModel
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
@@ -1613,7 +1634,8 @@ export const agentModeController = {
         emailNotifications: emailNotifications || [],
         dailyDigest: scheduleFrequency === 'hourly' ? (dailyDigest || false) : false, // Only allow daily digest for hourly schedules
         updatedAt: now.toISOString(),
-        emailCampaignTaskId: emailCampaignTaskId || null
+        emailCampaignTaskId: emailCampaignTaskId || null,
+        llmModel: llmModel || agentModeService.default_model // Use provided model or default
       };
 
       await scheduleDb.updateSchedule(scheduleId, updates);
@@ -1970,6 +1992,9 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found' });
       }
 
+      // Use session's llmModel if available, otherwise use default
+      const modelToUse = session.llmModel || agentModeService.default_model;
+
       res.json({
         sessionId: session.sessionId,
         title: session.title,
@@ -1977,6 +2002,7 @@ export const agentModeController = {
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
         workPlan: session.workPlan,
+        llmModel: modelToUse,
         isConversable: true
       });
     } catch (error) {
@@ -1999,12 +2025,15 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found' });
       }
 
+      // Use session's llmModel if available, otherwise use default
+      const modelToUse = session.llmModel || agentModeService.default_model;
+
       // Generate AI response using the same function as regular users
       const response = await generateSessionResponse(
         session.sessionId,
         userMessage,
         session.userId, // Use the original session owner's userId
-        agentModeService.default_model, // Use default model
+        modelToUse,
         attachments
       );
 
@@ -2167,6 +2196,10 @@ export const agentModeController = {
         autocomplete: predefinedPlan.autocomplete || false
       };
       await chatbotDb.updateSessionWorkPlan(session.sessionId, workPlanWithWelcome);
+
+      // Set default model for new sessions
+      const defaultModel = agentModeService.default_model;
+      await chatbotDb.updateSessionLlmModel(session.sessionId, defaultModel);
 
       // Enable interactive sharing for the session
       const conversableToken = crypto.randomBytes(32).toString('hex');
@@ -2377,6 +2410,38 @@ export const agentModeController = {
         error: 'Failed to perform verified generation',
         message: error.message || 'Unknown error'
       });
+    }
+  },
+
+  // Update session LLM model
+  async updateSessionLlmModel(req: AuthenticatedRequest, res: Response) {
+    try {
+      const { sessionId } = req.params;
+      const { llmModel } = req.body;
+      const user = req.user as User;
+
+      if (!llmModel) {
+        return res.status(400).json({ error: 'llmModel is required' });
+      }
+
+      // Get the session to verify ownership
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Check if user owns the session (or is admin)
+      if (session.userId !== user.userId && !user.isAdmin) {
+        return res.status(403).json({ error: 'Unauthorized access to session' });
+      }
+
+      // Update the session's llmModel
+      const updatedSession = await chatbotDb.updateSessionLlmModel(sessionId, llmModel);
+
+      res.json({ llmModel: updatedSession.llmModel });
+    } catch (error) {
+      console.error('AgentMode: Update session LLM model error:', error);
+      res.status(500).json({ error: 'Failed to update session LLM model' });
     }
   },
 };

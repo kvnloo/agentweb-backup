@@ -93,6 +93,10 @@ router.post('/sessions', asyncHandler(agentModeController.createSession));
 // Get specific chat session
 router.get('/session/:sessionId', asyncHandler(agentModeController.getSession));
 
+// PATCH /api/agent-mode/session/:sessionId/llm-model
+// Update session LLM model
+router.patch('/session/:sessionId/llm-model', asyncHandler(agentModeController.updateSessionLlmModel));
+
 // GET /api/agent-mode/function-calls
 // Get available function calls for benchmark tests
 router.get('/function-calls', asyncHandler(agentModeController.getAvailableFunctionCalls));

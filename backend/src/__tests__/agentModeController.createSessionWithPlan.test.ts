@@ -11,7 +11,8 @@ jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     createChatSession: jest.fn(),
     updateSessionWorkPlan: jest.fn(),
-    updateSessionInteractiveShareMetadata: jest.fn()
+    updateSessionInteractiveShareMetadata: jest.fn(),
+    updateSessionLlmModel: jest.fn(),
   }
 }));
 
@@ -96,6 +97,15 @@ describe('AgentModeController - createSessionWithPlan', () => {
       settingKey: 'agent-mode-predefined-workplans',
       settingValue: JSON.stringify(mockWorkPlans)
     } as any);
+    
+    // Mock updateSessionLlmModel to return session with llmModel
+    mockChatbotDb.updateSessionLlmModel = jest.fn().mockImplementation((sessionId, llmModel) => {
+      return Promise.resolve({
+        ...mockSession,
+        sessionId,
+        llmModel,
+      } as any);
+    });
   });
 
   describe('User ID handling', () => {

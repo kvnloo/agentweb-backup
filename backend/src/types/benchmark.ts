@@ -29,9 +29,11 @@ export interface BenchmarkTest {
     functionCalls?: string[]; // Expected function calls
   };
   status: 'draft' | 'active' | 'archived';
+  llmModel?: string; // Selected LLM model for this test
   createdAt: string;
   updatedAt: string;
   lastRunAt?: string;
+  lastRunModel?: string; // Model used in the last run
   runCount: number;
   successCount: number;
   failureCount: number;
@@ -52,6 +54,7 @@ export interface BenchmarkTestResult {
   functionCallMisses: string[];
   executionTime: number; // milliseconds
   errorMessage?: string;
+  llmModel?: string; // Model used in this test run
   createdAt: string;
 }
 
@@ -63,6 +66,7 @@ export interface CreateBenchmarkTestRequest {
     keywords?: string[];
     functionCalls?: string[];
   };
+  llmModel?: string; // Selected LLM model for this test
 }
 
 export interface RunBenchmarkTestRequest {
