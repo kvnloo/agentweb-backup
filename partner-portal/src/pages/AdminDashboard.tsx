@@ -4129,11 +4129,13 @@ const AgentModeSettings = () => {
   const [predefinedWorkPlans, setPredefinedWorkPlans] = useState<PredefinedWorkPlan[]>([]);
   const [availableFunctionCalls, setAvailableFunctionCalls] = useState<AvailableFunctionCall[]>([]);
   const [selectedFunctionCall, setSelectedFunctionCall] = useState<Record<string, string>>({});
+  const [contentModel, setContentModel] = useState('');
   const [loading, setLoading] = useState(true);
   const [savingSystemPrompt, setSavingSystemPrompt] = useState(false);
   const [savingWelcomeMessage, setSavingWelcomeMessage] = useState(false);
   const [savingConversationStarters, setSavingConversationStarters] = useState(false);
   const [savingWorkPlans, setSavingWorkPlans] = useState(false);
+  const [savingContentModel, setSavingContentModel] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const { token } = useAuth();
@@ -4161,6 +4163,9 @@ const AgentModeSettings = () => {
       
       // Load predefined work plans
       await loadPredefinedWorkPlans();
+      
+      // Load content model
+      await loadContentModel();
     } catch (error) {
       console.error('Error loading settings:', error);
       setError('Failed to load settings');
@@ -4386,6 +4391,55 @@ const AgentModeSettings = () => {
     } catch (error) {
       console.error('Error loading predefined work plans:', error);
       setPredefinedWorkPlans([]);
+    }
+  };
+
+  const loadContentModel = async () => {
+    try {
+      try {
+        // Try to get content model from settings
+        const response = await axios.get(buildApiUrl('/api/settings/agent_mode_content_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        
+        if (response.data && response.data.settingValue) {
+          setContentModel(response.data.settingValue);
+          return;
+        }
+      } catch (settingsError: any) {
+        // If setting doesn't exist (404), use default
+        if (settingsError.response?.status !== 404) {
+          console.error('Error loading content model:', settingsError);
+        }
+      }
+      
+      // Default to gpt-5-chat-2 if no setting exists
+      setContentModel('gpt-5-chat-2');
+    } catch (error) {
+      console.error('Error loading content model:', error);
+      setContentModel('gpt-4');
+    }
+  };
+
+  const saveContentModel = async () => {
+    try {
+      setSavingContentModel(true);
+      setError('');
+      setSuccess('');
+      
+      await axios.put(buildApiUrl('/api/settings/agent_mode_content_model'), {
+        settingValue: contentModel,
+        description: 'Content model for blog article and book content generation (e.g., gpt-4, claude-sonnet-4-5 via AWS Bedrock). Note: This does not affect Agent Mode chat conversations.'
+      }, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      
+      setSuccess('Content model updated successfully!');
+    } catch (error) {
+      console.error('Error saving content model:', error);
+      setError('Failed to save content model');
+    } finally {
+      setSavingContentModel(false);
     }
   };
 
@@ -4636,6 +4690,40 @@ const AgentModeSettings = () => {
           {success}
         </Alert>
       )}
+
+      {/* Content Model for Blog/Book Generation */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">
+              Content Model (Blog & Book Generation)
+            </Typography>
+            <Button
+              variant="contained"
+              onClick={saveContentModel}
+              disabled={savingContentModel}
+            >
+              {savingContentModel ? <CircularProgress size={20} /> : 'Save Changes'}
+            </Button>
+          </Box>
+          
+          <FormControl fullWidth sx={{ mb: 2 }}>
+            <InputLabel>Content Model</InputLabel>
+            <Select
+              value={contentModel}
+              onChange={(e) => setContentModel(e.target.value)}
+              label="Content Model"
+            >
+              <MenuItem value="gpt-5-chat-2">GPT-5 Chat 2 (Azure)</MenuItem>
+              <MenuItem value="anthropic.claude-sonnet-4-5-20250929-v1:0">Claude Sonnet 4.5 (AWS Bedrock)</MenuItem>
+            </Select>
+          </FormControl>
+          
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            Select the LLM model to use for blog article and book content generation. This setting does NOT affect Agent Mode chat conversations, which use their own model configuration.
+          </Typography>
+        </CardContent>
+      </Card>
 
       {/* System Prompt */}
       <Card sx={{ mb: 3 }}>

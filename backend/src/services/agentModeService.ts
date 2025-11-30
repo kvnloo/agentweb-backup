@@ -8560,21 +8560,52 @@ ${book.language === '中文' ? '- Language: Write in Chinese (中文)' : '- Lang
 ${existingContentText ? `Existing Content (use as base and enhance/expand based on content description):
 ${existingContentText}
 
-Instructions: Use the existing content above as a foundation, and enhance or expand it based on the content description. Maintain consistency with the existing style and structure while incorporating the new requirements.` : 'Instructions: Create comprehensive, well-structured content from scratch based on the content description.'}
+Instructions: Use the existing content above as a foundation, and enhance or expand it based on the content description. Maintain consistency with the existing style and structure while incorporating the new requirements.` : 'Instructions: Create comprehensive, well-structured content from scratch based on the content description.'}`;
 
-Format the response as JSON with this structure:
-{{
-  "content": "Full content in markdown format. Do not include a title in the content (the title is already provided above). Start directly with the main content."
-}}`;
+      // Get content model from settings
+      let contentModel: string | undefined;
+      try {
+        const setting = await settingsService.getSetting('agent_mode_content_model');
+        if (setting && setting.settingValue) {
+          contentModel = setting.settingValue;
+        }
+      } catch (error) {
+        console.error('Error getting content model setting:', error);
+      }
 
       // Generate content using LangChain LLM service
       const { createLLMService } = await import('../utils/llmService');
-      const llmService = createLLMService(undefined, 0.8, 4000);
+      const modelName = contentModel || process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4';
       
-      const systemPrompt = `You are a seasoned content writer specializing in ${book.type === 'book' ? 'books' : 'white papers'}. Write naturally, avoid AI patterns, and focus on providing comprehensive, well-structured content. Always respond with valid JSON. ${book.language === '中文' ? 'Write in Chinese (中文).' : 'Write in English.'}`;
+      // Use XML format for Chinese content (more forgiving with quotes)
+      const useXMLFormat = book.language === '中文';
+      const format = useXMLFormat ? 'xml' : 'json';
+      console.log(`[generateBookContent] Using model: ${modelName}, output format: ${format.toUpperCase()}, language: ${book.language}`);
       
-      // Generate JSON content using LangChain
-      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt);
+      const llmService = createLLMService(modelName, 0.8, 4000);
+      
+      const systemPrompt = `You are a seasoned content writer specializing in ${book.type === 'book' ? 'books' : 'white papers'}. Write naturally, avoid AI patterns, and focus on providing comprehensive, well-structured content. ${book.language === '中文' ? 'Write in Chinese (中文).' : 'Write in English.'}
+
+${useXMLFormat ? `CRITICAL: You MUST respond ONLY in XML format. Do NOT use JSON format.
+
+Format your response as XML with this structure:
+<response>
+  <content>Full content in markdown format. Do not include a title in the content (the title is already provided above). Start directly with the main content.</content>
+</response>
+
+IMPORTANT: 
+- Use XML format ONLY - do not use JSON
+- XML handles quotes and special characters naturally - you do NOT need to escape quotes
+- The content can contain any Chinese characters, quotes, or special characters without escaping
+- Return ONLY the XML structure above, nothing else` : `Format your response as JSON with this structure:
+{
+  "content": "Full content in markdown format. Do not include a title in the content (the title is already provided above). Start directly with the main content."
+}
+
+IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly.`}`;
+      
+      // Generate content using LangChain with appropriate format
+      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format);
       
       // Extract content from JSON
       if (!contentData.content) {

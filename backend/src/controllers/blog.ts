@@ -262,9 +262,23 @@ ${researchContext}`;
   }
 
   try {
+    // Get content model from settings
+    const { settingsService } = await import('../services/settingsService');
+    let contentModel: string | undefined;
+    try {
+      const setting = await settingsService.getSetting('agent_mode_content_model');
+      if (setting && setting.settingValue) {
+        contentModel = setting.settingValue;
+      }
+    } catch (error) {
+      console.error('Error getting content model setting:', error);
+    }
+
     // Use LangChain LLM service with dynamic maxTokens based on article length
     const { createLLMService } = await import('../utils/llmService');
-    const llmService = createLLMService(undefined, 0.8, maxTokens);
+    const modelName = contentModel || process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4';
+    console.log(`[generateBlogContent] Using model: ${modelName}, output format: JSON`);
+    const llmService = createLLMService(modelName, 0.8, maxTokens);
     
     const systemPrompt = `You are a seasoned marketing strategist and content writer. Write naturally, avoid AI patterns, and focus on providing real value to startup founders. Never create tables - use bullet points, numbered lists, or paragraphs instead. Always respond with valid JSON. 
 

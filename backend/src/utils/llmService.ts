@@ -1,74 +1,54 @@
 import { AzureChatOpenAI } from '@langchain/openai';
+import { ChatBedrockConverse } from '@langchain/aws';
+import { BedrockRuntimeClient } from '@aws-sdk/client-bedrock-runtime';
 import { ChatPromptTemplate } from '@langchain/core/prompts';
 import { JsonOutputParser } from '@langchain/core/output_parsers';
 
-/**
- * Common LLM service for generating content using LangChain
- * Supports multiple models and providers
- */
+export type OutputFormat = 'json' | 'xml';
+
 export class LLMService {
-  private chatModel: AzureChatOpenAI;
+  private chatModel: AzureChatOpenAI | ChatBedrockConverse;
 
   constructor(modelName?: string, temperature: number = 0.8, maxTokens?: number) {
-    // Determine which model to use
     const model = modelName || process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4';
+    const isClaude = model.toLowerCase().includes('claude') || model.toLowerCase().includes('sonnet') || model.startsWith('anthropic.');
     
-    // Get the endpoint URL
-    const endpoint = process.env.AZURE_OPENAI_ENDPOINT || '';
-    const apiKey = process.env.AZURE_OPENAI_API_KEY;
-    
-    // Validate required environment variables
-    if (!apiKey) {
-      throw new Error('AZURE_OPENAI_API_KEY is not set');
-    }
-    if (!endpoint) {
-      throw new Error('AZURE_OPENAI_ENDPOINT is not set');
-    }
-    
-    // Extract instance name from endpoint (e.g., https://myinstance.openai.azure.com -> myinstance)
-    // LangChain expects just the instance name, not the full URL
-    let instanceName = '';
-    try {
-      const url = new URL(endpoint);
-      instanceName = url.hostname.replace('.openai.azure.com', '');
-    } catch (error) {
-      // Fallback to regex if URL parsing fails
-      const urlMatch = endpoint.match(/https?:\/\/([^\/]+)/);
-      if (urlMatch) {
-        instanceName = urlMatch[1].replace('.openai.azure.com', '');
+    if (isClaude) {
+      const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-west-2';
+      const bedrockClient = new BedrockRuntimeClient({
+        region,
+        credentials: process.env.AWS_ACCESS_KEY_ID ? {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
+        } : undefined,
+      });
+      
+      const modelId = model === 'anthropic.claude-sonnet-4-5-20250929-v1:0'
+        ? 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0'
+        : model;
+      
+      this.chatModel = new ChatBedrockConverse({
+        model: modelId,
+        region,
+        client: bedrockClient,
+        temperature,
+        ...(maxTokens && { maxTokens }),
+      });
+    } else {
+      const endpoint = process.env.AZURE_OPENAI_ENDPOINT || '';
+      const apiKey = process.env.AZURE_OPENAI_API_KEY;
+      if (!apiKey || !endpoint) {
+        throw new Error('AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT must be set');
       }
-    }
-    
-    if (!instanceName) {
-      throw new Error(`Could not extract instance name from AZURE_OPENAI_ENDPOINT: ${endpoint}`);
-    }
-    
-    // Configure Azure OpenAI for LangChain
-    // Use AzureChatOpenAI which accepts Azure-specific properties
-    try {
-      const config: any = {
+      const instanceName = new URL(endpoint).hostname.replace('.openai.azure.com', '');
+      this.chatModel = new AzureChatOpenAI({
         azureOpenAIApiKey: apiKey,
         azureOpenAIApiInstanceName: instanceName,
         azureOpenAIApiDeploymentName: model,
         azureOpenAIApiVersion: process.env.AZURE_OPENAI_API_VERSION || '2024-08-01-preview',
-        temperature: temperature,
-      };
-      
-      if (maxTokens) {
-        config.maxTokens = maxTokens;
-      }
-      
-      this.chatModel = new AzureChatOpenAI(config);
-    } catch (configError) {
-      console.error('LLMService: Configuration error:', {
-        error: configError,
-        endpoint,
-        instanceName,
-        model,
-        hasApiKey: !!apiKey,
-        apiKeyLength: apiKey ? apiKey.length : 0,
+        temperature,
+        ...(maxTokens && { maxTokens }),
       });
-      throw new Error(`Failed to configure Azure OpenAI: ${configError instanceof Error ? configError.message : 'Unknown configuration error'}`);
     }
   }
 
@@ -111,14 +91,34 @@ export class LLMService {
   }
 
   /**
-   * Generate JSON content with validation
-   * @param systemPrompt System prompt (should instruct to return JSON)
+   * Parse XML format response
+   */
+  private parseXML<T = any>(xmlString: string): T {
+    const result: any = {};
+    const contentMatch = xmlString.match(/<content>([\s\S]*?)<\/content>/i);
+    if (contentMatch?.[1]) {
+      result.content = contentMatch[1].trim();
+    }
+    const titleMatch = xmlString.match(/<title>([\s\S]*?)<\/title>/i);
+    if (titleMatch?.[1]) result.title = titleMatch[1].trim();
+    const descriptionMatch = xmlString.match(/<description>([\s\S]*?)<\/description>/i);
+    if (descriptionMatch?.[1]) result.description = descriptionMatch[1].trim();
+    const imagePromptMatch = xmlString.match(/<imagePrompt>([\s\S]*?)<\/imagePrompt>/i);
+    if (imagePromptMatch?.[1]) result.imagePrompt = imagePromptMatch[1].trim();
+    return result as T;
+  }
+
+  /**
+   * Generate structured content with validation
+   * @param systemPrompt System prompt
    * @param userPrompt User prompt
-   * @returns Parsed JSON object
+   * @param format Output format: 'json' (default) or 'xml'
+   * @returns Parsed content object
    */
   async generateJSONContent<T = any>(
     systemPrompt: string,
-    userPrompt: string
+    userPrompt: string,
+    format: OutputFormat = 'json'
   ): Promise<T> {
     try {
       const prompt = ChatPromptTemplate.fromMessages([
@@ -126,25 +126,34 @@ export class LLMService {
         ['user', userPrompt],
       ]);
 
-      const jsonParser = new JsonOutputParser();
-      const chain = prompt.pipe(this.chatModel).pipe(jsonParser);
+      const chain = prompt.pipe(this.chatModel);
+      const response = await chain.invoke({}) as { content: string };
+      const rawResponse = response.content;
 
-      const result = await chain.invoke({});
-      return result as T;
-    } catch (error) {
-      console.error('LLMService: Error generating JSON content:', error);
-      if (error instanceof Error) {
-        console.error('Error name:', error.name);
-        console.error('Error message:', error.message);
-        console.error('Error stack:', error.stack);
-        // Check for common Azure OpenAI configuration errors
-        if (error.message.includes('api key') || error.message.includes('API key') || error.message.includes('api-key')) {
-          throw new Error(`Azure OpenAI API key configuration error: ${error.message}`);
+      if (format === 'xml') {
+        const parsed = this.parseXML<T>(rawResponse);
+        if (parsed && (parsed as any).content) {
+          return parsed;
         }
-        if (error.message.includes('endpoint') || error.message.includes('instance')) {
-          throw new Error(`Azure OpenAI endpoint configuration error: ${error.message}`);
+        // Fallback: extract content directly if XML parsing fails
+        const contentStart = rawResponse.indexOf('<content>');
+        if (contentStart !== -1) {
+          const start = contentStart + '<content>'.length;
+          const end = rawResponse.indexOf('</content>', start);
+          const content = end !== -1 ? rawResponse.substring(start, end) : rawResponse.substring(start);
+          if (content.trim()) {
+            return { content: content.trim() } as T;
+          }
         }
+        throw new Error('Could not extract content from XML response');
       }
+
+      // JSON format
+      const jsonParser = new JsonOutputParser();
+      const jsonChain = chain.pipe(jsonParser);
+      return await jsonChain.invoke({}) as T;
+    } catch (error) {
+      console.error('LLMService: Error generating content:', error);
       throw error;
     }
   }

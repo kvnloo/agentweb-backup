@@ -407,12 +407,14 @@ export class ImageService {
       }
     });
     
-    let imageBuffer = Buffer.from(imageResponse.data as ArrayBuffer);
+    // Convert ArrayBufferLike to Buffer
+    const data = imageResponse.data as ArrayBuffer;
+    let imageBuffer: Buffer = Buffer.from(data);
     let mimeType = this.getImageMimeType(imageUrl, imageResponse.headers['content-type'] as string);
     
     // Check if it's an SVG and convert to PNG
     if (mimeType === 'image/svg+xml') {
-      imageBuffer = await this.convertSvgToPng(imageBuffer);
+      imageBuffer = await this.convertSvgToPng(imageBuffer) as Buffer;
       mimeType = 'image/png'; // After conversion, it's PNG
     }
     
