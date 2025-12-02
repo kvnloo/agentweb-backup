@@ -43,15 +43,16 @@ jest.mock('aws-sdk', () => {
   };
 });
 
-const { DynamoDB } = require('aws-sdk');
-
 describe('Market Strategy Route - Partial Update Tests', () => {
   let mockDynamoDB: any;
   let mockQuery: jest.Mock;
   let mockUpdate: jest.Mock;
+  let AWS: any;
 
   beforeEach(() => {
     jest.clearAllMocks();
+    
+    AWS = require('aws-sdk');
     
     mockQuery = jest.fn();
     mockUpdate = jest.fn();
@@ -61,7 +62,7 @@ describe('Market Strategy Route - Partial Update Tests', () => {
       update: mockUpdate,
     };
     
-    (DynamoDB.DocumentClient as jest.Mock).mockImplementation(() => mockDynamoDB);
+    (AWS.DynamoDB.DocumentClient as jest.Mock).mockImplementation(() => mockDynamoDB);
   });
 
   describe('Partial Update Logic', () => {
