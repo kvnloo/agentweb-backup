@@ -887,6 +887,45 @@ const createBenchmarkTestsTable = async () => {
   }
 };
 
+// Create GTM Plans table
+const createGTMPlansTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-GTMPlan`,
+    AttributeDefinitions: [
+      { AttributeName: 'planId', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'createdAt', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'planId', KeyType: 'HASH' }
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'UserIdIndex',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 const main = async () => {
   try {
     console.log(`Creating tables for environment: ${process.env.NODE_ENV || 'production'}`);
@@ -906,6 +945,7 @@ const main = async () => {
     await createSettingsTable();
     await createEmailEventsTable();
     await createBenchmarkTestsTable();
+    await createGTMPlansTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
