@@ -19,7 +19,7 @@ jest.mock('aws-sdk', () => {
   };
 });
 
-const { DynamoDB } = require('aws-sdk');
+const AWS = require('aws-sdk');
 
 describe('GTM Plan Route Tests', () => {
   let mockDynamoDB: any;
@@ -73,7 +73,7 @@ describe('GTM Plan Route Tests', () => {
       delete: mockDelete,
     };
     
-    (DynamoDB.DocumentClient as jest.Mock).mockImplementation(() => mockDynamoDB);
+    (AWS.DynamoDB.DocumentClient as jest.Mock).mockImplementation(() => mockDynamoDB);
   });
 
   describe('List GTM Plans (GET /)', () => {
