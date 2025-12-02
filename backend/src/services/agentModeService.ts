@@ -451,6 +451,7 @@ When updating HTML files, follow this process:
 - The 'create_task_from_prompt' tool allows you to create custom web automation tasks with specific instructions when templates don't fit
  - **Image Generation**: Use 'generate_image' for creating and revising images. This provides real-time (~30s) image generation. [DEPRECATED: 'create_image_task_from_prompt' is deprecated - use 'generate_image' instead]
  - **Image Editing Tips**: When using 'generate_image' with inputImages, you can include multiple image URLs to create combined images. For example, to add a logo to an existing image, include both the current image URL and the logo image URL in the inputImages array. The AI will combine elements from all provided images based on your prompt. This is useful for tasks like adding logos, combining multiple images, or creating composite visuals.
+ - **Video Generation**: Use 'generate_video' for creating videos. This provides real-time video generation using Veo 3.1. You can optionally provide start and end frames for interpolation between two images. The generated video will be saved and returned as an S3 URL.
  - **Blog Articles**: When creating blog articles, prefer using the 'create_blog_article' tool. It generates the article content, creates a high-quality hero image via imageService, formats the article into clean HTML, uploads it to S3, and returns the final HTML URL. Avoid ad-hoc content + image flows when this tool fits the request.
  - **Meta Ads Metrics**: Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data
 - When metrics data is loaded, provide contextual analysis based on the conversation history and user's business goals
@@ -1367,6 +1368,40 @@ Use the available tools to create tasks in the agent-engine when complex work is
       {
         type: 'function' as const,
         function: {
+          name: 'generate_video',
+          description: 'Generate videos using AI video generation models. Supports text-to-video generation and video generation with optional start and end frames for interpolation.',
+          parameters: {
+            type: 'object',
+            properties: {
+              prompt: {
+                type: 'string',
+                description: 'Detailed description of the video to generate, including style, content, motion, and visual specifications'
+              },
+              filename: {
+                type: 'string',
+                description: 'Name for the generated video file (should include .mp4 extension, will be added automatically if missing)'
+              },
+              videoModel: {
+                type: 'string',
+                description: 'Optional: Specific video generation model to use. Currently supports: veo-3.1-generate-preview (by Google). Defaults to veo-3.1-generate-preview if not specified.',
+                enum: ['veo-3.1-generate-preview']
+              },
+              startFrame: {
+                type: 'string',
+                description: 'Optional: URL of the first frame image to use as the starting point for video generation. If provided, the video will start from this frame.'
+              },
+              endFrame: {
+                type: 'string',
+                description: 'Optional: URL of the last frame image to use as the ending point for video generation. If provided, the video will end at this frame. Can be used together with startFrame for interpolation between two frames.'
+              }
+            },
+            required: ['prompt', 'filename']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
           name: 'create_blog_article',
           description: 'Create a complete blog article with content, images, and HTML file. Generates blog content using AI, creates a hero image, and produces a complete HTML file uploaded to S3.',
           parameters: {
@@ -1780,6 +1815,16 @@ Use the available tools to create tasks in the agent-engine when complex work is
       };
     }
 
+    // For video generation, return the essential fields
+    if (toolName === 'generate_video') {
+      return {
+        success: result.success,
+        message: result.message,
+        videoUrl: result.videoUrl,
+        filename: result.filename
+      };
+    }
+
     // For other tools, return empty object to minimize storage
     return {};
   }
@@ -1819,6 +1864,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
           success: true,
           message: `Mock image "${args.filename}" generated successfully!`,
           imageUrl: `data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==`,
+          filename: args.filename
+        };
+
+      case 'generate_video':
+        return {
+          success: true,
+          message: `Mock video "${args.filename}" generated successfully!`,
+          videoUrl: `https://mock-s3-bucket.s3.amazonaws.com/mock-video-${Date.now()}.mp4`,
           filename: args.filename
         };
 
@@ -2542,6 +2595,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.readFileContent(args.url);
       case 'generate_image':
         return await this.generateImage(args.prompt, args.filename, args.size || '1024x1024', args.quality || 'medium', args.inputImages || [], userId, sessionId, args.imageModel);
+      case 'generate_video':
+        return await this.generateVideo(args.prompt, args.filename, userId, sessionId, args.videoModel, args.startFrame, args.endFrame);
       case 'remove_c2pa_from_image':
         return await this.removeC2PAFromImage(args.image_url, args.filename, userId);
       case 'create_blog_article':
@@ -6308,6 +6363,93 @@ Use the available tools to create tasks in the agent-engine when complex work is
       return {
         success: false,
         message: 'Failed to generate image',
+        error: error.message
+      };
+    }
+  }
+
+  /**
+   * Generate a video using AI video generation models
+   */
+  private async generateVideo(
+    prompt: string,
+    filename: string,
+    userId: string,
+    sessionId: string,
+    videoModel?: string,
+    startFrame?: string,
+    endFrame?: string
+  ): Promise<any> {
+    try {
+      console.log('AgentMode: Generating video with prompt:', prompt, 'filename:', filename, 'videoModel:', videoModel, 'startFrame:', startFrame ? 'provided' : 'none', 'endFrame:', endFrame ? 'provided' : 'none', 'userId:', userId, 'sessionId:', sessionId);
+
+      // Import the video generation service
+      const { videoService } = await import('./videoGeneration');
+
+      // Check if the service is available
+      const isAvailable = await videoService.isAvailable();
+      if (!isAvailable) {
+        return {
+          success: false,
+          message: 'Video generation service is not available. Please check API key configuration in AWS Secrets Manager.',
+          error: 'Service unavailable'
+        };
+      }
+
+      // Generate the video
+      const result = await videoService.generateVideo({
+        prompt,
+        filename,
+        userId,
+        videoModel,
+        startFrame,
+        endFrame
+      });
+
+      if (result.success && result.videoUrl) {
+        // Save the video URL to the session for reference
+        const videoData = {
+          url: result.videoUrl,
+          filename: result.filename,
+          generatedAt: new Date().toISOString(),
+          prompt: prompt,
+          model: videoModel || 'veo-3.1-generate-preview'
+        };
+
+        // Store video data in session metadata (optional)
+        try {
+          await chatbotDb.addMessageToSession(sessionId, {
+            role: 'system',
+            content: `Video generated: ${result.filename}`,
+            metadata: {
+              timestamp: new Date().toISOString()
+            }
+          });
+        } catch (error) {
+          console.warn('Failed to store video generation metadata:', error);
+        }
+
+        return {
+          success: true,
+          message: `✅ Video "${result.filename}" generated successfully!`,
+          videoUrl: result.videoUrl,
+          filename: result.filename,
+          prompt: prompt,
+          model: videoModel || 'veo-3.1-generate-preview'
+        };
+      } else {
+        return {
+          success: false,
+          message: result.error || 'Failed to generate video',
+          error: result.error
+        };
+      }
+
+    } catch (error: any) {
+      console.error('AgentMode: Error generating video:', error);
+      return {
+        success: false,
+        message: 'Failed to generate video',
         error: error.message
       };
     }
