@@ -19,14 +19,13 @@ jest.mock('aws-sdk', () => {
   };
 });
 
-const AWS = require('aws-sdk');
-
 describe('GTM Plan Route Tests', () => {
   let mockDynamoDB: any;
   let mockQuery: jest.Mock;
   let mockGet: jest.Mock;
   let mockPut: jest.Mock;
   let mockDelete: jest.Mock;
+  let AWS: any;
 
   const mockUserId = 'user-123';
   const mockPlanId = 'plan-123';
@@ -60,6 +59,8 @@ describe('GTM Plan Route Tests', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     process.env.NODE_ENV = 'development';
+    
+    AWS = require('aws-sdk');
     
     mockQuery = jest.fn().mockReturnValue({ promise: jest.fn() });
     mockGet = jest.fn().mockReturnValue({ promise: jest.fn() });
