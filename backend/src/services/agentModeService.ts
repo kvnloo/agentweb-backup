@@ -509,6 +509,20 @@ You can create and manage multi-step work plans using these tools:
 
 Work plans help organize complex multi-step projects like client onboarding, campaign planning, or content creation workflows. The current work plan status (if any) is automatically provided in your context. **If you see a work plan in your context, you MUST continue working with that existing plan - never create a duplicate.**
 
+## GTM Plan Capabilities
+You can read and create Go-To-Market (GTM) plans using these tools:
+- **list_gtm_plans**: List all GTM plans for the user. Returns plan IDs, titles, descriptions, phase counts, and creation dates.
+- **read_gtm_plan**: Read a specific GTM plan by its plan ID. Returns complete plan details including all phases and work items with their statuses, durations, and completion times.
+- **create_gtm_plan**: Create a new GTM plan with a title, optional description, and optional phases with work items. You can create a complete plan structure in one call by including phases (each with title, description, duration) and work items (each with title, optional description, optional duration) within each phase. Returns the created plan with its unique identifier.
+
+**IMPORTANT RESTRICTIONS:**
+- **You CANNOT modify existing GTM plans** - You can only read existing plans and create new ones.
+- **You CANNOT update work item statuses** - You cannot mark work items as completed, skipped, or pending.
+- **You CANNOT add phases or work items to existing plans** - You cannot modify the structure of an existing GTM plan.
+- **To modify plans**: Users must go to the /gtm-plan page in the customer portal to manually add phases, work items, update statuses, and make other changes.
+
+Use GTM plans to understand the user's go-to-market strategy and provide context-aware assistance. When a user asks about their GTM plan, use read_gtm_plan to get the current state and provide insights based on the plan structure and progress. When creating a GTM plan, you can include the complete structure with phases and work items in a single call.
+
 ### Required Function Calls
 You can specify required function calls for any step to ensure proper validation:
 - Add requiredFunctionCalls array when creating or modifying steps
@@ -1154,6 +1168,100 @@ Use the available tools to create tasks in the agent-engine when complex work is
               }
             },
             required: ['file_name', 'file_content']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'list_gtm_plans',
+          description: 'List all Go-To-Market (GTM) plans for the current user. Returns a list of plans with their IDs, titles, descriptions, phase counts, and creation dates.',
+          parameters: {
+            type: 'object',
+            properties: {},
+            required: []
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'read_gtm_plan',
+          description: 'Read a specific GTM plan by its plan ID. Returns the complete plan details including all phases and work items with their statuses, durations, and completion times.',
+          parameters: {
+            type: 'object',
+            properties: {
+              plan_id: {
+                type: 'string',
+                description: 'The unique identifier (planId) of the GTM plan to read'
+              }
+            },
+            required: ['plan_id']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'create_gtm_plan',
+          description: 'Create a new Go-To-Market (GTM) plan with a title, optional description, and optional phases with work items. Each phase can have multiple work items. Returns the created plan with its unique identifier.',
+          parameters: {
+            type: 'object',
+            properties: {
+              title: {
+                type: 'string',
+                description: 'The title of the GTM plan (e.g., "Q1 2024 Launch Plan")'
+              },
+              description: {
+                type: 'string',
+                description: 'Optional description of the GTM plan'
+              },
+              phases: {
+                type: 'array',
+                description: 'Optional array of phases to include in the plan. Each phase should have a title, description, duration (in days), and workItems array.',
+                items: {
+                  type: 'object',
+                  properties: {
+                    title: {
+                      type: 'string',
+                      description: 'The title of the phase (e.g., "Pre-Launch", "Launch", "Post-Launch")'
+                    },
+                    description: {
+                      type: 'string',
+                      description: 'Optional description of the phase'
+                    },
+                    duration: {
+                      type: 'number',
+                      description: 'Duration of the phase in days'
+                    },
+                    workItems: {
+                      type: 'array',
+                      description: 'Array of work items for this phase',
+                      items: {
+                        type: 'object',
+                        properties: {
+                          title: {
+                            type: 'string',
+                            description: 'Title of the work item'
+                          },
+                          description: {
+                            type: 'string',
+                            description: 'Optional description of the work item'
+                          },
+                          duration: {
+                            type: 'number',
+                            description: 'Optional duration of the work item in days'
+                          }
+                        },
+                        required: ['title']
+                      }
+                    }
+                  },
+                  required: ['title', 'duration']
+                }
+              }
+            },
+            required: ['title']
           }
         }
       },
@@ -1983,6 +2091,31 @@ Use the available tools to create tasks in the agent-engine when complex work is
           totalFiles: 2
         };
 
+      case 'list_gtm_plans':
+        return {
+          success: true,
+          message: 'Found 2 mock GTM plan(s)',
+          plans: [
+            {
+              planId: 'mock-plan-1',
+              title: 'Mock Q1 2024 Launch Plan',
+              description: 'Mock GTM plan for testing',
+              phaseCount: 3,
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString()
+            },
+            {
+              planId: 'mock-plan-2',
+              title: 'Mock Product Launch Plan',
+              description: 'Another mock GTM plan',
+              phaseCount: 2,
+              createdAt: new Date(Date.now() - 86400000).toISOString(),
+              updatedAt: new Date(Date.now() - 86400000).toISOString()
+            }
+          ],
+          totalPlans: 2
+        };
+
       case 'read_knowledge_base_file':
         return {
           success: true,
@@ -1993,6 +2126,71 @@ Use the available tools to create tasks in the agent-engine when complex work is
           size: 1024,
           type: 'private',
           updatedAt: new Date().toISOString()
+        };
+      case 'read_gtm_plan':
+        return {
+          success: true,
+          message: `Successfully read GTM plan "Mock Q1 2024 Launch Plan"`,
+          exists: true,
+          plan: {
+            planId: args.plan_id || 'mock-plan-1',
+            title: 'Mock Q1 2024 Launch Plan',
+            description: 'Mock GTM plan for testing',
+            phases: [
+              {
+                id: 'phase-1',
+                title: 'Pre-Launch',
+                description: 'Pre-launch activities',
+                duration: 30,
+                status: 'in_progress',
+                workItems: [
+                  {
+                    id: 'item-1',
+                    title: 'Create landing page',
+                    description: 'Design and develop landing page',
+                    duration: 5,
+                    status: 'completed',
+                    completedAt: new Date(Date.now() - 86400000).toISOString()
+                  }
+                ]
+              }
+            ],
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+          },
+          formattedContent: `GTM Plan: Mock Q1 2024 Launch Plan\nDescription: Mock GTM plan for testing\nCreated: ${new Date().toISOString()}\n\nPhases (1):\n\nPhase 1: Pre-Launch\n  Description: Pre-launch activities\n  Duration: 30 day(s)\n  Status: in_progress\n  Work Items (1):\n    1. Create landing page [completed] - 5 day(s) - Completed: ${new Date(Date.now() - 86400000).toISOString()}\n       Design and develop landing page\n\n`
+        };
+      case 'create_gtm_plan':
+        const mockPhases = args.phases || [
+          {
+            id: 'mock-phase-1',
+            title: 'Pre-Launch',
+            description: 'Pre-launch activities',
+            duration: 30,
+            status: 'in_progress',
+            workItems: [
+              {
+                id: 'mock-item-1',
+                title: 'Create landing page',
+                description: 'Design and develop landing page',
+                duration: 5,
+                status: 'pending'
+              }
+            ]
+          }
+        ];
+        return {
+          success: true,
+          message: `GTM plan "${args.title || 'Mock Plan'}" created successfully with ${mockPhases.length} phase(s)`,
+          plan: {
+            planId: `mock-plan-${Date.now()}`,
+            title: args.title || 'Mock Plan',
+            description: args.description || '',
+            phaseCount: mockPhases.length,
+            phases: mockPhases,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+          }
         };
 
       case 'read_brand_guidelines':
@@ -2442,6 +2640,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.modifyWorkPlan(args.steps, args.removeStepCounts || [], sessionId);
       case 'set_work_plan_status':
         return await this.setWorkPlanStatus(args.updates, sessionId);
+      case 'list_gtm_plans':
+        return await this.listGTMPlans(userId);
+      case 'read_gtm_plan':
+        return await this.readGTMPlan(args.plan_id, userId);
+      case 'create_gtm_plan':
+        return await this.createGTMPlan(args.title, args.description || '', args.phases || [], userId);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -3068,6 +3272,258 @@ Use the available tools to create tasks in the agent-engine when complex work is
       return {
         success: false,
         message: 'Failed to update market strategy',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // List all GTM plans for user
+  private async listGTMPlans(userId: string): Promise<any> {
+    try {
+      const { DynamoDB } = await import('aws-sdk');
+      const dynamodb = new DynamoDB.DocumentClient({
+        region: process.env.AWS_REGION || "us-west-2",
+        ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+          credentials: {
+            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          },
+        }),
+      });
+
+      const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+      const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+      const result = await dynamodb
+        .query({
+          TableName: TABLE_NAME,
+          IndexName: "UserIdIndex",
+          KeyConditionExpression: "userId = :userId",
+          ExpressionAttributeValues: {
+            ":userId": userId,
+          },
+          ScanIndexForward: false, // Sort by createdAt descending (newest first)
+        })
+        .promise();
+
+      const plans = result.Items || [];
+
+      return {
+        success: true,
+        message: `Found ${plans.length} GTM plan(s)`,
+        plans: plans.map((plan: any) => ({
+          planId: plan.planId,
+          title: plan.title,
+          description: plan.description || '',
+          phaseCount: plan.phases?.length || 0,
+          createdAt: plan.createdAt,
+          updatedAt: plan.updatedAt,
+        })),
+        totalPlans: plans.length
+      };
+    } catch (error) {
+      console.error('AgentMode: Error listing GTM plans:', error);
+      return {
+        success: false,
+        message: 'Failed to list GTM plans',
+        error: error instanceof Error ? error.message : 'Unknown error',
+        plans: [],
+        totalPlans: 0
+      };
+    }
+  }
+
+  // Read a specific GTM plan
+  private async readGTMPlan(planId: string, userId: string): Promise<any> {
+    try {
+      const { DynamoDB } = await import('aws-sdk');
+      const dynamodb = new DynamoDB.DocumentClient({
+        region: process.env.AWS_REGION || "us-west-2",
+        ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+          credentials: {
+            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          },
+        }),
+      });
+
+      const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+      const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+      const result = await dynamodb
+        .get({
+          TableName: TABLE_NAME,
+          Key: {
+            planId: planId,
+          },
+        })
+        .promise();
+
+      if (!result.Item) {
+        return {
+          success: false,
+          message: 'GTM plan not found',
+          exists: false,
+          error: 'GTM plan not found'
+        };
+      }
+
+      // Verify the plan belongs to the user
+      if (result.Item.userId !== userId) {
+        return {
+          success: false,
+          message: 'Access denied',
+          exists: false,
+          error: 'Access denied'
+        };
+      }
+
+      const plan = result.Item;
+
+      // Format the plan for LLM consumption
+      let formattedContent = `GTM Plan: ${plan.title}\n`;
+      if (plan.description) {
+        formattedContent += `Description: ${plan.description}\n`;
+      }
+      formattedContent += `Created: ${plan.createdAt}\n`;
+      formattedContent += `Updated: ${plan.updatedAt}\n\n`;
+      formattedContent += `Phases (${plan.phases?.length || 0}):\n\n`;
+
+      if (plan.phases && plan.phases.length > 0) {
+        plan.phases.forEach((phase: any, index: number) => {
+          formattedContent += `Phase ${index + 1}: ${phase.title}\n`;
+          if (phase.description) {
+            formattedContent += `  Description: ${phase.description}\n`;
+          }
+          formattedContent += `  Duration: ${phase.duration} day(s)\n`;
+          formattedContent += `  Status: ${phase.status}\n`;
+          formattedContent += `  Work Items (${phase.workItems?.length || 0}):\n`;
+
+          if (phase.workItems && phase.workItems.length > 0) {
+            phase.workItems.forEach((item: any, itemIndex: number) => {
+              formattedContent += `    ${itemIndex + 1}. ${item.title} [${item.status}]`;
+              if (item.duration !== undefined) {
+                formattedContent += ` - ${item.duration} day(s)`;
+              }
+              if (item.completedAt) {
+                formattedContent += ` - Completed: ${item.completedAt}`;
+              }
+              formattedContent += `\n`;
+              if (item.description) {
+                formattedContent += `       ${item.description}\n`;
+              }
+              if (item.note) {
+                formattedContent += `       Note: ${item.note}\n`;
+              }
+            });
+          }
+          formattedContent += `\n`;
+        });
+      } else {
+        formattedContent += `No phases yet.\n`;
+      }
+
+      return {
+        success: true,
+        message: `GTM plan "${plan.title}" retrieved successfully`,
+        exists: true,
+        plan: plan,
+        formattedContent
+      };
+    } catch (error) {
+      console.error('AgentMode: Error reading GTM plan:', error);
+      return {
+        success: false,
+        message: 'Failed to read GTM plan',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // Create a new GTM plan
+  private async createGTMPlan(title: string, description: string, phases: any[], userId: string): Promise<any> {
+    try {
+      const { DynamoDB } = await import('aws-sdk');
+      const dynamodb = new DynamoDB.DocumentClient({
+        region: process.env.AWS_REGION || "us-west-2",
+        ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+          credentials: {
+            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          },
+        }),
+      });
+
+      const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+      const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+      const planId = `plan-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
+      const now = new Date().toISOString();
+
+      // Process phases and work items
+      const processedPhases = (phases || []).map((phase: any, phaseIndex: number) => {
+        const phaseId = `phase-${Date.now()}-${phaseIndex}-${Math.random().toString(36).substring(2, 11)}`;
+        
+        // Process work items for this phase
+        const processedWorkItems = (phase.workItems || []).map((item: any, itemIndex: number) => ({
+          id: `workitem-${Date.now()}-${phaseIndex}-${itemIndex}-${Math.random().toString(36).substring(2, 11)}`,
+          title: item.title,
+          description: item.description || "",
+          duration: item.duration !== undefined ? item.duration : undefined,
+          status: "pending" as const,
+        }));
+
+        // Determine phase status based on work items
+        const hasWorkItems = processedWorkItems.length > 0;
+        const allItemsDone = hasWorkItems && processedWorkItems.every(
+          (item: any) => item.status === "completed" || item.status === "skipped"
+        );
+
+        return {
+          id: phaseId,
+          title: phase.title,
+          description: phase.description || "",
+          duration: phase.duration || 1,
+          status: allItemsDone ? "completed" : "in_progress" as const,
+          workItems: processedWorkItems,
+        };
+      });
+
+      const newPlan = {
+        planId,
+        userId,
+        title,
+        description: description || "",
+        phases: processedPhases,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      const params = {
+        TableName: TABLE_NAME,
+        Item: newPlan,
+      };
+
+      await dynamodb.put(params).promise();
+
+      return {
+        success: true,
+        message: `GTM plan "${title}" created successfully with ${processedPhases.length} phase(s)`,
+        plan: {
+          planId: newPlan.planId,
+          title: newPlan.title,
+          description: newPlan.description,
+          phaseCount: processedPhases.length,
+          phases: processedPhases,
+          createdAt: newPlan.createdAt,
+          updatedAt: newPlan.updatedAt,
+        }
+      };
+    } catch (error) {
+      console.error('AgentMode: Error creating GTM plan:', error);
+      return {
+        success: false,
+        message: 'Failed to create GTM plan',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
