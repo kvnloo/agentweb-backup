@@ -7,6 +7,19 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-01',
+    changes: [
+      'Added GTM Plan Management Feature',
+      '- New GTM Plan page in Customer Portal for creating and managing Go-To-Market plans',
+      '- Plans can contain multiple phases, each with a title, description, duration, and work items',
+      '- Work items support optional duration, status tracking (pending, completed, skipped), and notes',
+      'Added GTM Plan Support in Agent Mode',
+      '- Emma can now list all GTM plans using list_gtm_plans function',
+      '- Emma can read specific GTM plans with full details using read_gtm_plan function',
+      '- Emma can create new GTM plans with phases and work items using create_gtm_plan function',
+    ],
+  },
+  {
     date: '2025-11-28',
     changes: [
       'Supported Multiple LLM Models for Agent Mode',
