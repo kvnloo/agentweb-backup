@@ -13,6 +13,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Users can now upload images directly to Agent Mode sessions using the "Upload directly" option',
       '- Uploaded images are stored in session metadata and displayed in the chat interface',
       '- Images uploaded directly to Agent Mode sessions are now displayed on the Ad Images page alongside generated images',
+      'Fixed Brand Guidelines Primary Color End Saving',
+      '- Fixed bug where primaryColorEnd was not being saved to the database when updating brand colors in Brand Guidelines page',
     ],
   },
   {

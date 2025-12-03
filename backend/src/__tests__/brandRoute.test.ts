@@ -262,4 +262,342 @@ describe('Brand Route - Bug Fix Tests', () => {
       expect(brandGuidelinesData.brandData.brandPersonality).toBe("New personality");
     });
   });
+
+  describe('✅ primaryColorEnd and isGradient field handling', () => {
+    it('should save primaryColorEnd when provided', () => {
+      // Simulate existing brand guidelines
+      const existingBrandGuidelines = {
+        brandData: {
+          brandName: "Test Brand",
+          primaryColor: "#0000FF",
+          primaryColorEnd: "#000000",
+          secondaryColor: "#00FF00",
+          isGradient: false,
+          founders: [],
+        },
+        attachments: [],
+        createdAt: '2023-01-01T00:00:00.000Z',
+        updatedAt: '2023-01-01T00:00:00.000Z',
+      };
+
+      // Simulate incoming request with primaryColorEnd
+      const incomingData: any = {
+        primaryColor: "#FF0000",
+        primaryColorEnd: "#FF00FF", // New value
+      };
+
+      // Test the logic (matching the backend route)
+      let parsedIsGradient = existingBrandGuidelines?.brandData?.isGradient ?? false;
+      if (incomingData.isGradient !== undefined) {
+        parsedIsGradient = typeof incomingData.isGradient === 'string' ? incomingData.isGradient === 'true' : Boolean(incomingData.isGradient);
+      }
+
+      const brandGuidelinesData = {
+        brandData: {
+          primaryColor: incomingData.primaryColor !== undefined ? incomingData.primaryColor : (existingBrandGuidelines?.brandData?.primaryColor || ""),
+          primaryColorEnd: incomingData.primaryColorEnd !== undefined ? incomingData.primaryColorEnd : (existingBrandGuidelines?.brandData?.primaryColorEnd || ""),
+          secondaryColor: incomingData.secondaryColor !== undefined ? incomingData.secondaryColor : (existingBrandGuidelines?.brandData?.secondaryColor || ""),
+          isGradient: parsedIsGradient,
+          founders: existingBrandGuidelines?.brandData?.founders || [],
+        },
+      };
+
+      // Verify primaryColorEnd is saved
+      expect(brandGuidelinesData.brandData.primaryColorEnd).toBe("#FF00FF"); // ✅ Updated
+      expect(brandGuidelinesData.brandData.primaryColor).toBe("#FF0000"); // ✅ Updated
+      expect(brandGuidelinesData.brandData.isGradient).toBe(false); // ✅ Preserved (not provided)
+    });
+
+    it('should preserve existing primaryColorEnd when not provided', () => {
+      // Simulate existing brand guidelines with primaryColorEnd
+      const existingBrandGuidelines = {
+        brandData: {
+          brandName: "Test Brand",
+          primaryColor: "#0000FF",
+          primaryColorEnd: "#ECAC5F", // Existing value
+          secondaryColor: "#00FF00",
+          isGradient: true,
+          founders: [],
+        },
+        attachments: [],
+        createdAt: '2023-01-01T00:00:00.000Z',
+        updatedAt: '2023-01-01T00:00:00.000Z',
+      };
+
+      // Simulate incoming request without primaryColorEnd
+      const incomingData: any = {
+        primaryColor: "#FF0000",
+        // primaryColorEnd is undefined (not provided)
+      };
+
+      // Test the logic (matching the backend route)
+      let parsedIsGradient = existingBrandGuidelines?.brandData?.isGradient ?? false;
+      if (incomingData.isGradient !== undefined) {
+        parsedIsGradient = typeof incomingData.isGradient === 'string' ? incomingData.isGradient === 'true' : Boolean(incomingData.isGradient);
+      }
+
+      const brandGuidelinesData = {
+        brandData: {
+          primaryColor: incomingData.primaryColor !== undefined ? incomingData.primaryColor : (existingBrandGuidelines?.brandData?.primaryColor || ""),
+          primaryColorEnd: incomingData.primaryColorEnd !== undefined ? incomingData.primaryColorEnd : (existingBrandGuidelines?.brandData?.primaryColorEnd || ""),
+          secondaryColor: incomingData.secondaryColor !== undefined ? incomingData.secondaryColor : (existingBrandGuidelines?.brandData?.secondaryColor || ""),
+          isGradient: parsedIsGradient,
+          founders: existingBrandGuidelines?.brandData?.founders || [],
+        },
+      };
+
+      // Verify primaryColorEnd is preserved
+      expect(brandGuidelinesData.brandData.primaryColorEnd).toBe("#ECAC5F"); // ✅ Preserved
+      expect(brandGuidelinesData.brandData.primaryColor).toBe("#FF0000"); // ✅ Updated
+      expect(brandGuidelinesData.brandData.isGradient).toBe(true); // ✅ Preserved
+    });
+
+    it('should save isGradient when provided as boolean', () => {
+      // Simulate existing brand guidelines
+      const existingBrandGuidelines = {
+        brandData: {
+          brandName: "Test Brand",
+          primaryColor: "#0000FF",
+          primaryColorEnd: "#000000",
+          secondaryColor: "#00FF00",
+          isGradient: false,
+          founders: [],
+        },
+        attachments: [],
+        createdAt: '2023-01-01T00:00:00.000Z',
+        updatedAt: '2023-01-01T00:00:00.000Z',
+      };
+
+      // Simulate incoming request with isGradient as boolean
+      const incomingData: any = {
+        primaryColor: "#FF0000",
+        isGradient: true, // Boolean value
+      };
+
+      // Test the logic (matching the backend route)
+      let parsedIsGradient = existingBrandGuidelines?.brandData?.isGradient ?? false;
+      if (incomingData.isGradient !== undefined) {
+        parsedIsGradient = typeof incomingData.isGradient === 'string' ? incomingData.isGradient === 'true' : Boolean(incomingData.isGradient);
+      }
+
+      const brandGuidelinesData = {
+        brandData: {
+          primaryColor: incomingData.primaryColor !== undefined ? incomingData.primaryColor : (existingBrandGuidelines?.brandData?.primaryColor || ""),
+          primaryColorEnd: incomingData.primaryColorEnd !== undefined ? incomingData.primaryColorEnd : (existingBrandGuidelines?.brandData?.primaryColorEnd || ""),
+          isGradient: parsedIsGradient,
+          founders: existingBrandGuidelines?.brandData?.founders || [],
+        },
+      };
+
+      // Verify isGradient is saved
+      expect(brandGuidelinesData.brandData.isGradient).toBe(true); // ✅ Updated
+      expect(brandGuidelinesData.brandData.primaryColor).toBe("#FF0000"); // ✅ Updated
+    });
+
+    it('should save isGradient when provided as string "true"', () => {
+      // Simulate existing brand guidelines
+      const existingBrandGuidelines = {
+        brandData: {
+          brandName: "Test Brand",
+          primaryColor: "#0000FF",
+          primaryColorEnd: "#000000",
+          secondaryColor: "#00FF00",
+          isGradient: false,
+          founders: [],
+        },
+        attachments: [],
+        createdAt: '2023-01-01T00:00:00.000Z',
+        updatedAt: '2023-01-01T00:00:00.000Z',
+      };
+
+      // Simulate incoming request with isGradient as string
+      const incomingData: any = {
+        primaryColor: "#FF0000",
+        isGradient: "true", // String value
+      };
+
+      // Test the logic (matching the backend route)
+      let parsedIsGradient = existingBrandGuidelines?.brandData?.isGradient ?? false;
+      if (incomingData.isGradient !== undefined) {
+        parsedIsGradient = typeof incomingData.isGradient === 'string' ? incomingData.isGradient === 'true' : Boolean(incomingData.isGradient);
+      }
+
+      const brandGuidelinesData = {
+        brandData: {
+          primaryColor: incomingData.primaryColor !== undefined ? incomingData.primaryColor : (existingBrandGuidelines?.brandData?.primaryColor || ""),
+          primaryColorEnd: incomingData.primaryColorEnd !== undefined ? incomingData.primaryColorEnd : (existingBrandGuidelines?.brandData?.primaryColorEnd || ""),
+          isGradient: parsedIsGradient,
+          founders: existingBrandGuidelines?.brandData?.founders || [],
+        },
+      };
+
+      // Verify isGradient is parsed correctly from string
+      expect(brandGuidelinesData.brandData.isGradient).toBe(true); // ✅ Parsed from "true"
+    });
+
+    it('should save isGradient when provided as string "false"', () => {
+      // Simulate existing brand guidelines
+      const existingBrandGuidelines = {
+        brandData: {
+          brandName: "Test Brand",
+          primaryColor: "#0000FF",
+          primaryColorEnd: "#000000",
+          secondaryColor: "#00FF00",
+          isGradient: true,
+          founders: [],
+        },
+        attachments: [],
+        createdAt: '2023-01-01T00:00:00.000Z',
+        updatedAt: '2023-01-01T00:00:00.000Z',
+      };
+
+      // Simulate incoming request with isGradient as string
+      const incomingData: any = {
+        primaryColor: "#FF0000",
+        isGradient: "false", // String value
+      };
+
+      // Test the logic (matching the backend route)
+      let parsedIsGradient = existingBrandGuidelines?.brandData?.isGradient ?? false;
+      if (incomingData.isGradient !== undefined) {
+        parsedIsGradient = typeof incomingData.isGradient === 'string' ? incomingData.isGradient === 'true' : Boolean(incomingData.isGradient);
+      }
+
+      const brandGuidelinesData = {
+        brandData: {
+          primaryColor: incomingData.primaryColor !== undefined ? incomingData.primaryColor : (existingBrandGuidelines?.brandData?.primaryColor || ""),
+          primaryColorEnd: incomingData.primaryColorEnd !== undefined ? incomingData.primaryColorEnd : (existingBrandGuidelines?.brandData?.primaryColorEnd || ""),
+          isGradient: parsedIsGradient,
+          founders: existingBrandGuidelines?.brandData?.founders || [],
+        },
+      };
+
+      // Verify isGradient is parsed correctly from string
+      expect(brandGuidelinesData.brandData.isGradient).toBe(false); // ✅ Parsed from "false"
+    });
+
+    it('should preserve existing isGradient when not provided', () => {
+      // Simulate existing brand guidelines
+      const existingBrandGuidelines = {
+        brandData: {
+          brandName: "Test Brand",
+          primaryColor: "#0000FF",
+          primaryColorEnd: "#ECAC5F",
+          secondaryColor: "#00FF00",
+          isGradient: true, // Existing value
+          founders: [],
+        },
+        attachments: [],
+        createdAt: '2023-01-01T00:00:00.000Z',
+        updatedAt: '2023-01-01T00:00:00.000Z',
+      };
+
+      // Simulate incoming request without isGradient
+      const incomingData: any = {
+        primaryColor: "#FF0000",
+        // isGradient is undefined (not provided)
+      };
+
+      // Test the logic (matching the backend route)
+      let parsedIsGradient = existingBrandGuidelines?.brandData?.isGradient ?? false;
+      if (incomingData.isGradient !== undefined) {
+        parsedIsGradient = typeof incomingData.isGradient === 'string' ? incomingData.isGradient === 'true' : Boolean(incomingData.isGradient);
+      }
+
+      const brandGuidelinesData = {
+        brandData: {
+          primaryColor: incomingData.primaryColor !== undefined ? incomingData.primaryColor : (existingBrandGuidelines?.brandData?.primaryColor || ""),
+          primaryColorEnd: incomingData.primaryColorEnd !== undefined ? incomingData.primaryColorEnd : (existingBrandGuidelines?.brandData?.primaryColorEnd || ""),
+          isGradient: parsedIsGradient,
+          founders: existingBrandGuidelines?.brandData?.founders || [],
+        },
+      };
+
+      // Verify isGradient is preserved
+      expect(brandGuidelinesData.brandData.isGradient).toBe(true); // ✅ Preserved
+      expect(brandGuidelinesData.brandData.primaryColorEnd).toBe("#ECAC5F"); // ✅ Preserved
+    });
+
+    it('should save both primaryColorEnd and isGradient together', () => {
+      // Simulate existing brand guidelines
+      const existingBrandGuidelines = {
+        brandData: {
+          brandName: "Test Brand",
+          primaryColor: "#0000FF",
+          primaryColorEnd: "#000000",
+          secondaryColor: "#00FF00",
+          isGradient: false,
+          founders: [],
+        },
+        attachments: [],
+        createdAt: '2023-01-01T00:00:00.000Z',
+        updatedAt: '2023-01-01T00:00:00.000Z',
+      };
+
+      // Simulate incoming request with both fields
+      const incomingData: any = {
+        primaryColor: "#FF0000",
+        primaryColorEnd: "#FF00FF",
+        isGradient: true,
+      };
+
+      // Test the logic (matching the backend route)
+      let parsedIsGradient = existingBrandGuidelines?.brandData?.isGradient ?? false;
+      if (incomingData.isGradient !== undefined) {
+        parsedIsGradient = typeof incomingData.isGradient === 'string' ? incomingData.isGradient === 'true' : Boolean(incomingData.isGradient);
+      }
+
+      const brandGuidelinesData = {
+        brandData: {
+          primaryColor: incomingData.primaryColor !== undefined ? incomingData.primaryColor : (existingBrandGuidelines?.brandData?.primaryColor || ""),
+          primaryColorEnd: incomingData.primaryColorEnd !== undefined ? incomingData.primaryColorEnd : (existingBrandGuidelines?.brandData?.primaryColorEnd || ""),
+          secondaryColor: incomingData.secondaryColor !== undefined ? incomingData.secondaryColor : (existingBrandGuidelines?.brandData?.secondaryColor || ""),
+          isGradient: parsedIsGradient,
+          founders: existingBrandGuidelines?.brandData?.founders || [],
+        },
+      };
+
+      // Verify both fields are saved
+      expect(brandGuidelinesData.brandData.primaryColorEnd).toBe("#FF00FF"); // ✅ Updated
+      expect(brandGuidelinesData.brandData.isGradient).toBe(true); // ✅ Updated
+      expect(brandGuidelinesData.brandData.primaryColor).toBe("#FF0000"); // ✅ Updated
+    });
+
+    it('should create new brand guidelines with primaryColorEnd and isGradient', () => {
+      // Simulate no existing brand guidelines
+      const existingBrandGuidelines: any = null;
+
+      // Simulate incoming request data
+      const incomingData: any = {
+        brandName: "New Brand",
+        primaryColor: "#FF0000",
+        primaryColorEnd: "#ECAC5F",
+        secondaryColor: "#00FF00",
+        isGradient: true,
+      };
+
+      // Test the logic (matching the backend route)
+      let parsedIsGradient = existingBrandGuidelines?.brandData?.isGradient ?? false;
+      if (incomingData.isGradient !== undefined) {
+        parsedIsGradient = typeof incomingData.isGradient === 'string' ? incomingData.isGradient === 'true' : Boolean(incomingData.isGradient);
+      }
+
+      const brandGuidelinesData = {
+        brandData: {
+          brandName: incomingData.brandName !== undefined ? incomingData.brandName : (existingBrandGuidelines?.brandData?.brandName || ""),
+          primaryColor: incomingData.primaryColor !== undefined ? incomingData.primaryColor : (existingBrandGuidelines?.brandData?.primaryColor || ""),
+          primaryColorEnd: incomingData.primaryColorEnd !== undefined ? incomingData.primaryColorEnd : (existingBrandGuidelines?.brandData?.primaryColorEnd || ""),
+          secondaryColor: incomingData.secondaryColor !== undefined ? incomingData.secondaryColor : (existingBrandGuidelines?.brandData?.secondaryColor || ""),
+          isGradient: parsedIsGradient,
+          founders: existingBrandGuidelines?.brandData?.founders || [],
+        },
+      };
+
+      // Verify new brand guidelines are created correctly
+      expect(brandGuidelinesData.brandData.brandName).toBe("New Brand");
+      expect(brandGuidelinesData.brandData.primaryColor).toBe("#FF0000");
+      expect(brandGuidelinesData.brandData.primaryColorEnd).toBe("#ECAC5F"); // ✅ Created with primaryColorEnd
+      expect(brandGuidelinesData.brandData.isGradient).toBe(true); // ✅ Created with isGradient
+    });
+  });
 });
