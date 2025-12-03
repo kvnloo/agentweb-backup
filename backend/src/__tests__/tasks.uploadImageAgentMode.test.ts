@@ -52,12 +52,9 @@ describe('Tasks Route - getExecutionsWithAssets with upload_image', () => {
 
     mockChatbotDb.getUserSessions.mockResolvedValue(mockSessions as any);
 
-    // Import the function dynamically to test it
-    const { getExecutionsWithAssets } = await import('../routes/tasks');
-    
-    // Since getExecutionsWithAssets is not exported, we need to test it indirectly
-    // through the route handler. For now, let's verify the session structure
-    // matches what the function expects.
+    // Note: getExecutionsWithAssets is not exported, so we test it indirectly
+    // by verifying the session structure matches what the function expects.
+    // The actual function is tested through integration tests via the route handlers.
     
     const session = mockSessions[0];
     const message = session.messages[0];

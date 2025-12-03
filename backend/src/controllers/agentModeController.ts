@@ -1563,7 +1563,9 @@ export const agentModeController = {
           timestamp: new Date().toISOString(),
           toolCalls: [
             {
+              id: uuidv4(),
               name: 'upload_image',
+              arguments: {},
               result: {
                 success: true,
                 imageUrl: uploadResult.url,
