@@ -53,6 +53,8 @@ import {
   ExecutionTrendsChart,
   ExecutionStatusChart,
   UserTypeChart,
+  AgentModeSessionGrowthChart,
+  AgentModeSessionTypesChart,
 } from "../components/admin/AdminCharts";
 import {
   Info as InfoIcon,
@@ -576,6 +578,7 @@ export default function AdminDashboard() {
     waitlist,
     taskAnalytics,
     userAnalytics,
+    agentModeAnalytics,
     loadUsers,
     loadWaitlist,
     loadAnalytics,
@@ -644,14 +647,26 @@ export default function AdminDashboard() {
     }
   }, [searchParams]);
 
+  // Track last loaded dates to prevent unnecessary reloads
+  const lastLoadedDatesRef = React.useRef<{ startDate: string; endDate: string } | null>(null);
+
   useEffect(() => {
     if (startDate && endDate && tabValue === 0 && !adminLoading) {
-      loadAnalytics(
-        format(startDate, "yyyy-MM-dd"),
-        format(endDate, "yyyy-MM-dd")
-      );
+      const startDateStr = format(startDate, "yyyy-MM-dd");
+      const endDateStr = format(endDate, "yyyy-MM-dd");
+      
+      // Only load if dates have changed or we haven't loaded yet
+      const lastLoaded = lastLoadedDatesRef.current;
+      if (!lastLoaded || lastLoaded.startDate !== startDateStr || lastLoaded.endDate !== endDateStr) {
+        lastLoadedDatesRef.current = { startDate: startDateStr, endDate: endDateStr };
+        loadAnalytics(startDateStr, endDateStr);
+      }
     }
-  }, [startDate, endDate, tabValue]);
+    // Reset ref when switching tabs to allow reload when coming back
+    if (tabValue !== 0) {
+      lastLoadedDatesRef.current = null;
+    }
+  }, [startDate, endDate, tabValue, loadAnalytics, adminLoading]);
 
   useEffect(() => {
     const loadTasks = async () => {
@@ -1698,7 +1713,7 @@ export default function AdminDashboard() {
               </Grid>
 
               {/* User Type Distribution */}
-              <Grid container spacing={3}>
+              <Grid container spacing={3} sx={{ mb: 4 }}>
                 <Grid item xs={12} md={6}>
                   {userAnalytics && (
                     <UserTypeChart data={userAnalytics} />
@@ -1739,6 +1754,202 @@ export default function AdminDashboard() {
                   </Card>
                 </Grid>
               </Grid>
+
+              {/* Agent Mode Metrics Section */}
+              <Box sx={{ mb: 4 }}>
+                <Typography variant="h5" gutterBottom sx={{ mt: 4, mb: 3 }}>
+                  Agent Mode Analytics
+                </Typography>
+
+                {/* Agent Mode Key Metrics Cards */}
+                <Grid container spacing={3} sx={{ mb: 4 }}>
+                  <Grid item xs={12} md={3}>
+                    <Card>
+                      <CardContent>
+                        <Typography variant="h6" gutterBottom>
+                          Session Analytics
+                        </Typography>
+                        {agentModeAnalytics && (
+                          <>
+                            <Typography variant="h4" color="primary">
+                              {agentModeAnalytics.newSessions || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Sessions (in period)
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Total: {agentModeAnalytics.totalSessions || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Non-Scheduled: {agentModeAnalytics.newNonScheduledSessions || 0}
+                              <Box
+                                component="span"
+                                sx={{ color: "success.main", ml: 0.5 }}
+                              >
+                                •
+                              </Box>
+                              Scheduled: {agentModeAnalytics.newScheduledSessions || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary" sx={{ fontSize: '0.75rem', mt: 0.5 }}>
+                              Shared: {agentModeAnalytics.sharedSessions || 0} • 
+                              With Work Plans: {agentModeAnalytics.sessionsWithWorkPlans || 0}
+                            </Typography>
+                          </>
+                        )}
+                      </CardContent>
+                    </Card>
+                  </Grid>
+                  <Grid item xs={12} md={3}>
+                    <Card>
+                      <CardContent>
+                        <Typography variant="h6" gutterBottom>
+                          User Analytics
+                        </Typography>
+                        {agentModeAnalytics && (
+                          <>
+                            <Typography variant="h4" color="primary">
+                              {agentModeAnalytics.activeUsers || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Active Users (in period)
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Total: {agentModeAnalytics.totalUsers || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              New: {agentModeAnalytics.newUsers || 0}
+                              <Box
+                                component="span"
+                                sx={{ color: "success.main", ml: 0.5 }}
+                              >
+                                •
+                              </Box>
+                              Returning: {agentModeAnalytics.returningUsers || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary" sx={{ fontSize: '0.75rem' }}>
+                              Anonymous: {agentModeAnalytics.activeAnonymousUsers || 0}
+                              {agentModeAnalytics.totalAnonymousUsers !== undefined && (
+                                <>
+                                  {' '}(Total: {agentModeAnalytics.totalAnonymousUsers || 0})
+                                </>
+                              )}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Avg Sessions/User: {agentModeAnalytics.averageSessionsPerActiveUser || 0}
+                            </Typography>
+                          </>
+                        )}
+                      </CardContent>
+                    </Card>
+                  </Grid>
+                  <Grid item xs={12} md={3}>
+                    <Card>
+                      <CardContent>
+                        <Typography variant="h6" gutterBottom>
+                          Message Analytics
+                        </Typography>
+                        {agentModeAnalytics && (
+                          <>
+                            <Typography variant="h4" color="primary">
+                              {agentModeAnalytics.messagesInRange || agentModeAnalytics.totalMessages || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Messages (in period)
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Total: {agentModeAnalytics.totalMessages || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Avg/Session: {agentModeAnalytics.averageMessagesPerSession || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Avg/Active User: {agentModeAnalytics.averageMessagesPerActiveUser || 0}
+                            </Typography>
+                            {agentModeAnalytics.messagesByRole && (
+                              <>
+                                <Typography variant="body2" color="text.secondary" sx={{ mt: 1, fontSize: '0.75rem' }}>
+                                  User: {agentModeAnalytics.messagesByRole.user || 0} • 
+                                  Assistant: {agentModeAnalytics.messagesByRole.assistant || 0}
+                                </Typography>
+                                <Typography variant="body2" color="text.secondary" sx={{ fontSize: '0.75rem' }}>
+                                  With Attachments: {agentModeAnalytics.messagesWithAttachments || 0} • 
+                                  With Tool Calls: {agentModeAnalytics.messagesWithToolCalls || 0}
+                                </Typography>
+                              </>
+                            )}
+                            {agentModeAnalytics.totalTokens > 0 && (
+                              <Typography variant="body2" color="text.secondary" sx={{ fontSize: '0.75rem', mt: 0.5 }}>
+                                Total Tokens: {(agentModeAnalytics.totalTokens / 1000).toFixed(1)}K
+                              </Typography>
+                            )}
+                          </>
+                        )}
+                      </CardContent>
+                    </Card>
+                  </Grid>
+                  <Grid item xs={12} md={3}>
+                    <Card>
+                      <CardContent>
+                        <Typography variant="h6" gutterBottom>
+                          Tool Calls
+                        </Typography>
+                        {agentModeAnalytics && (
+                          <>
+                            <Typography variant="h4" color="primary">
+                              {agentModeAnalytics.toolCallsInRange || agentModeAnalytics.totalToolCalls || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Tool Calls (in period)
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Total: {agentModeAnalytics.totalToolCalls || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Avg/Session: {agentModeAnalytics.averageToolCallsPerSession || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Avg/Active User: {agentModeAnalytics.averageToolCallsPerActiveUser || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Sessions w/ Tools: {agentModeAnalytics.sessionsWithToolCallsInRange || agentModeAnalytics.sessionsWithToolCalls || 0}
+                            </Typography>
+                            {agentModeAnalytics.topToolsInRange && agentModeAnalytics.topToolsInRange.length > 0 && (
+                              <Box sx={{ mt: 1 }}>
+                                <Typography variant="caption" color="text.secondary" sx={{ fontSize: '0.7rem', fontWeight: 'bold' }}>
+                                  Top Tools:
+                                </Typography>
+                                {agentModeAnalytics.topToolsInRange.slice(0, 3).map((tool: any, idx: number) => (
+                                  <Typography key={idx} variant="caption" color="text.secondary" sx={{ display: 'block', fontSize: '0.7rem' }}>
+                                    {idx + 1}. {tool.name}: {tool.count}
+                                  </Typography>
+                                ))}
+                              </Box>
+                            )}
+                          </>
+                        )}
+                      </CardContent>
+                    </Card>
+                  </Grid>
+                </Grid>
+
+                {/* Agent Mode Growth Charts */}
+                <Grid container spacing={3} sx={{ mb: 4 }}>
+                  <Grid item xs={12} md={8}>
+                    {agentModeAnalytics && (
+                      <AgentModeSessionGrowthChart
+                        data={agentModeAnalytics}
+                        startDate={startDate ? format(startDate, "yyyy-MM-dd") : ""}
+                        endDate={endDate ? format(endDate, "yyyy-MM-dd") : ""}
+                      />
+                    )}
+                  </Grid>
+                  <Grid item xs={12} md={4}>
+                    {agentModeAnalytics && (
+                      <AgentModeSessionTypesChart data={agentModeAnalytics} />
+                    )}
+                  </Grid>
+                </Grid>
+              </Box>
             </Box>
           )}
         </TabPanel>

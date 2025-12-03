@@ -437,3 +437,223 @@ export const UserTypeChart: React.FC<{ data: any }> = ({ data }) => {
     </Paper>
   );
 };
+
+interface AgentModeSessionGrowthChartProps {
+  data: {
+    totalSessions: number;
+    newSessions: number;
+    totalScheduledSessions?: number;
+    totalNonScheduledSessions?: number;
+    newScheduledSessions?: number;
+    newNonScheduledSessions?: number;
+    dailyGrowth: Array<{ date: string; count?: number; scheduled?: number; nonScheduled?: number }>;
+  };
+  startDate: string;
+  endDate: string;
+}
+
+export const AgentModeSessionGrowthChart: React.FC<AgentModeSessionGrowthChartProps> = ({ 
+  data, 
+  startDate, 
+  endDate 
+}) => {
+  const chartRef = useRef<HTMLCanvasElement>(null);
+  const chartInstance = useRef<Chart | null>(null);
+
+  useEffect(() => {
+    if (chartRef.current && data) {
+      if (chartInstance.current) {
+        chartInstance.current.destroy();
+      }
+
+      // Use actual daily growth data if available, otherwise generate mock data
+      let labels: string[] = [];
+      let scheduledData: number[] = [];
+      let nonScheduledData: number[] = [];
+
+      if (data.dailyGrowth && data.dailyGrowth.length > 0) {
+        labels = data.dailyGrowth.map((item) => 
+          new Date(item.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+        );
+        
+        // Calculate cumulative sessions for Scheduled
+        let cumulativeScheduled = (data.totalScheduledSessions || 0) - (data.newScheduledSessions || 0);
+        scheduledData = data.dailyGrowth.map((item) => {
+          cumulativeScheduled += item.scheduled || 0;
+          return cumulativeScheduled;
+        });
+        
+        // Calculate cumulative sessions for Non-Scheduled
+        let cumulativeNonScheduled = (data.totalNonScheduledSessions || 0) - (data.newNonScheduledSessions || 0);
+        nonScheduledData = data.dailyGrowth.map((item) => {
+          cumulativeNonScheduled += item.nonScheduled || 0;
+          return cumulativeNonScheduled;
+        });
+      } else {
+        // Fallback to generated data
+        const timeSeriesData = generateTimeSeriesData(
+          startDate, 
+          endDate, 
+          data.totalSessions, 
+          data.newSessions
+        );
+        labels = timeSeriesData.labels;
+        // Split generated data proportionally (rough estimate)
+        const scheduledRatio = (data.totalScheduledSessions || 0) / Math.max(data.totalSessions, 1);
+        scheduledData = timeSeriesData.data.map((val, idx) => 
+          Math.round(val * scheduledRatio)
+        );
+        nonScheduledData = timeSeriesData.data.map((val, idx) => 
+          Math.round(val * (1 - scheduledRatio))
+        );
+      }
+
+      const config: ChartConfiguration = {
+        type: 'line',
+        data: {
+          labels,
+          datasets: [
+            {
+              label: 'Non-Scheduled Sessions',
+              data: nonScheduledData,
+              borderColor: '#2196f3',
+              backgroundColor: 'rgba(33, 150, 243, 0.1)',
+              fill: true,
+              tension: 0.4,
+            },
+            {
+              label: 'Scheduled Sessions',
+              data: scheduledData,
+              borderColor: '#ff9800',
+              backgroundColor: 'rgba(255, 152, 0, 0.1)',
+              fill: true,
+              tension: 0.4,
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            title: {
+              display: true,
+              text: 'Agent Mode Session Growth Over Time (Non-Scheduled vs Scheduled)'
+            },
+            legend: {
+              position: 'top' as const,
+            }
+          },
+          scales: {
+            y: {
+              beginAtZero: true,
+              ticks: {
+                stepSize: 1
+              }
+            },
+            x: {
+              ticks: {
+                maxRotation: 45,
+                minRotation: 45
+              }
+            }
+          }
+        }
+      };
+
+      chartInstance.current = new Chart(chartRef.current, config);
+    }
+
+    return () => {
+      if (chartInstance.current) {
+        chartInstance.current.destroy();
+      }
+    };
+  }, [data, startDate, endDate]);
+
+  return (
+    <Paper sx={{ p: 2, height: 300 }}>
+      <Box sx={{ position: 'relative', height: '100%' }}>
+        <canvas ref={chartRef} />
+      </Box>
+    </Paper>
+  );
+};
+
+interface AgentModeSessionTypesChartProps {
+  data: {
+    sessionTypes: Record<string, number>;
+    sessionTypesInRange: Record<string, number>;
+  };
+}
+
+export const AgentModeSessionTypesChart: React.FC<AgentModeSessionTypesChartProps> = ({ data }) => {
+  const chartRef = useRef<HTMLCanvasElement>(null);
+  const chartInstance = useRef<Chart | null>(null);
+
+  useEffect(() => {
+    if (chartRef.current && data && data.sessionTypes) {
+      if (chartInstance.current) {
+        chartInstance.current.destroy();
+      }
+
+      const labels = Object.keys(data.sessionTypes).map(key => {
+        // Format the label nicely
+        return key.split('-').map(word => 
+          word.charAt(0).toUpperCase() + word.slice(1)
+        ).join(' ');
+      });
+      const values = Object.values(data.sessionTypes);
+
+      const config: ChartConfiguration = {
+        type: 'doughnut',
+        data: {
+          labels,
+          datasets: [
+            {
+              data: values,
+              backgroundColor: [
+                '#2196f3',
+                '#4caf50',
+                '#ff9800',
+                '#f44336',
+                '#9c27b0',
+                '#00bcd4',
+              ],
+              borderWidth: 2,
+              borderColor: '#fff'
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            title: {
+              display: true,
+              text: 'Session Types Distribution'
+            },
+            legend: {
+              position: 'bottom' as const,
+            }
+          }
+        }
+      };
+
+      chartInstance.current = new Chart(chartRef.current, config);
+    }
+
+    return () => {
+      if (chartInstance.current) {
+        chartInstance.current.destroy();
+      }
+    };
+  }, [data]);
+
+  return (
+    <Paper sx={{ p: 2, height: 300 }}>
+      <Box sx={{ position: 'relative', height: '100%' }}>
+        <canvas ref={chartRef} />
+      </Box>
+    </Paper>
+  );
+};
