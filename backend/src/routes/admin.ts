@@ -765,6 +765,337 @@ router.get("/analytics/users", async (req, res) => {
   }
 });
 
+// Get Agent Mode analytics
+router.get("/analytics/agent-mode", async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    
+    // Get all sessions
+    const allSessions = await chatbotDb.getAllSessions();
+    
+    // Filter for Agent Mode sessions only
+    const agentSessions = allSessions.filter(
+      (session) => session.portalType === "agent" && !session.archived
+    );
+    
+    // Parse date range
+    const start = startDate ? new Date(startDate as string) : null;
+    const end = endDate ? new Date(endDate as string) : null;
+    
+    // Helper to check if date is in range
+    const isInRange = (dateStr: string) => {
+      if (!start && !end) return true;
+      const date = new Date(dateStr);
+      if (start && date < start) return false;
+      if (end) {
+        const endDate = new Date(end);
+        endDate.setHours(23, 59, 59, 999); // Include entire end date
+        if (date > endDate) return false;
+      }
+      return true;
+    };
+    
+    // Calculate metrics
+    const totalSessions = agentSessions.length;
+    const newSessions = agentSessions.filter((s) => isInRange(s.createdAt)).length;
+    
+    // Separate scheduled and non-scheduled sessions
+    const scheduledSessions = agentSessions.filter((s) => s.sessionType === "scheduled");
+    const nonScheduledSessions = agentSessions.filter((s) => s.sessionType !== "scheduled");
+    const totalScheduledSessions = scheduledSessions.length;
+    const totalNonScheduledSessions = nonScheduledSessions.length;
+    const newScheduledSessions = scheduledSessions.filter((s) => isInRange(s.createdAt)).length;
+    const newNonScheduledSessions = nonScheduledSessions.filter((s) => isInRange(s.createdAt)).length;
+    
+    // Session types breakdown
+    const sessionTypes: Record<string, number> = {};
+    const sessionTypesInRange: Record<string, number> = {};
+    
+    agentSessions.forEach((session) => {
+      const type = session.sessionType || "regular";
+      sessionTypes[type] = (sessionTypes[type] || 0) + 1;
+      if (isInRange(session.createdAt)) {
+        sessionTypesInRange[type] = (sessionTypesInRange[type] || 0) + 1;
+      }
+    });
+    
+    // Helper function to check if user is anonymous
+    const isAnonymousUser = (userId: string) => userId.startsWith('anon_');
+    
+    // Separate actual users and anonymous users
+    const actualUserSessions = agentSessions.filter((s) => !isAnonymousUser(s.userId));
+    const anonymousUserSessions = agentSessions.filter((s) => isAnonymousUser(s.userId));
+    
+    // Unique users - all time (actual users only)
+    const uniqueUsers = new Set(actualUserSessions.map((s) => s.userId));
+    const uniqueAnonymousUsers = new Set(anonymousUserSessions.map((s) => s.userId));
+    
+    // Sessions in date range
+    const sessionsInRange = agentSessions.filter((s) => isInRange(s.createdAt));
+    const actualSessionsInRange = actualUserSessions.filter((s) => isInRange(s.createdAt));
+    const anonymousSessionsInRange = anonymousUserSessions.filter((s) => isInRange(s.createdAt));
+    
+    // Active users (users who used Agent Mode at least once during the period)
+    const activeUsers = new Set(actualSessionsInRange.map((s) => s.userId));
+    const activeAnonymousUsers = new Set(anonymousSessionsInRange.map((s) => s.userId));
+    
+    // Sessions before the date range (to identify returning users)
+    const sessionsBeforeRange = actualUserSessions.filter((s) => {
+      if (!start) return false;
+      const date = new Date(s.createdAt);
+      return date < start;
+    });
+    const usersBeforeRange = new Set(sessionsBeforeRange.map((s) => s.userId));
+    
+    // New users (users who used Agent Mode for the first time during the period)
+    const newUsers = new Set(
+      actualSessionsInRange
+        .filter((s) => !usersBeforeRange.has(s.userId))
+        .map((s) => s.userId)
+    );
+    
+    // Returning users (users who used Agent Mode before the period and also during the period)
+    const returningUsers = new Set(
+      Array.from(activeUsers).filter((userId) => usersBeforeRange.has(userId))
+    );
+    
+    // Calculate sessions per user metrics (only for actual users)
+    const sessionsPerUser: Record<string, number> = {};
+    actualSessionsInRange.forEach((session) => {
+      sessionsPerUser[session.userId] = (sessionsPerUser[session.userId] || 0) + 1;
+    });
+    const averageSessionsPerActiveUser =
+      activeUsers.size > 0
+        ? actualSessionsInRange.length / activeUsers.size
+        : 0;
+    
+    // Total unique users in range (for backward compatibility)
+    const uniqueUsersInRange = activeUsers;
+    
+    // Messages statistics
+    const totalMessages = agentSessions.reduce(
+      (sum, s) => sum + (s.messages?.length || 0),
+      0
+    );
+    const averageMessagesPerSession =
+      totalSessions > 0 ? totalMessages / totalSessions : 0;
+    
+    // Messages in date range
+    const messagesInRange = sessionsInRange.reduce(
+      (sum, s) => sum + (s.messages?.length || 0),
+      0
+    );
+    const averageMessagesPerActiveUser =
+      activeUsers.size > 0 ? messagesInRange / activeUsers.size : 0;
+    
+    // Messages by role
+    const messagesByRole: Record<string, number> = {
+      user: 0,
+      assistant: 0,
+      system: 0,
+      tool: 0,
+    };
+    
+    // Messages with attachments
+    let messagesWithAttachments = 0;
+    
+    // Messages with tool calls
+    let messagesWithToolCalls = 0;
+    
+    // Token usage statistics
+    let totalTokens = 0;
+    let totalPromptTokens = 0;
+    let totalCompletionTokens = 0;
+    let messagesWithTokenData = 0;
+    
+    agentSessions.forEach((session) => {
+      if (session.messages) {
+        session.messages.forEach((message) => {
+          // Count by role
+          const role = message.role || "unknown";
+          if (messagesByRole[role] !== undefined) {
+            messagesByRole[role]++;
+          }
+          
+          // Count messages with attachments
+          if (message.metadata?.attachments && message.metadata.attachments.length > 0) {
+            messagesWithAttachments++;
+          }
+          
+          // Count messages with tool calls
+          if (message.tool_calls && message.tool_calls.length > 0) {
+            messagesWithToolCalls++;
+          }
+          if (message.metadata?.toolCalls && message.metadata.toolCalls.length > 0) {
+            messagesWithToolCalls++;
+          }
+          
+          // Count token usage
+          if (message.usage) {
+            totalTokens += message.usage.total_tokens || 0;
+            totalPromptTokens += message.usage.prompt_tokens || 0;
+            totalCompletionTokens += message.usage.completion_tokens || 0;
+            messagesWithTokenData++;
+          }
+        });
+      }
+    });
+    
+    const averageTokensPerMessage =
+      messagesWithTokenData > 0 ? totalTokens / messagesWithTokenData : 0;
+    
+    // Sessions with work plans
+    const sessionsWithWorkPlans = agentSessions.filter(
+      (s) => s.workPlan !== undefined
+    ).length;
+    const newSessionsWithWorkPlans = agentSessions.filter(
+      (s) => s.workPlan !== undefined && isInRange(s.createdAt)
+    ).length;
+    
+    // Shared sessions
+    const sharedSessions = agentSessions.filter(
+      (s) => s.shareMetadata?.isShared || s.interactiveShareMetadata?.isActive
+    ).length;
+    
+    // Tool calls statistics
+    const totalToolCalls = agentSessions.reduce((sum, s) => {
+      if (!s.calledFunctions) return sum;
+      return sum + Object.values(s.calledFunctions).reduce((a, b) => a + b, 0);
+    }, 0);
+    
+    // Tool calls in date range
+    const toolCallsInRange = sessionsInRange.reduce((sum, s) => {
+      if (!s.calledFunctions) return sum;
+      return sum + Object.values(s.calledFunctions).reduce((a, b) => a + b, 0);
+    }, 0);
+    
+    const averageToolCallsPerSession =
+      totalSessions > 0 ? totalToolCalls / totalSessions : 0;
+    const averageToolCallsPerActiveUser =
+      activeUsers.size > 0 ? toolCallsInRange / activeUsers.size : 0;
+    
+    // Sessions with tool calls
+    const sessionsWithToolCalls = agentSessions.filter((s) => {
+      if (s.calledFunctions && Object.keys(s.calledFunctions).length > 0) {
+        return Object.values(s.calledFunctions).some((count) => count > 0);
+      }
+      return false;
+    }).length;
+    
+    const sessionsWithToolCallsInRange = sessionsInRange.filter((s) => {
+      if (s.calledFunctions && Object.keys(s.calledFunctions).length > 0) {
+        return Object.values(s.calledFunctions).some((count) => count > 0);
+      }
+      return false;
+    }).length;
+    
+    // Tool calls by function name (breakdown)
+    const toolCallsByFunction: Record<string, number> = {};
+    const toolCallsByFunctionInRange: Record<string, number> = {};
+    
+    agentSessions.forEach((session) => {
+      if (session.calledFunctions) {
+        Object.entries(session.calledFunctions).forEach(([functionName, count]) => {
+          toolCallsByFunction[functionName] = (toolCallsByFunction[functionName] || 0) + count;
+          
+          if (isInRange(session.createdAt)) {
+            toolCallsByFunctionInRange[functionName] = (toolCallsByFunctionInRange[functionName] || 0) + count;
+          }
+        });
+      }
+    });
+    
+    // Get top tools (sorted by usage)
+    const topTools = Object.entries(toolCallsByFunction)
+      .sort(([, a], [, b]) => b - a)
+      .slice(0, 10)
+      .map(([name, count]) => ({ name, count }));
+    
+    const topToolsInRange = Object.entries(toolCallsByFunctionInRange)
+      .sort(([, a], [, b]) => b - a)
+      .slice(0, 10)
+      .map(([name, count]) => ({ name, count }));
+    
+    // Daily growth data for chart - separate Scheduled and Non-Scheduled sessions
+    const dailyGrowthScheduled: Record<string, number> = {};
+    const dailyGrowthNonScheduled: Record<string, number> = {};
+    
+    agentSessions.forEach((session) => {
+      if (isInRange(session.createdAt)) {
+        const dateKey = new Date(session.createdAt).toISOString().split("T")[0];
+        const isScheduled = session.sessionType === "scheduled";
+        
+        if (isScheduled) {
+          dailyGrowthScheduled[dateKey] = (dailyGrowthScheduled[dateKey] || 0) + 1;
+        } else {
+          dailyGrowthNonScheduled[dateKey] = (dailyGrowthNonScheduled[dateKey] || 0) + 1;
+        }
+      }
+    });
+    
+    // Get all unique dates from both
+    const allDates = new Set([
+      ...Object.keys(dailyGrowthScheduled),
+      ...Object.keys(dailyGrowthNonScheduled)
+    ]);
+    
+    // Sort daily growth by date and combine
+    const sortedDailyGrowth = Array.from(allDates)
+      .sort((a, b) => a.localeCompare(b))
+      .map((date) => ({
+        date,
+        scheduled: dailyGrowthScheduled[date] || 0,
+        nonScheduled: dailyGrowthNonScheduled[date] || 0,
+      }));
+    
+    res.json({
+      totalSessions,
+      newSessions,
+      totalScheduledSessions,
+      totalNonScheduledSessions,
+      newScheduledSessions,
+      newNonScheduledSessions,
+      totalUsers: uniqueUsers.size,
+      activeUsers: activeUsers.size,
+      newUsers: newUsers.size,
+      returningUsers: returningUsers.size,
+      totalAnonymousUsers: uniqueAnonymousUsers.size,
+      activeAnonymousUsers: activeAnonymousUsers.size,
+      averageSessionsPerActiveUser: Math.round(averageSessionsPerActiveUser * 10) / 10,
+      sessionTypes,
+      sessionTypesInRange,
+      totalMessages,
+      messagesInRange,
+      averageMessagesPerSession: Math.round(averageMessagesPerSession * 10) / 10,
+      averageMessagesPerActiveUser: Math.round(averageMessagesPerActiveUser * 10) / 10,
+      messagesByRole,
+      messagesWithAttachments,
+      messagesWithToolCalls,
+      totalTokens,
+      totalPromptTokens,
+      totalCompletionTokens,
+      averageTokensPerMessage: Math.round(averageTokensPerMessage * 10) / 10,
+      sessionsWithWorkPlans,
+      newSessionsWithWorkPlans,
+      sharedSessions,
+      totalToolCalls,
+      toolCallsInRange,
+      averageToolCallsPerSession: Math.round(averageToolCallsPerSession * 10) / 10,
+      averageToolCallsPerActiveUser: Math.round(averageToolCallsPerActiveUser * 10) / 10,
+      sessionsWithToolCalls,
+      sessionsWithToolCallsInRange,
+      toolCallsByFunction,
+      toolCallsByFunctionInRange,
+      topTools,
+      topToolsInRange,
+      dailyGrowth: sortedDailyGrowth,
+    });
+  } catch (error) {
+    console.error("Error getting Agent Mode analytics:", error);
+    res.status(500).json({ message: "Error fetching Agent Mode analytics" });
+  }
+});
+
 // Get single task details
 router.get("/tasks/:id", async (req, res) => {
   try {

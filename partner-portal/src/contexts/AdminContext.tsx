@@ -45,6 +45,7 @@ interface AdminContextType {
   waitlist: WaitlistEntry[];
   taskAnalytics: any;
   userAnalytics: any;
+  agentModeAnalytics: any;
   loadUsers: () => Promise<void>;
   loadWaitlist: () => Promise<void>;
   loadAnalytics: (startDate: string, endDate: string) => Promise<void>;
@@ -86,6 +87,7 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
   const [waitlist, setWaitlist] = useState<WaitlistEntry[]>([]);
   const [taskAnalytics, setTaskAnalytics] = useState<any>(null);
   const [userAnalytics, setUserAnalytics] = useState<any>(null);
+  const [agentModeAnalytics, setAgentModeAnalytics] = useState<any>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const { token, user } = useAuth();
@@ -135,17 +137,25 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
         setLoading(true);
         setError(null);
         
-        const [taskResponse, userResponse] = await Promise.all([
+        const [taskResponse, userResponse, agentModeResponse] = await Promise.all([
           api.get("/api/admin/analytics/tasks", {
             params: { startDate, endDate },
           }),
           api.get("/api/admin/analytics/users", {
             params: { startDate, endDate },
           }),
+          api.get("/api/admin/analytics/agent-mode", {
+            params: { startDate, endDate },
+          }).catch((err) => {
+            // Don't fail the whole request if agent mode analytics fails
+            console.error('Error loading agent mode analytics:', err);
+            return { data: null };
+          }),
         ]);
         
         setTaskAnalytics(taskResponse.data);
         setUserAnalytics(userResponse.data);
+        setAgentModeAnalytics(agentModeResponse.data);
         setError(null);
       } catch (err: any) {
         console.error('Error loading analytics:', err);
@@ -185,6 +195,49 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
           oauthUsers: 0,
           newOauthUsers: 0,
           adminUsers: 0,
+        });
+        
+        setAgentModeAnalytics({
+          totalSessions: 0,
+          newSessions: 0,
+          totalScheduledSessions: 0,
+          totalNonScheduledSessions: 0,
+          newScheduledSessions: 0,
+          newNonScheduledSessions: 0,
+          totalUsers: 0,
+          activeUsers: 0,
+          newUsers: 0,
+          returningUsers: 0,
+          totalAnonymousUsers: 0,
+          activeAnonymousUsers: 0,
+          averageSessionsPerActiveUser: 0,
+          sessionTypes: {},
+          sessionTypesInRange: {},
+          totalMessages: 0,
+          messagesInRange: 0,
+          averageMessagesPerSession: 0,
+          averageMessagesPerActiveUser: 0,
+          messagesByRole: {},
+          messagesWithAttachments: 0,
+          messagesWithToolCalls: 0,
+          totalTokens: 0,
+          totalPromptTokens: 0,
+          totalCompletionTokens: 0,
+          averageTokensPerMessage: 0,
+          sessionsWithWorkPlans: 0,
+          newSessionsWithWorkPlans: 0,
+          sharedSessions: 0,
+          totalToolCalls: 0,
+          toolCallsInRange: 0,
+          averageToolCallsPerSession: 0,
+          averageToolCallsPerActiveUser: 0,
+          sessionsWithToolCalls: 0,
+          sessionsWithToolCallsInRange: 0,
+          toolCallsByFunction: {},
+          toolCallsByFunctionInRange: {},
+          topTools: [],
+          topToolsInRange: [],
+          dailyGrowth: [],
         });
       } finally {
         setLoading(false);
@@ -314,6 +367,7 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
     waitlist,
     taskAnalytics,
     userAnalytics,
+    agentModeAnalytics,
     loadUsers,
     loadWaitlist,
     loadAnalytics,
