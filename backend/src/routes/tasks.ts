@@ -2004,12 +2004,16 @@ router.post('/executions/:executionId/favorite-image', authenticateToken, async 
       return res.status(400).json({ message: 'Execution ID and image URL are required' });
     }
 
-    // Check if this is an agent mode image (executionId pattern: ${sessionId}-images)
+    // Check if this is an agent mode image or video (executionId pattern: ${sessionId}-images or ${sessionId}-videos)
     const isAgentModeImage = executionId.endsWith('-images');
-    const agentSessionId = isAgentModeImage ? executionId.replace('-images', '') : null;
+    const isAgentModeVideo = executionId.endsWith('-videos');
+    const isAgentModeAsset = isAgentModeImage || isAgentModeVideo;
+    const agentSessionId = isAgentModeAsset 
+      ? (isAgentModeImage ? executionId.replace('-images', '') : executionId.replace('-videos', ''))
+      : null;
 
     if (agentSessionId) {
-      // Handle agent mode image - update session favorites field
+      // Handle agent mode image or video - update session favorites field
       const chatbotDb = new ChatbotDB();
       const session = await chatbotDb.getChatSession(agentSessionId);
       
@@ -2114,12 +2118,16 @@ router.post('/executions/:executionId/archive-image', authenticateToken, async (
       return res.status(400).json({ message: 'Execution ID and image URL are required' });
     }
 
-    // Check if this is an agent mode image (executionId pattern: ${sessionId}-images)
+    // Check if this is an agent mode image or video (executionId pattern: ${sessionId}-images or ${sessionId}-videos)
     const isAgentModeImage = executionId.endsWith('-images');
-    const agentSessionId = isAgentModeImage ? executionId.replace('-images', '') : null;
+    const isAgentModeVideo = executionId.endsWith('-videos');
+    const isAgentModeAsset = isAgentModeImage || isAgentModeVideo;
+    const agentSessionId = isAgentModeAsset 
+      ? (isAgentModeImage ? executionId.replace('-images', '') : executionId.replace('-videos', ''))
+      : null;
 
     if (agentSessionId) {
-      // Handle agent mode image - update session archives field
+      // Handle agent mode image or video - update session archives field
       const chatbotDb = new ChatbotDB();
       const session = await chatbotDb.getChatSession(agentSessionId);
       
