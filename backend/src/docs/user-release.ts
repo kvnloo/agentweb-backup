@@ -9,6 +9,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2025-12-03',
     changes: [
+      'Added Agent Mode Analytics to Admin Dashboard',
+      '- New comprehensive analytics section in Admin Dashboard Overview tab for tracking Agent Mode usage',
+      '- Session Analytics: Total sessions, new sessions, breakdown by Scheduled and Non-Scheduled sessions',
+      '- User Analytics: Active users, new users, returning users, with separate tracking for anonymous users',
+      '- Message Analytics: Message counts, role breakdown, attachments, tool calls, and token usage metrics',
+      '- Tool Calls Analytics: Total tool calls, function breakdown, top tools, and sessions with tool calls',
+      'Fixed bug that Video generation sessions not showing in Admin Dashboard',
       'Added Direct Image Upload Support for Agent Mode',
       '- Users can now upload images directly to Agent Mode sessions using the "Upload directly" option',
       '- Uploaded images are stored in session metadata and displayed in the chat interface',
