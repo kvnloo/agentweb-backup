@@ -125,6 +125,7 @@ router.post(
 
       const {
         primaryColor,
+        primaryColorEnd,
         secondaryColor,
         fontFamily,
         toneOfVoice,
@@ -135,6 +136,7 @@ router.post(
         targetAudience,
         brandPersonality,
         founders,
+        isGradient,
       } = req.body;
 
       const files = req.files as { [fieldname: string]: Express.Multer.File[] };
@@ -263,12 +265,19 @@ router.post(
         }
       }
 
+      // Parse isGradient if it's a string
+      let parsedIsGradient = existingBrandGuidelines?.brandData?.isGradient ?? false;
+      if (isGradient !== undefined) {
+        parsedIsGradient = typeof isGradient === 'string' ? isGradient === 'true' : Boolean(isGradient);
+      }
+
       const brandGuidelinesData = {
         brandData: {
           // Only update fields that are provided, preserve existing data for missing fields
           brandName: brandName !== undefined ? brandName : (existingBrandGuidelines?.brandData?.brandName || ""),
           tagline: tagline !== undefined ? tagline : (existingBrandGuidelines?.brandData?.tagline || ""),
           primaryColor: primaryColor !== undefined ? primaryColor : (existingBrandGuidelines?.brandData?.primaryColor || ""),
+          primaryColorEnd: primaryColorEnd !== undefined ? primaryColorEnd : (existingBrandGuidelines?.brandData?.primaryColorEnd || ""),
           secondaryColor: secondaryColor !== undefined ? secondaryColor : (existingBrandGuidelines?.brandData?.secondaryColor || ""),
           fontFamily: fontFamily !== undefined ? fontFamily : (existingBrandGuidelines?.brandData?.fontFamily || ""),
           toneOfVoice: toneOfVoice !== undefined ? toneOfVoice : (existingBrandGuidelines?.brandData?.toneOfVoice || ""),
@@ -276,6 +285,7 @@ router.post(
           brandValues: parsedBrandValues,
           targetAudience: targetAudience !== undefined ? targetAudience : (existingBrandGuidelines?.brandData?.targetAudience || ""),
           brandPersonality: brandPersonality !== undefined ? brandPersonality : (existingBrandGuidelines?.brandData?.brandPersonality || ""),
+          isGradient: parsedIsGradient,
           founders: parsedFounders,
         },
         attachments: [
