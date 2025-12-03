@@ -129,7 +129,7 @@ interface AdminChatSession {
   pageContent?: string;
   contextChunks?: any[];
   portalType?: "customer" | "partner";
-  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation";
+  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation";
   shareMetadata?: {
     isShared: boolean;
     sharedAt?: string;
@@ -3189,6 +3189,8 @@ export default function AdminDashboard() {
                                 ? "Scheduled"
                                 : session.sessionType === "image-generation"
                                 ? "Image Generation"
+                                : session.sessionType === "video-generation"
+                                ? "Video Generation"
                                 : "Regular"
                             }
                             color={
@@ -3198,6 +3200,8 @@ export default function AdminDashboard() {
                                 ? "secondary"
                                 : session.sessionType === "image-generation"
                                 ? "success"
+                                : session.sessionType === "video-generation"
+                                ? "info"
                                 : "default"
                             }
                             size="small"
