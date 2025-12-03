@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-03',
+    changes: [
+      'Added Direct Image Upload Support for Agent Mode',
+      '- Users can now upload images directly to Agent Mode sessions using the "Upload directly" option',
+      '- Uploaded images are stored in session metadata and displayed in the chat interface',
+      '- Images uploaded directly to Agent Mode sessions are now displayed on the Ad Images page alongside generated images',
+    ],
+  },
+  {
     date: '2025-12-02',
     changes: [
       'Added Video Generation Support in Agent Mode',

@@ -1514,6 +1514,85 @@ export const agentModeController = {
     }
   },
 
+  // Upload image directly to Agent Mode session
+  async uploadImageToSession(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { sessionId } = req.params;
+      const file = (req as any).file;
+
+      if (!file) {
+        return res.status(400).json({ error: 'No file uploaded' });
+      }
+
+      // Validate that it's an image file
+      if (!file.mimetype.startsWith('image/')) {
+        return res.status(400).json({ error: 'File must be an image' });
+      }
+
+      // Verify session exists and belongs to user
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      if (session.userId !== user.userId && !user.isAdmin) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+
+      // Upload to S3 using common utility
+      const uploadResult = await uploadFileToS3(
+        file.buffer,
+        file.originalname,
+        user.userId,
+        file.mimetype
+      );
+
+      if (!uploadResult.success) {
+        return res.status(500).json({ error: 'Failed to upload file to S3' });
+      }
+
+      // Create a system message with toolCall metadata using upload_image
+      // This structure matches what getExecutionsWithAssets expects
+      const uploadedImageMessage = {
+        role: 'system' as const,
+        content: `Image uploaded: ${file.originalname}`,
+        timestamp: new Date().toISOString(),
+        metadata: {
+          portalType: 'agent' as const,
+          timestamp: new Date().toISOString(),
+          toolCalls: [
+            {
+              id: uuidv4(),
+              name: 'upload_image',
+              arguments: {},
+              result: {
+                success: true,
+                imageUrl: uploadResult.url,
+                filename: file.originalname,
+                message: `✅ Image "${file.originalname}" uploaded successfully!`
+              }
+            }
+          ]
+        }
+      };
+
+      // Add message to session
+      await chatbotDb.addMessageToSession(sessionId, uploadedImageMessage);
+
+      res.json({
+        success: true,
+        message: 'Image uploaded successfully',
+        url: uploadResult.url,
+        filename: file.originalname,
+        uploadedAt: new Date().toISOString()
+      });
+    } catch (error) {
+      console.error('AgentMode: Upload image to session error:', error);
+      res.status(500).json({ error: 'Failed to upload image to session' });
+    }
+  },
+
   // Create scheduled chat
   async createScheduledChat(req: Request, res: Response) {
     try {
