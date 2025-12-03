@@ -286,6 +286,10 @@ async function runVerifiedChat(
     maxAttempts = 20,
     attachments = []
   } = params;
+  
+  // Ensure attachments is always an array
+  const attachmentsArray = Array.isArray(attachments) ? attachments : [];
+  console.log('AgentMode runVerifiedChat: Received attachments:', attachmentsArray.length, attachmentsArray);
 
   let attempt = 0;
   let allContent = '';
@@ -344,12 +348,15 @@ async function runVerifiedChat(
       }
 
       // Generate response
+      // Only pass attachments on the first attempt to avoid duplicating them
+      const attachmentsForThisAttempt = attempt === 1 ? attachmentsArray : [];
+      console.log(`AgentMode runVerifiedChat: Attempt ${attempt}, passing ${attachmentsForThisAttempt.length} attachments to generateSessionResponse`);
       const response = await generateSessionResponse(
         sessionId,
         userMessage,
         userId,
         params.llmModel || agentModeService.default_model,
-        attachments
+        attachmentsForThisAttempt
       );
 
       // Update content
@@ -788,7 +795,13 @@ async function generateSessionResponse(
   }
 
   // Add user message to session in database
+  console.log('AgentMode generateSessionResponse: Saving user message with attachments:', {
+    hasAttachments: !!(userMessageObj.metadata?.attachments && userMessageObj.metadata.attachments.length > 0),
+    attachmentCount: userMessageObj.metadata?.attachments?.length || 0,
+    attachments: userMessageObj.metadata?.attachments?.map((a: any) => ({ url: a.url, filename: a.filename }))
+  });
   await chatbotDb.addMessageToSession(sessionId, userMessageObj);
+  console.log('AgentMode generateSessionResponse: User message saved successfully');
 
   // Get updated session with the new user message
   const updatedSession = await chatbotDb.getChatSession(sessionId);
@@ -893,6 +906,7 @@ export const agentModeController = {
 
       // Determine sessionType: if explicitly provided, use it; otherwise default to 'regular'
       // For ad image generation from Images page, sessionType should be 'image-generation'
+      // For ad video generation from Videos page, sessionType should be 'video-generation'
       const finalSessionType = sessionType || 'regular';
 
       const session = await chatbotDb.createChatSession(
@@ -904,7 +918,7 @@ export const agentModeController = {
         undefined, // workflowId
         undefined, // executionId
         undefined, // emailCampaignTaskId
-        finalSessionType as "regular" | "predefined-work-plan" | "scheduled" | "image-generation"
+        finalSessionType as "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation"
       );
 
       // Set default model for new sessions
@@ -2329,6 +2343,9 @@ export const agentModeController = {
     try {
       const user = req.user as User;
       const { sessionId, startingMessage, requiredFunctions, keywords, attachments, maxAttempts: maxAttemptsParam } = req.body;
+      
+      // Log attachments for debugging
+      console.log('AgentMode verifiedGenerate: Received attachments:', attachments?.length || 0, attachments);
 
       // Validate required fields
       if (!sessionId) {
@@ -2371,6 +2388,9 @@ export const agentModeController = {
       });
 
       // Run verified chat
+      // Ensure attachments is always an array
+      const attachmentsArray = Array.isArray(attachments) ? attachments : [];
+      console.log('AgentMode verifiedGenerate: Passing attachments to runVerifiedChat:', attachmentsArray.length, attachmentsArray);
       const result = await runVerifiedChat({
         sessionId,
         userId: user.userId,
@@ -2378,7 +2398,7 @@ export const agentModeController = {
         keywords: keywords || [],
         requiredFunctions,
         maxAttempts: maxAttemptsParam || 5,
-        attachments: attachments || []
+        attachments: attachmentsArray
       });
 
       // If client disconnected, don't try to send response

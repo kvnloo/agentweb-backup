@@ -1819,6 +1819,122 @@ async function getExecutionsWithAssets(
     }
   }
 
+  // For videos, also search Agent Mode sessions for generate_video function calls
+  if (assetType === 'videos') {
+    try {
+      const chatbotDb = new ChatbotDB();
+      // Get all Agent Mode sessions for the user
+      const agentSessionsResult = await chatbotDb.getUserSessions(userId, 'agent');
+      const agentSessions = agentSessionsResult.sessions || [];
+      
+      // Process each session to find generate_video tool calls
+      agentSessions.forEach((session: any) => {
+        if (!session.messages || session.archived) {
+          return;
+        }
+        
+        // Search through messages for generate_video tool calls
+        session.messages.forEach((message: any) => {
+          if (message.metadata?.toolCalls) {
+            message.metadata.toolCalls.forEach((toolCall: any) => {
+              if (toolCall.name === 'generate_video' && toolCall.result?.success && toolCall.result?.videoUrl) {
+                const videoUrl = toolCall.result.videoUrl;
+                const filename = toolCall.result.filename || 'generated-video.mp4';
+                
+                // Extract timestamp from message or use session updatedAt
+                const timestamp = message.timestamp || message.metadata?.timestamp || session.updatedAt || session.createdAt;
+                
+                // Create a unique key for this session (using sessionId)
+                const sessionKey = `agent-mode-${session.sessionId}`;
+                
+                if (!result[sessionKey]) {
+                  result[sessionKey] = {
+                    taskId: sessionKey,
+                    taskName: session.title || 'Agent Mode Session',
+                    createdAt: session.createdAt,
+                    source: 'agent-mode',
+                    sessionId: session.sessionId,
+                    executions: []
+                  };
+                }
+                
+                // Check if this video already exists in the executions (avoid duplicates)
+                const existingVideo = result[sessionKey].executions.some((exec: any) => 
+                  exec.result_files.some((file: any) => file.url === videoUrl)
+                );
+                
+                if (!existingVideo) {
+                  // Use a single execution per session to group all videos
+                  const executionId = `${session.sessionId}-videos`;
+                  
+                  // Check if this execution already exists
+                  let execution = result[sessionKey].executions.find((exec: any) => exec.executionId === executionId);
+                  
+                  // Check favorites and archives from session fields
+                  const isFavorited = session.favorites?.[videoUrl] || false;
+                  const isArchived = session.archives?.[videoUrl] || false;
+                  
+                  // Skip archived videos (they will be filtered out, similar to task executions)
+                  if (isArchived) {
+                    return; // Skip this video
+                  }
+                  
+                  if (!execution) {
+                    execution = {
+                      executionId: executionId,
+                      startTime: timestamp, // Use the video generation timestamp
+                      result_files: []
+                    };
+                    result[sessionKey].executions.push(execution);
+                  } else {
+                    // Update startTime to the latest video generation time
+                    if (timestamp && (!execution.startTime || timestamp > execution.startTime)) {
+                      execution.startTime = timestamp;
+                    }
+                  }
+                  
+                  // Add the video file with its generation timestamp and status
+                  execution.result_files.push({
+                    url: videoUrl,
+                    filename: filename,
+                    token: '', // Not applicable for agent mode videos
+                    source: 'agent-mode',
+                    sessionId: session.sessionId,
+                    generatedAt: timestamp, // Store when this specific video was generated
+                    is_favorited: isFavorited,
+                    is_archived: false // Always false since we filter out archived videos
+                  });
+                }
+              }
+            });
+          }
+        });
+      });
+      
+      // Calculate latest execution time for agent mode sessions
+      Object.keys(result).forEach(key => {
+        if (result[key].source === 'agent-mode') {
+          const task = result[key];
+          const executionTimes = task.executions
+            .map((execution: any) => execution.startTime)
+            .filter((time: string) => time !== null);
+          
+          if (executionTimes.length > 0) {
+            task.latestExecutionTime = executionTimes.sort().pop();
+          } else {
+            task.latestExecutionTime = null;
+          }
+          
+          // Agent mode sessions don't have pending/running executions
+          task.latestPendingOrRunningExecution = null;
+        }
+      });
+    } catch (error) {
+      console.error('Error fetching Agent Mode videos:', error);
+      // Don't fail the whole request if agent mode video fetching fails
+    }
+  }
+
   return result;
 }
 
@@ -1888,12 +2004,16 @@ router.post('/executions/:executionId/favorite-image', authenticateToken, async 
       return res.status(400).json({ message: 'Execution ID and image URL are required' });
     }
 
-    // Check if this is an agent mode image (executionId pattern: ${sessionId}-images)
+    // Check if this is an agent mode image or video (executionId pattern: ${sessionId}-images or ${sessionId}-videos)
     const isAgentModeImage = executionId.endsWith('-images');
-    const agentSessionId = isAgentModeImage ? executionId.replace('-images', '') : null;
+    const isAgentModeVideo = executionId.endsWith('-videos');
+    const isAgentModeAsset = isAgentModeImage || isAgentModeVideo;
+    const agentSessionId = isAgentModeAsset 
+      ? (isAgentModeImage ? executionId.replace('-images', '') : executionId.replace('-videos', ''))
+      : null;
 
     if (agentSessionId) {
-      // Handle agent mode image - update session favorites field
+      // Handle agent mode image or video - update session favorites field
       const chatbotDb = new ChatbotDB();
       const session = await chatbotDb.getChatSession(agentSessionId);
       
@@ -1998,12 +2118,16 @@ router.post('/executions/:executionId/archive-image', authenticateToken, async (
       return res.status(400).json({ message: 'Execution ID and image URL are required' });
     }
 
-    // Check if this is an agent mode image (executionId pattern: ${sessionId}-images)
+    // Check if this is an agent mode image or video (executionId pattern: ${sessionId}-images or ${sessionId}-videos)
     const isAgentModeImage = executionId.endsWith('-images');
-    const agentSessionId = isAgentModeImage ? executionId.replace('-images', '') : null;
+    const isAgentModeVideo = executionId.endsWith('-videos');
+    const isAgentModeAsset = isAgentModeImage || isAgentModeVideo;
+    const agentSessionId = isAgentModeAsset 
+      ? (isAgentModeImage ? executionId.replace('-images', '') : executionId.replace('-videos', ''))
+      : null;
 
     if (agentSessionId) {
-      // Handle agent mode image - update session archives field
+      // Handle agent mode image or video - update session archives field
       const chatbotDb = new ChatbotDB();
       const session = await chatbotDb.getChatSession(agentSessionId);
       

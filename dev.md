@@ -217,3 +217,6 @@ There was two outages in recent three days. To debug, I downloaded the full log 
 
 November 24, 2025
 Added oncall alert on Agentweb-backend-env-prod-3 env as it is currently the prod backend and most risky outage.
+
+December 02, 2025
+VEO 3.1 integration doc: https://ai.google.dev/gemini-api/docs/video?example=dialogue#javascript_2

@@ -407,7 +407,7 @@ export class ImageService {
       }
     });
     
-    let imageBuffer = Buffer.from(imageResponse.data as ArrayBuffer);
+    let imageBuffer: Buffer = Buffer.from(imageResponse.data as ArrayBuffer);
     let mimeType = this.getImageMimeType(imageUrl, imageResponse.headers['content-type'] as string);
     
     // Check if it's an SVG and convert to PNG

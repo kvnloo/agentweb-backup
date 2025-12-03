@@ -77,17 +77,14 @@ describe('SSE Progress Utility', () => {
       consoleErrorSpy.mockRestore();
     });
 
-    it('should log when no active connections exist', () => {
-      const consoleLogSpy = jest.spyOn(console, 'log').mockImplementation();
-
+    it('should silently handle progress when no active connections exist', () => {
+      // Emit progress without any registered callbacks
+      // Should not throw and should still store progress
       emitProgress(sessionId, mockProgress);
 
-      expect(consoleLogSpy).toHaveBeenCalledWith(
-        expect.stringContaining('No active connections'),
-        mockProgress
-      );
-
-      consoleLogSpy.mockRestore();
+      // Progress should still be stored even without active connections
+      const stored = getLatestProgress(sessionId);
+      expect(stored).toEqual(mockProgress);
     });
 
     it('should update progress store with latest progress', () => {
