@@ -222,34 +222,19 @@ describe('AgentModeService - generate_video function', () => {
 
   describe('Tool Definition', () => {
     it('should have generate_video tool registered', () => {
-      const tools = (agentModeService as any).tools;
-      if (!tools || !Array.isArray(tools)) {
-        // Tools might be a getter or computed property, try accessing it differently
-        const serviceTools = agentModeService.getTools ? agentModeService.getTools() : tools;
-        const generateVideoTool = Array.isArray(serviceTools) 
-          ? serviceTools.find((tool: any) => tool.function?.name === 'generate_video')
-          : undefined;
-        
-        if (generateVideoTool) {
-          expect(generateVideoTool.function.name).toBe('generate_video');
-          expect(generateVideoTool.function.parameters.properties.prompt).toBeDefined();
-          expect(generateVideoTool.function.parameters.properties.filename).toBeDefined();
-          expect(generateVideoTool.function.parameters.properties.startFrame).toBeDefined();
-          expect(generateVideoTool.function.parameters.properties.endFrame).toBeDefined();
-        } else {
-          // If we can't find it, just verify the method exists
-          expect((agentModeService as any).generateVideo).toBeDefined();
-        }
-      } else {
-        const generateVideoTool = tools.find((tool: any) => tool.function?.name === 'generate_video');
-        
-        expect(generateVideoTool).toBeDefined();
-        expect(generateVideoTool.function.name).toBe('generate_video');
-        expect(generateVideoTool.function.parameters.properties.prompt).toBeDefined();
-        expect(generateVideoTool.function.parameters.properties.filename).toBeDefined();
-        expect(generateVideoTool.function.parameters.properties.startFrame).toBeDefined();
-        expect(generateVideoTool.function.parameters.properties.endFrame).toBeDefined();
+      const tools = agentModeService.getAvailableTools();
+      const generateVideoTool = tools.find((tool: any) => tool.function?.name === 'generate_video');
+      
+      expect(generateVideoTool).toBeDefined();
+      if (!generateVideoTool) {
+        throw new Error('generate_video tool not found');
       }
+      
+      expect(generateVideoTool.function.name).toBe('generate_video');
+      expect(generateVideoTool.function.parameters.properties.prompt).toBeDefined();
+      expect(generateVideoTool.function.parameters.properties.filename).toBeDefined();
+      expect(generateVideoTool.function.parameters.properties.startFrame).toBeDefined();
+      expect(generateVideoTool.function.parameters.properties.endFrame).toBeDefined();
     });
   });
 });
