@@ -500,10 +500,10 @@ export const AgentModeSessionGrowthChart: React.FC<AgentModeSessionGrowthChartPr
         labels = timeSeriesData.labels;
         // Split generated data proportionally (rough estimate)
         const scheduledRatio = (data.totalScheduledSessions || 0) / Math.max(data.totalSessions, 1);
-        scheduledData = timeSeriesData.data.map((val, idx) => 
+        scheduledData = timeSeriesData.data.map((val) => 
           Math.round(val * scheduledRatio)
         );
-        nonScheduledData = timeSeriesData.data.map((val, idx) => 
+        nonScheduledData = timeSeriesData.data.map((val) => 
           Math.round(val * (1 - scheduledRatio))
         );
       }

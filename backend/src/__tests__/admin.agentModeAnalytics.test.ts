@@ -192,7 +192,7 @@ describe('Admin Agent Mode Analytics', () => {
     const mockSessions: ChatSession[] = [
       createMockSession({
         messages: [
-          { role: 'user', content: 'Message 1', metadata: { attachments: [{ url: 'test.jpg', filename: 'test.jpg', size: 100, mimetype: 'image/jpeg', uploadedAt: new Date().toISOString() }] } },
+          { role: 'user', content: 'Message 1', metadata: { timestamp: new Date().toISOString(), attachments: [{ url: 'test.jpg', filename: 'test.jpg', size: 100, mimetype: 'image/jpeg', uploadedAt: new Date().toISOString() }] } },
           { role: 'assistant', content: 'Response 1' },
           { role: 'user', content: 'Message 2' },
         ],
@@ -200,7 +200,7 @@ describe('Admin Agent Mode Analytics', () => {
       createMockSession({
         messages: [
           { role: 'user', content: 'Message 3' },
-          { role: 'assistant', content: 'Response 2', tool_calls: [{ id: '1', function: { name: 'search_web' } }], usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 } },
+          { role: 'assistant', content: 'Response 2', tool_calls: [{ id: '1', function: { name: 'search_web' } }], usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150, estimated_cost: 0.001 } },
         ],
       }),
     ];
