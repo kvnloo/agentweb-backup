@@ -6291,8 +6291,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
     imageModel?: string
   ): Promise<any> {
     try {
-      console.log('AgentMode: Generating image with prompt:', prompt, 'filename:', filename, 'size:', size, 'quality:', quality, 'inputImages:', inputImages, 'imageModel:', imageModel, 'userId:', userId, 'sessionId:', sessionId);
-
       // Import the image generation service
       const { imageService } = await import('./imageGeneration');
 

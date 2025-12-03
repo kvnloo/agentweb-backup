@@ -749,14 +749,6 @@ async function generateSessionResponse(
       attachments: attachments || []
     }
   };
-  
-  // Log attachments being saved to message
-  console.log('AgentMode generateSessionResponse: Received attachments parameter:', attachments ? attachments.length : 0, attachments);
-  if (attachments && attachments.length > 0) {
-    console.log('AgentMode generateSessionResponse: Adding attachments to message:', attachments.length, attachments.map((a: any) => ({ url: a.url, filename: a.filename, size: a.size })));
-  } else {
-    console.log('AgentMode generateSessionResponse: No attachments to add (attachments is', attachments, ')');
-  }
 
   // Check if this is the first user message (excluding system message)
   const userMessages = session.messages?.filter(msg => msg.role === 'user') || [];
