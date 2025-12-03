@@ -121,6 +121,10 @@ router.post('/verified-generate', asyncHandler(agentModeController.verifiedGener
 // Upload file attachment for Agent Mode
 router.post('/upload', upload.single('file'), asyncHandler(agentModeController.uploadAttachment));
 
+// POST /api/agent-mode/sessions/:sessionId/upload-image
+// Upload image directly to Agent Mode session (stores in session metadata)
+router.post('/sessions/:sessionId/upload-image', upload.single('file'), asyncHandler(agentModeController.uploadImageToSession));
+
 // GET /api/agent-mode/system-prompt
 // Get current system prompt (admin only)
 router.get('/system-prompt', requireAdmin, asyncHandler(agentModeController.getSystemPrompt));

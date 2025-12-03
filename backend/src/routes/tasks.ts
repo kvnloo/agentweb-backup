@@ -1717,11 +1717,11 @@ async function getExecutionsWithAssets(
           return;
         }
         
-        // Search through messages for generate_image tool calls
+        // Search through messages for generate_image and upload_image tool calls
         session.messages.forEach((message: any) => {
           if (message.metadata?.toolCalls) {
             message.metadata.toolCalls.forEach((toolCall: any) => {
-              if (toolCall.name === 'generate_image' && toolCall.result?.success && toolCall.result?.imageUrl) {
+              if ((toolCall.name === 'generate_image' || toolCall.name === 'upload_image') && toolCall.result?.success && toolCall.result?.imageUrl) {
                 const imageUrl = toolCall.result.imageUrl;
                 const filename = toolCall.result.filename || 'generated-image.png';
                 
