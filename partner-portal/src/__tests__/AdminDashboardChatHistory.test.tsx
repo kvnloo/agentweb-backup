@@ -7,6 +7,7 @@ describe('AdminDashboard - Chat History Session Type Display', () => {
     if (sessionType === 'predefined-work-plan') return 'Predefined Work Plan';
     if (sessionType === 'scheduled') return 'Scheduled';
     if (sessionType === 'image-generation') return 'Image Generation';
+    if (sessionType === 'video-generation') return 'Video Generation';
     return 'Regular';
   };
 
@@ -14,6 +15,7 @@ describe('AdminDashboard - Chat History Session Type Display', () => {
     if (sessionType === 'predefined-work-plan') return 'primary';
     if (sessionType === 'scheduled') return 'secondary';
     if (sessionType === 'image-generation') return 'success';
+    if (sessionType === 'video-generation') return 'info';
     return 'default';
   };
 
@@ -35,6 +37,11 @@ describe('AdminDashboard - Chat History Session Type Display', () => {
   it('should return "Image Generation" for image-generation sessionType', () => {
     expect(getSessionTypeLabel('image-generation')).toBe('Image Generation');
     expect(getSessionTypeColor('image-generation')).toBe('success');
+  });
+
+  it('should return "Video Generation" for video-generation sessionType', () => {
+    expect(getSessionTypeLabel('video-generation')).toBe('Video Generation');
+    expect(getSessionTypeColor('video-generation')).toBe('info');
   });
 
   it('should return "Undefined" for undefined sessionType', () => {
