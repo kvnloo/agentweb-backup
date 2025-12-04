@@ -3217,6 +3217,40 @@ export const crmDb = {
     }
   },
 
+  async getLeadEngagementCount(listId: string, leadId: string, userId: string): Promise<number> {
+    try {
+      // Get the lead
+      const lead = await this.getLeadById(listId, leadId);
+      if (!lead) {
+        return 0;
+      }
+
+      let count = 0;
+
+      // Count manual engagements
+      const manualEngagements = (lead.engagements as Array<{ eventType: string; eventData: any; createdAt: string }>) || [];
+      count += manualEngagements.length;
+
+      // Count email events if user has email domain configured
+      const user = await userDb.getUserById(userId);
+      if (user && user.emailDomain) {
+        const emailEventsDb = require('./emailEventsDb').emailEventsDb;
+        const leadEmail = lead.email?.toLowerCase();
+        
+        if (leadEmail) {
+          // Use optimized query with composite GSI (EmailDomainLeadEmailIndex)
+          const filteredEvents = await emailEventsDb.getEventsByEmailDomainAndLeadEmail(user.emailDomain, leadEmail);
+          count += filteredEvents.length;
+        }
+      }
+
+      return count;
+    } catch (error) {
+      console.error('Error counting lead engagements:', error);
+      return 0; // Return 0 on error to avoid breaking the UI
+    }
+  },
+
   async getLeadEngagements(listId: string, leadId: string, userId: string) {
     try {
       // Get the lead

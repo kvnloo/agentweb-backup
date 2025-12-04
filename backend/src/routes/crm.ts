@@ -245,12 +245,23 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
 
     const result = await crmDb.getLeadsByListId(listId, validLimit, lastEvaluatedKey);
     
+    // Add engagement counts to each lead
+    const leadsWithCounts = await Promise.all(
+      result.items.map(async (lead: any) => {
+        const engagementCount = await crmDb.getLeadEngagementCount(listId, lead.leadId, userId);
+        return {
+          ...lead,
+          engagementCount,
+        };
+      })
+    );
+    
     // Calculate total pages (approximate - we don't know the exact total without scanning all)
     // For now, we'll indicate if there are more pages
     const totalPages = result.hasMore ? validPage + 1 : validPage;
 
     res.json({
-      leads: result.items,
+      leads: leadsWithCounts,
       page: validPage,
       limit: validLimit,
       totalPages: result.hasMore ? null : validPage, // null means unknown total
