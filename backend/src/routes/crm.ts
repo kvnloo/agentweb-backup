@@ -191,14 +191,18 @@ router.delete('/lists/:listId', async (req: Request, res: Response) => {
 
 /**
  * @route GET /api/crm/lists/:listId/leads
- * @desc Get all leads in a list
+ * @desc Get leads in a list with pagination
  * @access Private
+ * @query page - Page number (default: 1, 1-indexed)
+ * @query limit - Number of items per page (default: 50, max: 100)
  */
 router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
+    const page = req.query.page ? parseInt(req.query.page as string, 10) : 1;
+    const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 50;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -214,8 +218,44 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    const leads = await crmDb.getLeadsByListId(listId);
-    res.json(leads);
+    // Validate inputs
+    const validPage = Math.max(1, page);
+    const validLimit = Math.min(Math.max(1, limit), 100); // Between 1 and 100
+
+    // For page-based pagination, we need to fetch all previous pages to get to the desired page
+    // This is not ideal for DynamoDB but necessary for page number navigation
+    let lastEvaluatedKey = undefined;
+    if (validPage > 1) {
+      // Fetch pages 1 through (page - 1) to get the cursor for the desired page
+      for (let p = 1; p < validPage; p++) {
+        const prevResult = await crmDb.getLeadsByListId(listId, validLimit, lastEvaluatedKey);
+        lastEvaluatedKey = prevResult.lastEvaluatedKey;
+        if (!lastEvaluatedKey) {
+          // We've reached the end, return empty results
+          return res.json({
+            leads: [],
+            page: validPage,
+            limit: validLimit,
+            totalPages: p,
+            hasMore: false,
+          });
+        }
+      }
+    }
+
+    const result = await crmDb.getLeadsByListId(listId, validLimit, lastEvaluatedKey);
+    
+    // Calculate total pages (approximate - we don't know the exact total without scanning all)
+    // For now, we'll indicate if there are more pages
+    const totalPages = result.hasMore ? validPage + 1 : validPage;
+
+    res.json({
+      leads: result.items,
+      page: validPage,
+      limit: validLimit,
+      totalPages: result.hasMore ? null : validPage, // null means unknown total
+      hasMore: result.hasMore,
+    });
   } catch (error: any) {
     console.error('Error fetching leads:', error);
     res.status(500).json({ message: error.message || 'Failed to fetch leads' });

@@ -2664,11 +2664,19 @@ export const crmDb = {
   async deleteLeadList(listId: string) {
     try {
       // First, delete all leads in this list
-      const leads = await this.getLeadsByListId(listId);
-      if (leads.length > 0) {
+      // Fetch all leads to delete (paginate through them)
+      const allLeads: any[] = [];
+      let lastKey = undefined;
+      do {
+        const result = await this.getLeadsByListId(listId, 100, lastKey);
+        allLeads.push(...result.items);
+        lastKey = result.lastEvaluatedKey;
+      } while (lastKey);
+
+      if (allLeads.length > 0) {
         const batchSize = 25;
-        for (let i = 0; i < leads.length; i += batchSize) {
-          const batch = leads.slice(i, i + batchSize);
+        for (let i = 0; i < allLeads.length; i += batchSize) {
+          const batch = allLeads.slice(i, i + batchSize);
           const deleteRequests = batch.map(lead => ({
             DeleteRequest: {
               Key: {
@@ -2838,9 +2846,9 @@ export const crmDb = {
     }
   },
 
-  async getLeadsByListId(listId: string) {
+  async getLeadsByListId(listId: string, limit?: number, lastEvaluatedKey?: any) {
     try {
-      const params = {
+      const params: any = {
         TableName: `${TABLE_PREFIX}AW-Leads`,
         KeyConditionExpression: 'listId = :listId',
         ExpressionAttributeValues: {
@@ -2848,8 +2856,20 @@ export const crmDb = {
         },
       };
 
+      if (limit !== undefined && limit > 0) {
+        params.Limit = limit;
+      }
+
+      if (lastEvaluatedKey) {
+        params.ExclusiveStartKey = lastEvaluatedKey;
+      }
+
       const result = await dynamodb.query(params).promise();
-      return result.Items || [];
+      return {
+        items: result.Items || [],
+        lastEvaluatedKey: result.LastEvaluatedKey || null,
+        hasMore: !!result.LastEvaluatedKey,
+      };
     } catch (error) {
       handleDynamoDbError(error, "getLeadsByListId");
       throw error;
@@ -3054,9 +3074,17 @@ export const crmDb = {
       };
 
       // Get existing leads to check for duplicates by email
-      const existingLeads = await this.getLeadsByListId(listId);
+      // Note: We need to fetch all existing leads, so we'll paginate through them
+      const allExistingLeads: any[] = [];
+      let lastKey = undefined;
+      do {
+        const result = await this.getLeadsByListId(listId, 100, lastKey);
+        allExistingLeads.push(...result.items);
+        lastKey = result.lastEvaluatedKey;
+      } while (lastKey);
+
       const existingEmails = new Set(
-        existingLeads
+        allExistingLeads
           .filter(lead => lead.email && lead.email.trim())
           .map(lead => lead.email.trim().toLowerCase())
       );
