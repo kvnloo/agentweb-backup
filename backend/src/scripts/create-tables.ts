@@ -977,7 +977,7 @@ const createLeadsTable = async () => {
     AttributeDefinitions: [
       { AttributeName: 'listId', AttributeType: 'S' },
       { AttributeName: 'leadId', AttributeType: 'S' },
-      { AttributeName: 'uniqueIdentifier', AttributeType: 'S' }
+      { AttributeName: 'email', AttributeType: 'S' }
     ],
     KeySchema: [
       { AttributeName: 'listId', KeyType: 'HASH' },
@@ -985,10 +985,10 @@ const createLeadsTable = async () => {
     ],
     GlobalSecondaryIndexes: [
       {
-        IndexName: 'uniqueIdentifier-index',
+        IndexName: 'email-index',
         KeySchema: [
           { AttributeName: 'listId', KeyType: 'HASH' },
-          { AttributeName: 'uniqueIdentifier', KeyType: 'RANGE' }
+          { AttributeName: 'email', KeyType: 'RANGE' }
         ],
         Projection: {
           ProjectionType: 'ALL'

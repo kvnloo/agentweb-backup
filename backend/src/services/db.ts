@@ -2781,7 +2781,7 @@ export const crmDb = {
         Item: {
           listId,
           leadId,
-          email: leadData.email?.trim() || '',
+          email: leadData.email?.trim().toLowerCase() || '',
           firstName: leadData.firstName || '',
           lastName: leadData.lastName || '',
           phone: leadData.phone || '',
@@ -2869,9 +2869,19 @@ export const crmDb = {
 
   async getLeadByEmail(listId: string, email: string) {
     try {
-      // Query all leads in the list and filter by email (case-insensitive)
-      const leads = await this.getLeadsByListId(listId);
-      return leads.find(lead => lead.email?.toLowerCase() === email.toLowerCase()) || null;
+      // Use email-index GSI to query by listId and email
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        IndexName: 'email-index',
+        KeyConditionExpression: 'listId = :listId AND email = :email',
+        ExpressionAttributeValues: {
+          ':listId': listId,
+          ':email': email.toLowerCase().trim(),
+        },
+      };
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items && result.Items.length > 0 ? result.Items[0] : null;
     } catch (error) {
       handleDynamoDbError(error, "getLeadByEmail");
       throw error;
@@ -2895,7 +2905,7 @@ export const crmDb = {
 
       if (updates.email !== undefined) {
         updateExpressions.push('email = :email');
-        expressionAttributeValues[':email'] = updates.email;
+        expressionAttributeValues[':email'] = updates.email.trim().toLowerCase();
       }
 
       if (updates.firstName !== undefined) {
@@ -3080,7 +3090,7 @@ export const crmDb = {
               Item: {
                 listId,
                 leadId,
-                email: lead.email?.trim() || '',
+                email: lead.email?.trim().toLowerCase() || '',
                 firstName: lead.firstName || '',
                 lastName: lead.lastName || '',
                 phone: lead.phone || '',
