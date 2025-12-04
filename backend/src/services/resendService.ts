@@ -1,5 +1,6 @@
 import { Resend } from 'resend';
 import { getSecret } from '../utils/secretsManager';
+import axios from 'axios';
 
 class ResendService {
   private resend: Resend | null = null;
@@ -128,6 +129,71 @@ class ResendService {
     }
 
     return result;
+  }
+
+  /**
+   * Fetch email content for a received email
+   * @param emailId The email ID from the email.received event
+   * @returns Email content including html, text, and headers, or null if failed
+   */
+  async getReceivedEmailContent(emailId: string): Promise<{
+    html?: string;
+    text?: string;
+    headers?: Record<string, string>;
+  } | null> {
+    await this.initializeResend();
+    
+    if (!this.apiKey) {
+      console.error('Resend API key not available');
+      return null;
+    }
+
+    if (!emailId) {
+      console.error('Email ID is required to fetch email content');
+      return null;
+    }
+
+    // Use direct REST API call since the SDK may not have receiving API
+    const result = await this.retryWithBackoff(
+      async () => {
+        try {
+          const response = await axios.get(
+            `https://api.resend.com/emails/receiving/${emailId}`,
+            {
+              headers: {
+                'Authorization': `Bearer ${this.apiKey}`,
+                'Content-Type': 'application/json',
+              },
+            }
+          );
+          
+          return response.data;
+        } catch (error: any) {
+          if (error.response) {
+            // The request was made and the server responded with a status code
+            // that falls out of the range of 2xx
+            throw new Error(`Resend API error: ${error.response.status} - ${JSON.stringify(error.response.data)}`);
+          } else if (error.request) {
+            // The request was made but no response was received
+            throw new Error(`Resend API error: No response received - ${error.message}`);
+          } else {
+            // Something happened in setting up the request
+            throw new Error(`Resend API error: ${error.message}`);
+          }
+        }
+      },
+      `Fetch email content for ${emailId}`
+    );
+
+    if (result) {
+      return {
+        html: result.html || undefined,
+        text: result.text || undefined,
+        headers: result.headers || undefined,
+      };
+    }
+
+    return null;
   }
 
 }

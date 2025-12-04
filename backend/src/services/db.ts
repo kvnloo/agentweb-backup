@@ -3244,12 +3244,37 @@ export const crmDb = {
         : [];
 
       // Transform email events to engagement format
-      const emailEngagements = filteredEvents.map((event: any) => ({
-        eventType: event.eventType,
-        eventData: event.data,
-        createdAt: event.createdAt,
-        source: 'email', // Mark as email event
-      }));
+      // For email.received events, fetch the email content
+      const emailEngagements = await Promise.all(
+        filteredEvents.map(async (event: any) => {
+          const baseEngagement = {
+            eventType: event.eventType,
+            eventData: event.data,
+            createdAt: event.createdAt,
+            source: 'email' as const, // Mark as email event
+          };
+
+          // For email.received events, fetch the email content
+          if (event.eventType === 'email.received' && event.data?.email_id) {
+            try {
+              const resendService = require('./resendService').resendService;
+              const emailContent = await resendService.getReceivedEmailContent(event.data.email_id);
+              
+              if (emailContent) {
+                return {
+                  ...baseEngagement,
+                  emailContent, // Add html, text, and headers
+                };
+              }
+            } catch (error) {
+              console.error(`Failed to fetch email content for ${event.data.email_id}:`, error);
+              // Continue without email content if fetch fails
+            }
+          }
+
+          return baseEngagement;
+        })
+      );
 
       // Get lead engagements
       const leadEngagements = ((lead.engagements as Array<{ eventId?: string; eventType: string; eventData: any; createdAt: string }>) || []).map((eng: any) => ({
