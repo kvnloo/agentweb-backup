@@ -2796,6 +2796,7 @@ export const crmDb = {
         notes: leadData.notes || '',
         linkedin: leadData.linkedin?.trim() || '',
         customFields: leadData.customFields || {},
+        engagements: [], // Initialize with empty array
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
@@ -3139,6 +3140,7 @@ export const crmDb = {
             notes: lead.notes || '',
             linkedin: lead.linkedin?.trim() || '',
             customFields: lead.customFields || {},
+            engagements: [], // Initialize with empty array
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
           };
@@ -3212,6 +3214,207 @@ export const crmDb = {
         errorCount: leads.length,
         errors: [`Batch upload failed: ${error.message}`],
       };
+    }
+  },
+
+  async getLeadEngagements(listId: string, leadId: string, userId: string) {
+    try {
+      // Get the lead
+      const lead = await this.getLeadById(listId, leadId);
+      if (!lead) {
+        throw new Error('Lead not found');
+      }
+
+      // Get user to get emailDomain
+      const user = await userDb.getUserById(userId);
+      if (!user || !user.emailDomain) {
+        // Return only lead engagements if no email domain configured
+        return {
+          engagements: (lead.engagements as Array<{ eventType: string; eventData: any; createdAt: string }>) || [],
+        };
+      }
+
+      // Get email events from AW-EmailEvents filtered by domain and lead email
+      const emailEventsDb = require('./emailEventsDb').emailEventsDb;
+      const leadEmail = lead.email?.toLowerCase();
+      
+      // Use optimized query with composite GSI (EmailDomainLeadEmailIndex)
+      const filteredEvents = leadEmail
+        ? await emailEventsDb.getEventsByEmailDomainAndLeadEmail(user.emailDomain, leadEmail)
+        : [];
+
+      // Transform email events to engagement format
+      const emailEngagements = filteredEvents.map((event: any) => ({
+        eventType: event.eventType,
+        eventData: event.data,
+        createdAt: event.createdAt,
+        source: 'email', // Mark as email event
+      }));
+
+      // Get lead engagements
+      const leadEngagements = ((lead.engagements as Array<{ eventId?: string; eventType: string; eventData: any; createdAt: string }>) || []).map((eng: any) => ({
+        ...eng,
+        source: 'manual', // Mark as manual engagement
+        // eventId is already included in eng if it exists
+      }));
+
+      // Combine and sort by createdAt (newest first)
+      const allEngagements = [...emailEngagements, ...leadEngagements].sort((a, b) => {
+        const dateA = new Date(a.createdAt).getTime();
+        const dateB = new Date(b.createdAt).getTime();
+        return dateB - dateA; // Descending order
+      });
+
+      return {
+        engagements: allEngagements,
+      };
+    } catch (error) {
+      handleDynamoDbError(error, "getLeadEngagements");
+      throw error;
+    }
+  },
+
+  async addLeadEngagement(listId: string, leadId: string, engagement: {
+    eventType: string;
+    eventData: any;
+    createdAt: string;
+  }) {
+    try {
+      // Get the lead first to ensure it exists
+      const lead = await this.getLeadById(listId, leadId);
+      if (!lead) {
+        throw new Error('Lead not found');
+      }
+
+      // Generate a unique eventId for this engagement
+      const eventId = `custom_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+      // Add eventId to the engagement
+      const engagementWithId = {
+        ...engagement,
+        eventId,
+      };
+
+      // Get existing engagements or initialize empty array
+      const existingEngagements = (lead.engagements as Array<{ eventId?: string; eventType: string; eventData: any; createdAt: string }>) || [];
+
+      // Add the new engagement
+      const updatedEngagements = [...existingEngagements, engagementWithId];
+
+      // Update the lead with the new engagements array
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: {
+          listId,
+          leadId,
+        },
+        UpdateExpression: 'SET engagements = :engagements, updatedAt = :updatedAt',
+        ExpressionAttributeValues: {
+          ':engagements': updatedEngagements,
+          ':updatedAt': new Date().toISOString(),
+        },
+        ReturnValues: 'ALL_NEW',
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "addLeadEngagement");
+      throw error;
+    }
+  },
+
+  async updateLeadEngagement(listId: string, leadId: string, eventId: string, engagement: {
+    eventType: string;
+    eventData: any;
+    createdAt: string;
+  }) {
+    try {
+      // Get the lead first to ensure it exists
+      const lead = await this.getLeadById(listId, leadId);
+      if (!lead) {
+        throw new Error('Lead not found');
+      }
+
+      // Get existing engagements or initialize empty array
+      const existingEngagements = (lead.engagements as Array<{ eventId?: string; eventType: string; eventData: any; createdAt: string }>) || [];
+
+      // Find the engagement by eventId
+      const engagementIndex = existingEngagements.findIndex((eng) => eng.eventId === eventId);
+      
+      if (engagementIndex === -1) {
+        throw new Error('Engagement not found');
+      }
+
+      // Update the engagement while preserving the eventId
+      const updatedEngagements = [...existingEngagements];
+      updatedEngagements[engagementIndex] = {
+        ...engagement,
+        eventId, // Preserve the original eventId
+      };
+
+      // Update the lead with the updated engagements array
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: {
+          listId,
+          leadId,
+        },
+        UpdateExpression: 'SET engagements = :engagements, updatedAt = :updatedAt',
+        ExpressionAttributeValues: {
+          ':engagements': updatedEngagements,
+          ':updatedAt': new Date().toISOString(),
+        },
+        ReturnValues: 'ALL_NEW',
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "updateLeadEngagement");
+      throw error;
+    }
+  },
+
+  async deleteLeadEngagement(listId: string, leadId: string, eventId: string) {
+    try {
+      // Get the lead first to ensure it exists
+      const lead = await this.getLeadById(listId, leadId);
+      if (!lead) {
+        throw new Error('Lead not found');
+      }
+
+      // Get existing engagements or initialize empty array
+      const existingEngagements = (lead.engagements as Array<{ eventId?: string; eventType: string; eventData: any; createdAt: string }>) || [];
+
+      // Find and remove the matching engagement by eventId
+      const updatedEngagements = existingEngagements.filter((eng) => eng.eventId !== eventId);
+
+      // Check if we actually removed something
+      if (updatedEngagements.length === existingEngagements.length) {
+        throw new Error('Engagement not found');
+      }
+
+      // Update the lead with the updated engagements array
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: {
+          listId,
+          leadId,
+        },
+        UpdateExpression: 'SET engagements = :engagements, updatedAt = :updatedAt',
+        ExpressionAttributeValues: {
+          ':engagements': updatedEngagements,
+          ':updatedAt': new Date().toISOString(),
+        },
+        ReturnValues: 'ALL_NEW',
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "deleteLeadEngagement");
+      throw error;
     }
   },
 };

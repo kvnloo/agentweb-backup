@@ -21,8 +21,16 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
 
     console.log(`Received Resend webhook: ${event.type} for email ${event.data.email_id}`);
 
-    // Extract email domain from the 'from' field
-    const emailDomain = webhookService.extractEmailDomain(event.data.from);
+    // Extract email domain
+    // For email.received events, extract from data.to[0] (the recipient is the domain)
+    // For all other events, extract from data.from (the sender is the domain)
+    let emailDomain: string;
+    if (event.type === 'email.received') {
+      const recipient = Array.isArray(event.data.to) ? event.data.to[0] : event.data.to;
+      emailDomain = webhookService.extractEmailDomain(recipient);
+    } else {
+      emailDomain = webhookService.extractEmailDomain(event.data.from);
+    }
 
     // Generate deterministic event ID for deduplication
     const eventId = webhookService.generateEventId(event);
@@ -60,6 +68,10 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
       
       case 'email.opened':
         console.log(`Email opened: ${event.data.email_id}`);
+        break;
+      
+      case 'email.received':
+        console.log(`Email received: ${event.data.email_id} from ${event.data.from} to ${Array.isArray(event.data.to) ? event.data.to.join(', ') : event.data.to}`);
         break;
       
       default:

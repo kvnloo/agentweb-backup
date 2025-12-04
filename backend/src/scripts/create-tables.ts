@@ -778,7 +778,8 @@ const createEmailEventsTable = async () => {
     AttributeDefinitions: [
       { AttributeName: 'eventId', AttributeType: 'S' },
       { AttributeName: 'emailId', AttributeType: 'S' },
-      { AttributeName: 'emailDomain', AttributeType: 'S' }
+      { AttributeName: 'emailDomain', AttributeType: 'S' },
+      { AttributeName: 'leadEmail', AttributeType: 'S' }
     ],
     GlobalSecondaryIndexes: [
       {
@@ -798,6 +799,20 @@ const createEmailEventsTable = async () => {
         IndexName: 'EmailDomainIndex',
         KeySchema: [
           { AttributeName: 'emailDomain', KeyType: 'HASH' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5
+        }
+      },
+      {
+        IndexName: 'EmailDomainLeadEmailIndex',
+        KeySchema: [
+          { AttributeName: 'emailDomain', KeyType: 'HASH' },
+          { AttributeName: 'leadEmail', KeyType: 'RANGE' }
         ],
         Projection: {
           ProjectionType: 'ALL'

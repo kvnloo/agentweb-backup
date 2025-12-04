@@ -519,5 +519,169 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
   }
 });
 
+/**
+ * @route GET /api/crm/lists/:listId/leads/:leadId/engagements
+ * @desc Get engagements for a lead
+ * @access Private
+ */
+router.get('/lists/:listId/leads/:leadId/engagements', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId, leadId } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Verify list ownership
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const result = await crmDb.getLeadEngagements(listId, leadId, userId);
+    res.json(result);
+  } catch (error: any) {
+    console.error('Error fetching lead engagements:', error);
+    res.status(500).json({ message: error.message || 'Failed to fetch lead engagements' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/leads/:leadId/engagements
+ * @desc Add a custom engagement event to a lead
+ * @access Private
+ */
+router.post('/lists/:listId/leads/:leadId/engagements', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId, leadId } = req.params;
+    const { eventType, eventData, createdAt } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!eventType || !createdAt) {
+      return res.status(400).json({ message: 'eventType and createdAt are required' });
+    }
+
+    // Verify eventType starts with "custom."
+    if (!eventType.startsWith('custom.')) {
+      return res.status(400).json({ message: 'Event type must start with "custom."' });
+    }
+
+    // Verify list ownership
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const engagement = {
+      eventType,
+      eventData: eventData || {},
+      createdAt,
+    };
+
+    const updatedLead = await crmDb.addLeadEngagement(listId, leadId, engagement);
+    res.json({ success: true, lead: updatedLead });
+  } catch (error: any) {
+    console.error('Error adding lead engagement:', error);
+    res.status(500).json({ message: error.message || 'Failed to add lead engagement' });
+  }
+});
+
+/**
+ * @route PUT /api/crm/lists/:listId/leads/:leadId/engagements/:eventId
+ * @desc Update a custom engagement event for a lead
+ * @access Private
+ */
+router.put('/lists/:listId/leads/:leadId/engagements/:eventId', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId, leadId, eventId } = req.params;
+    const { eventType, eventData, createdAt } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!eventType || !createdAt) {
+      return res.status(400).json({ message: 'eventType and createdAt are required' });
+    }
+
+    // Verify eventType starts with "custom."
+    if (!eventType.startsWith('custom.')) {
+      return res.status(400).json({ message: 'Event type must start with "custom."' });
+    }
+
+    // Verify list ownership
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const engagement = {
+      eventType,
+      eventData: eventData || {},
+      createdAt,
+    };
+
+    const updatedLead = await crmDb.updateLeadEngagement(listId, leadId, eventId, engagement);
+    res.json({ success: true, lead: updatedLead });
+  } catch (error: any) {
+    console.error('Error updating lead engagement:', error);
+    res.status(500).json({ message: error.message || 'Failed to update lead engagement' });
+  }
+});
+
+/**
+ * @route DELETE /api/crm/lists/:listId/leads/:leadId/engagements/:eventId
+ * @desc Delete a custom engagement event from a lead
+ * @access Private
+ */
+router.delete('/lists/:listId/leads/:leadId/engagements/:eventId', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId, leadId, eventId } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Verify list ownership
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const updatedLead = await crmDb.deleteLeadEngagement(listId, leadId, eventId);
+    res.json({ success: true, lead: updatedLead });
+  } catch (error: any) {
+    console.error('Error deleting lead engagement:', error);
+    res.status(500).json({ message: error.message || 'Failed to delete lead engagement' });
+  }
+});
+
 export default router;
 
