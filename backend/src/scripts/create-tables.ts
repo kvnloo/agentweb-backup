@@ -926,6 +926,97 @@ const createGTMPlansTable = async () => {
   }
 };
 
+// Create Lead Lists table
+const createLeadListsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-LeadLists`,
+    AttributeDefinitions: [
+      { AttributeName: 'listId', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'listId', KeyType: 'HASH' }
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'userId-index',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5
+        }
+      }
+    ],
+    ProvisionedThroughput: {
+      ReadCapacityUnits: 5,
+      WriteCapacityUnits: 5
+    }
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// Create Leads table
+const createLeadsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-Leads`,
+    AttributeDefinitions: [
+      { AttributeName: 'listId', AttributeType: 'S' },
+      { AttributeName: 'leadId', AttributeType: 'S' },
+      { AttributeName: 'uniqueIdentifier', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'listId', KeyType: 'HASH' },
+      { AttributeName: 'leadId', KeyType: 'RANGE' }
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'uniqueIdentifier-index',
+        KeySchema: [
+          { AttributeName: 'listId', KeyType: 'HASH' },
+          { AttributeName: 'uniqueIdentifier', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5
+        }
+      }
+    ],
+    ProvisionedThroughput: {
+      ReadCapacityUnits: 5,
+      WriteCapacityUnits: 5
+    }
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 const main = async () => {
   try {
     console.log(`Creating tables for environment: ${process.env.NODE_ENV || 'production'}`);
@@ -946,6 +1037,8 @@ const main = async () => {
     await createEmailEventsTable();
     await createBenchmarkTestsTable();
     await createGTMPlansTable();
+    await createLeadListsTable();
+    await createLeadsTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
