@@ -2776,23 +2776,30 @@ export const crmDb = {
         }
       }
 
+      const emailValue = leadData.email?.trim().toLowerCase();
+      const item: any = {
+        listId,
+        leadId,
+        firstName: leadData.firstName || '',
+        lastName: leadData.lastName || '',
+        phone: leadData.phone || '',
+        company: leadData.company || '',
+        title: leadData.title || '',
+        notes: leadData.notes || '',
+        linkedin: leadData.linkedin?.trim() || '',
+        customFields: leadData.customFields || {},
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      
+      // Only include email if it's provided (GSI key cannot be empty string)
+      if (emailValue) {
+        item.email = emailValue;
+      }
+
       const params = {
         TableName: `${TABLE_PREFIX}AW-Leads`,
-        Item: {
-          listId,
-          leadId,
-          email: leadData.email?.trim().toLowerCase() || '',
-          firstName: leadData.firstName || '',
-          lastName: leadData.lastName || '',
-          phone: leadData.phone || '',
-          company: leadData.company || '',
-          title: leadData.title || '',
-          notes: leadData.notes || '',
-          linkedin: leadData.linkedin?.trim() || '',
-          customFields: leadData.customFields || {},
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        },
+        Item: item,
       };
 
       await dynamodb.put(params).promise();
@@ -2904,8 +2911,15 @@ export const crmDb = {
       const expressionAttributeValues: any = {};
 
       if (updates.email !== undefined) {
-        updateExpressions.push('email = :email');
-        expressionAttributeValues[':email'] = updates.email.trim().toLowerCase();
+        const emailValue = updates.email.trim().toLowerCase();
+        if (emailValue) {
+          // Only set email if it's not empty (GSI key cannot be empty string)
+          updateExpressions.push('email = :email');
+          expressionAttributeValues[':email'] = emailValue;
+        } else {
+          // Remove email attribute if it's being set to empty
+          updateExpressions.push('REMOVE email');
+        }
       }
 
       if (updates.firstName !== undefined) {
@@ -3084,24 +3098,31 @@ export const crmDb = {
         
         const writeRequests = batch.map(lead => {
           const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+          const emailValue = lead.email?.trim().toLowerCase();
+          
+          const item: any = {
+            listId,
+            leadId,
+            firstName: lead.firstName || '',
+            lastName: lead.lastName || '',
+            phone: lead.phone || '',
+            company: lead.company || '',
+            title: lead.title || '',
+            notes: lead.notes || '',
+            linkedin: lead.linkedin?.trim() || '',
+            customFields: lead.customFields || {},
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          };
+          
+          // Only include email if it's provided (GSI key cannot be empty string)
+          if (emailValue) {
+            item.email = emailValue;
+          }
           
           return {
             PutRequest: {
-              Item: {
-                listId,
-                leadId,
-                email: lead.email?.trim().toLowerCase() || '',
-                firstName: lead.firstName || '',
-                lastName: lead.lastName || '',
-                phone: lead.phone || '',
-                company: lead.company || '',
-                title: lead.title || '',
-                notes: lead.notes || '',
-                linkedin: lead.linkedin?.trim() || '',
-                customFields: lead.customFields || {},
-                createdAt: new Date().toISOString(),
-                updatedAt: new Date().toISOString(),
-              },
+              Item: item,
             },
           };
         });
