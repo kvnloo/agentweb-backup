@@ -3217,19 +3217,31 @@ export const crmDb = {
     }
   },
 
-  async getLeadEngagementCount(listId: string, leadId: string, userId: string): Promise<number> {
+  async getLeadEngagementCount(listId: string, leadId: string, userId: string): Promise<{ total: number; last7Days: number }> {
     try {
       // Get the lead
       const lead = await this.getLeadById(listId, leadId);
       if (!lead) {
-        return 0;
+        return { total: 0, last7Days: 0 };
       }
 
-      let count = 0;
+      const now = new Date();
+      const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+      let totalCount = 0;
+      let last7DaysCount = 0;
 
       // Count manual engagements
       const manualEngagements = (lead.engagements as Array<{ eventType: string; eventData: any; createdAt: string }>) || [];
-      count += manualEngagements.length;
+      totalCount += manualEngagements.length;
+      
+      // Count manual engagements in last 7 days
+      manualEngagements.forEach((eng) => {
+        const createdAt = new Date(eng.createdAt);
+        if (createdAt >= sevenDaysAgo) {
+          last7DaysCount++;
+        }
+      });
 
       // Count email events if user has email domain configured
       const user = await userDb.getUserById(userId);
@@ -3240,14 +3252,22 @@ export const crmDb = {
         if (leadEmail) {
           // Use optimized query with composite GSI (EmailDomainLeadEmailIndex)
           const filteredEvents = await emailEventsDb.getEventsByEmailDomainAndLeadEmail(user.emailDomain, leadEmail);
-          count += filteredEvents.length;
+          totalCount += filteredEvents.length;
+          
+          // Count email events in last 7 days
+          filteredEvents.forEach((event: any) => {
+            const createdAt = new Date(event.createdAt);
+            if (createdAt >= sevenDaysAgo) {
+              last7DaysCount++;
+            }
+          });
         }
       }
 
-      return count;
+      return { total: totalCount, last7Days: last7DaysCount };
     } catch (error) {
       console.error('Error counting lead engagements:', error);
-      return 0; // Return 0 on error to avoid breaking the UI
+      return { total: 0, last7Days: 0 }; // Return 0 on error to avoid breaking the UI
     }
   },
 

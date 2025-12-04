@@ -248,10 +248,11 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
     // Add engagement counts to each lead
     const leadsWithCounts = await Promise.all(
       result.items.map(async (lead: any) => {
-        const engagementCount = await crmDb.getLeadEngagementCount(listId, lead.leadId, userId);
+        const engagementCounts = await crmDb.getLeadEngagementCount(listId, lead.leadId, userId);
         return {
           ...lead,
-          engagementCount,
+          engagementCount: engagementCounts.total,
+          engagementCountLast7Days: engagementCounts.last7Days,
         };
       })
     );
