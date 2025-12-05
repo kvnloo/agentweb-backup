@@ -524,6 +524,20 @@ You can read and create Go-To-Market (GTM) plans using these tools:
 
 Use GTM plans to understand the user's go-to-market strategy and provide context-aware assistance. When a user asks about their GTM plan, use read_gtm_plan to get the current state and provide insights based on the plan structure and progress. When creating a GTM plan, you can include the complete structure with phases and work items in a single call.
 
+## Lead Lists Management
+You can manage lead lists and add leads to them using these tools:
+- **get_lead_lists**: Get all lead lists for the user. Returns list IDs, names, descriptions, lead counts, and creation dates. Use this to see what lead lists exist before adding leads or creating new lists.
+- **create_lead_list**: Create a new lead list with a name and optional description. Returns the created list with its ID. Use this when the user wants to organize leads into a new list.
+- **add_leads_to_list**: Add one or more leads to an existing lead list. Each lead can include email (used for deduplication), firstName, lastName, phone, company, title, notes, linkedin, and custom fields. Returns the number of successfully added leads and any errors. **IMPORTANT**: Always use get_lead_lists first to get the correct list_id before adding leads.
+
+**Best Practices for Lead Lists:**
+- When a user wants to add leads, first check if a suitable list exists using get_lead_lists
+- If no appropriate list exists, offer to create one using create_lead_list
+- When adding leads, include as much information as possible (email, name, company, etc.) to make the leads more valuable
+- The email field is used for deduplication - leads with the same email in the same list will be skipped
+- Custom fields can be used to store any additional information about leads
+- Always confirm the list_id with the user or use get_lead_lists to find the correct one before adding leads
+
 ### Required Function Calls
 You can specify required function calls for any step to ensure proper validation:
 - Add requiredFunctionCalls array when creating or modifying steps
@@ -679,6 +693,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
         messageObj.tool_calls = (msg as any).tool_calls;
       }
 
+      // Ensure content is never null or undefined
+      if (messageObj.content == null || messageObj.content === null || messageObj.content === undefined) {
+        messageObj.content = '';
+      } else {
+        messageObj.content = String(messageObj.content);
+      }
       messages.push(messageObj);
     }
 
@@ -1263,6 +1283,78 @@ Use the available tools to create tasks in the agent-engine when complex work is
               }
             },
             required: ['title']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'get_lead_lists',
+          description: 'Get all lead lists for the current user. Returns a list of lead lists with their IDs, names, descriptions, lead counts, and creation dates.',
+          parameters: {
+            type: 'object',
+            properties: {},
+            required: []
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'create_lead_list',
+          description: 'Create a new lead list with a name and optional description. Returns the created lead list with its ID.',
+          parameters: {
+            type: 'object',
+            properties: {
+              name: {
+                type: 'string',
+                description: 'Name of the lead list'
+              },
+              description: {
+                type: 'string',
+                description: 'Optional description of the lead list'
+              }
+            },
+            required: ['name']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'add_leads_to_list',
+          description: 'Add one or more leads to an existing lead list. Each lead can have email, firstName, lastName, phone, company, title, notes, linkedin, and custom fields. Returns the number of successfully added leads and any errors.',
+          parameters: {
+            type: 'object',
+            properties: {
+              list_id: {
+                type: 'string',
+                description: 'The ID of the lead list to add leads to'
+              },
+              leads: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    email: { type: 'string', description: 'Email address (used for deduplication)' },
+                    firstName: { type: 'string', description: 'First name' },
+                    lastName: { type: 'string', description: 'Last name' },
+                    phone: { type: 'string', description: 'Phone number' },
+                    company: { type: 'string', description: 'Company name' },
+                    title: { type: 'string', description: 'Job title' },
+                    notes: { type: 'string', description: 'Additional notes' },
+                    linkedin: { type: 'string', description: 'LinkedIn profile URL' },
+                    customFields: {
+                      type: 'object',
+                      description: 'Custom fields as key-value pairs',
+                      additionalProperties: true
+                    }
+                  }
+                },
+                description: 'Array of lead objects to add to the list'
+              }
+            },
+            required: ['list_id', 'leads']
           }
         }
       },
@@ -2213,6 +2305,48 @@ Use the available tools to create tasks in the agent-engine when complex work is
           },
           formattedContent: `GTM Plan: Mock Q1 2024 Launch Plan\nDescription: Mock GTM plan for testing\nCreated: ${new Date().toISOString()}\n\nPhases (1):\n\nPhase 1: Pre-Launch\n  Description: Pre-launch activities\n  Duration: 30 day(s)\n  Status: in_progress\n  Work Items (1):\n    1. Create landing page [completed] - 5 day(s) - Completed: ${new Date(Date.now() - 86400000).toISOString()}\n       Design and develop landing page\n\n`
         };
+      case 'get_lead_lists':
+        return {
+          success: true,
+          message: 'Found 2 mock lead list(s)',
+          lists: [
+            {
+              listId: 'mock-list-1',
+              name: 'Mock Sales Leads',
+              description: 'Mock description',
+              leadCount: 10,
+              createdAt: new Date().toISOString()
+            },
+            {
+              listId: 'mock-list-2',
+              name: 'Mock Marketing Leads',
+              description: 'Mock description',
+              leadCount: 5,
+              createdAt: new Date().toISOString()
+            }
+          ],
+          totalLists: 2
+        };
+      case 'create_lead_list':
+        return {
+          success: true,
+          message: `Mock lead list "${args.name}" created successfully`,
+          list: {
+            listId: `mock-list-${Date.now()}`,
+            name: args.name,
+            description: args.description || '',
+            leadCount: 0,
+            createdAt: new Date().toISOString()
+          }
+        };
+      case 'add_leads_to_list':
+        return {
+          success: true,
+          message: `Successfully added ${args.leads?.length || 0} lead(s) to list`,
+          successCount: args.leads?.length || 0,
+          errorCount: 0,
+          errors: []
+        };
       case 'create_gtm_plan':
         const mockPhases = args.phases || [
           {
@@ -2701,6 +2835,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.readGTMPlan(args.plan_id, userId);
       case 'create_gtm_plan':
         return await this.createGTMPlan(args.title, args.description || '', args.phases || [], userId);
+      case 'get_lead_lists':
+        return await this.getLeadLists(userId);
+      case 'create_lead_list':
+        return await this.createLeadList(args.name, args.description || '', userId);
+      case 'add_leads_to_list':
+        return await this.addLeadsToList(args.list_id, args.leads || [], userId);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -3579,6 +3719,113 @@ Use the available tools to create tasks in the agent-engine when complex work is
       return {
         success: false,
         message: 'Failed to create GTM plan',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async getLeadLists(userId: string): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+      const lists = await crmDb.getLeadListsByUserId(userId);
+      
+      return {
+        success: true,
+        message: `Found ${lists.length} lead list(s)`,
+        lists: lists.map((list: any) => ({
+          listId: list.listId,
+          name: list.name,
+          description: list.description || '',
+          leadCount: list.leadCount || 0,
+          createdAt: list.createdAt
+        })),
+        totalLists: lists.length
+      };
+    } catch (error) {
+      console.error('AgentMode: Error listing lead lists:', error);
+      return {
+        success: false,
+        message: 'Failed to list lead lists',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async createLeadList(name: string, description: string, userId: string): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+      const list = await crmDb.createLeadList(userId, name, description);
+      
+      return {
+        success: true,
+        message: `Lead list "${name}" created successfully`,
+        list: {
+          listId: list.listId,
+          name: list.name,
+          description: list.description || '',
+          leadCount: list.leadCount || 0,
+          createdAt: list.createdAt
+        }
+      };
+    } catch (error) {
+      console.error('AgentMode: Error creating lead list:', error);
+      return {
+        success: false,
+        message: 'Failed to create lead list',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async addLeadsToList(listId: string, leads: any[], userId: string): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+      
+      // Verify list ownership
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return {
+          success: false,
+          message: 'Lead list not found',
+          error: 'The specified lead list does not exist'
+        };
+      }
+      
+      if (list.userId !== userId) {
+        return {
+          success: false,
+          message: 'Access denied',
+          error: 'You do not have permission to add leads to this list'
+        };
+      }
+      
+      // Convert leads array to the format expected by batchCreateLeads
+      const formattedLeads = leads.map((lead: any) => ({
+        email: lead.email,
+        firstName: lead.firstName,
+        lastName: lead.lastName,
+        phone: lead.phone,
+        company: lead.company,
+        title: lead.title,
+        notes: lead.notes,
+        linkedin: lead.linkedin,
+        customFields: lead.customFields || {}
+      }));
+      
+      const result = await crmDb.batchCreateLeads(listId, formattedLeads);
+      
+      return {
+        success: result.successCount > 0,
+        message: `Successfully added ${result.successCount} lead(s) to list. ${result.errorCount > 0 ? `${result.errorCount} lead(s) failed.` : ''}`,
+        successCount: result.successCount,
+        errorCount: result.errorCount,
+        errors: result.errors.length > 0 ? result.errors : undefined
+      };
+    } catch (error) {
+      console.error('AgentMode: Error adding leads to list:', error);
+      return {
+        success: false,
+        message: 'Failed to add leads to list',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
