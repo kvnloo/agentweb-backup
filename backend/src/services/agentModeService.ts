@@ -1365,7 +1365,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'update_email_draft_for_lead',
-          description: 'Create or update an email draft for a specific lead. This function loads the lead record, engagement history, brand guidelines, and market strategy, then uses AI to generate a personalized email draft (subject and HTML content) based on the instruction provided. If a draft already exists, it will be included in the prompt for refinement. The draft is saved to the lead record along with the session ID for future updates.',
+          description: 'Create or update an email draft for a specific lead. This function loads the lead record, engagement history, brand guidelines, and market strategy, then uses AI to generate a personalized email draft (subject and HTML content) based on the instruction provided. If a draft already exists, it will be included in the prompt for refinement. The draft is saved to the lead record along with the current session ID for future updates.',
           parameters: {
             type: 'object',
             properties: {
@@ -1380,13 +1380,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
               instruction: {
                 type: 'string',
                 description: 'Instructions for creating the email draft (e.g., "welcome email", "follow-up on their interest in our product", "introduce our new feature"). The AI will use this along with lead data, engagement history, brand guidelines, and market strategy to create a personalized email.'
-              },
-              session_id: {
-                type: 'string',
-                description: 'The Agent Mode session ID associated with this email draft creation/update. This will be saved to the lead record for future updates.'
               }
             },
-            required: ['list_id', 'lead_id', 'instruction', 'session_id']
+            required: ['list_id', 'lead_id', 'instruction']
           }
         }
       },
@@ -2878,7 +2874,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'add_leads_to_list':
         return await this.addLeadsToList(args.list_id, args.leads || [], userId);
       case 'update_email_draft_for_lead':
-        return await this.updateEmailDraftForLead(args.list_id, args.lead_id, args.instruction, args.session_id, userId);
+        return await this.updateEmailDraftForLead(args.list_id, args.lead_id, args.instruction, sessionId, userId);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
