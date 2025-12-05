@@ -4048,9 +4048,26 @@ Use the available tools to create tasks in the agent-engine when complex work is
           if (eng.eventData?.subject) {
             emailPrompt += ` (Subject: ${eng.eventData.subject})`;
           }
-          if (eng.source === 'email' && eng.eventType === 'email.received' && eng.emailContent?.text) {
-            const preview = eng.emailContent.text.substring(0, 100);
-            emailPrompt += `\n   Preview: ${preview}...`;
+          
+          // Include email content if available (first 1k characters)
+          if (eng.emailContent) {
+            let contentPreview = '';
+            // Prefer text content, fall back to HTML
+            if (eng.emailContent.text) {
+              contentPreview = eng.emailContent.text.substring(0, 1000);
+            } else if (eng.emailContent.html) {
+              // Strip HTML tags for preview, then take first 1k characters
+              const textFromHtml = eng.emailContent.html
+                .replace(/<[^>]*>/g, ' ') // Remove HTML tags
+                .replace(/\s+/g, ' ') // Normalize whitespace
+                .trim();
+              contentPreview = textFromHtml.substring(0, 1000);
+            }
+            
+            if (contentPreview) {
+              const truncated = contentPreview.length >= 1000 ? contentPreview + '...' : contentPreview;
+              emailPrompt += `\n   Email Content (first 1k characters):\n   ${truncated}`;
+            }
           }
         });
       } else {
