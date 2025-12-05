@@ -3070,6 +3070,8 @@ export const crmDb = {
     try {
       const results = {
         successCount: 0,
+        newCount: 0,
+        mergedCount: 0,
         errorCount: 0,
         errors: [] as string[],
       };
@@ -3084,12 +3086,18 @@ export const crmDb = {
         lastKey = result.lastEvaluatedKey;
       } while (lastKey);
 
-      const existingEmails = new Set(
-        allExistingLeads
-          .filter(lead => lead.email && lead.email.trim())
-          .map(lead => lead.email.trim().toLowerCase())
-      );
+      // Create a map of existing leads by email for quick lookup
+      const existingLeadsByEmail = new Map<string, any>();
+      allExistingLeads.forEach(lead => {
+        if (lead.email && lead.email.trim()) {
+          existingLeadsByEmail.set(lead.email.trim().toLowerCase(), lead);
+        }
+      });
 
+      // Separate leads into new leads and leads to update
+      const newLeads: typeof leads = [];
+      const leadsToUpdate: Array<{ existingLead: any; newData: typeof leads[0] }> = [];
+      
       // Deduplicate leads within the upload by email (case-insensitive)
       const uniqueLeads = new Map<string, typeof leads[0]>();
       leads.forEach((lead, index) => {
@@ -3103,19 +3111,18 @@ export const crmDb = {
             return;
           }
           
-          // Check against existing leads
-          if (existingEmails.has(emailKey)) {
-            results.errorCount++;
-            results.errors.push(`Row ${index + 1}: Email "${lead.email}" already exists in this list`);
-            return;
+          // Check against existing leads - if exists, mark for update instead of error
+          const existingLead = existingLeadsByEmail.get(emailKey);
+          if (existingLead) {
+            leadsToUpdate.push({ existingLead, newData: lead });
+            return; // Skip adding to uniqueLeads, will be handled separately
           }
         }
         
         uniqueLeads.set(emailKey, lead);
       });
 
-      // Filter out leads that have errors (duplicates)
-      const newLeads: typeof leads = [];
+      // Add unique new leads
       uniqueLeads.forEach((lead) => {
         newLeads.push(lead);
       });
@@ -3166,6 +3173,7 @@ export const crmDb = {
 
           await dynamodb.batchWrite(params).promise();
           results.successCount += batch.length;
+          results.newCount += batch.length;
         } catch (batchError: any) {
           batch.forEach((lead, index) => {
             results.errorCount++;
@@ -3174,10 +3182,11 @@ export const crmDb = {
         }
       }
 
-      // Extract all field names from imported leads
+      // Extract all field names from imported leads (both new and updated)
       const allFieldNames: string[] = [];
       const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'];
       
+      // Extract from new leads
       newLeads.forEach(lead => {
         standardFields.forEach(field => {
           if (lead[field as keyof typeof lead] && String(lead[field as keyof typeof lead]).trim()) {
@@ -3193,6 +3202,22 @@ export const crmDb = {
         }
       });
       
+      // Extract from leads being updated
+      leadsToUpdate.forEach(({ newData }) => {
+        standardFields.forEach(field => {
+          if (newData[field as keyof typeof newData] && String(newData[field as keyof typeof newData]).trim()) {
+            allFieldNames.push(field);
+          }
+        });
+        if (newData.customFields) {
+          Object.keys(newData.customFields).forEach(key => {
+            if (newData.customFields![key] && String(newData.customFields![key]).trim()) {
+              allFieldNames.push(key);
+            }
+          });
+        }
+      });
+      
       // Update field names in list
       if (allFieldNames.length > 0) {
         const list = await this.getLeadListById(listId);
@@ -3201,9 +3226,56 @@ export const crmDb = {
         await this.updateFieldNames(listId, combinedFieldNames);
       }
       
-      // Update lead count
-      if (results.successCount > 0) {
-        await this.incrementLeadCount(listId, results.successCount);
+      // Process leads to update (merge existing leads with new data)
+      for (const { existingLead, newData } of leadsToUpdate) {
+        try {
+          // Build update object - only include fields that have values in newData
+          const updates: any = {};
+          
+          if (newData.firstName !== undefined && newData.firstName.trim()) {
+            updates.firstName = newData.firstName;
+          }
+          if (newData.lastName !== undefined && newData.lastName.trim()) {
+            updates.lastName = newData.lastName;
+          }
+          if (newData.phone !== undefined && newData.phone.trim()) {
+            updates.phone = newData.phone;
+          }
+          if (newData.company !== undefined && newData.company.trim()) {
+            updates.company = newData.company;
+          }
+          if (newData.title !== undefined && newData.title.trim()) {
+            updates.title = newData.title;
+          }
+          if (newData.notes !== undefined && newData.notes.trim()) {
+            updates.notes = newData.notes;
+          }
+          if (newData.linkedin !== undefined && newData.linkedin.trim()) {
+            updates.linkedin = newData.linkedin.trim();
+          }
+          
+          // Merge customFields - combine existing and new, with new values overriding
+          if (newData.customFields && Object.keys(newData.customFields).length > 0) {
+            const existingCustomFields = existingLead.customFields || {};
+            updates.customFields = {
+              ...existingCustomFields,
+              ...newData.customFields,
+            };
+          }
+          
+          // Update the lead
+          await this.updateLead(listId, existingLead.leadId, updates);
+          results.successCount++;
+          results.mergedCount++;
+        } catch (updateError: any) {
+          results.errorCount++;
+          results.errors.push(`Row: Email "${newData.email}" - Failed to update: ${updateError.message}`);
+        }
+      }
+
+      // Update lead count (only for new leads, updates don't change count)
+      if (newLeads.length > 0) {
+        await this.incrementLeadCount(listId, newLeads.length);
       }
 
       return results;
@@ -3211,6 +3283,8 @@ export const crmDb = {
       handleDynamoDbError(error, "batchCreateLeads");
       return {
         successCount: 0,
+        newCount: 0,
+        mergedCount: 0,
         errorCount: leads.length,
         errors: [`Batch upload failed: ${error.message}`],
       };

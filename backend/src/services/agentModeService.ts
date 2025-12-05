@@ -528,14 +528,15 @@ Use GTM plans to understand the user's go-to-market strategy and provide context
 You can manage lead lists and add leads to them using these tools:
 - **get_lead_lists**: Get all lead lists for the user. Returns list IDs, names, descriptions, lead counts, and creation dates. Use this to see what lead lists exist before adding leads or creating new lists.
 - **create_lead_list**: Create a new lead list with a name and optional description. Returns the created list with its ID. Use this when the user wants to organize leads into a new list.
-- **add_leads_to_list**: Add one or more leads to an existing lead list. Each lead can include email (used for deduplication), firstName, lastName, phone, company, title, notes, linkedin, and custom fields. Returns the number of successfully added leads and any errors. **IMPORTANT**: Always use get_lead_lists first to get the correct list_id before adding leads.
+- **add_leads_to_list**: Add one or more leads to an existing lead list. Each lead is a flexible object that can contain any fields you want to store. Common fields include: email (used for deduplication and merging), firstName, lastName, phone, company, title, notes, linkedin, and any custom fields. You can use any field names that make sense for your data. If a lead with the same email already exists, it will be merged with the new data. Returns counts of new and merged leads, plus any errors. **IMPORTANT**: Always use get_lead_lists first to get the correct list_id before adding leads.
 
 **Best Practices for Lead Lists:**
 - When a user wants to add leads, first check if a suitable list exists using get_lead_lists
 - If no appropriate list exists, offer to create one using create_lead_list
-- When adding leads, include as much information as possible (email, name, company, etc.) to make the leads more valuable
-- The email field is used for deduplication - leads with the same email in the same list will be skipped
-- Custom fields can be used to store any additional information about leads
+- When adding leads, use field names that make sense for the data you're storing - you're not limited to predefined fields
+- The email field (if provided) is used for deduplication and merging - leads with the same email will be merged with existing records
+- Include as much information as possible to make the leads more valuable
+- You can use any field names - standard fields (email, firstName, lastName, phone, company, title, notes, linkedin) are recognized, and all other fields will be stored as custom fields
 - Always confirm the list_id with the user or use get_lead_lists to find the correct one before adding leads
 
 ### Required Function Calls
@@ -1323,7 +1324,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'add_leads_to_list',
-          description: 'Add one or more leads to an existing lead list. Each lead can have email, firstName, lastName, phone, company, title, notes, linkedin, and custom fields. Returns the number of successfully added leads and any errors.',
+          description: 'Add one or more leads to an existing lead list. Each lead is a flexible object that can contain any fields you want to store. Common fields include: email (used for deduplication and merging), firstName, lastName, phone, company, title, notes, linkedin, and any custom fields. You can use any field names that make sense for your data. If a lead with the same email already exists, it will be merged with the new data. Returns counts of new and merged leads, plus any errors.',
           parameters: {
             type: 'object',
             properties: {
@@ -1335,23 +1336,16 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 type: 'array',
                 items: {
                   type: 'object',
+                  description: 'A lead object with any fields you want to store. Use field names that make sense for your data. The email field (if provided) is used for deduplication and merging.',
+                  additionalProperties: true,
                   properties: {
-                    email: { type: 'string', description: 'Email address (used for deduplication)' },
-                    firstName: { type: 'string', description: 'First name' },
-                    lastName: { type: 'string', description: 'Last name' },
-                    phone: { type: 'string', description: 'Phone number' },
-                    company: { type: 'string', description: 'Company name' },
-                    title: { type: 'string', description: 'Job title' },
-                    notes: { type: 'string', description: 'Additional notes' },
-                    linkedin: { type: 'string', description: 'LinkedIn profile URL' },
-                    customFields: {
-                      type: 'object',
-                      description: 'Custom fields as key-value pairs',
-                      additionalProperties: true
+                    email: { 
+                      type: 'string', 
+                      description: 'Email address (optional, but recommended for deduplication and merging existing leads)' 
                     }
                   }
                 },
-                description: 'Array of lead objects to add to the list'
+                description: 'Array of lead objects to add to the list. Each lead can have any fields you want to store.'
               }
             },
             required: ['list_id', 'leads']
@@ -2340,10 +2334,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
           }
         };
       case 'add_leads_to_list':
+        const mockNewCount = Math.floor((args.leads?.length || 0) * 0.7);
+        const mockMergedCount = (args.leads?.length || 0) - mockNewCount;
         return {
           success: true,
-          message: `Successfully added ${args.leads?.length || 0} lead(s) to list`,
+          message: `Successfully processed: ${mockNewCount} new lead(s) created, ${mockMergedCount} lead(s) merged.`,
           successCount: args.leads?.length || 0,
+          newCount: mockNewCount,
+          mergedCount: mockMergedCount,
           errorCount: 0,
           errors: []
         };
@@ -3800,24 +3798,54 @@ Use the available tools to create tasks in the agent-engine when complex work is
       }
       
       // Convert leads array to the format expected by batchCreateLeads
-      const formattedLeads = leads.map((lead: any) => ({
-        email: lead.email,
-        firstName: lead.firstName,
-        lastName: lead.lastName,
-        phone: lead.phone,
-        company: lead.company,
-        title: lead.title,
-        notes: lead.notes,
-        linkedin: lead.linkedin,
-        customFields: lead.customFields || {}
-      }));
+      // Extract standard fields and put everything else in customFields
+      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'];
+      const formattedLeads = leads.map((lead: any) => {
+        const formatted: any = {};
+        const customFields: Record<string, any> = {};
+        
+        // Extract standard fields if they exist
+        standardFields.forEach(field => {
+          if (lead[field] !== undefined) {
+            formatted[field] = lead[field];
+          }
+        });
+        
+        // Put all other fields into customFields
+        Object.keys(lead).forEach(key => {
+          if (!standardFields.includes(key)) {
+            customFields[key] = lead[key];
+          }
+        });
+        
+        if (Object.keys(customFields).length > 0) {
+          formatted.customFields = customFields;
+        }
+        
+        return formatted;
+      });
       
       const result = await crmDb.batchCreateLeads(listId, formattedLeads);
       
+      const messageParts: string[] = [];
+      if (result.newCount > 0) {
+        messageParts.push(`${result.newCount} new lead(s) created`);
+      }
+      if (result.mergedCount > 0) {
+        messageParts.push(`${result.mergedCount} lead(s) merged`);
+      }
+      if (result.errorCount > 0) {
+        messageParts.push(`${result.errorCount} lead(s) failed`);
+      }
+      
       return {
         success: result.successCount > 0,
-        message: `Successfully added ${result.successCount} lead(s) to list. ${result.errorCount > 0 ? `${result.errorCount} lead(s) failed.` : ''}`,
+        message: messageParts.length > 0 
+          ? `Successfully processed: ${messageParts.join(', ')}.`
+          : 'No leads were processed.',
         successCount: result.successCount,
+        newCount: result.newCount || 0,
+        mergedCount: result.mergedCount || 0,
         errorCount: result.errorCount,
         errors: result.errors.length > 0 ? result.errors : undefined
       };
