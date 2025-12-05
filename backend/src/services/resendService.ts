@@ -211,6 +211,92 @@ class ResendService {
     return null;
   }
 
+  async getDeliveredEmailContent(emailId: string): Promise<{
+    html?: string;
+    text?: string;
+    headers?: Record<string, string>;
+  } | null> {
+    await this.initializeResend();
+    
+    if (!this.apiKey) {
+      console.error('Resend API key not available');
+      return null;
+    }
+
+    if (!emailId) {
+      console.error('Email ID is required to fetch email content');
+      return null;
+    }
+
+    // Use direct REST API call to get email content for delivered emails
+    // For delivered emails (emails we sent), use the receiving endpoint as shown in user's example
+    interface ResendEmailContent {
+      html?: string;
+      text?: string;
+      headers?: Record<string, string>;
+    }
+
+    const result = await this.retryWithBackoff<ResendEmailContent>(
+      async () => {
+        try {
+          // Try receiving endpoint first (as shown in user's example)
+          const response = await axios.get<ResendEmailContent>(
+            `https://api.resend.com/emails/receiving/${emailId}`,
+            {
+              headers: {
+                'Authorization': `Bearer ${this.apiKey}`,
+                'Content-Type': 'application/json',
+              },
+            }
+          );
+          
+          return response.data;
+        } catch (error: any) {
+          // If receiving endpoint fails, try the regular emails endpoint
+          if (error.response?.status === 404) {
+            try {
+              const response = await axios.get<ResendEmailContent>(
+                `https://api.resend.com/emails/${emailId}`,
+                {
+                  headers: {
+                    'Authorization': `Bearer ${this.apiKey}`,
+                    'Content-Type': 'application/json',
+                  },
+                }
+              );
+              return response.data;
+            } catch (fallbackError: any) {
+              if (fallbackError.response) {
+                throw new Error(`Resend API error: ${fallbackError.response.status} - ${JSON.stringify(fallbackError.response.data)}`);
+              } else if (fallbackError.request) {
+                throw new Error(`Resend API error: No response received - ${fallbackError.message}`);
+              } else {
+                throw new Error(`Resend API error: ${fallbackError.message}`);
+              }
+            }
+          } else if (error.response) {
+            throw new Error(`Resend API error: ${error.response.status} - ${JSON.stringify(error.response.data)}`);
+          } else if (error.request) {
+            throw new Error(`Resend API error: No response received - ${error.message}`);
+          } else {
+            throw new Error(`Resend API error: ${error.message}`);
+          }
+        }
+      },
+      `Fetch delivered email content for ${emailId}`
+    );
+
+    if (result) {
+      return {
+        html: result.html || undefined,
+        text: result.text || undefined,
+        headers: result.headers || undefined,
+      };
+    }
+
+    return null;
+  }
+
 }
 
 export const resendService = new ResendService();

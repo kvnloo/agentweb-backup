@@ -12,6 +12,11 @@ export interface EmailEvent {
   data: ResendWebhookEvent['data'];
   processedAt: string;
   leadEmail?: string; // Optional, extracted based on event type
+  emailContent?: {
+    html?: string;
+    text?: string;
+    headers?: Record<string, string>;
+  }; // Optional, cached email content (truncated to 10k chars if needed)
 }
 
 class EmailEventsDb {
@@ -87,6 +92,36 @@ class EmailEventsDb {
     await dynamodb.put(params).promise();
     
     return emailEvent;
+  }
+
+  async updateEmailEventContent(eventId: string, emailContent: {
+    html?: string;
+    text?: string;
+    headers?: Record<string, string>;
+  }): Promise<void> {
+    // Truncate content to 10k characters if needed
+    const truncatedContent = {
+      html: emailContent.html && emailContent.html.length > 10000 
+        ? emailContent.html.substring(0, 10000) + '... [truncated]'
+        : emailContent.html,
+      text: emailContent.text && emailContent.text.length > 10000 
+        ? emailContent.text.substring(0, 10000) + '... [truncated]'
+        : emailContent.text,
+      headers: emailContent.headers
+    };
+
+    const params = {
+      TableName: TABLE_NAME,
+      Key: {
+        eventId
+      },
+      UpdateExpression: 'SET emailContent = :emailContent',
+      ExpressionAttributeValues: {
+        ':emailContent': truncatedContent
+      }
+    };
+
+    await dynamodb.update(params).promise();
   }
 
   async getEventsByEmailId(emailId: string): Promise<EmailEvent[]> {

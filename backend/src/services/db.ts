@@ -3421,16 +3421,52 @@ export const crmDb = {
             source: 'email' as const, // Mark as email event
           };
 
-          // For email.received events, fetch the email content
-          if (event.eventType === 'email.received' && event.data?.email_id) {
+          // For email.received and email.delivered events, fetch the email content
+          if ((event.eventType === 'email.received' || event.eventType === 'email.delivered') && event.data?.email_id) {
             try {
-              const resendService = require('./resendService').resendService;
-              const emailContent = await resendService.getReceivedEmailContent(event.data.email_id);
+              let emailContent: { html?: string; text?: string; headers?: Record<string, string> } | null = null;
               
-              if (emailContent) {
+              // Check if email content is already cached in the event record
+              if (event.emailContent) {
                 return {
                   ...baseEngagement,
-                  emailContent, // Add html, text, and headers
+                  emailContent: event.emailContent, // Use cached content from event record
+                };
+              }
+              
+              // Fetch from Resend if not cached
+              const resendService = require('./resendService').resendService;
+              
+              if (event.eventType === 'email.received') {
+                emailContent = await resendService.getReceivedEmailContent(event.data.email_id);
+              } else if (event.eventType === 'email.delivered') {
+                emailContent = await resendService.getDeliveredEmailContent(event.data.email_id);
+              }
+              
+              if (emailContent) {
+                // Store in event record for caching (truncated to 10k if needed)
+                try {
+                  const emailEventsDb = require('./emailEventsDb').emailEventsDb;
+                  await emailEventsDb.updateEmailEventContent(event.eventId, emailContent);
+                } catch (updateError) {
+                  console.error(`Failed to update email event content for ${event.data.email_id}:`, updateError);
+                  // Continue even if update fails
+                }
+                
+                // Truncate for response if needed (same logic as in updateEmailEventContent)
+                const truncatedContent = {
+                  html: emailContent.html && emailContent.html.length > 10000 
+                    ? emailContent.html.substring(0, 10000) + '... [truncated]'
+                    : emailContent.html,
+                  text: emailContent.text && emailContent.text.length > 10000 
+                    ? emailContent.text.substring(0, 10000) + '... [truncated]'
+                    : emailContent.text,
+                  headers: emailContent.headers
+                };
+                
+                return {
+                  ...baseEngagement,
+                  emailContent: truncatedContent, // Add html, text, and headers
                 };
               }
             } catch (error) {
