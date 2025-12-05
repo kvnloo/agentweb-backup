@@ -2926,69 +2926,97 @@ export const crmDb = {
     notes?: string;
     linkedin?: string;
     customFields?: Record<string, any>;
+    emailDraft?: {
+      subject: string;
+      htmlContent: string;
+      createdAt: string;
+      updatedAt: string;
+      sessionId?: string;
+    } | null;
   }) {
     try {
-      const updateExpressions: string[] = [];
+      const setExpressions: string[] = [];
+      const removeExpressions: string[] = [];
       const expressionAttributeValues: any = {};
 
       if (updates.email !== undefined) {
         const emailValue = updates.email.trim().toLowerCase();
         if (emailValue) {
           // Only set email if it's not empty (GSI key cannot be empty string)
-          updateExpressions.push('email = :email');
+          setExpressions.push('email = :email');
           expressionAttributeValues[':email'] = emailValue;
         } else {
           // Remove email attribute if it's being set to empty
-          updateExpressions.push('REMOVE email');
+          removeExpressions.push('email');
         }
       }
 
       if (updates.firstName !== undefined) {
-        updateExpressions.push('firstName = :firstName');
+        setExpressions.push('firstName = :firstName');
         expressionAttributeValues[':firstName'] = updates.firstName;
       }
 
       if (updates.lastName !== undefined) {
-        updateExpressions.push('lastName = :lastName');
+        setExpressions.push('lastName = :lastName');
         expressionAttributeValues[':lastName'] = updates.lastName;
       }
 
       if (updates.phone !== undefined) {
-        updateExpressions.push('phone = :phone');
+        setExpressions.push('phone = :phone');
         expressionAttributeValues[':phone'] = updates.phone;
       }
 
       if (updates.company !== undefined) {
-        updateExpressions.push('company = :company');
+        setExpressions.push('company = :company');
         expressionAttributeValues[':company'] = updates.company;
       }
 
       if (updates.title !== undefined) {
-        updateExpressions.push('title = :title');
+        setExpressions.push('title = :title');
         expressionAttributeValues[':title'] = updates.title;
       }
 
       if (updates.notes !== undefined) {
-        updateExpressions.push('notes = :notes');
+        setExpressions.push('notes = :notes');
         expressionAttributeValues[':notes'] = updates.notes;
       }
 
       if (updates.linkedin !== undefined) {
-        updateExpressions.push('linkedin = :linkedin');
+        setExpressions.push('linkedin = :linkedin');
         expressionAttributeValues[':linkedin'] = updates.linkedin.trim();
       }
 
       if (updates.customFields !== undefined) {
-        updateExpressions.push('customFields = :customFields');
+        setExpressions.push('customFields = :customFields');
         expressionAttributeValues[':customFields'] = updates.customFields;
       }
 
-      if (updateExpressions.length === 0) {
+      if (updates.emailDraft !== undefined) {
+        if (updates.emailDraft === null) {
+          // Remove emailDraft attribute
+          removeExpressions.push('emailDraft');
+        } else {
+          setExpressions.push('emailDraft = :emailDraft');
+          expressionAttributeValues[':emailDraft'] = updates.emailDraft;
+        }
+      }
+
+      // Always update updatedAt
+      setExpressions.push('updatedAt = :updatedAt');
+      expressionAttributeValues[':updatedAt'] = new Date().toISOString();
+
+      if (setExpressions.length === 0 && removeExpressions.length === 0) {
         return await this.getLeadById(listId, leadId);
       }
 
-      updateExpressions.push('updatedAt = :updatedAt');
-      expressionAttributeValues[':updatedAt'] = new Date().toISOString();
+      // Build UpdateExpression with proper SET and REMOVE clauses
+      const updateExpressionParts: string[] = [];
+      if (setExpressions.length > 0) {
+        updateExpressionParts.push(`SET ${setExpressions.join(', ')}`);
+      }
+      if (removeExpressions.length > 0) {
+        updateExpressionParts.push(`REMOVE ${removeExpressions.join(', ')}`);
+      }
 
       const params = {
         TableName: `${TABLE_PREFIX}AW-Leads`,
@@ -2996,9 +3024,9 @@ export const crmDb = {
           listId,
           leadId,
         },
-        UpdateExpression: `SET ${updateExpressions.join(', ')}`,
-        ExpressionAttributeValues: expressionAttributeValues,
-        ReturnValues: 'ALL_NEW',
+        UpdateExpression: updateExpressionParts.join(' '),
+        ExpressionAttributeValues: Object.keys(expressionAttributeValues).length > 0 ? expressionAttributeValues : undefined,
+        ReturnValues: 'ALL_NEW' as const,
       };
 
       const result = await dynamodb.update(params).promise();

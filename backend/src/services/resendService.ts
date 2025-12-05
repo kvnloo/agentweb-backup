@@ -154,10 +154,16 @@ class ResendService {
     }
 
     // Use direct REST API call since the SDK may not have receiving API
-    const result = await this.retryWithBackoff(
+    interface ResendEmailContent {
+      html?: string;
+      text?: string;
+      headers?: Record<string, string>;
+    }
+
+    const result = await this.retryWithBackoff<ResendEmailContent>(
       async () => {
         try {
-          const response = await axios.get(
+          const response = await axios.get<ResendEmailContent>(
             `https://api.resend.com/emails/receiving/${emailId}`,
             {
               headers: {
