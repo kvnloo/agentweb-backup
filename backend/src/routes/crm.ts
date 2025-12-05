@@ -861,13 +861,74 @@ router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res:
       emailDraft: null
     });
 
-    res.json({ 
+    res.json({
       message: 'Email sent successfully',
-      emailId: result.id 
+      emailId: result.id
     });
   } catch (error: any) {
     console.error('Error sending email:', error);
     res.status(500).json({ message: error.message || 'Failed to send email' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/leads/:leadId/reply-email
+ * @desc Reply to an email.received event using Resend
+ * @access Private
+ */
+router.post('/lists/:listId/leads/:leadId/reply-email', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId, leadId } = req.params;
+    const { senderEmail, senderName, subject, htmlContent, messageId } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Validate required fields
+    if (!senderEmail || !senderName || !subject || !htmlContent || !messageId) {
+      return res.status(400).json({ message: 'Missing required fields: senderEmail, senderName, subject, htmlContent, messageId' });
+    }
+
+    // Get the lead to get the recipient email
+    const lead = await crmDb.getLeadById(listId, leadId);
+    if (!lead) {
+      return res.status(404).json({ message: 'Lead not found' });
+    }
+
+    if (!lead.email) {
+      return res.status(400).json({ message: 'Lead does not have an email address' });
+    }
+
+    // Verify the lead belongs to the user's list
+    const list = await crmDb.getLeadListById(listId);
+    if (!list || list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Send reply email via Resend with In-Reply-To header
+    const from = `${senderName} <${senderEmail}>`;
+    const result = await resendService.sendEmail({
+      from,
+      to: lead.email,
+      subject,
+      html: htmlContent,
+      inReplyTo: messageId
+    });
+
+    if (!result) {
+      return res.status(500).json({ message: 'Failed to send reply email via Resend' });
+    }
+
+    res.json({
+      message: 'Reply email sent successfully',
+      emailId: result.id
+    });
+  } catch (error: any) {
+    console.error('Error sending reply email:', error);
+    res.status(500).json({ message: error.message || 'Failed to send reply email' });
   }
 });
 

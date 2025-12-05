@@ -73,13 +73,15 @@ class ResendService {
     to,
     subject,
     html,
-    text
+    text,
+    inReplyTo
   }: {
     from: string;
     to: string | string[];
     subject: string;
     html?: string;
     text?: string;
+    inReplyTo?: string;
   }) {
     await this.initializeResend();
     
@@ -100,6 +102,13 @@ class ResendService {
     }
     if (text) {
       emailOptions.text = text;
+    }
+
+    // Add reply headers if replying to an email
+    if (inReplyTo) {
+      emailOptions.headers = {
+        'In-Reply-To': inReplyTo
+      };
     }
 
     const recipient = Array.isArray(to) ? to.join(', ') : to;
