@@ -3319,7 +3319,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   // Get CRM sender emails configuration
   private async getCrmSenders(userId: string): Promise<{
     success: boolean;
-    senders: Array<{ id: string; email: string; fromName: string }>;
+    senders: Array<{ id: string; email: string; fromName: string; notes?: string }>;
     defaultSenderId: string | null;
     error?: string;
   }> {
@@ -3356,6 +3356,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   // Get sender information for a lead (from lead record, or default sender)
   private async getSenderForLead(userId: string, leadSelectedSenderId?: string | null): Promise<{
     fromName: string;
+    notes?: string;
   } | null> {
     try {
       const sendersResult = await this.getCrmSenders(userId);
@@ -3377,7 +3378,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
       
       if (sender) {
         return {
-          fromName: sender.fromName
+          fromName: sender.fromName,
+          notes: sender.notes
         };
       }
       
@@ -4072,9 +4074,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
       // Add sender information
       if (senderInfo) {
         emailPrompt += `\n\n## Sender Information:
-- From Name: ${senderInfo.fromName}
-
-Use this sender information to create an appropriate email signature. The signature should match the sender's name.`;
+- From Name: ${senderInfo.fromName}`;
+        if (senderInfo.notes) {
+          emailPrompt += `\n- Notes: ${senderInfo.notes}`;
+        }
+        emailPrompt += `\n\nUse this sender information to create an appropriate email signature. The signature should match the sender's name.`;
+        if (senderInfo.notes) {
+          emailPrompt += ` If the notes contain a meeting schedule link or other relevant information, consider including it in the email where appropriate.`;
+        }
       } else {
         emailPrompt += `\n\n## Sender Information: Not configured (use a generic professional signature)`;
       }

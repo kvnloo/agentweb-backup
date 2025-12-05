@@ -765,6 +765,10 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
       if (!/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(sender.email)) {
         return res.status(400).json({ message: `Invalid email format: ${sender.email}` });
       }
+      // Notes is optional, but if provided, it should be a string
+      if (sender.notes !== undefined && typeof sender.notes !== 'string') {
+        return res.status(400).json({ message: 'Notes must be a string if provided' });
+      }
     }
 
     // Validate defaultSenderId if provided
@@ -782,7 +786,8 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
       senders: senders.map((s: any, index: number) => ({
         id: s.id || index.toString(),
         email: s.email.trim(),
-        fromName: s.fromName.trim()
+        fromName: s.fromName.trim(),
+        notes: s.notes ? s.notes.trim() : undefined
       })),
       defaultSenderId: defaultSenderId || (senders.length > 0 ? senders[0].id || '0' : null)
     };
