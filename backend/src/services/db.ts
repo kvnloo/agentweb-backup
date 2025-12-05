@@ -2926,6 +2926,7 @@ export const crmDb = {
     notes?: string;
     linkedin?: string;
     customFields?: Record<string, any>;
+    selectedSenderId?: string | null;
     emailDraft?: {
       subject: string;
       htmlContent: string;
@@ -2989,6 +2990,16 @@ export const crmDb = {
       if (updates.customFields !== undefined) {
         setExpressions.push('customFields = :customFields');
         expressionAttributeValues[':customFields'] = updates.customFields;
+      }
+
+      if (updates.selectedSenderId !== undefined) {
+        if (updates.selectedSenderId === null) {
+          // Remove selectedSenderId attribute
+          removeExpressions.push('selectedSenderId');
+        } else {
+          setExpressions.push('selectedSenderId = :selectedSenderId');
+          expressionAttributeValues[':selectedSenderId'] = updates.selectedSenderId;
+        }
       }
 
       if (updates.emailDraft !== undefined) {

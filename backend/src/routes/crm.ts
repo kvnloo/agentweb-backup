@@ -1,6 +1,8 @@
 import express, { Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { crmDb } from '../services/db';
+import { settingsService } from '../services/settingsService';
+import { resendService } from '../services/resendService';
 import multer from 'multer';
 import { parse } from 'csv-parse/sync';
 
@@ -692,6 +694,175 @@ router.delete('/lists/:listId/leads/:leadId/engagements/:eventId', async (req: R
   } catch (error: any) {
     console.error('Error deleting lead engagement:', error);
     res.status(500).json({ message: error.message || 'Failed to delete lead engagement' });
+  }
+});
+
+/**
+ * @route GET /api/crm/sender-emails
+ * @desc Get CRM sender emails configuration for the authenticated user
+ * @access Private
+ */
+router.get('/sender-emails', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const settingName = `crm_sender_emails_${userId}`;
+    const setting = await settingsService.getSetting(settingName);
+
+    if (!setting) {
+      return res.json({ senders: [], defaultSenderId: null });
+    }
+
+    try {
+      const config = JSON.parse(setting.settingValue);
+      res.json({
+        senders: config.senders || [],
+        defaultSenderId: config.defaultSenderId || null
+      });
+    } catch (parseError) {
+      console.error('Error parsing CRM sender emails:', parseError);
+      res.json({ senders: [], defaultSenderId: null });
+    }
+  } catch (error: any) {
+    console.error('Error fetching CRM sender emails:', error);
+    res.status(500).json({ message: error.message || 'Failed to fetch CRM sender emails' });
+  }
+});
+
+/**
+ * @route POST /api/crm/sender-emails
+ * @desc Save CRM sender emails configuration for the authenticated user
+ * @access Private
+ */
+router.post('/sender-emails', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { senders, defaultSenderId } = req.body;
+
+    // Validate senders array
+    if (!Array.isArray(senders)) {
+      return res.status(400).json({ message: 'Senders must be an array' });
+    }
+
+    // Validate each sender
+    for (const sender of senders) {
+      if (!sender.email || !sender.fromName) {
+        return res.status(400).json({ message: 'Each sender must have email and fromName' });
+      }
+      // Remove description if present (no longer supported)
+      delete sender.description;
+      if (!/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(sender.email)) {
+        return res.status(400).json({ message: `Invalid email format: ${sender.email}` });
+      }
+    }
+
+    // Validate defaultSenderId if provided
+    if (defaultSenderId !== null && defaultSenderId !== undefined) {
+      const defaultSenderExists = senders.some((s: any, index: number) => 
+        s.id === defaultSenderId || index.toString() === defaultSenderId
+      );
+      if (!defaultSenderExists && senders.length > 0) {
+        return res.status(400).json({ message: 'defaultSenderId must reference an existing sender' });
+      }
+    }
+
+    const settingName = `crm_sender_emails_${userId}`;
+    const config = {
+      senders: senders.map((s: any, index: number) => ({
+        id: s.id || index.toString(),
+        email: s.email.trim(),
+        fromName: s.fromName.trim()
+      })),
+      defaultSenderId: defaultSenderId || (senders.length > 0 ? senders[0].id || '0' : null)
+    };
+
+    await settingsService.setSetting(
+      settingName,
+      JSON.stringify(config),
+      'CRM sender emails configuration',
+      authReq.user?.email || 'system'
+    );
+
+    res.json({ message: 'CRM sender emails saved successfully', ...config });
+  } catch (error: any) {
+    console.error('Error saving CRM sender emails:', error);
+    res.status(500).json({ message: error.message || 'Failed to save CRM sender emails' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/leads/:leadId/send-email
+ * @desc Send email draft to a lead using Resend
+ * @access Private
+ */
+router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId, leadId } = req.params;
+    const { senderEmail, senderName, subject, htmlContent } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Validate required fields
+    if (!senderEmail || !senderName || !subject || !htmlContent) {
+      return res.status(400).json({ message: 'Missing required fields: senderEmail, senderName, subject, htmlContent' });
+    }
+
+    // Get the lead to get the recipient email
+    const lead = await crmDb.getLeadById(listId, leadId);
+    if (!lead) {
+      return res.status(404).json({ message: 'Lead not found' });
+    }
+
+    if (!lead.email) {
+      return res.status(400).json({ message: 'Lead does not have an email address' });
+    }
+
+    // Verify the lead belongs to the user's list
+    const list = await crmDb.getLeadListById(listId);
+    if (!list || list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Send email via Resend
+    const from = `${senderName} <${senderEmail}>`;
+    const result = await resendService.sendEmail({
+      from,
+      to: lead.email,
+      subject,
+      html: htmlContent
+    });
+
+    if (!result) {
+      return res.status(500).json({ message: 'Failed to send email via Resend' });
+    }
+
+    // Remove the email draft after successfully sending
+    await crmDb.updateLead(listId, leadId, {
+      emailDraft: null
+    });
+
+    res.json({ 
+      message: 'Email sent successfully',
+      emailId: result.id 
+    });
+  } catch (error: any) {
+    console.error('Error sending email:', error);
+    res.status(500).json({ message: error.message || 'Failed to send email' });
   }
 });
 

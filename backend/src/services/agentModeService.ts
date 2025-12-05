@@ -3320,6 +3320,78 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
+  // Get CRM sender emails configuration
+  private async getCrmSenders(userId: string): Promise<{
+    success: boolean;
+    senders: Array<{ id: string; email: string; fromName: string }>;
+    defaultSenderId: string | null;
+    error?: string;
+  }> {
+    try {
+      const { settingsService } = await import('./settingsService');
+      const settingName = `crm_sender_emails_${userId}`;
+      const setting = await settingsService.getSetting(settingName);
+      
+      if (!setting) {
+        return {
+          success: true,
+          senders: [],
+          defaultSenderId: null
+        };
+      }
+
+      const config = JSON.parse(setting.settingValue);
+      return {
+        success: true,
+        senders: config.senders || [],
+        defaultSenderId: config.defaultSenderId || null
+      };
+    } catch (error) {
+      console.error('AgentMode: Error getting CRM senders:', error);
+      return {
+        success: false,
+        senders: [],
+        defaultSenderId: null,
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // Get sender information for a lead (from lead record, or default sender)
+  private async getSenderForLead(userId: string, leadSelectedSenderId?: string | null): Promise<{
+    fromName: string;
+  } | null> {
+    try {
+      const sendersResult = await this.getCrmSenders(userId);
+      if (!sendersResult.success || sendersResult.senders.length === 0) {
+        return null;
+      }
+
+      // Find the sender saved on the lead record, or default sender, or use the first one
+      let sender = null;
+      if (leadSelectedSenderId) {
+        sender = sendersResult.senders.find((s) => s.id === leadSelectedSenderId);
+      }
+      if (!sender) {
+        const defaultSenderId = sendersResult.defaultSenderId;
+        sender = defaultSenderId 
+          ? sendersResult.senders.find((s) => s.id === defaultSenderId)
+          : sendersResult.senders[0];
+      }
+      
+      if (sender) {
+        return {
+          fromName: sender.fromName
+        };
+      }
+      
+      return null;
+    } catch (error) {
+      console.error('AgentMode: Error getting sender for lead:', error);
+      return null;
+    }
+  }
+
   // Read current user's market strategy
   private async readMarketStrategy(userId: string): Promise<any> {
     try {
@@ -3941,6 +4013,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
       // Get market strategy
       const marketStrategy = await this.readMarketStrategy(userId);
 
+      // Get sender information (from lead record, or default sender from CRM configuration)
+      const leadSelectedSenderId = (lead as any).selectedSenderId;
+      const senderInfo = await this.getSenderForLead(userId, leadSelectedSenderId);
+
       // Get existing draft if it exists
       const existingDraft = (lead as any).emailDraft;
 
@@ -3997,6 +4073,16 @@ Use the available tools to create tasks in the agent-engine when complex work is
         emailPrompt += `\n\n## Market Strategy: Not configured`;
       }
 
+      // Add sender information
+      if (senderInfo) {
+        emailPrompt += `\n\n## Sender Information:
+- From Name: ${senderInfo.fromName}
+
+Use this sender information to create an appropriate email signature. The signature should match the sender's name.`;
+      } else {
+        emailPrompt += `\n\n## Sender Information: Not configured (use a generic professional signature)`;
+      }
+
       // Add existing draft if it exists
       if (existingDraft) {
         emailPrompt += `\n\n## Existing Email Draft (to refine/update):\nSubject: ${existingDraft.subject}\nHTML Content:\n${existingDraft.htmlContent}`;
@@ -4013,7 +4099,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
 5. Subject line should be compelling and personalized (50-60 characters ideal)
 6. HTML content should be well-formatted, professional, and email-friendly
 7. Include a clear call-to-action
-8. If updating an existing draft, improve it based on the instruction while maintaining the core message
+8. Include an appropriate email signature at the end using the sender information provided (if available)
+9. If updating an existing draft, improve it based on the instruction while maintaining the core message
 
 Format the response as JSON with this structure:
 {
