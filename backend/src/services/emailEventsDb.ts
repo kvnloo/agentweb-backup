@@ -11,11 +11,67 @@ export interface EmailEvent {
   createdAt: string;
   data: ResendWebhookEvent['data'];
   processedAt: string;
+  leadEmail?: string; // Optional, extracted based on event type
+  emailContent?: {
+    html?: string;
+    text?: string;
+    headers?: Record<string, string>;
+  }; // Optional, cached email content (truncated to 10k chars if needed)
 }
 
 class EmailEventsDb {
+  /**
+   * Extract email address from email string
+   * Handles formats like "Name <email@domain.com>" or "email@domain.com"
+   */
+  private extractEmailAddress(email: string): string {
+    // Extract email from "Name <email@domain.com>" format
+    const match = email.match(/<([^>]+)>/);
+    if (match) {
+      return match[1].toLowerCase().trim();
+    }
+    
+    // If no angle brackets, assume the whole string is an email
+    return email.split(' ').pop()?.toLowerCase().trim() || email.toLowerCase().trim();
+  }
+
+  /**
+   * Extract leadEmail from event data based on event type
+   */
+  private extractLeadEmail(event: ResendWebhookEvent): string | null {
+    if (!event.data) {
+      return null;
+    }
+
+    // For email.received events, leadEmail is the sender (from field)
+    if (event.type === 'email.received') {
+      const from = event.data.from;
+      if (!from) {
+        return null;
+      }
+      return this.extractEmailAddress(from);
+    } else {
+      // For all other events (delivered, opened, clicked, etc.), leadEmail is the recipient (to field)
+      const to = event.data.to;
+      if (!to) {
+        return null;
+      }
+      
+      // Handle both array and string formats
+      const recipient = Array.isArray(to) ? to[0] : to;
+      if (!recipient) {
+        return null;
+      }
+      
+      return this.extractEmailAddress(recipient);
+    }
+  }
+
   async addEmailEvent(event: ResendWebhookEvent, emailDomain: string, eventId: string): Promise<EmailEvent> {
     const processedAt = new Date().toISOString();
+
+    // Extract leadEmail based on event type
+    const leadEmail = this.extractLeadEmail(event);
 
     const emailEvent: EmailEvent = {
       eventId,
@@ -24,7 +80,8 @@ class EmailEventsDb {
       eventType: event.type,
       createdAt: event.created_at,
       data: event.data,
-      processedAt
+      processedAt,
+      ...(leadEmail && { leadEmail }) // Only include leadEmail if it was successfully extracted
     };
 
     const params = {
@@ -35,6 +92,36 @@ class EmailEventsDb {
     await dynamodb.put(params).promise();
     
     return emailEvent;
+  }
+
+  async updateEmailEventContent(eventId: string, emailContent: {
+    html?: string;
+    text?: string;
+    headers?: Record<string, string>;
+  }): Promise<void> {
+    // Truncate content to 10k characters if needed
+    const truncatedContent = {
+      html: emailContent.html && emailContent.html.length > 10000 
+        ? emailContent.html.substring(0, 10000) + '... [truncated]'
+        : emailContent.html,
+      text: emailContent.text && emailContent.text.length > 10000 
+        ? emailContent.text.substring(0, 10000) + '... [truncated]'
+        : emailContent.text,
+      headers: emailContent.headers
+    };
+
+    const params = {
+      TableName: TABLE_NAME,
+      Key: {
+        eventId
+      },
+      UpdateExpression: 'SET emailContent = :emailContent',
+      ExpressionAttributeValues: {
+        ':emailContent': truncatedContent
+      }
+    };
+
+    await dynamodb.update(params).promise();
   }
 
   async getEventsByEmailId(emailId: string): Promise<EmailEvent[]> {
@@ -78,6 +165,46 @@ class EmailEventsDb {
         KeyConditionExpression: 'emailDomain = :emailDomain',
         ExpressionAttributeValues: {
           ':emailDomain': emailDomain
+        }
+      };
+
+      if (lastEvaluatedKey) {
+        params.ExclusiveStartKey = lastEvaluatedKey;
+      }
+
+      const result = await dynamodb.query(params).promise();
+      
+      if (result.Items) {
+        allItems.push(...(result.Items as EmailEvent[]));
+      }
+      
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+
+    return allItems;
+  }
+
+  /**
+   * Get events by email domain and lead email.
+   * Uses the EmailDomainLeadEmailIndex composite GSI for efficient querying.
+   * 
+   * @param emailDomain The email domain to query
+   * @param leadEmail The lead email to filter by (case-insensitive, should be normalized)
+   * @returns Filtered email events
+   */
+  async getEventsByEmailDomainAndLeadEmail(emailDomain: string, leadEmail: string): Promise<EmailEvent[]> {
+    const allItems: EmailEvent[] = [];
+    let lastEvaluatedKey: any = undefined;
+    const normalizedLeadEmail = leadEmail.toLowerCase();
+
+    do {
+      const params: any = {
+        TableName: TABLE_NAME,
+        IndexName: 'EmailDomainLeadEmailIndex',
+        KeyConditionExpression: 'emailDomain = :emailDomain AND leadEmail = :leadEmail',
+        ExpressionAttributeValues: {
+          ':emailDomain': emailDomain,
+          ':leadEmail': normalizedLeadEmail
         }
       };
 

@@ -140,6 +140,57 @@ Notes:
 - GSI creation is asynchronous; queries against `UserIdIndex` work after status becomes `ACTIVE`.
 - Replace `Dev-AW-TaskSchedules` with `AW-TaskSchedules` for production.
 
+## DynamoDB: Add EmailDomainLeadEmailIndex to AW-EmailEvents
+
+If you need to add the `EmailDomainLeadEmailIndex` composite GSI to the `AW-EmailEvents` table (for efficient lead engagement queries), use these commands.
+
+Prerequisites:
+- AWS CLI configured for the target account/region (`aws configure`)
+- Region: `us-west-2` (override with `--region` if different)
+
+Add index in Development (Dev- prefixed table):
+
+```bash
+aws dynamodb update-table \
+  --table-name Dev-AW-EmailEvents \
+  --attribute-definitions AttributeName=emailDomain,AttributeType=S AttributeName=leadEmail,AttributeType=S \
+  --global-secondary-index-updates '[{"Create":{"IndexName":"EmailDomainLeadEmailIndex","KeySchema":[{"AttributeName":"emailDomain","KeyType":"HASH"},{"AttributeName":"leadEmail","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"},"ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}}}]' \
+  --region us-west-2
+```
+
+Add index in Production (no prefix):
+
+```bash
+aws dynamodb update-table \
+  --table-name AW-EmailEvents \
+  --attribute-definitions AttributeName=emailDomain,AttributeType=S AttributeName=leadEmail,AttributeType=S \
+  --global-secondary-index-updates '[{"Create":{"IndexName":"EmailDomainLeadEmailIndex","KeySchema":[{"AttributeName":"emailDomain","KeyType":"HASH"},{"AttributeName":"leadEmail","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"},"ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}}}]' \
+  --region us-west-2
+```
+
+Verify index status (repeat until `IndexStatus` is `ACTIVE`):
+
+```bash
+aws dynamodb describe-table \
+  --table-name Dev-AW-EmailEvents \
+  --region us-west-2 \
+  --query 'Table.GlobalSecondaryIndexes[?IndexName==`EmailDomainLeadEmailIndex`].{IndexName:IndexName,IndexStatus:IndexStatus}'
+```
+
+List all GSIs on the table:
+
+```bash
+aws dynamodb describe-table \
+  --table-name Dev-AW-EmailEvents \
+  --region us-west-2 \
+  --query 'Table.GlobalSecondaryIndexes[].{IndexName:IndexName,IndexStatus:IndexStatus}'
+```
+
+Notes:
+- GSI creation is asynchronous; queries against `EmailDomainLeadEmailIndex` work after status becomes `ACTIVE`.
+- Replace `Dev-AW-EmailEvents` with `AW-EmailEvents` for production.
+- The `leadEmail` attribute must be populated in existing records for the index to be useful. Consider backfilling existing records if needed.
+
 ## Port Management
 
 ### Finding and Killing Processes on Port 3001

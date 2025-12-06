@@ -9,6 +9,15 @@ import { taskDb, taskTemplateDb } from './db';
 import { settingsService } from './settingsService';
 import { getSecret, getGCSPPrivateKey } from '../utils/secretsManager';
 
+// Initialize Azure OpenAI client for direct chat completion (same as blog.ts)
+// Used for updateEmailDraftForLead to match generateBlogContent pattern
+const openai = new OpenAI({
+  apiKey: process.env.AZURE_OPENAI_API_KEY,
+  baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT}`,
+  defaultQuery: { "api-version": process.env.AZURE_OPENAI_API_VERSION },
+  defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
+});
+
 // Type declaration for pdf-parse module
 interface PDFData {
   text: string;
@@ -524,6 +533,21 @@ You can read and create Go-To-Market (GTM) plans using these tools:
 
 Use GTM plans to understand the user's go-to-market strategy and provide context-aware assistance. When a user asks about their GTM plan, use read_gtm_plan to get the current state and provide insights based on the plan structure and progress. When creating a GTM plan, you can include the complete structure with phases and work items in a single call.
 
+## Lead Lists Management
+You can manage lead lists and add leads to them using these tools:
+- **get_lead_lists**: Get all lead lists for the user. Returns list IDs, names, descriptions, lead counts, and creation dates. Use this to see what lead lists exist before adding leads or creating new lists.
+- **create_lead_list**: Create a new lead list with a name and optional description. Returns the created list with its ID. Use this when the user wants to organize leads into a new list.
+- **add_leads_to_list**: Add one or more leads to an existing lead list. Each lead is a flexible object that can contain any fields you want to store. Common fields include: email (used for deduplication and merging), firstName, lastName, phone, company, title, notes, linkedin, and any custom fields. You can use any field names that make sense for your data. If a lead with the same email already exists, it will be merged with the new data. Returns counts of new and merged leads, plus any errors. **IMPORTANT**: Always use get_lead_lists first to get the correct list_id before adding leads.
+
+**Best Practices for Lead Lists:**
+- When a user wants to add leads, first check if a suitable list exists using get_lead_lists
+- If no appropriate list exists, offer to create one using create_lead_list
+- When adding leads, use field names that make sense for the data you're storing - you're not limited to predefined fields
+- The email field (if provided) is used for deduplication and merging - leads with the same email will be merged with existing records
+- Include as much information as possible to make the leads more valuable
+- You can use any field names - standard fields (email, firstName, lastName, phone, company, title, notes, linkedin) are recognized, and all other fields will be stored as custom fields
+- Always confirm the list_id with the user or use get_lead_lists to find the correct one before adding leads
+
 ### Required Function Calls
 You can specify required function calls for any step to ensure proper validation:
 - Add requiredFunctionCalls array when creating or modifying steps
@@ -679,6 +703,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
         messageObj.tool_calls = (msg as any).tool_calls;
       }
 
+      // Ensure content is never null or undefined
+      if (messageObj.content == null || messageObj.content === null || messageObj.content === undefined) {
+        messageObj.content = '';
+      } else {
+        messageObj.content = String(messageObj.content);
+      }
       messages.push(messageObj);
     }
 
@@ -1263,6 +1293,96 @@ Use the available tools to create tasks in the agent-engine when complex work is
               }
             },
             required: ['title']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'get_lead_lists',
+          description: 'Get all lead lists for the current user. Returns a list of lead lists with their IDs, names, descriptions, lead counts, and creation dates.',
+          parameters: {
+            type: 'object',
+            properties: {},
+            required: []
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'create_lead_list',
+          description: 'Create a new lead list with a name and optional description. Returns the created lead list with its ID.',
+          parameters: {
+            type: 'object',
+            properties: {
+              name: {
+                type: 'string',
+                description: 'Name of the lead list'
+              },
+              description: {
+                type: 'string',
+                description: 'Optional description of the lead list'
+              }
+            },
+            required: ['name']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'add_leads_to_list',
+          description: 'Add one or more leads to an existing lead list. Each lead is a flexible object that can contain any fields you want to store. Common fields include: email (used for deduplication and merging), firstName, lastName, phone, company, title, notes, linkedin, and any custom fields. You can use any field names that make sense for your data. If a lead with the same email already exists, it will be merged with the new data. Returns counts of new and merged leads, plus any errors.',
+          parameters: {
+            type: 'object',
+            properties: {
+              list_id: {
+                type: 'string',
+                description: 'The ID of the lead list to add leads to'
+              },
+              leads: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  description: 'A lead object with any fields you want to store. Use field names that make sense for your data. The email field (if provided) is used for deduplication and merging.',
+                  additionalProperties: true,
+                  properties: {
+                    email: { 
+                      type: 'string', 
+                      description: 'Email address (optional, but recommended for deduplication and merging existing leads)' 
+                    }
+                  }
+                },
+                description: 'Array of lead objects to add to the list. Each lead can have any fields you want to store.'
+              }
+            },
+            required: ['list_id', 'leads']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'update_email_draft_for_lead',
+          description: 'Create or update an email draft for a specific lead. This function loads the lead record, engagement history, brand guidelines, and market strategy, then uses AI to generate a personalized email draft (subject and HTML content) based on the instruction provided. If a draft already exists, it will be included in the prompt for refinement. The draft is saved to the lead record along with the current session ID for future updates.',
+          parameters: {
+            type: 'object',
+            properties: {
+              list_id: {
+                type: 'string',
+                description: 'The ID of the lead list containing the lead'
+              },
+              lead_id: {
+                type: 'string',
+                description: 'The ID of the lead to create/update email draft for'
+              },
+              instruction: {
+                type: 'string',
+                description: 'Instructions for creating the email draft (e.g., "welcome email", "follow-up on their interest in our product", "introduce our new feature"). The AI will use this along with lead data, engagement history, brand guidelines, and market strategy to create a personalized email.'
+              }
+            },
+            required: ['list_id', 'lead_id', 'instruction']
           }
         }
       },
@@ -2213,6 +2333,52 @@ Use the available tools to create tasks in the agent-engine when complex work is
           },
           formattedContent: `GTM Plan: Mock Q1 2024 Launch Plan\nDescription: Mock GTM plan for testing\nCreated: ${new Date().toISOString()}\n\nPhases (1):\n\nPhase 1: Pre-Launch\n  Description: Pre-launch activities\n  Duration: 30 day(s)\n  Status: in_progress\n  Work Items (1):\n    1. Create landing page [completed] - 5 day(s) - Completed: ${new Date(Date.now() - 86400000).toISOString()}\n       Design and develop landing page\n\n`
         };
+      case 'get_lead_lists':
+        return {
+          success: true,
+          message: 'Found 2 mock lead list(s)',
+          lists: [
+            {
+              listId: 'mock-list-1',
+              name: 'Mock Sales Leads',
+              description: 'Mock description',
+              leadCount: 10,
+              createdAt: new Date().toISOString()
+            },
+            {
+              listId: 'mock-list-2',
+              name: 'Mock Marketing Leads',
+              description: 'Mock description',
+              leadCount: 5,
+              createdAt: new Date().toISOString()
+            }
+          ],
+          totalLists: 2
+        };
+      case 'create_lead_list':
+        return {
+          success: true,
+          message: `Mock lead list "${args.name}" created successfully`,
+          list: {
+            listId: `mock-list-${Date.now()}`,
+            name: args.name,
+            description: args.description || '',
+            leadCount: 0,
+            createdAt: new Date().toISOString()
+          }
+        };
+      case 'add_leads_to_list':
+        const mockNewCount = Math.floor((args.leads?.length || 0) * 0.7);
+        const mockMergedCount = (args.leads?.length || 0) - mockNewCount;
+        return {
+          success: true,
+          message: `Successfully processed: ${mockNewCount} new lead(s) created, ${mockMergedCount} lead(s) merged.`,
+          successCount: args.leads?.length || 0,
+          newCount: mockNewCount,
+          mergedCount: mockMergedCount,
+          errorCount: 0,
+          errors: []
+        };
       case 'create_gtm_plan':
         const mockPhases = args.phases || [
           {
@@ -2701,6 +2867,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.readGTMPlan(args.plan_id, userId);
       case 'create_gtm_plan':
         return await this.createGTMPlan(args.title, args.description || '', args.phases || [], userId);
+      case 'get_lead_lists':
+        return await this.getLeadLists(userId);
+      case 'create_lead_list':
+        return await this.createLeadList(args.name, args.description || '', userId);
+      case 'add_leads_to_list':
+        return await this.addLeadsToList(args.list_id, args.leads || [], userId);
+      case 'update_email_draft_for_lead':
+        return await this.updateEmailDraftForLead(args.list_id, args.lead_id, args.instruction, sessionId, userId);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -3142,6 +3316,80 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
+  // Get CRM sender emails configuration
+  private async getCrmSenders(userId: string): Promise<{
+    success: boolean;
+    senders: Array<{ id: string; email: string; fromName: string; notes?: string }>;
+    defaultSenderId: string | null;
+    error?: string;
+  }> {
+    try {
+      const { settingsService } = await import('./settingsService');
+      const settingName = `crm_sender_emails_${userId}`;
+      const setting = await settingsService.getSetting(settingName);
+      
+      if (!setting) {
+        return {
+          success: true,
+          senders: [],
+          defaultSenderId: null
+        };
+      }
+
+      const config = JSON.parse(setting.settingValue);
+      return {
+        success: true,
+        senders: config.senders || [],
+        defaultSenderId: config.defaultSenderId || null
+      };
+    } catch (error) {
+      console.error('AgentMode: Error getting CRM senders:', error);
+      return {
+        success: false,
+        senders: [],
+        defaultSenderId: null,
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // Get sender information for a lead (from lead record, or default sender)
+  private async getSenderForLead(userId: string, leadSelectedSenderId?: string | null): Promise<{
+    fromName: string;
+    notes?: string;
+  } | null> {
+    try {
+      const sendersResult = await this.getCrmSenders(userId);
+      if (!sendersResult.success || sendersResult.senders.length === 0) {
+        return null;
+      }
+
+      // Find the sender saved on the lead record, or default sender, or use the first one
+      let sender = null;
+      if (leadSelectedSenderId) {
+        sender = sendersResult.senders.find((s) => s.id === leadSelectedSenderId);
+      }
+      if (!sender) {
+        const defaultSenderId = sendersResult.defaultSenderId;
+        sender = defaultSenderId 
+          ? sendersResult.senders.find((s) => s.id === defaultSenderId)
+          : sendersResult.senders[0];
+      }
+      
+      if (sender) {
+        return {
+          fromName: sender.fromName,
+          notes: sender.notes
+        };
+      }
+      
+      return null;
+    } catch (error) {
+      console.error('AgentMode: Error getting sender for lead:', error);
+      return null;
+    }
+  }
+
   // Read current user's market strategy
   private async readMarketStrategy(userId: string): Promise<any> {
     try {
@@ -3579,6 +3827,372 @@ Use the available tools to create tasks in the agent-engine when complex work is
       return {
         success: false,
         message: 'Failed to create GTM plan',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async getLeadLists(userId: string): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+      const lists = await crmDb.getLeadListsByUserId(userId);
+      
+      return {
+        success: true,
+        message: `Found ${lists.length} lead list(s)`,
+        lists: lists.map((list: any) => ({
+          listId: list.listId,
+          name: list.name,
+          description: list.description || '',
+          leadCount: list.leadCount || 0,
+          createdAt: list.createdAt
+        })),
+        totalLists: lists.length
+      };
+    } catch (error) {
+      console.error('AgentMode: Error listing lead lists:', error);
+      return {
+        success: false,
+        message: 'Failed to list lead lists',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async createLeadList(name: string, description: string, userId: string): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+      const list = await crmDb.createLeadList(userId, name, description);
+      
+      return {
+        success: true,
+        message: `Lead list "${name}" created successfully`,
+        list: {
+          listId: list.listId,
+          name: list.name,
+          description: list.description || '',
+          leadCount: list.leadCount || 0,
+          createdAt: list.createdAt
+        }
+      };
+    } catch (error) {
+      console.error('AgentMode: Error creating lead list:', error);
+      return {
+        success: false,
+        message: 'Failed to create lead list',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async addLeadsToList(listId: string, leads: any[], userId: string): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+      
+      // Verify list ownership
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return {
+          success: false,
+          message: 'Lead list not found',
+          error: 'The specified lead list does not exist'
+        };
+      }
+      
+      if (list.userId !== userId) {
+        return {
+          success: false,
+          message: 'Access denied',
+          error: 'You do not have permission to add leads to this list'
+        };
+      }
+      
+      // Convert leads array to the format expected by batchCreateLeads
+      // Extract standard fields and put everything else in customFields
+      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'];
+      const formattedLeads = leads.map((lead: any) => {
+        const formatted: any = {};
+        const customFields: Record<string, any> = {};
+        
+        // Extract standard fields if they exist
+        standardFields.forEach(field => {
+          if (lead[field] !== undefined) {
+            formatted[field] = lead[field];
+          }
+        });
+        
+        // Put all other fields into customFields
+        Object.keys(lead).forEach(key => {
+          if (!standardFields.includes(key)) {
+            customFields[key] = lead[key];
+          }
+        });
+        
+        if (Object.keys(customFields).length > 0) {
+          formatted.customFields = customFields;
+        }
+        
+        return formatted;
+      });
+      
+      const result = await crmDb.batchCreateLeads(listId, formattedLeads);
+      
+      const messageParts: string[] = [];
+      if (result.newCount > 0) {
+        messageParts.push(`${result.newCount} new lead(s) created`);
+      }
+      if (result.mergedCount > 0) {
+        messageParts.push(`${result.mergedCount} lead(s) merged`);
+      }
+      if (result.errorCount > 0) {
+        messageParts.push(`${result.errorCount} lead(s) failed`);
+      }
+      
+      return {
+        success: result.successCount > 0,
+        message: messageParts.length > 0 
+          ? `Successfully processed: ${messageParts.join(', ')}.`
+          : 'No leads were processed.',
+        successCount: result.successCount,
+        newCount: result.newCount || 0,
+        mergedCount: result.mergedCount || 0,
+        errorCount: result.errorCount,
+        errors: result.errors.length > 0 ? result.errors : undefined
+      };
+    } catch (error) {
+      console.error('AgentMode: Error adding leads to list:', error);
+      return {
+        success: false,
+        message: 'Failed to add leads to list',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async updateEmailDraftForLead(listId: string, leadId: string, instruction: string, sessionId: string, userId: string): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+      
+      // Verify list ownership
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return {
+          success: false,
+          message: 'Lead list not found',
+          error: 'The specified lead list does not exist'
+        };
+      }
+      
+      if (list.userId !== userId) {
+        return {
+          success: false,
+          message: 'Access denied',
+          error: 'You do not have permission to access this lead list'
+        };
+      }
+
+      // Get the lead
+      const lead = await crmDb.getLeadById(listId, leadId);
+      if (!lead) {
+        return {
+          success: false,
+          message: 'Lead not found',
+          error: 'The specified lead does not exist'
+        };
+      }
+
+      // Get engagement history
+      const engagementsResult = await crmDb.getLeadEngagements(listId, leadId, userId);
+      const engagements = engagementsResult.engagements || [];
+
+      // Get brand guidelines
+      const brandGuidelines = await this.readBrandGuidelines(userId);
+
+      // Get market strategy
+      const marketStrategy = await this.readMarketStrategy(userId);
+
+      // Get sender information (from lead record, or default sender from CRM configuration)
+      const leadSelectedSenderId = (lead as any).selectedSenderId;
+      const senderInfo = await this.getSenderForLead(userId, leadSelectedSenderId);
+
+      // Get existing draft if it exists
+      const existingDraft = (lead as any).emailDraft;
+
+      // Build the prompt for LLM
+      let emailPrompt = `You are an expert email marketing strategist. Create a personalized email draft for a lead based on the following information:
+
+## Lead Information:
+- Name: ${lead.firstName || ''} ${lead.lastName || ''}`.trim();
+      
+      if (lead.company) {
+        emailPrompt += `\n- Company: ${lead.company}`;
+      }
+      if (lead.title) {
+        emailPrompt += `\n- Title: ${lead.title}`;
+      }
+      if (lead.email) {
+        emailPrompt += `\n- Email: ${lead.email}`;
+      }
+      if (lead.notes) {
+        emailPrompt += `\n- Notes: ${lead.notes}`;
+      }
+      if (lead.customFields && Object.keys(lead.customFields).length > 0) {
+        emailPrompt += `\n- Custom Fields: ${JSON.stringify(lead.customFields, null, 2)}`;
+      }
+
+      // Add engagement history
+      if (engagements.length > 0) {
+        emailPrompt += `\n\n## Engagement History:`;
+        engagements.slice(0, 10).forEach((eng: any, index: number) => {
+          emailPrompt += `\n${index + 1}. ${eng.eventType} - ${eng.createdAt}`;
+          if (eng.eventData?.subject) {
+            emailPrompt += ` (Subject: ${eng.eventData.subject})`;
+          }
+          
+          // Include email content if available (first 1k characters)
+          if (eng.emailContent) {
+            let contentPreview = '';
+            // Prefer text content, fall back to HTML
+            if (eng.emailContent.text) {
+              contentPreview = eng.emailContent.text.substring(0, 1000);
+            } else if (eng.emailContent.html) {
+              // Strip HTML tags for preview, then take first 1k characters
+              const textFromHtml = eng.emailContent.html
+                .replace(/<[^>]*>/g, ' ') // Remove HTML tags
+                .replace(/\s+/g, ' ') // Normalize whitespace
+                .trim();
+              contentPreview = textFromHtml.substring(0, 1000);
+            }
+            
+            if (contentPreview) {
+              const truncated = contentPreview.length >= 1000 ? contentPreview + '...' : contentPreview;
+              emailPrompt += `\n   Email Content (first 1k characters):\n   ${truncated}`;
+            }
+          }
+        });
+      } else {
+        emailPrompt += `\n\n## Engagement History: No previous engagements`;
+      }
+
+      // Add brand guidelines
+      if (brandGuidelines.exists) {
+        emailPrompt += `\n\n## Brand Guidelines:\n${brandGuidelines.formattedContent || JSON.stringify(brandGuidelines.brandData, null, 2)}`;
+      } else {
+        emailPrompt += `\n\n## Brand Guidelines: Not configured`;
+      }
+
+      // Add market strategy
+      if (marketStrategy.exists) {
+        emailPrompt += `\n\n## Market Strategy:\n${marketStrategy.formattedContent || JSON.stringify(marketStrategy.marketData, null, 2)}`;
+      } else {
+        emailPrompt += `\n\n## Market Strategy: Not configured`;
+      }
+
+      // Add sender information
+      if (senderInfo) {
+        emailPrompt += `\n\n## Sender Information:
+- From Name: ${senderInfo.fromName}`;
+        if (senderInfo.notes) {
+          emailPrompt += `\n- Notes: ${senderInfo.notes}`;
+        }
+        emailPrompt += `\n\nUse this sender information to create an appropriate email signature. The signature should match the sender's name.`;
+        if (senderInfo.notes) {
+          emailPrompt += ` If the notes contain a meeting schedule link or other relevant information, consider including it in the email where appropriate.`;
+        }
+      } else {
+        emailPrompt += `\n\n## Sender Information: Not configured (use a generic professional signature)`;
+      }
+
+      // Add existing draft if it exists
+      if (existingDraft) {
+        emailPrompt += `\n\n## Existing Email Draft (to refine/update):\nSubject: ${existingDraft.subject}\nHTML Content:\n${existingDraft.htmlContent}`;
+      }
+
+      // Add instruction
+      emailPrompt += `\n\n## Instruction:\n${instruction}`;
+
+      emailPrompt += `\n\n## Requirements:
+1. Create a professional, personalized email that aligns with the brand guidelines and market strategy
+2. Use the lead's information to personalize the email (use their name, company, etc.)
+3. Consider the engagement history to make the email contextually relevant
+4. The email should be appropriate for the instruction provided
+5. Subject line should be compelling and personalized (50-60 characters ideal)
+6. HTML content should be well-formatted, professional, and email-friendly
+7. Include a clear call-to-action
+8. Include an appropriate email signature at the end using the sender information provided (if available)
+9. If updating an existing draft, improve it based on the instruction while maintaining the core message
+
+Format the response as JSON with this structure:
+{
+  "subject": "Email subject line (personalized, 50-60 characters)",
+  "htmlContent": "Complete HTML email body (well-formatted, professional, email-friendly HTML)"
+}`;
+
+      // Call LLM to generate email using direct chat completion (same as generateBlogContent)
+      const completion = await openai.chat.completions.create({
+        model: process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4",
+        messages: [
+          {
+            role: "system",
+            content: "You are an expert email marketing strategist. Create personalized, professional emails that align with brand guidelines and market strategy. Always respond with valid JSON containing subject and htmlContent fields.",
+          },
+          { role: "user", content: emailPrompt },
+        ],
+        temperature: 0.8,
+        max_tokens: 3000,
+        response_format: { type: 'json_object' }
+      });
+
+      const responseContent = completion.choices[0].message.content;
+      if (!responseContent) {
+        throw new Error('No content generated from LLM');
+      }
+
+      // Parse the JSON response
+      let emailData;
+      try {
+        const cleanedContent = responseContent.replace(/```json\s*|\s*```/g, '').trim();
+        emailData = JSON.parse(cleanedContent);
+      } catch (parseError) {
+        console.error('AgentMode: Error parsing email draft JSON:', parseError);
+        throw new Error('Failed to parse email draft response');
+      }
+
+      // Validate required fields
+      if (!emailData.subject || !emailData.htmlContent) {
+        throw new Error('LLM response missing required fields (subject, htmlContent)');
+      }
+
+      // Save draft to lead record with sessionId
+      const now = new Date().toISOString();
+      const emailDraft = {
+        subject: emailData.subject,
+        htmlContent: emailData.htmlContent,
+        createdAt: existingDraft?.createdAt || now,
+        updatedAt: now,
+        sessionId: sessionId
+      };
+
+      // Update lead with email draft
+      await crmDb.updateLead(listId, leadId, {
+        emailDraft: emailDraft
+      });
+
+      return {
+        success: true,
+        message: existingDraft 
+          ? 'Email draft updated successfully' 
+          : 'Email draft created successfully',
+        data: {
+          subject: emailData.subject,
+          htmlContent: emailData.htmlContent
+        }
+      };
+    } catch (error) {
+      console.error('AgentMode: Error updating email draft for lead:', error);
+      return {
+        success: false,
+        message: 'Failed to create/update email draft',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }

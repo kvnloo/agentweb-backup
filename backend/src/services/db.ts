@@ -2538,4 +2538,1113 @@ class BenchmarkTestDB {
 
 export const benchmarkTestDb = new BenchmarkTestDB();
 
+// CRM Database Service
+export const crmDb = {
+  // Lead List operations
+  async createLeadList(userId: string, name: string, description?: string) {
+    try {
+      const listId = `list_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Item: {
+          listId,
+          userId,
+          name,
+          description: description || '',
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          leadCount: 0,
+          fieldNames: [], // Initialize with empty array
+          displayFields: ['email', 'firstName', 'lastName', 'company', 'phone', 'title', 'linkedin', 'notes'], // Default visible fields
+        },
+      };
+
+      await dynamodb.put(params).promise();
+      return params.Item;
+    } catch (error) {
+      handleDynamoDbError(error, "createLeadList");
+      throw error;
+    }
+  },
+
+  async getLeadListsByUserId(userId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        IndexName: 'userId-index', // Assuming GSI on userId
+        KeyConditionExpression: 'userId = :userId',
+        ExpressionAttributeValues: {
+          ':userId': userId,
+        },
+      };
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items || [];
+    } catch (error: any) {
+      // If index doesn't exist, use scan with filter
+      if (error.code === 'ResourceNotFoundException' || error.message?.includes('index')) {
+        const params = {
+          TableName: `${TABLE_PREFIX}AW-LeadLists`,
+          FilterExpression: 'userId = :userId',
+          ExpressionAttributeValues: {
+            ':userId': userId,
+          },
+        };
+        const result = await dynamodb.scan(params).promise();
+        return result.Items || [];
+      }
+      handleDynamoDbError(error, "getLeadListsByUserId");
+      throw error;
+    }
+  },
+
+  async getLeadListById(listId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: {
+          listId,
+        },
+      };
+
+      const result = await dynamodb.get(params).promise();
+      return result.Item || null;
+    } catch (error) {
+      handleDynamoDbError(error, "getLeadListById");
+      throw error;
+    }
+  },
+
+  async updateLeadList(listId: string, updates: { name?: string; description?: string; displayFields?: string[] }) {
+    try {
+      const updateExpressions: string[] = [];
+      const expressionAttributeValues: any = {};
+
+      if (updates.name !== undefined) {
+        updateExpressions.push('name = :name');
+        expressionAttributeValues[':name'] = updates.name;
+      }
+
+      if (updates.description !== undefined) {
+        updateExpressions.push('description = :description');
+        expressionAttributeValues[':description'] = updates.description;
+      }
+
+      if (updates.displayFields !== undefined) {
+        updateExpressions.push('displayFields = :displayFields');
+        expressionAttributeValues[':displayFields'] = updates.displayFields;
+      }
+
+      if (updateExpressions.length === 0) {
+        return await this.getLeadListById(listId);
+      }
+
+      updateExpressions.push('updatedAt = :updatedAt');
+      expressionAttributeValues[':updatedAt'] = new Date().toISOString();
+
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: {
+          listId,
+        },
+        UpdateExpression: `SET ${updateExpressions.join(', ')}`,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: 'ALL_NEW',
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "updateLeadList");
+      throw error;
+    }
+  },
+
+  async deleteLeadList(listId: string) {
+    try {
+      // First, delete all leads in this list
+      // Fetch all leads to delete (paginate through them)
+      const allLeads: any[] = [];
+      let lastKey = undefined;
+      do {
+        const result = await this.getLeadsByListId(listId, 100, lastKey);
+        allLeads.push(...result.items);
+        lastKey = result.lastEvaluatedKey;
+      } while (lastKey);
+
+      if (allLeads.length > 0) {
+        const batchSize = 25;
+        for (let i = 0; i < allLeads.length; i += batchSize) {
+          const batch = allLeads.slice(i, i + batchSize);
+          const deleteRequests = batch.map(lead => ({
+            DeleteRequest: {
+              Key: {
+                listId: lead.listId,
+                leadId: lead.leadId,
+              },
+            },
+          }));
+
+          const params = {
+            RequestItems: {
+              [`${TABLE_PREFIX}AW-Leads`]: deleteRequests,
+            },
+          };
+
+          await dynamodb.batchWrite(params).promise();
+        }
+      }
+
+      // Then delete the list
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: {
+          listId,
+        },
+      };
+
+      await dynamodb.delete(params).promise();
+      return { success: true };
+    } catch (error) {
+      handleDynamoDbError(error, "deleteLeadList");
+      throw error;
+    }
+  },
+
+  async incrementLeadCount(listId: string, increment: number = 1) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: {
+          listId,
+        },
+        UpdateExpression: 'ADD leadCount :inc SET updatedAt = :updatedAt',
+        ExpressionAttributeValues: {
+          ':inc': increment,
+          ':updatedAt': new Date().toISOString(),
+        },
+        ReturnValues: 'ALL_NEW',
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "incrementLeadCount");
+      throw error;
+    }
+  },
+
+  async updateFieldNames(listId: string, fieldNames: string[]) {
+    try {
+      // Get unique field names and sort them
+      const uniqueFieldNames = Array.from(new Set(fieldNames)).sort();
+      
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: {
+          listId,
+        },
+        UpdateExpression: 'SET fieldNames = :fieldNames, updatedAt = :updatedAt',
+        ExpressionAttributeValues: {
+          ':fieldNames': uniqueFieldNames,
+          ':updatedAt': new Date().toISOString(),
+        },
+        ReturnValues: 'ALL_NEW',
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "updateFieldNames");
+      throw error;
+    }
+  },
+
+  // Lead operations
+  async createLead(listId: string, leadData: {
+    email?: string;
+    firstName?: string;
+    lastName?: string;
+    phone?: string;
+    company?: string;
+    title?: string;
+    notes?: string;
+    linkedin?: string;
+    customFields?: Record<string, any>;
+  }) {
+    try {
+      const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      
+      // Check for duplicate email if email is provided
+      if (leadData.email && leadData.email.trim()) {
+        const existingLead = await this.getLeadByEmail(listId, leadData.email.trim().toLowerCase());
+        if (existingLead) {
+          throw new Error(`Lead with email "${leadData.email}" already exists in this list`);
+        }
+      }
+
+      const emailValue = leadData.email?.trim().toLowerCase();
+      const item: any = {
+        listId,
+        leadId,
+        firstName: leadData.firstName || '',
+        lastName: leadData.lastName || '',
+        phone: leadData.phone || '',
+        company: leadData.company || '',
+        title: leadData.title || '',
+        notes: leadData.notes || '',
+        linkedin: leadData.linkedin?.trim() || '',
+        customFields: leadData.customFields || {},
+        engagements: [], // Initialize with empty array
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      
+      // Only include email if it's provided (GSI key cannot be empty string)
+      if (emailValue) {
+        item.email = emailValue;
+      }
+
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Item: item,
+      };
+
+      await dynamodb.put(params).promise();
+      
+      // Extract field names from lead data
+      const fieldNames: string[] = [];
+      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'];
+      standardFields.forEach(field => {
+        if (leadData[field as keyof typeof leadData] && String(leadData[field as keyof typeof leadData]).trim()) {
+          fieldNames.push(field);
+        }
+      });
+      if (leadData.customFields) {
+        Object.keys(leadData.customFields).forEach(key => {
+          if (leadData.customFields![key] && String(leadData.customFields![key]).trim()) {
+            fieldNames.push(key);
+          }
+        });
+      }
+      
+      // Update field names in list
+      if (fieldNames.length > 0) {
+        const list = await this.getLeadListById(listId);
+        const existingFieldNames = (list?.fieldNames as string[]) || [];
+        const allFieldNames = [...existingFieldNames, ...fieldNames];
+        await this.updateFieldNames(listId, allFieldNames);
+      }
+      
+      // Increment lead count
+      await this.incrementLeadCount(listId, 1);
+      
+      return params.Item;
+    } catch (error) {
+      handleDynamoDbError(error, "createLead");
+      throw error;
+    }
+  },
+
+  async getLeadsByListId(listId: string, limit?: number, lastEvaluatedKey?: any) {
+    try {
+      const params: any = {
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        KeyConditionExpression: 'listId = :listId',
+        ExpressionAttributeValues: {
+          ':listId': listId,
+        },
+      };
+
+      if (limit !== undefined && limit > 0) {
+        params.Limit = limit;
+      }
+
+      if (lastEvaluatedKey) {
+        params.ExclusiveStartKey = lastEvaluatedKey;
+      }
+
+      const result = await dynamodb.query(params).promise();
+      return {
+        items: result.Items || [],
+        lastEvaluatedKey: result.LastEvaluatedKey || null,
+        hasMore: !!result.LastEvaluatedKey,
+      };
+    } catch (error) {
+      handleDynamoDbError(error, "getLeadsByListId");
+      throw error;
+    }
+  },
+
+  async getLeadById(listId: string, leadId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: {
+          listId,
+          leadId,
+        },
+      };
+
+      const result = await dynamodb.get(params).promise();
+      return result.Item || null;
+    } catch (error) {
+      handleDynamoDbError(error, "getLeadById");
+      throw error;
+    }
+  },
+
+  async getLeadByEmail(listId: string, email: string) {
+    try {
+      // Use email-index GSI to query by listId and email
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        IndexName: 'email-index',
+        KeyConditionExpression: 'listId = :listId AND email = :email',
+        ExpressionAttributeValues: {
+          ':listId': listId,
+          ':email': email.toLowerCase().trim(),
+        },
+      };
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items && result.Items.length > 0 ? result.Items[0] : null;
+    } catch (error) {
+      handleDynamoDbError(error, "getLeadByEmail");
+      throw error;
+    }
+  },
+
+  async updateLead(listId: string, leadId: string, updates: {
+    email?: string;
+    firstName?: string;
+    lastName?: string;
+    phone?: string;
+    company?: string;
+    title?: string;
+    notes?: string;
+    linkedin?: string;
+    customFields?: Record<string, any>;
+    selectedSenderId?: string | null;
+    emailDraft?: {
+      subject: string;
+      htmlContent: string;
+      createdAt: string;
+      updatedAt: string;
+      sessionId?: string;
+    } | null;
+  }) {
+    try {
+      const setExpressions: string[] = [];
+      const removeExpressions: string[] = [];
+      const expressionAttributeValues: any = {};
+
+      if (updates.email !== undefined) {
+        const emailValue = updates.email.trim().toLowerCase();
+        if (emailValue) {
+          // Only set email if it's not empty (GSI key cannot be empty string)
+          setExpressions.push('email = :email');
+          expressionAttributeValues[':email'] = emailValue;
+        } else {
+          // Remove email attribute if it's being set to empty
+          removeExpressions.push('email');
+        }
+      }
+
+      if (updates.firstName !== undefined) {
+        setExpressions.push('firstName = :firstName');
+        expressionAttributeValues[':firstName'] = updates.firstName;
+      }
+
+      if (updates.lastName !== undefined) {
+        setExpressions.push('lastName = :lastName');
+        expressionAttributeValues[':lastName'] = updates.lastName;
+      }
+
+      if (updates.phone !== undefined) {
+        setExpressions.push('phone = :phone');
+        expressionAttributeValues[':phone'] = updates.phone;
+      }
+
+      if (updates.company !== undefined) {
+        setExpressions.push('company = :company');
+        expressionAttributeValues[':company'] = updates.company;
+      }
+
+      if (updates.title !== undefined) {
+        setExpressions.push('title = :title');
+        expressionAttributeValues[':title'] = updates.title;
+      }
+
+      if (updates.notes !== undefined) {
+        setExpressions.push('notes = :notes');
+        expressionAttributeValues[':notes'] = updates.notes;
+      }
+
+      if (updates.linkedin !== undefined) {
+        setExpressions.push('linkedin = :linkedin');
+        expressionAttributeValues[':linkedin'] = updates.linkedin.trim();
+      }
+
+      if (updates.customFields !== undefined) {
+        setExpressions.push('customFields = :customFields');
+        expressionAttributeValues[':customFields'] = updates.customFields;
+      }
+
+      if (updates.selectedSenderId !== undefined) {
+        if (updates.selectedSenderId === null) {
+          // Remove selectedSenderId attribute
+          removeExpressions.push('selectedSenderId');
+        } else {
+          setExpressions.push('selectedSenderId = :selectedSenderId');
+          expressionAttributeValues[':selectedSenderId'] = updates.selectedSenderId;
+        }
+      }
+
+      if (updates.emailDraft !== undefined) {
+        if (updates.emailDraft === null) {
+          // Remove emailDraft attribute
+          removeExpressions.push('emailDraft');
+        } else {
+          setExpressions.push('emailDraft = :emailDraft');
+          expressionAttributeValues[':emailDraft'] = updates.emailDraft;
+        }
+      }
+
+      // Always update updatedAt
+      setExpressions.push('updatedAt = :updatedAt');
+      expressionAttributeValues[':updatedAt'] = new Date().toISOString();
+
+      if (setExpressions.length === 0 && removeExpressions.length === 0) {
+        return await this.getLeadById(listId, leadId);
+      }
+
+      // Build UpdateExpression with proper SET and REMOVE clauses
+      const updateExpressionParts: string[] = [];
+      if (setExpressions.length > 0) {
+        updateExpressionParts.push(`SET ${setExpressions.join(', ')}`);
+      }
+      if (removeExpressions.length > 0) {
+        updateExpressionParts.push(`REMOVE ${removeExpressions.join(', ')}`);
+      }
+
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: {
+          listId,
+          leadId,
+        },
+        UpdateExpression: updateExpressionParts.join(' '),
+        ExpressionAttributeValues: Object.keys(expressionAttributeValues).length > 0 ? expressionAttributeValues : undefined,
+        ReturnValues: 'ALL_NEW' as const,
+      };
+
+      const result = await dynamodb.update(params).promise();
+      
+      // Extract field names from updates
+      const fieldNames: string[] = [];
+      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'];
+      standardFields.forEach(field => {
+        if (updates[field as keyof typeof updates] !== undefined && String(updates[field as keyof typeof updates]).trim()) {
+          fieldNames.push(field);
+        }
+      });
+      if (updates.customFields) {
+        Object.keys(updates.customFields).forEach(key => {
+          if (updates.customFields![key] && String(updates.customFields![key]).trim()) {
+            fieldNames.push(key);
+          }
+        });
+      }
+      
+      // Update field names in list
+      if (fieldNames.length > 0) {
+        const list = await this.getLeadListById(listId);
+        const existingFieldNames = (list?.fieldNames as string[]) || [];
+        const allFieldNames = [...existingFieldNames, ...fieldNames];
+        await this.updateFieldNames(listId, allFieldNames);
+      }
+      
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "updateLead");
+      throw error;
+    }
+  },
+
+  async deleteLead(listId: string, leadId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: {
+          listId,
+          leadId,
+        },
+      };
+
+      await dynamodb.delete(params).promise();
+      
+      // Decrement lead count
+      await this.incrementLeadCount(listId, -1);
+      
+      return { success: true };
+    } catch (error) {
+      handleDynamoDbError(error, "deleteLead");
+      throw error;
+    }
+  },
+
+  async batchCreateLeads(listId: string, leads: Array<{
+    email?: string;
+    firstName?: string;
+    lastName?: string;
+    phone?: string;
+    company?: string;
+    title?: string;
+    notes?: string;
+    linkedin?: string;
+    customFields?: Record<string, any>;
+  }>) {
+    try {
+      const results = {
+        successCount: 0,
+        newCount: 0,
+        mergedCount: 0,
+        errorCount: 0,
+        errors: [] as string[],
+      };
+
+      // Get existing leads to check for duplicates by email
+      // Note: We need to fetch all existing leads, so we'll paginate through them
+      const allExistingLeads: any[] = [];
+      let lastKey = undefined;
+      do {
+        const result = await this.getLeadsByListId(listId, 100, lastKey);
+        allExistingLeads.push(...result.items);
+        lastKey = result.lastEvaluatedKey;
+      } while (lastKey);
+
+      // Create a map of existing leads by email for quick lookup
+      const existingLeadsByEmail = new Map<string, any>();
+      allExistingLeads.forEach(lead => {
+        if (lead.email && lead.email.trim()) {
+          existingLeadsByEmail.set(lead.email.trim().toLowerCase(), lead);
+        }
+      });
+
+      // Separate leads into new leads and leads to update
+      const newLeads: typeof leads = [];
+      const leadsToUpdate: Array<{ existingLead: any; newData: typeof leads[0] }> = [];
+      
+      // Deduplicate leads within the upload by email (case-insensitive)
+      const uniqueLeads = new Map<string, typeof leads[0]>();
+      leads.forEach((lead, index) => {
+        const emailKey = lead.email?.trim().toLowerCase() || `__no_email_${index + 1}__`;
+        
+        // Only deduplicate if email is provided
+        if (lead.email && lead.email.trim()) {
+          if (uniqueLeads.has(emailKey)) {
+            results.errorCount++;
+            results.errors.push(`Row ${index + 1}: Duplicate email "${lead.email}" found in upload data`);
+            return;
+          }
+          
+          // Check against existing leads - if exists, mark for update instead of error
+          const existingLead = existingLeadsByEmail.get(emailKey);
+          if (existingLead) {
+            leadsToUpdate.push({ existingLead, newData: lead });
+            return; // Skip adding to uniqueLeads, will be handled separately
+          }
+        }
+        
+        uniqueLeads.set(emailKey, lead);
+      });
+
+      // Add unique new leads
+      uniqueLeads.forEach((lead) => {
+        newLeads.push(lead);
+      });
+
+      // Process new leads in batches of 25 (DynamoDB batch write limit)
+      const batchSize = 25;
+      for (let i = 0; i < newLeads.length; i += batchSize) {
+        const batch = newLeads.slice(i, i + batchSize);
+        
+        const writeRequests = batch.map(lead => {
+          const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+          const emailValue = lead.email?.trim().toLowerCase();
+          
+          const item: any = {
+            listId,
+            leadId,
+            firstName: lead.firstName || '',
+            lastName: lead.lastName || '',
+            phone: lead.phone || '',
+            company: lead.company || '',
+            title: lead.title || '',
+            notes: lead.notes || '',
+            linkedin: lead.linkedin?.trim() || '',
+            customFields: lead.customFields || {},
+            engagements: [], // Initialize with empty array
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          };
+          
+          // Only include email if it's provided (GSI key cannot be empty string)
+          if (emailValue) {
+            item.email = emailValue;
+          }
+          
+          return {
+            PutRequest: {
+              Item: item,
+            },
+          };
+        });
+
+        try {
+          const params = {
+            RequestItems: {
+              [`${TABLE_PREFIX}AW-Leads`]: writeRequests,
+            },
+          };
+
+          await dynamodb.batchWrite(params).promise();
+          results.successCount += batch.length;
+          results.newCount += batch.length;
+        } catch (batchError: any) {
+          batch.forEach((lead, index) => {
+            results.errorCount++;
+            results.errors.push(`Row ${i + index + 1}: ${lead.email || 'Unknown'} - ${batchError.message}`);
+          });
+        }
+      }
+
+      // Extract all field names from imported leads (both new and updated)
+      const allFieldNames: string[] = [];
+      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'];
+      
+      // Extract from new leads
+      newLeads.forEach(lead => {
+        standardFields.forEach(field => {
+          if (lead[field as keyof typeof lead] && String(lead[field as keyof typeof lead]).trim()) {
+            allFieldNames.push(field);
+          }
+        });
+        if (lead.customFields) {
+          Object.keys(lead.customFields).forEach(key => {
+            if (lead.customFields![key] && String(lead.customFields![key]).trim()) {
+              allFieldNames.push(key);
+            }
+          });
+        }
+      });
+      
+      // Extract from leads being updated
+      leadsToUpdate.forEach(({ newData }) => {
+        standardFields.forEach(field => {
+          if (newData[field as keyof typeof newData] && String(newData[field as keyof typeof newData]).trim()) {
+            allFieldNames.push(field);
+          }
+        });
+        if (newData.customFields) {
+          Object.keys(newData.customFields).forEach(key => {
+            if (newData.customFields![key] && String(newData.customFields![key]).trim()) {
+              allFieldNames.push(key);
+            }
+          });
+        }
+      });
+      
+      // Update field names in list
+      if (allFieldNames.length > 0) {
+        const list = await this.getLeadListById(listId);
+        const existingFieldNames = (list?.fieldNames as string[]) || [];
+        const combinedFieldNames = [...existingFieldNames, ...allFieldNames];
+        await this.updateFieldNames(listId, combinedFieldNames);
+      }
+      
+      // Process leads to update (merge existing leads with new data)
+      for (const { existingLead, newData } of leadsToUpdate) {
+        try {
+          // Build update object - only include fields that have values in newData
+          const updates: any = {};
+          
+          if (newData.firstName !== undefined && newData.firstName.trim()) {
+            updates.firstName = newData.firstName;
+          }
+          if (newData.lastName !== undefined && newData.lastName.trim()) {
+            updates.lastName = newData.lastName;
+          }
+          if (newData.phone !== undefined && newData.phone.trim()) {
+            updates.phone = newData.phone;
+          }
+          if (newData.company !== undefined && newData.company.trim()) {
+            updates.company = newData.company;
+          }
+          if (newData.title !== undefined && newData.title.trim()) {
+            updates.title = newData.title;
+          }
+          if (newData.notes !== undefined && newData.notes.trim()) {
+            updates.notes = newData.notes;
+          }
+          if (newData.linkedin !== undefined && newData.linkedin.trim()) {
+            updates.linkedin = newData.linkedin.trim();
+          }
+          
+          // Merge customFields - combine existing and new, with new values overriding
+          if (newData.customFields && Object.keys(newData.customFields).length > 0) {
+            const existingCustomFields = existingLead.customFields || {};
+            updates.customFields = {
+              ...existingCustomFields,
+              ...newData.customFields,
+            };
+          }
+          
+          // Update the lead
+          await this.updateLead(listId, existingLead.leadId, updates);
+          results.successCount++;
+          results.mergedCount++;
+        } catch (updateError: any) {
+          results.errorCount++;
+          results.errors.push(`Row: Email "${newData.email}" - Failed to update: ${updateError.message}`);
+        }
+      }
+
+      // Update lead count (only for new leads, updates don't change count)
+      if (newLeads.length > 0) {
+        await this.incrementLeadCount(listId, newLeads.length);
+      }
+
+      return results;
+    } catch (error: any) {
+      handleDynamoDbError(error, "batchCreateLeads");
+      return {
+        successCount: 0,
+        newCount: 0,
+        mergedCount: 0,
+        errorCount: leads.length,
+        errors: [`Batch upload failed: ${error.message}`],
+      };
+    }
+  },
+
+  async getLeadEngagementCount(listId: string, leadId: string, userId: string): Promise<{ total: number; last7Days: number }> {
+    try {
+      // Get the lead
+      const lead = await this.getLeadById(listId, leadId);
+      if (!lead) {
+        return { total: 0, last7Days: 0 };
+      }
+
+      const now = new Date();
+      const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+      let totalCount = 0;
+      let last7DaysCount = 0;
+
+      // Count manual engagements
+      const manualEngagements = (lead.engagements as Array<{ eventType: string; eventData: any; createdAt: string }>) || [];
+      totalCount += manualEngagements.length;
+      
+      // Count manual engagements in last 7 days
+      manualEngagements.forEach((eng) => {
+        const createdAt = new Date(eng.createdAt);
+        if (createdAt >= sevenDaysAgo) {
+          last7DaysCount++;
+        }
+      });
+
+      // Count email events if user has email domain configured
+      const user = await userDb.getUserById(userId);
+      if (user && user.emailDomain) {
+        const emailEventsDb = require('./emailEventsDb').emailEventsDb;
+        const leadEmail = lead.email?.toLowerCase();
+        
+        if (leadEmail) {
+          // Use optimized query with composite GSI (EmailDomainLeadEmailIndex)
+          const filteredEvents = await emailEventsDb.getEventsByEmailDomainAndLeadEmail(user.emailDomain, leadEmail);
+          totalCount += filteredEvents.length;
+          
+          // Count email events in last 7 days
+          filteredEvents.forEach((event: any) => {
+            const createdAt = new Date(event.createdAt);
+            if (createdAt >= sevenDaysAgo) {
+              last7DaysCount++;
+            }
+          });
+        }
+      }
+
+      return { total: totalCount, last7Days: last7DaysCount };
+    } catch (error) {
+      console.error('Error counting lead engagements:', error);
+      return { total: 0, last7Days: 0 }; // Return 0 on error to avoid breaking the UI
+    }
+  },
+
+  async getLeadEngagements(listId: string, leadId: string, userId: string) {
+    try {
+      // Get the lead
+      const lead = await this.getLeadById(listId, leadId);
+      if (!lead) {
+        throw new Error('Lead not found');
+      }
+
+      // Get user to get emailDomain
+      const user = await userDb.getUserById(userId);
+      if (!user || !user.emailDomain) {
+        // Return only lead engagements if no email domain configured
+        return {
+          engagements: (lead.engagements as Array<{ eventType: string; eventData: any; createdAt: string }>) || [],
+        };
+      }
+
+      // Get email events from AW-EmailEvents filtered by domain and lead email
+      const emailEventsDb = require('./emailEventsDb').emailEventsDb;
+      const leadEmail = lead.email?.toLowerCase();
+      
+      // Use optimized query with composite GSI (EmailDomainLeadEmailIndex)
+      const filteredEvents = leadEmail
+        ? await emailEventsDb.getEventsByEmailDomainAndLeadEmail(user.emailDomain, leadEmail)
+        : [];
+
+      // Transform email events to engagement format
+      // For email.received events, fetch the email content
+      const emailEngagements = await Promise.all(
+        filteredEvents.map(async (event: any) => {
+          const baseEngagement = {
+            eventType: event.eventType,
+            eventData: event.data,
+            createdAt: event.createdAt,
+            source: 'email' as const, // Mark as email event
+          };
+
+          // For email.received and email.delivered events, fetch the email content
+          if ((event.eventType === 'email.received' || event.eventType === 'email.delivered') && event.data?.email_id) {
+            try {
+              let emailContent: { html?: string; text?: string; headers?: Record<string, string> } | null = null;
+              
+              // Check if email content is already cached in the event record
+              if (event.emailContent) {
+                return {
+                  ...baseEngagement,
+                  emailContent: event.emailContent, // Use cached content from event record
+                };
+              }
+              
+              // Fetch from Resend if not cached
+              const resendService = require('./resendService').resendService;
+              
+              if (event.eventType === 'email.received') {
+                emailContent = await resendService.getReceivedEmailContent(event.data.email_id);
+              } else if (event.eventType === 'email.delivered') {
+                emailContent = await resendService.getDeliveredEmailContent(event.data.email_id);
+              }
+              
+              if (emailContent) {
+                // Store in event record for caching (truncated to 10k if needed)
+                try {
+                  const emailEventsDb = require('./emailEventsDb').emailEventsDb;
+                  await emailEventsDb.updateEmailEventContent(event.eventId, emailContent);
+                } catch (updateError) {
+                  console.error(`Failed to update email event content for ${event.data.email_id}:`, updateError);
+                  // Continue even if update fails
+                }
+                
+                // Truncate for response if needed (same logic as in updateEmailEventContent)
+                const truncatedContent = {
+                  html: emailContent.html && emailContent.html.length > 10000 
+                    ? emailContent.html.substring(0, 10000) + '... [truncated]'
+                    : emailContent.html,
+                  text: emailContent.text && emailContent.text.length > 10000 
+                    ? emailContent.text.substring(0, 10000) + '... [truncated]'
+                    : emailContent.text,
+                  headers: emailContent.headers
+                };
+                
+                return {
+                  ...baseEngagement,
+                  emailContent: truncatedContent, // Add html, text, and headers
+                };
+              }
+            } catch (error) {
+              console.error(`Failed to fetch email content for ${event.data.email_id}:`, error);
+              // Continue without email content if fetch fails
+            }
+          }
+
+          return baseEngagement;
+        })
+      );
+
+      // Get lead engagements
+      const leadEngagements = ((lead.engagements as Array<{ eventId?: string; eventType: string; eventData: any; createdAt: string }>) || []).map((eng: any) => ({
+        ...eng,
+        source: 'manual', // Mark as manual engagement
+        // eventId is already included in eng if it exists
+      }));
+
+      // Combine and sort by createdAt (newest first)
+      const allEngagements = [...emailEngagements, ...leadEngagements].sort((a, b) => {
+        const dateA = new Date(a.createdAt).getTime();
+        const dateB = new Date(b.createdAt).getTime();
+        return dateB - dateA; // Descending order
+      });
+
+      return {
+        engagements: allEngagements,
+      };
+    } catch (error) {
+      handleDynamoDbError(error, "getLeadEngagements");
+      throw error;
+    }
+  },
+
+  async addLeadEngagement(listId: string, leadId: string, engagement: {
+    eventType: string;
+    eventData: any;
+    createdAt: string;
+  }) {
+    try {
+      // Get the lead first to ensure it exists
+      const lead = await this.getLeadById(listId, leadId);
+      if (!lead) {
+        throw new Error('Lead not found');
+      }
+
+      // Generate a unique eventId for this engagement
+      const eventId = `custom_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+      // Add eventId to the engagement
+      const engagementWithId = {
+        ...engagement,
+        eventId,
+      };
+
+      // Get existing engagements or initialize empty array
+      const existingEngagements = (lead.engagements as Array<{ eventId?: string; eventType: string; eventData: any; createdAt: string }>) || [];
+
+      // Add the new engagement
+      const updatedEngagements = [...existingEngagements, engagementWithId];
+
+      // Update the lead with the new engagements array
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: {
+          listId,
+          leadId,
+        },
+        UpdateExpression: 'SET engagements = :engagements, updatedAt = :updatedAt',
+        ExpressionAttributeValues: {
+          ':engagements': updatedEngagements,
+          ':updatedAt': new Date().toISOString(),
+        },
+        ReturnValues: 'ALL_NEW',
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "addLeadEngagement");
+      throw error;
+    }
+  },
+
+  async updateLeadEngagement(listId: string, leadId: string, eventId: string, engagement: {
+    eventType: string;
+    eventData: any;
+    createdAt: string;
+  }) {
+    try {
+      // Get the lead first to ensure it exists
+      const lead = await this.getLeadById(listId, leadId);
+      if (!lead) {
+        throw new Error('Lead not found');
+      }
+
+      // Get existing engagements or initialize empty array
+      const existingEngagements = (lead.engagements as Array<{ eventId?: string; eventType: string; eventData: any; createdAt: string }>) || [];
+
+      // Find the engagement by eventId
+      const engagementIndex = existingEngagements.findIndex((eng) => eng.eventId === eventId);
+      
+      if (engagementIndex === -1) {
+        throw new Error('Engagement not found');
+      }
+
+      // Update the engagement while preserving the eventId
+      const updatedEngagements = [...existingEngagements];
+      updatedEngagements[engagementIndex] = {
+        ...engagement,
+        eventId, // Preserve the original eventId
+      };
+
+      // Update the lead with the updated engagements array
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: {
+          listId,
+          leadId,
+        },
+        UpdateExpression: 'SET engagements = :engagements, updatedAt = :updatedAt',
+        ExpressionAttributeValues: {
+          ':engagements': updatedEngagements,
+          ':updatedAt': new Date().toISOString(),
+        },
+        ReturnValues: 'ALL_NEW',
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "updateLeadEngagement");
+      throw error;
+    }
+  },
+
+  async deleteLeadEngagement(listId: string, leadId: string, eventId: string) {
+    try {
+      // Get the lead first to ensure it exists
+      const lead = await this.getLeadById(listId, leadId);
+      if (!lead) {
+        throw new Error('Lead not found');
+      }
+
+      // Get existing engagements or initialize empty array
+      const existingEngagements = (lead.engagements as Array<{ eventId?: string; eventType: string; eventData: any; createdAt: string }>) || [];
+
+      // Find and remove the matching engagement by eventId
+      const updatedEngagements = existingEngagements.filter((eng) => eng.eventId !== eventId);
+
+      // Check if we actually removed something
+      if (updatedEngagements.length === existingEngagements.length) {
+        throw new Error('Engagement not found');
+      }
+
+      // Update the lead with the updated engagements array
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: {
+          listId,
+          leadId,
+        },
+        UpdateExpression: 'SET engagements = :engagements, updatedAt = :updatedAt',
+        ExpressionAttributeValues: {
+          ':engagements': updatedEngagements,
+          ':updatedAt': new Date().toISOString(),
+        },
+        ReturnValues: 'ALL_NEW',
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "deleteLeadEngagement");
+      throw error;
+    }
+  },
+};
+
 

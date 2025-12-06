@@ -1,0 +1,692 @@
+// Unit tests for CRM database service functions
+// Mock AWS SDK before importing db.ts (which calls AWS.config.update)
+const mockDocumentClientMethods = {
+  put: jest.fn(),
+  get: jest.fn(),
+  query: jest.fn(),
+  scan: jest.fn(),
+  update: jest.fn(),
+  delete: jest.fn(),
+  batchWrite: jest.fn(),
+};
+
+jest.mock('aws-sdk', () => {
+  return {
+    config: {
+      update: jest.fn(),
+    },
+    DynamoDB: {
+      DocumentClient: jest.fn(() => mockDocumentClientMethods),
+    },
+    S3: jest.fn(() => ({
+      upload: jest.fn(),
+      getObject: jest.fn(),
+      deleteObject: jest.fn(),
+    })),
+  };
+});
+
+// Mock emailEventsDb and resendService before importing db.ts
+jest.mock('../services/emailEventsDb', () => ({
+  emailEventsDb: {
+    getEventsByEmailDomainAndLeadEmail: jest.fn(),
+    updateEmailEventContent: jest.fn(),
+  },
+}));
+
+jest.mock('../services/resendService', () => ({
+  resendService: {
+    getReceivedEmailContent: jest.fn(),
+    getDeliveredEmailContent: jest.fn(),
+  },
+}));
+
+import { crmDb } from '../services/db';
+import AWS from 'aws-sdk';
+
+describe('CRM Database Service', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    // Reset all methods to return promises
+    Object.keys(mockDocumentClientMethods).forEach(method => {
+      (mockDocumentClientMethods as any)[method].mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+    });
+  });
+
+  describe('createLeadList', () => {
+    it('should create a new lead list', async () => {
+      const userId = 'user1';
+      const name = 'Test List';
+      const description = 'Test Description';
+
+      mockDocumentClientMethods.put.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      const result = await crmDb.createLeadList(userId, name, description);
+
+      expect(mockDocumentClientMethods.put).toHaveBeenCalled();
+      expect(result.listId).toBeDefined();
+      expect(result.name).toBe(name);
+      expect(result.userId).toBe(userId);
+    });
+
+    it('should create list without description if not provided', async () => {
+      const userId = 'user1';
+      const name = 'Test List';
+
+      mockDocumentClientMethods.put.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      const result = await crmDb.createLeadList(userId, name);
+
+      expect(mockDocumentClientMethods.put).toHaveBeenCalled();
+      expect(result.name).toBe(name);
+    });
+  });
+
+  describe('getLeadListById', () => {
+    it('should retrieve a lead list by ID', async () => {
+      const listId = 'list_123';
+      const mockList = {
+        listId,
+        name: 'Test List',
+        userId: 'user1',
+      };
+
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: mockList }),
+      });
+
+      const result = await crmDb.getLeadListById(listId);
+
+      expect(mockDocumentClientMethods.get).toHaveBeenCalledWith(
+        expect.objectContaining({
+          Key: { listId },
+        })
+      );
+      expect(result).toEqual(mockList);
+    });
+
+    it('should return null if list not found', async () => {
+      const listId = 'nonexistent';
+
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      const result = await crmDb.getLeadListById(listId);
+
+      expect(result).toBeNull();
+    });
+  });
+
+  describe('createLead', () => {
+    it('should create a new lead', async () => {
+      const listId = 'list_123';
+      const leadData = {
+        email: 'test@example.com',
+        firstName: 'John',
+        lastName: 'Doe',
+        company: 'Test Company',
+      };
+
+      mockDocumentClientMethods.put.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      const result = await crmDb.createLead(listId, leadData);
+
+      expect(mockDocumentClientMethods.put).toHaveBeenCalled();
+      expect(result.leadId).toBeDefined();
+      expect(result.listId).toBe(listId);
+      expect(result.email).toBe(leadData.email.toLowerCase());
+    });
+
+    it('should handle leads without email', async () => {
+      const listId = 'list_123';
+      const leadData = {
+        firstName: 'John',
+        lastName: 'Doe',
+      };
+
+      mockDocumentClientMethods.put.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      const result = await crmDb.createLead(listId, leadData);
+
+      expect(mockDocumentClientMethods.put).toHaveBeenCalled();
+      // Email should not be in the item if not provided
+      const putCall = mockDocumentClientMethods.put.mock.calls[0][0];
+      expect(putCall.Item.email).toBeUndefined();
+    });
+  });
+
+  describe('getLeadsByListId', () => {
+    it('should retrieve leads with pagination', async () => {
+      const listId = 'list_123';
+      const limit = 50;
+      const mockLeads = [
+        { leadId: 'lead1', listId, email: 'test1@example.com' },
+        { leadId: 'lead2', listId, email: 'test2@example.com' },
+      ];
+
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Items: mockLeads,
+          LastEvaluatedKey: { listId, leadId: 'lead2' },
+        }),
+      });
+
+      const result = await crmDb.getLeadsByListId(listId, limit);
+
+      expect(mockDocumentClientMethods.query).toHaveBeenCalled();
+      expect(result.items).toEqual(mockLeads);
+      expect(result.hasMore).toBe(true);
+    });
+
+    it('should handle lastEvaluatedKey for pagination', async () => {
+      const listId = 'list_123';
+      const limit = 50;
+      const lastEvaluatedKey = { listId, leadId: 'lead1' };
+
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Items: [],
+          LastEvaluatedKey: null,
+        }),
+      });
+
+      const result = await crmDb.getLeadsByListId(listId, limit, lastEvaluatedKey);
+
+      expect(mockDocumentClientMethods.query).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ExclusiveStartKey: lastEvaluatedKey,
+        })
+      );
+      expect(result.hasMore).toBe(false);
+    });
+  });
+
+  describe('updateLead', () => {
+    it('should update lead fields', async () => {
+      const listId = 'list_123';
+      const leadId = 'lead_123';
+      const updates = {
+        firstName: 'Jane',
+        lastName: 'Smith',
+        company: 'New Company',
+      };
+
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Attributes: {
+            leadId,
+            listId,
+            ...updates,
+          },
+        }),
+      });
+
+      const result = await crmDb.updateLead(listId, leadId, updates);
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalled();
+      expect(result).toBeTruthy();
+      expect(result!.firstName).toBe(updates.firstName);
+    });
+
+    it('should handle email updates and normalize to lowercase', async () => {
+      const listId = 'list_123';
+      const leadId = 'lead_123';
+      const updates = {
+        email: 'NEWEMAIL@EXAMPLE.COM',
+      };
+
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Attributes: {
+            leadId,
+            listId,
+            email: 'newemail@example.com',
+          },
+        }),
+      });
+
+      const result = await crmDb.updateLead(listId, leadId, updates);
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalled();
+      // Verify email is normalized in the update expression
+      const updateCall = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(updateCall.ExpressionAttributeValues[':email']).toBe('newemail@example.com');
+    });
+
+    it('should handle customFields updates', async () => {
+      const listId = 'list_123';
+      const leadId = 'lead_123';
+      const updates = {
+        customFields: {
+          'Lead Score': '85',
+          'Status': 'Active',
+        },
+      };
+
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Attributes: {
+            leadId,
+            listId,
+            customFields: updates.customFields,
+          },
+        }),
+      });
+
+      const result = await crmDb.updateLead(listId, leadId, updates);
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalled();
+      expect(result).toBeTruthy();
+      expect(result!.customFields).toEqual(updates.customFields);
+    });
+
+    it('should handle emailDraft updates', async () => {
+      const listId = 'list_123';
+      const leadId = 'lead_123';
+      const emailDraft = {
+        subject: 'Test Subject',
+        htmlContent: '<p>Test content</p>',
+        createdAt: '2024-01-01T00:00:00Z',
+        updatedAt: '2024-01-01T00:00:00Z',
+        sessionId: 'session1',
+      };
+
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Attributes: {
+            leadId,
+            listId,
+            emailDraft,
+          },
+        }),
+      });
+
+      const result = await crmDb.updateLead(listId, leadId, { emailDraft });
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalled();
+      expect(result).toBeTruthy();
+      expect(result!.emailDraft).toEqual(emailDraft);
+    });
+
+    it('should handle removing emailDraft (setting to null)', async () => {
+      const listId = 'list_123';
+      const leadId = 'lead_123';
+
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Attributes: {
+            leadId,
+            listId,
+          },
+        }),
+      });
+
+      const result = await crmDb.updateLead(listId, leadId, { emailDraft: null });
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalled();
+      // Verify REMOVE clause is used
+      const updateCall = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(updateCall.UpdateExpression).toContain('REMOVE');
+    });
+  });
+
+  describe('batchCreateLeads', () => {
+    it('should batch create leads', async () => {
+      const listId = 'list_123';
+      const leads = [
+        { email: 'test1@example.com', firstName: 'John', lastName: 'Doe' },
+        { email: 'test2@example.com', firstName: 'Jane', lastName: 'Smith' },
+      ];
+
+      // Mock existing leads query (empty)
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Items: [] }),
+      });
+
+      // Mock batch write
+      mockDocumentClientMethods.batchWrite.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      const result = await crmDb.batchCreateLeads(listId, leads);
+
+      expect(result.successCount).toBe(2);
+      expect(result.errorCount).toBe(0);
+    });
+
+    it('should merge leads with existing emails', async () => {
+      const listId = 'list_123';
+      const leads = [
+        { email: 'existing@example.com', firstName: 'New', lastName: 'Name' },
+      ];
+
+      // Mock existing lead
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Items: [
+            { leadId: 'lead1', listId, email: 'existing@example.com', firstName: 'Old' },
+          ],
+        }),
+      });
+
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Attributes: {
+            leadId: 'lead1',
+            listId,
+            email: 'existing@example.com',
+            firstName: 'New',
+          },
+        }),
+      });
+
+      const result = await crmDb.batchCreateLeads(listId, leads);
+
+      expect(result.mergedCount).toBe(1);
+      expect(result.newCount).toBe(0);
+    });
+  });
+
+  describe('getLeadEngagements', () => {
+    it('should retrieve engagements for a lead', async () => {
+      const listId = 'list_123';
+      const leadId = 'lead_123';
+      const userId = 'user1';
+
+      const mockLead = {
+        leadId,
+        listId,
+        email: 'lead@example.com',
+        engagements: [
+          {
+            eventType: 'custom.meeting',
+            eventData: { notes: 'Test meeting' },
+            createdAt: '2024-01-01T00:00:00Z',
+            source: 'manual',
+            eventId: 'event1',
+          },
+        ],
+      };
+
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: mockLead }),
+      });
+
+      // Mock emailEventsDb
+      const { emailEventsDb } = require('../services/emailEventsDb');
+      emailEventsDb.getEventsByEmailDomainAndLeadEmail.mockResolvedValue([]);
+
+      // Mock userDb.getUserById (used in getLeadEngagements)
+      const { userDb } = require('../services/db');
+      jest.spyOn(userDb, 'getUserById').mockResolvedValue({
+        userId,
+        email: 'user@example.com',
+        emailDomain: 'example.com',
+      });
+
+      const result = await crmDb.getLeadEngagements(listId, leadId, userId);
+
+      expect(result.engagements).toBeDefined();
+      expect(Array.isArray(result.engagements)).toBe(true);
+    });
+
+    it('should include email content from engagements', async () => {
+      const listId = 'list_123';
+      const leadId = 'lead_123';
+      const userId = 'user1';
+
+      const mockLead = {
+        leadId,
+        listId,
+        email: 'lead@example.com',
+        engagements: [],
+      };
+
+      const mockEmailEvent = {
+        eventId: 'event1',
+        eventType: 'email.received',
+        emailDomain: 'example.com',
+        leadEmail: 'lead@example.com',
+        data: {
+          subject: 'Test Email',
+          from: 'sender@example.com',
+          to: ['lead@example.com'],
+          email_id: 'email-123',
+        },
+        emailContent: {
+          html: '<p>Email content</p>',
+          text: 'Email content',
+        },
+        createdAt: '2024-01-01T00:00:00Z',
+      };
+
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: mockLead }),
+      });
+
+      // Mock emailEventsDb
+      const { emailEventsDb } = require('../services/emailEventsDb');
+      emailEventsDb.getEventsByEmailDomainAndLeadEmail.mockResolvedValue([mockEmailEvent]);
+      emailEventsDb.updateEmailEventContent.mockResolvedValue(undefined);
+
+      // Mock userDb.getUserById
+      const { userDb } = require('../services/db');
+      jest.spyOn(userDb, 'getUserById').mockResolvedValue({
+        userId,
+        email: 'user@example.com',
+        emailDomain: 'example.com',
+      });
+
+      const result = await crmDb.getLeadEngagements(listId, leadId, userId);
+
+      expect(result.engagements).toHaveLength(1);
+      // The emailContent should be included from the cached event.emailContent
+      const engagement = result.engagements[0];
+      expect(engagement).toBeDefined();
+      // Since event.emailContent exists, it should be used directly
+      expect(engagement.emailContent).toBeDefined();
+      expect(engagement.emailContent.html).toBe('<p>Email content</p>');
+    });
+  });
+
+  describe('addLeadEngagement', () => {
+    it('should add a custom engagement to a lead', async () => {
+      const listId = 'list_123';
+      const leadId = 'lead_123';
+      const engagement = {
+        eventType: 'custom.meeting',
+        eventData: { notes: 'Test meeting' },
+        createdAt: '2024-01-01T00:00:00Z',
+      };
+
+      const mockLead = {
+        leadId,
+        listId,
+        engagements: [],
+      };
+
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: mockLead }),
+      });
+
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Attributes: {
+            leadId,
+            listId,
+            engagements: [{ ...engagement, eventId: 'event1' }],
+          },
+        }),
+      });
+
+      const result = await crmDb.addLeadEngagement(listId, leadId, engagement);
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalled();
+      expect(result).toBeTruthy();
+      expect(result!.engagements).toContainEqual(
+        expect.objectContaining({
+          eventType: 'custom.meeting',
+        })
+      );
+    });
+
+    it('should generate eventId for custom engagements', async () => {
+      const listId = 'list_123';
+      const leadId = 'lead_123';
+      const engagement = {
+        eventType: 'custom.meeting',
+        eventData: { notes: 'Test meeting' },
+        createdAt: '2024-01-01T00:00:00Z',
+      };
+
+      const mockLead = {
+        leadId,
+        listId,
+        engagements: [],
+      };
+
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: mockLead }),
+      });
+
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Attributes: {
+            leadId,
+            listId,
+            engagements: [{ ...engagement, eventId: 'event1' }],
+          },
+        }),
+      });
+
+      const result = await crmDb.addLeadEngagement(listId, leadId, engagement);
+
+      expect(result).toBeTruthy();
+      const addedEngagement = result!.engagements.find(
+        (e: any) => e.eventType === 'custom.meeting'
+      );
+      expect(addedEngagement.eventId).toBeDefined();
+    });
+  });
+
+  describe('deleteLeadEngagement', () => {
+    it('should delete an engagement by eventId', async () => {
+      const listId = 'list_123';
+      const leadId = 'lead_123';
+      const eventId = 'event1';
+
+      const existingEngagements = [
+        {
+          eventId: 'event1',
+          eventType: 'custom.meeting',
+          createdAt: '2024-01-01T00:00:00Z',
+        },
+        {
+          eventId: 'event2',
+          eventType: 'custom.call',
+          createdAt: '2024-01-02T00:00:00Z',
+        },
+      ];
+
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Item: {
+            leadId,
+            listId,
+            engagements: existingEngagements,
+          },
+        }),
+      });
+
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Attributes: {
+            leadId,
+            listId,
+            engagements: [existingEngagements[1]], // Remaining engagement
+          },
+        }),
+      });
+
+      const result = await crmDb.deleteLeadEngagement(listId, leadId, eventId);
+
+      expect(result).toBeTruthy();
+      expect(result!.engagements).toHaveLength(1);
+      expect(result!.engagements[0].eventId).toBe('event2');
+    });
+  });
+
+  describe('getLeadEngagementCount', () => {
+    it('should return engagement counts', async () => {
+      const listId = 'list_123';
+      const leadId = 'lead_123';
+      const userId = 'user1';
+
+      const mockLead = {
+        leadId,
+        listId,
+        engagements: [
+          {
+            eventType: 'custom.meeting',
+            createdAt: new Date().toISOString(), // Recent
+          },
+          {
+            eventType: 'custom.call',
+            createdAt: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(), // 10 days ago
+          },
+        ],
+      };
+
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: mockLead }),
+      });
+
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Items: [] }),
+      });
+
+      // Mock userDb.getUserById
+      const { userDb } = require('../services/db');
+      jest.spyOn(userDb, 'getUserById').mockResolvedValue({
+        userId,
+        email: 'user@example.com',
+        emailDomain: 'example.com',
+      });
+
+      const result = await crmDb.getLeadEngagementCount(listId, leadId, userId);
+
+      expect(result.total).toBeGreaterThanOrEqual(0);
+      expect(result.last7Days).toBeGreaterThanOrEqual(0);
+    });
+  });
+});
+
