@@ -7,6 +7,26 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-05',
+    changes: [
+      'Added CRM Page to Customer Portal',
+      '- New CRM page for managing lead lists and contacts',
+      '- Create and manage multiple lead lists with custom field configurations',
+      '- Add leads manually or import from CSV files with automatic email-based deduplication',
+      '- Search functionality to quickly find leads',
+      '- Engagement tracking showing email events and custom engagement history',
+      '- Email draft generation with Agent Mode integration for personalized email creation',
+      '- Batch email drafting for multiple leads with progress tracking',
+      '- Email sender configuration with multiple senders and default sender support',
+      'Made CRM Accessible from Agent Mode',
+      '- Emma can now list all lead lists using get_lead_lists function',
+      '- Emma can create new lead lists using create_lead_list function',
+      '- Emma can add leads to existing lists using add_leads_to_list function with automatic merging for duplicate emails',
+      '- Emma can draft personalized emails for leads using update_email_draft_for_lead function',
+      '- Email drafts incorporate lead data, engagement history, brand guidelines, market strategy, and sender information',
+    ],
+  },
+  {
     date: '2025-12-03',
     changes: [
       'Added Agent Mode Analytics to Admin Dashboard',
