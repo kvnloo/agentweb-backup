@@ -1,0 +1,500 @@
+// Unit tests for updateEmailDraftForLead in agentModeService
+
+// Mock OpenAI before importing agentModeService (which creates module-level openai instance)
+// Create the mock function inside the factory to ensure it's accessible
+const mockChatCompletionsCreate = jest.fn();
+
+jest.mock('openai', () => {
+  // Create mock function that will be shared
+  const createMock = jest.fn();
+  // Store it globally so tests can access it
+  (global as any).__openaiMockCreate = createMock;
+  
+  return {
+    __esModule: true,
+    default: jest.fn().mockImplementation(() => {
+      return {
+        chat: {
+          completions: {
+            create: createMock,
+          },
+        },
+      };
+    }),
+  };
+});
+
+// Mock dependencies
+jest.mock('../services/db', () => ({
+  crmDb: {
+    getLeadListById: jest.fn(),
+    getLeadById: jest.fn(),
+    getLeadEngagements: jest.fn(),
+    updateLead: jest.fn(),
+  }
+}));
+
+import { AgentModeService } from '../services/agentModeService';
+import { crmDb } from '../services/db';
+
+// Get the mock function from global scope
+const getMockCreate = () => (global as any).__openaiMockCreate as jest.Mock;
+
+describe('AgentModeService - updateEmailDraftForLead', () => {
+  let agentModeService: AgentModeService;
+  let mockReadBrandGuidelines: jest.Mock;
+  let mockReadMarketStrategy: jest.Mock;
+  let mockGetSenderForLead: jest.Mock;
+  let mockCreate: jest.Mock;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    
+    agentModeService = new AgentModeService();
+    // Use jest.spyOn to properly mock private methods
+    mockReadBrandGuidelines = jest.spyOn(agentModeService as any, 'readBrandGuidelines');
+    mockReadMarketStrategy = jest.spyOn(agentModeService as any, 'readMarketStrategy');
+    mockGetSenderForLead = jest.spyOn(agentModeService as any, 'getSenderForLead');
+    
+    // Get and clear the OpenAI mock
+    mockCreate = getMockCreate();
+    if (mockCreate) {
+      mockCreate.mockClear();
+    } else {
+      // If mockCreate is not available, create a fallback
+      console.warn('OpenAI mock not found, tests may fail');
+    }
+  });
+
+  describe('Success cases', () => {
+    it('should create email draft with engagement history including email content', async () => {
+      const listId = 'list1';
+      const leadId = 'lead1';
+      const userId = 'user1';
+      const sessionId = 'session1';
+      const instruction = 'Create a welcome email';
+
+      const mockList = {
+        listId,
+        name: 'Test List',
+        userId,
+      };
+
+      const mockLead = {
+        leadId,
+        listId,
+        email: 'lead@example.com',
+        firstName: 'John',
+        lastName: 'Doe',
+        company: 'Test Company',
+        title: 'CEO',
+        notes: 'Test notes',
+        customFields: { 'Lead Score': '85' },
+      };
+
+      const mockEngagements = [
+        {
+          eventType: 'email.received',
+          createdAt: '2024-01-01T00:00:00Z',
+          source: 'email',
+          eventData: {
+            subject: 'Previous Email',
+            from: 'lead@example.com',
+            to: ['sender@example.com'],
+          },
+          emailContent: {
+            text: 'This is a long email content that should be included in the prompt. '.repeat(20), // ~1000 chars
+            html: '<p>This is a long email content</p>',
+          },
+        },
+        {
+          eventType: 'email.sent',
+          createdAt: '2024-01-02T00:00:00Z',
+          source: 'email',
+          eventData: {
+            subject: 'Sent Email',
+          },
+        },
+      ];
+
+      const mockBrandGuidelines = {
+        exists: true,
+        formattedContent: 'Brand guidelines content',
+      };
+
+      const mockMarketStrategy = {
+        exists: true,
+        formattedContent: 'Market strategy content',
+      };
+
+      const mockSenderInfo = {
+        fromName: 'Sender Name',
+        notes: 'Meeting link: https://calendly.com/meeting',
+      };
+
+      const mockLLMResponse = {
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                subject: 'Welcome to Our Platform',
+                htmlContent: '<p>Welcome John!</p>',
+              }),
+            },
+          },
+        ],
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue({
+        engagements: mockEngagements,
+      });
+      mockReadBrandGuidelines.mockResolvedValue(mockBrandGuidelines);
+      mockReadMarketStrategy.mockResolvedValue(mockMarketStrategy);
+      mockGetSenderForLead.mockResolvedValue(mockSenderInfo);
+
+      // Mock OpenAI client (module-level instance)
+      mockCreate.mockResolvedValue(mockLLMResponse);
+
+      (crmDb.updateLead as jest.Mock).mockResolvedValue({
+        ...mockLead,
+        emailDraft: {
+          subject: 'Welcome to Our Platform',
+          htmlContent: '<p>Welcome John!</p>',
+          createdAt: expect.any(String),
+          updatedAt: expect.any(String),
+          sessionId,
+        },
+      });
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        listId,
+        leadId,
+        instruction,
+        sessionId,
+        userId
+      );
+
+      expect(result.success).toBe(true);
+      expect(crmDb.getLeadEngagements).toHaveBeenCalledWith(listId, leadId, userId);
+      expect(mockReadBrandGuidelines).toHaveBeenCalledWith(userId);
+      expect(mockReadMarketStrategy).toHaveBeenCalledWith(userId);
+      expect(mockGetSenderForLead).toHaveBeenCalledWith(userId, undefined);
+      expect(crmDb.updateLead).toHaveBeenCalled();
+    });
+
+    it('should include first 1k characters of email content from engagements', async () => {
+      const listId = 'list1';
+      const leadId = 'lead1';
+      const userId = 'user1';
+      const sessionId = 'session1';
+      const instruction = 'Follow up email';
+
+      const mockList = { listId, name: 'Test List', userId };
+      const mockLead = { leadId, listId, email: 'lead@example.com', firstName: 'John' };
+
+      const longEmailContent = 'A'.repeat(2000); // 2000 characters
+      const mockEngagements = [
+        {
+          eventType: 'email.received',
+          createdAt: '2024-01-01T00:00:00Z',
+          source: 'email',
+          eventData: { subject: 'Previous Email' },
+          emailContent: {
+            text: longEmailContent,
+          },
+        },
+      ];
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue({
+        engagements: mockEngagements,
+      });
+      mockReadBrandGuidelines.mockResolvedValue({ exists: false });
+      mockReadMarketStrategy.mockResolvedValue({ exists: false });
+      mockGetSenderForLead.mockResolvedValue({ fromName: 'Sender' });
+
+      // Mock OpenAI client (module-level instance)
+      mockCreate.mockResolvedValue({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              subject: 'Follow Up',
+              htmlContent: '<p>Content</p>',
+            }),
+          },
+        }],
+      });
+
+      (crmDb.updateLead as jest.Mock).mockResolvedValue(mockLead);
+
+      await (agentModeService as any).updateEmailDraftForLead(
+        listId,
+        leadId,
+        instruction,
+        sessionId,
+        userId
+      );
+
+      // Verify that the prompt includes email content (first 1k chars)
+      expect(mockCreate).toHaveBeenCalled();
+      const callArgs = mockCreate.mock.calls[0];
+      const prompt = callArgs[0].messages[1].content;
+      
+      expect(prompt).toContain('Email Content (first 1k characters)');
+      expect(prompt).toContain('A'.repeat(1000)); // First 1000 characters
+      expect(prompt).toContain('...'); // Truncation indicator
+    });
+
+    it('should extract text from HTML content if text is not available', async () => {
+      const listId = 'list1';
+      const leadId = 'lead1';
+      const userId = 'user1';
+      const sessionId = 'session1';
+      const instruction = 'Follow up';
+
+      const mockList = { listId, name: 'Test List', userId };
+      const mockLead = { leadId, listId, email: 'lead@example.com' };
+
+      const mockEngagements = [
+        {
+          eventType: 'email.received',
+          createdAt: '2024-01-01T00:00:00Z',
+          source: 'email',
+          eventData: { subject: 'Previous Email' },
+          emailContent: {
+            html: '<p>This is HTML content with <strong>formatting</strong> and <em>styles</em>.</p>',
+          },
+        },
+      ];
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue({
+        engagements: mockEngagements,
+      });
+      mockReadBrandGuidelines.mockResolvedValue({ exists: false });
+      mockReadMarketStrategy.mockResolvedValue({ exists: false });
+      mockGetSenderForLead.mockResolvedValue({ fromName: 'Sender' });
+
+      // Mock OpenAI client (module-level instance)
+      mockCreate.mockResolvedValue({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              subject: 'Follow Up',
+              htmlContent: '<p>Content</p>',
+            }),
+          },
+        }],
+      });
+
+      (crmDb.updateLead as jest.Mock).mockResolvedValue(mockLead);
+
+      await (agentModeService as any).updateEmailDraftForLead(
+        listId,
+        leadId,
+        instruction,
+        sessionId,
+        userId
+      );
+
+      expect(mockCreate).toHaveBeenCalled();
+      const callArgs = mockCreate.mock.calls[0];
+      const prompt = callArgs[0].messages[1].content;
+      
+      // Should extract text from HTML (strip tags)
+      expect(prompt).toContain('Email Content (first 1k characters)');
+      expect(prompt).toContain('This is HTML content with formatting and styles');
+      expect(prompt).not.toContain('<p>');
+      expect(prompt).not.toContain('<strong>');
+    });
+
+    it('should update existing draft when one exists', async () => {
+      const listId = 'list1';
+      const leadId = 'lead1';
+      const userId = 'user1';
+      const sessionId = 'session1';
+      const instruction = 'Update the email';
+
+      const mockList = { listId, name: 'Test List', userId };
+      const mockLead = {
+        leadId,
+        listId,
+        email: 'lead@example.com',
+        emailDraft: {
+          subject: 'Old Subject',
+          htmlContent: '<p>Old content</p>',
+          createdAt: '2024-01-01T00:00:00Z',
+          updatedAt: '2024-01-01T00:00:00Z',
+        },
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue({
+        engagements: [],
+      });
+      mockReadBrandGuidelines.mockResolvedValue({ exists: false });
+      mockReadMarketStrategy.mockResolvedValue({ exists: false });
+      mockGetSenderForLead.mockResolvedValue({ fromName: 'Sender' });
+
+      // Mock OpenAI client (module-level instance)
+      mockCreate.mockResolvedValue({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              subject: 'Updated Subject',
+              htmlContent: '<p>Updated content</p>',
+            }),
+          },
+        }],
+      });
+
+      (crmDb.updateLead as jest.Mock).mockResolvedValue({
+        ...mockLead,
+        emailDraft: {
+          ...mockLead.emailDraft,
+          subject: 'Updated Subject',
+          htmlContent: '<p>Updated content</p>',
+          updatedAt: expect.any(String),
+        },
+      });
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        listId,
+        leadId,
+        instruction,
+        sessionId,
+        userId
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.message).toContain('updated');
+      
+      // Verify existing draft is included in prompt
+      expect(mockCreate).toHaveBeenCalled();
+      const callArgs = mockCreate.mock.calls[0];
+      const prompt = callArgs[0].messages[1].content;
+      expect(prompt).toContain('Existing Email Draft');
+      expect(prompt).toContain('Old Subject');
+    });
+  });
+
+  describe('Error cases', () => {
+    it('should return error if list not found', async () => {
+      const listId = 'nonexistent';
+      const leadId = 'lead1';
+      const userId = 'user1';
+      const sessionId = 'session1';
+      const instruction = 'Create email';
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(null);
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        listId,
+        leadId,
+        instruction,
+        sessionId,
+        userId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('not found');
+    });
+
+    it('should return error if user does not own the list', async () => {
+      const listId = 'list1';
+      const leadId = 'lead1';
+      const userId = 'user1';
+      const sessionId = 'session1';
+      const instruction = 'Create email';
+
+      const mockList = {
+        listId,
+        name: 'Test List',
+        userId: 'other-user',
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        listId,
+        leadId,
+        instruction,
+        sessionId,
+        userId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Access denied');
+    });
+
+    it('should return error if lead not found', async () => {
+      const listId = 'list1';
+      const leadId = 'nonexistent';
+      const userId = 'user1';
+      const sessionId = 'session1';
+      const instruction = 'Create email';
+
+      const mockList = {
+        listId,
+        name: 'Test List',
+        userId,
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(null);
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        listId,
+        leadId,
+        instruction,
+        sessionId,
+        userId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('not found');
+    });
+
+    it('should handle LLM API errors gracefully', async () => {
+      const listId = 'list1';
+      const leadId = 'lead1';
+      const userId = 'user1';
+      const sessionId = 'session1';
+      const instruction = 'Create email';
+
+      const mockList = { listId, name: 'Test List', userId };
+      const mockLead = { leadId, listId, email: 'lead@example.com' };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue({
+        engagements: [],
+      });
+      mockReadBrandGuidelines.mockResolvedValue({ exists: false });
+      mockReadMarketStrategy.mockResolvedValue({ exists: false });
+      mockGetSenderForLead.mockResolvedValue({ fromName: 'Sender' });
+
+      // Mock OpenAI client to throw error
+      mockCreate.mockRejectedValue(
+        new Error('LLM API error')
+      );
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        listId,
+        leadId,
+        instruction,
+        sessionId,
+        userId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Failed');
+    });
+  });
+});
+
