@@ -285,3 +285,65 @@ Added oncall alert on Agentweb-backend-env-prod-3 env as it is currently the pro
 
 December 02, 2025
 VEO 3.1 integration doc: https://ai.google.dev/gemini-api/docs/video?example=dialogue#javascript_2
+
+December 06, 2025
+## CVE-2025-55182 (React2Shell) Security Check
+
+### Assessment: Project is NOT directly impacted
+
+**Status**: ✅ Not vulnerable
+
+### Findings
+
+1. **Frontend Applications (Safe)**:
+   - `customer-portal`: React 18.3.1 ✅
+   - `partner-portal`: React 18.3.1 ✅
+   - `growth-chat`: React 18.3.1 ✅
+   - All frontend applications use React 18.x, which is NOT affected by CVE-2025-55182
+
+2. **Backend (Low Risk)**:
+   - Has React 19.0.0 installed as a transitive dependency via `reactflow` and `@reactflow/core`
+   - **NOT using React Server Components (RSC)** - no `react-server-dom-*` packages found
+   - No Next.js or RSC frameworks detected
+   - Backend is a standard Express.js server, not using RSC functionality
+
+### Why It's Not Vulnerable
+
+CVE-2025-55182 (React2Shell) is a critical pre-authentication remote code execution (RCE) vulnerability that specifically affects:
+- React 19.0.0, 19.1.0, 19.1.1, and 19.2.0
+- **React Server Components (RSC)** functionality
+- Frameworks using RSC (Next.js 15.x/16.x, React Router, Waku, Parcel RSC, Vite RSC)
+
+While the backend has React 19.0.0 installed, it does **not** use React Server Components, so the vulnerability does not apply.
+
+### Recommendations
+
+1. **Monitor for Future Changes**:
+   - If you plan to add React Server Components or upgrade to Next.js 15.x/16.x, ensure you use patched React versions:
+     - React 19.0.1, 19.1.2, or 19.2.1+
+     - Next.js 15.0.5+, 15.1.9+, 15.2.6+, 15.3.6+, 15.4.8+, 15.5.7+, or 16.0.7+
+
+2. **Optional Cleanup**:
+   - Consider removing React 19.0.0 from backend dependencies if `reactflow` is not actively used
+   - Or pin `reactflow` to a version that doesn't require React 19
+
+3. **Regular Security Audits**:
+   - Run `npm audit` regularly to check for security vulnerabilities
+   - Monitor React and Next.js security advisories
+
+### Verification Commands
+
+To verify React versions in the future:
+```bash
+# Check frontend React versions
+cd customer-portal && npm list react react-dom
+cd partner-portal && npm list react react-dom
+cd growth-chat && npm list react react-dom
+
+# Check backend React version (if needed)
+cd backend && npm list react react-dom
+```
+
+### References
+- CVE-2025-55182 Scanner: https://cve-2025-55182.com/
+- React Security Advisory: https://github.com/facebook/react/security
