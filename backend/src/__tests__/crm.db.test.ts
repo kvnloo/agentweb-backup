@@ -247,7 +247,8 @@ describe('CRM Database Service', () => {
       const result = await crmDb.updateLead(listId, leadId, updates);
 
       expect(mockDocumentClientMethods.update).toHaveBeenCalled();
-      expect(result.firstName).toBe(updates.firstName);
+      expect(result).toBeTruthy();
+      expect(result!.firstName).toBe(updates.firstName);
     });
 
     it('should handle email updates and normalize to lowercase', async () => {
@@ -298,7 +299,8 @@ describe('CRM Database Service', () => {
       const result = await crmDb.updateLead(listId, leadId, updates);
 
       expect(mockDocumentClientMethods.update).toHaveBeenCalled();
-      expect(result.customFields).toEqual(updates.customFields);
+      expect(result).toBeTruthy();
+      expect(result!.customFields).toEqual(updates.customFields);
     });
 
     it('should handle emailDraft updates', async () => {
@@ -325,7 +327,8 @@ describe('CRM Database Service', () => {
       const result = await crmDb.updateLead(listId, leadId, { emailDraft });
 
       expect(mockDocumentClientMethods.update).toHaveBeenCalled();
-      expect(result.emailDraft).toEqual(emailDraft);
+      expect(result).toBeTruthy();
+      expect(result!.emailDraft).toEqual(emailDraft);
     });
 
     it('should handle removing emailDraft (setting to null)', async () => {
@@ -548,7 +551,8 @@ describe('CRM Database Service', () => {
       const result = await crmDb.addLeadEngagement(listId, leadId, engagement);
 
       expect(mockDocumentClientMethods.update).toHaveBeenCalled();
-      expect(result.engagements).toContainEqual(
+      expect(result).toBeTruthy();
+      expect(result!.engagements).toContainEqual(
         expect.objectContaining({
           eventType: 'custom.meeting',
         })
@@ -586,7 +590,8 @@ describe('CRM Database Service', () => {
 
       const result = await crmDb.addLeadEngagement(listId, leadId, engagement);
 
-      const addedEngagement = result.engagements.find(
+      expect(result).toBeTruthy();
+      const addedEngagement = result!.engagements.find(
         (e: any) => e.eventType === 'custom.meeting'
       );
       expect(addedEngagement.eventId).toBeDefined();
@@ -634,8 +639,9 @@ describe('CRM Database Service', () => {
 
       const result = await crmDb.deleteLeadEngagement(listId, leadId, eventId);
 
-      expect(result.engagements).toHaveLength(1);
-      expect(result.engagements[0].eventId).toBe('event2');
+      expect(result).toBeTruthy();
+      expect(result!.engagements).toHaveLength(1);
+      expect(result!.engagements[0].eventId).toBe('event2');
     });
   });
 

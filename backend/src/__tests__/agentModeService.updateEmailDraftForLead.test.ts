@@ -52,9 +52,9 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
     
     agentModeService = new AgentModeService();
     // Use jest.spyOn to properly mock private methods
-    mockReadBrandGuidelines = jest.spyOn(agentModeService as any, 'readBrandGuidelines');
-    mockReadMarketStrategy = jest.spyOn(agentModeService as any, 'readMarketStrategy');
-    mockGetSenderForLead = jest.spyOn(agentModeService as any, 'getSenderForLead');
+    mockReadBrandGuidelines = jest.spyOn(agentModeService as any, 'readBrandGuidelines') as jest.Mock;
+    mockReadMarketStrategy = jest.spyOn(agentModeService as any, 'readMarketStrategy') as jest.Mock;
+    mockGetSenderForLead = jest.spyOn(agentModeService as any, 'getSenderForLead') as jest.Mock;
     
     // Get and clear the OpenAI mock
     mockCreate = getMockCreate();

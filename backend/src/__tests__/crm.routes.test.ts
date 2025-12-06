@@ -86,7 +86,7 @@ describe('CRM Routes', () => {
       
       // Simulate route handler
       const handler = router.stack.find((r: any) => r.route?.path === '/lists' && r.route?.methods?.get);
-      if (handler) {
+      if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
@@ -99,7 +99,7 @@ describe('CRM Routes', () => {
       
       // The middleware would handle this, but we test the handler logic
       const handler = router.stack.find((r: any) => r.route?.path === '/lists' && r.route?.methods?.get);
-      if (handler) {
+      if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
@@ -124,7 +124,7 @@ describe('CRM Routes', () => {
       mockRequest.body = { name: 'New List', description: 'Test description' };
       
       const handler = router.stack.find((r: any) => r.route?.path === '/lists' && r.route?.methods?.post);
-      if (handler) {
+      if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
@@ -137,7 +137,7 @@ describe('CRM Routes', () => {
       mockRequest.body = { description: 'Test description' };
       
       const handler = router.stack.find((r: any) => r.route?.path === '/lists' && r.route?.methods?.post);
-      if (handler) {
+      if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
@@ -149,7 +149,7 @@ describe('CRM Routes', () => {
       mockRequest.body = { name: '   ' };
       
       const handler = router.stack.find((r: any) => r.route?.path === '/lists' && r.route?.methods?.post);
-      if (handler) {
+      if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
@@ -170,7 +170,7 @@ describe('CRM Routes', () => {
       mockRequest.params = { listId: 'list1' };
       
       const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.get);
-      if (handler) {
+      if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
@@ -184,7 +184,7 @@ describe('CRM Routes', () => {
       mockRequest.params = { listId: 'nonexistent' };
       
       const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.get);
-      if (handler) {
+      if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
@@ -203,7 +203,7 @@ describe('CRM Routes', () => {
       mockRequest.params = { listId: 'list1' };
       
       const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.get);
-      if (handler) {
+      if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
@@ -226,7 +226,7 @@ describe('CRM Routes', () => {
       mockRequest.body = { name: 'Updated List', displayFields: ['email', 'firstName'] };
       
       const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.put);
-      if (handler) {
+      if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
@@ -249,7 +249,7 @@ describe('CRM Routes', () => {
       mockRequest.body = { displayFields: 'not-an-array' };
       
       const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.put);
-      if (handler) {
+      if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
@@ -286,7 +286,7 @@ describe('CRM Routes', () => {
       const handler = router.stack.find((r: any) => 
         r.route?.path === '/lists/:listId/leads' && r.route?.methods?.post
       );
-      if (handler) {
+      if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
@@ -326,7 +326,7 @@ describe('CRM Routes', () => {
       const handler = router.stack.find((r: any) => 
         r.route?.path === '/lists/:listId/leads' && r.route?.methods?.get
       );
-      if (handler) {
+      if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
@@ -368,7 +368,7 @@ describe('CRM Routes', () => {
       const handler = router.stack.find((r: any) => 
         r.route?.path === '/lists/:listId/leads/import' && r.route?.methods?.post
       );
-      if (handler) {
+      if (handler && handler.route) {
         // Skip multer middleware and call the route handler directly
         // Find the actual route handler (not the multer middleware)
         const routeHandler = handler.route.stack.find((layer: any) => 
@@ -409,7 +409,7 @@ describe('CRM Routes', () => {
       const handler = router.stack.find((r: any) => 
         r.route?.path === '/lists/:listId/leads/import' && r.route?.methods?.post
       );
-      if (handler) {
+      if (handler && handler.route) {
         // Skip multer middleware and call the route handler directly
         const routeHandler = handler.route.stack.find((layer: any) => 
           layer.name !== 'multerMiddleware' && typeof layer.handle === 'function'
@@ -442,7 +442,7 @@ describe('CRM Routes', () => {
       const handler = router.stack.find((r: any) => 
         r.route?.path === '/sender-emails' && r.route?.methods?.get
       );
-      if (handler) {
+      if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
@@ -456,7 +456,7 @@ describe('CRM Routes', () => {
       const handler = router.stack.find((r: any) => 
         r.route?.path === '/sender-emails' && r.route?.methods?.get
       );
-      if (handler) {
+      if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
@@ -483,7 +483,7 @@ describe('CRM Routes', () => {
       const handler = router.stack.find((r: any) => 
         r.route?.path === '/sender-emails' && r.route?.methods?.post
       );
-      if (handler) {
+      if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
@@ -499,7 +499,7 @@ describe('CRM Routes', () => {
       const handler = router.stack.find((r: any) => 
         r.route?.path === '/sender-emails' && r.route?.methods?.post
       );
-      if (handler) {
+      if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
@@ -514,7 +514,7 @@ describe('CRM Routes', () => {
       const handler = router.stack.find((r: any) => 
         r.route?.path === '/sender-emails' && r.route?.methods?.post
       );
-      if (handler) {
+      if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
@@ -552,7 +552,7 @@ describe('CRM Routes', () => {
       const handler = router.stack.find((r: any) => 
         r.route?.path === '/lists/:listId/leads/:leadId/send-email' && r.route?.methods?.post
       );
-      if (handler) {
+      if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
