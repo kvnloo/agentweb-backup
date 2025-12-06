@@ -164,7 +164,7 @@ Add index in Production (no prefix):
 aws dynamodb update-table \
   --table-name AW-EmailEvents \
   --attribute-definitions AttributeName=emailDomain,AttributeType=S AttributeName=leadEmail,AttributeType=S \
-  --global-secondary-index-updates '[{"Create":{"IndexName":"EmailDomainLeadEmailIndex","KeySchema":[{"AttributeName":"emailDomain","KeyType":"HASH"},{"AttributeName":"leadEmail","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"},"ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}}}]' \
+  --global-secondary-index-updates '[{"Create":{"IndexName":"EmailDomainLeadEmailIndex","KeySchema":[{"AttributeName":"emailDomain","KeyType":"HASH"},{"AttributeName":"leadEmail","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"}}}]' \
   --region us-west-2
 ```
 
@@ -186,10 +186,24 @@ aws dynamodb describe-table \
   --query 'Table.GlobalSecondaryIndexes[].{IndexName:IndexName,IndexStatus:IndexStatus}'
 ```
 
+After the index is active, run the repair-tables script to update the table schema:
+
+```bash
+cd backend
+NODE_ENV=development npx ts-node src/scripts/@repair-tables.ts
+```
+
+For production, use:
+```bash
+cd backend
+NODE_ENV=production npx ts-node src/scripts/@repair-tables.ts
+```
+
 Notes:
 - GSI creation is asynchronous; queries against `EmailDomainLeadEmailIndex` work after status becomes `ACTIVE`.
 - Replace `Dev-AW-EmailEvents` with `AW-EmailEvents` for production.
 - The `leadEmail` attribute must be populated in existing records for the index to be useful. Consider backfilling existing records if needed.
+- **Important**: The production `AW-EmailEvents` table uses `PAY_PER_REQUEST` billing mode, so `ProvisionedThroughput` should NOT be specified when creating indexes in production. The development table uses provisioned capacity, so it requires `ProvisionedThroughput` to be specified.
 
 ## Port Management
 
