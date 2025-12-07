@@ -7,6 +7,23 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-07',
+    changes: [
+      'Enhanced GTM Plan Management with DRI Support',
+      '- Added DRI (Directly Responsible Individual) support at plan, phase, and work item levels',
+      '- DRI can be added and edited for plans, phases, and work items through the UI',
+      '- DRI is optional at all levels and can be set via Agent Mode using create_gtm_plan function',
+      '- read_gtm_plan function now includes DRI information at all levels in the formatted output',
+      'Improved GTM Plan Status Tracking',
+      '- Plans are automatically marked as "completed" when all phases are completed',
+      '- Completed plans now display a completion timestamp',
+      'Added GTM Plans Admin Dashboard',
+      '- New "GTM Plans" tab in the admin dashboard showing all plans from all users',
+      '- Displays DRIs at all levels (plan, phase, and work item) for each plan',
+      '- Shows plan statistics: completed/total phases and completed/total work items',
+    ],
+  },
+  {
     date: '2025-12-06',
     changes: [
       'Fixed OAuth login for manually invited users',
