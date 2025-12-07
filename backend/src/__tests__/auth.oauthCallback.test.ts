@@ -24,11 +24,19 @@ describe('OAuth Callback - Customer Role Addition for Invited Users', () => {
   const createMockProfile = (email: string, displayName?: string): Profile => ({
     id: 'google-id-123',
     displayName: displayName || 'Test User',
-    emails: [{ value: email, type: 'account' }],
+    emails: [{ value: email, verified: true }],
     provider: 'google',
     _raw: '',
-    _json: {}
-  });
+    _json: {
+      iss: 'https://accounts.google.com',
+      aud: 'test-client-id',
+      sub: 'google-id-123',
+      iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + 3600,
+      email: email,
+      email_verified: true
+    }
+  } as Profile);
 
   const createMockRequest = (portalOrigin: string = 'customer'): Partial<Request> => ({
     query: { state: portalOrigin }
