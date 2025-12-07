@@ -7,6 +7,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-06',
+    changes: [
+      'Fixed OAuth login for manually invited users',
+      '- Users who are manually invited from the admin page can now successfully sign in with OAuth',
+    ],
+  },
+  {
     date: '2025-12-05',
     changes: [
       'Added CRM Page to Customer Portal',
