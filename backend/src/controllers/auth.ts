@@ -301,6 +301,25 @@ export const googleCallback = async (
       }
     }
 
+    // If user already exists, check if they have an invited waitlist entry
+    // and add customer role if they don't have it yet
+    if (user) {
+      const waitlistEntry = await waitlistDb.getByEmail(email);
+      if (
+        waitlistEntry &&
+        waitlistEntry.status === "invited" &&
+        (!user.roles || !user.roles.includes("customer"))
+      ) {
+        // User was invited but doesn't have customer role yet - add it
+        const updatedRoles = user.roles && user.roles.length > 0 
+          ? [...user.roles, "customer"]
+          : ["customer"];
+        await userDb.updateUser(user.userId, { roles: updatedRoles });
+        user.roles = updatedRoles;
+        console.log(`Added customer role to existing user ${email} during OAuth login`);
+      }
+    }
+
     if (
       portalOrigin === "customer" &&
       (!user.roles || !user.roles.includes("customer"))
