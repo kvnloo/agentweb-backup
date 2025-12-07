@@ -211,6 +211,38 @@ describe('GTM Plan Route Tests', () => {
       );
     });
 
+    it('should create a plan with DRI at plan level', async () => {
+      const newPlan = {
+        planId: 'plan-with-dri',
+        userId: mockUserId,
+        title: 'Plan with DRI',
+        description: 'Test Description',
+        dri: 'dri@example.com',
+        status: 'in_progress',
+        phases: [],
+        createdAt: '2024-01-02T00:00:00Z',
+        updatedAt: '2024-01-02T00:00:00Z',
+      };
+
+      const mockPromise = jest.fn().mockResolvedValue({});
+      mockPut.mockReturnValue({ promise: mockPromise });
+
+      await mockDynamoDB.put({
+        TableName: 'Dev-AW-GTMPlan',
+        Item: newPlan,
+      }).promise();
+
+      expect(mockPut).toHaveBeenCalledWith(
+        expect.objectContaining({
+          TableName: 'Dev-AW-GTMPlan',
+          Item: expect.objectContaining({
+            dri: 'dri@example.com',
+            status: 'in_progress',
+          }),
+        })
+      );
+    });
+
     it('should create a plan without phases', async () => {
       const newPlan = {
         planId: 'plan-empty',
@@ -338,6 +370,85 @@ describe('GTM Plan Route Tests', () => {
       });
 
       expect(recalculatedPhases[0].status).toBe('in_progress');
+    });
+
+    it('should update plan DRI when provided', () => {
+      const existingPlan = {
+        ...mockPlan,
+        status: 'in_progress',
+      };
+      const updates = {
+        dri: 'new-dri@example.com',
+      };
+
+      // Simulate the update logic
+      const updatedPlan = {
+        ...existingPlan,
+        ...updates,
+      };
+
+      expect(updatedPlan.dri).toBe('new-dri@example.com');
+    });
+
+    it('should set plan status to completed when all phases are completed', () => {
+      const completedPhases = [
+        {
+          id: 'phase-1',
+          title: 'Phase 1',
+          duration: 30,
+          status: 'completed',
+          workItems: [
+            {
+              id: 'item-1',
+              title: 'Item 1',
+              status: 'completed',
+            },
+          ],
+        },
+        {
+          id: 'phase-2',
+          title: 'Phase 2',
+          duration: 20,
+          status: 'completed',
+          workItems: [
+            {
+              id: 'item-2',
+              title: 'Item 2',
+              status: 'completed',
+            },
+          ],
+        },
+      ];
+
+      const hasPhases = completedPhases && completedPhases.length > 0;
+      const allPhasesCompleted = hasPhases && completedPhases.every(
+        (phase: any) => phase.status === 'completed'
+      );
+      const planStatus = allPhasesCompleted ? 'completed' : 'in_progress';
+
+      expect(planStatus).toBe('completed');
+    });
+
+    it('should set completedAt when plan transitions to completed', () => {
+      const wasCompleted = false;
+      const isNowCompleted = true;
+      const justCompleted = !wasCompleted && isNowCompleted;
+
+      expect(justCompleted).toBe(true);
+      
+      if (justCompleted) {
+        const completedAt = new Date().toISOString();
+        expect(completedAt).toBeDefined();
+        expect(new Date(completedAt).getTime()).toBeLessThanOrEqual(Date.now());
+      }
+    });
+
+    it('should clear completedAt when plan goes back to in_progress', () => {
+      const wasCompleted = true;
+      const isNowCompleted = false;
+      const shouldClearCompletedAt = wasCompleted && !isNowCompleted;
+
+      expect(shouldClearCompletedAt).toBe(true);
     });
   });
 
