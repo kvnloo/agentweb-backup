@@ -111,7 +111,7 @@ router.get("/:planId", authenticateToken, async (req, res) => {
 router.post("/", authenticateToken, async (req, res) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
-    const { title, description } = req.body;
+    const { title, description, dri } = req.body;
 
     if (!userId) {
       return res.status(401).json({ error: "User ID not provided" });
@@ -132,6 +132,7 @@ router.post("/", authenticateToken, async (req, res) => {
       userId,
       title,
       description: description || "",
+      dri: dri || undefined, // DRI (Directly Responsible Individual) email at plan level
       phases: [],
       createdAt: now,
       updatedAt: now,
@@ -158,12 +159,12 @@ router.post("/", authenticateToken, async (req, res) => {
   }
 });
 
-// Update a GTM plan (title, description, or phases)
+// Update a GTM plan (title, description, dri, or phases)
 router.put("/:planId", authenticateToken, async (req, res) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
     const { planId } = req.params;
-    const { title, description, phases } = req.body;
+    const { title, description, dri, phases } = req.body;
 
     if (!userId) {
       return res.status(401).json({ error: "User ID not provided" });
@@ -204,6 +205,12 @@ router.put("/:planId", authenticateToken, async (req, res) => {
       updateExpressions.push("#description = :description");
       expressionAttributeNames["#description"] = "description";
       expressionAttributeValues[":description"] = description;
+    }
+
+    if (dri !== undefined) {
+      updateExpressions.push("#dri = :dri");
+      expressionAttributeNames["#dri"] = "dri";
+      expressionAttributeValues[":dri"] = dri || null; // Allow null to remove DRI
     }
 
     if (phases !== undefined) {
