@@ -3695,6 +3695,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       const plan = result.Item;
 
+      // Calculate plan status based on phases
+      const hasPhases = plan.phases && plan.phases.length > 0;
+      const allPhasesCompleted = hasPhases && plan.phases.every(
+        (phase: any) => phase.status === "completed"
+      );
+      const planStatus = allPhasesCompleted ? "completed" : "in_progress";
+
       // Format the plan for LLM consumption
       let formattedContent = `GTM Plan: ${plan.title}\n`;
       if (plan.description) {
@@ -3703,6 +3710,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       if (plan.dri) {
         formattedContent += `DRI (Plan Level): ${plan.dri}\n`;
       }
+      formattedContent += `Status: ${planStatus}\n`;
       formattedContent += `Created: ${plan.createdAt}\n`;
       formattedContent += `Updated: ${plan.updatedAt}\n\n`;
       formattedContent += `Phases (${plan.phases?.length || 0}):\n\n`;
@@ -3815,12 +3823,20 @@ Use the available tools to create tasks in the agent-engine when complex work is
         };
       });
 
+      // Calculate plan status based on phases
+      const hasPhases = processedPhases && processedPhases.length > 0;
+      const allPhasesCompleted = hasPhases && processedPhases.every(
+        (phase: any) => phase.status === "completed"
+      );
+      const planStatus = allPhasesCompleted ? "completed" : "in_progress";
+
       const newPlan = {
         planId,
         userId,
         title,
         description: description || "",
         dri: dri || undefined, // DRI at plan level
+        status: planStatus,
         phases: processedPhases,
         createdAt: now,
         updatedAt: now,

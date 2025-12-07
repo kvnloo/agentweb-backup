@@ -133,6 +133,7 @@ router.post("/", authenticateToken, async (req, res) => {
       title,
       description: description || "",
       dri: dri || undefined, // DRI (Directly Responsible Individual) email at plan level
+      status: "in_progress", // Plan starts as in_progress
       phases: [],
       createdAt: now,
       updatedAt: now,
@@ -227,9 +228,21 @@ router.put("/:planId", authenticateToken, async (req, res) => {
         };
       });
 
+      // Check if all phases are completed to determine plan status
+      const hasPhases = updatedPhases && updatedPhases.length > 0;
+      const allPhasesCompleted = hasPhases && updatedPhases.every(
+        (phase: any) => phase.status === "completed"
+      );
+      const planStatus = allPhasesCompleted ? "completed" : "in_progress";
+
       updateExpressions.push("#phases = :phases");
       expressionAttributeNames["#phases"] = "phases";
       expressionAttributeValues[":phases"] = updatedPhases;
+
+      // Update plan status based on phases
+      updateExpressions.push("#status = :status");
+      expressionAttributeNames["#status"] = "status";
+      expressionAttributeValues[":status"] = planStatus;
     }
 
     // Always update updatedAt
