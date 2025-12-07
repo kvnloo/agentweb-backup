@@ -111,7 +111,7 @@ router.get("/:planId", authenticateToken, async (req, res) => {
 router.post("/", authenticateToken, async (req, res) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
-    const { title, description } = req.body;
+    const { title, description, dri } = req.body;
 
     if (!userId) {
       return res.status(401).json({ error: "User ID not provided" });
@@ -132,6 +132,8 @@ router.post("/", authenticateToken, async (req, res) => {
       userId,
       title,
       description: description || "",
+      dri: dri || undefined, // DRI (Directly Responsible Individual) email at plan level
+      status: "in_progress", // Plan starts as in_progress
       phases: [],
       createdAt: now,
       updatedAt: now,
@@ -158,12 +160,12 @@ router.post("/", authenticateToken, async (req, res) => {
   }
 });
 
-// Update a GTM plan (title, description, or phases)
+// Update a GTM plan (title, description, dri, or phases)
 router.put("/:planId", authenticateToken, async (req, res) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
     const { planId } = req.params;
-    const { title, description, phases } = req.body;
+    const { title, description, dri, phases } = req.body;
 
     if (!userId) {
       return res.status(401).json({ error: "User ID not provided" });
@@ -206,6 +208,12 @@ router.put("/:planId", authenticateToken, async (req, res) => {
       expressionAttributeValues[":description"] = description;
     }
 
+    if (dri !== undefined) {
+      updateExpressions.push("#dri = :dri");
+      expressionAttributeNames["#dri"] = "dri";
+      expressionAttributeValues[":dri"] = dri || null; // Allow null to remove DRI
+    }
+
     if (phases !== undefined) {
       // Check if all work items in each phase are completed or skipped
       const updatedPhases = phases.map((phase: any) => {
@@ -220,9 +228,38 @@ router.put("/:planId", authenticateToken, async (req, res) => {
         };
       });
 
+      // Check if all phases are completed to determine plan status
+      const hasPhases = updatedPhases && updatedPhases.length > 0;
+      const allPhasesCompleted = hasPhases && updatedPhases.every(
+        (phase: any) => phase.status === "completed"
+      );
+      const planStatus = allPhasesCompleted ? "completed" : "in_progress";
+      
+      // Check if plan is transitioning to completed (was not completed before, now is)
+      const wasCompleted = existingPlan.status === "completed";
+      const isNowCompleted = planStatus === "completed";
+      const justCompleted = !wasCompleted && isNowCompleted;
+
       updateExpressions.push("#phases = :phases");
       expressionAttributeNames["#phases"] = "phases";
       expressionAttributeValues[":phases"] = updatedPhases;
+
+      // Update plan status based on phases
+      updateExpressions.push("#status = :status");
+      expressionAttributeNames["#status"] = "status";
+      expressionAttributeValues[":status"] = planStatus;
+      
+      // Set completedAt when plan is just completed, clear it if going back to in_progress
+      if (justCompleted) {
+        updateExpressions.push("#completedAt = :completedAt");
+        expressionAttributeNames["#completedAt"] = "completedAt";
+        expressionAttributeValues[":completedAt"] = new Date().toISOString();
+      } else if (wasCompleted && !isNowCompleted) {
+        // Plan was completed but is now in progress again (phases were modified)
+        updateExpressions.push("#completedAt = :completedAt");
+        expressionAttributeNames["#completedAt"] = "completedAt";
+        expressionAttributeValues[":completedAt"] = null;
+      }
     }
 
     // Always update updatedAt

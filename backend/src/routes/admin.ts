@@ -1599,4 +1599,61 @@ router.get("/knowledge-base-metrics", async (req, res) => {
   }
 });
 
+// Get all GTM plans from all users
+router.get("/gtm-plans", async (req, res) => {
+  try {
+    const dynamodb = new DynamoDB.DocumentClient({
+      region: process.env.AWS_REGION || "us-west-2",
+      ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+        },
+      }),
+    });
+
+    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+    const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+    // Scan all GTM plans (admin can see all)
+    const result = await dynamodb.scan({
+      TableName: TABLE_NAME,
+    }).promise();
+
+    const plans = result.Items || [];
+
+    // Get user information for each plan
+    const plansWithUsers = await Promise.all(
+      plans.map(async (plan: any) => {
+        try {
+          const user = await userDb.getUserById(plan.userId);
+          return {
+            ...plan,
+            userEmail: user?.email || undefined,
+            userName: user?.name || undefined,
+          };
+        } catch (error) {
+          return {
+            ...plan,
+            userEmail: undefined,
+            userName: undefined,
+          };
+        }
+      })
+    );
+
+    res.json({
+      success: true,
+      data: plansWithUsers,
+    });
+  } catch (error: any) {
+    console.error("Error getting all GTM plans:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error fetching GTM plans",
+      error: error?.message || "Internal server error",
+    });
+  }
+});
+
 export default router;

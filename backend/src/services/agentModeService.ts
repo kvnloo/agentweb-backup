@@ -522,8 +522,8 @@ Work plans help organize complex multi-step projects like client onboarding, cam
 ## GTM Plan Capabilities
 You can read and create Go-To-Market (GTM) plans using these tools:
 - **list_gtm_plans**: List all GTM plans for the user. Returns plan IDs, titles, descriptions, phase counts, and creation dates.
-- **read_gtm_plan**: Read a specific GTM plan by its plan ID. Returns complete plan details including all phases and work items with their statuses, durations, and completion times.
-- **create_gtm_plan**: Create a new GTM plan with a title, optional description, and optional phases with work items. You can create a complete plan structure in one call by including phases (each with title, description, duration) and work items (each with title, optional description, optional duration) within each phase. Returns the created plan with its unique identifier.
+- **read_gtm_plan**: Read a specific GTM plan by its plan ID. Returns complete plan details including all phases and work items with their statuses, durations, completion times, and DRI (Directly Responsible Individual) email addresses at plan, phase, and item levels.
+- **create_gtm_plan**: Create a new GTM plan with a title, optional description, optional DRI (Directly Responsible Individual) email at plan level, and optional phases with work items. You can create a complete plan structure in one call by including phases (each with title, description, duration, optional DRI) and work items (each with title, optional description, optional duration, optional DRI) within each phase. DRI can be specified at the plan level, phase level, or work item level. Returns the created plan with its unique identifier.
 
 **IMPORTANT RESTRICTIONS:**
 - **You CANNOT modify existing GTM plans** - You can only read existing plans and create new ones.
@@ -1235,7 +1235,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'create_gtm_plan',
-          description: 'Create a new Go-To-Market (GTM) plan with a title, optional description, and optional phases with work items. Each phase can have multiple work items. Returns the created plan with its unique identifier.',
+          description: 'Create a new Go-To-Market (GTM) plan with a title, optional description, optional DRI (Directly Responsible Individual) email, and optional phases with work items. Each phase can have multiple work items. DRI can be specified at plan level, phase level, or item level. Returns the created plan with its unique identifier.',
           parameters: {
             type: 'object',
             properties: {
@@ -1247,9 +1247,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 type: 'string',
                 description: 'Optional description of the GTM plan'
               },
+              dri: {
+                type: 'string',
+                description: 'Optional DRI (Directly Responsible Individual) email address at the plan level'
+              },
               phases: {
                 type: 'array',
-                description: 'Optional array of phases to include in the plan. Each phase should have a title, description, duration (in days), and workItems array.',
+                description: 'Optional array of phases to include in the plan. Each phase should have a title, description, duration (in days), optional DRI email, and workItems array.',
                 items: {
                   type: 'object',
                   properties: {
@@ -1264,6 +1268,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
                     duration: {
                       type: 'number',
                       description: 'Duration of the phase in days'
+                    },
+                    dri: {
+                      type: 'string',
+                      description: 'Optional DRI (Directly Responsible Individual) email address at the phase level'
                     },
                     workItems: {
                       type: 'array',
@@ -1282,6 +1290,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
                           duration: {
                             type: 'number',
                             description: 'Optional duration of the work item in days'
+                          },
+                          dri: {
+                            type: 'string',
+                            description: 'Optional DRI (Directly Responsible Individual) email address at the work item level'
                           }
                         },
                         required: ['title']
@@ -2866,7 +2878,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'read_gtm_plan':
         return await this.readGTMPlan(args.plan_id, userId);
       case 'create_gtm_plan':
-        return await this.createGTMPlan(args.title, args.description || '', args.phases || [], userId);
+        return await this.createGTMPlan(args.title, args.description || '', args.dri || undefined, args.phases || [], userId);
       case 'get_lead_lists':
         return await this.getLeadLists(userId);
       case 'create_lead_list':
@@ -3683,13 +3695,28 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       const plan = result.Item;
 
+      // Calculate plan status based on phases
+      const hasPhases = plan.phases && plan.phases.length > 0;
+      const allPhasesCompleted = hasPhases && plan.phases.every(
+        (phase: any) => phase.status === "completed"
+      );
+      const planStatus = allPhasesCompleted ? "completed" : "in_progress";
+
       // Format the plan for LLM consumption
       let formattedContent = `GTM Plan: ${plan.title}\n`;
       if (plan.description) {
         formattedContent += `Description: ${plan.description}\n`;
       }
+      if (plan.dri) {
+        formattedContent += `DRI (Plan Level): ${plan.dri}\n`;
+      }
+      formattedContent += `Status: ${planStatus}\n`;
       formattedContent += `Created: ${plan.createdAt}\n`;
-      formattedContent += `Updated: ${plan.updatedAt}\n\n`;
+      formattedContent += `Updated: ${plan.updatedAt}\n`;
+      if (planStatus === "completed" && plan.completedAt) {
+        formattedContent += `Completed: ${plan.completedAt}\n`;
+      }
+      formattedContent += `\n`;
       formattedContent += `Phases (${plan.phases?.length || 0}):\n\n`;
 
       if (plan.phases && plan.phases.length > 0) {
@@ -3697,6 +3724,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
           formattedContent += `Phase ${index + 1}: ${phase.title}\n`;
           if (phase.description) {
             formattedContent += `  Description: ${phase.description}\n`;
+          }
+          if (phase.dri) {
+            formattedContent += `  DRI: ${phase.dri}\n`;
           }
           formattedContent += `  Duration: ${phase.duration} day(s)\n`;
           formattedContent += `  Status: ${phase.status}\n`;
@@ -3707,6 +3737,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
               formattedContent += `    ${itemIndex + 1}. ${item.title} [${item.status}]`;
               if (item.duration !== undefined) {
                 formattedContent += ` - ${item.duration} day(s)`;
+              }
+              if (item.dri) {
+                formattedContent += ` - DRI: ${item.dri}`;
               }
               if (item.completedAt) {
                 formattedContent += ` - Completed: ${item.completedAt}`;
@@ -3744,7 +3777,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   // Create a new GTM plan
-  private async createGTMPlan(title: string, description: string, phases: any[], userId: string): Promise<any> {
+  private async createGTMPlan(title: string, description: string, dri: string | undefined, phases: any[], userId: string): Promise<any> {
     try {
       const { DynamoDB } = await import('aws-sdk');
       const dynamodb = new DynamoDB.DocumentClient({
@@ -3773,6 +3806,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           title: item.title,
           description: item.description || "",
           duration: item.duration !== undefined ? item.duration : undefined,
+          dri: item.dri || undefined, // DRI at work item level
           status: "pending" as const,
         }));
 
@@ -3787,16 +3821,26 @@ Use the available tools to create tasks in the agent-engine when complex work is
           title: phase.title,
           description: phase.description || "",
           duration: phase.duration || 1,
+          dri: phase.dri || undefined, // DRI at phase level
           status: allItemsDone ? "completed" : "in_progress" as const,
           workItems: processedWorkItems,
         };
       });
+
+      // Calculate plan status based on phases
+      const hasPhases = processedPhases && processedPhases.length > 0;
+      const allPhasesCompleted = hasPhases && processedPhases.every(
+        (phase: any) => phase.status === "completed"
+      );
+      const planStatus = allPhasesCompleted ? "completed" : "in_progress";
 
       const newPlan = {
         planId,
         userId,
         title,
         description: description || "",
+        dri: dri || undefined, // DRI at plan level
+        status: planStatus,
         phases: processedPhases,
         createdAt: now,
         updatedAt: now,

@@ -273,7 +273,7 @@ describe('Agent Mode Service - GTM Plan Functions', () => {
       const mockPromise = jest.fn().mockResolvedValue({});
       mockPut.mockReturnValue({ promise: mockPromise });
 
-      const result = await (agentModeService as any).createGTMPlan(title, description, phases, mockUserId);
+      const result = await (agentModeService as any).createGTMPlan(title, description, undefined, phases, mockUserId);
 
       expect(result.success).toBe(true);
       expect(result.message).toContain('created successfully');
@@ -315,7 +315,7 @@ describe('Agent Mode Service - GTM Plan Functions', () => {
       const mockPromise = jest.fn().mockResolvedValue({});
       mockPut.mockReturnValue({ promise: mockPromise });
 
-      const result = await (agentModeService as any).createGTMPlan(title, description, phases, mockUserId);
+      const result = await (agentModeService as any).createGTMPlan(title, description, undefined, phases, mockUserId);
 
       expect(result.success).toBe(true);
       expect(result.plan.title).toBe('Empty Plan');
@@ -339,7 +339,7 @@ describe('Agent Mode Service - GTM Plan Functions', () => {
       const mockPromise = jest.fn().mockResolvedValue({});
       mockPut.mockReturnValue({ promise: mockPromise });
 
-      const result = await (agentModeService as any).createGTMPlan('Test Plan', '', phases, mockUserId);
+      const result = await (agentModeService as any).createGTMPlan('Test Plan', '', undefined, phases, mockUserId);
 
       expect(result.plan.phases[0].workItems[0].status).toBe('pending');
     });
@@ -363,7 +363,7 @@ describe('Agent Mode Service - GTM Plan Functions', () => {
       const mockPromise = jest.fn().mockResolvedValue({});
       mockPut.mockReturnValue({ promise: mockPromise });
 
-      const result = await (agentModeService as any).createGTMPlan('Test Plan', '', phases, mockUserId);
+      const result = await (agentModeService as any).createGTMPlan('Test Plan', '', undefined, phases, mockUserId);
 
       // Phase should be in_progress when items are pending
       expect(result.plan.phases[0].status).toBe('in_progress');
@@ -390,10 +390,191 @@ describe('Agent Mode Service - GTM Plan Functions', () => {
       const mockPromise = jest.fn().mockResolvedValue({});
       mockPut.mockReturnValue({ promise: mockPromise });
 
-      const result = await (agentModeService as any).createGTMPlan('Test Plan', '', phases, mockUserId);
+      const result = await (agentModeService as any).createGTMPlan('Test Plan', '', undefined, phases, mockUserId);
 
       expect(result.plan.phases[0].workItems[0].duration).toBeUndefined();
       expect(result.plan.phases[0].workItems[1].duration).toBe(5);
+    });
+
+    it('should create a plan with DRI at plan level', async () => {
+      const title = 'Plan with DRI';
+      const description = 'Test Description';
+      const dri = 'plan-dri@example.com';
+      const phases: any[] = [];
+
+      const mockPromise = jest.fn().mockResolvedValue({});
+      mockPut.mockReturnValue({ promise: mockPromise });
+
+      const result = await (agentModeService as any).createGTMPlan(title, description, dri, phases, mockUserId);
+
+      expect(result.success).toBe(true);
+      expect(mockPut).toHaveBeenCalledWith(
+        expect.objectContaining({
+          TableName: 'Dev-AW-GTMPlan',
+          Item: expect.objectContaining({
+            dri: 'plan-dri@example.com',
+            status: 'in_progress',
+          }),
+        })
+      );
+    });
+
+    it('should create a plan with DRI at phase level', async () => {
+      const title = 'Plan with Phase DRI';
+      const description = 'Test Description';
+      const phases = [
+        {
+          title: 'Phase 1',
+          duration: 10,
+          dri: 'phase-dri@example.com',
+          workItems: [],
+        },
+      ];
+
+      const mockPromise = jest.fn().mockResolvedValue({});
+      mockPut.mockReturnValue({ promise: mockPromise });
+
+      const result = await (agentModeService as any).createGTMPlan(title, description, undefined, phases, mockUserId);
+
+      expect(result.success).toBe(true);
+      expect(result.plan.phases[0].dri).toBe('phase-dri@example.com');
+    });
+
+    it('should create a plan with DRI at work item level', async () => {
+      const title = 'Plan with Item DRI';
+      const description = 'Test Description';
+      const phases = [
+        {
+          title: 'Phase 1',
+          duration: 10,
+          workItems: [
+            {
+              title: 'Item 1',
+              dri: 'item-dri@example.com',
+            },
+          ],
+        },
+      ];
+
+      const mockPromise = jest.fn().mockResolvedValue({});
+      mockPut.mockReturnValue({ promise: mockPromise });
+
+      const result = await (agentModeService as any).createGTMPlan(title, description, undefined, phases, mockUserId);
+
+      expect(result.success).toBe(true);
+      expect(result.plan.phases[0].workItems[0].dri).toBe('item-dri@example.com');
+    });
+
+    it('should set plan status to completed when all phases are completed', async () => {
+      const phases = [
+        {
+          title: 'Phase 1',
+          duration: 10,
+          workItems: [
+            {
+              title: 'Item 1',
+              status: 'completed',
+            },
+          ],
+        },
+      ];
+
+      // Mock the plan creation to simulate completed phases
+      const mockPlan = {
+        planId: 'plan-123',
+        userId: mockUserId,
+        title: 'Completed Plan',
+        description: '',
+        dri: undefined,
+        status: 'completed',
+        phases: [
+          {
+            id: 'phase-1',
+            title: 'Phase 1',
+            duration: 10,
+            status: 'completed',
+            workItems: [
+              {
+                id: 'item-1',
+                title: 'Item 1',
+                status: 'completed',
+              },
+            ],
+          },
+        ],
+        createdAt: '2024-01-01T00:00:00Z',
+        updatedAt: '2024-01-01T00:00:00Z',
+      };
+
+      const hasPhases = mockPlan.phases && mockPlan.phases.length > 0;
+      const allPhasesCompleted = hasPhases && mockPlan.phases.every(
+        (phase: any) => phase.status === 'completed'
+      );
+      const planStatus = allPhasesCompleted ? 'completed' : 'in_progress';
+
+      expect(planStatus).toBe('completed');
+    });
+
+    it('should include DRI in formatted output for read_gtm_plan', async () => {
+      const planWithDri = {
+        ...mockPlan,
+        dri: 'plan-dri@example.com',
+        phases: [
+          {
+            ...mockPlan.phases[0],
+            dri: 'phase-dri@example.com',
+            workItems: [
+              {
+                ...mockPlan.phases[0].workItems[0],
+                dri: 'item-dri@example.com',
+              },
+            ],
+          },
+        ],
+      };
+
+      const mockPromise = jest.fn().mockResolvedValue({
+        Item: planWithDri,
+      });
+      mockGet.mockReturnValue({ promise: mockPromise });
+
+      const result = await (agentModeService as any).readGTMPlan(mockPlanId, mockUserId);
+
+      expect(result.success).toBe(true);
+      expect(result.formattedContent).toContain('DRI (Plan Level): plan-dri@example.com');
+      expect(result.formattedContent).toContain('DRI: phase-dri@example.com');
+      expect(result.formattedContent).toContain('DRI: item-dri@example.com');
+    });
+
+    it('should include plan status and completedAt in formatted output', async () => {
+      const completedPlan = {
+        ...mockPlan,
+        status: 'completed',
+        completedAt: '2024-01-02T12:00:00Z',
+        phases: [
+          {
+            ...mockPlan.phases[0],
+            status: 'completed',
+            workItems: [
+              {
+                ...mockPlan.phases[0].workItems[0],
+                status: 'completed',
+              },
+            ],
+          },
+        ],
+      };
+
+      const mockPromise = jest.fn().mockResolvedValue({
+        Item: completedPlan,
+      });
+      mockGet.mockReturnValue({ promise: mockPromise });
+
+      const result = await (agentModeService as any).readGTMPlan(mockPlanId, mockUserId);
+
+      expect(result.success).toBe(true);
+      expect(result.formattedContent).toContain('Status: completed');
+      expect(result.formattedContent).toContain('Completed: 2024-01-02T12:00:00Z');
     });
   });
 });

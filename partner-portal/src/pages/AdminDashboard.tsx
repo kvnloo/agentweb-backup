@@ -500,6 +500,7 @@ export default function AdminDashboard() {
     'image-models': 9,
     'default-prompts': 10,
     'benchmarks': 11,
+    'gtm-plans': 12,
   };
   
   // Get initial tab value from URL or default to 0
@@ -571,6 +572,8 @@ export default function AdminDashboard() {
   const [userToCreate, setUserToCreate] = useState<string | null>(null);
   const [createUserRoles, setCreateUserRoles] = useState<string[]>(["customer"]);
   const [createUserLoading, setCreateUserLoading] = useState(false);
+  const [gtmPlans, setGtmPlans] = useState<any[]>([]);
+  const [gtmPlansLoading, setGtmPlansLoading] = useState(false);
   const { token } = useAuth();
 
   const {
@@ -751,6 +754,35 @@ export default function AdminDashboard() {
     // Only load knowledge base metrics when Knowledge Base tab (7) is selected and we haven't loaded them yet
     if (tabValue === 7 && !knowledgeBaseMetrics) {
       loadKnowledgeBaseMetrics();
+    }
+  }, [tabValue, token]);
+
+  useEffect(() => {
+    const loadGtmPlans = async () => {
+      if (!token) return;
+      try {
+        setGtmPlansLoading(true);
+        const response = await axios.get(
+          buildApiUrl("/api/admin/gtm-plans"),
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          }
+        );
+        if (response.data.success) {
+          setGtmPlans(response.data.data || []);
+        }
+      } catch (error) {
+        console.error("Error loading GTM plans:", error);
+      } finally {
+        setGtmPlansLoading(false);
+      }
+    };
+
+    // Load GTM plans when GTM Plans tab (12) is selected
+    if (tabValue === 12 && gtmPlans.length === 0 && !gtmPlansLoading) {
+      loadGtmPlans();
     }
   }, [tabValue, token]);
 
@@ -1504,6 +1536,7 @@ export default function AdminDashboard() {
             <Tab label="Image Models" {...a11yProps(9)} />
             <Tab label="Default Prompts" {...a11yProps(10)} />
             <Tab label="Benchmarks" {...a11yProps(11)} />
+            <Tab label="GTM Plans" {...a11yProps(12)} />
           </Tabs>
         </Box>
 
@@ -3481,6 +3514,149 @@ export default function AdminDashboard() {
 
         <TabPanel value={tabValue} index={11}>
           <BenchmarksTab />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={12}>
+          <Box>
+            <Typography variant="h6" gutterBottom>
+              GTM Plans
+            </Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
+              View all GTM plans from all users with DRIs and completion statistics
+            </Typography>
+
+            {gtmPlansLoading ? (
+              <Box sx={{ display: "flex", justifyContent: "center", p: 4 }}>
+                <CircularProgress />
+              </Box>
+            ) : gtmPlans.length === 0 ? (
+              <Alert severity="info">No GTM plans found</Alert>
+            ) : (
+              <TableContainer component={Paper}>
+                <Table>
+                  <TableHead>
+                    <TableRow>
+                      <TableCell><strong>Plan Title</strong></TableCell>
+                      <TableCell><strong>User</strong></TableCell>
+                      <TableCell><strong>Plan DRI</strong></TableCell>
+                      <TableCell><strong>Phase DRIs</strong></TableCell>
+                      <TableCell><strong>Item DRIs</strong></TableCell>
+                      <TableCell><strong>Phases</strong></TableCell>
+                      <TableCell><strong>Work Items</strong></TableCell>
+                      <TableCell><strong>Status</strong></TableCell>
+                      <TableCell><strong>Created</strong></TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {gtmPlans.map((plan: any) => {
+                      // Calculate phase stats
+                      const totalPhases = plan.phases?.length || 0;
+                      const completedPhases = plan.phases?.filter(
+                        (p: any) => p.status === "completed"
+                      ).length || 0;
+
+                      // Calculate work item stats
+                      const allWorkItems = plan.phases?.flatMap(
+                        (phase: any) => phase.workItems || []
+                      ) || [];
+                      const totalWorkItems = allWorkItems.length;
+                      const completedWorkItems = allWorkItems.filter(
+                        (item: any) => item.status === "completed" || item.status === "skipped"
+                      ).length;
+
+                      // Collect all DRIs
+                      const phaseDris = plan.phases
+                        ?.filter((p: any) => p.dri)
+                        .map((p: any) => p.dri) || [];
+                      const itemDris = allWorkItems
+                        .filter((item: any) => item.dri)
+                        .map((item: any) => item.dri) || [];
+
+                      return (
+                        <TableRow key={plan.planId} hover>
+                          <TableCell>
+                            <Typography variant="body2" fontWeight="medium">
+                              {plan.title}
+                            </Typography>
+                          </TableCell>
+                          <TableCell>
+                            {plan.userEmail || plan.userName ? (
+                              <>
+                                <Typography variant="body2">{plan.userEmail || plan.userName}</Typography>
+                                {plan.userName && plan.userName !== plan.userEmail && (
+                                  <Typography variant="caption" color="text.secondary" display="block">
+                                    {plan.userName}
+                                  </Typography>
+                                )}
+                              </>
+                            ) : (
+                              <Typography variant="body2" color="text.secondary">Unknown</Typography>
+                            )}
+                          </TableCell>
+                          <TableCell>
+                            {plan.dri ? (
+                              <Chip label={plan.dri} size="small" variant="outlined" />
+                            ) : (
+                              <Typography variant="body2" color="text.secondary">-</Typography>
+                            )}
+                          </TableCell>
+                          <TableCell>
+                            {phaseDris.length > 0 ? (
+                              <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5 }}>
+                                {phaseDris.map((dri: string, idx: number) => (
+                                  <Chip key={idx} label={dri} size="small" variant="outlined" />
+                                ))}
+                              </Box>
+                            ) : (
+                              <Typography variant="body2" color="text.secondary">-</Typography>
+                            )}
+                          </TableCell>
+                          <TableCell>
+                            {itemDris.length > 0 ? (
+                              <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5 }}>
+                                {itemDris.map((dri: string, idx: number) => (
+                                  <Chip key={idx} label={dri} size="small" variant="outlined" />
+                                ))}
+                              </Box>
+                            ) : (
+                              <Typography variant="body2" color="text.secondary">-</Typography>
+                            )}
+                          </TableCell>
+                          <TableCell>
+                            <Typography variant="body2">
+                              {completedPhases}/{totalPhases}
+                            </Typography>
+                          </TableCell>
+                          <TableCell>
+                            <Typography variant="body2">
+                              {completedWorkItems}/{totalWorkItems}
+                            </Typography>
+                          </TableCell>
+                          <TableCell>
+                            <Chip
+                              label={plan.status === "completed" ? "Completed" : "In Progress"}
+                              color={plan.status === "completed" ? "success" : "default"}
+                              size="small"
+                            />
+                            {plan.status === "completed" && plan.completedAt && (
+                              <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
+                                {format(new Date(plan.completedAt), "MMM d, yyyy 'at' h:mm a")}
+                              </Typography>
+                            )}
+                          </TableCell>
+                          <TableCell>
+                            <Typography variant="body2">
+                              {format(new Date(plan.createdAt), "MMM d, yyyy")}
+                            </Typography>
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+            )}
+          </Box>
         </TabPanel>
       </Paper>
 
