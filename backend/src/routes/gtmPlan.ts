@@ -234,6 +234,11 @@ router.put("/:planId", authenticateToken, async (req, res) => {
         (phase: any) => phase.status === "completed"
       );
       const planStatus = allPhasesCompleted ? "completed" : "in_progress";
+      
+      // Check if plan is transitioning to completed (was not completed before, now is)
+      const wasCompleted = existingPlan.status === "completed";
+      const isNowCompleted = planStatus === "completed";
+      const justCompleted = !wasCompleted && isNowCompleted;
 
       updateExpressions.push("#phases = :phases");
       expressionAttributeNames["#phases"] = "phases";
@@ -243,6 +248,18 @@ router.put("/:planId", authenticateToken, async (req, res) => {
       updateExpressions.push("#status = :status");
       expressionAttributeNames["#status"] = "status";
       expressionAttributeValues[":status"] = planStatus;
+      
+      // Set completedAt when plan is just completed, clear it if going back to in_progress
+      if (justCompleted) {
+        updateExpressions.push("#completedAt = :completedAt");
+        expressionAttributeNames["#completedAt"] = "completedAt";
+        expressionAttributeValues[":completedAt"] = new Date().toISOString();
+      } else if (wasCompleted && !isNowCompleted) {
+        // Plan was completed but is now in progress again (phases were modified)
+        updateExpressions.push("#completedAt = :completedAt");
+        expressionAttributeNames["#completedAt"] = "completedAt";
+        expressionAttributeValues[":completedAt"] = null;
+      }
     }
 
     // Always update updatedAt

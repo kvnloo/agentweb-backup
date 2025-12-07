@@ -3712,7 +3712,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
       }
       formattedContent += `Status: ${planStatus}\n`;
       formattedContent += `Created: ${plan.createdAt}\n`;
-      formattedContent += `Updated: ${plan.updatedAt}\n\n`;
+      formattedContent += `Updated: ${plan.updatedAt}\n`;
+      if (planStatus === "completed" && plan.completedAt) {
+        formattedContent += `Completed: ${plan.completedAt}\n`;
+      }
+      formattedContent += `\n`;
       formattedContent += `Phases (${plan.phases?.length || 0}):\n\n`;
 
       if (plan.phases && plan.phases.length > 0) {
