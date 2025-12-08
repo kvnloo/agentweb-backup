@@ -5,7 +5,7 @@ on:
     branches:
       - main
   pull_request:
-    types: [closed, opened, synchronize]
+    types: [closed]
     branches:
       - main
 
@@ -41,27 +41,6 @@ jobs:
             partner:
               - 'partner-portal/**'
 
-  detect-changes-staging:
-    name: Detect changed projects (staging - backend only)
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' && github.event.pull_request.merged == false
-    outputs:
-      backend: ${{ steps.filter.outputs.backend }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
-
-      - name: Paths filter
-        id: filter
-        uses: dorny/paths-filter@v3
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          filters: |
-            backend:
-              - 'backend/**'
 
   backend-deploy:
     name: Backend deploy (only if version increased)
@@ -280,81 +259,3 @@ jobs:
 
       # Artifact upload removed to save GitHub storage quota
       # Build artifacts are already uploaded to S3 for deployment
-
-  backend-deploy-staging:
-    name: Backend deploy to staging (PR)
-    needs: detect-changes-staging
-    if: github.event_name == 'pull_request' && github.event.pull_request.merged == false && needs.detect-changes-staging.outputs.backend == 'true'
-    runs-on: ubuntu-latest
-    environment: staging
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          cache: 'npm'
-          cache-dependency-path: backend/package-lock.json
-
-      - name: Install dependencies
-        working-directory: backend
-        run: npm ci
-
-      - name: Build
-        working-directory: backend
-        run: NODE_OPTIONS="--max-old-space-size=4096" npm run build --if-present
-
-      - name: Package artifact
-        working-directory: backend
-        run: |
-          VERSION=$(jq -r .version package.json)
-          PR_NUMBER=${{ github.event.pull_request.number }}
-          mkdir -p builds
-          zip -r "builds/deploy_v${VERSION}-staging-pr${PR_NUMBER}.zip" dist package.json package-lock.json .env.example .platform .ebextensions || zip -r "builds/deploy_v${VERSION}-staging-pr${PR_NUMBER}.zip" dist package.json package-lock.json
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Deploy to Elastic Beanstalk (Staging)
-        timeout-minutes: 5
-        working-directory: backend
-        run: |
-          VERSION=$(jq -r .version package.json)
-          PR_NUMBER=${{ github.event.pull_request.number }}
-          VERSION_LABEL="backend_v${VERSION}-staging-pr${PR_NUMBER}"
-          echo "Deploying backend to staging version: $VERSION_LABEL"
-          
-          # Upload to S3
-          echo "Uploading deployment package to S3..."
-          aws s3 cp "builds/deploy_v${VERSION}-staging-pr${PR_NUMBER}.zip" "s3://elasticbeanstalk-${{ env.AWS_REGION }}-992382574572/builds/backend_deploy_${VERSION_LABEL}.zip"
-          
-          # Create new application version
-          echo "Creating new application version..."
-          aws elasticbeanstalk create-application-version \
-            --application-name ${{ vars.EB_BACKEND_STAGING_APPLICATION_NAME }} \
-            --version-label "$VERSION_LABEL" \
-            --source-bundle S3Bucket="elasticbeanstalk-${{ env.AWS_REGION }}-992382574572,S3Key=builds/backend_deploy_${VERSION_LABEL}.zip" || echo "⚠️  Version creation failed (may already exist), continuing..."
-          
-          # Deploy to environment
-          echo "Deploying to staging environment..."
-          aws elasticbeanstalk update-environment \
-            --environment-name ${{ vars.EB_BACKEND_STAGING_ENVIRONMENT_NAME }} \
-            --version-label "$VERSION_LABEL" || echo "⚠️  Environment update failed (may be updating), but AWS deployment likely succeeded"
-
-      - name: Backend Staging Deployment Status
-        run: |
-          VERSION=$(jq -r .version backend/package.json)
-          PR_NUMBER=${{ github.event.pull_request.number }}
-          echo "🚀 Backend staging deployment initiated successfully!"
-          echo "📊 Check deployment status: https://${{ env.AWS_REGION }}.console.aws.amazon.com/elasticbeanstalk/home?region=${{ env.AWS_REGION }}#/environments"
-          echo "✅ Version deployed: backend_v${VERSION}-staging-pr${PR_NUMBER}"
-          echo "🔗 Staging URL: https://api-stage.agentweb.pro"
-

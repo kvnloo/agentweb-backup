@@ -1661,6 +1661,7 @@ This repository includes CI (build verification) and CD (deploy) workflows for `
   - Version rule for PRs: the `package.json` version in the PR must be the same or higher than the base branch
   - Builds the projects to verify compilation
   - Uses the runner's default Node version (no explicit `node-version`)
+  - **Staging Deployment**: After backend tests pass, automatically deploys backend to staging environment
   - **Note**: Unit tests are not run in CI - run them locally before submitting PRs (see [Testing](#testing) section)
 
 - `deploy.yml` — Handles both production and staging deployments:
@@ -1669,9 +1670,10 @@ This repository includes CI (build verification) and CD (deploy) workflows for `
     - Version rule for deploys: deploys only if the new version is strictly higher than the previous commit
     - Builds production bundles using the same commands documented below
     - Packages versioned zip files and deploys to AWS Elastic Beanstalk production environments
-  - **Staging deployment (Backend only)**: Runs automatically when backend changes are pushed to a Pull Request (opened or updated)
+  - **Staging deployment (Backend only)**: Runs automatically after backend tests pass successfully on a Pull Request
     - Deploys backend to staging environment for testing before merging to `main`
-    - No version bump required - deploys on any PR push with backend changes
+    - Only deploys if tests pass - ensures code quality before staging deployment
+    - No version bump required - deploys on any PR push with backend changes (after tests pass)
     - Staging backend URL: `https://api-stage.agentweb.pro`
     - Version labels include PR number: `backend_v<version>-staging-pr<PR_NUMBER>`
     - Allows developers to test backend changes in staging
@@ -1728,7 +1730,8 @@ The workflows use region `us-west-2` by default. Update `AWS_REGION` in the work
   - Version labels in Elastic Beanstalk:
     - Backend: `backend_v<package.json version>-staging-pr<PR_NUMBER>`
   - Artifacts uploaded to S3 bucket: `elasticbeanstalk-<region>-992382574572/builds/*`
-  - Deploys automatically on PR push (no version bump required)
+  - Deploys automatically after tests pass on PR push (no version bump required)
+  - Only deploys if backend tests succeed - ensures code quality
   - Staging backend URL: `https://api-stage.agentweb.pro`
   - Allows developers to test backend changes in staging before merging to `main`
   - **Note**: Partner Portal and Customer Portal should be run locally pointing to staging backend (see [Local Development with Staging Backend](#local-development-with-staging-backend))
@@ -1737,11 +1740,14 @@ The workflows use region `us-west-2` by default. Update `AWS_REGION` in the work
 
 When you create or update a Pull Request that touches `backend/**`:
 
-1. **Automatic Backend Staging Deployment**: The workflow automatically detects backend changes and deploys to staging environment
-2. **No Version Bump Required**: Unlike production, staging deployments don't require version bumps - they deploy on any PR push
-3. **Test Your Backend Changes**: Once deployed, the staging backend is available at `https://api-stage.agentweb.pro`
-4. **Version Labels**: Each staging deployment uses a unique version label including the PR number (e.g., `backend_v1.0.0-staging-pr123`)
-5. **Production Deployment**: After your PR is merged to `main`, production deployment will run automatically (if version was bumped)
+1. **Tests Run First**: The workflow automatically runs backend tests (build verification, version checks)
+2. **Staging Deployment After Tests Pass**: If tests pass successfully, the workflow automatically deploys to staging environment
+3. **No Version Bump Required**: Unlike production, staging deployments don't require version bumps - they deploy on any PR push (after tests pass)
+4. **Test Your Backend Changes**: Once deployed, the staging backend is available at `https://api-stage.agentweb.pro`
+5. **Version Labels**: Each staging deployment uses a unique version label including the PR number (e.g., `backend_v1.0.0-staging-pr123`)
+6. **Production Deployment**: After your PR is merged to `main`, production deployment will run automatically (if version was bumped)
+
+**Note**: Staging deployment only runs if backend tests pass. If tests fail, staging deployment is skipped to prevent deploying broken code.
 
 **Note**: Staging deployments use the same AWS credentials as production, but deploy to separate staging Elastic Beanstalk environments configured via GitHub repository variables.
 
