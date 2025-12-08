@@ -34,18 +34,18 @@ export class GenerateMarketingResponseWorkerService {
   ): Promise<GenerateMarketingResponseResult> {
     return new Promise((resolve, reject) => {
       // Get the worker script path
-      // In production, __dirname points to dist/services, so we need to go up to dist/workers
+      // In production/staging, __dirname points to dist/services, so we need to go up to dist/workers
       // In development, we use ts-node to run the TypeScript file directly
       let workerScript: string;
       let execArgv: string[] = [];
       
-      if (process.env.NODE_ENV === 'production') {
-        // Production: use compiled JavaScript
-        workerScript = path.join(__dirname, '../workers/generateMarketingResponseWorker.js');
-      } else {
+      if (process.env.NODE_ENV === 'development') {
         // Development: use TypeScript with ts-node
         workerScript = path.join(__dirname, '../workers/generateMarketingResponseWorker.ts');
         execArgv = ['-r', 'ts-node/register'];
+      } else {
+        // Production/Staging: use compiled JavaScript
+        workerScript = path.join(__dirname, '../workers/generateMarketingResponseWorker.js');
       }
       
       // Fork a new process
