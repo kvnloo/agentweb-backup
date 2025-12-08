@@ -7,6 +7,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-08',
+    changes: [
+      'Fixed Brand Guidelines Gradient Checkbox Bug',
+      '- Fixed issue where "Use gradient for primary color" checkbox was not properly using the isGradient value',
+    ],
+  },
+  {
     date: '2025-12-07',
     changes: [
       'Enhanced GTM Plan Management with DRI Support',
