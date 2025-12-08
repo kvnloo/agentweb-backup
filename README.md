@@ -1684,8 +1684,10 @@ This repository includes CI (build verification) and CD (deploy) workflows for `
 Configure the following for GitHub Actions (Settings → Secrets and variables → Actions):
 
 - **Secrets** (sensitive):
-  - `AWS_ACCESS_KEY_ID`
-  - `AWS_SECRET_ACCESS_KEY`
+  - **Repository-level secrets** (used as fallback, but environment secrets take precedence):
+    - `AWS_ACCESS_KEY_ID` — AWS access key for the `github-actions-deploy-backend` IAM user
+    - `AWS_SECRET_ACCESS_KEY` — AWS secret key for the `github-actions-deploy-backend` IAM user
+  - **Note**: Production and staging use different access keys, but both are from the same IAM user `github-actions-deploy-backend`
 
 - **Variables** (non-sensitive, easier to manage):
   - **Production:**
@@ -1701,8 +1703,21 @@ Configure the following for GitHub Actions (Settings → Secrets and variables �
   - Create a `staging` environment in GitHub repository settings
     - Go to Settings → Environments → New environment
     - Name it `staging`
-    - Optionally configure environment protection rules or secrets specific to staging
+    - **Configure AWS Secrets in the staging environment:**
+      - Click on the `staging` environment
+      - Under "Environment secrets", add:
+        - `AWS_ACCESS_KEY_ID` — Staging AWS access key ID for the `github-actions-deploy-backend` IAM user
+        - `AWS_SECRET_ACCESS_KEY` — Staging AWS secret access key for the `github-actions-deploy-backend` IAM user
+      - **Note**: These are different credentials from production, but both are from the same IAM user `github-actions-deploy-backend`
+      - **Note**: Environment secrets override repository secrets, so you must configure them at the environment level when using `environment: staging`
+    - Optionally configure environment protection rules
   - The `prod` environment should already exist (used by production deployments)
+    - **Configure AWS Secrets in the prod environment:**
+      - Click on the `prod` environment
+      - Under "Environment secrets", ensure:
+        - `AWS_ACCESS_KEY_ID` — Production AWS access key ID for the `github-actions-deploy-backend` IAM user
+        - `AWS_SECRET_ACCESS_KEY` — Production AWS secret access key for the `github-actions-deploy-backend` IAM user
+      - **Note**: These are different credentials from staging, but both are from the same IAM user `github-actions-deploy-backend`
 
 The workflows use region `us-west-2` by default. Update `AWS_REGION` in the workflow if needed, or add a repository variable `AWS_REGION` to override.
 
