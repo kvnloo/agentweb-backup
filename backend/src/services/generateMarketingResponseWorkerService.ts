@@ -34,18 +34,23 @@ export class GenerateMarketingResponseWorkerService {
   ): Promise<GenerateMarketingResponseResult> {
     return new Promise((resolve, reject) => {
       // Get the worker script path
-      // In production, __dirname points to dist/services, so we need to go up to dist/workers
-      // In development, we use ts-node to run the TypeScript file directly
+      // In production/staging, __dirname points to dist/services, so we need to go up to dist/workers
+      // In local development, we use ts-node to run the TypeScript file directly
+      // Check if we're in a deployed environment by checking if __dirname contains 'dist'
+      // (in deployed environments, code is in dist/, in local dev it's in src/)
       let workerScript: string;
       let execArgv: string[] = [];
       
-      if (process.env.NODE_ENV === 'production') {
-        // Production: use compiled JavaScript
-        workerScript = path.join(__dirname, '../workers/generateMarketingResponseWorker.js');
-      } else {
-        // Development: use TypeScript with ts-node
+      const isDeployedEnvironment = __dirname.includes('/dist/') || __dirname.includes('\\dist\\');
+      const isLocalDevelopment = process.env.NODE_ENV === 'development' && !isDeployedEnvironment;
+      
+      if (isLocalDevelopment) {
+        // Local development: use TypeScript with ts-node
         workerScript = path.join(__dirname, '../workers/generateMarketingResponseWorker.ts');
         execArgv = ['-r', 'ts-node/register'];
+      } else {
+        // Production/Staging/Deployed: use compiled JavaScript
+        workerScript = path.join(__dirname, '../workers/generateMarketingResponseWorker.js');
       }
       
       // Fork a new process

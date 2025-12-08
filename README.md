@@ -285,24 +285,25 @@ cd partner-portal
 npm install
 ```
 
-2. Configure environment variables:
+2. Start the development server:
 
-- Create a `.env` file in the `partner-portal` directory:
-
-```
-VITE_API_URL=http://localhost:3001
-```
-
-3. Start the development server:
-
+**Option A: Local development with local backend** (default):
 ```bash
 npm run dev
+```
+This will use `http://localhost:3001` as the API URL (if backend is running locally).
+
+**Option B: Local development with staging backend** (recommended for testing):
+```bash
+VITE_API_URL=https://api-stage.agentweb.pro VITE_CUSTOMER_FRONTEND_URL=http://localhost:5174 VITE_DEBUG=true npm run dev
 ```
 
 The frontend development server will be available at:
 
 - Local access: http://localhost:5173
 - Network access: http://[your-ip-address]:5173
+
+**Note**: When using staging backend, your local partner portal will connect to `https://api-stage.agentweb.pro` for API calls. This is useful for testing frontend changes against the staging backend without deploying the frontend.
 
 ### Admin Setup
 
@@ -1660,27 +1661,63 @@ This repository includes CI (build verification) and CD (deploy) workflows for `
   - Version rule for PRs: the `package.json` version in the PR must be the same or higher than the base branch
   - Builds the projects to verify compilation
   - Uses the runner's default Node version (no explicit `node-version`)
+  - **Staging Deployment**: After backend tests pass, automatically deploys backend to staging environment
   - **Note**: Unit tests are not run in CI - run them locally before submitting PRs (see [Testing](#testing) section)
 
-- `deploy.yml` — Runs on push to `main` touching `backend/**` or `partner-portal/**`
-  - Detects which project changed and runs only the relevant jobs
-  - Version rule for deploys: deploys only if the new version is strictly higher than the previous commit
-  - Builds production bundles using the same commands documented below
-  - Packages versioned zip files and deploys to AWS Elastic Beanstalk (mirrors customer-portal flow)
+- `deploy.yml` — Handles both production and staging deployments:
+  - **Production deployment**: Runs on push to `main` or when a PR is merged to `main`
+    - Detects which project changed and runs only the relevant jobs
+    - Version rule for deploys: deploys only if the new version is strictly higher than the previous commit
+    - Builds production bundles using the same commands documented below
+    - Packages versioned zip files and deploys to AWS Elastic Beanstalk production environments
+  - **Staging deployment (Backend only)**: Runs automatically after backend tests pass successfully on a Pull Request
+    - Deploys backend to staging environment for testing before merging to `main`
+    - Only deploys if tests pass - ensures code quality before staging deployment
+    - No version bump required - deploys on any PR push with backend changes (after tests pass)
+    - Staging backend URL: `https://api-stage.agentweb.pro`
+    - Version labels include PR number: `backend_v<version>-staging-pr<PR_NUMBER>`
+    - Allows developers to test backend changes in staging
+    - **Frontend testing**: Partner Portal and Customer Portal should be run locally pointing to staging backend (see [Local Development with Staging Backend](#local-development-with-staging-backend))
 
 ### Required GitHub configuration for deployments
 
 Configure the following for GitHub Actions (Settings → Secrets and variables → Actions):
 
-- Secrets (sensitive):
-  - `AWS_ACCESS_KEY_ID`
-  - `AWS_SECRET_ACCESS_KEY`
+- **Secrets** (sensitive):
+  - **Repository-level secrets** (used as fallback, but environment secrets take precedence):
+    - `AWS_ACCESS_KEY_ID` — AWS access key for the `github-actions-deploy-backend` IAM user
+    - `AWS_SECRET_ACCESS_KEY` — AWS secret key for the `github-actions-deploy-backend` IAM user
+  - **Note**: Production and staging use different access keys, but both are from the same IAM user `github-actions-deploy-backend`
 
-- Variables (non-sensitive, easier to manage):
-  - `EB_BACKEND_APPLICATION_NAME` — Elastic Beanstalk application name for backend
-  - `EB_BACKEND_ENVIRONMENT_NAME` — Elastic Beanstalk environment name for backend
-  - `EB_PARTNER_APPLICATION_NAME` — Elastic Beanstalk application name for partner-portal
-  - `EB_PARTNER_ENVIRONMENT_NAME` — Elastic Beanstalk environment name for partner-portal
+- **Variables** (non-sensitive, easier to manage):
+  - **Production:**
+    - `EB_BACKEND_APPLICATION_NAME` — Elastic Beanstalk application name for backend
+    - `EB_BACKEND_ENVIRONMENT_NAME` — Elastic Beanstalk environment name for backend
+    - `EB_PARTNER_APPLICATION_NAME` — Elastic Beanstalk application name for partner-portal
+    - `EB_PARTNER_ENVIRONMENT_NAME` — Elastic Beanstalk environment name for partner-portal
+  - **Staging:**
+    - `EB_BACKEND_STAGING_APPLICATION_NAME` — Elastic Beanstalk application name for backend staging.
+    - `EB_BACKEND_STAGING_ENVIRONMENT_NAME` — Elastic Beanstalk environment name for backend staging.
+
+- **Environments** (Settings → Environments):
+  - Create a `staging` environment in GitHub repository settings
+    - Go to Settings → Environments → New environment
+    - Name it `staging`
+    - **Configure AWS Secrets in the staging environment:**
+      - Click on the `staging` environment
+      - Under "Environment secrets", add:
+        - `AWS_ACCESS_KEY_ID` — Staging AWS access key ID for the `github-actions-deploy-backend` IAM user
+        - `AWS_SECRET_ACCESS_KEY` — Staging AWS secret access key for the `github-actions-deploy-backend` IAM user
+      - **Note**: These are different credentials from production, but both are from the same IAM user `github-actions-deploy-backend`
+      - **Note**: Environment secrets override repository secrets, so you must configure them at the environment level when using `environment: staging`
+    - Optionally configure environment protection rules
+  - The `prod` environment should already exist (used by production deployments)
+    - **Configure AWS Secrets in the prod environment:**
+      - Click on the `prod` environment
+      - Under "Environment secrets", ensure:
+        - `AWS_ACCESS_KEY_ID` — Production AWS access key ID for the `github-actions-deploy-backend` IAM user
+        - `AWS_SECRET_ACCESS_KEY` — Production AWS secret access key for the `github-actions-deploy-backend` IAM user
+      - **Note**: These are different credentials from staging, but both are from the same IAM user `github-actions-deploy-backend`
 
 The workflows use region `us-west-2` by default. Update `AWS_REGION` in the workflow if needed, or add a repository variable `AWS_REGION` to override.
 
@@ -1696,11 +1733,70 @@ The workflows use region `us-west-2` by default. Update `AWS_REGION` in the work
 
 ### Deployment behavior
 
-- Version labels in Elastic Beanstalk:
-  - Backend: `backend_v<package.json version>`
-  - Partner Portal: `partner_v<package.json version>`
-- Artifacts uploaded to S3 bucket: `elasticbeanstalk-<region>-992382574572/builds/*`
-- The deploy job will no-op if the version is the same or lower than the previous commit
+- **Production deployments:**
+  - Version labels in Elastic Beanstalk:
+    - Backend: `backend_v<package.json version>`
+    - Partner Portal: `partner_v<package.json version>`
+  - Artifacts uploaded to S3 bucket: `elasticbeanstalk-<region>-992382574572/builds/*`
+  - The deploy job will no-op if the version is the same or lower than the previous commit
+  - Deploys to production environments configured in GitHub Actions
+
+- **Staging deployments (Backend only):**
+  - Version labels in Elastic Beanstalk:
+    - Backend: `backend_v<package.json version>-staging-pr<PR_NUMBER>`
+  - Artifacts uploaded to S3 bucket: `elasticbeanstalk-<region>-992382574572/builds/*`
+  - Deploys automatically after tests pass on PR push (no version bump required)
+  - Only deploys if backend tests succeed - ensures code quality
+  - Staging backend URL: `https://api-stage.agentweb.pro`
+  - Allows developers to test backend changes in staging before merging to `main`
+  - **Note**: Partner Portal and Customer Portal should be run locally pointing to staging backend (see [Local Development with Staging Backend](#local-development-with-staging-backend))
+
+### Staging Deployment Workflow
+
+When you create or update a Pull Request that touches `backend/**`:
+
+1. **Tests Run First**: The workflow automatically runs backend tests (build verification, version checks)
+2. **Staging Deployment After Tests Pass**: If tests pass successfully, the workflow automatically deploys to staging environment
+3. **No Version Bump Required**: Unlike production, staging deployments don't require version bumps - they deploy on any PR push (after tests pass)
+4. **Test Your Backend Changes**: Once deployed, the staging backend is available at `https://api-stage.agentweb.pro`
+5. **Version Labels**: Each staging deployment uses a unique version label including the PR number (e.g., `backend_v1.0.0-staging-pr123`)
+6. **Production Deployment**: After your PR is merged to `main`, production deployment will run automatically (if version was bumped)
+
+**Note**: Staging deployment only runs if backend tests pass. If tests fail, staging deployment is skipped to prevent deploying broken code.
+
+**Note**: Staging deployments use the same AWS credentials as production, but deploy to separate staging Elastic Beanstalk environments configured via GitHub repository variables.
+
+### Local Development with Staging Backend
+
+For frontend development (Partner Portal and Customer Portal), run the applications locally and point them to the staging backend:
+
+#### Partner Portal - Local Development with Staging
+
+Navigate to the partner-portal directory and run:
+
+```bash
+cd partner-portal
+VITE_API_URL=https://api-stage.agentweb.pro VITE_CUSTOMER_FRONTEND_URL=http://localhost:5174 VITE_DEBUG=true npm run dev
+```
+
+The partner portal will be available at `http://localhost:5173` and will connect to the staging backend at `https://api-stage.agentweb.pro`.
+
+#### Customer Portal - Local Development with Staging
+
+Navigate to the customer-portal directory and run:
+
+```bash
+cd customer-portal
+VITE_API_URL=https://api-stage.agentweb.pro VITE_PARTNER_PORTAL_URL=http://localhost:5173 VITE_DEBUG=true npm run dev
+```
+
+The customer portal will be available at `http://localhost:5174` and will connect to the staging backend at `https://api-stage.agentweb.pro`.
+
+**Benefits of this approach:**
+- Faster iteration: No need to wait for frontend deployments
+- Easy testing: Test frontend changes immediately against staging backend
+- Cost effective: No need for separate staging frontend environments
+- Flexible: Developers can test different frontend configurations easily
 
 ### PRs from forks
 

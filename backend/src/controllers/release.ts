@@ -8,6 +8,16 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-12-08",
+    changes: [
+      "Supported Deployment to Staging for Backend",
+      "- Backend changes in Pull Requests now automatically deploy to staging after tests pass",
+      "- Staging environment available at https://api-stage.agentweb.pro for testing",
+      "- Frontend applications (Partner Portal and Customer Portal) can run locally pointing to staging backend",
+      "- Enables developers to test backend changes in staging before merging to production",
+    ],
+  },
+  {
     date: "2025-11-15",
     changes: [
       "Enhanced Admin Dashboard Chat History",
