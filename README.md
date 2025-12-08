@@ -1692,8 +1692,8 @@ Configure the following for GitHub Actions (Settings → Secrets and variables �
     - `EB_PARTNER_APPLICATION_NAME` — Elastic Beanstalk application name for partner-portal
     - `EB_PARTNER_ENVIRONMENT_NAME` — Elastic Beanstalk environment name for partner-portal
   - **Staging:**
-    - `EB_BACKEND_STAGING_APPLICATION_NAME` — Elastic Beanstalk application name for backend staging
-    - `EB_BACKEND_STAGING_ENVIRONMENT_NAME` — Elastic Beanstalk environment name for backend staging
+    - `EB_BACKEND_STAGING_APPLICATION_NAME` — Elastic Beanstalk application name for backend staging.
+    - `EB_BACKEND_STAGING_ENVIRONMENT_NAME` — Elastic Beanstalk environment name for backend staging.
 
 - **Environments** (Settings → Environments):
   - Create a `staging` environment in GitHub repository settings
