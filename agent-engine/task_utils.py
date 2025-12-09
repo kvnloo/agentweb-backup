@@ -9,11 +9,8 @@ import json
 import hashlib
 from urllib.parse import quote
 import aiohttp
-from browser_use.agent.views import ActionResult
 from aws_utils import get_dynamodb_resource, get_s3_client, get_bedrock_client
 from pydantic import SecretStr
-from langchain_aws import ChatBedrock
-from langchain_openai import AzureChatOpenAI, ChatOpenAI
 import html
 import time
 import uuid
@@ -239,16 +236,17 @@ def get_agent_code_base_path(user_id: str, task_id: Optional[str] = None) -> str
     return base_path
 
 def get_aws_bedrock_llm(model_name: str):
-    """Initialize AWS Bedrock language model"""
+    """Initialize AWS Bedrock language model using browser-use's native ChatAWSBedrock class."""
     try:
-        # Get Bedrock client with no retries
-        bedrock = get_bedrock_client()
-
-        return ChatBedrock(
-            client=bedrock,
-            model_id=model_name,
-            model_kwargs={"temperature": 0.0}
+        from browser_use.llm import ChatAWSBedrock
+        
+        return ChatAWSBedrock(
+            model=model_name,
+            temperature=0.0
         )
+    except ImportError as e:
+        logger.error(f"browser_use.llm.ChatAWSBedrock could not be imported: {e}")
+        sys.exit(1)
     except Exception as e:
         if "AccessDeniedException" in str(e):
             logger.error("Error: The AWS user lacks permission to invoke Claude model in Bedrock.")
@@ -257,182 +255,230 @@ def get_aws_bedrock_llm(model_name: str):
         raise
 
 def get_azure_openai_llm(model_name: str):
-    """Initialize Azure OpenAI language model"""
+    """Initialize Azure OpenAI language model using browser-use's native ChatAzureOpenAI class."""
     try:
-        deployment_name = model_name # use model name as deployment name in Azure portal
+        from browser_use.llm import ChatAzureOpenAI
         
-        return AzureChatOpenAI(
-            model_name=model_name,
+        deployment_name = model_name  # use model name as deployment name in Azure portal
+        
+        return ChatAzureOpenAI(
+            model=model_name,
             azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT'),
             azure_deployment=deployment_name,
             api_key=os.getenv('AZURE_OPENAI_API_KEY'),
             api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-08-01-preview'),
             temperature=0.0
         )
+    except ImportError as e:
+        logger.error(f"browser_use.llm.ChatAzureOpenAI could not be imported: {e}")
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Error initializing Azure OpenAI: {e}")
         logger.error("Please ensure all Azure OpenAI environment variables are set correctly.")
         sys.exit(1)
 
 def get_azure_openai_llm2(model_name: str):
-    """Initialize Azure OpenAI language model"""
+    """Initialize Azure OpenAI language model using browser-use's native ChatAzureOpenAI class (endpoint 2).
+    
+    Note: browser-use 0.10.1+ uses its own LLM wrappers instead of LangChain.
+    """
     try:
-        deployment_name = model_name # use model name as deployment name in Azure portal
+        from browser_use.llm import ChatAzureOpenAI
         
-        return AzureChatOpenAI(
-            model_name=model_name,
+        deployment_name = model_name  # use model name as deployment name in Azure portal
+        
+        return ChatAzureOpenAI(
+            model=model_name,
             azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT2'),
             azure_deployment=deployment_name,
             api_key=os.getenv('AZURE_OPENAI_API_KEY2'),
             api_version=os.getenv('AZURE_OPENAI_API_VERSION2', '2024-12-01-preview'),
             temperature=0.0
         )
+    except ImportError as e:
+        logger.error(f"browser_use.llm.ChatAzureOpenAI could not be imported: {e}")
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Error initializing Azure OpenAI: {e}")
         logger.error("Please ensure all Azure OpenAI environment variables are set correctly.")
         sys.exit(1)
 
 def get_azure_openai_llm3(model_name: str):
-    """Initialize Azure OpenAI language model"""
+    """Initialize Azure OpenAI language model using browser-use's native ChatAzureOpenAI class (endpoint 3)."""
     try:
-        deployment_name = model_name # use model name as deployment name in Azure portal
+        from browser_use.llm import ChatAzureOpenAI
         
-        return AzureChatOpenAI(
-            model_name=model_name,
+        deployment_name = model_name  # use model name as deployment name in Azure portal
+        
+        return ChatAzureOpenAI(
+            model=model_name,
             azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT3'),
             azure_deployment=deployment_name,
             api_key=os.getenv('AZURE_OPENAI_API_KEY3'),
             api_version=os.getenv('AZURE_OPENAI_API_VERSION3', '2025-01-01-preview'),
         )
+    except ImportError as e:
+        logger.error(f"browser_use.llm.ChatAzureOpenAI could not be imported: {e}")
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Error initializing Azure OpenAI: {e}")
         logger.error("Please ensure all Azure OpenAI environment variables are set correctly.")
         sys.exit(1)
 
 def get_azure_openai_llm_o1(model_name: str):
-    """Initialize Azure OpenAI language model"""
+    """Initialize Azure OpenAI language model for O1 series using browser-use's native ChatAzureOpenAI class."""
     try:
-        deployment_name = model_name # use model name as deployment name in Azure portal
+        from browser_use.llm import ChatAzureOpenAI
         
-        # O1 series model does not support temperature
-        return AzureChatOpenAI(
-            model_name=model_name,
+        deployment_name = model_name  # use model name as deployment name in Azure portal
+        
+        return ChatAzureOpenAI(
+            model=model_name,
             azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT'),
             azure_deployment=deployment_name,
             api_key=os.getenv('AZURE_OPENAI_API_KEY'),
-            api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-09-12')
+            api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-09-12'),
+            temperature=None  # O1 series does not support temperature
         )
+    except ImportError as e:
+        logger.error(f"browser_use.llm.ChatAzureOpenAI could not be imported: {e}")
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Error initializing Azure OpenAI: {e}")
         logger.error("Please ensure all Azure OpenAI environment variables are set correctly.")
         sys.exit(1)
 
 def get_deepseek_llm(model_name: str):
-    """Initialize DeepSeek language model"""
+    """Initialize DeepSeek language model using browser-use's native ChatDeepSeek class."""
     global global_use_vision
     try:
+        from browser_use.llm import ChatDeepSeek
+        
         global_use_vision = False
         api_key = os.getenv('DEEPSEEK_API_KEY')
         if not api_key:
             raise ValueError('DEEPSEEK_API_KEY is not set')
             
-        return ChatOpenAI(
-            base_url='https://api.deepseek.com',
+        return ChatDeepSeek(
             model=model_name,
-            api_key=SecretStr(api_key),
+            api_key=api_key,
             temperature=0.0
         )
+    except ImportError as e:
+        logger.error(f"browser_use.llm.ChatDeepSeek could not be imported: {e}")
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Error initializing DeepSeek: {e}")
         logger.error("Please ensure DEEPSEEK_API_KEY environment variable is set correctly.")
         sys.exit(1)
 
 def get_pld_deepseek_llm(model_name: str):
-    """Initialize DeepSeek language model hosted on Pale Blue Dot"""
+    """Initialize DeepSeek language model hosted on Pale Blue Dot using browser-use's native ChatOpenAI class."""
     global global_use_vision
     try:
+        from browser_use.llm import ChatOpenAI as BrowserUseChatOpenAI
+        
         global_use_vision = False
         api_key = os.getenv('PLD_DEEPSEEK_API_KEY')
         if not api_key:
             raise ValueError('PLD_DEEPSEEK_API_KEY is not set')
             
-        return ChatOpenAI(
+        return BrowserUseChatOpenAI(
             base_url='https://www.palebluedot.ai/api',
             model=model_name,
-            api_key=SecretStr(api_key),
+            api_key=api_key,
             temperature=0.0
         )
+    except ImportError as e:
+        logger.error(f"browser_use.llm.ChatOpenAI could not be imported: {e}")
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Error initializing DeepSeek: {e}")
         logger.error("Please ensure PLD_DEEPSEEK_API_KEY environment variable is set correctly.")
         sys.exit(1)
 
 def get_openai_llm(model_name: str):
+    """Initialize OpenAI language model using browser-use's native ChatOpenAI class."""
     if model_name == "gpt-5":
         # Use Gemini 2.5 Flash as a proxy for gpt-5
         return get_gemini_llm("gemini-2.5-flash")
     
-    """Initialize OpenAI language model"""
     try:
+        from browser_use.llm import ChatOpenAI as BrowserUseChatOpenAI
+        
         api_key = os.getenv('OPENAI_API_KEY')
         if not api_key:
             raise ValueError('OPENAI_API_KEY is not set')
             
-        return ChatOpenAI(
+        return BrowserUseChatOpenAI(
             model=model_name,
-            api_key=SecretStr(api_key),
+            api_key=api_key,
             temperature=0.0
         )
+    except ImportError as e:
+        logger.error(f"browser_use.llm.ChatOpenAI could not be imported: {e}")
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Error initializing OpenAI: {e}")
         logger.error("Please ensure OPENAI_API_KEY environment variable is set correctly.")
         sys.exit(1)
 
 def get_openai_llm_think(model_name: str):
-    """Initialize OpenAI language model"""
+    """Initialize OpenAI language model for thinking models (O3-mini, etc.) using browser-use's native ChatOpenAI class."""
     global global_use_vision
     try:
+        from browser_use.llm import ChatOpenAI as BrowserUseChatOpenAI
+        
         api_key = os.getenv('OPENAI_API_KEY')
         if not api_key:
             raise ValueError('OPENAI_API_KEY is not set')
             
-        # For think model such as o3-mini, we disable vision: https://github.com/browser-use/browser-use/issues/283
+        # For think model such as o3-mini, we disable vision
         global_use_vision = False
         logger.warning(f"Vision is disabled for {model_name}. Execution details in gif will not be available.")
-        return ChatOpenAI(
+        return BrowserUseChatOpenAI(
             model=model_name,
-            api_key=SecretStr(api_key),
-            disabled_params={"parallel_tool_calls": None}
+            api_key=api_key,
+            temperature=None  # Think models don't support temperature
         )
+    except ImportError as e:
+        logger.error(f"browser_use.llm.ChatOpenAI could not be imported: {e}")
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Error initializing OpenAI: {e}")
         logger.error("Please ensure OPENAI_API_KEY environment variable is set correctly.")
         sys.exit(1)
 
 def get_gemini_llm(model_name: str, code_execution: bool = False):
-    """Initialize Google Gemini language model"""
+    """Initialize Google Gemini language model using browser-use's native ChatGoogle class."""
     try:
         api_key = os.getenv('GEMINI_API_KEY')
         if not api_key:
             raise ValueError('GEMINI_API_KEY is not set')
-            
-        # Import here to avoid requiring the package for all users
-        from langchain_google_genai import ChatGoogleGenerativeAI
+         
+        # Import browser-use's native ChatGoogle class
+        from browser_use.llm import ChatGoogle
         
-        llm = ChatGoogleGenerativeAI(
+        # Build config dictionary for code execution if requested
+        config = None
+        if code_execution:
+            from google.genai import types
+            config = {
+                'tools': [types.Tool(code_execution=types.ToolCodeExecution())]
+            }
+        
+        llm = ChatGoogle(
             model=model_name,
-            api_key=SecretStr(api_key),
-            temperature=0.0
+            api_key=api_key,
+            temperature=0.0,
+            config=config
         )
 
-        # Enable code execution for Gemini models only if requested
-        if code_execution:
-            return llm.bind(code_execution=True)
-        else:
-            return llm
+        return llm
 
-    except ImportError:
-        logger.error("langchain_google_genai package is not installed. Install it with: pip install langchain-google-genai")
+    except ImportError as e:
+        logger.error(f"browser_use.llm.ChatGoogle could not be imported: {e}")
+        logger.error("Ensure browser-use is installed with: pip install browser-use>=0.10.1")
         sys.exit(1)
     except Exception as e:
         logger.error(f"Error initializing Gemini: {e}")

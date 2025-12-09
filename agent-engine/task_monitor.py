@@ -7,7 +7,6 @@ import uuid
 import logging
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
-from web_agent import WebAgent
 from botocore.exceptions import ClientError
 import time
 from decimal import Decimal

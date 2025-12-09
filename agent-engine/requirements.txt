@@ -1,11 +1,11 @@
-browser-use[memory]==0.8.0
+browser-use[memory]==0.10.1
 aiohttp
 beautifulsoup4
 python-dotenv
 boto3
 humanize
 PyJWT
-ag2[browser-use]
+ag2
 nest-asyncio
 xmltodict
 facebook-business

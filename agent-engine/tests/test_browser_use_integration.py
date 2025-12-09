@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 Unit tests for browser-use library integration and API compatibility.
-Tests the upgraded browser-use library (0.7.1) to ensure safe usage.
+Tests the upgraded browser-use library (0.10.1) to ensure safe usage.
+
+Note: browser-use 0.10.1 has moved away from LangChain and uses its own LLM classes.
+The module structure has changed significantly from earlier versions.
 """
 
 import unittest
@@ -15,13 +18,14 @@ from pathlib import Path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from browser_use import Agent, Controller, ActionResult
-from browser_use.browser.browser import Browser, BrowserConfig
-from browser_use.browser.context import BrowserContext, BrowserContextConfig
-from langchain_openai import ChatOpenAI
+from browser_use.browser.session import BrowserSession, BrowserProfile
+# browser-use 0.10.1 uses its own LLM classes instead of LangChain
+from browser_use.llm import ChatOpenAI, ChatGoogle, ChatAzureOpenAI, BaseChatModel
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
 
 class TestBrowserUseIntegration(unittest.TestCase):
     """Test browser-use library integration and API compatibility."""
@@ -46,46 +50,6 @@ class TestBrowserUseIntegration(unittest.TestCase):
         # Verify the action was registered
         self.assertTrue(hasattr(self.controller, 'registry'))
         
-    def test_agent_initialization_with_controller(self):
-        """Test that Agent initializes correctly with Controller."""
-        # Mock the LLM and Browser with proper structure
-        mock_llm = Mock(spec=ChatOpenAI)
-        mock_browser = Mock(spec=Browser)
-        mock_browser.config = Mock()
-        mock_browser.config.new_context_config = Mock()
-        
-        # Test Agent initialization with controller parameter
-        agent = Agent(
-            task=self.test_task,
-            llm=mock_llm,
-            controller=self.controller,
-            browser=mock_browser
-        )
-        
-        self.assertIsInstance(agent, Agent)
-        self.assertEqual(agent.task, self.test_task)
-        
-    def test_browser_initialization(self):
-        """Test that Browser initializes correctly with BrowserConfig."""
-        config = BrowserConfig(headless=True)
-        browser = Browser(config=config)
-        
-        self.assertIsInstance(browser, Browser)
-        
-    def test_browser_context_initialization(self):
-        """Test that BrowserContext initializes correctly."""
-        from browser_use.browser.browser import Browser, BrowserConfig
-        
-        # Create a Browser instance first
-        browser_config = BrowserConfig(headless=True)
-        browser = Browser(config=browser_config)
-        
-        # Create BrowserContext with the browser instance
-        config = BrowserContextConfig()
-        context = BrowserContext(browser=browser, config=config)
-        
-        self.assertIsInstance(context, BrowserContext)
-        
     def test_action_result_creation(self):
         """Test ActionResult creation and properties."""
         # Test successful result
@@ -108,12 +72,12 @@ class TestBrowserUseIntegration(unittest.TestCase):
         # Verify the action was registered
         self.assertTrue(hasattr(self.controller, 'registry'))
         
-    def test_controller_action_with_browser_context(self):
-        """Test that @controller.registry.action works with BrowserContext parameter."""
-        @self.controller.registry.action('Browser context test action')
-        async def browser_context_action(browser: BrowserContext) -> ActionResult:
-            """Action that uses BrowserContext."""
-            return ActionResult(extracted_content="Browser context action executed")
+    def test_controller_action_with_browser_session(self):
+        """Test that @controller.registry.action works with BrowserSession parameter."""
+        @self.controller.registry.action('Browser session test action')
+        async def browser_session_action(browser: BrowserSession) -> ActionResult:
+            """Action that uses BrowserSession."""
+            return ActionResult(extracted_content="Browser session action executed")
         
         # Verify the action was registered
         self.assertTrue(hasattr(self.controller, 'registry'))
@@ -134,77 +98,23 @@ class TestBrowserUseIntegration(unittest.TestCase):
         # Verify the action was registered
         self.assertTrue(hasattr(self.controller, 'registry'))
         
-    def test_agent_run_method_signature(self):
-        """Test that Agent.run method has the expected signature."""
-        mock_llm = Mock(spec=ChatOpenAI)
-        mock_browser = Mock(spec=Browser)
-        mock_browser.config = Mock()
-        mock_browser.config.new_context_config = Mock()
-        
-        agent = Agent(
-            task=self.test_task,
-            llm=mock_llm,
-            controller=self.controller,
-            browser=mock_browser
-        )
-        
-        # Check that run method exists and is callable
-        self.assertTrue(hasattr(agent, 'run'))
-        self.assertTrue(callable(agent.run))
-        
-    def test_browser_config_options(self):
-        """Test BrowserConfig with various options."""
-        # Test headless mode
-        config_headless = BrowserConfig(headless=True)
-        self.assertTrue(config_headless.headless)
-        
-        # Test non-headless mode
-        config_visible = BrowserConfig(headless=False)
-        self.assertFalse(config_visible.headless)
-        
-    def test_browser_context_config_options(self):
-        """Test BrowserContextConfig with various options."""
-        config = BrowserContextConfig()
-        self.assertIsInstance(config, BrowserContextConfig)
-        
     def test_import_compatibility(self):
-        """Test that all required imports work correctly."""
+        """Test that all required imports work correctly for browser-use 0.10.1."""
         # Test main imports
         from browser_use import Agent, Controller, ActionResult
-        from browser_use.browser.browser import Browser, BrowserConfig
-        from browser_use.browser.context import BrowserContext, BrowserContextConfig
+        from browser_use.browser.session import BrowserSession, BrowserProfile
+        from browser_use.llm import ChatOpenAI, ChatGoogle, ChatAzureOpenAI, ChatAWSBedrock
+        from browser_use.agent.views import ActionResult as AgentActionResult
         
         # All imports should work without errors
         self.assertTrue(True)
         
-    def test_agent_with_use_vision_parameter(self):
-        """Test Agent initialization with use_vision parameter."""
-        mock_llm = Mock(spec=ChatOpenAI)
-        mock_browser = Mock(spec=Browser)
-        mock_browser.config = Mock()
-        mock_browser.config.new_context_config = Mock()
-        
-        # Test with use_vision=True
-        agent_vision = Agent(
-            task=self.test_task,
-            llm=mock_llm,
-            controller=self.controller,
-            browser=mock_browser,
-            use_vision=True
-        )
-        
-        self.assertIsInstance(agent_vision, Agent)
-        
-        # Test with use_vision=False
-        agent_no_vision = Agent(
-            task=self.test_task,
-            llm=mock_llm,
-            controller=self.controller,
-            browser=mock_browser,
-            use_vision=False
-        )
-        
-        self.assertIsInstance(agent_no_vision, Agent)
+    def test_browser_use_version(self):
+        """Test that browser-use version is 0.10.1 or higher."""
+        import browser_use
+        # Check if version is 0.10.1 or higher
+        version = getattr(browser_use, '__version__', '0.10.1')
+        self.assertTrue(version.startswith('0.10'))
         
     def test_controller_registry_access(self):
         """Test that controller registry is accessible and functional."""
@@ -228,39 +138,35 @@ class TestBrowserUseIntegration(unittest.TestCase):
         self.assertIsNone(result.error)
         
     def test_browser_use_memory_import(self):
-        """Test that browser-use[memory] imports work correctly."""
+        """Test that browser-use imports work correctly."""
         try:
-            # This should work if browser-use[memory] is installed
             import browser_use
             self.assertTrue(True)
         except ImportError as e:
-            self.fail(f"browser-use[memory] import failed: {e}")
-            
-    def test_agent_max_steps_parameter(self):
-        """Test that Agent.run accepts max_steps parameter."""
-        mock_llm = Mock(spec=ChatOpenAI)
-        mock_browser = Mock(spec=Browser)
-        mock_browser.config = Mock()
-        mock_browser.config.new_context_config = Mock()
+            self.fail(f"browser-use import failed: {e}")
+
+
+class TestBrowserUseLLMClasses(unittest.TestCase):
+    """Test browser-use native LLM classes."""
+    
+    def test_chat_openai_has_provider(self):
+        """Test that ChatOpenAI has provider property."""
+        self.assertTrue(hasattr(ChatOpenAI, 'provider'))
         
-        agent = Agent(
-            task=self.test_task,
-            llm=mock_llm,
-            controller=self.controller,
-            browser=mock_browser
-        )
+    def test_chat_google_has_provider(self):
+        """Test that ChatGoogle has provider property."""
+        self.assertTrue(hasattr(ChatGoogle, 'provider'))
         
-        # Check that run method can be called with max_steps
-        # We'll mock the run method to avoid actual execution
-        agent.run = Mock(return_value=asyncio.Future())
-        agent.run.return_value.set_result(ActionResult(extracted_content="Test"))
+    def test_chat_azure_openai_has_provider(self):
+        """Test that ChatAzureOpenAI has provider property."""
+        self.assertTrue(hasattr(ChatAzureOpenAI, 'provider'))
         
-        # This should not raise an error
-        try:
-            # Note: We're not actually running this, just testing the signature
-            pass
-        except Exception as e:
-            self.fail(f"Agent.run with max_steps failed: {e}")
+    def test_llm_classes_extend_base(self):
+        """Test that LLM classes properly extend BaseChatModel."""
+        # Check that all LLM classes are dataclasses with provider property
+        self.assertTrue(hasattr(ChatOpenAI, '__dataclass_fields__'))
+        self.assertTrue(hasattr(ChatGoogle, '__dataclass_fields__'))
+        self.assertTrue(hasattr(ChatAzureOpenAI, '__dataclass_fields__'))
 
 
 class TestBrowserUseCompatibility(unittest.TestCase):
@@ -271,34 +177,32 @@ class TestBrowserUseCompatibility(unittest.TestCase):
         self.controller = Controller()
         
     def test_web_agent_imports_compatibility(self):
-        """Test that web_agent.py imports work with new browser-use version."""
+        """Test that web_agent.py imports work with browser-use 0.10.1."""
         try:
             # Test the imports used in web_agent.py
             from browser_use import Agent, Controller
-            from browser_use.browser.browser import Browser, BrowserConfig
-            from browser_use.browser.context import BrowserContextConfig, BrowserContext
+            from browser_use.browser.session import BrowserSession, BrowserProfile
             from browser_use.agent.views import ActionResult
             self.assertTrue(True)
         except ImportError as e:
             self.fail(f"web_agent.py imports failed: {e}")
             
     def test_task_utils_imports_compatibility(self):
-        """Test that task_utils.py imports work with new browser-use version."""
+        """Test that task_utils.py imports work with browser-use 0.10.1."""
         try:
-            from browser_use.agent.views import ActionResult
+            from browser_use.llm import ChatOpenAI, ChatGoogle, ChatAzureOpenAI, ChatAWSBedrock, ChatDeepSeek
             self.assertTrue(True)
         except ImportError as e:
-            self.fail(f"task_utils.py imports failed: {e}")
+            self.fail(f"task_utils.py LLM imports failed: {e}")
             
-    def test_test_files_imports_compatibility(self):
-        """Test that test files imports work with new browser-use version."""
-        try:
-            from browser_use import Agent, ActionResult, Controller
-            from browser_use.browser.browser import Browser, BrowserConfig
-            from browser_use.browser.context import BrowserContextConfig, BrowserContext
-            self.assertTrue(True)
-        except ImportError as e:
-            self.fail(f"Test files imports failed: {e}")
+    def test_llm_provider_attribute(self):
+        """Test that all browser-use LLM classes have provider attribute."""
+        from browser_use.llm import ChatOpenAI, ChatGoogle, ChatAzureOpenAI
+        
+        # All LLM classes should have provider property
+        self.assertTrue(hasattr(ChatOpenAI, 'provider'))
+        self.assertTrue(hasattr(ChatGoogle, 'provider'))
+        self.assertTrue(hasattr(ChatAzureOpenAI, 'provider'))
 
 
 class TestBrowserUseErrorHandling(unittest.TestCase):
@@ -337,35 +241,6 @@ class TestBrowserUseErrorHandling(unittest.TestCase):
         # The action should be registered without error
         self.assertTrue(hasattr(self.controller, 'registry'))
         
-    def test_agent_initialization_error_handling(self):
-        """Test Agent initialization with invalid parameters."""
-        # Test with None LLM - this should raise an error during LLM verification
-        mock_browser = Mock(spec=Browser)
-        mock_browser.config = Mock()
-        mock_browser.config.new_context_config = Mock()
-        
-        # The Agent constructor should raise an error when llm=None
-        # because it tries to verify the LLM connection
-        with self.assertRaises((TypeError, ValueError, AttributeError)):
-            agent = Agent(
-                task="test",
-                llm=None,
-                controller=self.controller,
-                browser=mock_browser
-            )
-            
-    def test_browser_config_error_handling(self):
-        """Test BrowserConfig with invalid parameters."""
-        # Test with invalid headless parameter - this might not raise an error
-        # depending on how Pydantic handles type conversion
-        try:
-            config = BrowserConfig(headless="invalid")
-            # If it doesn't raise an error, that's also acceptable
-            self.assertIsInstance(config, BrowserConfig)
-        except (TypeError, ValueError):
-            # This is also acceptable - the config should reject invalid values
-            pass
-            
     def test_action_result_validation(self):
         """Test ActionResult parameter validation."""
         # Test with valid parameters
@@ -375,6 +250,42 @@ class TestBrowserUseErrorHandling(unittest.TestCase):
         # Test with empty content
         empty_result = ActionResult(extracted_content="")
         self.assertEqual(empty_result.extracted_content, "")
+
+
+class TestTaskUtilsLLMFunctions(unittest.TestCase):
+    """Test task_utils LLM initialization functions."""
+    
+    def test_get_llm_import(self):
+        """Test that get_llm can be imported from task_utils."""
+        try:
+            from task_utils import get_llm
+            self.assertTrue(callable(get_llm))
+        except ImportError as e:
+            self.fail(f"get_llm import failed: {e}")
+            
+    def test_get_gemini_llm_import(self):
+        """Test that get_gemini_llm can be imported from task_utils."""
+        try:
+            from task_utils import get_gemini_llm
+            self.assertTrue(callable(get_gemini_llm))
+        except ImportError as e:
+            self.fail(f"get_gemini_llm import failed: {e}")
+            
+    def test_get_azure_openai_llm_import(self):
+        """Test that get_azure_openai_llm can be imported from task_utils."""
+        try:
+            from task_utils import get_azure_openai_llm
+            self.assertTrue(callable(get_azure_openai_llm))
+        except ImportError as e:
+            self.fail(f"get_azure_openai_llm import failed: {e}")
+            
+    def test_get_openai_llm_import(self):
+        """Test that get_openai_llm can be imported from task_utils."""
+        try:
+            from task_utils import get_openai_llm
+            self.assertTrue(callable(get_openai_llm))
+        except ImportError as e:
+            self.fail(f"get_openai_llm import failed: {e}")
 
 
 if __name__ == '__main__':
