@@ -1593,6 +1593,85 @@ export const agentModeController = {
     }
   },
 
+  // Upload video directly to Agent Mode session
+  async uploadVideoToSession(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { sessionId } = req.params;
+      const file = (req as any).file;
+
+      if (!file) {
+        return res.status(400).json({ error: 'No file uploaded' });
+      }
+
+      // Validate that it's a video file
+      if (!file.mimetype.startsWith('video/')) {
+        return res.status(400).json({ error: 'File must be a video' });
+      }
+
+      // Verify session exists and belongs to user
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      if (session.userId !== user.userId && !user.isAdmin) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+
+      // Upload to S3 using common utility
+      const uploadResult = await uploadFileToS3(
+        file.buffer,
+        file.originalname,
+        user.userId,
+        file.mimetype
+      );
+
+      if (!uploadResult.success) {
+        return res.status(500).json({ error: 'Failed to upload file to S3' });
+      }
+
+      // Create a system message with toolCall metadata using upload_video
+      // This structure matches what getExecutionsWithAssets expects
+      const uploadedVideoMessage = {
+        role: 'system' as const,
+        content: `Video uploaded: ${file.originalname}`,
+        timestamp: new Date().toISOString(),
+        metadata: {
+          portalType: 'agent' as const,
+          timestamp: new Date().toISOString(),
+          toolCalls: [
+            {
+              id: uuidv4(),
+              name: 'upload_video',
+              arguments: {},
+              result: {
+                success: true,
+                videoUrl: uploadResult.url,
+                filename: file.originalname,
+                message: `✅ Video "${file.originalname}" uploaded successfully!`
+              }
+            }
+          ]
+        }
+      };
+
+      // Add message to session
+      await chatbotDb.addMessageToSession(sessionId, uploadedVideoMessage);
+
+      res.json({
+        success: true,
+        message: 'Video uploaded successfully',
+        url: uploadResult.url,
+        filename: file.originalname,
+        uploadedAt: new Date().toISOString()
+      });
+    } catch (error) {
+      console.error('AgentMode: Upload video to session error:', error);
+      res.status(500).json({ error: 'Failed to upload video to session' });
+    }
+  },
+
   // Create scheduled chat
   async createScheduledChat(req: Request, res: Response) {
     try {

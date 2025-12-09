@@ -125,6 +125,10 @@ router.post('/upload', upload.single('file'), asyncHandler(agentModeController.u
 // Upload image directly to Agent Mode session (stores in session metadata)
 router.post('/sessions/:sessionId/upload-image', upload.single('file'), asyncHandler(agentModeController.uploadImageToSession));
 
+// POST /api/agent-mode/sessions/:sessionId/upload-video
+// Upload video directly to Agent Mode session (stores in session metadata)
+router.post('/sessions/:sessionId/upload-video', upload.single('file'), asyncHandler(agentModeController.uploadVideoToSession));
+
 // GET /api/agent-mode/system-prompt
 // Get current system prompt (admin only)
 router.get('/system-prompt', requireAdmin, asyncHandler(agentModeController.getSystemPrompt));

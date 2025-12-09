@@ -11,6 +11,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
     changes: [
       'Fixed Brand Guidelines Gradient Checkbox Bug',
       '- Fixed issue where "Use gradient for primary color" checkbox was not properly using the isGradient value',
+      'Added Upload Directly Support for Videos',
+      '- Users can now upload video files directly to task executions and Agent Mode sessions from the Ad Videos page',
+      '- Supports video file formats: MP4, AVI, MOV, WebM with a maximum file size of 18MB',
     ],
   },
   {
