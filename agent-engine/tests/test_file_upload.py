@@ -7,9 +7,8 @@ import asyncio
 from dotenv import load_dotenv
 
 from browser_use import Agent, Controller
-from browser_use.browser.browser import Browser, BrowserConfig
-from browser_use.browser.context import BrowserContext
-from browser_use.agent.views import ActionResult
+from browser_use.browser.session import BrowserSession as Browser, BrowserProfile as BrowserConfig, BrowserSession as BrowserContext
+from browser_use import ActionResult
 from langchain_openai import AzureChatOpenAI
 
 # Load environment variables
@@ -22,14 +21,11 @@ logger = logging.getLogger(__name__)
 # Create a test file
 TEST_FILE = Path.cwd() / 'downloads/1738251317419/american_model.png'
 if not TEST_FILE.exists():
+    TEST_FILE.parent.mkdir(parents=True, exist_ok=True)
     TEST_FILE.write_text('This is a test file for upload testing')
 
-# Initialize browser with non-headless mode for debugging
-browser = Browser(
-    config=BrowserConfig(
-        headless=False
-    )
-)
+# Note: Browser initialization moved inside test functions for browser-use 0.10.1 compatibility
+# The old Browser(config=BrowserConfig(...)) pattern is deprecated
 
 controller = Controller()
 

@@ -8,18 +8,11 @@ from unittest.mock import patch, Mock, MagicMock
 import sys
 import os
 
-# Add the current directory to the path so we can import task_utils
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Add the parent directory to the path so we can import task_utils
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Mock the problematic imports before importing task_utils
-sys.modules['langchain_aws'] = MagicMock()
-sys.modules['langchain_openai'] = MagicMock()
-sys.modules['browser_use'] = MagicMock()
-sys.modules['browser_use.agent'] = MagicMock()
-sys.modules['browser_use.agent.views'] = MagicMock()
-sys.modules['aws_utils'] = MagicMock()
-sys.modules['pydantic'] = MagicMock()
-
+# Import task_utils directly - no need to mock browser_use for these tests
+# as is_page_broken only uses requests module
 from task_utils import is_page_broken
 
 class TestIsPageBroken(unittest.TestCase):
