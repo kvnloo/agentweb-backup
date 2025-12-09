@@ -18,6 +18,7 @@ class TestRunPythonCodeInSandbox(unittest.TestCase):
         """Set up test fixtures."""
         # Create a temporary execution ID for testing
         self.execution_id = "test_execution_123"
+        self.user_id = "test_user_123"
         
         # Create a test directory and make sure it gets cleaned up
         self.temp_dir = tempfile.mkdtemp()
@@ -45,6 +46,7 @@ class TestRunPythonCodeInSandbox(unittest.TestCase):
         result = run_python_code_in_sandbox(
             python_code=python_code,
             execution_id=self.execution_id,
+            user_id=self.user_id,
             script_type="test"
         )
         
@@ -59,6 +61,7 @@ class TestRunPythonCodeInSandbox(unittest.TestCase):
         result = run_python_code_in_sandbox(
             python_code=python_code,
             execution_id=self.execution_id,
+            user_id=self.user_id,
             script_type="test"
         )
         
@@ -68,17 +71,26 @@ class TestRunPythonCodeInSandbox(unittest.TestCase):
         
     def test_timeout_handling(self):
         """Test that the function handles code that exceeds the timeout."""
-        python_code = "import time\ntime.sleep(60)"  # This should timeout (30s limit)
+        # Set a short timeout for testing (5 seconds instead of default 300)
+        os.environ['SANDBOX_TIMEOUT_SECONDS'] = '5'
         
-        result = run_python_code_in_sandbox(
-            python_code=python_code,
-            execution_id=self.execution_id,
-            script_type="test"
-        )
-        
-        self.assertIsInstance(result, ActionResult)
-        self.assertIsNotNone(result.error)
-        self.assertEqual(result.error, "Execution timed out after 30 seconds")
+        try:
+            python_code = "import time\ntime.sleep(60)"  # This should timeout
+            
+            result = run_python_code_in_sandbox(
+                python_code=python_code,
+                execution_id=self.execution_id,
+                user_id=self.user_id,
+                script_type="test"
+            )
+            
+            self.assertIsInstance(result, ActionResult)
+            self.assertIsNotNone(result.error)
+            self.assertEqual(result.error, "Execution timed out after 5 seconds")
+        finally:
+            # Clean up environment variable
+            if 'SANDBOX_TIMEOUT_SECONDS' in os.environ:
+                del os.environ['SANDBOX_TIMEOUT_SECONDS']
         
     def test_header_comment(self):
         """Test that the function correctly adds a header comment."""
@@ -102,6 +114,7 @@ class TestRunPythonCodeInSandbox(unittest.TestCase):
             result = run_python_code_in_sandbox(
                 python_code=python_code,
                 execution_id=self.execution_id,
+                user_id=self.user_id,
                 script_type="test",
                 header_comment=header_comment
             )
@@ -116,6 +129,7 @@ class TestRunPythonCodeInSandbox(unittest.TestCase):
         result = run_python_code_in_sandbox(
             python_code=python_code,
             execution_id=self.execution_id,
+            user_id=self.user_id,
             script_type="test",
             additional_env_vars={"TEST_VAR": "TEST_VALUE"}
         )
@@ -130,6 +144,7 @@ class TestRunPythonCodeInSandbox(unittest.TestCase):
         run_python_code_in_sandbox(
             python_code=python_code,
             execution_id=self.execution_id,
+            user_id=self.user_id,
             script_type="test"
         )
         
@@ -146,6 +161,7 @@ class TestRunPythonCodeInSandbox(unittest.TestCase):
         run_python_code_in_sandbox(
             python_code=python_code,
             execution_id=self.execution_id,
+            user_id=self.user_id,
             script_type="test"
         )
         
@@ -162,6 +178,7 @@ class TestRunPythonCodeInSandbox(unittest.TestCase):
         result = run_python_code_in_sandbox(
             python_code=python_code,
             execution_id=self.execution_id,
+            user_id=self.user_id,
             script_type="test"
         )
         

@@ -10,10 +10,7 @@ import base64
 from typing import Dict, Any, Optional, List, Union
 import browser_use
 from browser_use import Agent, Controller
-from browser_use.browser.browser import Browser, BrowserConfig
-from browser_use.browser.context import BrowserContextConfig, BrowserContext
-from langchain_aws import ChatBedrock
-from langchain_openai import AzureChatOpenAI, ChatOpenAI
+from browser_use.browser.session import BrowserSession, BrowserProfile
 from pydantic import SecretStr, BaseModel
 from botocore.config import Config
 from dotenv import load_dotenv
@@ -211,8 +208,6 @@ class WebAgent:
         self.current_task_id = None
         self.controller = Controller()
         self.question_count = 0  # Track number of questions asked
-        self.s3_client = boto3.client('s3')
-        self.s3_bucket = os.getenv('S3_BUCKET_NAME')  # Make sure to set this in .env
         self._log_handlers = []  # Store log handlers for cleanup
         self.generate_gif = None
         self.sensitive_data = []  # List to store all credentials for log filtering
@@ -1395,7 +1390,7 @@ class WebAgent:
                     return ActionResult(error=f"Failed to submit Python code: {str(e)}")
 
         @self.controller.registry.action('Upload file')
-        async def upload_file(file_name: str, index: int, browser: BrowserContext) -> ActionResult:
+        async def upload_file(file_name: str, index: int, browser: BrowserSession) -> ActionResult:
             """Upload a file to a file input element on the page"""
             try:
                 # Get attachment path
@@ -1457,7 +1452,7 @@ class WebAgent:
                 return ActionResult(error=f'Failed to upload file: {str(e)}')
 
         @self.controller.registry.action('Close file dialog')
-        async def close_file_dialog(browser: BrowserContext) -> ActionResult:
+        async def close_file_dialog(browser: BrowserSession) -> ActionResult:
             """Close any open file dialog"""
             try:
                 page = await browser.get_current_page()
@@ -1467,7 +1462,7 @@ class WebAgent:
                 return ActionResult(error=f'Failed to close file dialog: {str(e)}')
 
         @self.controller.registry.action('Download image when you have the URL')
-        async def download_image(url: str, browser: BrowserContext) -> ActionResult:
+        async def download_image(url: str, browser: BrowserSession) -> ActionResult:
             """Download an image from a URL and save it to the attachments folder."""
             try:
                 # Use the helper method to get the attachment directory
@@ -1486,7 +1481,7 @@ class WebAgent:
                 return ActionResult(error=f'Failed to download image: {str(e)}')
 
         @self.controller.registry.action('Download file when you have the URL')
-        async def download_file(url: str, browser: BrowserContext) -> ActionResult:
+        async def download_file(url: str, browser: BrowserSession) -> ActionResult:
             """Download a file from a URL and save it to the attachments folder."""
             try:
                 # Use the helper method to get the attachment directory
@@ -1559,7 +1554,7 @@ class WebAgent:
         # Only register ask_user action if interactive mode is enabled
         if self.is_interactive:
             @self.controller.registry.action('Ask user for input')
-            async def ask_user(question: str, browser: BrowserContext) -> ActionResult:
+            async def ask_user(question: str, browser: BrowserSession) -> ActionResult:
                 """Ask the user a question and wait for their response. Limited to 5 questions per task."""
                 try:
                     if not self.current_execution_id:
@@ -1644,7 +1639,7 @@ class WebAgent:
         # Add agentic dev mode actions
         if self.is_agentic_dev_mode:
             @self.controller.registry.action('Get current page content')
-            async def get_current_page_content(browser: BrowserContext) -> ActionResult:
+            async def get_current_page_content(browser: BrowserSession) -> ActionResult:
                 """Get the HTML content of the current page."""
                 try:
                     page = await browser.get_current_page()
@@ -1655,7 +1650,7 @@ class WebAgent:
                     return ActionResult(error=f"Failed to get page content: {str(e)}")
             
             @self.controller.registry.action('Run JavaScript on current page')
-            async def run_javascript_on_current_page(script: str, browser: BrowserContext) -> ActionResult:
+            async def run_javascript_on_current_page(script: str, browser: BrowserSession) -> ActionResult:
                 """Run JavaScript code on the current page and return the result."""
                 try:
                     page = await browser.get_current_page()
@@ -3979,7 +3974,7 @@ class WebAgent:
         # Create browser context config with user-specific cookies file
         cookies_path = self._get_cookies_path()
         if cookies_path and self.cookie_sync:
-            # Try to download cookies from S3 before starting
+            # Try to load cookies from local storage before starting
             effective_user_id_for_download = "SHARED_USER_ID" if self.use_shared_browser else self.user_id
             if not effective_user_id_for_download: # Should only happen if self.user_id is None and not shared_browser
                  logger.warning("Cannot download cookies: user_id is None and not in shared browser mode.")
@@ -3988,10 +3983,6 @@ class WebAgent:
             
         # Configure downloads path
         downloads_path = self._get_downloads_path()
-        context_config = BrowserContextConfig(
-            cookies_file=cookies_path,
-            save_downloads_path=downloads_path
-        )
         if cookies_path:
             logger.info(f"Using cookies file for user {self.user_id}: {cookies_path}")
         logger.info(f"Using downloads path: {downloads_path}")
@@ -4009,8 +4000,15 @@ class WebAgent:
             logger.info(f"Task run by user {self.run_user_id} who is not the owner. Setting headless=false to allow admin interaction.")
             headless = False
             
-        browser_config = BrowserConfig(new_context_config=context_config, headless=headless)
-        self.browser = Browser(config=browser_config)
+        # In browser-use 0.8.0, BrowserProfile is used to configure browser settings
+        browser_profile = BrowserProfile(
+            cookies_file=cookies_path,
+            downloads_dir=downloads_path,
+            headless=headless
+        )
+        # Store browser_profile for Agent initialization
+        self.browser_profile = browser_profile
+        self.browser = None  # Browser is now managed by Agent internally
         
         # Get all credentials for log filtering
         if self.user_id:
@@ -4045,12 +4043,13 @@ class WebAgent:
             "task": self.task,
             "llm": self.llm,
             "controller": self.controller,
-            "browser": self.browser,
+            "browser_profile": self.browser_profile,
+            "retry_delay": 60,
+            # "generate_gif": self.generate_gif,
+            "validate_output": validate_output,
             "use_vision": global_use_vision,
             "max_failures": 5,
-            "retry_delay": 60,
-            "generate_gif": self.generate_gif,
-            "validate_output": validate_output
+            "generate_gif": self.generate_gif
         }
 
         # Conditionally add tool_calling_method for Azure OpenAI LLMs
@@ -4065,8 +4064,9 @@ class WebAgent:
     async def cleanup(self):
         """Clean up browser resources and sync cookies"""
         try:
-            if self.browser:
+            # In browser-use 0.10.1, browser is managed by Agent
                 # Save cookies before closing
+            if self.agent:
                 cookies_path = self._get_cookies_path()
                 if cookies_path:
                     if self.cookie_sync:
@@ -4080,7 +4080,8 @@ class WebAgent:
                     Path(cookies_path).unlink(missing_ok=True)
                     logger.info(f"Deleted cookie file at local: {cookies_path}")
                 
-                await self.browser.close()
+                # Close the agent (which will handle browser cleanup)
+                await self.agent.close()
             
             # Clean up logging handlers (which also stops the log filter thread)
             self.cleanup_logging()
