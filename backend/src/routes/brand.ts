@@ -18,7 +18,7 @@ const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 10 * 1024 * 1024, // 10MB limit
+    fileSize: 18 * 1024 * 1024, // 18MB limit
   },
 });
 

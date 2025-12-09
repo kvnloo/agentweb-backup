@@ -24,7 +24,7 @@ const router = express.Router();
 const upload = multer({ 
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 10 * 1024 * 1024, // 10MB limit
+    fileSize: 18 * 1024 * 1024, // 18MB limit (to support video uploads, images are validated to 10MB in frontend)
   },
 });
 
@@ -1833,11 +1833,11 @@ async function getExecutionsWithAssets(
           return;
         }
         
-        // Search through messages for generate_video tool calls
+        // Search through messages for generate_video and upload_video tool calls
         session.messages.forEach((message: any) => {
           if (message.metadata?.toolCalls) {
             message.metadata.toolCalls.forEach((toolCall: any) => {
-              if (toolCall.name === 'generate_video' && toolCall.result?.success && toolCall.result?.videoUrl) {
+              if ((toolCall.name === 'generate_video' || toolCall.name === 'upload_video') && toolCall.result?.success && toolCall.result?.videoUrl) {
                 const videoUrl = toolCall.result.videoUrl;
                 const filename = toolCall.result.filename || 'generated-video.mp4';
                 
