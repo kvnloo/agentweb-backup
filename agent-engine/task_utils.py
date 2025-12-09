@@ -25,6 +25,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import re
 import requests
+from browser_use.agent.views import ActionResult
 
 # Configure logging
 logger = logging.getLogger(__name__)

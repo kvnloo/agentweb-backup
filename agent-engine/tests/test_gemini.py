@@ -13,8 +13,7 @@ from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
 from pydantic import SecretStr, BaseModel
 from browser_use import Agent, ActionResult, Controller
-from browser_use.browser.browser import Browser, BrowserConfig
-from browser_use.browser.context import BrowserContextConfig, BrowserContext
+from browser_use.browser.session import BrowserSession as Browser, BrowserProfile as BrowserConfig, BrowserSession as BrowserContext
 import re # Added for sanitize_filename
 import random # Added for sanitize_filename fallback
 import base64 # Ensure base64 is imported at the top level

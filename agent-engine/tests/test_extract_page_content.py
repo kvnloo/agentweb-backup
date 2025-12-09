@@ -10,8 +10,7 @@ from typing import Dict, Any
 from dotenv import load_dotenv
 
 from browser_use import Agent
-from browser_use.browser.browser import Browser, BrowserConfig
-from browser_use.browser.context import BrowserContext
+from browser_use.browser.session import BrowserSession as Browser, BrowserProfile as BrowserConfig
 from langchain_openai import ChatOpenAI
 
 # Load environment variables

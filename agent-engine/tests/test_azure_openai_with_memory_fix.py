@@ -46,8 +46,8 @@ class TestAzureOpenAIWithMemoryFix(unittest.TestCase):
         """Test gpt-4o initialization with memory fix."""
         print("\n=== Testing gpt-4o with Memory Fix ===")
         
-        # Set up mock Azure credentials
-        with patch('task_utils.AzureChatOpenAI') as mock_azure:
+        # Mock the ChatAzureOpenAI class from browser_use.llm to avoid actual API calls
+        with patch('browser_use.llm.ChatAzureOpenAI') as mock_azure:
             mock_instance = Mock()
             mock_azure.return_value = mock_instance
             
@@ -64,10 +64,10 @@ class TestAzureOpenAIWithMemoryFix(unittest.TestCase):
                 self.assertIsNotNone(llm)
                 self.assertEqual(llm_name, "azure->openai->gpt-4o")
                 
-                # Verify AzureChatOpenAI was called with correct parameters
+                # Verify ChatAzureOpenAI was called with correct parameters
                 mock_azure.assert_called_once()
                 call_args = mock_azure.call_args
-                self.assertEqual(call_args[1]['model_name'], 'gpt-4o')
+                self.assertEqual(call_args[1]['model'], 'gpt-4o')
                 self.assertEqual(call_args[1]['azure_endpoint'], 'https://test.openai.azure.com/')
                 self.assertEqual(call_args[1]['api_key'], 'test-api-key')
                 
@@ -80,8 +80,8 @@ class TestAzureOpenAIWithMemoryFix(unittest.TestCase):
         """Test gpt-4.1 initialization with memory fix."""
         print("\n=== Testing gpt-4.1 with Memory Fix ===")
         
-        # Set up mock Azure credentials
-        with patch('task_utils.AzureChatOpenAI') as mock_azure:
+        # Mock the ChatAzureOpenAI class from browser_use.llm to avoid actual API calls
+        with patch('browser_use.llm.ChatAzureOpenAI') as mock_azure:
             mock_instance = Mock()
             mock_azure.return_value = mock_instance
             
@@ -98,10 +98,10 @@ class TestAzureOpenAIWithMemoryFix(unittest.TestCase):
                 self.assertIsNotNone(llm)
                 self.assertEqual(llm_name, "azure->openai->gpt-4.1")
                 
-                # Verify AzureChatOpenAI was called with correct parameters
+                # Verify ChatAzureOpenAI was called with correct parameters
                 mock_azure.assert_called_once()
                 call_args = mock_azure.call_args
-                self.assertEqual(call_args[1]['model_name'], 'gpt-4.1')
+                self.assertEqual(call_args[1]['model'], 'gpt-4.1')
                 self.assertEqual(call_args[1]['azure_endpoint'], 'https://test2.openai.azure.com/')
                 self.assertEqual(call_args[1]['api_key'], 'test-api-key-2')
                 
@@ -129,10 +129,15 @@ class TestAzureOpenAIWithMemoryFix(unittest.TestCase):
             from web_agent import WebAgent
             print("✅ WebAgent imported successfully with memory fix")
             
-            # Test that WebAgent can be instantiated (with mock LLM)
-            with patch('web_agent.get_llm') as mock_get_llm:
+            # Set required environment variable for CookieSync
+            os.environ['AWS_S3_BUCKET_INTERNAL'] = 'test-bucket'
+            
+            # Test that WebAgent can be instantiated (with mock LLM and CookieSync)
+            with patch('web_agent.get_llm') as mock_get_llm, \
+                 patch('web_agent.CookieSync') as mock_cookie_sync:
                 mock_llm = Mock()
                 mock_get_llm.return_value = (mock_llm, "test-llm")
+                mock_cookie_sync.return_value = Mock()
                 
                 agent = WebAgent(user_id="test", full_llm_name="test-llm")
                 self.assertIsNotNone(agent)
