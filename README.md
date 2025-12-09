@@ -1148,6 +1148,137 @@ When you need to update your staging environment:
 5. Enter a version label (e.g., "v0.22-stage")
 6. Click "Deploy"
 
+#### 6. Creating IAM User for Vendor Access to Staging Backend Load Logs
+
+Create an AWS IAM user for vendor Argusoft to access CloudWatch logs via AWS Console UI:
+
+1. **Create IAM Policy**:
+   - Go to AWS IAM Console > Policies > Create policy > JSON tab
+   - Paste this policy:
+
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Action": [
+           "elasticbeanstalk:DescribeEnvironments",
+           "elasticbeanstalk:DescribeEnvironmentHealth",
+           "elasticbeanstalk:DescribeEnvironmentResources",
+           "elasticbeanstalk:DescribeInstancesHealth",
+           "elasticbeanstalk:DescribeConfigurationSettings",
+           "elasticbeanstalk:DescribeApplicationVersions",
+           "elasticbeanstalk:DescribeApplications",
+           "elasticbeanstalk:ListAvailableSolutionStacks",
+           "elasticbeanstalk:DescribeEvents",
+           "elasticbeanstalk:RetrieveEnvironmentInfo",
+           "elasticbeanstalk:RequestEnvironmentInfo"
+         ],
+         "Resource": "*"
+       },
+       {
+         "Effect": "Deny",
+         "Action": [
+           "elasticbeanstalk:UpdateEnvironment",
+           "elasticbeanstalk:UpdateApplicationVersion",
+           "elasticbeanstalk:UpdateConfigurationTemplate",
+           "elasticbeanstalk:CreateConfigurationTemplate",
+           "elasticbeanstalk:DeleteConfigurationTemplate",
+           "elasticbeanstalk:ValidateConfigurationSettings",
+           "elasticbeanstalk:ApplyEnvironmentManagedAction",
+           "elasticbeanstalk:RestartAppServer",
+           "elasticbeanstalk:RebuildEnvironment",
+           "elasticbeanstalk:SwapEnvironmentCNAMEs",
+           "elasticbeanstalk:TerminateEnvironment"
+         ],
+         "Resource": "*"
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "logs:DescribeLogGroups",
+           "logs:DescribeLogStreams",
+           "logs:GetLogEvents",
+           "logs:FilterLogEvents"
+         ],
+         "Resource": [
+           "arn:aws:logs:*:*:log-group:/aws/elasticbeanstalk/*"
+         ]
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "logs:DescribeLogGroups"
+         ],
+         "Resource": "*"
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "cloudtrail:LookupEvents",
+           "cloudtrail:GetTrail",
+           "cloudtrail:ListTrails",
+           "cloudtrail:DescribeTrails"
+         ],
+         "Resource": "*"
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "s3:ListBucket",
+           "s3:GetObject",
+           "s3:GetObjectAcl",
+           "s3:PutObjectAcl"
+         ],
+         "Resource": [
+           "arn:aws:s3:::elasticbeanstalk-us-west-2-992382574572",
+           "arn:aws:s3:::elasticbeanstalk-us-west-2-992382574572/*"
+         ]
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "cloudformation:DescribeStacks",
+           "cloudformation:DescribeStackResources",
+           "cloudformation:DescribeStackResource",
+           "cloudformation:ListStacks",
+           "cloudformation:GetTemplate"
+         ],
+         "Resource": "*"
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "autoscaling:DescribeAutoScalingGroups",
+           "autoscaling:DescribeAutoScalingInstances",
+           "autoscaling:DescribeLaunchConfigurations",
+           "autoscaling:DescribeScalingActivities"
+         ],
+         "Resource": "*"
+       }
+     ]
+   }
+   ```
+
+   **Note**: Elastic Beanstalk read actions require `"Resource": "*"` as they don't support fine-grained resource restrictions. However, all write/modify actions are explicitly denied, so Argusoft can only view information and cannot make any changes to any environment.
+
+   - Name: `VendorStagingLogsAccess` > Create policy
+
+2. **Create IAM User**:
+   - Go to AWS IAM Console > Users > Add User
+   - Username: `vendor-argusoft-access`
+   - Select "AWS Management Console access"
+   - Attach the `VendorStagingLogsAccess` policy
+   - Create user and set password
+
+3. **Share Access**:
+   - Share the AWS Console sign-in URL (found in IAM > Dashboard > "IAM users sign-in link")
+   - Share the username and password securely
+   - Argusoft can:
+     - View the staging environment page: Elastic Beanstalk > Environments > `Agentweb-backend-env-1` (read-only, no Configuration access)
+     - Access logs via CloudWatch > Logs > Log groups (filter by `/aws/elasticbeanstalk/`)
+
 ### Setting Up Oncall Alerts for Elastic Beanstalk Services
 
 This section describes how to set up monitoring and oncall alerts when Elastic Beanstalk services become unhealthy.
