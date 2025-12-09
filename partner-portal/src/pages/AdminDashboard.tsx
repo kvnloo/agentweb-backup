@@ -171,6 +171,7 @@ interface User {
   fromName?: string; // From name for emails
   slackChannel?: string; // Default Slack channel for this user
   seoDomains?: string[]; // SEO domains to track
+  googleAnalyticsPropertyId?: string; // Google Analytics Property ID
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
 }
 
@@ -556,6 +557,7 @@ export default function AdminDashboard() {
   const [seoDomainsDialogOpen, setSeoDomainsDialogOpen] = useState(false);
   const [editingSeoDomainsUserId, setEditingSeoDomainsUserId] = useState<string | null>(null);
   const [seoDomainsText, setSeoDomainsText] = useState("");
+  const [googleAnalyticsPropertyId, setGoogleAnalyticsPropertyId] = useState("");
   const [seoDomainsEditLoading, setSeoDomainsEditLoading] = useState(false);
   const [editingCmsTypeUserId, setEditingCmsTypeUserId] = useState<string | null>(null);
   const [currentCmsType, setCurrentCmsType] = useState<"Basehub" | "Webflow" | "">("");
@@ -1347,9 +1349,20 @@ export default function AdminDashboard() {
         }
       }
       
+      // Validate Google Analytics Property ID format if provided
+      // Note: The API uses Property ID (numeric), not Measurement ID (G-XXXXXXXXXX)
+      const gaId = googleAnalyticsPropertyId.trim();
+      if (gaId && !/^\d+$/.test(gaId)) {
+        setError(`Invalid Google Analytics Property ID format: ${gaId}. Please enter the numeric Property ID (e.g., 123456789). You can find this in GA4 Admin > Property Settings.`);
+        return;
+      }
+      
       const response = await axios.put(
-        buildApiUrl(`/api/admin/users/${editingSeoDomainsUserId}/seo-domains`),
-        { seoDomains: domains },
+        buildApiUrl(`/api/admin/users/${editingSeoDomainsUserId}/seo-aeo`),
+        { 
+          seoDomains: domains,
+          googleAnalyticsPropertyId: gaId || null
+        },
         {
           headers: { Authorization: `Bearer ${token}` }
         }
@@ -1362,19 +1375,21 @@ export default function AdminDashboard() {
             user.userId === editingSeoDomainsUserId 
               ? { 
                   ...user, 
-                  seoDomains: response.data.seoDomains || []
+                  seoDomains: response.data.seoDomains || [],
+                  googleAnalyticsPropertyId: response.data.googleAnalyticsPropertyId || undefined
                 }
               : user
           )
         );
-        setSuccess("SEO domains updated successfully!");
+        setSuccess("SEO/AEO configuration updated successfully!");
         setSeoDomainsDialogOpen(false);
         setEditingSeoDomainsUserId(null);
         setSeoDomainsText("");
+        setGoogleAnalyticsPropertyId("");
       }
     } catch (error: any) {
-      console.error("Error updating SEO domains:", error);
-      setError(error.response?.data?.message || "Failed to update SEO domains");
+      console.error("Error updating SEO/AEO configuration:", error);
+      setError(error.response?.data?.message || "Failed to update SEO/AEO configuration");
     } finally {
       setSeoDomainsEditLoading(false);
     }
@@ -2083,7 +2098,7 @@ export default function AdminDashboard() {
                   <TableCell>Ad Account</TableCell>
                   <TableCell>Email Sender</TableCell>
                   <TableCell>Slack Channel</TableCell>
-                  <TableCell>SEO Domains</TableCell>
+                  <TableCell>SEO/AEO</TableCell>
                   <TableCell>CMS Type</TableCell>
                   <TableCell>Created</TableCell>
                   <TableCell>Last Login</TableCell>
@@ -2216,27 +2231,39 @@ export default function AdminDashboard() {
                         </TableCell>
                         <TableCell>
                           <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                            {user.seoDomains && user.seoDomains.length > 0 ? (
-                              <Box>
-                                {user.seoDomains.map((domain: string, idx: number) => (
-                                  <Chip
-                                    key={idx}
-                                    label={domain}
-                                    size="small"
-                                    sx={{ mr: 0.5, mb: 0.5 }}
-                                  />
-                                ))}
-                              </Box>
-                            ) : (
-                              <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
-                                -
-                              </Typography>
-                            )}
+                            <Box sx={{ flex: 1, minWidth: 200 }}>
+                              {user.seoDomains && user.seoDomains.length > 0 ? (
+                                <Box sx={{ mb: 1 }}>
+                                  {user.seoDomains.map((domain: string, idx: number) => (
+                                    <Chip
+                                      key={idx}
+                                      label={domain}
+                                      size="small"
+                                      sx={{ mr: 0.5, mb: 0.5 }}
+                                    />
+                                  ))}
+                                </Box>
+                              ) : (
+                                <Typography variant="body2" sx={{ mb: 1 }}>
+                                  No domains
+                                </Typography>
+                              )}
+                              {user.googleAnalyticsPropertyId ? (
+                                <Typography variant="body2" color="text.secondary">
+                                  GA: {user.googleAnalyticsPropertyId}
+                                </Typography>
+                              ) : (
+                                <Typography variant="body2" color="text.secondary">
+                                  No GA ID
+                                </Typography>
+                              )}
+                            </Box>
                             <IconButton
                               size="small"
                               onClick={() => {
                                 setEditingSeoDomainsUserId(user.userId);
                                 setSeoDomainsText(user.seoDomains?.join("\n") || "");
+                                setGoogleAnalyticsPropertyId(user.googleAnalyticsPropertyId || "");
                                 setSeoDomainsDialogOpen(true);
                               }}
                               disabled={seoDomainsEditLoading}
@@ -4272,25 +4299,27 @@ export default function AdminDashboard() {
         </DialogActions>
       </Dialog>
 
-      {/* SEO Domains Configuration Dialog */}
+      {/* SEO/AEO Configuration Dialog */}
       <Dialog
         open={seoDomainsDialogOpen}
         onClose={() => {
           setSeoDomainsDialogOpen(false);
           setEditingSeoDomainsUserId(null);
           setSeoDomainsText("");
+          setGoogleAnalyticsPropertyId("");
         }}
         maxWidth="sm"
         fullWidth
       >
         <DialogTitle>
-          Configure SEO Domains
+          Configure SEO/AEO
           <IconButton
             aria-label="close"
             onClick={() => {
               setSeoDomainsDialogOpen(false);
               setEditingSeoDomainsUserId(null);
               setSeoDomainsText("");
+              setGoogleAnalyticsPropertyId("");
             }}
             sx={{
               position: 'absolute',
@@ -4302,18 +4331,33 @@ export default function AdminDashboard() {
           </IconButton>
         </DialogTitle>
         <DialogContent dividers>
-          <TextField
-            autoFocus
-            fullWidth
-            multiline
-            rows={6}
-            label="SEO Domains"
-            value={seoDomainsText}
-            onChange={(e) => setSeoDomainsText(e.target.value)}
-            placeholder="example.com&#10;subdomain.example.com&#10;another-domain.com"
-            helperText="Enter one domain per line. These domains will be tracked for SEO metrics in the customer portal. Format: example.com (without http:// or https://)"
-            disabled={seoDomainsEditLoading}
-          />
+          <Grid container spacing={2}>
+            <Grid item xs={12}>
+              <TextField
+                autoFocus
+                fullWidth
+                multiline
+                rows={6}
+                label="SEO Domains"
+                value={seoDomainsText}
+                onChange={(e) => setSeoDomainsText(e.target.value)}
+                placeholder="example.com&#10;subdomain.example.com&#10;another-domain.com"
+                helperText="Enter one domain per line. These domains will be tracked for SEO metrics in the customer portal. Format: example.com (without http:// or https://)"
+                disabled={seoDomainsEditLoading}
+              />
+            </Grid>
+            <Grid item xs={12}>
+              <TextField
+                fullWidth
+                label="Google Analytics Property ID"
+                value={googleAnalyticsPropertyId}
+                onChange={(e) => setGoogleAnalyticsPropertyId(e.target.value)}
+                placeholder="123456789"
+                helperText="Enter your Google Analytics 4 Property ID (numeric, e.g., 123456789). You can find this in GA4 Admin > Property Settings. This will enable Google Analytics metrics on the SEO/AEO page."
+                disabled={seoDomainsEditLoading}
+              />
+            </Grid>
+          </Grid>
         </DialogContent>
         <DialogActions>
           <Button
@@ -4321,6 +4365,7 @@ export default function AdminDashboard() {
               setSeoDomainsDialogOpen(false);
               setEditingSeoDomainsUserId(null);
               setSeoDomainsText("");
+              setGoogleAnalyticsPropertyId("");
             }}
             disabled={seoDomainsEditLoading}
           >

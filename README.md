@@ -640,6 +640,27 @@ Store your Google Search Console API credentials in AWS Secrets Manager:
 - Secret Name: `prod/AgentWeb/Google/SearchConsole`
 - Secret Value: Paste the entire contents of the service account JSON key file you downloaded
 
+### Google Analytics Data API (GA4) Configuration for SEO/AEO
+
+If you see `PERMISSION_DENIED: Google Analytics Data API has not been used...` on the SEO/AEO page, do the following:
+
+1. **Enable Google Analytics Data API in the correct project**
+   - Open [Google Cloud Console](https://console.cloud.google.com/apis/library/analyticsdata.googleapis.com)
+   - Switch to the project used for AgentWeb (e.g., `606140610214` or your chosen project)
+   - Click **Enable**
+   - Wait a few minutes for the change to propagate
+
+2. **Grant the service account access to the GA4 property**
+   - Find the service account email stored in `dev/AgentWeb/Google/SearchConsole` or `prod/AgentWeb/Google/SearchConsole` (the `client_email` field)
+   - In GA4 Admin, under **Property** > **Property Access Management**, click **Add** and grant this service account **Viewer** (read-only) access to the GA4 property you want to use
+
+3. **Configure GA4 Property ID in Admin Dashboard**
+   - In the partner portal Admin > Users tab, click the edit icon under the "SEO/AEO" column
+   - In the "Google Analytics Property ID" field, enter the **numeric Property ID** (e.g., `123456789`)
+   - **Important**: Enter the **Property ID** (numeric), NOT the Measurement ID (`G-XXXXXXXXXX`)
+   - To find your Property ID: Go to GA4 Admin > Property Settings. The Property ID is the numeric value (e.g., `123456789`), not the Measurement ID which starts with `G-`
+   - After enabling the API and granting access, retry the SEO/AEO page
+
 ### CMS Configuration (BaseHub and Webflow)
 
 The blog publishing feature supports publishing to both BaseHub and Webflow CMS. Users can be configured with a CMS Type in the admin dashboard, and the system will automatically route blog posts to the appropriate CMS.

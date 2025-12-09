@@ -3,6 +3,7 @@ import { authenticateToken } from "../middleware/auth";
 import { userDb } from "../services/db";
 import { getSecret } from "../utils/secretsManager";
 import { JWT } from "google-auth-library";
+import { BetaAnalyticsDataClient } from "@google-analytics/data";
 
 const router = express.Router();
 
@@ -40,6 +41,37 @@ async function getGoogleSearchConsoleAccessToken(): Promise<string | null> {
   }
 }
 
+// Helper function to get Google Analytics Data API client
+async function getGoogleAnalyticsDataClient(): Promise<BetaAnalyticsDataClient | null> {
+  try {
+    const secretName = process.env.NODE_ENV === "production" 
+      ? "prod/AgentWeb/Google/SearchConsole"
+      : "dev/AgentWeb/Google/SearchConsole";
+
+    // Use the same service account as Search Console
+    const serviceAccountJson = await getSecret(secretName);
+    const serviceAccount = JSON.parse(serviceAccountJson);
+    
+    if (!serviceAccount.private_key || !serviceAccount.client_email) {
+      console.error("Service account JSON missing required fields (private_key or client_email)");
+      return null;
+    }
+
+    // Create Analytics Data client with service account credentials
+    const client = new BetaAnalyticsDataClient({
+      credentials: {
+        client_email: serviceAccount.client_email,
+        private_key: serviceAccount.private_key,
+      },
+    });
+    
+    return client;
+  } catch (error: any) {
+    console.error("Error creating Google Analytics Data client:", error);
+    return null;
+  }
+}
+
 // Get SEO metrics for user's configured domains
 router.get("/metrics", async (req, res) => {
   try {
@@ -51,10 +83,10 @@ router.get("/metrics", async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Check if user has SEO domains configured
-    if (!user.seoDomains || user.seoDomains.length === 0) {
+    // Check if user has SEO domains or GA Property ID configured
+    if ((!user.seoDomains || user.seoDomains.length === 0) && !user.googleAnalyticsPropertyId) {
       return res.status(400).json({ 
-        message: "No SEO domains configured. Please configure domains in the admin panel." 
+        message: "No SEO domains or Google Analytics Property ID configured. Please configure SEO/AEO settings in the admin panel." 
       });
     }
 
@@ -336,8 +368,133 @@ router.get("/metrics", async (req, res) => {
 
     const metrics = await Promise.all(metricsPromises);
 
+    // Fetch Google Analytics metrics if Property ID is configured
+    let gaMetrics: any = null;
+    if (user.googleAnalyticsPropertyId) {
+      try {
+        const gaClient = await getGoogleAnalyticsDataClient();
+        if (gaClient) {
+          // Calculate date range based on timeframe
+          const now = new Date();
+          const endDate = new Date(now);
+          endDate.setUTCDate(endDate.getUTCDate() - 1); // Yesterday in UTC
+          endDate.setUTCHours(0, 0, 0, 0);
+          
+          const startDate = new Date(endDate);
+          const timeframe = (req.query.timeframe as string) || "30d";
+          
+          if (timeframe === "7d") {
+            startDate.setUTCDate(endDate.getUTCDate() - 7);
+          } else if (timeframe === "14d") {
+            startDate.setUTCDate(endDate.getUTCDate() - 14);
+          } else if (timeframe === "30d") {
+            startDate.setUTCDate(endDate.getUTCDate() - 30);
+          } else if (timeframe === "90d") {
+            startDate.setUTCDate(endDate.getUTCDate() - 90);
+          } else {
+            startDate.setUTCDate(endDate.getUTCDate() - 30);
+          }
+          startDate.setUTCHours(0, 0, 0, 0);
+
+          const startDateStr = startDate.toISOString().split("T")[0];
+          const endDateStr = endDate.toISOString().split("T")[0];
+
+          const propertyId = user.googleAnalyticsPropertyId;
+
+          // Fetch overall metrics
+          const [overallResponse] = await gaClient.runReport({
+            property: `properties/${propertyId}`,
+            dateRanges: [
+              {
+                startDate: startDateStr,
+                endDate: endDateStr,
+              },
+            ],
+            metrics: [
+              { name: "sessions" },
+              { name: "activeUsers" },
+              { name: "screenPageViews" },
+              { name: "averageSessionDuration" },
+              { name: "bounceRate" },
+            ],
+          });
+
+          // Fetch daily data for timeline
+          const [dailyResponse] = await gaClient.runReport({
+            property: `properties/${propertyId}`,
+            dateRanges: [
+              {
+                startDate: startDateStr,
+                endDate: endDateStr,
+              },
+            ],
+            dimensions: [{ name: "date" }],
+            metrics: [
+              { name: "sessions" },
+              { name: "activeUsers" },
+              { name: "screenPageViews" },
+            ],
+          });
+
+          // Process overall metrics
+          let totalSessions = 0;
+          let totalUsers = 0;
+          let totalPageViews = 0;
+          let avgSessionDuration = 0;
+          let bounceRate = 0;
+
+          if (overallResponse.rows && overallResponse.rows.length > 0) {
+            const row = overallResponse.rows[0];
+            totalSessions = parseInt(row.metricValues[0].value || "0");
+            totalUsers = parseInt(row.metricValues[1].value || "0");
+            totalPageViews = parseInt(row.metricValues[2].value || "0");
+            avgSessionDuration = parseFloat(row.metricValues[3].value || "0");
+            bounceRate = parseFloat(row.metricValues[4].value || "0") * 100; // Convert to percentage
+          }
+
+          // Process daily data
+          const dailyData: Array<{ date: string; sessions: number; users: number; pageViews: number }> = [];
+          if (dailyResponse.rows) {
+            dailyResponse.rows.forEach((row) => {
+              const date = row.dimensionValues[0].value || "";
+              const sessions = parseInt(row.metricValues[0].value || "0");
+              const users = parseInt(row.metricValues[1].value || "0");
+              const pageViews = parseInt(row.metricValues[2].value || "0");
+              
+              dailyData.push({
+                date: `${date.substring(0, 4)}-${date.substring(4, 6)}-${date.substring(6, 8)}`,
+                sessions,
+                users,
+                pageViews,
+              });
+            });
+          }
+
+          gaMetrics = {
+            propertyId,
+            sessions: totalSessions,
+            users: totalUsers,
+            pageViews: totalPageViews,
+            avgSessionDuration,
+            bounceRate,
+            dailyData: dailyData.sort((a, b) => a.date.localeCompare(b.date)),
+            dateRange: {
+              startDate: startDateStr,
+              endDate: endDateStr,
+            },
+          };
+        }
+      } catch (error: any) {
+        console.error("Error fetching Google Analytics metrics:", error);
+        gaMetrics = {
+          error: error.message || "Failed to fetch Google Analytics metrics",
+        };
+      }
+    }
+
     res.json({
       metrics,
+      gaMetrics,
       timestamp: new Date().toISOString(),
     });
   } catch (error: any) {
