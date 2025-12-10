@@ -108,11 +108,10 @@ router.get("/metrics", async (req, res) => {
         const siteUrl = domain.startsWith("http") ? domain : `sc-domain:${domain}`;
 
         // Calculate date range based on timeframe
-        // End date is yesterday (most recent complete day)
+        // End date is today
         const now = new Date();
         const endDate = new Date(now);
-        endDate.setUTCDate(endDate.getUTCDate() - 1); // Yesterday in UTC
-        endDate.setUTCHours(0, 0, 0, 0);
+        endDate.setUTCHours(0, 0, 0, 0); // Today in UTC
         
         const startDate = new Date(endDate);
         
@@ -138,7 +137,6 @@ router.get("/metrics", async (req, res) => {
         const endDateStr = endDate.toISOString().split("T")[0];
         
         const daysInRange = Math.floor((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24)) + 1;
-        console.log(`[SEO Debug] Date calculation - Start: ${startDateStr}, End: ${endDateStr}, Days: ${daysInRange}, Timeframe: ${timeframe}`);
 
         const searchAnalyticsUrl = `https://www.googleapis.com/webmasters/v3/sites/${encodeURIComponent(siteUrl)}/searchAnalytics/query`;
         
@@ -176,19 +174,6 @@ router.get("/metrics", async (req, res) => {
 
         const dailyDataResult = await dailyDataResponse.json();
         
-        // Debug logging
-        console.log(`[SEO Debug] Domain: ${domain}`);
-        console.log(`[SEO Debug] Date range: ${startDateStr} to ${endDateStr}`);
-        console.log(`[SEO Debug] Raw API response rows count: ${dailyDataResult.rows?.length || 0}`);
-        if (dailyDataResult.rows && dailyDataResult.rows.length > 0) {
-          console.log(`[SEO Debug] First row sample:`, JSON.stringify(dailyDataResult.rows[0], null, 2));
-          // Check for November 10 specifically
-          const nov10Row = dailyDataResult.rows.find((r: any) => r.keys?.[0] === "2025-11-10" || r.keys?.[0] === "2024-11-10");
-          if (nov10Row) {
-            console.log(`[SEO Debug] November 10 row found:`, JSON.stringify(nov10Row, null, 2));
-          }
-        }
-        
         dailyData = (dailyDataResult.rows || [])
           .map((row: any) => ({
             date: row.keys?.[0] || "",
@@ -198,13 +183,6 @@ router.get("/metrics", async (req, res) => {
           .filter((item: any) => item.date)
           .sort((a: any, b: any) => a.date.localeCompare(b.date));
 
-        // Debug: Check specific date
-        const nov10Data = dailyData.find(d => d.date === "2025-11-10" || d.date === "2024-11-10");
-        if (nov10Data) {
-          console.log(`[SEO Debug] November 10 processed data:`, nov10Data);
-        }
-        console.log(`[SEO Debug] Total daily data entries: ${dailyData.length}`);
-        console.log(`[SEO Debug] Sample dates:`, dailyData.slice(0, 5).map(d => d.date));
 
         // Fetch overall totals without dimensions - this matches Google UI exactly
         // Google calculates totals from the full dataset, not just daily breakdown
@@ -235,18 +213,15 @@ router.get("/metrics", async (req, res) => {
             totalImpressions = overallRow.impressions || 0;
             avgPosition = overallRow.position || 0; // Weighted average position from Google
             avgCtr = totalImpressions > 0 ? (totalClicks / totalImpressions) * 100 : 0;
-            console.log(`[SEO Debug] Overall API totals (matches Google UI) - Clicks: ${totalClicks}, Impressions: ${totalImpressions}, Position: ${avgPosition.toFixed(2)}, CTR: ${avgCtr.toFixed(2)}%`);
           } else {
             // Fallback: sum daily data (may not match exactly due to sampling)
-            console.log(`[SEO Debug] Overall response has no rows, falling back to daily data sum`);
             totalClicks = dailyData.reduce((sum, day) => sum + day.clicks, 0);
             totalImpressions = dailyData.reduce((sum, day) => sum + day.impressions, 0);
             avgCtr = totalImpressions > 0 ? (totalClicks / totalImpressions) * 100 : 0;
           }
         } else {
           // Fallback to daily data if overall request fails
-          const errorData = await overallResponse.json().catch(() => ({}));
-          console.log(`[SEO Debug] Overall request failed:`, errorData);
+          await overallResponse.json().catch(() => ({}));
           totalClicks = dailyData.reduce((sum, day) => sum + day.clicks, 0);
           totalImpressions = dailyData.reduce((sum, day) => sum + day.impressions, 0);
           avgCtr = totalImpressions > 0 ? (totalClicks / totalImpressions) * 100 : 0;
@@ -271,7 +246,6 @@ router.get("/metrics", async (req, res) => {
         let allQueriesData: any = null;
         if (queriesResponse.ok) {
           allQueriesData = await queriesResponse.json();
-          console.log(`[SEO Debug] Queries response rows: ${allQueriesData.rows?.length || 0}`);
           topQueries = (allQueriesData.rows || [])
             .map((row: any) => ({
               query: row.keys?.[0] || "Unknown",
@@ -299,11 +273,8 @@ router.get("/metrics", async (req, res) => {
           });
           if (totalImpressionsForPosition > 0) {
             avgPosition = totalPositionWeighted / totalImpressionsForPosition;
-            console.log(`[SEO Debug] Calculated weighted position from queries: ${avgPosition.toFixed(2)}`);
           }
         }
-        
-        console.log(`[SEO Debug] Final totals - Clicks: ${totalClicks}, Impressions: ${totalImpressions}, Position: ${avgPosition.toFixed(2)}, CTR: ${avgCtr.toFixed(2)}%`);
 
         // Fetch top pages (single dimension to avoid aggregation issues)
         const pagesResponse = await fetch(searchAnalyticsUrl, {
@@ -323,7 +294,6 @@ router.get("/metrics", async (req, res) => {
         let topPages: Array<{ page: string; clicks: number; impressions: number; ctr: number; position: number }> = [];
         if (pagesResponse.ok) {
           const pagesData = await pagesResponse.json();
-          console.log(`[SEO Debug] Pages response rows: ${pagesData.rows?.length || 0}`);
           topPages = (pagesData.rows || [])
             .map((row: any) => ({
               page: row.keys?.[0] || "Unknown",
@@ -377,22 +347,21 @@ router.get("/metrics", async (req, res) => {
           // Calculate date range based on timeframe
           const now = new Date();
           const endDate = new Date(now);
-          endDate.setUTCDate(endDate.getUTCDate() - 1); // Yesterday in UTC
-          endDate.setUTCHours(0, 0, 0, 0);
+          endDate.setUTCHours(0, 0, 0, 0); // Today in UTC
           
           const startDate = new Date(endDate);
           const timeframe = (req.query.timeframe as string) || "30d";
           
           if (timeframe === "7d") {
-            startDate.setUTCDate(endDate.getUTCDate() - 7);
+            startDate.setUTCDate(endDate.getUTCDate() - 6); // 7 days total (including end date)
           } else if (timeframe === "14d") {
-            startDate.setUTCDate(endDate.getUTCDate() - 14);
+            startDate.setUTCDate(endDate.getUTCDate() - 13); // 14 days total
           } else if (timeframe === "30d") {
-            startDate.setUTCDate(endDate.getUTCDate() - 30);
+            startDate.setUTCDate(endDate.getUTCDate() - 29); // 30 days total
           } else if (timeframe === "90d") {
-            startDate.setUTCDate(endDate.getUTCDate() - 90);
+            startDate.setUTCDate(endDate.getUTCDate() - 89); // 90 days total
           } else {
-            startDate.setUTCDate(endDate.getUTCDate() - 30);
+            startDate.setUTCDate(endDate.getUTCDate() - 29); // Default 30 days total
           }
           startDate.setUTCHours(0, 0, 0, 0);
 
@@ -512,6 +481,7 @@ router.get("/metrics", async (req, res) => {
               { name: "activeUsers" },
               { name: "screenPageViews" },
             ],
+            keepEmptyRows: false,
           });
 
           // Fetch traffic sources for AEO analysis
@@ -564,19 +534,32 @@ router.get("/metrics", async (req, res) => {
           const dailyData: Array<{ date: string; sessions: number; users: number; pageViews: number }> = [];
           if (dailyResponse.rows) {
             dailyResponse.rows.forEach((row) => {
-              const date = row.dimensionValues[0].value || "";
-              const sessions = parseInt(row.metricValues[0].value || "0");
-              const users = parseInt(row.metricValues[1].value || "0");
-              const pageViews = parseInt(row.metricValues[2].value || "0");
+              const dimensions = row.dimensionValues || [];
+              const metrics = row.metricValues || [];
+              const dateValue = dimensions[0]?.value || "";
+              
+              if (!dateValue || dateValue.length !== 8) {
+                return;
+              }
+              
+              const sessions = parseInt(metrics[0]?.value || "0");
+              const users = parseInt(metrics[1]?.value || "0");
+              const pageViews = parseInt(metrics[2]?.value || "0");
+              
+              // GA4 returns date in YYYYMMDD format, convert to YYYY-MM-DD
+              const formattedDate = `${dateValue.substring(0, 4)}-${dateValue.substring(4, 6)}-${dateValue.substring(6, 8)}`;
               
               dailyData.push({
-                date: `${date.substring(0, 4)}-${date.substring(4, 6)}-${date.substring(6, 8)}`,
+                date: formattedDate,
                 sessions,
                 users,
                 pageViews,
               });
             });
           }
+          
+          // Sort daily data by date to ensure proper chronological order
+          dailyData.sort((a, b) => a.date.localeCompare(b.date));
 
           // Process traffic sources
           interface TrafficSource {
