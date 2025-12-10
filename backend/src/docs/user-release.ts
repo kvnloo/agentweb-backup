@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-09',
+    changes: [
+      'Added Text Email Content Support in CRM',
+      '- Email drafts in CRM now default to plain text format for better deliverability and compatibility',
+      '- Users can choose between text or HTML format when creating or updating email drafts',
+      '- Batch email drafting supports format selection with text as the default',
+    ],
+  },
+  {
     date: '2025-12-08',
     changes: [
       'Fixed Brand Guidelines Gradient Checkbox Bug',

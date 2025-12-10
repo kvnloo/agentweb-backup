@@ -816,15 +816,15 @@ router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res:
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId, leadId } = req.params;
-    const { senderEmail, senderName, subject, htmlContent } = req.body;
+    const { senderEmail, senderName, subject, htmlContent, textContent } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    // Validate required fields
-    if (!senderEmail || !senderName || !subject || !htmlContent) {
-      return res.status(400).json({ message: 'Missing required fields: senderEmail, senderName, subject, htmlContent' });
+    // Validate required fields - need either htmlContent or textContent
+    if (!senderEmail || !senderName || !subject || (!htmlContent && !textContent)) {
+      return res.status(400).json({ message: 'Missing required fields: senderEmail, senderName, subject, and either htmlContent or textContent' });
     }
 
     // Get the lead to get the recipient email
@@ -849,7 +849,8 @@ router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res:
       from,
       to: lead.email,
       subject,
-      html: htmlContent
+      html: htmlContent,
+      text: textContent
     });
 
     if (!result) {

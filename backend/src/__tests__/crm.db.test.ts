@@ -331,6 +331,104 @@ describe('CRM Database Service', () => {
       expect(result!.emailDraft).toEqual(emailDraft);
     });
 
+    it('should handle emailDraftFormat updates', async () => {
+      const listId = 'list_123';
+      const leadId = 'lead_123';
+
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Item: { leadId, listId },
+        }),
+      });
+
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Attributes: {
+            leadId,
+            listId,
+            emailDraftFormat: 'text',
+          },
+        }),
+      });
+
+      const result = await crmDb.updateLead(listId, leadId, { emailDraftFormat: 'text' });
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalled();
+      const updateCall = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(updateCall.ExpressionAttributeValues[':emailDraftFormat']).toBe('text');
+      expect(result!.emailDraftFormat).toBe('text');
+    });
+
+    it('should handle emailDraft with textContent', async () => {
+      const listId = 'list_123';
+      const leadId = 'lead_123';
+
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Item: { leadId, listId },
+        }),
+      });
+
+      const emailDraft = {
+        subject: 'Test Subject',
+        textContent: 'Plain text content',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Attributes: {
+            leadId,
+            listId,
+            emailDraft,
+          },
+        }),
+      });
+
+      const result = await crmDb.updateLead(listId, leadId, { emailDraft });
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalled();
+      expect(result!.emailDraft).toEqual(emailDraft);
+      expect(result!.emailDraft!.textContent).toBe('Plain text content');
+      expect(result!.emailDraft!.htmlContent).toBeUndefined();
+    });
+
+    it('should handle emailDraft with htmlContent', async () => {
+      const listId = 'list_123';
+      const leadId = 'lead_123';
+
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Item: { leadId, listId },
+        }),
+      });
+
+      const emailDraft = {
+        subject: 'Test Subject',
+        htmlContent: '<p>HTML content</p>',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Attributes: {
+            leadId,
+            listId,
+            emailDraft,
+          },
+        }),
+      });
+
+      const result = await crmDb.updateLead(listId, leadId, { emailDraft });
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalled();
+      expect(result!.emailDraft).toEqual(emailDraft);
+      expect(result!.emailDraft!.htmlContent).toBe('<p>HTML content</p>');
+      expect(result!.emailDraft!.textContent).toBeUndefined();
+    });
+
     it('should handle removing emailDraft (setting to null)', async () => {
       const listId = 'list_123';
       const leadId = 'lead_123';
