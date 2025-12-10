@@ -642,6 +642,8 @@ Store your Google Search Console API credentials in AWS Secrets Manager:
 
 ### Google Analytics Data API (GA4) Configuration for SEO/AEO
 
+**AEO (Answer Engine Optimization)** tracks traffic from answer engines like ChatGPT, Perplexity, LinkedIn, and other AI-powered search platforms. The SEO/AEO page displays both traditional SEO metrics (from Google Search Console) and AEO metrics (from Google Analytics) to help you understand how users discover your content through both search engines and answer engines.
+
 If you see `PERMISSION_DENIED: Google Analytics Data API has not been used...` on the SEO/AEO page, do the following:
 
 1. **Enable Google Analytics Data API in the correct project**
@@ -660,6 +662,59 @@ If you see `PERMISSION_DENIED: Google Analytics Data API has not been used...` o
    - **Important**: Enter the **Property ID** (numeric), NOT the Measurement ID (`G-XXXXXXXXXX`)
    - To find your Property ID: Go to GA4 Admin > Property Settings. The Property ID is the numeric value (e.g., `123456789`), not the Measurement ID which starts with `G-`
    - After enabling the API and granting access, retry the SEO/AEO page
+
+**What is AEO (Answer Engine Optimization)?**
+
+AEO tracks how users discover your content through answer engines - AI-powered platforms like ChatGPT, Perplexity, Google Bard/Gemini, Bing Chat, LinkedIn, and other conversational search platforms. The SEO/AEO page shows:
+
+- **SEO Metrics**: Traditional search engine performance from Google Search Console (clicks, impressions, CTR, position)
+- **AEO Metrics**: Traffic from answer engines including:
+  - Answer engine traffic volume and percentage of total traffic
+  - Traffic sources breakdown (identifying which answer engines drive traffic)
+  - Top pages that receive traffic from answer engines
+  - User engagement metrics from answer engine traffic
+
+This helps you understand both traditional search visibility and emerging answer engine visibility for your content.
+
+#### Testing Google Analytics API Connection
+
+If you're seeing 0 traffic or errors, you can test the API connection using the test script:
+
+**Prerequisites:**
+- The script uses the same AWS credential configuration as the backend (from `.env` file)
+- AWS credentials must have `secretsmanager:GetSecretValue` permission
+- Set `AWS_REGION` environment variable if not using default `us-west-2`
+- Ensure `NODE_ENV` is set to `development` or `production` (defaults to `development`)
+- **Note**: If you get `AccessDeniedException`, your local AWS credentials don't have Secrets Manager access. The script will work when run on the server where the backend normally runs.
+
+**Run the test:**
+
+```bash
+cd backend
+ts-node scripts/test-ga-api.ts <property-id>
+```
+
+Example:
+```bash
+ts-node scripts/test-ga-api.ts 123456789
+```
+
+The script will:
+- Test the service account credentials from AWS Secrets Manager
+- Fetch overall metrics (sessions, users, page views, bounce rate, session duration)
+- Fetch daily data for the last 30 days
+- Fetch traffic sources (including answer engine detection)
+- Fetch top pages by traffic
+
+**What to look for:**
+- ✅ If you see data: The API is working correctly, check if the Property ID in admin matches
+- ⚠️  If you see 0s: The Property ID might be correct but there's no traffic in the date range
+- ❌ If you see errors: Check API enablement, service account permissions, or Property ID
+
+**Common issues:**
+- `PERMISSION_DENIED`: API not enabled or service account lacks access
+- `not found`: Wrong Property ID or service account can't access this property
+- `0 traffic`: Property ID is correct but no data in the selected date range
 
 ### CMS Configuration (BaseHub and Webflow)
 
