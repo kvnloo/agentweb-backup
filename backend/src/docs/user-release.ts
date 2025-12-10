@@ -14,6 +14,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Configure Google Analytics Property ID in the admin panel under Users tab > SEO/AEO settings',
       '- Traffic Sources table displaying all traffic sources with sessions, users, page views, and average session duration',
       '- Top Pages by Engagement table showing pages ranked by engagement rate with sessions, engagement time, and event counts',
+      'Added Microsoft Clarity User Activity Tracking Support',
+      '- Customer Portal now includes Microsoft Clarity integration for comprehensive user activity tracking',
+      '- Automatically tracks user interactions, page views, and navigation patterns',
+      '- Provides heatmaps and session recordings to understand user behavior',
+      '- Helps identify usability issues and optimize user experience',
     ],
   },
   {
