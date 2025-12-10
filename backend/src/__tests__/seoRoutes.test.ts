@@ -28,6 +28,14 @@ jest.mock('google-auth-library', () => ({
   }))
 }));
 
+// Mock @google-analytics/data
+const mockRunReport = jest.fn();
+jest.mock('@google-analytics/data', () => ({
+  BetaAnalyticsDataClient: jest.fn().mockImplementation(() => ({
+    runReport: mockRunReport
+  }))
+}));
+
 import express from 'express';
 import request from 'supertest';
 import seoRoutes from '../routes/seo';
@@ -74,23 +82,24 @@ describe('SEO Routes', () => {
       expect(response.body.message).toBe('User not found');
     });
 
-    it('should return 400 if no SEO domains configured', async () => {
+    it('should return 400 if no SEO domains or GA Property ID configured', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue({
-        id: 'test-user-123',
+        userId: 'test-user-123',
         email: 'test@example.com',
-        seoDomains: []
+        seoDomains: [],
+        googleAnalyticsPropertyId: undefined
       });
 
       const response = await request(app)
         .get('/api/seo/metrics')
         .expect(400);
 
-      expect(response.body.message).toContain('No SEO domains configured');
+      expect(response.body.message).toContain('No SEO domains or Google Analytics Property ID configured');
     });
 
     it('should return 500 if Google Search Console API not configured', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue({
-        id: 'test-user-123',
+        userId: 'test-user-123',
         email: 'test@example.com',
         seoDomains: ['example.com']
       });
@@ -106,7 +115,7 @@ describe('SEO Routes', () => {
 
     it('should fetch metrics for configured domains', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue({
-        id: 'test-user-123',
+        userId: 'test-user-123',
         email: 'test@example.com',
         seoDomains: ['example.com']
       });
@@ -166,7 +175,7 @@ describe('SEO Routes', () => {
 
     it('should handle different timeframes', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue({
-        id: 'test-user-123',
+        userId: 'test-user-123',
         email: 'test@example.com',
         seoDomains: ['example.com']
       });
@@ -202,7 +211,7 @@ describe('SEO Routes', () => {
 
     it('should calculate totals from daily data', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue({
-        id: 'test-user-123',
+        userId: 'test-user-123',
         email: 'test@example.com',
         seoDomains: ['example.com']
       });
@@ -247,7 +256,7 @@ describe('SEO Routes', () => {
 
     it('should handle API errors gracefully', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue({
-        id: 'test-user-123',
+        userId: 'test-user-123',
         email: 'test@example.com',
         seoDomains: ['example.com']
       });
@@ -270,7 +279,7 @@ describe('SEO Routes', () => {
 
     it('should handle multiple domains', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue({
-        id: 'test-user-123',
+        userId: 'test-user-123',
         email: 'test@example.com',
         seoDomains: ['example.com', 'another.com']
       });
@@ -289,12 +298,220 @@ describe('SEO Routes', () => {
       expect(response.body.metrics[0].domain).toBe('example.com');
       expect(response.body.metrics[1].domain).toBe('another.com');
     });
+
+    it('should return 400 if no SEO domains or GA Property ID configured', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        id: 'test-user-123',
+        email: 'test@example.com',
+        seoDomains: [],
+        googleAnalyticsPropertyId: undefined
+      });
+
+      const response = await request(app)
+        .get('/api/seo/metrics')
+        .expect(400);
+
+      expect(response.body.message).toContain('No SEO domains or Google Analytics Property ID configured');
+    });
+
+    it('should fetch Google Analytics metrics when Property ID is configured', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-123',
+        email: 'test@example.com',
+        seoDomains: [],
+        googleAnalyticsPropertyId: '123456789'
+      });
+
+      // Mock GA API responses
+      mockRunReport
+        .mockResolvedValueOnce([{
+          rows: [{
+            metricValues: [
+              { value: '1000' }, // sessions
+              { value: '800' },  // activeUsers
+              { value: '2500' }, // screenPageViews
+              { value: '120.5' }, // averageSessionDuration
+              { value: '0.35' }  // bounceRate
+            ]
+          }]
+        }])
+        .mockResolvedValueOnce([{
+          rows: [{
+            dimensionValues: [
+              { value: 'Test Page' },
+              { value: '/test-page' },
+              { value: 'example.com' }
+            ],
+            metricValues: [
+              { value: '50' },   // sessions
+              { value: '0.75' }, // engagementRate
+              { value: '300' },  // userEngagementDuration
+              { value: '200' }   // eventCount
+            ]
+          }]
+        }])
+        .mockResolvedValueOnce([{
+          rows: [{
+            dimensionValues: [{ value: '20241210' }],
+            metricValues: [
+              { value: '100' }, // sessions
+              { value: '80' },  // activeUsers
+              { value: '250' }  // screenPageViews
+            ]
+          }]
+        }])
+        .mockResolvedValueOnce([{
+          rows: [{
+            dimensionValues: [
+              { value: 'google' },
+              { value: 'organic' }
+            ],
+            metricValues: [
+              { value: '500' },  // sessions
+              { value: '400' },  // activeUsers
+              { value: '1200' }, // screenPageViews
+              { value: '90.5' }  // averageSessionDuration
+            ]
+          }]
+        }]);
+
+      const response = await request(app)
+        .get('/api/seo/metrics')
+        .expect(200);
+
+      expect(response.body.gaMetrics).toBeDefined();
+      expect(response.body.gaMetrics.propertyId).toBe('123456789');
+      expect(response.body.gaMetrics.sessions).toBe(1000);
+      expect(response.body.gaMetrics.users).toBe(800);
+      expect(response.body.gaMetrics.pageViews).toBe(2500);
+      expect(response.body.gaMetrics.topPagesByEngagement).toHaveLength(1);
+      expect(response.body.gaMetrics.topPagesByEngagement[0].pageTitle).toBe('Test Page');
+      expect(response.body.gaMetrics.dailyData).toHaveLength(1);
+      expect(response.body.gaMetrics.trafficSources).toHaveLength(1);
+    });
+
+    it('should handle GA API errors gracefully', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-123',
+        email: 'test@example.com',
+        seoDomains: [],
+        googleAnalyticsPropertyId: '123456789'
+      });
+
+      mockRunReport.mockRejectedValueOnce(new Error('PERMISSION_DENIED'));
+
+      const response = await request(app)
+        .get('/api/seo/metrics')
+        .expect(200);
+
+      expect(response.body.gaMetrics).toBeDefined();
+      expect(response.body.gaMetrics.error).toContain('PERMISSION_DENIED');
+    });
+
+    it('should handle missing engagement metrics gracefully', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-123',
+        email: 'test@example.com',
+        seoDomains: [],
+        googleAnalyticsPropertyId: '123456789'
+      });
+
+      mockRunReport
+        .mockResolvedValueOnce([{
+          rows: [{
+            metricValues: [
+              { value: '1000' },
+              { value: '800' },
+              { value: '2500' },
+              { value: '120.5' },
+              { value: '0.35' }
+            ]
+          }]
+        }])
+        .mockRejectedValueOnce(new Error('INVALID_ARGUMENT')) // Engagement metrics fail
+        .mockResolvedValueOnce([{
+          rows: [{
+            dimensionValues: [{ value: '20241210' }],
+            metricValues: [
+              { value: '100' },
+              { value: '80' },
+              { value: '250' }
+            ]
+          }]
+        }])
+        .mockResolvedValueOnce([{
+          rows: []
+        }]);
+
+      const response = await request(app)
+        .get('/api/seo/metrics')
+        .expect(200);
+
+      expect(response.body.gaMetrics).toBeDefined();
+      expect(response.body.gaMetrics.sessions).toBe(1000);
+      expect(response.body.gaMetrics.topPagesByEngagement).toEqual([]);
+    });
+
+    it('should construct full URLs for top pages by engagement', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-123',
+        email: 'test@example.com',
+        seoDomains: ['example.com'],
+        googleAnalyticsPropertyId: '123456789'
+      });
+
+      mockRunReport
+        .mockResolvedValueOnce([{
+          rows: [{
+            metricValues: [
+              { value: '1000' },
+              { value: '800' },
+              { value: '2500' },
+              { value: '120.5' },
+              { value: '0.35' }
+            ]
+          }]
+        }])
+        .mockResolvedValueOnce([{
+          rows: [{
+            dimensionValues: [
+              { value: 'Test Page' },
+              { value: '/test-page' },
+              { value: 'example.com' }
+            ],
+            metricValues: [
+              { value: '50' },
+              { value: '0.75' },
+              { value: '300' },
+              { value: '200' }
+            ]
+          }]
+        }])
+        .mockResolvedValueOnce([{
+          rows: []
+        }])
+        .mockResolvedValueOnce([{
+          rows: []
+        }]);
+
+      // Mock Search Console API
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ rows: [] })
+      });
+
+      const response = await request(app)
+        .get('/api/seo/metrics')
+        .expect(200);
+
+      expect(response.body.gaMetrics.topPagesByEngagement[0].pagePath).toBe('https://example.com/test-page');
+    });
   });
 
   describe('GET /api/seo/debug', () => {
     it('should return debug information', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue({
-        id: 'test-user-123',
+        userId: 'test-user-123',
         email: 'test@example.com',
         seoDomains: ['example.com']
       });

@@ -161,7 +161,7 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
   }
 });
 
-// Update user SEO domains
+// Update user SEO domains (kept for backward compatibility)
 router.put("/users/:userId/seo-domains", async (req, res) => {
   try {
     const { userId } = req.params;
@@ -198,6 +198,66 @@ router.put("/users/:userId/seo-domains", async (req, res) => {
   } catch (error) {
     console.error("Error updating user SEO domains:", error);
     res.status(500).json({ message: "Error updating SEO domains" });
+  }
+});
+
+// Update user SEO/AEO configuration (SEO domains and Google Analytics Measurement ID)
+router.put("/users/:userId/seo-aeo", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { seoDomains, googleAnalyticsPropertyId } = req.body;
+
+    // Check if user exists
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Validate seoDomains is an array if provided
+    if (seoDomains !== undefined) {
+      if (!Array.isArray(seoDomains)) {
+        return res.status(400).json({ message: "seoDomains must be an array" });
+      }
+
+      // Validate each domain format
+      const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
+      for (const domain of seoDomains) {
+        if (typeof domain !== 'string' || !domainRegex.test(domain.trim())) {
+          return res.status(400).json({ 
+            message: `Invalid domain format: ${domain}. Please use format like example.com` 
+          });
+        }
+      }
+    }
+
+    // Validate Google Analytics Property ID format if provided
+    // Note: The API uses Property ID (numeric), not Measurement ID (G-XXXXXXXXXX)
+    if (googleAnalyticsPropertyId !== undefined && googleAnalyticsPropertyId !== null && googleAnalyticsPropertyId !== "") {
+      // GA4 Property ID is numeric (e.g., 123456789)
+      const gaIdRegex = /^\d+$/;
+      const trimmedId = googleAnalyticsPropertyId.trim();
+      if (typeof googleAnalyticsPropertyId !== 'string' || !gaIdRegex.test(trimmedId)) {
+        return res.status(400).json({ 
+          message: `Invalid Google Analytics Property ID format: ${googleAnalyticsPropertyId}. Please enter the numeric Property ID (e.g., 123456789). You can find this in GA4 Admin > Property Settings.` 
+        });
+      }
+    }
+
+    // Build update object with only provided fields
+    const updateData: any = {};
+    if (seoDomains !== undefined) {
+      updateData.seoDomains = seoDomains;
+    }
+    if (googleAnalyticsPropertyId !== undefined) {
+      updateData.googleAnalyticsPropertyId = googleAnalyticsPropertyId?.trim() || null;
+    }
+
+    // Update the user's SEO/AEO configuration
+    const updatedUser = await userDb.updateUser(userId, updateData);
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error updating user SEO/AEO configuration:", error);
+    res.status(500).json({ message: "Error updating SEO/AEO configuration" });
   }
 });
 

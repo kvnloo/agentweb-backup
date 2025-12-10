@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-10',
+    changes: [
+      'Added Google Analytics Metrics Support to SEO/GEO Page',
+      '- SEO/GEO page now displays Google Analytics metrics alongside traditional SEO metrics',
+      '- Configure Google Analytics Property ID in the admin panel under Users tab > SEO/AEO settings',
+      '- Traffic Sources table displaying all traffic sources with sessions, users, page views, and average session duration',
+      '- Top Pages by Engagement table showing pages ranked by engagement rate with sessions, engagement time, and event counts',
+    ],
+  },
+  {
     date: '2025-12-09',
     changes: [
       'Added Text Email Content Support in CRM',
