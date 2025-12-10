@@ -2928,9 +2928,11 @@ export const crmDb = {
     linkedin?: string;
     customFields?: Record<string, any>;
     selectedSenderId?: string | null;
+    emailDraftFormat?: 'text' | 'html';
     emailDraft?: {
       subject: string;
-      htmlContent: string;
+      htmlContent?: string;
+      textContent?: string;
       createdAt: string;
       updatedAt: string;
       sessionId?: string;
@@ -3001,6 +3003,11 @@ export const crmDb = {
           setExpressions.push('selectedSenderId = :selectedSenderId');
           expressionAttributeValues[':selectedSenderId'] = updates.selectedSenderId;
         }
+      }
+
+      if (updates.emailDraftFormat !== undefined) {
+        setExpressions.push('emailDraftFormat = :emailDraftFormat');
+        expressionAttributeValues[':emailDraftFormat'] = updates.emailDraftFormat;
       }
 
       if (updates.emailDraft !== undefined) {

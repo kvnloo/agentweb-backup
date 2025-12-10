@@ -1392,6 +1392,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
               instruction: {
                 type: 'string',
                 description: 'Instructions for creating the email draft (e.g., "welcome email", "follow-up on their interest in our product", "introduce our new feature"). The AI will use this along with lead data, engagement history, brand guidelines, and market strategy to create a personalized email.'
+              },
+              email_format: {
+                type: 'string',
+                enum: ['text', 'html'],
+                description: 'Optional. The format for the email draft: "text" for plain text or "html" for HTML. If not provided, uses the lead\'s saved format preference (defaults to "text").'
               }
             },
             required: ['list_id', 'lead_id', 'instruction']
@@ -2886,7 +2891,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'add_leads_to_list':
         return await this.addLeadsToList(args.list_id, args.leads || [], userId);
       case 'update_email_draft_for_lead':
-        return await this.updateEmailDraftForLead(args.list_id, args.lead_id, args.instruction, sessionId, userId);
+        return await this.updateEmailDraftForLead(args.list_id, args.lead_id, args.instruction, sessionId, userId, args.email_format);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -4013,7 +4018,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
-  private async updateEmailDraftForLead(listId: string, leadId: string, instruction: string, sessionId: string, userId: string): Promise<any> {
+  private async updateEmailDraftForLead(listId: string, leadId: string, instruction: string, sessionId: string, userId: string, emailFormat?: 'text' | 'html'): Promise<any> {
     try {
       const { crmDb } = await import('./db');
       
@@ -4061,6 +4066,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Get existing draft if it exists
       const existingDraft = (lead as any).emailDraft;
+
+      // Get email draft format: use provided parameter, or lead's preference, or default to 'text'
+      const emailDraftFormat = emailFormat || (lead as any).emailDraftFormat || 'text';
 
       // Build the prompt for LLM
       let emailPrompt = `You are an expert email marketing strategist. Create a personalized email draft for a lead based on the following information:
@@ -4149,28 +4157,38 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Add existing draft if it exists
       if (existingDraft) {
-        emailPrompt += `\n\n## Existing Email Draft (to refine/update):\nSubject: ${existingDraft.subject}\nHTML Content:\n${existingDraft.htmlContent}`;
+        const existingContent = emailDraftFormat === 'text' 
+          ? (existingDraft.textContent || existingDraft.htmlContent || '')
+          : (existingDraft.htmlContent || existingDraft.textContent || '');
+        emailPrompt += `\n\n## Existing Email Draft (to refine/update):\nSubject: ${existingDraft.subject}\nContent:\n${existingContent}`;
       }
 
       // Add instruction
       emailPrompt += `\n\n## Instruction:\n${instruction}`;
 
+      const contentType = emailDraftFormat === 'text' ? 'plain text' : 'HTML';
       emailPrompt += `\n\n## Requirements:
 1. Create a professional, personalized email that aligns with the brand guidelines and market strategy
 2. Use the lead's information to personalize the email (use their name, company, etc.)
 3. Consider the engagement history to make the email contextually relevant
 4. The email should be appropriate for the instruction provided
 5. Subject line should be compelling and personalized (50-60 characters ideal)
-6. HTML content should be well-formatted, professional, and email-friendly
+6. Email content should be well-formatted, professional, and email-friendly (${contentType} format)
 7. Include a clear call-to-action
 8. Include an appropriate email signature at the end using the sender information provided (if available)
 9. If updating an existing draft, improve it based on the instruction while maintaining the core message
+${emailDraftFormat === 'text' ? '10. Use plain text format only - no HTML tags, no formatting markup. Use line breaks and simple text formatting.' : '10. Use HTML format with proper email-friendly HTML tags and styling.'}
 
 Format the response as JSON with this structure:
-{
+${emailDraftFormat === 'text' 
+  ? `{
+  "subject": "Email subject line (personalized, 50-60 characters)",
+  "textContent": "Complete plain text email body (no HTML, use line breaks for paragraphs)"
+}` 
+  : `{
   "subject": "Email subject line (personalized, 50-60 characters)",
   "htmlContent": "Complete HTML email body (well-formatted, professional, email-friendly HTML)"
-}`;
+}`}`;
 
       // Call LLM to generate email using direct chat completion (same as generateBlogContent)
       const completion = await openai.chat.completions.create({
@@ -4178,7 +4196,9 @@ Format the response as JSON with this structure:
         messages: [
           {
             role: "system",
-            content: "You are an expert email marketing strategist. Create personalized, professional emails that align with brand guidelines and market strategy. Always respond with valid JSON containing subject and htmlContent fields.",
+            content: emailDraftFormat === 'text' 
+              ? "You are an expert email marketing strategist. Create personalized, professional plain text emails that align with brand guidelines and market strategy. Always respond with valid JSON containing subject and textContent fields. Use plain text only - no HTML tags or formatting markup."
+              : "You are an expert email marketing strategist. Create personalized, professional emails that align with brand guidelines and market strategy. Always respond with valid JSON containing subject and htmlContent fields.",
           },
           { role: "user", content: emailPrompt },
         ],
@@ -4202,24 +4222,36 @@ Format the response as JSON with this structure:
         throw new Error('Failed to parse email draft response');
       }
 
-      // Validate required fields
-      if (!emailData.subject || !emailData.htmlContent) {
-        throw new Error('LLM response missing required fields (subject, htmlContent)');
+      // Validate required fields based on format
+      if (emailDraftFormat === 'text') {
+        if (!emailData.subject || !emailData.textContent) {
+          throw new Error('LLM response missing required fields (subject, textContent)');
+        }
+      } else {
+        if (!emailData.subject || !emailData.htmlContent) {
+          throw new Error('LLM response missing required fields (subject, htmlContent)');
+        }
       }
 
       // Save draft to lead record with sessionId
       const now = new Date().toISOString();
-      const emailDraft = {
+      const emailDraft: any = {
         subject: emailData.subject,
-        htmlContent: emailData.htmlContent,
         createdAt: existingDraft?.createdAt || now,
         updatedAt: now,
         sessionId: sessionId
       };
 
-      // Update lead with email draft
+      if (emailDraftFormat === 'text') {
+        emailDraft.textContent = emailData.textContent;
+      } else {
+        emailDraft.htmlContent = emailData.htmlContent;
+      }
+
+      // Update lead with email draft and format preference
       await crmDb.updateLead(listId, leadId, {
-        emailDraft: emailDraft
+        emailDraft: emailDraft,
+        emailDraftFormat: emailDraftFormat
       });
 
       return {
@@ -4227,10 +4259,15 @@ Format the response as JSON with this structure:
         message: existingDraft 
           ? 'Email draft updated successfully' 
           : 'Email draft created successfully',
-        data: {
-          subject: emailData.subject,
-          htmlContent: emailData.htmlContent
-        }
+        data: emailDraftFormat === 'text' 
+          ? {
+              subject: emailData.subject,
+              textContent: emailData.textContent
+            }
+          : {
+              subject: emailData.subject,
+              htmlContent: emailData.htmlContent
+            }
       };
     } catch (error) {
       console.error('AgentMode: Error updating email draft for lead:', error);

@@ -565,6 +565,133 @@ describe('CRM Routes', () => {
       expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', { emailDraft: null });
       expect(mockResponse.json).toHaveBeenCalled();
     });
+
+    it('should send email with text content', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+      
+      const mockLead = {
+        leadId: 'lead1',
+        listId: 'list1',
+        email: 'lead@example.com',
+      };
+      
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'email-id-123' });
+      (crmDb.updateLead as jest.Mock).mockResolvedValue({ ...mockLead, emailDraft: null });
+      
+      mockRequest.params = { listId: 'list1', leadId: 'lead1' };
+      mockRequest.body = {
+        senderEmail: 'sender@example.com',
+        senderName: 'Sender Name',
+        subject: 'Test Subject',
+        textContent: 'Plain text content without HTML',
+      };
+      
+      const handler = router.stack.find((r: any) => 
+        r.route?.path === '/lists/:listId/leads/:leadId/send-email' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+      
+      expect(resendService.sendEmail).toHaveBeenCalledWith({
+        from: 'Sender Name <sender@example.com>',
+        to: 'lead@example.com',
+        subject: 'Test Subject',
+        text: 'Plain text content without HTML',
+      });
+      expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', { emailDraft: null });
+      expect(mockResponse.json).toHaveBeenCalled();
+    });
+
+    it('should send email with both HTML and text content', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+      
+      const mockLead = {
+        leadId: 'lead1',
+        listId: 'list1',
+        email: 'lead@example.com',
+      };
+      
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'email-id-123' });
+      (crmDb.updateLead as jest.Mock).mockResolvedValue({ ...mockLead, emailDraft: null });
+      
+      mockRequest.params = { listId: 'list1', leadId: 'lead1' };
+      mockRequest.body = {
+        senderEmail: 'sender@example.com',
+        senderName: 'Sender Name',
+        subject: 'Test Subject',
+        htmlContent: '<p>HTML content</p>',
+        textContent: 'Plain text content',
+      };
+      
+      const handler = router.stack.find((r: any) => 
+        r.route?.path === '/lists/:listId/leads/:leadId/send-email' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+      
+      expect(resendService.sendEmail).toHaveBeenCalledWith({
+        from: 'Sender Name <sender@example.com>',
+        to: 'lead@example.com',
+        subject: 'Test Subject',
+        html: '<p>HTML content</p>',
+        text: 'Plain text content',
+      });
+      expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', { emailDraft: null });
+      expect(mockResponse.json).toHaveBeenCalled();
+    });
+
+    it('should return 400 if neither htmlContent nor textContent is provided', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+      
+      const mockLead = {
+        leadId: 'lead1',
+        listId: 'list1',
+        email: 'lead@example.com',
+      };
+      
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      
+      mockRequest.params = { listId: 'list1', leadId: 'lead1' };
+      mockRequest.body = {
+        senderEmail: 'sender@example.com',
+        senderName: 'Sender Name',
+        subject: 'Test Subject',
+        // Missing both htmlContent and textContent
+      };
+      
+      const handler = router.stack.find((r: any) => 
+        r.route?.path === '/lists/:listId/leads/:leadId/send-email' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+      
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: expect.stringContaining('either htmlContent or textContent'),
+        })
+      );
+    });
   });
 });
 
