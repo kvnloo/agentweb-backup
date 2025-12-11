@@ -1,6 +1,6 @@
 import express, { Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
-import { crmDb } from '../services/db';
+import { crmDb, taskDb, subscriberDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import multer from 'multer';
@@ -930,6 +930,109 @@ router.post('/lists/:listId/leads/:leadId/reply-email', async (req: Request, res
   } catch (error: any) {
     console.error('Error sending reply email:', error);
     res.status(500).json({ message: error.message || 'Failed to send reply email' });
+  }
+});
+
+/**
+ * @route POST /api/crm/sync-subscribers
+ * @desc Sync task subscribers to a CRM lead list
+ * @access Private
+ */
+router.post('/sync-subscribers', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { taskId } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!taskId) {
+      return res.status(400).json({ message: 'taskId is required' });
+    }
+
+    // Get the task to get the task name
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Verify task ownership
+    if (task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Get all subscribers for the task (including unsubscribed) so we can update the subscribed field
+    const subscribers = await subscriberDb.getAllTaskSubscribers(taskId);
+    
+    if (!subscribers || subscribers.length === 0) {
+      return res.status(400).json({ message: 'No subscribers to sync' });
+    }
+
+    // Find or create lead list named "<task_name> Subscribers"
+    const listName = `${task.name} Subscribers`;
+    let leadList = null;
+
+    // Get all lead lists for the user
+    const allLists = await crmDb.getLeadListsByUserId(userId);
+    leadList = allLists.find((list: any) => list.name === listName);
+
+    // Create the list if it doesn't exist
+    if (!leadList) {
+      leadList = await crmDb.createLeadList(
+        userId,
+        listName,
+        `Subscribers synced from task: ${task.name}`
+      );
+    }
+
+    // Convert subscribers to leads format (subscribers is guaranteed to be defined and non-empty here)
+    const leads = (subscribers || []).map((subscriber: any) => {
+      const lead: any = {
+        email: subscriber.email || '',
+        firstName: subscriber.firstName || '',
+        lastName: subscriber.lastName || '',
+        phone: subscriber.phone || '',
+        company: subscriber.company || '',
+        title: subscriber.title || '',
+        notes: subscriber.notes || '',
+        linkedin: subscriber.linkedin || '',
+      };
+
+      // Add custom fields - treat all customFields as custom fields
+      const customFields: Record<string, any> = {};
+      
+      // Add subscribed field (yes/no) based on unsubscribed status
+      customFields.subscribed = subscriber.unsubscribed ? 'no' : 'yes';
+      
+      if (subscriber.customFields && typeof subscriber.customFields === 'object') {
+        Object.assign(customFields, subscriber.customFields);
+      }
+      if (Object.keys(customFields).length > 0) {
+        lead.customFields = customFields;
+      }
+
+      return lead;
+    });
+
+    // Batch create/merge leads (always force update)
+    const results = await crmDb.batchCreateLeads(leadList.listId, leads);
+
+    res.json({
+      success: true,
+      listId: leadList.listId,
+      listName: leadList.name,
+      successCount: results.successCount,
+      newCount: results.newCount,
+      mergedCount: results.mergedCount,
+      errorCount: results.errorCount,
+      errors: results.errors,
+      message: `Synced ${results.successCount} subscriber(s) to lead list "${listName}"${results.errorCount > 0 ? `, ${results.errorCount} error(s)` : ''}`,
+    });
+  } catch (error: any) {
+    console.error('Error syncing subscribers to CRM:', error);
+    res.status(500).json({ message: error.message || 'Failed to sync subscribers to CRM' });
   }
 });
 
