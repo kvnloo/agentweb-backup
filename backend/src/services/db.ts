@@ -3276,44 +3276,127 @@ export const crmDb = {
       // Process leads to update (merge existing leads with new data)
       for (const { existingLead, newData } of leadsToUpdate) {
         try {
+          // Helper to normalize values for comparison
+          const normalize = (value: any): string => {
+            if (value === null || value === undefined) return '';
+            return String(value).trim();
+          };
+
           // Build update object - only include fields that have values in newData
           const updates: any = {};
+          let changed = false;
           
+          // Check and update standard fields - only if newData has a value and it's different
           if (newData.firstName !== undefined && newData.firstName.trim()) {
-            updates.firstName = newData.firstName;
+            const newValue = newData.firstName.trim();
+            const existingValue = normalize(existingLead.firstName);
+            if (existingValue !== newValue) {
+              updates.firstName = newValue;
+              changed = true;
+            }
           }
           if (newData.lastName !== undefined && newData.lastName.trim()) {
-            updates.lastName = newData.lastName;
+            const newValue = newData.lastName.trim();
+            const existingValue = normalize(existingLead.lastName);
+            if (existingValue !== newValue) {
+              updates.lastName = newValue;
+              changed = true;
+            }
           }
           if (newData.phone !== undefined && newData.phone.trim()) {
-            updates.phone = newData.phone;
+            const newValue = newData.phone.trim();
+            const existingValue = normalize(existingLead.phone);
+            if (existingValue !== newValue) {
+              updates.phone = newValue;
+              changed = true;
+            }
           }
           if (newData.company !== undefined && newData.company.trim()) {
-            updates.company = newData.company;
+            const newValue = newData.company.trim();
+            const existingValue = normalize(existingLead.company);
+            if (existingValue !== newValue) {
+              updates.company = newValue;
+              changed = true;
+            }
           }
           if (newData.title !== undefined && newData.title.trim()) {
-            updates.title = newData.title;
+            const newValue = newData.title.trim();
+            const existingValue = normalize(existingLead.title);
+            if (existingValue !== newValue) {
+              updates.title = newValue;
+              changed = true;
+            }
           }
           if (newData.notes !== undefined && newData.notes.trim()) {
-            updates.notes = newData.notes;
+            const newValue = newData.notes.trim();
+            const existingValue = normalize(existingLead.notes);
+            if (existingValue !== newValue) {
+              updates.notes = newValue;
+              changed = true;
+            }
           }
           if (newData.linkedin !== undefined && newData.linkedin.trim()) {
-            updates.linkedin = newData.linkedin.trim();
+            const newValue = newData.linkedin.trim();
+            const existingValue = normalize(existingLead.linkedin);
+            if (existingValue !== newValue) {
+              updates.linkedin = newValue;
+              changed = true;
+            }
           }
           
-          // Merge customFields - combine existing and new, with new values overriding
-          if (newData.customFields && Object.keys(newData.customFields).length > 0) {
+          // Check customFields - only if newData has customFields
+          if (newData.customFields !== undefined) {
             const existingCustomFields = existingLead.customFields || {};
-            updates.customFields = {
-              ...existingCustomFields,
-              ...newData.customFields,
+            const newCustomFields = newData.customFields || {};
+            
+            // Normalize function for consistent comparison (sort keys, trim strings, handle null/undefined/empty consistently)
+            const normalizeCustomFields = (fields: Record<string, any>): Record<string, any> => {
+              if (!fields || typeof fields !== 'object') return {};
+              const normalized: Record<string, any> = {};
+              Object.keys(fields).sort().forEach(key => {
+                const value = fields[key];
+                // Only include non-null, non-undefined values
+                if (value !== null && value !== undefined) {
+                  // Convert to string and trim, or keep as-is if not a string
+                  normalized[key] = typeof value === 'string' ? value.trim() : value;
+                }
+              });
+              return normalized;
             };
+            
+            // Normalize existing and new separately
+            const existingNormalized = normalizeCustomFields(existingCustomFields);
+            const newNormalized = normalizeCustomFields(newCustomFields);
+            
+            // Merge normalized versions
+            const mergedNormalized = {
+              ...existingNormalized,
+              ...newNormalized,
+            };
+            
+            // Compare normalized existing with normalized merged result
+            const existingStr = JSON.stringify(existingNormalized);
+            const mergedStr = JSON.stringify(mergedNormalized);
+            
+            // Only update if the merged result is different from existing
+            if (existingStr !== mergedStr) {
+              // Use the actual merged customFields (not normalized) for the update
+              const mergedCustomFields = {
+                ...existingCustomFields,
+                ...newCustomFields,
+              };
+              updates.customFields = mergedCustomFields;
+              changed = true;
+            }
           }
           
-          // Update the lead
-          await this.updateLead(listId, existingLead.leadId, updates);
-          results.successCount++;
-          results.mergedCount++;
+          // Only update if there are changes
+          if (changed) {
+            await this.updateLead(listId, existingLead.leadId, updates);
+            results.successCount++;
+            results.mergedCount++;
+          }
+          // If no changes, skip the update (don't count as merged)
         } catch (updateError: any) {
           results.errorCount++;
           results.errors.push(`Row: Email "${newData.email}" - Failed to update: ${updateError.message}`);

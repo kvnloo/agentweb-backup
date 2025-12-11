@@ -24,7 +24,13 @@ jest.mock('../services/db', () => ({
     updateLeadEngagement: jest.fn(),
     deleteLeadEngagement: jest.fn(),
     getLeadEngagementCount: jest.fn(),
-  }
+  },
+  taskDb: {
+    getTaskById: jest.fn(),
+  },
+  subscriberDb: {
+    getAllTaskSubscribers: jest.fn(),
+  },
 }));
 
 jest.mock('../services/settingsService', () => ({
@@ -691,6 +697,241 @@ describe('CRM Routes', () => {
           message: expect.stringContaining('either htmlContent or textContent'),
         })
       );
+    });
+  });
+
+  describe('POST /api/crm/sync-subscribers', () => {
+    const { taskDb, subscriberDb } = require('../services/db');
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it('should sync subscribers to CRM lead list', async () => {
+      const mockTask = {
+        taskId: 'task1',
+        name: 'Test Task',
+        userId: 'test-user-id',
+      };
+
+      const mockSubscribers = [
+        {
+          email: 'subscriber1@example.com',
+          firstName: 'John',
+          lastName: 'Doe',
+          unsubscribed: false,
+          subscribedAt: '2024-01-01T00:00:00Z',
+        },
+        {
+          email: 'subscriber2@example.com',
+          unsubscribed: true,
+          subscribedAt: '2024-01-02T00:00:00Z',
+        },
+      ];
+
+      const mockLeadList = {
+        listId: 'list1',
+        name: 'Test Task Subscribers',
+        userId: 'test-user-id',
+      };
+
+      const mockBatchResult = {
+        successCount: 2,
+        newCount: 2,
+        mergedCount: 0,
+        errorCount: 0,
+        errors: [],
+      };
+
+      (taskDb.getTaskById as jest.Mock).mockResolvedValue(mockTask);
+      (subscriberDb.getAllTaskSubscribers as jest.Mock).mockResolvedValue(mockSubscribers);
+      (crmDb.getLeadListsByUserId as jest.Mock).mockResolvedValue([]);
+      (crmDb.createLeadList as jest.Mock).mockResolvedValue(mockLeadList);
+      (crmDb.batchCreateLeads as jest.Mock).mockResolvedValue(mockBatchResult);
+
+      mockRequest.method = 'POST';
+      mockRequest.url = '/sync-subscribers';
+      mockRequest.body = { taskId: 'task1' };
+
+      const handler = router.stack.find((r: any) => 
+        r.route?.path === '/sync-subscribers' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(taskDb.getTaskById).toHaveBeenCalledWith('task1');
+      expect(subscriberDb.getAllTaskSubscribers).toHaveBeenCalledWith('task1');
+      expect(crmDb.createLeadList).toHaveBeenCalledWith(
+        'test-user-id',
+        'Test Task Subscribers',
+        'Subscribers synced from task: Test Task'
+      );
+      expect(crmDb.batchCreateLeads).toHaveBeenCalled();
+      expect(mockResponse.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: true,
+          listId: 'list1',
+          listName: 'Test Task Subscribers',
+          successCount: 2,
+        })
+      );
+    });
+
+    it('should use existing lead list if it exists', async () => {
+      const mockTask = {
+        taskId: 'task1',
+        name: 'Test Task',
+        userId: 'test-user-id',
+      };
+
+      const mockSubscribers = [
+        {
+          email: 'subscriber1@example.com',
+          unsubscribed: false,
+          subscribedAt: '2024-01-01T00:00:00Z',
+        },
+      ];
+
+      const mockExistingList = {
+        listId: 'existing-list',
+        name: 'Test Task Subscribers',
+        userId: 'test-user-id',
+      };
+
+      const mockBatchResult = {
+        successCount: 1,
+        newCount: 0,
+        mergedCount: 1,
+        errorCount: 0,
+        errors: [],
+      };
+
+      (taskDb.getTaskById as jest.Mock).mockResolvedValue(mockTask);
+      (subscriberDb.getAllTaskSubscribers as jest.Mock).mockResolvedValue(mockSubscribers);
+      (crmDb.getLeadListsByUserId as jest.Mock).mockResolvedValue([mockExistingList]);
+      (crmDb.batchCreateLeads as jest.Mock).mockResolvedValue(mockBatchResult);
+
+      mockRequest.method = 'POST';
+      mockRequest.url = '/sync-subscribers';
+      mockRequest.body = { taskId: 'task1' };
+
+      const handler = router.stack.find((r: any) => 
+        r.route?.path === '/sync-subscribers' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.createLeadList).not.toHaveBeenCalled();
+      expect(crmDb.batchCreateLeads).toHaveBeenCalledWith('existing-list', expect.any(Array));
+    });
+
+    it('should return 400 if no subscribers to sync', async () => {
+      const mockTask = {
+        taskId: 'task1',
+        name: 'Test Task',
+        userId: 'test-user-id',
+      };
+
+      (taskDb.getTaskById as jest.Mock).mockResolvedValue(mockTask);
+      (subscriberDb.getAllTaskSubscribers as jest.Mock).mockResolvedValue([]);
+
+      mockRequest.method = 'POST';
+      mockRequest.url = '/sync-subscribers';
+      mockRequest.body = { taskId: 'task1' };
+
+      const handler = router.stack.find((r: any) => 
+        r.route?.path === '/sync-subscribers' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: 'No subscribers to sync',
+        })
+      );
+    });
+
+    it('should return 403 if user does not own the task', async () => {
+      const mockTask = {
+        taskId: 'task1',
+        name: 'Test Task',
+        userId: 'other-user-id',
+      };
+
+      (taskDb.getTaskById as jest.Mock).mockResolvedValue(mockTask);
+
+      mockRequest.method = 'POST';
+      mockRequest.url = '/sync-subscribers';
+      mockRequest.body = { taskId: 'task1' };
+
+      const handler = router.stack.find((r: any) => 
+        r.route?.path === '/sync-subscribers' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(403);
+    });
+
+    it('should include subscribed field in customFields', async () => {
+      const mockTask = {
+        taskId: 'task1',
+        name: 'Test Task',
+        userId: 'test-user-id',
+      };
+
+      const mockSubscribers = [
+        {
+          email: 'subscriber1@example.com',
+          unsubscribed: false,
+          subscribedAt: '2024-01-01T00:00:00Z',
+        },
+        {
+          email: 'subscriber2@example.com',
+          unsubscribed: true,
+          subscribedAt: '2024-01-02T00:00:00Z',
+        },
+      ];
+
+      const mockLeadList = {
+        listId: 'list1',
+        name: 'Test Task Subscribers',
+        userId: 'test-user-id',
+      };
+
+      (taskDb.getTaskById as jest.Mock).mockResolvedValue(mockTask);
+      (subscriberDb.getAllTaskSubscribers as jest.Mock).mockResolvedValue(mockSubscribers);
+      (crmDb.getLeadListsByUserId as jest.Mock).mockResolvedValue([]);
+      (crmDb.createLeadList as jest.Mock).mockResolvedValue(mockLeadList);
+      (crmDb.batchCreateLeads as jest.Mock).mockResolvedValue({
+        successCount: 2,
+        newCount: 2,
+        mergedCount: 0,
+        errorCount: 0,
+        errors: [],
+      });
+
+      mockRequest.method = 'POST';
+      mockRequest.url = '/sync-subscribers';
+      mockRequest.body = { taskId: 'task1' };
+
+      const handler = router.stack.find((r: any) => 
+        r.route?.path === '/sync-subscribers' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.batchCreateLeads).toHaveBeenCalled();
+      const leadsPassed = (crmDb.batchCreateLeads as jest.Mock).mock.calls[0][1];
+      expect(leadsPassed[0].customFields.subscribed).toBe('yes');
+      expect(leadsPassed[1].customFields.subscribed).toBe('no');
     });
   });
 });

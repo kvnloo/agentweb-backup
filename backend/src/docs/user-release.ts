@@ -19,6 +19,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Automatically tracks user interactions, page views, and navigation patterns',
       '- Provides heatmaps and session recordings to understand user behavior',
       '- Helps identify usability issues and optimize user experience',
+      'Supported Sync to CRM for Task Subscribers',
+      '- New "Sync to CRM" button in the Subscribers section on Task Details page',
+      '- Syncs all task subscribers to a CRM lead list named "<task_name> Subscribers"',
+      '- Automatically creates the lead list if it doesn\'t exist, or merges with existing list',
     ],
   },
   {
