@@ -4,6 +4,7 @@ import { google } from 'googleapis';
 import { createHash } from 'crypto';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
+import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
 import { taskDb, taskTemplateDb } from './db';
 import { settingsService } from './settingsService';
@@ -1127,6 +1128,68 @@ Use the available tools to create tasks in the agent-engine when complex work is
       {
         type: 'function' as const,
         function: {
+          name: 'create_book',
+          description: 'Create a new book or white paper with metadata. Returns the created book with bookId for use in other operations.',
+          parameters: {
+            type: 'object',
+            properties: {
+              title: {
+                type: 'string',
+                description: 'Title of the book or white paper'
+              },
+              description: {
+                type: 'string',
+                description: 'Description or summary of the book'
+              },
+              type: {
+                type: 'string',
+                enum: ['book', 'whitepaper'],
+                description: 'Type: "book" or "whitepaper"'
+              },
+              author: {
+                type: 'string',
+                description: 'Author name'
+              },
+              language: {
+                type: 'string',
+                description: 'Language of the book (e.g., "English", "中文")',
+                default: 'English'
+              },
+              tags: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Optional array of tags for categorization',
+                default: []
+              }
+            },
+            required: ['title', 'description', 'type', 'author']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'create_book_outline',
+          description: 'Create the complete outline structure (sections and chapters) for a book. This replaces any existing outline. Each section can have multiple chapters. Sections and chapters will be ordered by their order field.',
+          parameters: {
+            type: 'object',
+            properties: {
+              book_id: {
+                type: 'string',
+                description: 'The unique identifier (bookId) of the book to create outline for'
+              },
+              outline_json: {
+                type: 'string',
+                description: 'JSON string containing the outline structure: [{"title": "Section Title", "description": "Optional section description", "order": 1, "chapters": [{"title": "Chapter Title", "description": "Optional chapter description", "order": 1}]}]'
+              }
+            },
+            required: ['book_id', 'outline_json']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
           name: 'save_file',
           description: 'Create and save a file with the provided content to S3, then return the file URL for sharing or reference',
           parameters: {
@@ -2147,6 +2210,47 @@ Use the available tools to create tasks in the agent-engine when complex work is
           content_preview: `# Generated Content\n\nThis is mock generated content for ${args.content_description || 'the specified section/chapter'}. The content would be ${mockLength} length (${mockWordCounts[mockLength]} words)...`
         };
       
+      case 'create_book':
+        return {
+          success: true,
+          message: 'Book created successfully',
+          book: {
+            book_id: 'mock-book-new',
+            title: args.title || 'Mock Book',
+            description: args.description || 'Mock description',
+            type: args.type || 'book',
+            author: args.author || 'Mock Author',
+            language: args.language || 'English',
+            tags: args.tags || [],
+            status: 'draft',
+            sections: []
+          }
+        };
+      
+      case 'create_book_outline':
+        let mockOutline = [];
+        try {
+          if (args.outline_json) {
+            mockOutline = JSON.parse(args.outline_json);
+          }
+        } catch (error) {
+          return {
+            success: false,
+            message: 'Invalid JSON in outline_json',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          };
+        }
+        const totalChapters = mockOutline.reduce((sum: number, section: any) => 
+          sum + (section.chapters?.length || 0), 0
+        );
+        return {
+          success: true,
+          message: `Outline created successfully with ${mockOutline.length} section(s) and ${totalChapters} chapter(s)`,
+          book_id: args.book_id || 'mock-book-1',
+          sections_count: mockOutline.length,
+          total_chapters: totalChapters
+        };
+      
       case 'read_brand_guidelines':
         return {
           success: true,
@@ -2514,6 +2618,22 @@ Use the available tools to create tasks in the agent-engine when complex work is
           args.chapter_id,
           args.content_description,
           args.length || 'medium',
+          userId
+        );
+      case 'create_book':
+        return await this.createBook(
+          args.title,
+          args.description,
+          args.type,
+          args.author,
+          args.language || 'English',
+          args.tags || [],
+          userId
+        );
+      case 'create_book_outline':
+        return await this.createBookOutline(
+          args.book_id,
+          args.outline_json,
           userId
         );
       case 'read_brand_guidelines':
@@ -8648,6 +8768,198 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       return {
         success: false,
         message: 'Failed to generate book content',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async createBook(
+    title: string,
+    description: string,
+    type: string,
+    author: string,
+    language: string,
+    tags: string[],
+    userId: string
+  ): Promise<any> {
+    try {
+      console.log('AgentMode: Creating book for user:', userId);
+
+      // Validate required parameters
+      if (!title || !title.trim()) {
+        return {
+          success: false,
+          message: 'Title is required',
+          error: 'Title cannot be empty'
+        };
+      }
+
+      if (!description || !description.trim()) {
+        return {
+          success: false,
+          message: 'Description is required',
+          error: 'Description cannot be empty'
+        };
+      }
+
+      if (!type || (type !== 'book' && type !== 'whitepaper')) {
+        return {
+          success: false,
+          message: 'Type must be "book" or "whitepaper"',
+          error: 'Invalid type specified'
+        };
+      }
+
+      if (!author || !author.trim()) {
+        return {
+          success: false,
+          message: 'Author is required',
+          error: 'Author cannot be empty'
+        };
+      }
+
+      const { bookDb } = await import('./bookDb');
+
+      const bookData = {
+        userId,
+        title: title.trim(),
+        description: description.trim(),
+        content: '', // Empty content initially
+        type: type as 'book' | 'whitepaper',
+        author: author.trim(),
+        language: language || 'English',
+        tags: tags && Array.isArray(tags) ? tags : [],
+        status: 'draft' as const,
+        sections: []
+      };
+
+      const book = await bookDb.createBook(bookData);
+
+      return {
+        success: true,
+        message: 'Book created successfully',
+        book: {
+          book_id: book.bookId,
+          title: book.title,
+          description: book.description,
+          type: book.type,
+          author: book.author,
+          language: book.language,
+          tags: book.tags || [],
+          status: book.status,
+          sections: book.sections || []
+        }
+      };
+    } catch (error) {
+      console.error('Error creating book:', error);
+      return {
+        success: false,
+        message: 'Failed to create book',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async createBookOutline(
+    bookId: string,
+    outlineJson: string,
+    userId: string
+  ): Promise<any> {
+    try {
+      console.log('AgentMode: Creating book outline for:', bookId);
+
+      // Validate book exists and belongs to user
+      const { bookDb } = await import('./bookDb');
+      const book = await bookDb.getBookById(bookId, userId);
+
+      if (!book) {
+        return {
+          success: false,
+          message: 'Book not found',
+          error: 'Book not found or access denied'
+        };
+      }
+
+      // Parse outline JSON
+      let outline: any[];
+      try {
+        outline = JSON.parse(outlineJson);
+      } catch (error) {
+        return {
+          success: false,
+          message: 'Invalid JSON in outline_json',
+          error: error instanceof Error ? error.message : 'Unknown error'
+        };
+      }
+
+      // Validate outline structure
+      if (!Array.isArray(outline)) {
+        return {
+          success: false,
+          message: 'Outline must be an array of sections',
+          error: 'Invalid outline structure'
+        };
+      }
+
+      // Build sections array with proper structure
+      const sections = outline.map((section: any, sectionIndex: number) => {
+        // Validate section has title
+        if (!section.title || !section.title.trim()) {
+          throw new Error(`Section at index ${sectionIndex} is missing required field: title`);
+        }
+
+        const sectionId = uuidv4();
+        const sectionOrder = section.order !== undefined ? section.order : sectionIndex + 1;
+
+        // Process chapters if provided
+        const chapters = (section.chapters || []).map((chapter: any, chapterIndex: number) => {
+          // Validate chapter has title
+          if (!chapter.title || !chapter.title.trim()) {
+            throw new Error(`Chapter at index ${chapterIndex} in section "${section.title}" is missing required field: title`);
+          }
+
+          return {
+            chapterId: uuidv4(),
+            title: chapter.title.trim(),
+            description: chapter.description?.trim() || '',
+            order: chapter.order !== undefined ? chapter.order : chapterIndex + 1
+          };
+        });
+
+        return {
+          sectionId,
+          title: section.title.trim(),
+          description: section.description?.trim() || '',
+          order: sectionOrder,
+          chapters
+        };
+      });
+
+      // Update book with new outline
+      const updatedBook = await bookDb.updateBook(bookId, userId, { sections });
+
+      if (!updatedBook) {
+        return {
+          success: false,
+          message: 'Failed to update book outline',
+          error: 'Book update failed'
+        };
+      }
+
+      const totalChapters = sections.reduce((sum, section) => sum + section.chapters.length, 0);
+
+      return {
+        success: true,
+        message: `Outline created successfully with ${sections.length} section(s) and ${totalChapters} chapter(s)`,
+        book_id: bookId,
+        sections_count: sections.length,
+        total_chapters: totalChapters
+      };
+    } catch (error) {
+      console.error('Error creating book outline:', error);
+      return {
+        success: false,
+        message: 'Failed to create book outline',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }

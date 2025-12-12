@@ -188,11 +188,15 @@ export const bookDb = {
 
       Object.keys(updates).forEach((key) => {
         if (key !== "bookId" && key !== "userId" && key !== "createdAt") {
-          const attributeName = `#${key}`;
-          const attributeValue = `:${key}`;
-          updateExpressions.push(`${attributeName} = ${attributeValue}`);
-          expressionAttributeNames[attributeName] = key;
-          expressionAttributeValues[attributeValue] = updates[key as keyof typeof updates];
+          const value = updates[key as keyof typeof updates];
+          // Skip undefined values - DynamoDB doesn't allow undefined in UpdateExpression
+          if (value !== undefined) {
+            const attributeName = `#${key}`;
+            const attributeValue = `:${key}`;
+            updateExpressions.push(`${attributeName} = ${attributeValue}`);
+            expressionAttributeNames[attributeName] = key;
+            expressionAttributeValues[attributeValue] = value;
+          }
         }
       });
 
