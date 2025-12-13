@@ -634,6 +634,36 @@ const createChatSessionsTable = async () => {
   }
 };
 
+// Create Chat Messages table
+const createChatMessagesTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-ChatMessages`,
+    AttributeDefinitions: [
+      { AttributeName: 'sessionId', AttributeType: 'S' },
+      { AttributeName: 'messageIndex', AttributeType: 'N' }
+    ],
+    KeySchema: [
+      { AttributeName: 'sessionId', KeyType: 'HASH' },
+      { AttributeName: 'messageIndex', KeyType: 'RANGE' }
+    ],
+    ProvisionedThroughput: {
+      ReadCapacityUnits: 5,
+      WriteCapacityUnits: 5
+    }
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 // Create Task Lead List table
 const createTaskLeadListTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
@@ -1046,6 +1076,7 @@ const main = async () => {
     await createWorkflowExecutionsTable();
     await createTaskTemplatesTable();
     await createChatSessionsTable();
+    await createChatMessagesTable();
     await createTaskLeadListTable();
     await createAssetApprovalsTable();
     await createSettingsTable();

@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-12',
+    changes: [
+      'Improved Chat Session Storage and Scalability',
+      '- Chat messages are now stored in a separate database table for better performance and scalability',
+      '- Automatic migration of existing chat messages from session records to the new messages table',
+      '- Long chat sessions now perform better without hitting database size limits',
+    ],
+  },
+  {
     date: '2025-12-10',
     changes: [
       'Added Google Analytics Metrics Support to SEO/GEO Page',

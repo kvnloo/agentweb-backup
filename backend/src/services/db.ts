@@ -2480,7 +2480,7 @@ class BenchmarkTestDB {
     } catch (error: any) {
       // Handle DynamoDB item size limit error
       if (error.code === 'ValidationException' && error.message?.includes('exceeded the maximum allowed size')) {
-        console.log(`Item size limit exceeded for test ${testId}. Keeping only last 10 test history records.`);
+        console.log(`Item size limit exceeded for test ${testId}. Keeping only last 5 test history records.`);
         
         try {
           // Get the current test to access testHistory
@@ -2496,8 +2496,8 @@ class BenchmarkTestDB {
             throw new Error('Item size limit exceeded but no test history to remove');
           }
           
-          // Keep only the last 10 records (most recent)
-          const updatedHistory = testHistory.slice(-10);
+          // Keep only the last 5 records (most recent)
+          const updatedHistory = testHistory.slice(-5);
           
           console.log(`Reducing test history from ${testHistory.length} to ${updatedHistory.length} records.`);
           

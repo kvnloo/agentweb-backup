@@ -81,7 +81,7 @@ describe('BenchmarkTestDb - Model Selection and Size Limit Handling', () => {
       );
     });
 
-    it('should handle size limit error by keeping last 10 records', async () => {
+    it('should handle size limit error by keeping last 5 records', async () => {
       // First call fails with size limit error
       const sizeLimitError = {
         code: 'ValidationException',
@@ -109,8 +109,8 @@ describe('BenchmarkTestDb - Model Selection and Size Limit Handling', () => {
         testHistory,
       };
 
-      // Expected: keep last 10 records (indices 5-14)
-      const expectedHistory = testHistory.slice(-10);
+      // Expected: keep last 5 records (indices 10-14)
+      const expectedHistory = testHistory.slice(-5);
 
       mockDocClient.update
         .mockReturnValueOnce({
@@ -164,10 +164,10 @@ describe('BenchmarkTestDb - Model Selection and Size Limit Handling', () => {
       // Verify retry update was called
       expect(mockDocClient.update).toHaveBeenCalledTimes(3);
       expect(result).toBeDefined();
-      expect(result!.testHistory).toHaveLength(11); // 10 kept + 1 new
+      expect(result!.testHistory).toHaveLength(6); // 5 kept + 1 new
     });
 
-    it('should handle size limit error when test has less than 10 records', async () => {
+    it('should handle size limit error when test has less than 5 records', async () => {
       const sizeLimitError = {
         code: 'ValidationException',
         message: 'Item size to update has exceeded the maximum allowed size',
@@ -194,8 +194,8 @@ describe('BenchmarkTestDb - Model Selection and Size Limit Handling', () => {
         testHistory,
       };
 
-      // Should keep all 5 records (slice(-10) keeps all if less than 10)
-      const expectedHistory = testHistory.slice(-10);
+      // Should keep all 5 records (slice(-5) keeps all if less than 5)
+      const expectedHistory = testHistory.slice(-5);
 
       mockDocClient.update
         .mockReturnValueOnce({
