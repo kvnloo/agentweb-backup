@@ -54,6 +54,30 @@ router.get('/me', authenticateToken, async (req, res) => {
       };
     }
     
+    // Add subscription type, allowed pages, and allowed function calls for customer portal users
+    if (user.roles && user.roles.includes('customer')) {
+      try {
+        const { getUserSubscriptionType, getAllowedPages, getAllowedFunctionCalls } = await import('../services/subscriptionService');
+        
+        const subscriptionTypeName = await getUserSubscriptionType(userId);
+        
+        response.subscriptionType = subscriptionTypeName;
+        
+        // Get allowed pages (expands "*" to actual list)
+        response.allowedPages = await getAllowedPages(userId);
+        
+        // Get allowed function calls (expands "*" to actual list)
+        response.allowedFunctionCalls = await getAllowedFunctionCalls(userId);
+      } catch (error) {
+        console.error('Error fetching subscription info:', error);
+        // Default to Basic subscription with all pages and function calls on error
+        const { getAllowedPages, getAllowedFunctionCalls } = await import('../services/subscriptionService');
+        response.subscriptionType = 'Basic';
+        response.allowedPages = await getAllowedPages(userId);
+        response.allowedFunctionCalls = await getAllowedFunctionCalls(userId);
+      }
+    }
+    
     res.json(response);
   } catch (error) {
     console.error('Error fetching current user:', error);

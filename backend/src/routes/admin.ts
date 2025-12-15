@@ -9,6 +9,7 @@ import { emailService } from "../services/emailService";
 import { chatbotDb, ChatSession } from "../services/chatbotService";
 import { DynamoDB } from "aws-sdk";
 import { workflowDb } from "../services/workflowDb";
+import { settingsService } from "../services/settingsService";
 
 const router = express.Router();
 
@@ -1713,6 +1714,190 @@ router.get("/gtm-plans", async (req, res) => {
       message: "Error fetching GTM plans",
       error: error?.message || "Internal server error",
     });
+  }
+});
+
+// Subscription Types endpoints
+
+// Get all subscription types
+router.get("/subscription-types", async (req, res) => {
+  try {
+    const setting = await settingsService.getSetting("subscription_types");
+    let subscriptionTypes = [];
+    
+    if (setting) {
+      try {
+        subscriptionTypes = JSON.parse(setting.settingValue);
+      } catch (error) {
+        console.error("Error parsing subscription types:", error);
+        subscriptionTypes = [];
+      }
+    }
+    
+    // Import helper functions to expand "*" to actual lists if needed
+    const subscriptionService = await import('../services/subscriptionService');
+    const allAvailablePages = subscriptionService.getAllAvailablePages();
+    const allAvailableFunctionCalls = await subscriptionService.getAllAvailableFunctionCalls();
+    
+    // If no subscription types exist, return default Basic type with actual lists
+    if (subscriptionTypes.length === 0) {
+      subscriptionTypes = [{
+        name: "Basic",
+        allowedPages: allAvailablePages, // All available pages (expanded)
+        allowedFunctionCalls: allAvailableFunctionCalls // All available function calls (expanded)
+      }];
+    }
+    
+    // Normalize paths: remove "/marketing" prefix from allowedPages (for backward compatibility)
+    // Also expand "*" to actual lists if present (for backward compatibility with old data)
+    subscriptionTypes = await Promise.all(subscriptionTypes.map(async (type: any) => {
+      // Normalize pages
+      let normalizedPages = type.allowedPages.map((page: string) => {
+        if (page.startsWith('/marketing/')) {
+          return page.replace('/marketing', '');
+        }
+        return page;
+      });
+      
+      // Expand "*" to actual list if present (for backward compatibility)
+      if (normalizedPages.includes('*')) {
+        normalizedPages = allAvailablePages;
+      }
+      
+      // Expand "*" to actual list if present (for backward compatibility)
+      let normalizedFunctionCalls = type.allowedFunctionCalls;
+      if (normalizedFunctionCalls.includes('*')) {
+        normalizedFunctionCalls = allAvailableFunctionCalls;
+      }
+      
+      return {
+        ...type,
+        allowedPages: normalizedPages,
+        allowedFunctionCalls: normalizedFunctionCalls
+      };
+    }));
+    
+    res.json(subscriptionTypes);
+  } catch (error) {
+    console.error("Error getting subscription types:", error);
+    res.status(500).json({ message: "Error fetching subscription types" });
+  }
+});
+
+// Create or update subscription types
+router.post("/subscription-types", async (req, res) => {
+  try {
+    const { subscriptionTypes } = req.body;
+    
+    if (!Array.isArray(subscriptionTypes)) {
+      return res.status(400).json({ message: "subscriptionTypes must be an array" });
+    }
+    
+    // Import helper functions to expand "*" to actual lists
+    const subscriptionService = await import('../services/subscriptionService');
+    const allAvailablePages = subscriptionService.getAllAvailablePages();
+    const allAvailableFunctionCalls = await subscriptionService.getAllAvailableFunctionCalls();
+    
+    // Validate subscription types structure, normalize paths, and expand "*" to actual lists
+    const normalizedTypes = await Promise.all(subscriptionTypes.map(async (type: any) => {
+      if (!type.name || typeof type.name !== "string") {
+        throw new Error("Each subscription type must have a name");
+      }
+      if (!Array.isArray(type.allowedPages)) {
+        throw new Error("Each subscription type must have allowedPages array");
+      }
+      if (!Array.isArray(type.allowedFunctionCalls)) {
+        throw new Error("Each subscription type must have allowedFunctionCalls array");
+      }
+      
+      // Remove "/marketing" prefix from allowedPages if present
+      let normalizedPages = type.allowedPages.map((page: string) => {
+        if (page.startsWith('/marketing/')) {
+          return page.replace('/marketing', '');
+        }
+        return page;
+      });
+      
+      // Expand "*" to actual list of pages
+      if (normalizedPages.includes('*')) {
+        normalizedPages = allAvailablePages;
+      }
+      
+      // Expand "*" to actual list of function calls
+      let normalizedFunctionCalls = type.allowedFunctionCalls;
+      if (normalizedFunctionCalls.includes('*')) {
+        normalizedFunctionCalls = allAvailableFunctionCalls;
+      }
+      
+      return {
+        ...type,
+        allowedPages: normalizedPages,
+        allowedFunctionCalls: normalizedFunctionCalls
+      };
+    }));
+    
+    const updatedBy = (req as any).user?.email || "unknown";
+    await settingsService.setSetting(
+      "subscription_types",
+      JSON.stringify(normalizedTypes),
+      "Customer portal subscription types configuration",
+      updatedBy
+    );
+    
+    res.json({ success: true, subscriptionTypes: normalizedTypes });
+  } catch (error: any) {
+    console.error("Error saving subscription types:", error);
+    res.status(400).json({ message: error.message || "Error saving subscription types" });
+  }
+});
+
+// Update user subscription type
+router.put("/users/:userId/subscription-type", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { subscriptionType } = req.body;
+    
+    if (!subscriptionType || typeof subscriptionType !== "string") {
+      return res.status(400).json({ message: "subscriptionType is required and must be a string" });
+    }
+    
+    // Check if user exists
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+    
+    // Verify subscription type exists
+    const setting = await settingsService.getSetting("subscription_types");
+    let subscriptionTypes = [];
+    
+    if (setting) {
+      try {
+        subscriptionTypes = JSON.parse(setting.settingValue);
+      } catch (error) {
+        console.error("Error parsing subscription types:", error);
+      }
+    }
+    
+    // If no subscription types defined, allow "Basic" as default
+    if (subscriptionTypes.length === 0 && subscriptionType !== "Basic") {
+      return res.status(400).json({ message: "Subscription type not found. Only 'Basic' is available." });
+    }
+    
+    // Check if subscription type exists (unless it's Basic and no types are defined)
+    if (subscriptionTypes.length > 0) {
+      const typeExists = subscriptionTypes.some((type: any) => type.name === subscriptionType);
+      if (!typeExists) {
+        return res.status(400).json({ message: "Subscription type not found" });
+      }
+    }
+    
+    // Update the user's subscription type
+    const updatedUser = await userDb.updateUser(userId, { subscriptionType });
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error updating user subscription type:", error);
+    res.status(500).json({ message: "Error updating subscription type" });
   }
 });
 

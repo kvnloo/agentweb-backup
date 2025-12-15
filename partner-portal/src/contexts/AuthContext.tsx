@@ -12,6 +12,7 @@ interface User {
   isOAuthUser: boolean;
   createdAt: string;
   roles: ('partner' | 'customer')[];
+  subscriptionType?: string;
 }
 
 interface AuthContextType {
