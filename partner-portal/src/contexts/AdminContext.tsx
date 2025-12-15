@@ -39,6 +39,7 @@ interface User {
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
+  subscriptionType?: string; // Subscription type for customer portal users
 }
 
 interface AdminContextType {
