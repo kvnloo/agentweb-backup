@@ -714,6 +714,109 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
     }
   },
 
+  async sendScheduledChatErrorEmail(
+    toEmails: string | string[],
+    scheduleName: string,
+    disallowedFunctions: string[],
+    scheduleId: string
+  ) {
+    try {
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      
+      const currentDate = new Date().toLocaleDateString('en-US', { 
+        year: 'numeric', 
+        month: 'short', 
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+
+      const html = `
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa; }
+            .container { max-width: 800px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .header { background-color: #dc3545; color: white; padding: 20px; border-radius: 8px 8px 0 0; }
+            .header h1 { margin: 0; font-size: 24px; }
+            .content { padding: 20px; }
+            .error-section { background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 20px 0; border-radius: 4px; }
+            .error-section h3 { margin-top: 0; color: #856404; }
+            .function-list { background-color: #f8f9fa; padding: 10px; border-radius: 4px; margin: 10px 0; }
+            .function-list ul { margin: 0; padding-left: 20px; }
+            .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; }
+            .button { display: inline-block; background-color: #1976d2; color: white !important; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin: 10px 0; }
+            .button:hover { background-color: #1565c0; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h1>❌ Scheduled Chat Error</h1>
+              <p style="margin: 5px 0 0 0; opacity: 0.9;">${scheduleName}</p>
+            </div>
+            
+            <div class="content">
+              <div class="error-section">
+                <h3>⚠️ Scheduled Chat Cannot Run</h3>
+                <p style="margin: 0; line-height: 1.6;">
+                  Your scheduled chat <strong>"${scheduleName}"</strong> was scheduled to run at <strong>${currentDate}</strong>, 
+                  but it cannot execute because the following required function calls are not allowed by your subscription:
+                </p>
+                <div class="function-list">
+                  <ul>
+                    ${disallowedFunctions.map(func => `<li><strong>${func}</strong></li>`).join('')}
+                  </ul>
+                </div>
+                <p style="margin: 10px 0 0 0; line-height: 1.6;">
+                  Please contact your administrator to update your subscription type or modify the scheduled chat 
+                  to only use function calls that are allowed by your current subscription.
+                </p>
+              </div>
+            </div>
+            
+            <div class="footer">
+              <p style="margin-top: 15px; font-size: 12px; color: #6c757d;">
+                This is an automated email from your scheduled chat. 
+                <a href="${customerFrontendUrl}/agent-mode" style="color: #1976d2;">Manage your schedules</a>
+              </p>
+            </div>
+          </div>
+        </body>
+        </html>
+      `;
+
+      const text = `
+Scheduled Chat Error: ${scheduleName}
+
+Your scheduled chat "${scheduleName}" was scheduled to run at ${currentDate}, but it cannot execute because the following required function calls are not allowed by your subscription:
+
+${disallowedFunctions.map(func => `- ${func}`).join('\n')}
+
+Please contact your administrator to update your subscription type or modify the scheduled chat to only use function calls that are allowed by your current subscription.
+
+---
+This is an automated email from your scheduled chat.
+Manage your schedules: ${customerFrontendUrl}/agent-mode
+      `;
+
+      const subject = `❌ Scheduled Chat Error: ${scheduleName} - Function Calls Not Allowed`;
+      
+      // Normalize to array for consistent handling
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      
+      // Send ONE email to all recipients
+      await this.sendEmail(emailList, subject, text, html);
+      
+      console.log(`Scheduled chat error email sent to recipients: ${emailList.join(', ')}`);
+      
+    } catch (error) {
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      console.error(`Error sending scheduled chat error emails to ${emailList.join(', ')}:`, error);
+      // Don't throw error - email failure shouldn't break the scheduled chat execution
+    }
+  },
+
   async sendScheduledChatResultEmail(
     toEmails: string | string[],
     scheduleName: string,

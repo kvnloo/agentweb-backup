@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-15',
+    changes: [
+      'Added Subscription Types and Access Controls for Customer Portal',
+      '- Admins can now configure subscription types in the partner portal, defining which customer-portal pages and Agent Mode function calls are available for each type',
+      '- Users receive their subscription type and explicit lists of allowed pages and function calls as part of their account metadata and can view them in the Customer Portal Settings page',
+      '- Scheduled chats now validate required function calls against the user\'s subscription and send error emails instead of running when permissions are insufficient',
+      '- A default \"Basic\" subscription type is provided which grants full access to all customer-portal pages and Agent Mode function calls, and is automatically used when no subscription types are configured',
+    ],
+  },
+  {
     date: '2025-12-12',
     changes: [
       'Improved Chat Session Storage and Scalability',

@@ -531,6 +531,109 @@ async function runScheduledChat(
   const now = new Date();
 
   try {
+    // Check if required function calls are allowed for the user's subscription
+    const expectedFunctionCalls = schedule.requiredFunctionCalls || [];
+    if (expectedFunctionCalls.length > 0) {
+      const { getAllowedFunctionCalls } = await import('../services/subscriptionService');
+      const allowedFunctionCalls = await getAllowedFunctionCalls(userId);
+      
+      // Check if all required function calls are allowed
+      // getAllowedFunctionCalls now always returns an array (never null or "*")
+      // If the array is empty, it means no functions are allowed (shouldn't happen, but handle it)
+      if (allowedFunctionCalls.length === 0) {
+        // This shouldn't happen, but if it does, block all function calls
+        const disallowedFunctions = expectedFunctionCalls;
+        
+        // Get user info for email
+        const { userDb } = await import('../services/db');
+        const user = await userDb.getUserById(userId);
+        const emailNotifications = schedule.emailNotifications || [];
+        
+        // Send error email instead of running
+        const { emailService } = await import('../services/emailService');
+        await emailService.sendScheduledChatErrorEmail(
+          emailNotifications.length > 0 ? emailNotifications : (user?.email ? [user.email] : []),
+          schedule.scheduleName,
+          disallowedFunctions,
+          schedule.scheduleId
+        );
+        
+        // Create failure result
+        const errorResult = {
+          scheduleId: schedule.scheduleId,
+          runId: require('uuid').v4(),
+          status: 'failure' as const,
+          passed: false,
+          actualResponse: `Scheduled chat cannot run: No function calls are allowed by your subscription.`,
+          actualFunctionCalls: [],
+          keywordMatches: [],
+          keywordMisses: [],
+          functionCallMatches: [],
+          functionCallMisses: disallowedFunctions,
+          executionTime: 0,
+          sessionId: '',
+          attempt: 0,
+          createdAt: new Date().toISOString()
+        };
+        
+        // Save the error result to database
+        try {
+          await scheduleDb.addRunResult(schedule.scheduleId, errorResult);
+        } catch (error) {
+          console.error('Error saving error run result:', error);
+        }
+        
+        return errorResult;
+      }
+      
+      const disallowedFunctions = expectedFunctionCalls.filter((funcName: string) => 
+        !allowedFunctionCalls.includes(funcName)
+      );
+        
+      if (disallowedFunctions.length > 0) {
+        // Get user info for email
+        const { userDb } = await import('../services/db');
+        const user = await userDb.getUserById(userId);
+        const emailNotifications = schedule.emailNotifications || [];
+        
+        // Send error email instead of running
+        const { emailService } = await import('../services/emailService');
+        await emailService.sendScheduledChatErrorEmail(
+          emailNotifications.length > 0 ? emailNotifications : (user?.email ? [user.email] : []),
+          schedule.scheduleName,
+          disallowedFunctions,
+          schedule.scheduleId
+        );
+        
+        // Create failure result
+        const errorResult = {
+          scheduleId: schedule.scheduleId,
+          runId: require('uuid').v4(),
+          status: 'failure' as const,
+          passed: false,
+          actualResponse: `Scheduled chat cannot run: Required function calls are not allowed by your subscription: ${disallowedFunctions.join(', ')}`,
+          actualFunctionCalls: [],
+          keywordMatches: [],
+          keywordMisses: [],
+          functionCallMatches: [],
+          functionCallMisses: disallowedFunctions,
+          executionTime: 0,
+          sessionId: '',
+          attempt: 0,
+          createdAt: new Date().toISOString()
+        };
+        
+        // Save the error result to database
+        try {
+          await scheduleDb.addRunResult(schedule.scheduleId, errorResult);
+        } catch (error) {
+          console.error('Error saving error run result:', error);
+        }
+        
+        return errorResult;
+      }
+    }
+
     // Create a session for the run
     const sessionTitle = isTest ? `Test: ${schedule.scheduleName}` : `Scheduled: ${schedule.scheduleName}`;
     const testSession = await chatbotDb.createChatSession(
@@ -552,7 +655,6 @@ async function runScheduledChat(
 
     // Convert schedule format to runVerifiedChat format
     const expectedKeywords = schedule.keywords || [];
-    const expectedFunctionCalls = schedule.requiredFunctionCalls || [];
     const functionCallMinCalls = schedule.functionCallMinCalls || {};
 
     const requiredFunctions = expectedFunctionCalls.map((funcName: string) => ({
@@ -619,7 +721,7 @@ async function runScheduledChat(
 
     // Also sync Research Reports execution for email campaigns
     try {
-      if (schedule.emailCampaignTaskId) {
+      if (schedule.emailCampaignTaskId && finalResult.sessionId) {
         await syncEmailCampaignExecution(userId, finalResult.sessionId, schedule.emailCampaignTaskId);
       }
     } catch (err) {
@@ -971,14 +1073,27 @@ export const agentModeController = {
   // Get available function calls for benchmark tests
   async getAvailableFunctionCalls(req: Request, res: Response) {
     try {
+      const user = req.user as User;
       const agentModeService = new AgentModeService();
-      const tools = agentModeService.getAvailableTools();
+      const allTools = agentModeService.getAvailableTools();
+      
+      // For admin users, return all function calls without filtering
+      // For regular users, filter tools based on subscription
+      let toolsToReturn = allTools;
+      if (!user.isAdmin) {
+        const { getAllowedFunctionCalls, filterFunctionCalls } = await import('../services/subscriptionService');
+        const allowedFunctionCalls = await getAllowedFunctionCalls(user.userId);
+        // getAllowedFunctionCalls now always returns an array (never null)
+        toolsToReturn = filterFunctionCalls(allTools, allowedFunctionCalls);
+      }
 
       // Extract function names and descriptions
-      const functionCalls = tools.map((tool: any) => ({
-        name: tool.function.name,
-        description: tool.function.description
-      }));
+      const functionCalls = toolsToReturn
+        .filter((tool: any) => tool.type === 'function')
+        .map((tool: any) => ({
+          name: tool.function.name,
+          description: tool.function.description
+        }));
 
       res.json({ functionCalls });
     } catch (error) {
@@ -2076,40 +2191,44 @@ export const agentModeController = {
             // Decrement concurrent run counter when done
             currentConcurrentRuns--;
 
-            // Send email notification with the result
-            try {
-              // Only send emails if email notifications are specified
-              const emailNotifications = schedule.emailNotifications || [];
-              if (emailNotifications.length > 0) {
-                // Check if this is an hourly schedule with daily digest enabled
-                if (schedule.frequency === 'hourly' && schedule.dailyDigest) {
-                  // Check if this is the last run of the day
-                  const now = new Date();
-                  const nextRunTime = calculateNextRunTime('hourly', now);
-                  const isLastRunOfDay = isLastRunOfDayForHourlySchedule(now, nextRunTime);
+            // Send email notification with the result (only if it actually ran, not if it was blocked)
+            // If result.sessionId is empty, it means the run was blocked due to subscription restrictions
+            if (result.sessionId) {
+              try {
+                // Only send emails if email notifications are specified
+                const emailNotifications = schedule.emailNotifications || [];
+                if (emailNotifications.length > 0) {
+                  // Check if this is an hourly schedule with daily digest enabled
+                  if (schedule.frequency === 'hourly' && schedule.dailyDigest) {
+                    // Check if this is the last run of the day
+                    const now = new Date();
+                    const nextRunTime = calculateNextRunTime('hourly', now);
+                    const isLastRunOfDay = isLastRunOfDayForHourlySchedule(now, nextRunTime);
 
-                  if (isLastRunOfDay) {
-                    // Send daily digest instead of individual email
-                    await sendDailyDigestEmail(schedule, emailNotifications);
+                    if (isLastRunOfDay) {
+                      // Send daily digest instead of individual email
+                      await sendDailyDigestEmail(schedule, emailNotifications);
+                    }
+                    // For hourly schedules with daily digest, don't send individual emails
+                    // Only send the daily digest on the last run of the day
+                  } else {
+                    // Send individual email as usual for non-hourly schedules or hourly without daily digest
+                    await emailService.sendScheduledChatResultEmail(
+                      emailNotifications,
+                      schedule.scheduleName,
+                      result,
+                      schedule.scheduleId
+                    );
                   }
-                  // For hourly schedules with daily digest, don't send individual emails
-                  // Only send the daily digest on the last run of the day
                 } else {
-                  // Send individual email as usual for non-hourly schedules or hourly without daily digest
-                  await emailService.sendScheduledChatResultEmail(
-                    emailNotifications,
-                    schedule.scheduleName,
-                    result,
-                    schedule.scheduleId
-                  );
+                  console.log(`No email notifications configured for schedule ${schedule.scheduleName}, skipping email send`);
                 }
-              } else {
-                console.log(`No email notifications configured for schedule ${schedule.scheduleName}, skipping email send`);
+              } catch (error) {
+                console.error('Error sending scheduled chat result email:', error);
+                // Don't throw error - email failure shouldn't break the scheduled chat execution
               }
-            } catch (error) {
-              console.error('Error sending scheduled chat result email:', error);
-              // Don't throw error - email failure shouldn't break the scheduled chat execution
             }
+            // If result.sessionId is empty, the error email was already sent in runScheduledChat
           }).catch((error) => {
             // Decrement concurrent run counter on error
             currentConcurrentRuns--;

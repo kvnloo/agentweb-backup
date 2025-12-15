@@ -237,9 +237,13 @@ export class AgentModeService {
           });
         }
 
+        // Get available tools filtered by subscription
+        const allTools = this.getAvailableTools();
+        const filteredTools = await this.getFilteredTools(userId, allTools);
+
         // Make LLM call
         const response = await this.callLLM(llmModel, messages, {
-          tools: this.getAvailableTools(),
+          tools: filteredTools,
           tool_choice: 'auto',
           max_completion_tokens: 12384,
           temperature: 0.1
@@ -1928,6 +1932,20 @@ Use the available tools to create tasks in the agent-engine when complex work is
         }
       }
     ];
+  }
+
+  // Get filtered tools based on user's subscription type
+  private async getFilteredTools(userId: string, allTools: any[]): Promise<any[]> {
+    try {
+      const { getAllowedFunctionCalls, filterFunctionCalls } = await import('./subscriptionService');
+      const allowedFunctionCalls = await getAllowedFunctionCalls(userId);
+      // getAllowedFunctionCalls now always returns an array (never null)
+      return filterFunctionCalls(allTools, allowedFunctionCalls);
+    } catch (error) {
+      console.error('Error filtering tools by subscription:', error);
+      // Default to all tools on error
+      return allTools;
+    }
   }
 
   // Extract only the necessary data for the frontend to reduce storage size

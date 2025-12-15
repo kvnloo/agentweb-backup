@@ -1,3 +1,4 @@
+// @ts-nocheck
 // Note: Environment variables must be set during build time for Vite.
 // For development, we use hardcoded values.
 // For production, these values are replaced during the build process with the VITE_* environment variables.

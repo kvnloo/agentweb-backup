@@ -47,6 +47,7 @@ import DOMPurify from "dompurify";
 import ImageModelsSettings from "../components/admin/ImageModelsSettings";
 import DefaultPromptsSettings from "../components/admin/DefaultPromptsSettings";
 import BenchmarksTab from "../components/admin/BenchmarksTab";
+import SubscriptionTypesTab from "../components/admin/SubscriptionTypesTab";
 import {
   UserGrowthChart,
   TaskGrowthChart,
@@ -173,6 +174,7 @@ interface User {
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
+  subscriptionType?: string; // Subscription type for customer portal users
 }
 
 // Define an interface for the task data shown in the admin tasks tab
@@ -502,6 +504,7 @@ export default function AdminDashboard() {
     'default-prompts': 10,
     'benchmarks': 11,
     'gtm-plans': 12,
+    'subscriptions': 13,
   };
   
   // Get initial tab value from URL or default to 0
@@ -562,6 +565,10 @@ export default function AdminDashboard() {
   const [editingCmsTypeUserId, setEditingCmsTypeUserId] = useState<string | null>(null);
   const [currentCmsType, setCurrentCmsType] = useState<"Basehub" | "Webflow" | "">("");
   const [cmsTypeEditLoading, setCmsTypeEditLoading] = useState(false);
+  const [editingSubscriptionTypeUserId, setEditingSubscriptionTypeUserId] = useState<string | null>(null);
+  const [currentSubscriptionType, setCurrentSubscriptionType] = useState<string>("");
+  const [subscriptionTypeEditLoading, setSubscriptionTypeEditLoading] = useState(false);
+  const [availableSubscriptionTypes, setAvailableSubscriptionTypes] = useState<string[]>([]);
   const [delegateAccessLoading, setDelegateAccessLoading] = useState<string | null>(null);
   const [emailToDelete, setEmailToDelete] = useState<string | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -633,8 +640,28 @@ export default function AdminDashboard() {
   useEffect(() => {
     if (tabValue === 2) {
       loadUsers();
+      loadSubscriptionTypes();
     }
   }, [tabValue]);
+
+  // Load subscription types
+  const loadSubscriptionTypes = async () => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/admin/subscription-types'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const types = response.data;
+      // Extract type names, including "Basic" as default
+      const typeNames = types.length > 0 
+        ? types.map((t: any) => t.name)
+        : ['Basic'];
+      setAvailableSubscriptionTypes(typeNames);
+    } catch (error) {
+      console.error('Error loading subscription types:', error);
+      // Default to Basic if loading fails
+      setAvailableSubscriptionTypes(['Basic']);
+    }
+  };
 
   // Load waitlist data only when Waitlist tab (3) is selected
   useEffect(() => {
@@ -1426,10 +1453,46 @@ export default function AdminDashboard() {
         setCurrentCmsType("");
       }
     } catch (error: any) {
-      console.error("Error updating CMS Type:", error);
       setError(error.response?.data?.message || "Failed to update CMS Type");
     } finally {
       setCmsTypeEditLoading(false);
+    }
+  };
+
+  const handleSaveSubscriptionType = async () => {
+    if (!editingSubscriptionTypeUserId) return;
+    
+    try {
+      setSubscriptionTypeEditLoading(true);
+      
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/users/${editingSubscriptionTypeUserId}/subscription-type`),
+        { subscriptionType: currentSubscriptionType || 'Basic' },
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+
+      if (response.status === 200) {
+        // Update the user in the local state without reloading
+        setUsers((prevUsers: User[]) => 
+          prevUsers.map((user: User) => 
+            user.userId === editingSubscriptionTypeUserId 
+              ? { 
+                  ...user, 
+                  subscriptionType: response.data.subscriptionType || 'Basic'
+                }
+              : user
+          )
+        );
+        setSuccess("Subscription Type updated successfully!");
+        setEditingSubscriptionTypeUserId(null);
+        setCurrentSubscriptionType("");
+      }
+    } catch (error: any) {
+      setError(error.response?.data?.message || "Failed to update Subscription Type");
+    } finally {
+      setSubscriptionTypeEditLoading(false);
     }
   };
 
@@ -1552,6 +1615,7 @@ export default function AdminDashboard() {
             <Tab label="Default Prompts" {...a11yProps(10)} />
             <Tab label="Benchmarks" {...a11yProps(11)} />
             <Tab label="GTM Plans" {...a11yProps(12)} />
+            <Tab label="Subscriptions" {...a11yProps(13)} />
           </Tabs>
         </Box>
 
@@ -2109,6 +2173,7 @@ export default function AdminDashboard() {
                   <TableCell>OAuth User</TableCell>
                   <TableCell>Admin</TableCell>
                   <TableCell>Status</TableCell>
+                  <TableCell>Subscription Type</TableCell>
                   <TableCell>Actions</TableCell>
                 </TableRow>
               </TableHead>
@@ -2454,6 +2519,67 @@ export default function AdminDashboard() {
                             }
                             size="small"
                           />
+                        </TableCell>
+                        <TableCell>
+                          {user.roles && user.roles.includes("customer") ? (
+                            <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+                              {editingSubscriptionTypeUserId === user.userId ? (
+                                <>
+                                  <FormControl size="small" sx={{ minWidth: 120 }}>
+                                    <Select
+                                      value={currentSubscriptionType}
+                                      onChange={(e) => setCurrentSubscriptionType(e.target.value)}
+                                      disabled={subscriptionTypeEditLoading}
+                                    >
+                                      {availableSubscriptionTypes.map((type) => (
+                                        <MenuItem key={type} value={type}>
+                                          {type}
+                                        </MenuItem>
+                                      ))}
+                                    </Select>
+                                  </FormControl>
+                                  <IconButton
+                                    size="small"
+                                    onClick={handleSaveSubscriptionType}
+                                    disabled={subscriptionTypeEditLoading}
+                                    color="primary"
+                                  >
+                                    <CheckIcon />
+                                  </IconButton>
+                                  <IconButton
+                                    size="small"
+                                    onClick={() => {
+                                      setEditingSubscriptionTypeUserId(null);
+                                      setCurrentSubscriptionType("");
+                                    }}
+                                    disabled={subscriptionTypeEditLoading}
+                                  >
+                                    <CloseIcon />
+                                  </IconButton>
+                                </>
+                              ) : (
+                                <>
+                                  <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
+                                    {user.subscriptionType || "Basic"}
+                                  </Typography>
+                                  <IconButton
+                                    size="small"
+                                    onClick={() => {
+                                      setEditingSubscriptionTypeUserId(user.userId);
+                                      setCurrentSubscriptionType(user.subscriptionType || "Basic");
+                                    }}
+                                    disabled={subscriptionTypeEditLoading}
+                                  >
+                                    <EditIcon />
+                                  </IconButton>
+                                </>
+                              )}
+                            </Box>
+                          ) : (
+                            <Typography variant="body2" color="text.secondary">
+                              -
+                            </Typography>
+                          )}
                         </TableCell>
                         <TableCell>
                           <Box sx={{ display: "flex", gap: 0.5, alignItems: "center", flexWrap: "nowrap" }}>
@@ -3684,6 +3810,10 @@ export default function AdminDashboard() {
               </TableContainer>
             )}
           </Box>
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={13}>
+          <SubscriptionTypesTab />
         </TabPanel>
       </Paper>
 

@@ -26,6 +26,7 @@ import benchmarkRoutes from "./routes/benchmark";
 import seoRoutes from "./routes/seo";
 import gtmPlanRoutes from "./routes/gtmPlan";
 import crmRoutes from "./routes/crm";
+import subscriptionRoutes from "./routes/subscription";
 
 // Import the new controller
 import {
@@ -126,6 +127,7 @@ app.use("/api/benchmark", benchmarkRoutes);
 app.use("/api/seo", seoRoutes);
 app.use("/api/gtm-plan", gtmPlanRoutes);
 app.use("/api/crm", crmRoutes);
+app.use("/api/subscription", subscriptionRoutes);
 
 // Health check endpoint
 app.get("/", (req, res) => {

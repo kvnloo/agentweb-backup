@@ -126,6 +126,7 @@ export interface User {
   }>;
   resetPasswordToken?: string;
   resetPasswordExpires?: string;
+  subscriptionType?: string; // Subscription type for customer-portal users (defaults to "Basic")
 }
 
 interface UserInteraction {
