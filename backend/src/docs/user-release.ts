@@ -7,6 +7,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-16',
+    changes: [
+      'Fixed Agent Mode Images Not Showing in Ad Images Page',
+      '- Fixed bug where recently created Agent Mode images were not appearing in the Ad Images page',
+    ],
+  },
+  {
     date: '2025-12-15',
     changes: [
       'Added Subscription Types and Access Controls for Customer Portal',

@@ -1712,13 +1712,20 @@ async function getExecutionsWithAssets(
       const agentSessions = agentSessionsResult.sessions || [];
       
       // Process each session to find generate_image tool calls
-      agentSessions.forEach((session: any) => {
-        if (!session.messages || session.archived) {
-          return;
+      // Note: getUserSessions doesn't load messages, so we need to load them for each session
+      for (const session of agentSessions) {
+        if (session.archived) {
+          continue;
+        }
+        
+        // Load messages for this session (messages are stored in AW-ChatMessages table)
+        const sessionWithMessages = await chatbotDb.getChatSession(session.sessionId);
+        if (!sessionWithMessages || !sessionWithMessages.messages) {
+          continue;
         }
         
         // Search through messages for generate_image and upload_image tool calls
-        session.messages.forEach((message: any) => {
+        sessionWithMessages.messages.forEach((message: any) => {
           if (message.metadata?.toolCalls) {
             message.metadata.toolCalls.forEach((toolCall: any) => {
               if ((toolCall.name === 'generate_image' || toolCall.name === 'upload_image') && toolCall.result?.success && toolCall.result?.imageUrl) {
@@ -1726,18 +1733,18 @@ async function getExecutionsWithAssets(
                 const filename = toolCall.result.filename || 'generated-image.png';
                 
                 // Extract timestamp from message or use session updatedAt
-                const timestamp = message.timestamp || message.metadata?.timestamp || session.updatedAt || session.createdAt;
+                const timestamp = message.timestamp || message.metadata?.timestamp || sessionWithMessages.updatedAt || sessionWithMessages.createdAt;
                 
                 // Create a unique key for this session (using sessionId)
-                const sessionKey = `agent-mode-${session.sessionId}`;
+                const sessionKey = `agent-mode-${sessionWithMessages.sessionId}`;
                 
                 if (!result[sessionKey]) {
                   result[sessionKey] = {
                     taskId: sessionKey,
-                    taskName: session.title || 'Agent Mode Session',
-                    createdAt: session.createdAt,
+                    taskName: sessionWithMessages.title || 'Agent Mode Session',
+                    createdAt: sessionWithMessages.createdAt,
                     source: 'agent-mode',
-                    sessionId: session.sessionId,
+                    sessionId: sessionWithMessages.sessionId,
                     executions: []
                   };
                 }
@@ -1749,14 +1756,14 @@ async function getExecutionsWithAssets(
                 
                 if (!existingImage) {
                   // Use a single execution per session to group all images
-                  const executionId = `${session.sessionId}-images`;
+                  const executionId = `${sessionWithMessages.sessionId}-images`;
                   
                   // Check if this execution already exists
                   let execution = result[sessionKey].executions.find((exec: any) => exec.executionId === executionId);
                   
                   // Check favorites and archives from session fields
-                  const isFavorited = session.favorites?.[imageUrl] || false;
-                  const isArchived = session.archives?.[imageUrl] || false;
+                  const isFavorited = sessionWithMessages.favorites?.[imageUrl] || false;
+                  const isArchived = sessionWithMessages.archives?.[imageUrl] || false;
                   
                   // Skip archived images (they will be filtered out, similar to task executions)
                   if (isArchived) {
@@ -1783,7 +1790,7 @@ async function getExecutionsWithAssets(
                     filename: filename,
                     token: '', // Not applicable for agent mode images
                     source: 'agent-mode',
-                    sessionId: session.sessionId,
+                    sessionId: sessionWithMessages.sessionId,
                     generatedAt: timestamp, // Store when this specific image was generated
                     is_favorited: isFavorited,
                     is_archived: false // Always false since we filter out archived images
@@ -1793,7 +1800,7 @@ async function getExecutionsWithAssets(
             });
           }
         });
-      });
+      }
       
       // Calculate latest execution time for agent mode sessions
       Object.keys(result).forEach(key => {
@@ -1828,13 +1835,20 @@ async function getExecutionsWithAssets(
       const agentSessions = agentSessionsResult.sessions || [];
       
       // Process each session to find generate_video tool calls
-      agentSessions.forEach((session: any) => {
-        if (!session.messages || session.archived) {
-          return;
+      // Note: getUserSessions doesn't load messages, so we need to load them for each session
+      for (const session of agentSessions) {
+        if (session.archived) {
+          continue;
+        }
+        
+        // Load messages for this session (messages are stored in AW-ChatMessages table)
+        const sessionWithMessages = await chatbotDb.getChatSession(session.sessionId);
+        if (!sessionWithMessages || !sessionWithMessages.messages) {
+          continue;
         }
         
         // Search through messages for generate_video and upload_video tool calls
-        session.messages.forEach((message: any) => {
+        sessionWithMessages.messages.forEach((message: any) => {
           if (message.metadata?.toolCalls) {
             message.metadata.toolCalls.forEach((toolCall: any) => {
               if ((toolCall.name === 'generate_video' || toolCall.name === 'upload_video') && toolCall.result?.success && toolCall.result?.videoUrl) {
@@ -1842,18 +1856,18 @@ async function getExecutionsWithAssets(
                 const filename = toolCall.result.filename || 'generated-video.mp4';
                 
                 // Extract timestamp from message or use session updatedAt
-                const timestamp = message.timestamp || message.metadata?.timestamp || session.updatedAt || session.createdAt;
+                const timestamp = message.timestamp || message.metadata?.timestamp || sessionWithMessages.updatedAt || sessionWithMessages.createdAt;
                 
                 // Create a unique key for this session (using sessionId)
-                const sessionKey = `agent-mode-${session.sessionId}`;
+                const sessionKey = `agent-mode-${sessionWithMessages.sessionId}`;
                 
                 if (!result[sessionKey]) {
                   result[sessionKey] = {
                     taskId: sessionKey,
-                    taskName: session.title || 'Agent Mode Session',
-                    createdAt: session.createdAt,
+                    taskName: sessionWithMessages.title || 'Agent Mode Session',
+                    createdAt: sessionWithMessages.createdAt,
                     source: 'agent-mode',
-                    sessionId: session.sessionId,
+                    sessionId: sessionWithMessages.sessionId,
                     executions: []
                   };
                 }
@@ -1865,14 +1879,14 @@ async function getExecutionsWithAssets(
                 
                 if (!existingVideo) {
                   // Use a single execution per session to group all videos
-                  const executionId = `${session.sessionId}-videos`;
+                  const executionId = `${sessionWithMessages.sessionId}-videos`;
                   
                   // Check if this execution already exists
                   let execution = result[sessionKey].executions.find((exec: any) => exec.executionId === executionId);
                   
                   // Check favorites and archives from session fields
-                  const isFavorited = session.favorites?.[videoUrl] || false;
-                  const isArchived = session.archives?.[videoUrl] || false;
+                  const isFavorited = sessionWithMessages.favorites?.[videoUrl] || false;
+                  const isArchived = sessionWithMessages.archives?.[videoUrl] || false;
                   
                   // Skip archived videos (they will be filtered out, similar to task executions)
                   if (isArchived) {
@@ -1899,7 +1913,7 @@ async function getExecutionsWithAssets(
                     filename: filename,
                     token: '', // Not applicable for agent mode videos
                     source: 'agent-mode',
-                    sessionId: session.sessionId,
+                    sessionId: sessionWithMessages.sessionId,
                     generatedAt: timestamp, // Store when this specific video was generated
                     is_favorited: isFavorited,
                     is_archived: false // Always false since we filter out archived videos
@@ -1909,7 +1923,7 @@ async function getExecutionsWithAssets(
             });
           }
         });
-      });
+      }
       
       // Calculate latest execution time for agent mode sessions
       Object.keys(result).forEach(key => {

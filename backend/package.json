@@ -1,6 +1,6 @@
 {
   "name": "backend",
-  "version": "19.7.1",
+  "version": "19.7.2",
   "main": "dist/server.js",
   "scripts": {
     "start": "node dist/server.js",
