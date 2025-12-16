@@ -589,7 +589,7 @@ export const taskDb = {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Tasks`,
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt, createVideo, videoModel, imageModel, requireApproval, slackChannel, emailSender, fromName",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseFiles, knowledgeBaseUpdatedAt, createVideo, videoModel, imageModel, requireApproval, slackChannel, emailSender, fromName",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -715,7 +715,7 @@ export const taskDb = {
           taskId,
         },
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, emailFriendlyHtml, repairImageEmbedding, htmlFormatInstructions, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, updateLeadList, createVideo, videoModel, imageModel, leadListIdentifier, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt, requireApproval, slackChannel, sendHtmlReportOnly, emailSender, fromName",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, emailFriendlyHtml, repairImageEmbedding, htmlFormatInstructions, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, updateLeadList, createVideo, videoModel, imageModel, leadListIdentifier, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseFiles, knowledgeBaseUpdatedAt, requireApproval, slackChannel, sendHtmlReportOnly, emailSender, fromName",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -766,6 +766,13 @@ export const taskDb = {
       knowledgeBase?: string;
       knowledgeBaseSize?: number;
       knowledgeBaseType?: "public" | "private";
+      knowledgeBaseFiles?: Array<{
+        filename: string;
+        size: number;
+        url: string;
+        key: string;
+        uploadedAt: string;
+      }>;
       useKnowledgeBase?: boolean;
       updateKnowledgeBase?: boolean;
       updateLeadList?: boolean;
@@ -797,7 +804,17 @@ export const taskDb = {
           // Attribute to be set/updated
           setClauses.push(`#${key} = :${key}`);
           expressionAttributeNames[`#${key}`] = key;
+          // DynamoDB handles arrays and objects automatically, but ensure proper serialization
           expressionAttributeValues[`:${key}`] = value;
+          
+          // Log knowledgeBaseFiles updates for debugging
+          if (key === 'knowledgeBaseFiles') {
+            console.log('Updating knowledgeBaseFiles:', {
+              taskId,
+              filesCount: Array.isArray(value) ? value.length : 0,
+              value: JSON.stringify(value)
+            });
+          }
         }
       });
 
@@ -839,6 +856,17 @@ export const taskDb = {
       }
 
       const result = await dynamodb.update(params).promise();
+      
+      // Log if knowledgeBaseFiles was updated
+      if (updates.knowledgeBaseFiles !== undefined) {
+        console.log('updateTask result:', {
+          taskId,
+          hasAttributes: !!result.Attributes,
+          knowledgeBaseFilesInResult: !!(result.Attributes as any)?.knowledgeBaseFiles,
+          knowledgeBaseFilesCount: (result.Attributes as any)?.knowledgeBaseFiles?.length || 0
+        });
+      }
+      
       return result.Attributes;
     } catch (error) {
       console.error(`[db.ts] Error in updateTask for taskId ${taskId}:`, error);
@@ -1363,6 +1391,7 @@ export const taskDb = {
           name: task.name,
           knowledgeBaseSize: size,
           knowledgeBaseType: task.knowledgeBaseType || 'private',
+          knowledgeBaseFiles: task.knowledgeBaseFiles || [],
           knowledgeBaseUpdatedAt: task.knowledgeBaseUpdatedAt || task.updatedAt || task.createdAt,
           // Include additional fields that might be useful
           updatedAt: task.updatedAt || task.createdAt,

@@ -347,3 +347,6 @@ cd backend && npm list react react-dom
 ### References
 - CVE-2025-55182 Scanner: https://cve-2025-55182.com/
 - React Security Advisory: https://github.com/facebook/react/security
+
+## Dec 15, 2025
+to support pdf file uploads for Knowledge Base, add OCR Parser for PDF file formats so that Vertex AI Search will uses this parser to parse PDF files.
