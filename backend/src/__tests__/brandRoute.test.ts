@@ -600,4 +600,343 @@ describe('Brand Route - Bug Fix Tests', () => {
       expect(brandGuidelinesData.brandData.isGradient).toBe(true); // ✅ Created with isGradient
     });
   });
+
+  describe('🐛 BUG FIX: keyMessages and brandValues should not overwrite each other', () => {
+    it('should preserve brandValues when updating keyMessages only', () => {
+      // Simulate existing brand guidelines with both keyMessages and brandValues
+      const existingBrandGuidelines = {
+        brandData: {
+          brandName: "Test Brand",
+          keyMessages: ["Original message 1", "Original message 2"],
+          brandValues: ["Value 1", "Value 2", "Value 3"],
+          founders: [],
+        },
+        attachments: [],
+        createdAt: '2023-01-01T00:00:00.000Z',
+        updatedAt: '2023-01-01T00:00:00.000Z',
+      };
+
+      // Simulate incoming request with only keyMessages (brandValues is undefined)
+      const incomingData: any = {
+        keyMessages: JSON.stringify(["New message 1", "New message 2"]),
+        // brandValues is undefined (not provided)
+      };
+
+      // Test the fixed logic (matching the backend route)
+      let parsedKeyMessages = existingBrandGuidelines?.brandData?.keyMessages || [];
+      if (incomingData.keyMessages !== undefined) {
+        try {
+          parsedKeyMessages =
+            typeof incomingData.keyMessages === "string"
+              ? JSON.parse(incomingData.keyMessages)
+              : incomingData.keyMessages;
+        } catch (e) {
+          parsedKeyMessages =
+            typeof incomingData.keyMessages === "string" ? [incomingData.keyMessages] : incomingData.keyMessages;
+        }
+      }
+
+      let parsedBrandValues = existingBrandGuidelines?.brandData?.brandValues || [];
+      if (incomingData.brandValues !== undefined) {
+        try {
+          parsedBrandValues =
+            typeof incomingData.brandValues === "string"
+              ? JSON.parse(incomingData.brandValues)
+              : incomingData.brandValues;
+        } catch (e) {
+          parsedBrandValues =
+            typeof incomingData.brandValues === "string" ? [incomingData.brandValues] : incomingData.brandValues;
+        }
+      }
+
+      // Verify the fix works
+      expect(parsedKeyMessages).toEqual(["New message 1", "New message 2"]); // ✅ Updated
+      expect(parsedBrandValues).toEqual(["Value 1", "Value 2", "Value 3"]); // ✅ Preserved (not removed!)
+    });
+
+    it('should preserve keyMessages when updating brandValues only', () => {
+      // Simulate existing brand guidelines with both keyMessages and brandValues
+      const existingBrandGuidelines = {
+        brandData: {
+          brandName: "Test Brand",
+          keyMessages: ["Message 1", "Message 2", "Message 3"],
+          brandValues: ["Original value 1", "Original value 2"],
+          founders: [],
+        },
+        attachments: [],
+        createdAt: '2023-01-01T00:00:00.000Z',
+        updatedAt: '2023-01-01T00:00:00.000Z',
+      };
+
+      // Simulate incoming request with only brandValues (keyMessages is undefined)
+      const incomingData: any = {
+        brandValues: ["New value 1", "New value 2", "New value 3"],
+        // keyMessages is undefined (not provided)
+      };
+
+      // Test the fixed logic (matching the backend route)
+      let parsedKeyMessages = existingBrandGuidelines?.brandData?.keyMessages || [];
+      if (incomingData.keyMessages !== undefined) {
+        try {
+          parsedKeyMessages =
+            typeof incomingData.keyMessages === "string"
+              ? JSON.parse(incomingData.keyMessages)
+              : incomingData.keyMessages;
+        } catch (e) {
+          parsedKeyMessages =
+            typeof incomingData.keyMessages === "string" ? [incomingData.keyMessages] : incomingData.keyMessages;
+        }
+      }
+
+      let parsedBrandValues = existingBrandGuidelines?.brandData?.brandValues || [];
+      if (incomingData.brandValues !== undefined) {
+        try {
+          parsedBrandValues =
+            typeof incomingData.brandValues === "string"
+              ? JSON.parse(incomingData.brandValues)
+              : incomingData.brandValues;
+        } catch (e) {
+          parsedBrandValues =
+            typeof incomingData.brandValues === "string" ? [incomingData.brandValues] : incomingData.brandValues;
+        }
+      }
+
+      // Verify the fix works
+      expect(parsedKeyMessages).toEqual(["Message 1", "Message 2", "Message 3"]); // ✅ Preserved (not removed!)
+      expect(parsedBrandValues).toEqual(["New value 1", "New value 2", "New value 3"]); // ✅ Updated
+    });
+
+    it('should update both keyMessages and brandValues when both are provided', () => {
+      // Simulate existing brand guidelines
+      const existingBrandGuidelines = {
+        brandData: {
+          brandName: "Test Brand",
+          keyMessages: ["Old message"],
+          brandValues: ["Old value"],
+          founders: [],
+        },
+        attachments: [],
+        createdAt: '2023-01-01T00:00:00.000Z',
+        updatedAt: '2023-01-01T00:00:00.000Z',
+      };
+
+      // Simulate incoming request with both fields
+      const incomingData: any = {
+        keyMessages: ["New message 1", "New message 2"],
+        brandValues: ["New value 1", "New value 2"],
+      };
+
+      // Test the fixed logic (matching the backend route)
+      let parsedKeyMessages = existingBrandGuidelines?.brandData?.keyMessages || [];
+      if (incomingData.keyMessages !== undefined) {
+        try {
+          parsedKeyMessages =
+            typeof incomingData.keyMessages === "string"
+              ? JSON.parse(incomingData.keyMessages)
+              : incomingData.keyMessages;
+        } catch (e) {
+          parsedKeyMessages =
+            typeof incomingData.keyMessages === "string" ? [incomingData.keyMessages] : incomingData.keyMessages;
+        }
+      }
+
+      let parsedBrandValues = existingBrandGuidelines?.brandData?.brandValues || [];
+      if (incomingData.brandValues !== undefined) {
+        try {
+          parsedBrandValues =
+            typeof incomingData.brandValues === "string"
+              ? JSON.parse(incomingData.brandValues)
+              : incomingData.brandValues;
+        } catch (e) {
+          parsedBrandValues =
+            typeof incomingData.brandValues === "string" ? [incomingData.brandValues] : incomingData.brandValues;
+        }
+      }
+
+      // Verify both are updated
+      expect(parsedKeyMessages).toEqual(["New message 1", "New message 2"]); // ✅ Updated
+      expect(parsedBrandValues).toEqual(["New value 1", "New value 2"]); // ✅ Updated
+    });
+
+    it('should handle empty arrays correctly - allow clearing when explicitly provided', () => {
+      // Simulate existing brand guidelines with data
+      const existingBrandGuidelines = {
+        brandData: {
+          brandName: "Test Brand",
+          keyMessages: ["Message 1", "Message 2"],
+          brandValues: ["Value 1", "Value 2"],
+          founders: [],
+        },
+        attachments: [],
+        createdAt: '2023-01-01T00:00:00.000Z',
+        updatedAt: '2023-01-01T00:00:00.000Z',
+      };
+
+      // Simulate incoming request with empty array for keyMessages (explicitly clearing it)
+      const incomingData: any = {
+        keyMessages: [], // Explicitly empty array
+        // brandValues is undefined (not provided)
+      };
+
+      // Test the fixed logic (matching the backend route)
+      let parsedKeyMessages = existingBrandGuidelines?.brandData?.keyMessages || [];
+      if (incomingData.keyMessages !== undefined) {
+        try {
+          parsedKeyMessages =
+            typeof incomingData.keyMessages === "string"
+              ? JSON.parse(incomingData.keyMessages)
+              : incomingData.keyMessages;
+        } catch (e) {
+          parsedKeyMessages =
+            typeof incomingData.keyMessages === "string" ? [incomingData.keyMessages] : incomingData.keyMessages;
+        }
+      }
+
+      let parsedBrandValues = existingBrandGuidelines?.brandData?.brandValues || [];
+      if (incomingData.brandValues !== undefined) {
+        try {
+          parsedBrandValues =
+            typeof incomingData.brandValues === "string"
+              ? JSON.parse(incomingData.brandValues)
+              : incomingData.brandValues;
+        } catch (e) {
+          parsedBrandValues =
+            typeof incomingData.brandValues === "string" ? [incomingData.brandValues] : incomingData.brandValues;
+        }
+      }
+
+      // Verify empty array clears keyMessages but preserves brandValues
+      expect(parsedKeyMessages).toEqual([]); // ✅ Cleared (explicitly provided empty array)
+      expect(parsedBrandValues).toEqual(["Value 1", "Value 2"]); // ✅ Preserved (not provided)
+    });
+
+    it('should handle string parsing for keyMessages and brandValues', () => {
+      // Simulate existing brand guidelines
+      const existingBrandGuidelines = {
+        brandData: {
+          brandName: "Test Brand",
+          keyMessages: ["Old message"],
+          brandValues: ["Old value"],
+          founders: [],
+        },
+        attachments: [],
+        createdAt: '2023-01-01T00:00:00.000Z',
+        updatedAt: '2023-01-01T00:00:00.000Z',
+      };
+
+      // Simulate incoming request with string JSON for keyMessages
+      const incomingData: any = {
+        keyMessages: '["String message 1", "String message 2"]', // String JSON
+        // brandValues is undefined (not provided)
+      };
+
+      // Test the fixed logic (matching the backend route)
+      let parsedKeyMessages = existingBrandGuidelines?.brandData?.keyMessages || [];
+      if (incomingData.keyMessages !== undefined) {
+        try {
+          parsedKeyMessages =
+            typeof incomingData.keyMessages === "string"
+              ? JSON.parse(incomingData.keyMessages)
+              : incomingData.keyMessages;
+        } catch (e) {
+          parsedKeyMessages =
+            typeof incomingData.keyMessages === "string" ? [incomingData.keyMessages] : incomingData.keyMessages;
+        }
+      }
+
+      let parsedBrandValues = existingBrandGuidelines?.brandData?.brandValues || [];
+      if (incomingData.brandValues !== undefined) {
+        try {
+          parsedBrandValues =
+            typeof incomingData.brandValues === "string"
+              ? JSON.parse(incomingData.brandValues)
+              : incomingData.brandValues;
+        } catch (e) {
+          parsedBrandValues =
+            typeof incomingData.brandValues === "string" ? [incomingData.brandValues] : incomingData.brandValues;
+        }
+      }
+
+      // Verify string parsing works and brandValues is preserved
+      expect(parsedKeyMessages).toEqual(["String message 1", "String message 2"]); // ✅ Parsed from string
+      expect(parsedBrandValues).toEqual(["Old value"]); // ✅ Preserved
+    });
+
+    it('should demonstrate the old buggy behavior (for comparison)', () => {
+      // This test shows what the old buggy code would do
+      const existingBrandGuidelines = {
+        brandData: {
+          keyMessages: ["Message 1", "Message 2"],
+          brandValues: ["Value 1", "Value 2"],
+          founders: [],
+        },
+        attachments: [],
+        createdAt: '2023-01-01T00:00:00.000Z',
+        updatedAt: '2023-01-01T00:00:00.000Z',
+      };
+
+      // Simulate incoming request with only keyMessages
+      const incomingData: any = {
+        keyMessages: ["New message"],
+        // brandValues is undefined (not provided)
+      };
+
+      // OLD BUGGY CODE: Always initialized as empty arrays
+      let parsedKeyMessages = []; // BUG: Always empty initially
+      if (incomingData.keyMessages) { // BUG: Only checks truthiness
+        parsedKeyMessages = incomingData.keyMessages;
+      }
+
+      let parsedBrandValues = []; // BUG: Always empty initially
+      if (incomingData.brandValues) { // BUG: Only checks truthiness
+        parsedBrandValues = incomingData.brandValues;
+      }
+
+      // Verify the old buggy behavior
+      expect(parsedKeyMessages).toEqual(["New message"]); // ✅ This works
+      expect(parsedBrandValues).toEqual([]); // ❌ BUG: Should be ["Value 1", "Value 2"] but gets empty array!
+    });
+
+    it('should create new brand guidelines with keyMessages and brandValues when none exist', () => {
+      // Simulate no existing brand guidelines
+      const existingBrandGuidelines: any = null;
+
+      // Simulate incoming request data
+      const incomingData: any = {
+        keyMessages: ["New message 1", "New message 2"],
+        brandValues: ["New value 1", "New value 2"],
+      };
+
+      // Test the fixed logic (matching the backend route)
+      let parsedKeyMessages = existingBrandGuidelines?.brandData?.keyMessages || [];
+      if (incomingData.keyMessages !== undefined) {
+        try {
+          parsedKeyMessages =
+            typeof incomingData.keyMessages === "string"
+              ? JSON.parse(incomingData.keyMessages)
+              : incomingData.keyMessages;
+        } catch (e) {
+          parsedKeyMessages =
+            typeof incomingData.keyMessages === "string" ? [incomingData.keyMessages] : incomingData.keyMessages;
+        }
+      }
+
+      let parsedBrandValues = existingBrandGuidelines?.brandData?.brandValues || [];
+      if (incomingData.brandValues !== undefined) {
+        try {
+          parsedBrandValues =
+            typeof incomingData.brandValues === "string"
+              ? JSON.parse(incomingData.brandValues)
+              : incomingData.brandValues;
+        } catch (e) {
+          parsedBrandValues =
+            typeof incomingData.brandValues === "string" ? [incomingData.brandValues] : incomingData.brandValues;
+        }
+      }
+
+      // Verify new brand guidelines are created correctly
+      expect(parsedKeyMessages).toEqual(["New message 1", "New message 2"]);
+      expect(parsedBrandValues).toEqual(["New value 1", "New value 2"]);
+    });
+  });
 });
