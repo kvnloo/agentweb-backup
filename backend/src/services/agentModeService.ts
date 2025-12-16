@@ -2293,23 +2293,20 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'list_knowledge_base_files':
         return {
           success: true,
-          message: 'Found 2 mock knowledge base file(s)',
-          files: [
+          message: 'Found 1 mock knowledge base with files',
+          knowledge_bases: [
             {
-              file_identifier: 'mock-task-1',
-              name: 'Mock Product Specifications',
-              size: 1024,
+              identifier: 'mock-task-1',
+              name: 'Mock Knowledge Base',
               type: 'private',
-              updatedAt: new Date().toISOString()
-            },
-            {
-              file_identifier: 'mock-task-2',
-              name: 'Mock Company Guidelines',
-              size: 2048,
-              type: 'public',
-              updatedAt: new Date(Date.now() - 86400000).toISOString()
+              updatedAt: new Date().toISOString(),
+              files: [
+                { fileName: 'knowledge-base.txt', fileSize: 1024 },
+                { fileName: 'uploaded-guide.pdf', fileSize: 2048 }
+              ]
             }
           ],
+          totalKnowledgeBases: 1,
           totalFiles: 2
         };
 
@@ -6279,7 +6276,7 @@ ${emailDraftFormat === 'text'
         } catch (err: any) {
           results.push({
             success: false,
-            message: err?.message || 'Failed to read knowledge base file'
+            message: `Failed to read knowledge base file: ${err?.message || 'Unknown error'}`
           });
         }
       }
