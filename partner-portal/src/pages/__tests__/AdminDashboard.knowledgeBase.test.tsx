@@ -1,16 +1,17 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
+import "@testing-library/jest-dom";
 import { MemoryRouter } from "react-router-dom";
 import AdminDashboard from "../AdminDashboard";
 import axios from "axios";
 
-jest.mock("../contexts/AuthContext", () => ({
+jest.mock("../../contexts/AuthContext", () => ({
   useAuth: () => ({
     token: "test-token",
     user: { isAdmin: true },
   }),
 }));
 
-jest.mock("../contexts/AdminContext", () => ({
+jest.mock("../../contexts/AdminContext", () => ({
   useAdmin: () => ({
     users: [],
     waitlist: [],
@@ -30,11 +31,11 @@ jest.mock("../contexts/AdminContext", () => ({
   }),
 }));
 
-jest.mock("../components/admin/ImageModelsSettings", () => () => <div data-testid="mock-image-models" />);
-jest.mock("../components/admin/DefaultPromptsSettings", () => () => <div data-testid="mock-default-prompts" />);
-jest.mock("../components/admin/BenchmarksTab", () => () => <div data-testid="mock-benchmarks" />);
-jest.mock("../components/admin/SubscriptionTypesTab", () => () => <div data-testid="mock-subscriptions" />);
-jest.mock("../components/admin/AdminCharts", () => ({
+jest.mock("../../components/admin/ImageModelsSettings", () => () => <div data-testid="mock-image-models" />);
+jest.mock("../../components/admin/DefaultPromptsSettings", () => () => <div data-testid="mock-default-prompts" />);
+jest.mock("../../components/admin/BenchmarksTab", () => () => <div data-testid="mock-benchmarks" />);
+jest.mock("../../components/admin/SubscriptionTypesTab", () => () => <div data-testid="mock-subscriptions" />);
+jest.mock("../../components/admin/AdminCharts", () => ({
   UserGrowthChart: () => <div data-testid="mock-chart" />,
   TaskGrowthChart: () => <div data-testid="mock-chart" />,
   ExecutionTrendsChart: () => <div data-testid="mock-chart" />,
@@ -53,7 +54,7 @@ jest.mock("react-router-dom", () => {
   };
 });
 
-jest.mock("../config", () => ({
+jest.mock("../../config", () => ({
   buildApiUrl: (path: string) => `https://api.test${path}`,
   CUSTOMER_FRONTEND_URL: "https://customer.test",
 }));
@@ -148,9 +149,12 @@ describe("AdminDashboard Knowledge Base metrics", () => {
     expect(screen.getByText('1 files (1 tasks)')).toBeInTheDocument();
 
     // Task rows include uploaded file counts
-    expect(screen.getByText('Task One')).toBeInTheDocument();
-    expect(screen.getByText('3')).toBeInTheDocument(); // uploadedFilesCount for task-1
-    expect(screen.getByText('Task Two')).toBeInTheDocument();
-    expect(screen.getByText('1')).toBeInTheDocument(); // uploadedFilesCount for task-2
+    const taskOneRow = screen.getByText('Task One').closest('tr') as HTMLElement;
+    expect(taskOneRow).toBeInTheDocument();
+    expect(within(taskOneRow).getByText('3')).toBeInTheDocument();
+
+    const taskTwoRow = screen.getByText('Task Two').closest('tr') as HTMLElement;
+    expect(taskTwoRow).toBeInTheDocument();
+    expect(within(taskTwoRow).getByText('1')).toBeInTheDocument();
   });
 });
