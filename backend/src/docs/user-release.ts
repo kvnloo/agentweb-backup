@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-17',
+    changes: [
+      'Increased Video File Upload Limit to 100MB',
+      '- Video file uploads on the Ad Videos page now support files up to 100MB (previously 18MB)',
+      '- Other file types (images, documents, etc.) continue to use the 18MB limit',
+    ],
+  },
+  {
     date: '2025-12-16',
     changes: [
       'Added uploaded file support for Knowledge Base',

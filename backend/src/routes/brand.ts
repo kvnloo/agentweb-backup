@@ -5,6 +5,7 @@ import { v4 as uuidv4 } from "uuid";
 import multer from "multer";
 import { S3 } from "aws-sdk";
 import crypto from "crypto";
+import { MAX_FILE_SIZE } from "../config";
 
 const router = Router();
 const dynamodb = new DynamoDB.DocumentClient();
@@ -18,7 +19,7 @@ const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 18 * 1024 * 1024, // 18MB limit
+    fileSize: MAX_FILE_SIZE, // 100MB limit to match global upload cap
   },
 });
 

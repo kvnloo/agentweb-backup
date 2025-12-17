@@ -26,7 +26,7 @@ const router = express.Router();
 const upload = multer({ 
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: MAX_FILE_SIZE, // 18 * 1024 * 1024 (18MB limit to support video uploads, images are validated to 10MB in frontend)
+    fileSize: MAX_FILE_SIZE, // 100MB limit to support larger video uploads
   },
 });
 
