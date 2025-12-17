@@ -3,9 +3,13 @@ import { authenticateToken, AuthenticatedRequest, requireAdmin } from '../middle
 import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import multer from 'multer';
+import { MAX_FILE_SIZE } from '../config';
 
 const router = express.Router();
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({ 
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_FILE_SIZE }, // enforce global upload cap (100MB)
+});
 
 // Helper function to wrap async handlers
 const asyncHandler = (fn: (req: Request, res: Response, next: express.NextFunction) => Promise<any>) => {
