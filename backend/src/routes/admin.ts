@@ -1593,6 +1593,22 @@ router.get("/knowledge-base-metrics", async (req, res) => {
     }, 0);
     
     const averageKnowledgeBaseSize = tasksWithKnowledgeBase > 0 ? totalKnowledgeBaseSize / tasksWithKnowledgeBase : 0;
+
+    // Uploaded files metrics (from knowledgeBaseFiles array)
+    const getUploadedFileStats = (task: any) => {
+      const files = (task as any).knowledgeBaseFiles || [];
+      const count = Array.isArray(files) ? files.length : 0;
+      const size = Array.isArray(files)
+        ? files.reduce((sum: number, f: any) => sum + (typeof f?.size === 'number' ? f.size : 0), 0)
+        : 0;
+      return { count, size };
+    };
+
+    const totalUploadedFiles = tasks.reduce((sum, task) => sum + getUploadedFileStats(task).count, 0);
+    const totalUploadedFilesSize = tasks.reduce((sum, task) => sum + getUploadedFileStats(task).size, 0);
+    const tasksWithUploadedFiles = tasks.filter(task => getUploadedFileStats(task).count > 0).length;
+    const averageUploadedFilesPerTask = tasksWithUploadedFiles > 0 ? totalUploadedFiles / tasksWithUploadedFiles : 0;
+    const averageUploadedFileSizePerTask = tasksWithUploadedFiles > 0 ? totalUploadedFilesSize / tasksWithUploadedFiles : 0;
     
     // Calculate public knowledge base metrics
     const publicTasks = tasks.filter(task => task.knowledgeBaseType === 'public');
@@ -1605,6 +1621,21 @@ router.get("/knowledge-base-metrics", async (req, res) => {
       return sum + size;
     }, 0);
     const averagePublicKnowledgeBaseSize = publicTasksWithKnowledgeBase > 0 ? totalPublicKnowledgeBaseSize / publicTasksWithKnowledgeBase : 0;
+
+    const publicUploaded = publicTasks.reduce(
+      (acc, task) => {
+        const { count, size } = getUploadedFileStats(task);
+        acc.count += count;
+        acc.size += size;
+        if (count > 0) acc.tasksWithFiles += 1;
+        return acc;
+      },
+      { count: 0, size: 0, tasksWithFiles: 0 }
+    );
+    const averagePublicUploadedFilesPerTask =
+      publicUploaded.tasksWithFiles > 0 ? publicUploaded.count / publicUploaded.tasksWithFiles : 0;
+    const averagePublicUploadedSizePerTask =
+      publicUploaded.tasksWithFiles > 0 ? publicUploaded.size / publicUploaded.tasksWithFiles : 0;
     
     // Calculate private knowledge base metrics
     const privateTasks = tasks.filter(task => task.knowledgeBaseType === 'private');
@@ -1617,6 +1648,21 @@ router.get("/knowledge-base-metrics", async (req, res) => {
       return sum + size;
     }, 0);
     const averagePrivateKnowledgeBaseSize = privateTasksWithKnowledgeBase > 0 ? totalPrivateKnowledgeBaseSize / privateTasksWithKnowledgeBase : 0;
+
+    const privateUploaded = privateTasks.reduce(
+      (acc, task) => {
+        const { count, size } = getUploadedFileStats(task);
+        acc.count += count;
+        acc.size += size;
+        if (count > 0) acc.tasksWithFiles += 1;
+        return acc;
+      },
+      { count: 0, size: 0, tasksWithFiles: 0 }
+    );
+    const averagePrivateUploadedFilesPerTask =
+      privateUploaded.tasksWithFiles > 0 ? privateUploaded.count / privateUploaded.tasksWithFiles : 0;
+    const averagePrivateUploadedSizePerTask =
+      privateUploaded.tasksWithFiles > 0 ? privateUploaded.size / privateUploaded.tasksWithFiles : 0;
     
     // Get tasks with knowledge base details (only those with size > 0)
     const tasksWithDetails = tasks
@@ -1626,12 +1672,15 @@ router.get("/knowledge-base-metrics", async (req, res) => {
       })
       .map(task => {
         const size = typeof task.knowledgeBaseSize === 'string' ? parseInt(task.knowledgeBaseSize) : (task.knowledgeBaseSize || 0);
+        const { count: uploadedFilesCount, size: uploadedFilesSize } = getUploadedFileStats(task);
         return {
           taskId: task.taskId,
           name: task.name,
           knowledgeBaseSize: size,
           owner: task.userId,
-          type: task.knowledgeBaseType || 'private'
+          type: task.knowledgeBaseType || 'private',
+          uploadedFilesCount,
+          uploadedFilesSize,
         };
       });
 
@@ -1640,17 +1689,38 @@ router.get("/knowledge-base-metrics", async (req, res) => {
       tasksWithKnowledgeBase,
       totalKnowledgeBaseSize,
       averageKnowledgeBaseSize,
+      uploadedFiles: {
+        totalFiles: totalUploadedFiles,
+        totalSize: totalUploadedFilesSize,
+        tasksWithUploadedFiles,
+        averageFilesPerTask: averageUploadedFilesPerTask,
+        averageSizePerTask: averageUploadedFileSizePerTask,
+      },
       public: {
         tasks: publicTasks.length,
         tasksWithKnowledgeBase: publicTasksWithKnowledgeBase,
         totalSize: totalPublicKnowledgeBaseSize,
-        averageSize: averagePublicKnowledgeBaseSize
+        averageSize: averagePublicKnowledgeBaseSize,
+        uploadedFiles: {
+          totalFiles: publicUploaded.count,
+          totalSize: publicUploaded.size,
+          tasksWithUploadedFiles: publicUploaded.tasksWithFiles,
+          averageFilesPerTask: averagePublicUploadedFilesPerTask,
+          averageSizePerTask: averagePublicUploadedSizePerTask,
+        },
       },
       private: {
         tasks: privateTasks.length,
         tasksWithKnowledgeBase: privateTasksWithKnowledgeBase,
         totalSize: totalPrivateKnowledgeBaseSize,
-        averageSize: averagePrivateKnowledgeBaseSize
+        averageSize: averagePrivateKnowledgeBaseSize,
+        uploadedFiles: {
+          totalFiles: privateUploaded.count,
+          totalSize: privateUploaded.size,
+          tasksWithUploadedFiles: privateUploaded.tasksWithFiles,
+          averageFilesPerTask: averagePrivateUploadedFilesPerTask,
+          averageSizePerTask: averagePrivateUploadedSizePerTask,
+        },
       },
       tasks: tasksWithDetails
     });

@@ -72,6 +72,7 @@ describe('Knowledge Base All Endpoint - GET /api/tasks/knowledge-base/all', () =
         name: 'Task 3',
         knowledgeBaseSize: 1024,
         knowledgeBaseType: 'public',
+        knowledgeBaseFiles: [],
         knowledgeBaseUpdatedAt: '2024-01-02T00:00:00Z'
       });
     });
@@ -175,6 +176,7 @@ describe('Knowledge Base All Endpoint - GET /api/tasks/knowledge-base/all', () =
         name: 'Task 1',
         knowledgeBaseSize: 100,
         knowledgeBaseType: 'public',
+        knowledgeBaseFiles: [],
         knowledgeBaseUpdatedAt: '2024-01-01T00:00:00Z'
       });
       expect(response.body[0]).not.toHaveProperty('prompt');

@@ -215,17 +215,38 @@ interface KnowledgeBaseMetrics {
   tasksWithKnowledgeBase: number;
   totalKnowledgeBaseSize: number;
   averageKnowledgeBaseSize: number;
+  uploadedFiles: {
+    totalFiles: number;
+    totalSize: number;
+    tasksWithUploadedFiles: number;
+    averageFilesPerTask: number;
+    averageSizePerTask: number;
+  };
   public: {
     tasks: number;
     tasksWithKnowledgeBase: number;
     totalSize: number;
     averageSize: number;
+    uploadedFiles: {
+      totalFiles: number;
+      totalSize: number;
+      tasksWithUploadedFiles: number;
+      averageFilesPerTask: number;
+      averageSizePerTask: number;
+    };
   };
   private: {
     tasks: number;
     tasksWithKnowledgeBase: number;
     totalSize: number;
     averageSize: number;
+    uploadedFiles: {
+      totalFiles: number;
+      totalSize: number;
+      tasksWithUploadedFiles: number;
+      averageFilesPerTask: number;
+      averageSizePerTask: number;
+    };
   };
   tasks: {
     taskId: string;
@@ -233,6 +254,8 @@ interface KnowledgeBaseMetrics {
     knowledgeBaseSize: number;
     owner: string;
     type: "public" | "private";
+    uploadedFilesCount?: number;
+    uploadedFilesSize?: number;
   }[];
 }
 
@@ -3487,6 +3510,8 @@ export default function AdminDashboard() {
                           <TableCell>Tasks with Knowledge Base</TableCell>
                           <TableCell>Total Size</TableCell>
                           <TableCell>Average Size</TableCell>
+                          <TableCell>Uploaded Files</TableCell>
+                          <TableCell>Uploaded Size</TableCell>
                         </TableRow>
                       </TableHead>
                       <TableBody>
@@ -3511,6 +3536,13 @@ export default function AdminDashboard() {
                                 ).toFixed(2)}{" "}
                                 KB
                               </TableCell>
+                              <TableCell>
+                                {knowledgeBaseMetrics.uploadedFiles.totalFiles} files (
+                                {knowledgeBaseMetrics.uploadedFiles.tasksWithUploadedFiles} tasks)
+                              </TableCell>
+                              <TableCell>
+                                {(knowledgeBaseMetrics.uploadedFiles.totalSize / 1024).toFixed(2)} KB
+                              </TableCell>
                             </TableRow>
                             <TableRow>
                               <TableCell>Public</TableCell>
@@ -3531,6 +3563,13 @@ export default function AdminDashboard() {
                                   knowledgeBaseMetrics.public.averageSize / 1024
                                 ).toFixed(2)}{" "}
                                 KB
+                              </TableCell>
+                              <TableCell>
+                                {knowledgeBaseMetrics.public.uploadedFiles.totalFiles} files (
+                                {knowledgeBaseMetrics.public.uploadedFiles.tasksWithUploadedFiles} tasks)
+                              </TableCell>
+                              <TableCell>
+                                {(knowledgeBaseMetrics.public.uploadedFiles.totalSize / 1024).toFixed(2)} KB
                               </TableCell>
                             </TableRow>
                             <TableRow>
@@ -3554,11 +3593,18 @@ export default function AdminDashboard() {
                                 ).toFixed(2)}{" "}
                                 KB
                               </TableCell>
+                              <TableCell>
+                                {knowledgeBaseMetrics.private.uploadedFiles.totalFiles} files (
+                                {knowledgeBaseMetrics.private.uploadedFiles.tasksWithUploadedFiles} tasks)
+                              </TableCell>
+                              <TableCell>
+                                {(knowledgeBaseMetrics.private.uploadedFiles.totalSize / 1024).toFixed(2)} KB
+                              </TableCell>
                             </TableRow>
                           </>
                         ) : (
                           <TableRow>
-                            <TableCell colSpan={5} align="center">
+                            <TableCell colSpan={7} align="center">
                               <Typography
                                 variant="body2"
                                 color="text.secondary"
@@ -3590,6 +3636,8 @@ export default function AdminDashboard() {
                           <TableCell>Owner</TableCell>
                           <TableCell>Type</TableCell>
                           <TableCell>Knowledge Base Size</TableCell>
+                          <TableCell>Uploaded Files</TableCell>
+                          <TableCell>Uploaded Size</TableCell>
                           <TableCell>Actions</TableCell>
                         </TableRow>
                       </TableHead>
@@ -3619,6 +3667,12 @@ export default function AdminDashboard() {
                                 {(task.knowledgeBaseSize / 1024).toFixed(2)} KB
                               </TableCell>
                               <TableCell>
+                                {task.uploadedFilesCount ?? 0}
+                              </TableCell>
+                              <TableCell>
+                                {((task.uploadedFilesSize || 0) / 1024).toFixed(2)} KB
+                              </TableCell>
+                              <TableCell>
                                 <Button
                                   size="small"
                                   component={RouterLink}
@@ -3632,7 +3686,7 @@ export default function AdminDashboard() {
                           ))
                         ) : (
                           <TableRow>
-                            <TableCell colSpan={6} align="center">
+                            <TableCell colSpan={8} align="center">
                               <Typography
                                 variant="body2"
                                 color="text.secondary"

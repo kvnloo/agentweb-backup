@@ -9,6 +9,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2025-12-16',
     changes: [
+      'Added uploaded file support for Knowledge Base',
+      '- Knowledge bases now store uploaded files (PDF, DOCX, PPTX, XLSX, etc.) alongside the default knowledge-base.txt',
+      '- Customer Portal edit dialog shows uploaded files with size, date, and delete support; uploads respect the 18MB limit',
+      '- Partner Portal admin Knowledge Base tab now reports uploaded file counts and sizes for overall/public/private and per task',
+      '- Agent Mode can read the uploaded files using read_knowledge_base_files function',
       'Fixed Agent Mode Images Not Showing in Ad Images Page',
       '- Fixed bug where recently created Agent Mode images were not appearing in the Ad Images page',
     ],

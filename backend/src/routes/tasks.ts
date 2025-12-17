@@ -15,6 +15,8 @@ import AWS from 'aws-sdk';
 import { dynamodb } from '../config/aws';
 import { TABLE_PREFIX } from '../config/constants';
 import { ChatbotDB } from '../services/chatbotService';
+import { MAX_FILE_SIZE } from '../config';
+import { isSupportedFileType, getContentType } from '../utils/fileProcessor';
 
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
@@ -24,7 +26,7 @@ const router = express.Router();
 const upload = multer({ 
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 18 * 1024 * 1024, // 18MB limit (to support video uploads, images are validated to 10MB in frontend)
+    fileSize: MAX_FILE_SIZE, // 18 * 1024 * 1024 (18MB limit to support video uploads, images are validated to 10MB in frontend)
   },
 });
 
@@ -1016,6 +1018,7 @@ router.get('/knowledge-base/all', authenticateToken, async (req: Request, res: R
       name: task.name,
       knowledgeBaseSize: task.knowledgeBaseSize,
       knowledgeBaseType: task.knowledgeBaseType,
+      knowledgeBaseFiles: task.knowledgeBaseFiles || [],
       knowledgeBaseUpdatedAt: task.knowledgeBaseUpdatedAt,
     }));
 
@@ -1043,6 +1046,16 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
     if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
       return res.status(403).json({ message: 'Not authorized to access this task' });
     }
+
+    // Include knowledgeBaseFiles in the response
+    const knowledgeBaseFiles = (task as any).knowledgeBaseFiles || [];
+    
+    console.log('GET knowledge-base - Retrieved task:', {
+      taskId,
+      hasKnowledgeBaseFiles: !!(task as any).knowledgeBaseFiles,
+      knowledgeBaseFilesCount: knowledgeBaseFiles.length,
+      knowledgeBaseFiles: JSON.stringify(knowledgeBaseFiles)
+    });
 
     // If knowledgeBaseType is not set, determine it based on file content
     if (!task.knowledgeBaseType) {
@@ -1074,7 +1087,7 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
     // Check if file exists
     const [exists] = await file.exists();
     let contentStr = '';
-    let url = '';
+    let signedUrl = '';
     let size = 0;
     if (exists) {
       // If file exists, get its content and size
@@ -1087,6 +1100,7 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
         action: 'read',
         expires: '03-01-2500' // Far future expiration
       });
+      signedUrl = url;
     }
     // Update size if it doesn't match
     if (size !== task.knowledgeBaseSize) {
@@ -1098,7 +1112,8 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
     
     res.json({ 
       content: contentStr, 
-      url: task.knowledgeBase || url,
+      url: task.knowledgeBase || signedUrl,
+      knowledgeBaseFiles: knowledgeBaseFiles,
       knowledgeBaseUpdatedAt: task.knowledgeBaseUpdatedAt
     });
   } catch (error) {
@@ -1304,6 +1319,194 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
   }
 });
 
+// Upload files to knowledge base endpoint
+router.post('/:taskId/knowledge-base/files', authenticateToken, upload.array('files', 100), async (req: Request, res: Response) => {
+  try {
+    const { taskId } = req.params;
+    const files = (req as FileRequest & { files?: Express.Multer.File[] }).files || [];
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!files || files.length === 0) {
+      return res.status(400).json({ message: 'No files uploaded' });
+    }
+
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+      return res.status(403).json({ message: 'Not authorized to modify this task' });
+    }
+
+    // File processor functions are imported at the top
+
+    // Set knowledgeBaseType to 'private' if not defined
+    const knowledgeBaseType = task.knowledgeBaseType || 'private';
+    if (!task.knowledgeBaseType) {
+      await taskDb.updateTask(taskId, { knowledgeBaseType: 'private' });
+    }
+
+    // Use the appropriate bucket based on knowledgeBaseType
+    const storageInstance = await initializeStorage();
+    const bucket = storageInstance.bucket(knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
+
+    // Get existing knowledge base files
+    const currentKnowledgeBaseFiles = (task as any).knowledgeBaseFiles || [];
+
+    // Process each uploaded file
+    const uploadedFiles: Array<{ filename: string; size: number; url: string; key: string; uploadedAt: string }> = [];
+
+    for (const file of files) {
+      // Validate file type
+      if (!isSupportedFileType(file.originalname, file.mimetype)) {
+        return res.status(400).json({ 
+          message: `Unsupported file type: ${file.originalname}. Supported types: TXT, PDF, HTML, DOCX, PPTX, XLSX, XLSM` 
+        });
+      }
+
+      // Validate file size (matches multer limit and frontend MAX_FILE_SIZE)
+      if (file.size > MAX_FILE_SIZE) {
+        return res.status(400).json({ 
+          message: `File ${file.originalname} exceeds maximum size of ${MAX_FILE_SIZE / (1024 * 1024)}MB` 
+        });
+      }
+
+      try {
+        // Store the file in GCS
+        const timestamp = Date.now();
+        const sanitizedFilename = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
+        const filePath = `tasks/${taskId}/knowledge-base-files/${timestamp}_${sanitizedFilename}`;
+        const gcsFile = bucket.file(filePath);
+        
+        const buffer = Buffer.from(file.buffer);
+        await gcsFile.save(buffer, {
+          contentType: getContentType(file.originalname, file.mimetype),
+          metadata: {
+            taskId,
+            userId,
+            originalName: file.originalname,
+            uploadedAt: new Date().toISOString()
+          }
+        });
+
+        // Get signed URL for the file
+        const [url] = await gcsFile.getSignedUrl({
+          action: 'read',
+          expires: '03-01-2500' // Far future expiration
+        });
+
+        uploadedFiles.push({
+          filename: file.originalname,
+          size: file.size,
+          url,
+          key: filePath,
+          uploadedAt: new Date().toISOString()
+        });
+      } catch (error: any) {
+        console.error(`Error uploading file ${file.originalname}:`, error);
+        return res.status(400).json({ 
+          message: `Failed to upload file ${file.originalname}: ${error.message}` 
+        });
+      }
+    }
+
+    // Update task with new knowledge base files
+    const updatedKnowledgeBaseFiles = [...currentKnowledgeBaseFiles, ...uploadedFiles];
+    
+    console.log('Uploading files:', {
+      taskId,
+      currentFiles: currentKnowledgeBaseFiles.length,
+      newFiles: uploadedFiles.length,
+      totalFiles: updatedKnowledgeBaseFiles.length,
+      filesArray: JSON.stringify(updatedKnowledgeBaseFiles)
+    });
+    
+    await taskDb.updateTask(taskId, {
+      knowledgeBaseFiles: updatedKnowledgeBaseFiles,
+      knowledgeBaseUpdatedAt: new Date().toISOString()
+    });
+
+    // Verify the update by fetching the task again
+    const updatedTask = await taskDb.getTaskById(taskId);
+    const savedFiles = (updatedTask as any)?.knowledgeBaseFiles || [];
+    
+    console.log('After update, retrieved task:', {
+      taskId,
+      savedFilesCount: savedFiles.length,
+      savedFiles: JSON.stringify(savedFiles)
+    });
+
+    res.json({
+      message: `Successfully uploaded ${uploadedFiles.length} file(s)`,
+      files: uploadedFiles,
+      knowledgeBaseFiles: savedFiles.length > 0 ? savedFiles : updatedKnowledgeBaseFiles,
+      knowledgeBaseUpdatedAt: new Date().toISOString()
+    });
+  } catch (error: any) {
+    console.error('Error uploading files to knowledge base:', error);
+    res.status(500).json({ 
+      message: 'Internal server error',
+      error: error.message 
+    });
+  }
+});
+
+// Delete knowledge base file endpoint
+router.delete('/:taskId/knowledge-base/files/:fileKey', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { taskId, fileKey } = req.params;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+      return res.status(403).json({ message: 'Not authorized to modify this task' });
+    }
+
+    // Decode the file key (it's URL encoded)
+    const decodedKey = decodeURIComponent(fileKey);
+
+    // Delete file from GCS
+    const storageInstance = await initializeStorage();
+    const bucket = storageInstance.bucket(task.knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
+    const file = bucket.file(decodedKey);
+    
+    const [exists] = await file.exists();
+    if (exists) {
+      await file.delete();
+    }
+
+    // Update task to remove the file from knowledgeBaseFiles
+    const currentFiles = (task as any).knowledgeBaseFiles || [];
+    const updatedFiles = currentFiles.filter((f: any) => f.key !== decodedKey);
+    
+    await taskDb.updateTask(taskId, {
+      knowledgeBaseFiles: updatedFiles,
+      knowledgeBaseUpdatedAt: new Date().toISOString()
+    });
+
+    res.json({ 
+      message: 'File deleted successfully',
+      knowledgeBaseFiles: updatedFiles
+    });
+  } catch (error) {
+    console.error('Error deleting knowledge base file:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
 // Delete knowledge base endpoint
 router.delete('/:taskId/knowledge-base', authenticateToken, async (req: Request, res: Response) => {
   try {
@@ -1380,15 +1583,75 @@ router.put('/:id/knowledge-base-type', authenticateToken, async (req: Request, r
       return res.status(403).json({ message: 'Not authorized to modify this task' });
     }
 
-    // Only move file if type is actually changing
+    // Only move files if type is actually changing
     if (task.knowledgeBaseType !== knowledgeBaseType) {
-      const filePath = `tasks/${taskId}/knowledge-base.txt`;
       const storageInstance = await initializeStorage();
       const currentBucket = storageInstance.bucket(task.knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
       const newBucket = storageInstance.bucket(knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
+      
+      // Move knowledge base text file
+      const filePath = `tasks/${taskId}/knowledge-base.txt`;
       const currentFile = currentBucket.file(filePath);
       const newFile = newBucket.file(filePath);
-      // Check if current file exists
+      
+      // Get existing knowledge base files
+      const knowledgeBaseFiles = (task as any).knowledgeBaseFiles || [];
+      const updatedFiles: Array<{ filename: string; size: number; url: string; key: string; uploadedAt: string }> = [];
+      
+      // Move all knowledge base files to the new bucket
+      for (const fileInfo of knowledgeBaseFiles) {
+        try {
+          const oldFileKey = fileInfo.key;
+          const oldFile = currentBucket.file(oldFileKey);
+          const [fileExists] = await oldFile.exists();
+          
+          if (fileExists) {
+            // Download file from old bucket
+            const [fileContent] = await oldFile.download();
+            
+            // Get file metadata to preserve content type
+            const [metadata] = await oldFile.getMetadata();
+            const contentType = metadata.contentType || 'application/octet-stream';
+            
+            // Upload to new bucket (same path)
+            const newFileObj = newBucket.file(oldFileKey);
+            await newFileObj.save(fileContent, {
+              contentType: contentType,
+              metadata: {
+                ...metadata.metadata,
+                taskId,
+                userId,
+                movedAt: new Date().toISOString(),
+                sourceBucket: task.knowledgeBaseType
+              }
+            });
+            
+            // Get new signed URL
+            const [newUrl] = await newFileObj.getSignedUrl({
+              action: 'read',
+              expires: '03-01-2500'
+            });
+            
+            // Delete old file
+            await oldFile.delete();
+            
+            // Update file info with new URL
+            updatedFiles.push({
+              ...fileInfo,
+              url: newUrl
+            });
+          } else {
+            // File doesn't exist in old bucket, keep as is (might have been deleted)
+            updatedFiles.push(fileInfo);
+          }
+        } catch (error: any) {
+          console.error(`Error moving file ${fileInfo.filename}:`, error);
+          // Keep the old file info if move fails
+          updatedFiles.push(fileInfo);
+        }
+      }
+      
+      // Check if knowledge base text file exists
       const [exists] = await currentFile.exists();
       if (exists) {
         // Download current content
@@ -1408,22 +1671,33 @@ router.put('/:id/knowledge-base-type', authenticateToken, async (req: Request, r
           action: 'read',
           expires: '03-01-2500'
         });
-        // Update task with new bucket type and URL
+        // Update task with new bucket type, URL, and moved files
         await taskDb.updateTask(taskId, {
           knowledgeBaseType,
           knowledgeBase: url,
+          knowledgeBaseFiles: updatedFiles,
           knowledgeBaseUpdatedAt: new Date().toISOString()
         });
         // Delete the old file
         await currentFile.delete();
-        return res.json({ message: 'Knowledge base type and file moved successfully', knowledgeBaseType, url });
+        return res.json({ 
+          message: 'Knowledge base type and files moved successfully', 
+          knowledgeBaseType, 
+          url,
+          filesMoved: updatedFiles.length
+        });
       } else {
-        // If no file exists, just update the type
+        // If no text file exists, just update the type and files
         await taskDb.updateTask(taskId, { 
           knowledgeBaseType,
+          knowledgeBaseFiles: updatedFiles,
           knowledgeBaseUpdatedAt: new Date().toISOString()
         });
-        return res.json({ message: 'Knowledge base type updated (no file to move)', knowledgeBaseType });
+        return res.json({ 
+          message: 'Knowledge base type updated', 
+          knowledgeBaseType,
+          filesMoved: updatedFiles.length
+        });
       }
     } else {
       // If type is not changing, just return success
