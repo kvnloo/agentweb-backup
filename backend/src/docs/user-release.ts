@@ -14,6 +14,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Customer Portal edit dialog shows uploaded files with size, date, and delete support; uploads respect the 18MB limit',
       '- Partner Portal admin Knowledge Base tab now reports uploaded file counts and sizes for overall/public/private and per task',
       '- Agent Mode can read the uploaded files using read_knowledge_base_files function',
+      'Fixed Agent Mode Images Not Showing in Ad Images Page',
+      '- Fixed bug where recently created Agent Mode images were not appearing in the Ad Images page',
     ],
   },
   {
@@ -24,6 +26,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Users receive their subscription type and explicit lists of allowed pages and function calls as part of their account metadata and can view them in the Customer Portal Settings page',
       '- Scheduled chats now validate required function calls against the user\'s subscription and send error emails instead of running when permissions are insufficient',
       '- A default \"Basic\" subscription type is provided which grants full access to all customer-portal pages and Agent Mode function calls, and is automatically used when no subscription types are configured',
+      'Fixed Brand Guidelines Key Messages and Brand Values Overwrite Bug',
+      '- Fixed critical bug where updating key messages would remove brand values, and updating brand values would remove key messages',
     ],
   },
   {

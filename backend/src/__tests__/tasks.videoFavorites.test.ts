@@ -189,7 +189,8 @@ describe('Tasks Routes - Video Favorites and Archives', () => {
       const sessionId = 'session-123';
       const videoUrl = 'https://example.com/video.mp4';
 
-      const mockSession = {
+      // Mock getUserSessions to return session WITHOUT messages (actual behavior)
+      const sessionWithoutMessages = {
         sessionId,
         userId: 'user123',
         title: 'Test Session',
@@ -199,7 +200,13 @@ describe('Tasks Routes - Video Favorites and Archives', () => {
         favorites: {
           [videoUrl]: true
         },
-        archives: {},
+        archives: {}
+        // Note: no messages property - getUserSessions doesn't load messages
+      };
+
+      // Mock getChatSession to return session WITH messages (what our fix does)
+      const sessionWithMessages = {
+        ...sessionWithoutMessages,
         messages: [{
           timestamp: '2024-01-01T00:00:00Z',
           metadata: {
@@ -216,7 +223,14 @@ describe('Tasks Routes - Video Favorites and Archives', () => {
       };
 
       (ChatbotDB.prototype.getUserSessions as jest.Mock).mockResolvedValue({
-        sessions: [mockSession]
+        sessions: [sessionWithoutMessages]
+      });
+
+      (ChatbotDB.prototype.getChatSession as jest.Mock).mockImplementation((sid: string) => {
+        if (sid === sessionId) {
+          return Promise.resolve(sessionWithMessages);
+        }
+        return Promise.resolve(null);
       });
 
       (taskDb.getAllTaskExecutionsByUserId as jest.Mock).mockResolvedValue([]);
@@ -225,6 +239,9 @@ describe('Tasks Routes - Video Favorites and Archives', () => {
       const response = await request(app)
         .get('/api/tasks/executions/with-videos')
         .expect(200);
+
+      // Verify getChatSession was called
+      expect(ChatbotDB.prototype.getChatSession).toHaveBeenCalledWith(sessionId);
 
       const taskKey = `agent-mode-${sessionId}`;
       expect(response.body[taskKey]).toBeDefined();
@@ -236,7 +253,8 @@ describe('Tasks Routes - Video Favorites and Archives', () => {
       const sessionId = 'session-123';
       const videoUrl = 'https://example.com/video.mp4';
 
-      const mockSession = {
+      // Mock getUserSessions to return session WITHOUT messages (actual behavior)
+      const sessionWithoutMessages = {
         sessionId,
         userId: 'user123',
         title: 'Test Session',
@@ -246,7 +264,13 @@ describe('Tasks Routes - Video Favorites and Archives', () => {
         favorites: {},
         archives: {
           [videoUrl]: true
-        },
+        }
+        // Note: no messages property - getUserSessions doesn't load messages
+      };
+
+      // Mock getChatSession to return session WITH messages (what our fix does)
+      const sessionWithMessages = {
+        ...sessionWithoutMessages,
         messages: [{
           timestamp: '2024-01-01T00:00:00Z',
           metadata: {
@@ -263,7 +287,14 @@ describe('Tasks Routes - Video Favorites and Archives', () => {
       };
 
       (ChatbotDB.prototype.getUserSessions as jest.Mock).mockResolvedValue({
-        sessions: [mockSession]
+        sessions: [sessionWithoutMessages]
+      });
+
+      (ChatbotDB.prototype.getChatSession as jest.Mock).mockImplementation((sid: string) => {
+        if (sid === sessionId) {
+          return Promise.resolve(sessionWithMessages);
+        }
+        return Promise.resolve(null);
       });
 
       (taskDb.getAllTaskExecutionsByUserId as jest.Mock).mockResolvedValue([]);
@@ -272,6 +303,9 @@ describe('Tasks Routes - Video Favorites and Archives', () => {
       const response = await request(app)
         .get('/api/tasks/executions/with-videos')
         .expect(200);
+
+      // Verify getChatSession was called
+      expect(ChatbotDB.prototype.getChatSession).toHaveBeenCalledWith(sessionId);
 
       const taskKey = `agent-mode-${sessionId}`;
       // Archived videos should not appear in results
