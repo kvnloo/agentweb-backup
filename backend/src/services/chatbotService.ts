@@ -565,6 +565,31 @@ export class ChatbotDB {
     };
   }
 
+  // Get message count from AW-ChatMessages table (optimized for list views)
+  private async getMessageCountFromMessagesTable(sessionId: string): Promise<number> {
+    const params = {
+      TableName: this.messagesTableName,
+      KeyConditionExpression: "sessionId = :sessionId",
+      ExpressionAttributeValues: {
+        ":sessionId": sessionId,
+      },
+      Select: "COUNT",
+    };
+
+    try {
+      const result = await dynamodb.query(params).promise();
+      return result.Count || 0;
+    } catch (error) {
+      // If table doesn't exist yet, return 0
+      if ((error as any).code === 'ResourceNotFoundException') {
+        console.log(`ChatMessages table not found, returning 0 message count`);
+        return 0;
+      }
+      console.error("Error getting message count from messages table:", error);
+      throw error;
+    }
+  }
+
   // Get messages from AW-ChatMessages table
   private async getMessagesFromMessagesTable(sessionId: string): Promise<ChatMessage[]> {
     const params = {
@@ -751,12 +776,45 @@ export class ChatbotDB {
         );
       }
 
+      // Fetch messages from messages table for each session
+      // This ensures message counts are accurate since messages are now stored separately
+      const sessionsWithMessages = await Promise.all(
+        sessions.map(async (session) => {
+          try {
+            // Get messages from AW-ChatMessages table
+            let messages = await this.getMessagesFromMessagesTable(session.sessionId);
+
+            // If no messages in AW-ChatMessages but messages exist in session record, migrate them
+            if (messages.length === 0 && session.messages && session.messages.length > 0) {
+              console.log(`Migrating ${session.messages.length} messages from session record to AW-ChatMessages for session ${session.sessionId}`);
+              await this.migrateMessagesToMessagesTable(session.sessionId, session.messages);
+              messages = session.messages; // Use the migrated messages
+            }
+
+            // Remove messages from session object and replace with messages from messages table
+            const { messages: _, ...sessionWithoutMessages } = session;
+            return {
+              ...sessionWithoutMessages,
+              messages,
+            };
+          } catch (error) {
+            console.error(`Error fetching messages for session ${session.sessionId}:`, error);
+            // If there's an error, return session with empty messages array
+            const { messages: _, ...sessionWithoutMessages } = session;
+            return {
+              ...sessionWithoutMessages,
+              messages: [],
+            };
+          }
+        })
+      );
+
       console.log(
-        `Returning ${sessions.length} sorted chat sessions for user: ${userId}`
+        `Returning ${sessionsWithMessages.length} sorted chat sessions with messages for user: ${userId}`
       );
 
       return {
-        sessions,
+        sessions: sessionsWithMessages,
         lastEvaluatedKey: result.LastEvaluatedKey
       };
     } catch (error) {

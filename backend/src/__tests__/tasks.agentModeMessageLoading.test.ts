@@ -1,5 +1,7 @@
 // Unit tests for Agent Mode message loading fix in getExecutionsWithAssets
-// This test verifies that messages are loaded via getChatSession when getUserSessions
+// This test verifies message loading behavior.
+// Note: getUserSessions now loads messages from the messages table, but getChatSession
+// is still used in tasks.ts for full session data with all message details.
 // doesn't include them (which is the actual behavior)
 
 import express from 'express';
@@ -37,11 +39,11 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
   });
 
   describe('GET /executions/with-images', () => {
-    it('should load messages via getChatSession when getUserSessions returns sessions without messages', async () => {
+    it('should load full session data via getChatSession for detailed message processing', async () => {
       const sessionId = 'session-123';
       const imageUrl = 'https://example.com/image.png';
 
-      // Mock getUserSessions to return sessions WITHOUT messages (actual behavior)
+      // Mock getUserSessions to return sessions WITH messages (from messages table)
       const sessionWithoutMessages = {
         sessionId,
         userId: mockUserId,
@@ -51,7 +53,7 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
         archived: false,
         favorites: {},
         archives: {}
-        // Note: no messages property - this is what getUserSessions actually returns
+        // Note: messages are now loaded from messages table by getUserSessions
       };
 
       // Mock getChatSession to return session WITH messages (what our fix does)
