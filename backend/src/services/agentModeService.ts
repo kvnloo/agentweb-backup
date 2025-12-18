@@ -1602,8 +1602,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
               },
               deep_research: {
                 type: 'boolean',
-                description: 'When true, performs Gemini Deep Research to gather comprehensive information on the topic before generating the article. Research images will be embedded in the article. Takes several minutes to complete.',
+                description: 'When true, performs Gemini Deep Research to gather comprehensive information on the topic before generating the article. Takes several minutes to complete.',
                 default: false
+              },
+              image_mode: {
+                type: 'string',
+                description: 'Image mode: hero-only (1 hero image, default) or hero-with-inline (hero + 3-5 AI-placed inline images for richer visual content)',
+                enum: ['hero-only', 'hero-with-inline'],
+                default: 'hero-only'
               }
             },
             required: ['topic']
@@ -2820,7 +2826,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'remove_c2pa_from_image':
         return await this.removeC2PAFromImage(args.image_url, args.filename, userId);
       case 'create_blog_article':
-        return await this.createBlogArticle(args.topic, args.keywords || '', args.tone || 'professional', args.length || 'medium', args.researchContext || '', args.requirements || '', userId, sessionId, args.style || 'default', args.deep_research || false);
+        return await this.createBlogArticle(args.topic, args.keywords || '', args.tone || 'professional', args.length || 'medium', args.researchContext || '', args.requirements || '', userId, sessionId, args.style || 'default', args.deep_research || false, args.image_mode || 'hero-only');
       case 'publish_blog_article':
         return await this.publishBlogArticle(args.title, args.description, args.hero_image_url, args.blog_html_url, userId, sessionId);
       case 'create_social_media_posts':
@@ -7370,22 +7376,25 @@ ${emailDraftFormat === 'text'
     userId: string,
     sessionId: string,
     style: string = 'default',
-    deepResearch: boolean = false
+    deepResearch: boolean = false,
+    imageMode: 'hero-only' | 'hero-with-inline' = 'hero-only'
   ): Promise<any> {
     try {
-      console.log('AgentMode: Creating blog article for topic:', topic, 'tone:', tone, 'length:', length, 'deepResearch:', deepResearch, 'userId:', userId);
+      console.log('AgentMode: Creating blog article for topic:', topic, 'tone:', tone, 'length:', length, 'deepResearch:', deepResearch, 'imageMode:', imageMode, 'userId:', userId);
 
       // Import required services
       const { uploadFileToS3 } = await import('../utils/s3Utils');
-      const { generateBlogImage, generateBlogHtml } = await import('../controllers/blog');
+      const { generateBlogImage, generateBlogHtml, generateBlogContent } = await import('../controllers/blog');
 
-      let blogTitle: string;
-      let blogDescription: string;
-      let blogContent: string;
-      let imagePrompt: string;
-
+      // ========================================
+      // STEP 1: CONTENT GENERATION
+      // ========================================
+      // Both deep_research=true and deep_research=false paths use generateBlogContent
+      // Deep research provides richer researchContext for LLM to rewrite
+      
+      let finalResearchContext = researchContext;
+      
       if (deepResearch) {
-        // Deep Research Flow: Use research markdown directly (skip generateBlogContent)
         console.log('AgentMode: Deep research enabled, performing research...');
         const { deepResearchService } = await import('./deepResearchService');
         
@@ -7393,64 +7402,99 @@ ${emailDraftFormat === 'text'
           topic,
           prompt: requirements || undefined,
           userId,
-          rawMarkdownOnly: true  // Get raw markdown, no image processing
+          rawMarkdownOnly: true  // Get raw markdown for LLM to rewrite
         });
 
-        if (!researchResult.success || !researchResult.markdownContent) {
-          throw new Error(researchResult.error || 'Deep research failed to return content');
+        if (researchResult.success && researchResult.markdownContent) {
+          // Use full research markdown as context for LLM to rewrite
+          finalResearchContext = researchResult.markdownContent;
+          console.log('AgentMode: Deep research complete, using as context. Length:', finalResearchContext.length);
+        } else {
+          console.warn('AgentMode: Deep research failed, proceeding with original context:', researchResult.error);
+          // Continue with original researchContext if provided
         }
-
-        console.log('AgentMode: Deep research complete, using markdown directly');
-        
-        // Use research output directly
-        blogTitle = researchResult.title || topic;
-        blogDescription = researchResult.researchSummary || `Comprehensive research on ${topic}`;
-        
-        // Strip the first H1 from markdown to avoid duplicate title
-        // (generateBlogHtml already adds the title as H1 in the template)
-        let contentWithoutTitle = researchResult.markdownContent;
-        const h1Match = contentWithoutTitle.match(/^#\s+.+\n?/m);
-        if (h1Match) {
-          contentWithoutTitle = contentWithoutTitle.replace(h1Match[0], '');
-        }
-        blogContent = contentWithoutTitle.trim();
-        
-        imagePrompt = `Professional hero image for article about "${blogTitle}". High-quality, modern design.`;
-
-      } else {
-        // Standard Flow: Generate content using LLM
-        console.log('AgentMode: Generating blog content using existing blog service...');
-        const { generateBlogContent } = await import('../controllers/blog');
-        
-        const blogData = await generateBlogContent(topic, keywords, tone, length, researchContext, requirements, style);
-
-        if (!blogData.title || !blogData.content) {
-          throw new Error("Blog content generation failed");
-        }
-
-        blogTitle = blogData.title;
-        blogDescription = blogData.description;
-        blogContent = blogData.content;
-        imagePrompt = blogData.imagePrompt;
-        
-        console.log('AgentMode: Blog content generated successfully');
       }
 
-      // Step 2: Generate hero image
-      console.log('AgentMode: Generating hero image...');
-      const imageData = await generateBlogImage(imagePrompt, userId);
+      // Generate blog content using LLM (rewrites research into specified tone/length/style)
+      console.log('AgentMode: Generating blog content with LLM...');
+      const blogData = await generateBlogContent(topic, keywords, tone, length, finalResearchContext, requirements, style);
 
-      if (!imageData.imageUrl) {
-        throw new Error('Image generation failed');
+      if (!blogData.title || !blogData.content) {
+        throw new Error("Blog content generation failed");
+      }
+
+      console.log('AgentMode: Blog content generated successfully. Title:', blogData.title);
+
+      // ========================================
+      // STEP 2: IMAGE GENERATION
+      // ========================================
+      let heroImageUrl: string;
+      let inlineImages: Array<{ insertAfter: string; imageUrl: string; caption: string }> = [];
+
+      if (imageMode === 'hero-with-inline') {
+        // Generate hero + 3-5 inline images
+        console.log('AgentMode: Image mode is hero-with-inline, identifying image placements...');
+        
+        // Identify 3-5 optimal image placements via LLM
+        const placements = await this.identifyImagePlacements(blogData.content, blogData.title, topic);
+        console.log(`AgentMode: Identified ${placements.length} image placements`);
+
+        // Generate all images in parallel (hero + inline images)
+        console.log('AgentMode: Generating hero + inline images in parallel...');
+        const imagePromises = [
+          generateBlogImage(blogData.imagePrompt, userId),  // Hero image
+          ...placements.map(p => generateBlogImage(p.imagePrompt, userId))  // Inline images
+        ];
+
+        const imageResults = await Promise.all(imagePromises);
+        
+        // Extract hero image
+        const heroResult = imageResults[0];
+        if (!heroResult.imageUrl) {
+          throw new Error('Hero image generation failed');
+        }
+        heroImageUrl = heroResult.imageUrl;
+
+        // Extract inline images
+        inlineImages = placements.map((placement, index) => {
+          const imageResult = imageResults[index + 1];  // +1 because hero is at index 0
+          return {
+            insertAfter: placement.insertAfter,
+            imageUrl: imageResult.imageUrl || '',
+            caption: placement.context
+          };
+        }).filter(img => img.imageUrl);  // Filter out any failed generations
+
+        console.log(`AgentMode: Generated ${inlineImages.length} inline images successfully`);
+
+      } else {
+        // hero-only: Generate just the hero image
+        console.log('AgentMode: Generating hero image only...');
+        const heroResult = await generateBlogImage(blogData.imagePrompt, userId);
+        
+        if (!heroResult.imageUrl) {
+          throw new Error('Hero image generation failed');
+        }
+        heroImageUrl = heroResult.imageUrl;
       }
 
       console.log('AgentMode: Hero image generated successfully');
 
-      // Step 3: Generate HTML file
+      // ========================================
+      // STEP 3: BUILD HTML (COMMON)
+      // ========================================
       console.log('AgentMode: Generating HTML file with style:', style);
-      const htmlContent = generateBlogHtml(blogTitle, blogDescription, blogContent, imageData.imageUrl, style);
+      let htmlContent = generateBlogHtml(blogData.title, blogData.description, blogData.content, heroImageUrl, style);
 
-      // Step 4: Upload HTML file to S3
+      // Embed inline images if we have any
+      if (inlineImages.length > 0) {
+        console.log(`AgentMode: Embedding ${inlineImages.length} inline images...`);
+        htmlContent = this.embedInlineImages(htmlContent, inlineImages);
+      }
+
+      // ========================================
+      // STEP 4: UPLOAD TO S3 (COMMON)
+      // ========================================
       console.log('AgentMode: Uploading HTML file to S3...');
       const htmlFilename = `blog-${Date.now()}.html`;
 
@@ -7471,15 +7515,15 @@ ${emailDraftFormat === 'text'
 
       return {
         success: true,
-        message: deepResearch 
-          ? 'Blog article created successfully with deep research content'
-          : 'Blog article created successfully',
+        message: this.getBlogSuccessMessage(deepResearch, imageMode, inlineImages.length),
         data: {
-          title: blogTitle,
-          description: blogDescription,
-          imageUrl: imageData.imageUrl,
+          title: blogData.title,
+          description: blogData.description,
+          heroImageUrl: heroImageUrl,
           htmlUrl: htmlUrl,
-          deepResearchUsed: deepResearch
+          deepResearchUsed: deepResearch,
+          imageMode: imageMode,
+          inlineImagesCount: inlineImages.length
         }
       };
 
@@ -7491,6 +7535,218 @@ ${emailDraftFormat === 'text'
         error: error.message
       };
     }
+  }
+
+  /**
+   * Get success message based on options used
+   */
+  private getBlogSuccessMessage(deepResearch: boolean, imageMode: string, inlineCount: number): string {
+    const parts = ['Blog article created successfully'];
+    if (deepResearch) parts.push('with deep research');
+    if (imageMode === 'hero-with-inline' && inlineCount > 0) {
+      parts.push(`and ${inlineCount} inline images`);
+    }
+    return parts.join(' ');
+  }
+
+  /**
+   * Use LLM to identify 3-5 optimal locations for inline images in the blog content
+   */
+  private async identifyImagePlacements(
+    content: string,
+    title: string,
+    topic: string
+  ): Promise<Array<{
+    insertAfter: string;
+    context: string;
+    imagePrompt: string;
+  }>> {
+    try {
+      // Extract section summaries instead of truncating content
+      const sectionSummaries = this.extractSectionSummaries(content);
+      
+      const prompt = `Analyze this blog article structure and identify 3-5 optimal locations for inline images that would enhance the reader's understanding.
+
+ARTICLE TITLE: ${title}
+TOPIC: ${topic}
+
+ARTICLE SECTIONS:
+${sectionSummaries}
+
+For each location, provide:
+1. insertAfter: The EXACT heading text (## or ###) after which to insert the image
+2. context: A brief description of what the section discusses
+3. imagePrompt: A detailed prompt for generating a relevant, professional illustration
+
+IMPORTANT: 
+- Choose headings that would benefit most from visual illustration
+- Prioritize sections explaining concepts, processes, comparisons, or data
+- Image prompts should describe professional, informative visuals (infographics, diagrams, illustrations)
+- Return ONLY valid JSON array, no markdown code blocks
+
+Example format:
+[
+  {
+    "insertAfter": "## Understanding the Basics",
+    "context": "Introduction to core concepts",
+    "imagePrompt": "Professional infographic showing the fundamental concepts of [topic], modern clean design, blue and white color scheme"
+  }
+]`;
+
+      // Use OpenAI for reliable JSON output
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.3,
+        max_tokens: 2000
+      });
+
+      const responseText = response.choices[0]?.message?.content || '';
+      
+      // Parse JSON response
+      const jsonMatch = responseText.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        const placements = JSON.parse(jsonMatch[0]);
+        
+        // Validate and limit to 5
+        return placements
+          .filter((p: any) => p.insertAfter && p.context && p.imagePrompt)
+          .slice(0, 5);
+      }
+
+      console.warn('AgentMode: Could not parse image placements, using fallback');
+      return this.getFallbackImagePlacements(content, topic);
+
+    } catch (error: any) {
+      console.error('AgentMode: Error identifying image placements:', error);
+      return this.getFallbackImagePlacements(content, topic);
+    }
+  }
+
+  /**
+   * Fallback: Extract H2 headings for image placement if LLM fails
+   */
+  private getFallbackImagePlacements(
+    content: string,
+    topic: string
+  ): Array<{ insertAfter: string; context: string; imagePrompt: string }> {
+    const h2Matches = content.match(/^##\s+.+$/gm) || [];
+    
+    return h2Matches.slice(0, 4).map(heading => ({
+      insertAfter: heading,
+      context: heading.replace(/^##\s+/, ''),
+      imagePrompt: `Professional illustration for "${heading.replace(/^##\s+/, '')}" section of an article about ${topic}. Clean, modern infographic style.`
+    }));
+  }
+
+  /**
+   * Extract section summaries from markdown content
+   * Returns headings with 300-400 char excerpts for each section
+   */
+  private extractSectionSummaries(content: string): string {
+    const lines = content.split('\n');
+    const sections: Array<{ heading: string; level: number; excerpt: string }> = [];
+    
+    let currentHeading = '';
+    let currentLevel = 0;
+    let currentContent: string[] = [];
+    
+    for (const line of lines) {
+      // Check if this is a heading (H1, H2, or H3)
+      const headingMatch = line.match(/^(#{1,3})\s+(.+)$/);
+      
+      if (headingMatch) {
+        // Save previous section if we have one
+        if (currentHeading) {
+          const fullContent = currentContent.join(' ').replace(/\s+/g, ' ').trim();
+          const excerpt = fullContent.length > 350 
+            ? fullContent.substring(0, 350) + '...'
+            : fullContent;
+          
+          sections.push({
+            heading: currentHeading,
+            level: currentLevel,
+            excerpt
+          });
+        }
+        
+        // Start new section
+        currentLevel = headingMatch[1].length;
+        currentHeading = headingMatch[0]; // Full heading with ## prefix
+        currentContent = [];
+      } else if (currentHeading && line.trim()) {
+        // Add non-empty lines to current section content
+        currentContent.push(line.trim());
+      }
+    }
+    
+    // Don't forget the last section
+    if (currentHeading) {
+      const fullContent = currentContent.join(' ').replace(/\s+/g, ' ').trim();
+      const excerpt = fullContent.length > 350 
+        ? fullContent.substring(0, 350) + '...'
+        : fullContent;
+      
+      sections.push({
+        heading: currentHeading,
+        level: currentLevel,
+        excerpt
+      });
+    }
+    
+    // Format as structured summary
+    return sections.map(s => {
+      const indent = '  '.repeat(s.level - 1);
+      return `${indent}${s.heading}\n${indent}  ${s.excerpt || '(no content)'}`;
+    }).join('\n\n');
+  }
+
+  /**
+   * Embed inline images into blog HTML content after specified headings
+   */
+  private embedInlineImages(
+    htmlContent: string,
+    images: Array<{ insertAfter: string; imageUrl: string; caption: string }>
+  ): string {
+    if (images.length === 0) return htmlContent;
+
+    let modifiedHtml = htmlContent;
+
+    for (const image of images) {
+      // Convert markdown heading to HTML heading pattern
+      // "## Heading Text" -> look for <h2>Heading Text</h2>
+      const headingText = image.insertAfter.replace(/^#+\s*/, '').trim();
+      
+      // Try to find the heading in <h2> or <h3> tags
+      const h2Pattern = new RegExp(`(<h2[^>]*>\\s*${this.escapeRegex(headingText)}\\s*</h2>)`, 'i');
+      const h3Pattern = new RegExp(`(<h3[^>]*>\\s*${this.escapeRegex(headingText)}\\s*</h3>)`, 'i');
+
+      const figureHtml = `
+      <figure class="inline-image" style="margin: 2rem 0; text-align: center;">
+        <img src="${image.imageUrl}" alt="${image.caption}" 
+             style="max-width: 100%; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
+        <figcaption style="margin-top: 0.75rem; color: #666; font-size: 0.9rem; font-style: italic;">
+          ${image.caption}
+        </figcaption>
+      </figure>`;
+
+      if (h2Pattern.test(modifiedHtml)) {
+        modifiedHtml = modifiedHtml.replace(h2Pattern, `$1${figureHtml}`);
+      } else if (h3Pattern.test(modifiedHtml)) {
+        modifiedHtml = modifiedHtml.replace(h3Pattern, `$1${figureHtml}`);
+      } else {
+        console.warn(`AgentMode: Could not find heading "${headingText}" for image placement`);
+      }
+    }
+
+    return modifiedHtml;
+  }
+
+  /**
+   * Escape special regex characters in a string
+   */
+  private escapeRegex(str: string): string {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
   private async publishBlogArticle(

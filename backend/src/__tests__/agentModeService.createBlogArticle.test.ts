@@ -117,7 +117,7 @@ describe('AgentModeService - create_blog_article function', () => {
       expect(result.success).toBe(true);
       expect(result.data.title).toBe('Test Blog Title');
       expect(result.data.description).toBe('Test description');
-      expect(result.data.imageUrl).toBe('https://example.com/image.png');
+      expect(result.data.heroImageUrl).toBe('https://example.com/image.png');
       expect(result.data.htmlUrl).toBe(mockS3Url);
     });
 
@@ -426,7 +426,7 @@ describe('AgentModeService - create_blog_article function', () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('Image generation failed');
+      expect(result.error).toBe('Hero image generation failed');
     });
 
     it('should handle S3 upload failure', async () => {
