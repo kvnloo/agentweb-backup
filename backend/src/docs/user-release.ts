@@ -12,6 +12,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Increased Video File Upload Limit to 100MB',
       '- Video file uploads on the Ad Videos page now support files up to 100MB (previously 18MB)',
       '- Other file types (images, documents, etc.) continue to use the 18MB limit',
+      'Major UI/UX overhaul implementing a centralized design system, improved Agent Mode scheduling, and enhanced responsive behavior across the application',
+      '- Implemented centralized CSS variable system with full light/dark mode support and new button variants',
+      '- Refactored Agent Mode scheduling system with modular components (ScheduleFormPanel, ScheduleList, TestHistoryPanel)',
+      '- Added copy-to-clipboard functionality for assistant messages and responsive chat history panel',
+      '- Updated sidebar with iconsax icons, restructured navigation categories, and improved active state logic',
+      '- Redesigned auth pages (Login, ForgotPassword, Register) with updated components and animations',
     ],
   },
   {
