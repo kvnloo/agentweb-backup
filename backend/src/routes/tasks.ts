@@ -1986,13 +1986,13 @@ async function getExecutionsWithAssets(
       const agentSessions = agentSessionsResult.sessions || [];
       
       // Process each session to find generate_image tool calls
-      // Note: getUserSessions doesn't load messages, so we need to load them for each session
+      // Note: getUserSessions now loads messages, but we still call getChatSession to ensure we have the full session data
       for (const session of agentSessions) {
         if (session.archived) {
           continue;
         }
         
-        // Load messages for this session (messages are stored in AW-ChatMessages table)
+        // Load full session data (messages are stored in AW-ChatMessages table)
         const sessionWithMessages = await chatbotDb.getChatSession(session.sessionId);
         if (!sessionWithMessages || !sessionWithMessages.messages) {
           continue;
@@ -2109,13 +2109,13 @@ async function getExecutionsWithAssets(
       const agentSessions = agentSessionsResult.sessions || [];
       
       // Process each session to find generate_video tool calls
-      // Note: getUserSessions doesn't load messages, so we need to load them for each session
+      // Note: getUserSessions now loads messages, but we still call getChatSession to ensure we have the full session data
       for (const session of agentSessions) {
         if (session.archived) {
           continue;
         }
         
-        // Load messages for this session (messages are stored in AW-ChatMessages table)
+        // Load full session data (messages are stored in AW-ChatMessages table)
         const sessionWithMessages = await chatbotDb.getChatSession(session.sessionId);
         if (!sessionWithMessages || !sessionWithMessages.messages) {
           continue;

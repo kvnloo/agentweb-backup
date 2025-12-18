@@ -47,13 +47,23 @@ export const CUSTOMER_PORTAL_PAGES: CustomerPortalPage[] = [
     description: 'View Meta ad campaign performance'
   },
   {
+    path: '/paid-social',
+    label: 'Paid Social',
+    description: 'View paid social media campaign performance'
+  },
+  {
+    path: '/newsletter',
+    label: 'Newsletter',
+    description: 'View newsletter campaign performance'
+  },
+  {
     path: '/seo',
     label: 'SEO/GEO',
     description: 'SEO and analytics management'
   },
   {
     path: '/research-reports',
-    label: 'Research Reports',
+    label: 'Reports',
     description: 'View market research reports'
   },
   {
@@ -99,6 +109,29 @@ export function getCustomerPortalPages(): CustomerPortalPage[] {
  * Get page label by path
  */
 export function getPageLabel(path: string): string {
-  const page = CUSTOMER_PORTAL_PAGES.find(p => p.path === path);
+  // Handle default pages
+  if (path === '/' || path === '/agent-mode') {
+    return 'Agent Mode';
+  }
+  if (path === '/settings') {
+    return 'Settings';
+  }
+  if (path === '/guide') {
+    return 'User Guide';
+  }
+  
+  // Try to find exact match first
+  const exactPage = CUSTOMER_PORTAL_PAGES.find(p => p.path === path);
+  if (exactPage) {
+    return exactPage.label;
+  }
+  
+  // Try to match paths with parameters (e.g., /tasks/:taskId)
+  const page = CUSTOMER_PORTAL_PAGES.find(p => {
+    const pagePathPattern = p.path.replace(/:[^/]+/g, '[^/]+');
+    const regex = new RegExp(`^${pagePathPattern}$`);
+    return regex.test(path);
+  });
+  
   return page?.label || path;
 }

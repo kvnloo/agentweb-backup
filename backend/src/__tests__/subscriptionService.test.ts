@@ -27,6 +27,8 @@ jest.mock('../services/customerPortalPages', () => ({
   CUSTOMER_PORTAL_PAGES: [
     { path: '/tasks', label: 'Tasks' },
     { path: '/seo', label: 'SEO' },
+    { path: '/paid-social', label: 'Paid Social' },
+    { path: '/newsletter', label: 'Newsletter' },
   ],
 }));
 
@@ -61,7 +63,7 @@ describe('subscriptionService', () => {
 
   it('getAllAvailablePages includes default pages and customer portal pages', () => {
     const pages = getAllAvailablePages();
-    expect(pages).toEqual(['/', '/agent-mode', '/settings', '/guide', '/tasks', '/seo']);
+    expect(pages).toEqual(['/', '/agent-mode', '/settings', '/guide', '/tasks', '/seo', '/paid-social', '/newsletter']);
   });
 
   it('getAllAvailableFunctionCalls returns all function tool names from AgentModeService', async () => {

@@ -7,6 +7,21 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-18',
+    changes: [
+      'Reorganized Customer Portal Sidebar into 3 Hubs',
+      '- Restructured sidebar navigation into three main hubs: Brand Hub, Creative Hub, and Performance Hub',
+      '- Brand Hub: Brand Guidelines, Market Strategy, Knowledge Base, Email Templates',
+      '- Creative Hub: Reports (renamed from Research Reports), Images, Videos',
+      '- Performance Hub: Paid Social, Newsletter, SEO/GEO (expanded by default)',
+      '- Split Campaign Performance page into separate Paid Social and Newsletter pages for better organization',
+      'Fixed Agent Mode Session Message Count Display',
+      '- Fixed bug where session message count was not displaying correctly in the chat history panel',
+      'Fixed SEO/GEO Page Visibility Issue',
+      '- Fixed bug where SEO/GEO page was not showing in the sidebar even when selected for the user\'s subscription type',
+    ],
+  },
+  {
     date: '2025-12-17',
     changes: [
       'Increased Video File Upload Limit to 100MB',
