@@ -7405,7 +7405,16 @@ ${emailDraftFormat === 'text'
         // Use research output directly
         blogTitle = researchResult.title || topic;
         blogDescription = researchResult.researchSummary || `Comprehensive research on ${topic}`;
-        blogContent = researchResult.markdownContent;
+        
+        // Strip the first H1 from markdown to avoid duplicate title
+        // (generateBlogHtml already adds the title as H1 in the template)
+        let contentWithoutTitle = researchResult.markdownContent;
+        const h1Match = contentWithoutTitle.match(/^#\s+.+\n?/m);
+        if (h1Match) {
+          contentWithoutTitle = contentWithoutTitle.replace(h1Match[0], '');
+        }
+        blogContent = contentWithoutTitle.trim();
+        
         imagePrompt = `Professional hero image for article about "${blogTitle}". High-quality, modern design.`;
 
       } else {
