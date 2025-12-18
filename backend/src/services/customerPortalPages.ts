@@ -47,13 +47,23 @@ export const CUSTOMER_PORTAL_PAGES: CustomerPortalPage[] = [
     description: 'View Meta ad campaign performance'
   },
   {
+    path: '/paid-social',
+    label: 'Paid Social',
+    description: 'View paid social media campaign performance'
+  },
+  {
+    path: '/newsletter',
+    label: 'Newsletter',
+    description: 'View newsletter campaign performance'
+  },
+  {
     path: '/seo',
     label: 'SEO/GEO',
     description: 'SEO and analytics management'
   },
   {
     path: '/research-reports',
-    label: 'Research Reports',
+    label: 'Reports',
     description: 'View market research reports'
   },
   {
