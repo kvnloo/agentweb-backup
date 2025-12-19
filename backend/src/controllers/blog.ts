@@ -433,7 +433,7 @@ OUTPUT FORMAT (STRICT JSON):
     const systemInstruction = "You are an expert content editor. Restyle content while preserving key information. Always respond with valid JSON only, no markdown code blocks.";
     
     const response = await ai.models.generateContent({
-      model: 'gemini-3-flash-preview',  // Using Gemini 3 Flash for restyling
+      model: 'gemini-3-pro-preview',  // Using Gemini 3 Flash for restyling
       contents: prompt,
       config: {
         systemInstruction,
