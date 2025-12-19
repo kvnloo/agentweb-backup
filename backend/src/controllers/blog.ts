@@ -420,7 +420,7 @@ OUTPUT FORMAT (STRICT JSON):
 
   try {
     const completion = await openai.chat.completions.create({
-      model: "gpt-4o",  // Using GPT-4o for restyling
+      model: "gpt-5-mini",  // Updated to GPT-5-mini for faster/cheaper restyling
       messages: [
         {
           role: "system",
