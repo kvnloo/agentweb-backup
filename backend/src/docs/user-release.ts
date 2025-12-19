@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-19',
+    changes: [
+      'Added New Plan Page Endpoint with Query Parameter Support',
+      '- Introduced new `/plan/:planTitle/new` endpoint that accepts query parameters',
+      '- Query parameters are automatically formatted into a starting message and sent to begin the conversation',
+      '- System parameters (leadId, sessionId, conversable) are automatically filtered out from the starting message',
+    ],
+  },
+  {
     date: '2025-12-18',
     changes: [
       'Reorganized Customer Portal Sidebar into 3 Hubs',
