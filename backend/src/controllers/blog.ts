@@ -419,20 +419,28 @@ OUTPUT FORMAT (STRICT JSON):
 }`;
 
   try {
-    const completion = await openai.chat.completions.create({
-      model: "gpt-5.1",  // Updated to GPT-5-mini for faster/cheaper restyling
-      messages: [
-        {
-          role: "system",
-          content: "You are an expert content editor. Restyle content while preserving key information. Always respond with valid JSON.",
-        },
-        { role: "user", content: prompt },
-      ],
-      temperature: 0.7,
-      max_tokens: 16000,  // High limit for long research content output
+    // Use Gemini 3 for restyling
+    const { GoogleGenAI } = require('@google/genai');
+    const { getSecret } = await import('../utils/secretsManager');
+    
+    // Get Gemini API key from secrets manager
+    const secretName = process.env.NODE_ENV === 'development' ? 'dev/AgentWeb/GeminiApiKey' : 'prod/AgentWeb/GeminiApiKey';
+    const apiKey = await getSecret(secretName);
+    
+    const ai = new GoogleGenAI({ apiKey });
+    
+    const systemInstruction = "You are an expert content editor. Restyle content while preserving key information. Always respond with valid JSON only, no markdown code blocks.";
+    
+    const response = await ai.models.generateContent({
+      model: 'gemini-3-flash-preview',  // Using Gemini 3 Flash for restyling
+      contents: prompt,
+      config: {
+        systemInstruction,
+        temperature: 0.7,
+      },
     });
 
-    const responseContent = completion.choices[0].message.content;
+    const responseContent = response.text || '';
     if (!responseContent) {
       throw new Error("No content generated from LLM");
     }
