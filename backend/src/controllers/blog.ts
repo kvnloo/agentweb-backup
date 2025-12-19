@@ -424,7 +424,8 @@ OUTPUT FORMAT (STRICT JSON):
     const { getSecret } = await import('../utils/secretsManager');
     
     // Get Gemini API key from secrets manager
-    const secretName = process.env.NODE_ENV === 'development' ? 'dev/AgentWeb/GeminiApiKey' : 'prod/AgentWeb/GeminiApiKey';
+    const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+    const secretName = `${environment}/AgentWeb/GeminiAPIKey`;
     const apiKey = await getSecret(secretName);
     
     const ai = new GoogleGenAI({ apiKey });
