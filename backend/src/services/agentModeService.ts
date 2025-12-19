@@ -7373,31 +7373,28 @@ ${emailDraftFormat === 'text'
     deepResearch: boolean = false
   ): Promise<any> {
     try {
-      // deep_research=true: research + inline images
-      // deep_research=false: standard content + hero only
-      const includeInlineImages = deepResearch;
-      
-      console.log('AgentMode: Creating blog article for topic:', topic, 'tone:', tone, 'length:', length, 'deepResearch:', deepResearch, 'includeInlineImages:', includeInlineImages, 'userId:', userId);
+      console.log('AgentMode: Creating blog article for topic:', topic, 'tone:', tone, 'length:', length, 'deepResearch:', deepResearch, 'userId:', userId);
 
       // Import required services
       const { uploadFileToS3 } = await import('../utils/s3Utils');
       const { generateBlogImage, generateBlogHtml, generateBlogContent, restyleContent } = await import('../controllers/blog');
 
-      // ========================================
-      // STEP 1: CONTENT GENERATION
-      // ========================================
       let blogData: { title: string; description: string; content: string; imagePrompt: string };
+      let finalContent: string;
+      let inlineImagesCount = 0;
 
       if (deepResearch) {
-        // Deep Research Flow: Get research → Restyle (tone/style only, preserve content)
+        // ========================================
+        // DEEP RESEARCH FLOW: Research + Restyle + Inline Images
+        // ========================================
         console.log('AgentMode: Deep research enabled, performing research...');
         const { deepResearchService } = await import('./deepResearchService');
         
         const researchResult = await deepResearchService.performDeepResearch({
           topic,
           prompt: requirements || undefined,
-          tone,   // Pass tone to steer research output
-          style   // Pass style for formatting (e.g., substack)
+          tone,
+          style
         });
 
         if (!researchResult.success || !researchResult.markdownContent) {
@@ -7407,90 +7404,75 @@ ${emailDraftFormat === 'text'
         console.log('AgentMode: Deep research complete. Length:', researchResult.markdownContent.length);
         console.log('AgentMode: Restyling research content with tone:', tone, 'style:', style);
         
-        // Restyle the research content (don't regenerate, just adjust tone/style)
+        // Restyle with inline image placeholders
         blogData = await restyleContent(
           researchResult.markdownContent,
           topic,
           tone,
           style,
-          includeInlineImages
+          true // includeInlineImages = true for deep research
         );
 
+        if (!blogData.title || !blogData.content) {
+          throw new Error("Blog content generation failed");
+        }
+
+        // Parse and generate inline images
+        const placeholders = this.parseImagePlaceholders(blogData.content);
+        console.log(`AgentMode: Found ${placeholders.length} image placeholders in content`);
+
+        if (placeholders.length > 0) {
+          console.log('AgentMode: Generating inline images...');
+          const inlineImageResults = await Promise.all(
+            placeholders.map(p => generateBlogImage(p.prompt, userId))
+          );
+          
+          const inlineImageUrls = inlineImageResults.map(r => r.imageUrl || '');
+          inlineImagesCount = inlineImageUrls.filter(u => u).length;
+          console.log(`AgentMode: Generated ${inlineImagesCount} inline images successfully`);
+
+          // Replace placeholders with actual image URLs
+          finalContent = this.replaceImagePlaceholders(blogData.content, placeholders, inlineImageUrls);
+          console.log('AgentMode: Replaced image placeholders with actual images');
+        } else {
+          finalContent = blogData.content;
+        }
+
       } else {
-        // Standard Flow: Generate new content (hero image only)
+        // ========================================
+        // STANDARD FLOW: Generate content only
+        // ========================================
         console.log('AgentMode: Generating blog content with LLM...');
         blogData = await generateBlogContent(
           topic, keywords, tone, length, 
           researchContext, requirements, style
         );
-      }
 
-      if (!blogData.title || !blogData.content) {
-        throw new Error("Blog content generation failed");
-      }
-
-      console.log('AgentMode: Blog content ready. Title:', blogData.title);
-
-      // ========================================
-      // STEP 2: PARSE IMAGE PLACEHOLDERS
-      // ========================================
-      const placeholders = this.parseImagePlaceholders(blogData.content);
-      console.log(`AgentMode: Found ${placeholders.length} image placeholders in content`);
-
-      // ========================================
-      // STEP 3: GENERATE IMAGES
-      // ========================================
-      let heroImageUrl: string;
-      let inlineImageUrls: string[] = [];
-
-      if (placeholders.length > 0) {
-        // Generate hero + inline images in parallel
-        console.log('AgentMode: Generating hero + inline images in parallel...');
-        const imagePromises = [
-          generateBlogImage(blogData.imagePrompt, userId),
-          ...placeholders.map(p => generateBlogImage(p.prompt, userId))
-        ];
-
-        const imageResults = await Promise.all(imagePromises);
-        
-        const heroResult = imageResults[0];
-        if (!heroResult.imageUrl) {
-          throw new Error('Hero image generation failed');
+        if (!blogData.title || !blogData.content) {
+          throw new Error("Blog content generation failed");
         }
-        heroImageUrl = heroResult.imageUrl;
-        inlineImageUrls = imageResults.slice(1).map(r => r.imageUrl || '');
-        
-        console.log(`AgentMode: Generated ${inlineImageUrls.filter(u => u).length} inline images successfully`);
-      } else {
-        // Hero only
-        console.log('AgentMode: Generating hero image only...');
-        const heroResult = await generateBlogImage(blogData.imagePrompt, userId);
-        if (!heroResult.imageUrl) {
-          throw new Error('Hero image generation failed');
-        }
-        heroImageUrl = heroResult.imageUrl;
+
+        console.log('AgentMode: Blog content ready. Title:', blogData.title);
+        finalContent = blogData.content;
       }
 
+      // ========================================
+      // COMMON: Generate Hero Image
+      // ========================================
+      console.log('AgentMode: Generating hero image...');
+      const heroResult = await generateBlogImage(blogData.imagePrompt, userId);
+      if (!heroResult.imageUrl) {
+        throw new Error('Hero image generation failed');
+      }
+      const heroImageUrl = heroResult.imageUrl;
       console.log('AgentMode: Hero image generated successfully');
 
       // ========================================
-      // STEP 4: REPLACE PLACEHOLDERS IN CONTENT
-      // ========================================
-      let finalContent = blogData.content;
-      if (placeholders.length > 0 && inlineImageUrls.length > 0) {
-        finalContent = this.replaceImagePlaceholders(blogData.content, placeholders, inlineImageUrls);
-        console.log('AgentMode: Replaced image placeholders with actual images');
-      }
-
-      // ========================================
-      // STEP 5: BUILD HTML (COMMON)
+      // COMMON: Build HTML and Upload to S3
       // ========================================
       console.log('AgentMode: Generating HTML file with style:', style);
       const htmlContent = generateBlogHtml(blogData.title, blogData.description, finalContent, heroImageUrl, style);
 
-      // ========================================
-      // STEP 6: UPLOAD TO S3 (COMMON)
-      // ========================================
       console.log('AgentMode: Uploading HTML file to S3...');
       const htmlFilename = `blog-${Date.now()}.html`;
 
@@ -7508,7 +7490,6 @@ ${emailDraftFormat === 'text'
       const htmlUrl = uploadResult.url;
       console.log('AgentMode: HTML file uploaded successfully to:', htmlUrl);
 
-      const inlineImagesCount = inlineImageUrls.filter(u => u).length;
       return {
         success: true,
         message: this.getBlogSuccessMessage(deepResearch, inlineImagesCount),
