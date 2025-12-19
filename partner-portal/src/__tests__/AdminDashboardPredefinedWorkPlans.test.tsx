@@ -25,11 +25,13 @@ interface WorkPlanStep {
 interface PredefinedWorkPlan {
   title: string;
   steps: WorkPlanStep[];
+  showLoginSignup?: 'after_plan_completed' | 'always';
 }
 
 // Helper function to get default onboarding plan
 const getDefaultOnboardingPlan = (): PredefinedWorkPlan => ({
   title: 'Onboarding',
+  showLoginSignup: 'after_plan_completed',
   steps: [
     {
       stepCount: 1,
@@ -142,6 +144,7 @@ const savePredefinedWorkPlans = async (
   // Validate work plans
   const validatedWorkPlans = workPlans.map(workPlan => ({
     title: workPlan.title.trim(),
+    showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed',
     steps: workPlan.steps
       .filter(step => step.title.trim().length > 0)
       .map((step, index) => ({
@@ -659,4 +662,3 @@ describe('AdminDashboard Predefined Work Plans', () => {
     });
   });
 });
-

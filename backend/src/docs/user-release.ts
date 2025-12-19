@@ -13,6 +13,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Introduced new `/plan/:planTitle/new` endpoint that accepts query parameters',
       '- Query parameters are automatically formatted into a starting message and sent to begin the conversation',
       '- System parameters (leadId, sessionId, conversable) are automatically filtered out from the starting message',
+      'Added login/signup display setting for predefined work plans',
+      '- Admins can choose to show the login/signup prompt only after plan completion or always during plan sessions',
+      '- Default behavior remains showing the prompt after all plan steps are completed',
     ],
   },
   {
