@@ -317,7 +317,8 @@ describe('AgentModeController - createSessionWithPlan', () => {
             })
           ]),
           welcomeMessage: 'Welcome to onboarding!',
-          autocomplete: false
+          autocomplete: false,
+          showLoginSignup: 'after_plan_completed'
         })
       );
       expect(mockChatbotDb.updateSessionInteractiveShareMetadata).toHaveBeenCalled();
@@ -465,7 +466,70 @@ describe('AgentModeController - createSessionWithPlan', () => {
         })
       );
     });
+
+    it('should store showLoginSignup when predefined plan sets it to always', async () => {
+      const workPlansWithLoginSignup = [
+        {
+          title: 'Onboarding',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'Step 1',
+              description: 'First step'
+            }
+          ],
+          showLoginSignup: 'always'
+        }
+      ];
+      mockSettingsService.getSetting.mockResolvedValue({
+        settingKey: 'agent-mode-predefined-workplans',
+        settingValue: JSON.stringify(workPlansWithLoginSignup)
+      } as any);
+
+      const req = mockRequest(mockPlanTitle);
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      expect(mockChatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        'test-session-123',
+        expect.objectContaining({
+          title: 'Onboarding',
+          showLoginSignup: 'always'
+        })
+      );
+    });
+
+    it('should default showLoginSignup to after_plan_completed when not specified', async () => {
+      const workPlansWithoutLoginSignup = [
+        {
+          title: 'Onboarding',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'Step 1',
+              description: 'First step'
+            }
+          ]
+        }
+      ];
+      mockSettingsService.getSetting.mockResolvedValue({
+        settingKey: 'agent-mode-predefined-workplans',
+        settingValue: JSON.stringify(workPlansWithoutLoginSignup)
+      } as any);
+
+      const req = mockRequest(mockPlanTitle);
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      expect(mockChatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        'test-session-123',
+        expect.objectContaining({
+          title: 'Onboarding',
+          showLoginSignup: 'after_plan_completed'
+        })
+      );
+    });
   });
 });
-
-

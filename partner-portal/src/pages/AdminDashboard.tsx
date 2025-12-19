@@ -4730,6 +4730,7 @@ interface PredefinedWorkPlan {
   steps: WorkPlanStep[];
   welcomeMessage?: string;
   autocomplete?: boolean;
+  showLoginSignup?: 'after_plan_completed' | 'always';
 }
 
 interface AvailableFunctionCall {
@@ -4901,6 +4902,7 @@ const AgentModeSettings = () => {
 
   const getDefaultOnboardingPlan = (): PredefinedWorkPlan => ({
     autocomplete: false,
+    showLoginSignup: 'after_plan_completed',
     title: 'Onboarding',
     welcomeMessage: 'Welcome to the onboarding process! I\'m here to help you get set up. Let\'s get started!',
     steps: [
@@ -5089,6 +5091,7 @@ const AgentModeSettings = () => {
         title: workPlan.title.trim(),
         welcomeMessage: workPlan.welcomeMessage?.trim() || undefined,
         autocomplete: workPlan.autocomplete || false,
+        showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed',
         steps: workPlan.steps
           .filter(step => step.title.trim().length > 0)
           .map((step, index) => ({
@@ -5122,7 +5125,8 @@ const AgentModeSettings = () => {
       {
         title: '',
         steps: [{ stepCount: 1, title: '' }],
-        autocomplete: false
+        autocomplete: false,
+        showLoginSignup: 'after_plan_completed'
       }
     ]);
   };
@@ -5481,6 +5485,27 @@ const AgentModeSettings = () => {
                         When enabled, Emma MUST complete each step before responding to the user. Steps will be automatically completed when all required function calls are executed.
                       </Typography>
                     </Box>
+
+                    <FormControl fullWidth size="small" sx={{ mb: 2 }}>
+                      <InputLabel>Show Login/Signup</InputLabel>
+                      <Select
+                        value={workPlan.showLoginSignup || 'after_plan_completed'}
+                        label="Show Login/Signup"
+                        onChange={(e) =>
+                          updateWorkPlan(workPlanIndex, {
+                            ...workPlan,
+                            showLoginSignup: e.target.value as 'after_plan_completed' | 'always'
+                          })
+                        }
+                        disabled={savingWorkPlans}
+                      >
+                        <MenuItem value="after_plan_completed">After plan completed</MenuItem>
+                        <MenuItem value="always">Always</MenuItem>
+                      </Select>
+                      <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
+                        Controls when the login/signup prompt is displayed during a plan session.
+                      </Typography>
+                    </FormControl>
 
                     <Typography variant="subtitle2" gutterBottom sx={{ mt: 2, mb: 1 }}>
                       Steps:
