@@ -7396,8 +7396,6 @@ ${emailDraftFormat === 'text'
         const researchResult = await deepResearchService.performDeepResearch({
           topic,
           prompt: requirements || undefined,
-          userId,
-          rawMarkdownOnly: true,
           tone,   // Pass tone to steer research output
           style   // Pass style for formatting (e.g., substack)
         });

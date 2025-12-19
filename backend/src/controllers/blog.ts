@@ -1,5 +1,8 @@
 import { Request, Response } from "express";
 import { imageService } from "../services/imageGeneration";
+import { GoogleGenAI } from '@google/genai';
+import { getSecret } from '../utils/secretsManager';
+import { CONTENT_RESTYLE_MODEL } from '../config';
 import OpenAI from "openai";
 import axios from "axios";
 import AWS from "aws-sdk";
@@ -347,7 +350,7 @@ SUBSTACK STYLE:
   const inlineImageGuidelines = includeInlineImages ? `
 
 IMAGE PLACEHOLDERS:
-- Add 3-5 {{IMAGE: prompt="...", caption="..."}} placeholders throughout
+- Add 2-5 {{IMAGE: prompt="...", caption="..."}} placeholders throughout (choose based on content length and sections)
 - Place them after key sections that would benefit from visual illustration
 - Each should have a detailed prompt (describe style, colors, composition) and brief caption
 - Do NOT place a placeholder at the very beginning (hero image is separate)` : '';
@@ -371,24 +374,25 @@ CRITICAL QUALITY RULES (MUST FOLLOW):
    ✅ Keep the facts but remove the citation markers entirely
    ✅ Write clean prose without academic-style references
 
-3. SPECIFIC EXAMPLES (NOT VAGUE REFERENCES)
+3. USE ONLY FACTS FROM THE RESEARCH (NO HALLUCINATION)
+   ❌ NEVER invent company names, statistics, or examples not in the research
    ❌ WRONG: "Leading companies are adopting this technology..."
-   ✅ RIGHT: Name specific companies, products, or people mentioned in the research
-   ✅ If the research is vague, use well-known examples relevant to the topic
+   ✅ RIGHT: Name specific companies, products, or people ONLY if mentioned in the research
+   ✅ If research lacks specifics, write generally: "Organizations in this space typically..."
 
 4. ENGAGING INTRODUCTION (THE HOOK)
-   ✅ Start with one of these proven hooks (adapt to the topic):
-      - A specific scenario: Describe someone experiencing the problem or solution
-      - A striking statistic: Lead with a surprising number from the research
-      - A provocative question: Challenge the reader's assumptions about ${topic}
-      - A bold statement: Make a confident claim about the topic's importance
+   ✅ Start with one of these hooks using ONLY facts from the research:
+      - A striking statistic from the research
+      - A provocative question that challenges assumptions about ${topic}
+      - A bold statement based on research findings
+   ❌ Do NOT fabricate scenarios or statistics not in the research
    ✅ The intro should be 3-5 sentences minimum, not a single line
 
 5. WRITE LIKE A HUMAN (ANTI-AI PATTERNS)
    ✅ Write in a natural, human voice - avoid robotic AI-generated patterns
-   ✅ Be specific - use real examples, not generic statements
+   ✅ Be specific using real examples FROM THE RESEARCH
    ✅ Sound like a human expert, not a language model
-   ✅ Avoid overused AI phrases: "dive into", "landscape", "it's important to note", "in conclusion"
+   ❌ Avoid overused AI phrases: "dive into", "landscape", "it's important to note", "in conclusion", "in today's world", "game-changer"
 
 6. STRUCTURE AND FORMATTING
    ✅ Use clear H2 (##) and H3 (###) headings to organize content
@@ -397,13 +401,17 @@ CRITICAL QUALITY RULES (MUST FOLLOW):
    ✅ Use bullet points and numbered lists for better readability
    ✅ Keep paragraphs short (3-4 sentences max)
 
-7. PROFESSIONAL POLISH
+7. LENGTH AND CONTENT PRESERVATION
+   ✅ Maintain similar length to the original research (do NOT summarize aggressively)
+   ✅ Preserve ALL key facts, data points, and insights from the research
+   ✅ This is a RESTYLE, not a summary - keep the depth and detail
+
+8. PROFESSIONAL POLISH
    ✅ Tone: ${tone}
    ✅ Include practical, actionable insights - not just theory
    ✅ Vary sentence length (mix short punchy with longer explanatory)
    ✅ Use transition phrases ("Here's where it gets interesting...", "But there's a catch...")
    ✅ End with a forward-looking conclusion or call-to-action
-   ✅ Preserve ALL key facts and insights (just remove the citation formatting)
 
 ${substackGuidelines}
 ${inlineImageGuidelines}
@@ -415,14 +423,10 @@ OUTPUT FORMAT (STRICT JSON):
   "title": "Compelling, SEO-optimized title (avoid generic titles like 'The Future of X')",
   "description": "1-2 sentence meta description for SEO and social sharing",
   "content": "Full blog article in markdown format. Must follow ALL rules above.${includeInlineImages ? ' Include {{IMAGE:...}} placeholders.' : ''}",
-  "imagePrompt": "Detailed hero image prompt: describe the scene, style (photorealistic/illustration/3D), mood, colors, composition. No text in image."${includeInlineImages ? ',\n  "inlineImageCount": 4' : ''}
+  "imagePrompt": "Detailed hero image prompt: describe the scene, style (photorealistic/illustration/3D), mood, colors, composition. No text in image."${includeInlineImages ? ',\n  "inlineImageCount": "<number of {{IMAGE:...}} placeholders you added (2-5)>"' : ''}
 }`;
 
   try {
-    // Use Gemini 3 for restyling
-    const { GoogleGenAI } = require('@google/genai');
-    const { getSecret } = await import('../utils/secretsManager');
-    
     // Get Gemini API key from secrets manager
     const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
     const secretName = `${environment}/AgentWeb/GeminiAPIKey`;
@@ -433,7 +437,7 @@ OUTPUT FORMAT (STRICT JSON):
     const systemInstruction = "You are an expert content editor. Restyle content while preserving key information. Always respond with valid JSON only, no markdown code blocks.";
     
     const response = await ai.models.generateContent({
-      model: 'gemini-3-flash-preview',  // Using Gemini 3 Flash for restyling
+      model: CONTENT_RESTYLE_MODEL,
       contents: prompt,
       config: {
         systemInstruction,

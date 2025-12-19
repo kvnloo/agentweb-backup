@@ -1,4 +1,6 @@
+import { GoogleGenAI } from '@google/genai';
 import { getSecret } from "../utils/secretsManager";
+import { DEEP_RESEARCH_AGENT } from '../config';
 
 /**
  * Result from deep research operation
@@ -17,8 +19,6 @@ interface DeepResearchResult {
 interface DeepResearchParams {
   topic: string;
   prompt?: string;
-  userId: string;
-  rawMarkdownOnly?: boolean;  // Always true in current usage
   tone?: string;              // e.g., 'professional', 'casual', 'technical', 'executive'
   style?: string;             // e.g., 'default', 'substack'
 }
@@ -81,8 +81,6 @@ export class DeepResearchService {
    */
   async performDeepResearch(params: DeepResearchParams): Promise<DeepResearchResult> {
     try {
-      const { GoogleGenAI } = require('@google/genai');
-      
       const apiKey = await this.getGeminiApiKey();
       const ai = new GoogleGenAI({ apiKey });
 
@@ -127,7 +125,7 @@ export class DeepResearchService {
       // Start the Deep Research Agent with background=true for async execution
       const initialInteraction = await ai.interactions.create({
         input: researchInput,
-        agent: 'deep-research-pro-preview-12-2025',
+        agent: DEEP_RESEARCH_AGENT,
         background: true,
       });
 
@@ -178,7 +176,7 @@ export class DeepResearchService {
 
       // Get the final text output (usually the last one)
       const finalOutput = outputs[outputs.length - 1];
-      const researchText = finalOutput.text || '';
+      const researchText = 'text' in finalOutput ? (finalOutput.text as string) || '' : '';
 
       if (!researchText) {
         return {
