@@ -7397,7 +7397,9 @@ ${emailDraftFormat === 'text'
           topic,
           prompt: requirements || undefined,
           userId,
-          rawMarkdownOnly: true
+          rawMarkdownOnly: true,
+          tone,   // Pass tone to steer research output
+          style   // Pass style for formatting (e.g., substack)
         });
 
         if (!researchResult.success || !researchResult.markdownContent) {
