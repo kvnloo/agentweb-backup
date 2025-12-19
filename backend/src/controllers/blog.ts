@@ -317,6 +317,117 @@ This guide provides the essential information you need to get started with ${top
   }
 }
 
+/**
+ * Restyle existing content (e.g., from deep research) in specified tone and style
+ * Unlike generateBlogContent, this doesn't generate new content - just adjusts tone/style
+ */
+export async function restyleContent(
+  originalContent: string,
+  topic: string,
+  tone: string = "professional",
+  style: string = "default",
+  includeInlineImages: boolean = false
+): Promise<{
+  title: string;
+  description: string;
+  content: string;
+  imagePrompt: string;
+  inlineImageCount?: number;
+}> {
+  // Substack-style writing guidelines
+  const substackGuidelines = style === 'substack' ? `
+- Write in first-person perspective ("I", "we", "my experience")
+- Be conversational and approachable
+- Include personal transitions like "Here's what I've learned..." or "Let me share..."
+- Use shorter paragraphs for better readability` : '';
+
+  // Inline image placeholder instructions
+  const inlineImageGuidelines = includeInlineImages ? `
+
+Image Placeholders:
+- Add 3-5 {{IMAGE: prompt="...", caption="..."}} placeholders throughout
+- Place them after key sections that would benefit from visual illustration
+- Each should have a detailed prompt and brief caption
+- Do NOT place a placeholder at the very beginning` : '';
+
+  const prompt = `You are an expert editor. Restyle the following research content into a blog article.
+
+TASK: Restyle this content (do NOT generate new content, preserve the key information)
+
+ORIGINAL CONTENT:
+${originalContent}
+
+REQUIREMENTS:
+- Tone: ${tone}
+- Preserve all key facts, data, and insights from the original
+- Improve readability and flow
+- Remove any overly academic or dry language
+- Keep the structure but make it more engaging
+${substackGuidelines}
+${inlineImageGuidelines}
+
+Format the response as JSON:
+{
+  "title": "Engaging title for the article",
+  "description": "1-2 sentence meta description",
+  "content": "Restyled content in markdown${includeInlineImages ? ' with {{IMAGE:...}} placeholders' : ''}",
+  "imagePrompt": "Detailed prompt for hero image (conceptual, no text)"${includeInlineImages ? ',\n  "inlineImageCount": 3' : ''}
+}`;
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o",  // Using GPT-4o for restyling
+      messages: [
+        {
+          role: "system",
+          content: "You are an expert content editor. Restyle content while preserving key information. Always respond with valid JSON.",
+        },
+        { role: "user", content: prompt },
+      ],
+      temperature: 0.7,
+      max_tokens: 16000,  // High limit for long research content output
+    });
+
+    const responseContent = completion.choices[0].message.content;
+    if (!responseContent) {
+      throw new Error("No content generated from LLM");
+    }
+
+    // Parse the JSON response
+    let result;
+    try {
+      const cleanedContent = responseContent.replace(/```json\s*|\s*```/g, "").trim();
+      result = JSON.parse(cleanedContent);
+    } catch (parseError) {
+      // Fallback: use original content with minor cleanup
+      const firstLine = originalContent.split('\n')[0];
+      const title = firstLine.replace(/^#\s*/, '').trim() || `Insights on ${topic}`;
+      
+      result = {
+        title,
+        description: `Comprehensive research on ${topic}`,
+        content: originalContent,
+        imagePrompt: `Professional illustration for an article about ${topic}. Modern, clean design.`,
+      };
+    }
+
+    return result;
+  } catch (error: any) {
+    console.error('Error restyling content:', error);
+    
+    // Fallback: return original content
+    const firstLine = originalContent.split('\n')[0];
+    const title = firstLine.replace(/^#\s*/, '').trim() || `Research on ${topic}`;
+    
+    return {
+      title,
+      description: `Comprehensive research on ${topic}`,
+      content: originalContent,
+      imagePrompt: `Professional illustration for ${topic}. Clean, modern design.`,
+    };
+  }
+}
+
 // Utility function to generate blog image (extracted from generateImage)
 export async function generateBlogImage(
   prompt: string,
