@@ -336,42 +336,86 @@ export async function restyleContent(
 }> {
   // Substack-style writing guidelines
   const substackGuidelines = style === 'substack' ? `
+SUBSTACK STYLE:
 - Write in first-person perspective ("I", "we", "my experience")
-- Be conversational and approachable
+- Be conversational and approachable, like talking to a smart friend
 - Include personal transitions like "Here's what I've learned..." or "Let me share..."
-- Use shorter paragraphs for better readability` : '';
+- Use shorter paragraphs for better readability
+- Add rhetorical questions to engage the reader` : '';
 
   // Inline image placeholder instructions
   const inlineImageGuidelines = includeInlineImages ? `
 
-Image Placeholders:
+IMAGE PLACEHOLDERS:
 - Add 3-5 {{IMAGE: prompt="...", caption="..."}} placeholders throughout
 - Place them after key sections that would benefit from visual illustration
-- Each should have a detailed prompt and brief caption
-- Do NOT place a placeholder at the very beginning` : '';
+- Each should have a detailed prompt (describe style, colors, composition) and brief caption
+- Do NOT place a placeholder at the very beginning (hero image is separate)` : '';
 
-  const prompt = `You are an expert editor. Restyle the following research content into a blog article.
+  const prompt = `You are a SENIOR CONTENT EDITOR at a top-tier publication like The Atlantic or Wired. Transform this research into a polished, publication-ready blog article.
 
-TASK: Restyle this content (do NOT generate new content, preserve the key information)
-
-ORIGINAL CONTENT:
+ORIGINAL RESEARCH:
 ${originalContent}
 
-REQUIREMENTS:
-- Tone: ${tone}
-- Preserve all key facts, data, and insights from the original
-- Improve readability and flow
-- Remove any overly academic or dry language
-- Keep the structure but make it more engaging
+═══════════════════════════════════════════════════
+CRITICAL QUALITY RULES (MUST FOLLOW):
+═══════════════════════════════════════════════════
+
+1. NO PLACEHOLDER TEXT
+   ❌ NEVER include: [Your Name], [Organization], [Source], [Year], [Insert X here], etc.
+   ✅ Either use real information from the research or omit the placeholder entirely.
+   ✅ For bylines, use "Staff Writer" or omit - do NOT leave brackets.
+
+2. REMOVE ALL CITATIONS AND REFERENCES
+   ❌ Remove: [1], [Source], (Author, Year), footnotes, reference links, bibliography sections
+   ✅ Keep the facts but remove the citation markers entirely
+   ✅ Write clean prose without academic-style references
+
+3. SPECIFIC EXAMPLES (NOT VAGUE REFERENCES)
+   ❌ WRONG: "Leading companies are adopting this technology..."
+   ✅ RIGHT: Name specific companies, products, or people mentioned in the research
+   ✅ If the research is vague, use well-known examples relevant to the topic
+
+4. ENGAGING INTRODUCTION (THE HOOK)
+   ✅ Start with one of these proven hooks (adapt to the topic):
+      - A specific scenario: Describe someone experiencing the problem or solution
+      - A striking statistic: Lead with a surprising number from the research
+      - A provocative question: Challenge the reader's assumptions about ${topic}
+      - A bold statement: Make a confident claim about the topic's importance
+   ✅ The intro should be 3-5 sentences minimum, not a single line
+
+5. WRITE LIKE A HUMAN (ANTI-AI PATTERNS)
+   ✅ Write in a natural, human voice - avoid robotic AI-generated patterns
+   ✅ Be specific - use real examples, not generic statements
+   ✅ Sound like a human expert, not a language model
+   ✅ Avoid overused AI phrases: "dive into", "landscape", "it's important to note", "in conclusion"
+
+6. STRUCTURE AND FORMATTING
+   ✅ Use clear H2 (##) and H3 (###) headings to organize content
+   ✅ Do NOT include the title as an H1 heading - it will be added separately
+   ✅ Use markdown tables for comparative data when it adds value
+   ✅ Use bullet points and numbered lists for better readability
+   ✅ Keep paragraphs short (3-4 sentences max)
+
+7. PROFESSIONAL POLISH
+   ✅ Tone: ${tone}
+   ✅ Include practical, actionable insights - not just theory
+   ✅ Vary sentence length (mix short punchy with longer explanatory)
+   ✅ Use transition phrases ("Here's where it gets interesting...", "But there's a catch...")
+   ✅ End with a forward-looking conclusion or call-to-action
+   ✅ Preserve ALL key facts and insights (just remove the citation formatting)
+
 ${substackGuidelines}
 ${inlineImageGuidelines}
 
-Format the response as JSON:
+═══════════════════════════════════════════════════
+OUTPUT FORMAT (STRICT JSON):
+═══════════════════════════════════════════════════
 {
-  "title": "Engaging title for the article",
-  "description": "1-2 sentence meta description",
-  "content": "Restyled content in markdown${includeInlineImages ? ' with {{IMAGE:...}} placeholders' : ''}",
-  "imagePrompt": "Detailed prompt for hero image (conceptual, no text)"${includeInlineImages ? ',\n  "inlineImageCount": 3' : ''}
+  "title": "Compelling, SEO-optimized title (avoid generic titles like 'The Future of X')",
+  "description": "1-2 sentence meta description for SEO and social sharing",
+  "content": "Full blog article in markdown format. Must follow ALL rules above.${includeInlineImages ? ' Include {{IMAGE:...}} placeholders.' : ''}",
+  "imagePrompt": "Detailed hero image prompt: describe the scene, style (photorealistic/illustration/3D), mood, colors, composition. No text in image."${includeInlineImages ? ',\n  "inlineImageCount": 4' : ''}
 }`;
 
   try {
