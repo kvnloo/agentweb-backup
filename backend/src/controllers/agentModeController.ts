@@ -2412,7 +2412,10 @@ export const agentModeController = {
         return res.status(404).json({ error: `Work plan "${planTitle}" not found` });
       }
 
-      res.json(workPlan);
+      res.json({
+        ...workPlan,
+        showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed'
+      });
     } catch (error) {
       console.error('AgentMode: Get predefined work plan error:', error);
       res.status(500).json({ error: 'Failed to get predefined work plan' });
@@ -2484,7 +2487,8 @@ export const agentModeController = {
       const workPlanWithWelcome = {
         ...workPlan,
         welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
-        autocomplete: predefinedPlan.autocomplete || false
+        autocomplete: predefinedPlan.autocomplete || false,
+        showLoginSignup: predefinedPlan.showLoginSignup || 'after_plan_completed'
       };
       await chatbotDb.updateSessionWorkPlan(session.sessionId, workPlanWithWelcome);
 
