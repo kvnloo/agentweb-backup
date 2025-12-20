@@ -16,6 +16,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Added login/signup display setting for predefined work plans',
       '- Admins can choose to show the login/signup prompt only after plan completion or always during plan sessions',
       '- Default behavior remains showing the prompt after all plan steps are completed',
+      'Fixed Partner Portal Admin Chat History message loading',
+      '- Message counts and chat contents now load from the messages table instead of session records',
     ],
   },
   {
