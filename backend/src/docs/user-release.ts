@@ -7,6 +7,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-20',
+    changes: [
+      'Added Growth Hub to Customer Portal sidebar',
+      '- CRM and GTM Plan pages now live under the new Growth Hub section',
+    ],
+  },
+  {
     date: '2025-12-19',
     changes: [
       'Added New Plan Page Endpoint with Query Parameter Support',
