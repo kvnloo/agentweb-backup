@@ -1366,12 +1366,25 @@ router.get("/chat-sessions", async (req, res) => {
     // Get all chat sessions from DynamoDB
     const sessions = await chatbotDb.getAllSessions();
 
+    // Load messages from the messages table for each session
+    const sessionsWithMessages = await Promise.all(
+      sessions.map(async (session) => {
+        try {
+          const sessionWithMessages = await chatbotDb.getChatSession(session.sessionId);
+          return sessionWithMessages ?? session;
+        } catch (error) {
+          console.error(`Error loading messages for session ${session.sessionId}:`, error);
+          return session;
+        }
+      })
+    );
+
     // Sort sessions by updatedAt in descending order
-    sessions.sort((a: ChatSession, b: ChatSession) => {
+    sessionsWithMessages.sort((a: ChatSession, b: ChatSession) => {
       return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
     });
 
-    res.json(sessions);
+    res.json(sessionsWithMessages);
   } catch (error) {
     console.error("Error fetching chat sessions:", error);
     res.status(500).json({ message: "Failed to fetch chat sessions" });
