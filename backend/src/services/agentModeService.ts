@@ -123,6 +123,7 @@ export class AgentModeService {
   private llmModels: Record<string, LLMModelConfig> = {
     // List openai models - create client dynamically for each deployment
     'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: true },
+    'gpt-5.2-chat': { client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false },
     // List gemini models - client will be lazy-loaded
     'gemini-3-pro-preview': { client: null, supportsTemperature: true },
   };
