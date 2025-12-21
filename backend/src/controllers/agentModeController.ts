@@ -294,6 +294,7 @@ async function runVerifiedChat(
   let attempt = 0;
   let allContent = '';
   const allToolCalls: any[] = [];
+  const defaultModel = params.llmModel || await agentModeService.getDefaultModel();
 
   // Track remaining keywords and function calls
   let remainingKeywords = [...keywords];
@@ -355,7 +356,7 @@ async function runVerifiedChat(
         sessionId,
         userMessage,
         userId,
-        params.llmModel || agentModeService.default_model,
+        defaultModel,
         attachmentsForThisAttempt
       );
 
@@ -650,7 +651,8 @@ async function runScheduledChat(
     const sessionId = testSession.sessionId;
 
     // Update the session with the selected model from the schedule
-    const modelToUse = schedule.llmModel || agentModeService.default_model;
+    const defaultModel = await agentModeService.getDefaultModel();
+    const modelToUse = schedule.llmModel || defaultModel;
     await chatbotDb.updateSessionLlmModel(sessionId, modelToUse);
 
     // Convert schedule format to runVerifiedChat format
@@ -671,7 +673,7 @@ async function runScheduledChat(
       requiredFunctions,
       maxAttempts: 20,
       attachments: [],
-      llmModel: schedule.llmModel || agentModeService.default_model
+      llmModel: schedule.llmModel || defaultModel
     });
 
     // Convert result to scheduled chat format
@@ -1024,7 +1026,7 @@ export const agentModeController = {
       );
 
       // Set default model for new sessions
-      const defaultModel = agentModeService.default_model;
+      const defaultModel = await agentModeService.getDefaultModel();
       const sessionWithModel = await chatbotDb.updateSessionLlmModel(session.sessionId, defaultModel);
 
       res.status(201).json(sessionWithModel);
@@ -1437,7 +1439,8 @@ export const agentModeController = {
       }
 
       // Use session's llmModel if available, otherwise use default
-      const modelToUse = session.llmModel || agentModeService.default_model;
+      const defaultModel = await agentModeService.getDefaultModel();
+      const modelToUse = session.llmModel || defaultModel;
 
       res.status(200).json({
         session: {
@@ -1491,7 +1494,8 @@ export const agentModeController = {
 
       // Always use session's llmModel for ishare endpoints (ignore request body's llmModel)
       // This ensures anonymous users get the correct model from the session
-      const modelToUse = session.llmModel || agentModeService.default_model;
+      const defaultModel = await agentModeService.getDefaultModel();
+      const modelToUse = session.llmModel || defaultModel;
 
       // Use the same generateSessionResponse logic as the regular generateResponse
       const response = await generateSessionResponse(
@@ -1842,7 +1846,7 @@ export const agentModeController = {
         sessionId: sessionId || null, // Store original sessionId for reference (can be null)
         type: 'scheduled_chat', // Distinguish from regular task schedules
         emailCampaignTaskId: emailCampaignTaskId || null,
-        llmModel: llmModel || agentModeService.default_model // Use provided model or default
+        llmModel: llmModel || await agentModeService.getDefaultModel() // Use provided model or default
       };
 
       await scheduleDb.createSchedule(scheduledChat);
@@ -1922,7 +1926,7 @@ export const agentModeController = {
         dailyDigest: scheduleFrequency === 'hourly' ? (dailyDigest || false) : false, // Only allow daily digest for hourly schedules
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId || null,
-        llmModel: llmModel || agentModeService.default_model // Use provided model or default
+        llmModel: llmModel || await agentModeService.getDefaultModel() // Use provided model or default
       };
 
       await scheduleDb.updateSchedule(scheduleId, updates);
@@ -2284,7 +2288,8 @@ export const agentModeController = {
       }
 
       // Use session's llmModel if available, otherwise use default
-      const modelToUse = session.llmModel || agentModeService.default_model;
+      const defaultModel = await agentModeService.getDefaultModel();
+      const modelToUse = session.llmModel || defaultModel;
 
       res.json({
         sessionId: session.sessionId,
@@ -2317,7 +2322,8 @@ export const agentModeController = {
       }
 
       // Use session's llmModel if available, otherwise use default
-      const modelToUse = session.llmModel || agentModeService.default_model;
+      const defaultModel = await agentModeService.getDefaultModel();
+      const modelToUse = session.llmModel || defaultModel;
 
       // Generate AI response using the same function as regular users
       const response = await generateSessionResponse(
@@ -2493,7 +2499,7 @@ export const agentModeController = {
       await chatbotDb.updateSessionWorkPlan(session.sessionId, workPlanWithWelcome);
 
       // Set default model for new sessions
-      const defaultModel = agentModeService.default_model;
+      const defaultModel = await agentModeService.getDefaultModel();
       await chatbotDb.updateSessionLlmModel(session.sessionId, defaultModel);
 
       // Enable interactive sharing for the session

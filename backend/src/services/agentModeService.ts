@@ -47,6 +47,24 @@ interface LLMCallOptions {
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number }> = new Map();
   default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2';
+  private defaultModelSettingName = 'agent_mode_default_model';
+
+  async getDefaultModel(): Promise<string> {
+    const fallbackModel = this.default_model;
+    try {
+      const setting = await settingsService.getSetting(this.defaultModelSettingName);
+      const configuredModel = setting?.settingValue?.trim();
+      if (configuredModel) {
+        if (this.llmModels[configuredModel]) {
+          return configuredModel;
+        }
+        console.warn(`AgentMode: Unsupported default model "${configuredModel}" in settings; using fallback.`);
+      }
+    } catch (error) {
+      console.error('AgentMode: Error getting default model setting:', error);
+    }
+    return fallbackModel;
+  }
   
   // Helper method to create Azure OpenAI client for a specific deployment
   private getAzureOpenAIClient(deploymentName: string): OpenAI {
@@ -2943,7 +2961,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         };
       }
       if (!llmModel) {
-        llmModel = this.default_model;
+        llmModel = await this.getDefaultModel();
       }
       // Use custom prompt or default
       const analysisPrompt = prompt || 'Please analyze and describe this image in detail. Focus on visual elements, composition, colors, text, and any marketing or branding elements you can identify.';
@@ -4969,8 +4987,9 @@ ${emailDraftFormat === 'text'
 
   async generateSessionTitle(userMessage: string): Promise<string> {
     try {
+      const defaultModel = await this.getDefaultModel();
 
-      const response = await this.callLLM(this.default_model, [
+      const response = await this.callLLM(defaultModel, [
         {
           role: 'system',
           content: `You are a session title generator for AgentWeb's Agent Mode. Based on the user's first message, generate a concise, descriptive title (max 60 characters) that captures the main marketing topic or task. Return ONLY the title, nothing else.`
@@ -8799,7 +8818,7 @@ ${emailDraftFormat === 'text'
         };
       }
       if (!llmModel) {
-        llmModel = this.default_model;
+        llmModel = await this.getDefaultModel();
       }
       // Validate that all required variables are provided
       const templateVariables = template.variables || [];
