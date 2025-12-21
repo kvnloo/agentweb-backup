@@ -126,6 +126,7 @@ export class AgentModeService {
     'gpt-5.2-chat': { client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false },
     // List gemini models - client will be lazy-loaded
     'gemini-3-pro-preview': { client: null, supportsTemperature: true },
+    'gemini-3-flash-preview': { client: null, supportsTemperature: true },
   };
 
   async getSupportedModels() {
@@ -186,7 +187,7 @@ export class AgentModeService {
     // Get the client - lazy-load Gemini client if needed
     let client = this.llmModels[model].client;
     if (!client) {
-      if (model === 'gemini-3-pro-preview') {
+      if (model === 'gemini-3-pro-preview' || model === 'gemini-3-flash-preview') {
         client = await this.getGeminiClient();
         // Update the cached client for future use
         this.llmModels[model].client = client;
