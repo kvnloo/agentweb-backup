@@ -5,7 +5,7 @@ import { chatbotDb } from "../services/chatbotService";
 
 jest.mock("../services/chatbotService", () => ({
   chatbotDb: {
-    getAllSessions: jest.fn(),
+    getRecentSessionsPage: jest.fn(),
     getChatSession: jest.fn(),
   },
 }));
@@ -32,32 +32,35 @@ describe("Admin chat sessions endpoint", () => {
   it("hydrates sessions with messages from the messages table", async () => {
     const baseSessions = [
       {
-        sessionId: "session-1",
-        userId: "user-1",
-        createdAt: "2024-01-01T00:00:00Z",
-        updatedAt: "2024-01-02T00:00:00Z",
-        messages: [{ role: "user", content: "legacy" }],
-      },
-      {
         sessionId: "session-2",
         userId: "user-2",
         createdAt: "2024-01-03T00:00:00Z",
         updatedAt: "2024-01-04T00:00:00Z",
         messages: [],
       },
+      {
+        sessionId: "session-1",
+        userId: "user-1",
+        createdAt: "2024-01-01T00:00:00Z",
+        updatedAt: "2024-01-02T00:00:00Z",
+        messages: [{ role: "user", content: "legacy" }],
+      },
     ];
 
-    mockChatbotDb.getAllSessions.mockResolvedValue(baseSessions as any);
+    mockChatbotDb.getRecentSessionsPage.mockResolvedValue({
+      sessions: baseSessions as any,
+      lastEvaluatedKey: undefined,
+    });
     mockChatbotDb.getChatSession.mockImplementation(async (sessionId: string) => {
       if (sessionId === "session-1") {
         return {
-          ...baseSessions[0],
+          ...baseSessions[1],
           messages: [{ role: "assistant", content: "from-messages-table" }],
         } as any;
       }
       if (sessionId === "session-2") {
         return {
-          ...baseSessions[1],
+          ...baseSessions[0],
           messages: [
             { role: "user", content: "hello" },
             { role: "assistant", content: "world" },
@@ -69,15 +72,35 @@ describe("Admin chat sessions endpoint", () => {
 
     const res = await request(app).get("/api/admin/chat-sessions").expect(200);
 
+    expect(mockChatbotDb.getRecentSessionsPage).toHaveBeenCalledWith(30, undefined);
     expect(mockChatbotDb.getChatSession).toHaveBeenCalledTimes(2);
     expect(mockChatbotDb.getChatSession).toHaveBeenCalledWith("session-1");
     expect(mockChatbotDb.getChatSession).toHaveBeenCalledWith("session-2");
 
-    expect(res.body).toHaveLength(2);
-    expect(res.body[0].sessionId).toBe("session-2");
-    expect(res.body[0].messages).toHaveLength(2);
-    expect(res.body[0].messages[0].content).toBe("hello");
-    expect(res.body[1].sessionId).toBe("session-1");
-    expect(res.body[1].messages[0].content).toBe("from-messages-table");
+    expect(res.body.sessions).toHaveLength(2);
+    expect(res.body.nextCursor).toBeNull();
+    expect(res.body.sessions[0].sessionId).toBe("session-2");
+    expect(res.body.sessions[0].messages).toHaveLength(2);
+    expect(res.body.sessions[0].messages[0].content).toBe("hello");
+    expect(res.body.sessions[1].sessionId).toBe("session-1");
+    expect(res.body.sessions[1].messages[0].content).toBe("from-messages-table");
+  });
+
+  it("passes the decoded cursor to pagination queries", async () => {
+    const lastEvaluatedKey = { sessionId: "session-99" };
+    const cursor = Buffer.from(JSON.stringify(lastEvaluatedKey)).toString("base64");
+
+    mockChatbotDb.getRecentSessionsPage.mockResolvedValue({
+      sessions: [],
+      lastEvaluatedKey: undefined,
+    });
+
+    const res = await request(app)
+      .get(`/api/admin/chat-sessions?cursor=${encodeURIComponent(cursor)}`)
+      .expect(200);
+
+    expect(mockChatbotDb.getRecentSessionsPage).toHaveBeenCalledWith(30, lastEvaluatedKey);
+    expect(res.body.sessions).toHaveLength(0);
+    expect(res.body.nextCursor).toBeNull();
   });
 });

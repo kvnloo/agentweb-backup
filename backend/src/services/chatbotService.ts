@@ -103,6 +103,7 @@ export interface ChatMessage {
 export interface ChatSession {
   sessionId: string;
   userId: string;
+  adminListPartition?: string;
   title?: string; // Session title for display
   messages: ChatMessage[];
   createdAt: string;
@@ -403,6 +404,7 @@ export class ChatbotDB {
       ] : [],
       createdAt: timestamp,
       updatedAt: timestamp,
+      adminListPartition: "all",
       portalType,
       pageIdentifier,
       selectedStartupId,
@@ -907,10 +909,11 @@ export class ChatbotDB {
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET archived = :archived, updatedAt = :updatedAt",
+      UpdateExpression: "SET archived = :archived, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":archived": true,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
     };
 
@@ -952,11 +955,12 @@ export class ChatbotDB {
         sessionId,
       },
       UpdateExpression:
-        "SET pageContent = :pageContent, contextChunks = :contextChunks, updatedAt = :updatedAt",
+        "SET pageContent = :pageContent, contextChunks = :contextChunks, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":pageContent": pageContent,
         ":contextChunks": contextChunks,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -994,10 +998,11 @@ export class ChatbotDB {
         sessionId,
       },
       UpdateExpression:
-        "SET title = :title, updatedAt = :updatedAt",
+        "SET title = :title, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":title": title,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -1023,10 +1028,11 @@ export class ChatbotDB {
       sessionId,
       },
       UpdateExpression:
-        "SET portalType = :portalType, updatedAt = :updatedAt",
+        "SET portalType = :portalType, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":portalType": portalType,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -1052,10 +1058,11 @@ export class ChatbotDB {
         sessionId,
       },
       UpdateExpression:
-        "SET selectedStartupId = :selectedStartupId, updatedAt = :updatedAt",
+        "SET selectedStartupId = :selectedStartupId, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":selectedStartupId": selectedStartupId,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -1080,10 +1087,11 @@ export class ChatbotDB {
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET shareMetadata = :shareMetadata, updatedAt = :updatedAt",
+      UpdateExpression: "SET shareMetadata = :shareMetadata, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":shareMetadata": shareMetadata,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -1115,10 +1123,11 @@ export class ChatbotDB {
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET userId = :userId, updatedAt = :updatedAt",
+      UpdateExpression: "SET userId = :userId, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":userId": newUserId,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -1143,10 +1152,11 @@ export class ChatbotDB {
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET interactiveShareMetadata = :interactiveShareMetadata, updatedAt = :updatedAt",
+      UpdateExpression: "SET interactiveShareMetadata = :interactiveShareMetadata, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":interactiveShareMetadata": interactiveShareMetadata,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -1202,10 +1212,11 @@ export class ChatbotDB {
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET workPlan = :workPlan, updatedAt = :updatedAt",
+      UpdateExpression: "SET workPlan = :workPlan, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":workPlan": validatedWorkPlan,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -1231,10 +1242,11 @@ export class ChatbotDB {
         sessionId,
       },
       UpdateExpression:
-        "SET llmModel = :llmModel, updatedAt = :updatedAt",
+        "SET llmModel = :llmModel, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":llmModel": llmModel,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -1273,10 +1285,11 @@ export class ChatbotDB {
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET calledFunctions = :calledFunctions, updatedAt = :updatedAt",
+      UpdateExpression: "SET calledFunctions = :calledFunctions, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":calledFunctions": updatedCounts,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -1315,10 +1328,11 @@ export class ChatbotDB {
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET calledFunctions = :calledFunctions, updatedAt = :updatedAt",
+      UpdateExpression: "SET calledFunctions = :calledFunctions, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":calledFunctions": updatedCounts,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -1343,10 +1357,11 @@ export class ChatbotDB {
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET calledFunctions = :calledFunctions, updatedAt = :updatedAt",
+      UpdateExpression: "SET calledFunctions = :calledFunctions, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":calledFunctions": calledFunctions,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -1424,6 +1439,37 @@ export class ChatbotDB {
     } while (lastEvaluatedKey);
 
     return allSessions;
+  }
+
+  async getRecentSessionsPage(
+    limit: number,
+    lastEvaluatedKey?: AWS.DynamoDB.DocumentClient.Key
+  ): Promise<{ sessions: ChatSession[]; lastEvaluatedKey?: AWS.DynamoDB.DocumentClient.Key }> {
+    const params: AWS.DynamoDB.DocumentClient.QueryInput = {
+      TableName: this.tableName,
+      IndexName: "AdminUpdatedAtIndex",
+      KeyConditionExpression: "adminListPartition = :adminListPartition",
+      ExpressionAttributeValues: {
+        ":adminListPartition": "all",
+      },
+      Limit: limit,
+      ScanIndexForward: false,
+    };
+
+    if (lastEvaluatedKey) {
+      params.ExclusiveStartKey = lastEvaluatedKey;
+    }
+
+    try {
+      const result = await dynamodb.query(params).promise();
+      return {
+        sessions: (result.Items as ChatSession[]) || [],
+        lastEvaluatedKey: result.LastEvaluatedKey,
+      };
+    } catch (error) {
+      console.error("Error getting recent chat sessions:", error);
+      throw error;
+    }
   }
 
   async updateMessageInSession(sessionId: string, messageIndex: number, updatedMessage: ChatMessage): Promise<void> {
@@ -2238,4 +2284,3 @@ export async function updateTaskExecutionStatus(
     throw error;
   }
 }
-
