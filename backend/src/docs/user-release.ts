@@ -7,6 +7,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-21',
+    changes: [
+      'Supported deep research for create_blog_article function call in Agent Mode',
+      '- When deep_research is true, Agent Mode routes the task to the Gemini deep research agent for extended research and synthesis before drafting the article',
+    ],
+  },
+  {
     date: '2025-12-20',
     changes: [
       'Added Growth Hub to Customer Portal sidebar',

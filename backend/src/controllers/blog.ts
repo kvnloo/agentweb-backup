@@ -1,5 +1,8 @@
 import { Request, Response } from "express";
 import { imageService } from "../services/imageGeneration";
+import { GoogleGenAI } from '@google/genai';
+import { getSecret } from '../utils/secretsManager';
+import { CONTENT_RESTYLE_MODEL } from '../config';
 import OpenAI from "openai";
 import axios from "axios";
 import AWS from "aws-sdk";
@@ -313,6 +316,171 @@ This guide covers the fundamentals of ${topic}.
 
 This guide provides the essential information you need to get started with ${topic}.`,
       imagePrompt: `A professional business illustration representing ${topic}. Clean, modern design with relevant visual elements. No text, conceptual business representation.`,
+    };
+  }
+}
+
+/**
+ * Restyle existing content (e.g., from deep research) in specified tone and style
+ * Unlike generateBlogContent, this doesn't generate new content - just adjusts tone/style
+ */
+export async function restyleContent(
+  originalContent: string,
+  topic: string,
+  tone: string = "professional",
+  style: string = "default",
+  includeInlineImages: boolean = false
+): Promise<{
+  title: string;
+  description: string;
+  content: string;
+  imagePrompt: string;
+  inlineImageCount?: number;
+}> {
+  // Substack-style writing guidelines
+  const substackGuidelines = style === 'substack' ? `
+SUBSTACK STYLE:
+- Write in first-person perspective ("I", "we", "my experience")
+- Be conversational and approachable, like talking to a smart friend
+- Include personal transitions like "Here's what I've learned..." or "Let me share..."
+- Use shorter paragraphs for better readability
+- Add rhetorical questions to engage the reader` : '';
+
+  // Inline image placeholder instructions
+  const inlineImageGuidelines = includeInlineImages ? `
+
+IMAGE PLACEHOLDERS:
+- Add 2-5 {{IMAGE: prompt="...", caption="..."}} placeholders throughout (choose based on content length and sections)
+- Place them after key sections that would benefit from visual illustration
+- Each should have a detailed prompt (describe style, colors, composition) and brief caption
+- Do NOT place a placeholder at the very beginning (hero image is separate)` : '';
+
+  const prompt = `You are a SENIOR CONTENT EDITOR at a top-tier publication like The Atlantic or Wired. Transform this research into a polished, publication-ready blog article.
+
+ORIGINAL RESEARCH:
+${originalContent}
+
+═══════════════════════════════════════════════════
+CRITICAL QUALITY RULES (MUST FOLLOW):
+═══════════════════════════════════════════════════
+
+1. NO PLACEHOLDER TEXT
+   ❌ NEVER include: [Your Name], [Organization], [Source], [Year], [Insert X here], etc.
+   ✅ Either use real information from the research or omit the placeholder entirely.
+   ✅ For bylines, use "Staff Writer" or omit - do NOT leave brackets.
+
+2. REMOVE ALL CITATIONS AND REFERENCES
+   ❌ Remove: [1], [Source], (Author, Year), footnotes, reference links, bibliography sections
+   ✅ Keep the facts but remove the citation markers entirely
+   ✅ Write clean prose without academic-style references
+
+3. USE ONLY FACTS FROM THE RESEARCH (NO HALLUCINATION)
+   ❌ NEVER invent company names, statistics, or examples not in the research
+   ❌ WRONG: "Leading companies are adopting this technology..."
+   ✅ RIGHT: Name specific companies, products, or people ONLY if mentioned in the research
+   ✅ If research lacks specifics, write generally: "Organizations in this space typically..."
+
+4. ENGAGING INTRODUCTION (THE HOOK)
+   ✅ Start with one of these hooks using ONLY facts from the research:
+      - A striking statistic from the research
+      - A provocative question that challenges assumptions about ${topic}
+      - A bold statement based on research findings
+   ❌ Do NOT fabricate scenarios or statistics not in the research
+   ✅ The intro should be 3-5 sentences minimum, not a single line
+
+5. WRITE LIKE A HUMAN (ANTI-AI PATTERNS)
+   ✅ Write in a natural, human voice - avoid robotic AI-generated patterns
+   ✅ Be specific using real examples FROM THE RESEARCH
+   ✅ Sound like a human expert, not a language model
+   ❌ Avoid overused AI phrases: "dive into", "landscape", "it's important to note", "in conclusion", "in today's world", "game-changer"
+
+6. STRUCTURE AND FORMATTING
+   ✅ Use clear H2 (##) and H3 (###) headings to organize content
+   ✅ Do NOT include the title as an H1 heading - it will be added separately
+   ✅ Use markdown tables for comparative data when it adds value
+   ✅ Use bullet points and numbered lists for better readability
+   ✅ Keep paragraphs short (3-4 sentences max)
+
+7. LENGTH AND CONTENT PRESERVATION
+   ✅ Maintain similar length to the original research (do NOT summarize aggressively)
+   ✅ Preserve ALL key facts, data points, and insights from the research
+   ✅ This is a RESTYLE, not a summary - keep the depth and detail
+
+8. PROFESSIONAL POLISH
+   ✅ Tone: ${tone}
+   ✅ Include practical, actionable insights - not just theory
+   ✅ Vary sentence length (mix short punchy with longer explanatory)
+   ✅ Use transition phrases ("Here's where it gets interesting...", "But there's a catch...")
+   ✅ End with a forward-looking conclusion or call-to-action
+
+${substackGuidelines}
+${inlineImageGuidelines}
+
+═══════════════════════════════════════════════════
+OUTPUT FORMAT (STRICT JSON):
+═══════════════════════════════════════════════════
+{
+  "title": "Compelling, SEO-optimized title (avoid generic titles like 'The Future of X')",
+  "description": "1-2 sentence meta description for SEO and social sharing",
+  "content": "Full blog article in markdown format. Must follow ALL rules above.${includeInlineImages ? ' Include {{IMAGE:...}} placeholders.' : ''}",
+  "imagePrompt": "Detailed hero image prompt: describe the scene, style (photorealistic/illustration/3D), mood, colors, composition. No text in image."${includeInlineImages ? ',\n  "inlineImageCount": "<number of {{IMAGE:...}} placeholders you added (2-5)>"' : ''}
+}`;
+
+  try {
+    // Get Gemini API key from secrets manager
+    const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+    const secretName = `${environment}/AgentWeb/GeminiAPIKey`;
+    const apiKey = await getSecret(secretName);
+    
+    const ai = new GoogleGenAI({ apiKey });
+    
+    const systemInstruction = "You are an expert content editor. Restyle content while preserving key information. Always respond with valid JSON only, no markdown code blocks.";
+    
+    const response = await ai.models.generateContent({
+      model: CONTENT_RESTYLE_MODEL,
+      contents: prompt,
+      config: {
+        systemInstruction,
+        temperature: 0.7,
+      },
+    });
+
+    const responseContent = response.text || '';
+    if (!responseContent) {
+      throw new Error("No content generated from LLM");
+    }
+
+    // Parse the JSON response
+    let result;
+    try {
+      const cleanedContent = responseContent.replace(/```json\s*|\s*```/g, "").trim();
+      result = JSON.parse(cleanedContent);
+    } catch (parseError) {
+      // Fallback: use original content with minor cleanup
+      const firstLine = originalContent.split('\n')[0];
+      const title = firstLine.replace(/^#\s*/, '').trim() || `Insights on ${topic}`;
+      
+      result = {
+        title,
+        description: `Comprehensive research on ${topic}`,
+        content: originalContent,
+        imagePrompt: `Professional illustration for an article about ${topic}. Modern, clean design.`,
+      };
+    }
+
+    return result;
+  } catch (error: any) {
+    console.error('Error restyling content:', error);
+    
+    // Fallback: return original content
+    const firstLine = originalContent.split('\n')[0];
+    const title = firstLine.replace(/^#\s*/, '').trim() || `Research on ${topic}`;
+    
+    return {
+      title,
+      description: `Comprehensive research on ${topic}`,
+      content: originalContent,
+      imagePrompt: `Professional illustration for ${topic}. Clean, modern design.`,
     };
   }
 }
