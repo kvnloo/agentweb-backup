@@ -595,7 +595,8 @@ const createChatSessionsTable = async () => {
     AttributeDefinitions: [
       { AttributeName: 'sessionId', AttributeType: 'S' },
       { AttributeName: 'userId', AttributeType: 'S' },
-      { AttributeName: 'updatedAt', AttributeType: 'S' }
+      { AttributeName: 'updatedAt', AttributeType: 'S' },
+      { AttributeName: 'adminListPartition', AttributeType: 'S' }
     ],
     KeySchema: [
       { AttributeName: 'sessionId', KeyType: 'HASH' }
@@ -605,6 +606,20 @@ const createChatSessionsTable = async () => {
         IndexName: 'UserIdIndex',
         KeySchema: [
           { AttributeName: 'userId', KeyType: 'HASH' },
+          { AttributeName: 'updatedAt', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5
+        }
+      },
+      {
+        IndexName: 'AdminUpdatedAtIndex',
+        KeySchema: [
+          { AttributeName: 'adminListPartition', KeyType: 'HASH' },
           { AttributeName: 'updatedAt', KeyType: 'RANGE' }
         ],
         Projection: {

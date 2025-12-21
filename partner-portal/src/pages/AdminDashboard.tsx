@@ -554,6 +554,10 @@ export default function AdminDashboard() {
   const [selectedUser, setSelectedUser] = useState<User | null>(null);
   const [deactivateDialogOpen, setDeactivateDialogOpen] = useState(false);
   const [chatSessions, setChatSessions] = useState<AdminChatSession[]>([]);
+  const [chatSessionsLoading, setChatSessionsLoading] = useState(false);
+  const [chatSessionsCursor, setChatSessionsCursor] = useState<string | null>(null);
+  const [chatSessionsHasMore, setChatSessionsHasMore] = useState(true);
+  const [chatSessionsInitialized, setChatSessionsInitialized] = useState(false);
   const [selectedSession, setSelectedSession] =
     useState<AdminChatSession | null>(null);
   const [chatDialogOpen, setChatDialogOpen] = useState(false);
@@ -704,6 +708,7 @@ export default function AdminDashboard() {
 
   // Track last loaded dates to prevent unnecessary reloads
   const lastLoadedDatesRef = React.useRef<{ startDate: string; endDate: string } | null>(null);
+  const chatSessionsLoadMoreRef = React.useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (startDate && endDate && tabValue === 0 && !adminLoading) {
@@ -763,28 +768,92 @@ export default function AdminDashboard() {
     }
   }, [tabValue, token]);
 
-  useEffect(() => {
-    const loadChatSessions = async () => {
+  const loadChatSessions = React.useCallback(
+    async (options?: { reset?: boolean }) => {
+      if (!token || chatSessionsLoading) {
+        return;
+      }
+
+      const shouldReset = options?.reset ?? false;
+      const cursor = shouldReset ? null : chatSessionsCursor;
+
       try {
+        setChatSessionsLoading(true);
+        const params = new URLSearchParams();
+        params.set("limit", "30");
+        if (cursor) {
+          params.set("cursor", cursor);
+        }
+
         const response = await axios.get(
-          buildApiUrl("/api/admin/chat-sessions"),
+          buildApiUrl(`/api/admin/chat-sessions?${params.toString()}`),
           {
             headers: {
               Authorization: `Bearer ${token}`,
             },
           }
         );
-        setChatSessions(response.data);
+
+        const { sessions, nextCursor } = response.data as {
+          sessions: AdminChatSession[];
+          nextCursor: string | null;
+        };
+
+        setChatSessions((prev) => {
+          if (shouldReset) {
+            return sessions;
+          }
+          const seen = new Set(prev.map((session) => session.sessionId));
+          const merged = [...prev];
+          sessions.forEach((session) => {
+            if (!seen.has(session.sessionId)) {
+              merged.push(session);
+              seen.add(session.sessionId);
+            }
+          });
+          return merged;
+        });
+        setChatSessionsCursor(nextCursor);
+        setChatSessionsHasMore(Boolean(nextCursor));
+        setChatSessionsInitialized(true);
       } catch (error) {
         console.error("Error loading chat sessions:", error);
+      } finally {
+        setChatSessionsLoading(false);
       }
-    };
+    },
+    [token, chatSessionsCursor, chatSessionsLoading]
+  );
 
-    // Only load chat sessions when Chat History tab (6) is selected and we haven't loaded them yet
-    if (tabValue === 6 && chatSessions.length === 0) {
-      loadChatSessions();
+  useEffect(() => {
+    if (tabValue === 6 && !chatSessionsInitialized) {
+      loadChatSessions({ reset: true });
     }
-  }, [tabValue, token]);
+  }, [tabValue, chatSessionsInitialized, loadChatSessions]);
+
+  useEffect(() => {
+    if (tabValue !== 6 || !chatSessionsHasMore) {
+      return;
+    }
+
+    const target = chatSessionsLoadMoreRef.current;
+    if (!target) {
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const [entry] = entries;
+        if (entry.isIntersecting && !chatSessionsLoading && chatSessionsHasMore) {
+          loadChatSessions();
+        }
+      },
+      { root: null, rootMargin: "200px", threshold: 0.1 }
+    );
+
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [tabValue, chatSessionsHasMore, chatSessionsLoading, loadChatSessions]);
 
   useEffect(() => {
     const loadKnowledgeBaseMetrics = async () => {
@@ -3343,144 +3412,154 @@ export default function AdminDashboard() {
                 </TableRow>
               </TableHead>
               <TableBody>
-                {loading ? (
+                {chatSessionsLoading && chatSessions.length === 0 ? (
                   <TableRow>
                     <TableCell colSpan={8} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
                 ) : (
-                  chatSessions.map((session) => (
-                    <TableRow key={session.sessionId}>
-                      <TableCell component="th" scope="row">
-                        <Tooltip title={session.sessionId}>
-                          <span>{`${session.sessionId.substring(
-                            0,
-                            8
-                          )}...`}</span>
-                        </Tooltip>
-                      </TableCell>
-                      <TableCell>
-                        <Link
-                          component={RouterLink}
-                          to={`/profile/${session.userId}`}
-                          color="primary"
-                          underline="hover"
-                        >
-                          {session.userId}
-                        </Link>
-                      </TableCell>
-                      <TableCell>
-                        {session.portalType ? (
-                          <Chip
-                            label={
-                              session.portalType.charAt(0).toUpperCase() +
-                              session.portalType.slice(1)
-                            }
-                            color={
-                              session.portalType === "customer"
-                                ? "secondary"
-                                : "primary"
-                            }
-                            size="small"
-                          />
-                        ) : (
-                          <Chip label="Partner" color="primary" size="small" />
-                        )}
-                      </TableCell>
-                      <TableCell>
-                        {session.sessionType ? (
-                          <Chip
-                            label={
-                              session.sessionType === "predefined-work-plan"
-                                ? "Predefined Work Plan"
-                                : session.sessionType === "scheduled"
-                                ? "Scheduled"
-                                : session.sessionType === "image-generation"
-                                ? "Image Generation"
-                                : session.sessionType === "video-generation"
-                                ? "Video Generation"
-                                : "Regular"
-                            }
-                            color={
-                              session.sessionType === "predefined-work-plan"
-                                ? "primary"
-                                : session.sessionType === "scheduled"
-                                ? "secondary"
-                                : session.sessionType === "image-generation"
-                                ? "success"
-                                : session.sessionType === "video-generation"
-                                ? "info"
-                                : "default"
-                            }
-                            size="small"
-                          />
-                        ) : (
-                          <Chip label="Undefined" color="default" size="small" />
-                        )}
-                      </TableCell>
-                      <TableCell>
-                        {format(new Date(session.createdAt), "Pp")}
-                      </TableCell>
-                      <TableCell>
-                        {format(new Date(session.updatedAt), "Pp")}
-                      </TableCell>
-                      <TableCell>
-                        <Chip
-                          label={session.messages?.length || 0}
-                          color="primary"
-                          size="small"
-                        />
-                      </TableCell>
-                      <TableCell>
-                        <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
-                          <Button
-                            variant="outlined"
-                            size="small"
-                            onClick={() => handleViewChat(session)}
+                  <>
+                    {chatSessions.map((session) => (
+                      <TableRow key={session.sessionId}>
+                        <TableCell component="th" scope="row">
+                          <Tooltip title={session.sessionId}>
+                            <span>{`${session.sessionId.substring(
+                              0,
+                              8
+                            )}...`}</span>
+                          </Tooltip>
+                        </TableCell>
+                        <TableCell>
+                          <Link
+                            component={RouterLink}
+                            to={`/profile/${session.userId}`}
+                            color="primary"
+                            underline="hover"
                           >
-                            Debug Chat
-                          </Button>
-                          {session.shareMetadata?.isShared && !(session.interactiveShareMetadata?.isActive && session.interactiveShareMetadata?.token) && (
-                            <Button
-                              variant="outlined"
-                              size="small"
-                              color="error"
-                              component="a"
-                              href={`${CUSTOMER_FRONTEND_URL}/share/${session.sessionId}`}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              sx={{ textAlign: 'center' }}
-                            >
-                              Shared Chat
-                            </Button>
-                          )}
-                          {session.interactiveShareMetadata?.isActive && session.interactiveShareMetadata?.token && (
-                            <Button
-                              variant="outlined"
-                              size="small"
-                              color="error"
-                              component="a"
-                              href={
-                                session.sessionType === "predefined-work-plan" && session.workPlan?.title
-                                  ? `${CUSTOMER_FRONTEND_URL}/plan/${encodeURIComponent(session.workPlan.title)}/${session.sessionId}?conversable=${session.interactiveShareMetadata.token}`
-                                  : `${CUSTOMER_FRONTEND_URL}/ishare/${session.sessionId}?conversable=${session.interactiveShareMetadata.token}`
+                            {session.userId}
+                          </Link>
+                        </TableCell>
+                        <TableCell>
+                          {session.portalType ? (
+                            <Chip
+                              label={
+                                session.portalType.charAt(0).toUpperCase() +
+                                session.portalType.slice(1)
                               }
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              sx={{ textAlign: 'center' }}
-                            >
-                              Shared Chat
-                            </Button>
+                              color={
+                                session.portalType === "customer"
+                                  ? "secondary"
+                                  : "primary"
+                              }
+                              size="small"
+                            />
+                          ) : (
+                            <Chip label="Partner" color="primary" size="small" />
                           )}
-                        </Box>
-                      </TableCell>
-                    </TableRow>
-                  ))
+                        </TableCell>
+                        <TableCell>
+                          {session.sessionType ? (
+                            <Chip
+                              label={
+                                session.sessionType === "predefined-work-plan"
+                                  ? "Predefined Work Plan"
+                                  : session.sessionType === "scheduled"
+                                  ? "Scheduled"
+                                  : session.sessionType === "image-generation"
+                                  ? "Image Generation"
+                                  : session.sessionType === "video-generation"
+                                  ? "Video Generation"
+                                  : "Regular"
+                              }
+                              color={
+                                session.sessionType === "predefined-work-plan"
+                                  ? "primary"
+                                  : session.sessionType === "scheduled"
+                                  ? "secondary"
+                                  : session.sessionType === "image-generation"
+                                  ? "success"
+                                  : session.sessionType === "video-generation"
+                                  ? "info"
+                                  : "default"
+                              }
+                              size="small"
+                            />
+                          ) : (
+                            <Chip label="Undefined" color="default" size="small" />
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          {format(new Date(session.createdAt), "Pp")}
+                        </TableCell>
+                        <TableCell>
+                          {format(new Date(session.updatedAt), "Pp")}
+                        </TableCell>
+                        <TableCell>
+                          <Chip
+                            label={session.messages?.length || 0}
+                            color="primary"
+                            size="small"
+                          />
+                        </TableCell>
+                        <TableCell>
+                          <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+                            <Button
+                              variant="outlined"
+                              size="small"
+                              onClick={() => handleViewChat(session)}
+                            >
+                              Debug Chat
+                            </Button>
+                            {session.shareMetadata?.isShared && !(session.interactiveShareMetadata?.isActive && session.interactiveShareMetadata?.token) && (
+                              <Button
+                                variant="outlined"
+                                size="small"
+                                color="error"
+                                component="a"
+                                href={`${CUSTOMER_FRONTEND_URL}/share/${session.sessionId}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                sx={{ textAlign: 'center' }}
+                              >
+                                Shared Chat
+                              </Button>
+                            )}
+                            {session.interactiveShareMetadata?.isActive && session.interactiveShareMetadata?.token && (
+                              <Button
+                                variant="outlined"
+                                size="small"
+                                color="error"
+                                component="a"
+                                href={
+                                  session.sessionType === "predefined-work-plan" && session.workPlan?.title
+                                    ? `${CUSTOMER_FRONTEND_URL}/plan/${encodeURIComponent(session.workPlan.title)}/${session.sessionId}?conversable=${session.interactiveShareMetadata.token}`
+                                    : `${CUSTOMER_FRONTEND_URL}/ishare/${session.sessionId}?conversable=${session.interactiveShareMetadata.token}`
+                                }
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                sx={{ textAlign: 'center' }}
+                              >
+                                Shared Chat
+                              </Button>
+                            )}
+                          </Box>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                    {chatSessionsLoading && (
+                      <TableRow>
+                        <TableCell colSpan={8} align="center">
+                          <CircularProgress size={24} />
+                        </TableCell>
+                      </TableRow>
+                    )}
+                  </>
                 )}
               </TableBody>
             </Table>
           </TableContainer>
+          <Box ref={chatSessionsLoadMoreRef} sx={{ height: 1 }} />
         </TabPanel>
 
         <TabPanel value={tabValue} index={7}>
