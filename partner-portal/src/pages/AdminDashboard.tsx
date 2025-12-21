@@ -4825,7 +4825,10 @@ const AgentModeSettings = () => {
   const [predefinedWorkPlans, setPredefinedWorkPlans] = useState<PredefinedWorkPlan[]>([]);
   const [availableFunctionCalls, setAvailableFunctionCalls] = useState<AvailableFunctionCall[]>([]);
   const [selectedFunctionCall, setSelectedFunctionCall] = useState<Record<string, string>>({});
+  const [defaultModel, setDefaultModel] = useState('gpt-5-chat-2');
+  const [supportedModels, setSupportedModels] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
+  const [savingDefaultModel, setSavingDefaultModel] = useState(false);
   const [savingSystemPrompt, setSavingSystemPrompt] = useState(false);
   const [savingWelcomeMessage, setSavingWelcomeMessage] = useState(false);
   const [savingConversationStarters, setSavingConversationStarters] = useState(false);
@@ -4833,6 +4836,7 @@ const AgentModeSettings = () => {
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const { token } = useAuth();
+  const fallbackDefaultModel = 'gpt-5-chat-2';
 
   useEffect(() => {
     loadAllSettings();
@@ -4843,6 +4847,9 @@ const AgentModeSettings = () => {
       setLoading(true);
       setError('');
       
+      const models = await loadSupportedModels();
+      await loadDefaultModel(models);
+
       // Load system prompt
       await loadSystemPrompt();
       
@@ -4862,6 +4869,53 @@ const AgentModeSettings = () => {
       setError('Failed to load settings');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const loadSupportedModels = async (): Promise<string[]> => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/agent-mode/public/llm-models'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (Array.isArray(response.data) && response.data.length > 0) {
+        setSupportedModels(response.data);
+        return response.data;
+      }
+    } catch (error) {
+      console.error('Error loading supported models:', error);
+    }
+    const fallbackModels = [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    setSupportedModels(fallbackModels);
+    return fallbackModels;
+  };
+
+  const loadDefaultModel = async (models: string[] = []) => {
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    try {
+      try {
+        const response = await axios.get(buildApiUrl('/api/settings/agent_mode_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        
+        if (response.data && response.data.settingValue) {
+          const modelValue = response.data.settingValue.trim();
+          if (modelValue && availableModels.includes(modelValue)) {
+            setDefaultModel(modelValue);
+          } else {
+            setDefaultModel(fallbackDefaultModel);
+          }
+          return;
+        }
+      } catch (settingsError: any) {
+        if (settingsError.response?.status !== 404) {
+          console.error('Error loading default model setting:', settingsError);
+        }
+      }
+      
+      setDefaultModel(fallbackDefaultModel);
+    } catch (error) {
+      console.error('Error loading default model:', error);
+      setDefaultModel(fallbackDefaultModel);
     }
   };
 
@@ -5108,6 +5162,28 @@ const AgentModeSettings = () => {
     }
   };
 
+  const saveDefaultModel = async () => {
+    try {
+      setSavingDefaultModel(true);
+      setError('');
+      setSuccess('');
+
+      await axios.put(buildApiUrl('/api/settings/agent_mode_default_model'), {
+        settingValue: defaultModel,
+        description: 'Agent Mode default model for new sessions'
+      }, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      setSuccess('Default model updated successfully!');
+    } catch (error) {
+      console.error('Error saving default model:', error);
+      setError('Failed to save default model');
+    } finally {
+      setSavingDefaultModel(false);
+    }
+  };
+
   const saveWelcomeMessage = async () => {
     try {
       setSavingWelcomeMessage(true);
@@ -5243,7 +5319,7 @@ const AgentModeSettings = () => {
     setPredefinedWorkPlans(updated);
   };
 
-  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters') => {
+  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel') => {
     try {
       setError('');
       setSuccess('');
@@ -5291,6 +5367,14 @@ const AgentModeSettings = () => {
         setConversationStarters(response.data);
         setConversationStartersText(response.data.join('\n'));
         setSuccess('Reset to default conversation starters successfully!');
+      } else if (type === 'defaultModel') {
+        setSavingDefaultModel(true);
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        setDefaultModel(fallbackDefaultModel);
+        setSuccess('Reset to default model successfully!');
       }
     } catch (error) {
       console.error('Error resetting setting:', error);
@@ -5302,6 +5386,8 @@ const AgentModeSettings = () => {
         setSavingWelcomeMessage(false);
       } else if (type === 'conversationStarters') {
         setSavingConversationStarters(false);
+      } else if (type === 'defaultModel') {
+        setSavingDefaultModel(false);
       }
     }
   };
@@ -5335,6 +5421,54 @@ const AgentModeSettings = () => {
           {success}
         </Alert>
       )}
+
+      {/* Default Model */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">
+              Default Model
+            </Typography>
+            <Box>
+              <Button
+                variant="outlined"
+                onClick={() => resetToDefault('defaultModel')}
+                disabled={savingDefaultModel}
+                sx={{ mr: 1 }}
+              >
+                Reset to Default
+              </Button>
+              <Button
+                variant="contained"
+                onClick={saveDefaultModel}
+                disabled={savingDefaultModel || !defaultModel}
+              >
+                {savingDefaultModel ? <CircularProgress size={20} /> : 'Save Changes'}
+              </Button>
+            </Box>
+          </Box>
+
+          <FormControl fullWidth>
+            <InputLabel id="agent-mode-default-model-label">Default Model</InputLabel>
+            <Select
+              labelId="agent-mode-default-model-label"
+              value={defaultModel}
+              label="Default Model"
+              onChange={(e) => setDefaultModel(e.target.value as string)}
+            >
+              {(supportedModels.length > 0 ? supportedModels : [fallbackDefaultModel, 'gemini-3-pro-preview']).map((model) => (
+                <MenuItem key={model} value={model}>
+                  {model}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            Sets the default model for newly created Agent Mode sessions. Existing sessions keep their current model.
+          </Typography>
+        </CardContent>
+      </Card>
 
       {/* System Prompt */}
       <Card sx={{ mb: 3 }}>

@@ -25,6 +25,8 @@ jest.mock('../services/chatbotService', () => ({
 
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
+    default_model: 'gpt-5-chat-2',
+    getDefaultModel: jest.fn(),
     getMarketingSystemPrompt: jest.fn(),
     generateSessionTitle: jest.fn(),
     generateMarketingResponse: jest.fn(),
@@ -97,6 +99,7 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
     mockChatbotDb.createChatSession.mockResolvedValue(mockSession);
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession);
     mockChatbotDb.updateSessionLlmModel.mockResolvedValue(mockSession);
+    mockAgentModeService.getDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
     mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
     mockAgentModeService.generateSessionTitle.mockResolvedValue('Generated Title');
     // Use worker service instead of direct generateMarketingResponse

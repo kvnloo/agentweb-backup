@@ -13,6 +13,7 @@ jest.mock('../services/chatbotService', () => ({
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     default_model: 'gpt-5-chat-2',
+    getDefaultModel: jest.fn(),
     getMarketingSystemPrompt: jest.fn(),
     generateSessionTitle: jest.fn(),
   },
@@ -76,6 +77,7 @@ describe('AgentModeController - ishare Model Selection', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockAgentModeService.getDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
     mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
     mockAgentModeService.generateSessionTitle.mockResolvedValue('Generated Title');
     mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(mockResponse);
@@ -244,4 +246,3 @@ describe('AgentModeController - ishare Model Selection', () => {
     });
   });
 });
-
