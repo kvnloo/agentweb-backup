@@ -13,6 +13,8 @@ jest.mock('../services/chatbotService', () => ({
 
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
+    default_model: 'gpt-5-chat-2',
+    getDefaultModel: jest.fn(),
     getMarketingSystemPrompt: jest.fn(),
     generateSessionTitle: jest.fn(),
     generateMarketingResponse: jest.fn(),
@@ -43,10 +45,12 @@ jest.mock('../services/db', () => ({
 // Import mocked services
 import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
+import { agentModeService } from '../services/agentModeService';
 import { agentModeController } from '../controllers/agentModeController';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockGenerateMarketingResponseWorkerService = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
+const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
 
 describe('AgentModeController - Verified Generate', () => {
   const mockUserId = 'test-user-123';
@@ -78,6 +82,7 @@ describe('AgentModeController - Verified Generate', () => {
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession);
     mockChatbotDb.addMessageToSession.mockResolvedValue(undefined as any);
     mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(mockResponse);
+    mockAgentModeService.getDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
   });
 
   describe('verifiedGenerate endpoint', () => {
@@ -681,4 +686,3 @@ describe('AgentModeController - Verified Generate', () => {
     });
   });
 });
-

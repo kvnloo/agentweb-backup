@@ -21,6 +21,8 @@ jest.mock('../services/chatbotService', () => ({
 // Mock agentModeService
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
+    default_model: 'gpt-5-chat-2',
+    getDefaultModel: jest.fn(),
     getMarketingSystemPrompt: jest.fn(),
     generateSessionTitle: jest.fn(),
     generateMarketingResponse: jest.fn(),
@@ -72,6 +74,7 @@ describe('Sharing Integration Tests', () => {
     jest.clearAllMocks();
     
     // Setup default mocks
+    (agentModeService.getDefaultModel as jest.Mock).mockResolvedValue(agentModeService.default_model);
     (agentModeService.getMarketingSystemPrompt as jest.Mock).mockResolvedValue('System prompt');
     (agentModeService.generateSessionTitle as jest.Mock).mockResolvedValue('Generated Title');
     (chatbotDb.addMessageToSession as jest.Mock).mockResolvedValue(undefined);
