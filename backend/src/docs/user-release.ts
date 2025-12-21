@@ -11,6 +11,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
     changes: [
       'Supported deep research for create_blog_article function call in Agent Mode',
       '- When deep_research is true, Agent Mode routes the task to the Gemini deep research agent for extended research and synthesis before drafting the article',
+      'Added configurable default model for Agent Mode sessions in partner portal admin',
+      '- Admins can choose gpt-5-chat-2, gpt-5.2-chat, gemini-3-pro-preview, or gemini-3-flash-preview as the default for new Agent Mode sessions',
     ],
   },
   {
