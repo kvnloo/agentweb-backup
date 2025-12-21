@@ -8,6 +8,13 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2025-12-21",
+    changes: [
+      "Improved Admin Chat History performance",
+      "- Chat sessions now load the most recent 30 records first with infinite scroll for older entries",
+    ],
+  },
+  {
     date: "2025-12-08",
     changes: [
       "Supported Deployment to Staging for Backend",

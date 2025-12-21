@@ -98,7 +98,7 @@ Prerequisites:
 - AWS CLI configured for the target account/region (`aws configure`)
 - Region: `us-west-2` (override with `--region` if different)
 
-Add index in Development (Dev- prefixed table):
+Add index in Development (Dev- prefixed table, provisioned capacity):
 
 ```bash
 aws dynamodb update-table \
@@ -108,7 +108,7 @@ aws dynamodb update-table \
   --region us-west-2
 ```
 
-Add index in Production (no prefix):
+Add index in Production (no prefix, PAY_PER_REQUEST billing mode):
 
 ```bash
 aws dynamodb update-table \
@@ -199,11 +199,60 @@ cd backend
 NODE_ENV=production npx ts-node src/scripts/@repair-tables.ts
 ```
 
+## DynamoDB: Add AdminUpdatedAtIndex to AW-ChatSessions
+
+If you need to add the `AdminUpdatedAtIndex` GSI to the `AW-ChatSessions` table (for admin chat history pagination), use these commands.
+
+Prerequisites:
+- AWS CLI configured for the target account/region (`aws configure`)
+- Region: `us-west-2` (override with `--region` if different)
+
+Add index in Development (Dev- prefixed table):
+
+```bash
+aws dynamodb update-table \
+  --table-name Dev-AW-ChatSessions \
+  --attribute-definitions AttributeName=adminListPartition,AttributeType=S AttributeName=updatedAt,AttributeType=S \
+  --global-secondary-index-updates '[{"Create":{"IndexName":"AdminUpdatedAtIndex","KeySchema":[{"AttributeName":"adminListPartition","KeyType":"HASH"},{"AttributeName":"updatedAt","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"},"ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}}}]' \
+  --region us-west-2
+```
+
+Add index in Production (no prefix):
+
+```bash
+aws dynamodb update-table \
+  --table-name AW-ChatSessions \
+  --attribute-definitions AttributeName=adminListPartition,AttributeType=S AttributeName=updatedAt,AttributeType=S \
+  --global-secondary-index-updates '[{"Create":{"IndexName":"AdminUpdatedAtIndex","KeySchema":[{"AttributeName":"adminListPartition","KeyType":"HASH"},{"AttributeName":"updatedAt","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"}}}]' \
+  --region us-west-2
+```
+
+Verify index status (repeat until `IndexStatus` is `ACTIVE`):
+
+```bash
+aws dynamodb describe-table \
+  --table-name Dev-AW-ChatSessions \
+  --region us-west-2 \
+  --query 'Table.GlobalSecondaryIndexes[?IndexName==`AdminUpdatedAtIndex`].{IndexName:IndexName,IndexStatus:IndexStatus}'
+```
+
 Notes:
-- GSI creation is asynchronous; queries against `EmailDomainLeadEmailIndex` work after status becomes `ACTIVE`.
-- Replace `Dev-AW-EmailEvents` with `AW-EmailEvents` for production.
-- The `leadEmail` attribute must be populated in existing records for the index to be useful. Consider backfilling existing records if needed.
-- **Important**: The production `AW-EmailEvents` table uses `PAY_PER_REQUEST` billing mode, so `ProvisionedThroughput` should NOT be specified when creating indexes in production. The development table uses provisioned capacity, so it requires `ProvisionedThroughput` to be specified.
+- Do not specify `ProvisionedThroughput` when the table billing mode is `PAY_PER_REQUEST` (production).
+- After the index is active, backfill `adminListPartition` for existing items so they show up in the index.
+
+Backfill in Development:
+
+```bash
+cd backend
+NODE_ENV=development npx ts-node src/scripts/repair-chat-sessions-admin-index.ts
+```
+
+Backfill in Production:
+
+```bash
+cd backend
+NODE_ENV=production npx ts-node src/scripts/repair-chat-sessions-admin-index.ts
+```
 
 ## Port Management
 

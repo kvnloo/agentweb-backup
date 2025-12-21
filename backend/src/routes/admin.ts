@@ -1363,8 +1363,23 @@ router.post("/announcements/send", async (req, res) => {
 // Add the chat sessions route
 router.get("/chat-sessions", async (req, res) => {
   try {
-    // Get all chat sessions from DynamoDB
-    const sessions = await chatbotDb.getAllSessions();
+    const rawLimit = Number(req.query.limit);
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 100) : 30;
+    const cursor = typeof req.query.cursor === "string" ? req.query.cursor : undefined;
+    let lastEvaluatedKey: DynamoDB.DocumentClient.Key | undefined;
+
+    if (cursor) {
+      try {
+        lastEvaluatedKey = JSON.parse(Buffer.from(cursor, "base64").toString("utf8"));
+      } catch (error) {
+        return res.status(400).json({ message: "Invalid cursor" });
+      }
+    }
+
+    const { sessions, lastEvaluatedKey: nextKey } = await chatbotDb.getRecentSessionsPage(
+      limit,
+      lastEvaluatedKey
+    );
 
     // Load messages from the messages table for each session
     const sessionsWithMessages = await Promise.all(
@@ -1379,12 +1394,11 @@ router.get("/chat-sessions", async (req, res) => {
       })
     );
 
-    // Sort sessions by updatedAt in descending order
-    sessionsWithMessages.sort((a: ChatSession, b: ChatSession) => {
-      return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
-    });
+    const nextCursor = nextKey
+      ? Buffer.from(JSON.stringify(nextKey)).toString("base64")
+      : null;
 
-    res.json(sessionsWithMessages);
+    res.json({ sessions: sessionsWithMessages, nextCursor });
   } catch (error) {
     console.error("Error fetching chat sessions:", error);
     res.status(500).json({ message: "Failed to fetch chat sessions" });
