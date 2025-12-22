@@ -112,7 +112,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { name, description, displayFields } = req.body;
+    const { name, description, displayFields, sortConfig } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -128,7 +128,12 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    const updates: { name?: string; description?: string; displayFields?: string[] } = {};
+    const updates: {
+      name?: string;
+      description?: string;
+      displayFields?: string[];
+      sortConfig?: { column: string; direction: 'asc' | 'desc' } | null;
+    } = {};
     if (name !== undefined) {
       if (typeof name !== 'string' || name.trim().length === 0) {
         return res.status(400).json({ message: 'List name cannot be empty' });
@@ -145,6 +150,24 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
         updates.displayFields = displayFields;
       } else {
         return res.status(400).json({ message: 'displayFields must be an array' });
+      }
+    }
+
+    if (sortConfig !== undefined) {
+      if (sortConfig === null) {
+        updates.sortConfig = null;
+      } else if (typeof sortConfig === 'object' && !Array.isArray(sortConfig)) {
+        const column = typeof sortConfig.column === 'string' ? sortConfig.column.trim() : '';
+        const direction = typeof sortConfig.direction === 'string' ? sortConfig.direction.toLowerCase() : '';
+        if (!column) {
+          return res.status(400).json({ message: 'sortConfig.column is required' });
+        }
+        if (direction !== 'asc' && direction !== 'desc') {
+          return res.status(400).json({ message: 'sortConfig.direction must be "asc" or "desc"' });
+        }
+        updates.sortConfig = { column, direction: direction as 'asc' | 'desc' };
+      } else {
+        return res.status(400).json({ message: 'sortConfig must be an object or null' });
       }
     }
 
@@ -1037,4 +1060,3 @@ router.post('/sync-subscribers', async (req: Request, res: Response) => {
 });
 
 export default router;
-

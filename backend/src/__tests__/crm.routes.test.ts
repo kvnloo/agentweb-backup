@@ -242,6 +242,52 @@ describe('CRM Routes', () => {
       });
     });
 
+    it('should update sort config for a lead list', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.updateLeadList as jest.Mock).mockResolvedValue({
+        ...mockList,
+        sortConfig: { column: 'email', direction: 'desc' },
+      });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { sortConfig: { column: 'email', direction: 'desc' } };
+
+      const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.put);
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.updateLeadList).toHaveBeenCalledWith('list1', {
+        sortConfig: { column: 'email', direction: 'desc' },
+      });
+    });
+
+    it('should return 400 if sortConfig direction is invalid', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { sortConfig: { column: 'email', direction: 'down' } };
+
+      const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.put);
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+    });
+
     it('should return 400 if displayFields is not an array', async () => {
       const mockList = {
         listId: 'list1',
@@ -935,4 +981,3 @@ describe('CRM Routes', () => {
     });
   });
 });
-

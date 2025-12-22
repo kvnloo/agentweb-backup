@@ -2588,6 +2588,7 @@ export const crmDb = {
           leadCount: 0,
           fieldNames: [], // Initialize with empty array
           displayFields: ['email', 'firstName', 'lastName', 'company', 'phone', 'title', 'linkedin', 'notes'], // Default visible fields
+          sortConfig: null,
         },
       };
 
@@ -2647,7 +2648,15 @@ export const crmDb = {
     }
   },
 
-  async updateLeadList(listId: string, updates: { name?: string; description?: string; displayFields?: string[] }) {
+  async updateLeadList(
+    listId: string,
+    updates: {
+      name?: string;
+      description?: string;
+      displayFields?: string[];
+      sortConfig?: { column: string; direction: 'asc' | 'desc' } | null;
+    }
+  ) {
     try {
       const updateExpressions: string[] = [];
       const expressionAttributeValues: any = {};
@@ -2665,6 +2674,11 @@ export const crmDb = {
       if (updates.displayFields !== undefined) {
         updateExpressions.push('displayFields = :displayFields');
         expressionAttributeValues[':displayFields'] = updates.displayFields;
+      }
+
+      if (updates.sortConfig !== undefined) {
+        updateExpressions.push('sortConfig = :sortConfig');
+        expressionAttributeValues[':sortConfig'] = updates.sortConfig;
       }
 
       if (updateExpressions.length === 0) {
@@ -3767,5 +3781,4 @@ export const crmDb = {
     }
   },
 };
-
 
