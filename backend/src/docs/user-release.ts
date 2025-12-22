@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-22',
+    changes: [
+      'Added post-login redirect to return users to their intended destination',
+      'Fixed upload image file name overflow in the Customer Portal UI',
+      'Removed the extra line at the top of the main page',
+      'Fixed URL wrapping issues in the Customer Portal UI',
+      'Improved GTM Plan page responsiveness',
+    ],
+  },
+  {
     date: '2025-12-21',
     changes: [
       'Supported deep research for create_blog_article function call in Agent Mode',
