@@ -14,6 +14,7 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Removed the extra line at the top of the main page',
       'Fixed URL wrapping issues in the Customer Portal UI',
       'Improved GTM Plan page responsiveness',
+      'CRM lead list sorting now persists per list across browsers',
     ],
   },
   {
