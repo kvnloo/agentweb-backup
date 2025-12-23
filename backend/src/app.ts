@@ -27,6 +27,7 @@ import seoRoutes from "./routes/seo";
 import gtmPlanRoutes from "./routes/gtmPlan";
 import crmRoutes from "./routes/crm";
 import subscriptionRoutes from "./routes/subscription";
+import booksRoutes from "./routes/books";
 
 // Import the new controller
 import {
@@ -62,6 +63,25 @@ const corsOptions = {
       }
       return origin === allowedOrigin;
     });
+
+    // Allow local network IP addresses (192.168.x.x, 10.x.x.x, 172.16-31.x.x, localhost, 127.0.0.1)
+    if (!isAllowed) {
+      const localNetworkPatterns = [
+        /^http:\/\/localhost(:\d+)?$/, // localhost with optional port
+        /^http:\/\/127\.0\.0\.1(:\d+)?$/, // 127.0.0.1 with optional port
+        /^http:\/\/192\.168\.\d+\.\d+(:\d+)?$/, // 192.168.x.x with optional port
+        /^http:\/\/10\.\d+\.\d+\.\d+(:\d+)?$/, // 10.x.x.x with optional port
+        /^http:\/\/172\.(1[6-9]|2[0-9]|3[01])\.\d+\.\d+(:\d+)?$/, // 172.16-31.x.x with optional port
+      ];
+
+      const isLocalNetwork = localNetworkPatterns.some((pattern) =>
+        pattern.test(origin)
+      );
+
+      if (isLocalNetwork) {
+        return callback(null, true);
+      }
+    }
 
     if (isAllowed) {
       callback(null, true);
@@ -130,6 +150,7 @@ app.use("/api/seo", seoRoutes);
 app.use("/api/gtm-plan", gtmPlanRoutes);
 app.use("/api/crm", crmRoutes);
 app.use("/api/subscription", subscriptionRoutes);
+app.use("/api/books", booksRoutes);
 
 // Health check endpoint
 app.get("/", (req, res) => {

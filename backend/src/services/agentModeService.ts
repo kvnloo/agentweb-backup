@@ -4,6 +4,7 @@ import { google } from 'googleapis';
 import { createHash } from 'crypto';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
+import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
 import { taskDb, taskTemplateDb } from './db';
 import { settingsService } from './settingsService';
@@ -1223,6 +1224,227 @@ Use the available tools to create tasks in the agent-engine when complex work is
       {
         type: 'function' as const,
         function: {
+          name: 'list_books',
+          description: 'List all books and white papers for the current user. Returns a list of books with their IDs, titles, types, authors, status, and creation dates.',
+          parameters: {
+            type: 'object',
+            properties: {
+              type: {
+                type: 'string',
+                enum: ['book', 'whitepaper'],
+                description: 'Optional filter by type: "book" or "whitepaper". If not provided, returns all types.'
+              },
+              status: {
+                type: 'string',
+                enum: ['draft', 'published', 'archived'],
+                description: 'Optional filter by status: "draft", "published", or "archived". If not provided, returns all statuses.'
+              }
+            },
+            required: []
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'get_book_details',
+          description: 'Get detailed information about a specific book or white paper including its outline (sections and chapters structure), characters (for books), and other metadata. Returns book metadata, characters, and the complete outline hierarchy.',
+          parameters: {
+            type: 'object',
+            properties: {
+              book_id: {
+                type: 'string',
+                description: 'The unique identifier (bookId) of the book to retrieve'
+              }
+            },
+            required: ['book_id']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'get_book_content',
+          description: 'Get the markdown content for a specific section or chapter in a book. If chapter_id is provided, returns chapter content. Otherwise, returns section content.',
+          parameters: {
+            type: 'object',
+            properties: {
+              book_id: {
+                type: 'string',
+                description: 'The unique identifier (bookId) of the book'
+              },
+              section_id: {
+                type: 'string',
+                description: 'The unique identifier (sectionId) of the section'
+              },
+              chapter_id: {
+                type: 'string',
+                description: 'Optional: The unique identifier (chapterId) of the chapter. If provided, returns chapter content. If not provided, returns section content.'
+              }
+            },
+            required: ['book_id', 'section_id']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'update_book_content',
+          description: 'Update the markdown content for a specific section or chapter in a book using partial replacements. This function performs partial content updates only. For generating full content, use generate_book_content instead. IMPORTANT: Always use get_book_content first to retrieve the current content, then provide the exact old_content to replace. Note: Full content replacement will not work if the current content is empty - use generate_book_content to create new content instead.',
+          parameters: {
+            type: 'object',
+            properties: {
+              book_id: {
+                type: 'string',
+                description: 'The unique identifier (bookId) of the book'
+              },
+              section_id: {
+                type: 'string',
+                description: 'The unique identifier (sectionId) of the section'
+              },
+              chapter_id: {
+                type: 'string',
+                description: 'Optional: The unique identifier (chapterId) of the chapter. If provided, updates chapter content. If not provided, updates section content.'
+              },
+              replacement_json: {
+                type: 'string',
+                description: 'JSON string containing a list of replacement instructions: [{"old_content": "## Old Heading\\n\\nOld text...", "new_content": "## New Heading\\n\\nNew text...", "expected_count": 1}]. Use empty string for new_content to delete the specified content.'
+              }
+            },
+            required: ['book_id', 'section_id', 'replacement_json']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'generate_book_content',
+          description: 'Generate an entire chapter or section of content for a book. Creates comprehensive markdown content based on the content description and desired length. If existing content exists, it will be used as a base along with the content description to generate new content. Word counts: short (1000-2000 words), medium (2000-3000 words), long (3000-4000 words).',
+          parameters: {
+            type: 'object',
+            properties: {
+              book_id: {
+                type: 'string',
+                description: 'The unique identifier (bookId) of the book'
+              },
+              section_id: {
+                type: 'string',
+                description: 'The unique identifier (sectionId) of the section'
+              },
+              chapter_id: {
+                type: 'string',
+                description: 'Optional: The unique identifier (chapterId) of the chapter. If provided, generates chapter content. If not provided, generates section content.'
+              },
+              content_description: {
+                type: 'string',
+                description: 'Detailed description of what content should be generated for this section or chapter. Be as detailed as possible about the topics, themes, key points, and structure that should be included. IMPORTANT: Content from other sections of the book is not available to this function, so any relevant context, information, or details from other sections that should be referenced or built upon must be explicitly included in this description.'
+              },
+              length: {
+                type: 'string',
+                enum: ['short', 'medium', 'long'],
+                description: 'Desired length of the content: short (1000-2000 words), medium (2000-3000 words), long (3000-4000 words)',
+                default: 'medium'
+              },
+              imagine: {
+                type: 'boolean',
+                description: 'Whether to allow creative imagination and details that do not exist. Defaults to true. When false, the AI will stick strictly to facts and avoid inventing details.',
+                default: true
+              }
+            },
+            required: ['book_id', 'section_id', 'content_description']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'create_book',
+          description: 'Create a new book or white paper with metadata. Returns the created book with bookId for use in other operations.',
+          parameters: {
+            type: 'object',
+            properties: {
+              title: {
+                type: 'string',
+                description: 'Title of the book or white paper'
+              },
+              description: {
+                type: 'string',
+                description: 'Description or summary of the book'
+              },
+              type: {
+                type: 'string',
+                enum: ['book', 'whitepaper'],
+                description: 'Type: "book" or "whitepaper"'
+              },
+              author: {
+                type: 'string',
+                description: 'Author name'
+              },
+              language: {
+                type: 'string',
+                description: 'Language of the book (e.g., "English", "中文")',
+                default: 'English'
+              },
+              genre: {
+                type: 'string',
+                description: 'Genre of the book (only applicable when type is "book"). Can be one of the predefined genres (Fiction, Non-Fiction, Science Fiction, Fantasy, Mystery, Thriller, Romance, Horror, Biography, Autobiography, History, Self-Help, Business, Technology, Science, Philosophy, Religion, Health & Fitness, Travel, Cooking, Art, Music, Poetry, Drama, Comedy, Education, Reference, Children\'s, Young Adult, Other) or a custom genre string. If not provided and type is "book", defaults to "Other".'
+              },
+              tags: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Optional array of tags for categorization',
+                default: []
+              }
+            },
+            required: ['title', 'description', 'type', 'author']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'create_book_outline',
+          description: 'Create the complete outline structure (sections and chapters) for a book. This replaces any existing outline. Each section can have multiple chapters. Sections and chapters will be ordered by their order field.',
+          parameters: {
+            type: 'object',
+            properties: {
+              book_id: {
+                type: 'string',
+                description: 'The unique identifier (bookId) of the book to create outline for'
+              },
+              outline_json: {
+                type: 'string',
+                description: 'JSON string containing the outline structure: [{"title": "Section Title", "description": "Optional section description", "order": 1, "chapters": [{"title": "Chapter Title", "description": "Optional chapter description", "order": 1}]}]'
+              }
+            },
+            required: ['book_id', 'outline_json']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'add_characters',
+          description: 'Add one or more characters to a book. Each character must have a name and description. Characters are appended to the existing list of characters for the book.',
+          parameters: {
+            type: 'object',
+            properties: {
+              book_id: {
+                type: 'string',
+                description: 'The unique identifier (bookId) of the book to add characters to'
+              },
+              characters_json: {
+                type: 'string',
+                description: 'JSON string containing an array of characters: [{"name": "Character Name", "description": "Character description"}]'
+              }
+            },
+            required: ['book_id', 'characters_json']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
           name: 'save_file',
           description: 'Create and save a file with the provided content to S3, then return the file URL for sharing or reference',
           parameters: {
@@ -1818,7 +2040,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'update_html_file',
-          description: 'Update an HTML file by replacing specific content with new content. Use update_type="full" with old_file_hash for entire file replacement, or update_type="part" with old_content for partial replacements',
+          description: 'Update an HTML file by replacing specific content with new content. Use update_type="full" with old_content_hash for entire file replacement, or update_type="part" with old_content for partial replacements',
           parameters: {
             type: 'object',
             properties: {
@@ -1829,11 +2051,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
               update_type: {
                 type: 'string',
                 enum: ['part', 'full'],
-                description: 'Type of update: "part" for partial content replacement using old_content, "full" for entire file replacement using old_file_hash'
+                description: 'Type of update: "part" for partial content replacement using old_content, "full" for entire file replacement using old_content_hash'
               },
               replacement_json: {
                 type: 'string',
-                description: 'JSON string containing a list of replacement instructions. For full replacement: [{"old_file_hash": "abc123...", "new_content": "<!DOCTYPE html>...", "expected_count": 1}]. For part replacement: [{"old_content": "<h1>Old Title</h1>", "new_content": "<h1>New Title</h1>", "expected_count": 1}]. Use empty string for new_content to delete the specified content.'
+                description: 'JSON string containing a list of replacement instructions. For full replacement: [{"old_content_hash": "abc123...", "new_content": "<!DOCTYPE html>...", "expected_count": 1}]. For part replacement: [{"old_content": "<h1>Old Title</h1>", "new_content": "<h1>New Title</h1>", "expected_count": 1}]. Use empty string for new_content to delete the specified content.'
               }
             },
             required: ['file_url', 'update_type', 'replacement_json']
@@ -2485,7 +2707,242 @@ Use the available tools to create tasks in the agent-engine when complex work is
             updatedAt: new Date().toISOString()
           }
         };
-
+      case 'list_books':
+        return {
+          success: true,
+          message: 'Found 2 book(s)',
+          books: [
+            {
+              book_id: 'mock-book-1',
+              title: 'Mock Marketing Guide',
+              description: 'A comprehensive guide to marketing strategies',
+              type: 'book',
+              author: 'John Doe',
+              status: 'published',
+              published_at: new Date(Date.now() - 86400000).toISOString(),
+              created_at: new Date(Date.now() - 172800000).toISOString(),
+              updated_at: new Date(Date.now() - 86400000).toISOString(),
+              tags: ['marketing', 'strategy'],
+              has_sections: true
+            },
+            {
+              book_id: 'mock-book-2',
+              title: 'Mock White Paper: AI Trends',
+              description: 'An analysis of current AI trends in business',
+              type: 'whitepaper',
+              author: 'Jane Smith',
+              status: 'draft',
+              published_at: null,
+              created_at: new Date(Date.now() - 86400000).toISOString(),
+              updated_at: new Date(Date.now() - 3600000).toISOString(),
+              tags: ['AI', 'technology'],
+              has_sections: false
+            }
+          ],
+          totalBooks: 2
+        };
+      case 'get_book_details':
+        return {
+          success: true,
+          message: 'Book details retrieved successfully',
+          book: {
+            book_id: args.book_id || 'mock-book-1',
+            title: 'Mock Marketing Guide',
+            description: 'A comprehensive guide to marketing strategies',
+            type: 'book',
+            author: 'John Doe',
+            language: 'English',
+            genre: 'Business',
+            status: 'published',
+            published_at: new Date(Date.now() - 86400000).toISOString(),
+            created_at: new Date(Date.now() - 172800000).toISOString(),
+            updated_at: new Date(Date.now() - 86400000).toISOString(),
+            tags: ['marketing', 'strategy'],
+            cover_image_url: null,
+            characters: [
+              {
+                name: 'John Smith',
+                description: 'A marketing expert with 20 years of experience'
+              },
+              {
+                name: 'Sarah Johnson',
+                description: 'A young entrepreneur starting her first business'
+              }
+            ],
+            outline: [
+              {
+                section_id: 'mock-section-1',
+                title: 'Introduction',
+                description: 'Introduction to marketing',
+                order: 1,
+                has_content: true,
+                chapters: [
+                  {
+                    chapter_id: 'mock-chapter-1',
+                    title: 'What is Marketing?',
+                    description: 'Basic concepts',
+                    order: 1,
+                    has_content: true
+                  }
+                ]
+              }
+            ]
+          }
+        };
+      case 'get_book_content':
+        const mockContent = args.chapter_id 
+          ? `# ${args.chapter_id ? 'Chapter' : 'Section'} Content\n\nThis is mock ${args.chapter_id ? 'chapter' : 'section'} content for testing purposes.\n\nIt contains markdown formatted text that can be used to demonstrate the content retrieval functionality.`
+          : `# Section Content\n\nThis is mock section content for section ${args.section_id}.\n\n## Overview\n\nThis section provides an overview of the topic.\n\n## Key Points\n\n- Point 1\n- Point 2\n- Point 3`;
+        const mockContentHash = createHash('sha256').update(mockContent).digest('hex');
+        return {
+          success: true,
+          message: args.chapter_id ? 'Chapter content retrieved successfully' : 'Section content retrieved successfully',
+          content: mockContent,
+          content_hash: mockContentHash,
+          content_type: args.chapter_id ? 'chapter' : 'section',
+          section_id: args.section_id || 'mock-section-1',
+          chapter_id: args.chapter_id || null,
+          has_content: true
+        };
+      
+      case 'update_book_content':
+        // Mock validation for update_book_content (always partial replacement)
+        let mockBookReplacementInstructions = [];
+        try {
+          if (args.replacement_json) {
+            mockBookReplacementInstructions = JSON.parse(args.replacement_json);
+          }
+        } catch (error) {
+          return {
+            success: false,
+            message: 'Invalid JSON in replacement_json',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          };
+        }
+        
+        if (mockBookReplacementInstructions.length === 0) {
+          return {
+            success: false,
+            message: 'At least one replacement instruction is required'
+          };
+        }
+        
+        // Validate mock instructions (always partial replacement)
+        for (let i = 0; i < mockBookReplacementInstructions.length; i++) {
+          const instruction = mockBookReplacementInstructions[i];
+          if (instruction.new_content === undefined || instruction.expected_count === undefined) {
+            return {
+              success: false,
+              message: `Missing required fields in replacement instruction ${i + 1}: new_content and expected_count are required`
+            };
+          }
+          
+          if (!instruction.old_content) {
+            return {
+              success: false,
+              message: `Replacement instruction ${i + 1} missing old_content. old_content is required for partial replacements`
+            };
+          }
+        }
+        
+        return {
+          success: true,
+          message: `Content updated successfully with ${mockBookReplacementInstructions.length} replacement(s)`,
+          content_type: args.chapter_id ? 'chapter' : 'section',
+          section_id: args.section_id || 'mock-section-1',
+          chapter_id: args.chapter_id || null,
+          replacements: mockBookReplacementInstructions.map((inst: any, idx: number) => ({
+            index: idx + 1,
+            old_content: inst.old_content,
+            new_content: inst.new_content,
+            expected_count: inst.expected_count,
+            actual_count: inst.expected_count,
+            success: true
+          })),
+          updated_content_length: 1000
+        };
+      
+      case 'generate_book_content':
+        const mockLength = args.length || 'medium';
+        const mockWordCounts: Record<string, number> = {
+          short: 1500,
+          medium: 2500,
+          long: 3500
+        };
+        return {
+          success: true,
+          message: `${args.chapter_id ? 'Chapter' : 'Section'} content generated successfully (mock)`,
+          content_type: args.chapter_id ? 'chapter' : 'section',
+          section_id: args.section_id || 'mock-section-1',
+          chapter_id: args.chapter_id || null,
+          content_length: mockWordCounts[mockLength] * 5, // Approximate chars
+          word_count: mockWordCounts[mockLength],
+          target_word_range: mockLength === 'short' ? '1000-2000' : mockLength === 'medium' ? '2000-3000' : '3000-4000',
+          content_preview: `# Generated Content\n\nThis is mock generated content for ${args.content_description || 'the specified section/chapter'}. The content would be ${mockLength} length (${mockWordCounts[mockLength]} words)...`
+        };
+      
+      case 'create_book':
+        return {
+          success: true,
+          message: 'Book created successfully',
+          book: {
+            book_id: 'mock-book-new',
+            title: args.title || 'Mock Book',
+            description: args.description || 'Mock description',
+            type: args.type || 'book',
+            author: args.author || 'Mock Author',
+            language: args.language || 'English',
+            genre: args.type === 'book' ? (args.genre || 'Other') : undefined,
+            tags: args.tags || [],
+            status: 'draft',
+            sections: []
+          }
+        };
+      
+      case 'create_book_outline':
+        let mockOutline = [];
+        try {
+          if (args.outline_json) {
+            mockOutline = JSON.parse(args.outline_json);
+          }
+        } catch (error) {
+          return {
+            success: false,
+            message: 'Invalid JSON in outline_json',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          };
+        }
+        const totalChapters = mockOutline.reduce((sum: number, section: any) => 
+          sum + (section.chapters?.length || 0), 0
+        );
+        return {
+          success: true,
+          message: `Outline created successfully with ${mockOutline.length} section(s) and ${totalChapters} chapter(s)`,
+          book_id: args.book_id || 'mock-book-1',
+          sections_count: mockOutline.length,
+          total_chapters: totalChapters
+        };
+      case 'add_characters':
+        let mockCharacters = [];
+        try {
+          if (args.characters_json) {
+            mockCharacters = JSON.parse(args.characters_json);
+          }
+        } catch (error) {
+          return {
+            success: false,
+            message: 'Invalid JSON in characters_json',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          };
+        }
+        return {
+          success: true,
+          message: `Added ${mockCharacters.length} character(s) to book`,
+          book_id: args.book_id || 'mock-book-1',
+          characters_added: mockCharacters.length,
+          characters: mockCharacters
+        };
+      
       case 'read_brand_guidelines':
         return {
           success: true,
@@ -2697,17 +3154,17 @@ Use the available tools to create tasks in the agent-engine when complex work is
             }
 
             if (args.update_type === 'full') {
-              // For full replacement, require old_file_hash
-              if (!instruction.old_file_hash) {
+              // For full replacement, require old_content_hash
+              if (!instruction.old_content_hash) {
                 return {
                   success: false,
-                  message: `Replacement instruction ${i + 1} missing old_file_hash. For update_type="full", old_file_hash is required`
+                  message: `Replacement instruction ${i + 1} missing old_content_hash. For update_type="full", old_content_hash is required`
                 };
               }
               if (instruction.old_content !== undefined) {
                 return {
                   success: false,
-                  message: `Replacement instruction ${i + 1} should not have old_content when update_type="full". Use old_file_hash instead`
+                  message: `Replacement instruction ${i + 1} should not have old_content when update_type="full". Use old_content_hash instead`
                 };
               }
             } else if (args.update_type === 'part') {
@@ -2718,10 +3175,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
                   message: `Replacement instruction ${i + 1} missing old_content. For update_type="part", old_content is required`
                 };
               }
-              if (instruction.old_file_hash !== undefined) {
+              if (instruction.old_content_hash !== undefined) {
                 return {
                   success: false,
-                  message: `Replacement instruction ${i + 1} should not have old_file_hash when update_type="part". Use old_content instead`
+                  message: `Replacement instruction ${i + 1} should not have old_content_hash when update_type="part". Use old_content instead`
                 };
               }
             }
@@ -2738,7 +3195,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             };
 
             if (args.update_type === 'full') {
-              result.old_file_hash = instruction.old_file_hash;
+              result.old_content_hash = instruction.old_content_hash;
             } else {
               result.old_content = instruction.old_content;
             }
@@ -2819,6 +3276,68 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.listKnowledgeBaseFiles(userId);
       case 'read_knowledge_base_files':
         return await this.readKnowledgeBaseFiles(args.files, userId);
+      case 'read_knowledge_base_file':
+        return await this.readKnowledgeBaseFile(args.file_identifier, userId);
+      case 'list_books':
+        return await this.listBooks(userId, args.type, args.status);
+      case 'get_book_details':
+        return await this.getBookDetails(args.book_id, userId);
+      case 'get_book_content':
+        return await this.getBookContent(args.book_id, args.section_id, args.chapter_id, userId);
+      case 'update_book_content':
+        // Parse replacement_json
+        let bookReplacementInstructions = [];
+        try {
+          if (args.replacement_json) {
+            bookReplacementInstructions = JSON.parse(args.replacement_json);
+          }
+        } catch (error) {
+          return {
+            success: false,
+            message: 'Invalid JSON in replacement_json',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          };
+        }
+        return await this.updateBookContent(
+          args.book_id,
+          args.section_id,
+          args.chapter_id,
+          bookReplacementInstructions,
+          userId
+        );
+      case 'generate_book_content':
+        return await this.generateBookContent(
+          args.book_id,
+          args.section_id,
+          args.chapter_id,
+          args.content_description,
+          args.length || 'medium',
+          args.imagine !== undefined ? args.imagine : true,
+          userId
+        );
+      case 'create_book':
+        return await this.createBook(
+          args.title,
+          args.description,
+          args.type,
+          args.author,
+          args.language || 'English',
+          args.genre,
+          args.tags || [],
+          userId
+        );
+      case 'create_book_outline':
+        return await this.createBookOutline(
+          args.book_id,
+          args.outline_json,
+          userId
+        );
+      case 'add_characters':
+        return await this.addCharacters(
+          args.book_id,
+          args.characters_json,
+          userId
+        );
       case 'read_brand_guidelines':
         return await this.readBrandGuidelines(userId);
       case 'update_brand_guidelines':
@@ -6323,6 +6842,36 @@ ${emailDraftFormat === 'text'
     }
   }
 
+  // Read a single knowledge base file; file_identifier can be "kb_identifier::file_name" or an object.
+  private async readKnowledgeBaseFile(fileIdentifier: any, userId: string): Promise<any> {
+    let kbIdentifier: string | undefined;
+    let fileName: string | undefined;
+
+    if (typeof fileIdentifier === 'string') {
+      if (fileIdentifier.includes('::')) {
+        const [kb, file] = fileIdentifier.split('::');
+        kbIdentifier = kb;
+        fileName = file;
+      } else if (fileIdentifier.includes('/')) {
+        const [kb, ...rest] = fileIdentifier.split('/');
+        kbIdentifier = kb;
+        fileName = rest.join('/');
+      }
+    } else if (fileIdentifier?.kb_identifier && fileIdentifier?.file_name) {
+      kbIdentifier = fileIdentifier.kb_identifier;
+      fileName = fileIdentifier.file_name;
+    }
+
+    if (!kbIdentifier || !fileName) {
+      return {
+        success: false,
+        message: 'file_identifier must include kb_identifier and file_name'
+      };
+    }
+
+    return await this.readSingleKnowledgeBaseFile(kbIdentifier, fileName, userId);
+  }
+
   // Helper: read a single knowledge base file
   private async readSingleKnowledgeBaseFile(kbIdentifier: string, fileName: string, userId: string): Promise<any> {
     // Get the task
@@ -7493,7 +8042,6 @@ ${emailDraftFormat === 'text'
       // ========================================
       console.log('AgentMode: Generating HTML file with style:', style);
       const htmlContent = generateBlogHtml(blogData.title, blogData.description, finalContent, heroImageUrl, style);
-
       console.log('AgentMode: Uploading HTML file to S3...');
       const htmlFilename = `blog-${Date.now()}.html`;
 
@@ -7511,6 +8059,9 @@ ${emailDraftFormat === 'text'
       const htmlUrl = uploadResult.url;
       console.log('AgentMode: HTML file uploaded successfully to:', htmlUrl);
 
+      // Calculate word count from the content
+      const wordCount = blogData.content.split(/\s+/).filter((word: string) => word.length > 0).length;
+
       return {
         success: true,
         message: this.getBlogSuccessMessage(deepResearch, inlineImagesCount),
@@ -7518,9 +8069,11 @@ ${emailDraftFormat === 'text'
           title: blogData.title,
           description: blogData.description,
           heroImageUrl: heroImageUrl,
+          imageUrl: heroImageUrl,
           htmlUrl: htmlUrl,
           deepResearchUsed: deepResearch,
-          inlineImagesCount: inlineImagesCount
+          inlineImagesCount: inlineImagesCount,
+          wordCount: wordCount
         }
       };
 
@@ -8412,15 +8965,16 @@ ${emailDraftFormat === 'text'
     sessionId: string
   ): Promise<any> {
     try {
-      // Validate update_type
+      // Validate update_type first (before fetching file)
       if (!updateType || !['part', 'full'].includes(updateType)) {
         return {
           success: false,
           message: 'update_type must be either "part" or "full"'
         };
       }
-
-      // Validate that replacementInstructions is an array
+      
+      // Validate replacement instructions (before fetching file)
+      // This is a quick validation to catch errors early
       if (!Array.isArray(replacementInstructions)) {
         return {
           success: false,
@@ -8434,49 +8988,7 @@ ${emailDraftFormat === 'text'
           message: 'At least one replacement instruction is required'
         };
       }
-
-      // Validate each replacement instruction based on update_type
-      for (let i = 0; i < replacementInstructions.length; i++) {
-        const instruction = replacementInstructions[i];
-
-        if (instruction.new_content === undefined || instruction.expected_count === undefined) {
-          return {
-            success: false,
-            message: `Missing required fields in replacement instruction ${i + 1}: new_content and expected_count are required`
-          };
-        }
-
-        if (updateType === 'full') {
-          // For full replacement, require old_file_hash
-          if (!instruction.old_file_hash) {
-            return {
-              success: false,
-              message: `Replacement instruction ${i + 1} missing old_file_hash. For update_type="full", old_file_hash is required`
-            };
-          }
-          if (instruction.old_content !== undefined) {
-            return {
-              success: false,
-              message: `Replacement instruction ${i + 1} should not have old_content when update_type="full". Use old_file_hash instead`
-            };
-          }
-        } else if (updateType === 'part') {
-          // For part replacement, require old_content
-          if (!instruction.old_content) {
-            return {
-              success: false,
-              message: `Replacement instruction ${i + 1} missing old_content. For update_type="part", old_content is required`
-            };
-          }
-          if (instruction.old_file_hash !== undefined) {
-            return {
-              success: false,
-              message: `Replacement instruction ${i + 1} should not have old_file_hash when update_type="part". Use old_content instead`
-            };
-          }
-        }
-      }
-
+      
       // Fetch current file content
       const currentContent = await this.fetchFileContent(fileUrl);
       console.log(`AgentMode: Fetched file content, length: ${currentContent.length} characters`);
@@ -8484,89 +8996,29 @@ ${emailDraftFormat === 'text'
       // Compute hash of current content for verification
       const currentContentHash = createHash('sha256').update(currentContent).digest('hex');
       console.log(`AgentMode: Computed current content hash: ${currentContentHash}`);
-
-      let updatedContent = currentContent;
-
-      // Perform all replacements
-      const replacementResults = [];
-
-      for (let i = 0; i < replacementInstructions.length; i++) {
-        const instruction = replacementInstructions[i];
-        const { new_content, expected_count } = instruction;
-
-        if (updateType === 'full') {
-          // Entire file replacement using hash
-          const { old_file_hash } = instruction;
-          console.log(`AgentMode: Full replacement ${i + 1}: old_file_hash: ${old_file_hash}, new_content length: ${new_content.length}, expected_count: ${expected_count}`);
-
-          // Verify that the provided hash matches the current content hash
-          if (old_file_hash !== currentContentHash) {
-            return {
-              success: false,
-              message: `Replacement ${i + 1} failed: File hash mismatch. Expected: ${currentContentHash}, provided: ${old_file_hash}. The file may have been modified since it was last read.`,
-              suggestion: 'Use read_file_content to get the current content and hash, then retry the replacement'
-            };
-          }
-
-          // For hash-based replacement, we replace the entire content
-          if (expected_count === 1) {
-            console.log(`AgentMode: Hash verification successful, replacing entire content`);
-            updatedContent = new_content;
-            replacementResults.push({
-              index: i + 1,
-              old_file_hash: old_file_hash,
-              new_content: new_content,
-              expected_count: expected_count,
-              actual_count: 1,
-              success: true
-            });
-          } else {
-            return {
-              success: false,
-              message: `Replacement ${i + 1} failed: Full replacement only supports expected_count of 1 (entire file replacement)`,
-              suggestion: 'Use expected_count: 1 for full file replacement'
-            };
-          }
-        } else if (updateType === 'part') {
-          // Partial content replacement using old_content
-          const { old_content } = instruction;
-          console.log(`AgentMode: Part replacement ${i + 1}: old_content length: ${old_content.length}, new_content length: ${new_content.length}, expected_count: ${expected_count}`);
-
-          // Perform the replacement using the existing logic
-          const replacementResult = this.performDirectReplacement(
-            updatedContent,
-            old_content,
-            new_content,
-            true // exact_match = true for partial replacements
-          );
-
-          if (replacementResult === null) {
-            return {
-              success: false,
-              message: `Replacement ${i + 1} failed: The old_content was not found in the file. No changes were made to the file.`,
-              suggestion: 'Check that the old_content exactly matches the content in the file'
-            };
-          }
-
-          // Check if the actual change count matches expected count
-          if (replacementResult.changeCount !== expected_count) {
-            return {
-              success: false,
-              message: `Replacement ${i + 1} failed: Expected ${expected_count} occurrences of old_content, but found ${replacementResult.changeCount}. No changes were made to the file.`,
-              suggestion: 'Check the expected_count matches the actual number of occurrences in the file'
-            };
-          }
-
-          updatedContent = replacementResult.content;
-          replacementResults.push({
-            index: i + 1,
-            old_content: old_content,
-            new_content: new_content,
-            expected_count: expected_count,
-            actual_count: replacementResult.changeCount,
-            success: true
-          });
+      
+      // Use common replacement function
+      const replacementResult = this.performContentReplacements(
+        currentContent,
+        currentContentHash,
+        updateType,
+        replacementInstructions
+      );
+      
+      if (!replacementResult.success) {
+        // Map error messages to match expected format for HTML files
+        let errorMessage = replacementResult.error?.message || 'Failed to perform replacements';
+        
+        // Replace generic messages with HTML-specific ones for backward compatibility
+        if (replacementResult.error?.isHashMismatch || errorMessage.includes('Content hash mismatch')) {
+          errorMessage = errorMessage.replace('Content hash mismatch', 'File hash mismatch');
         }
+        
+        return {
+          success: false,
+          message: errorMessage,
+          suggestion: replacementResult.error?.suggestion
+        };
       }
 
       // Create versioned filename and upload the updated content
@@ -8575,14 +9027,14 @@ ${emailDraftFormat === 'text'
       console.log(`AgentMode: Generated versioned filename: ${versionedFilename}`);
       const originalPath = this.extractPathFromS3Url(fileUrl);
       console.log(`AgentMode: Original path: ${originalPath}`);
-      const uploadResult = await this.uploadUpdatedFile(updatedContent, versionedFilename, originalPath);
-
+      const uploadResult = await this.uploadUpdatedFile(replacementResult.updatedContent!, versionedFilename, originalPath);
+      
       return {
         success: true,
         s3_url: uploadResult.url,
-        message: `File updated successfully with ${replacementResults.length} replacements`,
+        message: `File updated successfully with ${replacementResult.replacementResults!.length} replacements`,
         method: 'mixed_replacement',
-        replacements: replacementResults,
+        replacements: replacementResult.replacementResults,
         versioned_filename: versionedFilename
       };
 
@@ -8592,7 +9044,7 @@ ${emailDraftFormat === 'text'
         success: false,
         message: 'Failed to update HTML file',
         error: error instanceof Error ? error.message : 'Unknown error',
-        suggestion: 'For entire file replacement, use old_file_hash from read_file_content. For partial replacement, use old_content with the exact text to replace'
+        suggestion: 'For entire file replacement, use old_content_hash from read_file_content. For partial replacement, use old_content with the exact text to replace'
       };
     }
   }
@@ -8609,6 +9061,194 @@ ${emailDraftFormat === 'text'
       console.error('Error fetching file content:', error);
       throw new Error(`Failed to fetch file content: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
+  }
+
+  // Common function to validate and perform content replacements
+  // Used by both update_html_file and update_book_content
+  private performContentReplacements(
+    currentContent: string,
+    currentContentHash: string,
+    updateType: string,
+    replacementInstructions: any[]
+  ): { success: boolean; updatedContent?: string; replacementResults?: any[]; error?: any } {
+    // Validate update_type
+    if (!updateType || !['part', 'full'].includes(updateType)) {
+      return {
+        success: false,
+        error: {
+          message: 'update_type must be either "part" or "full"'
+        }
+      };
+    }
+    
+    // Validate that replacementInstructions is an array
+    if (!Array.isArray(replacementInstructions)) {
+      return {
+        success: false,
+        error: {
+          message: 'replacement_json must be an array of replacement instructions'
+        }
+      };
+    }
+    
+    if (replacementInstructions.length === 0) {
+      return {
+        success: false,
+        error: {
+          message: 'At least one replacement instruction is required'
+        }
+      };
+    }
+    
+    // Validate each replacement instruction based on update_type
+    for (let i = 0; i < replacementInstructions.length; i++) {
+      const instruction = replacementInstructions[i];
+      
+      if (instruction.new_content === undefined || instruction.expected_count === undefined) {
+        return {
+          success: false,
+          error: {
+            message: `Missing required fields in replacement instruction ${i + 1}: new_content and expected_count are required`
+          }
+        };
+      }
+      
+      if (updateType === 'full') {
+        // For full replacement, require old_content_hash
+        if (!instruction.old_content_hash) {
+          return {
+            success: false,
+            error: {
+              message: `Replacement instruction ${i + 1} missing old_content_hash. For update_type="full", old_content_hash is required`
+            }
+          };
+        }
+        if (instruction.old_content !== undefined) {
+          return {
+            success: false,
+            error: {
+              message: `Replacement instruction ${i + 1} should not have old_content when update_type="full". Use hash instead`
+            }
+          };
+        }
+      } else if (updateType === 'part') {
+        // For part replacement, require old_content
+        if (!instruction.old_content) {
+          return {
+            success: false,
+            error: {
+              message: `Replacement instruction ${i + 1} missing old_content. For update_type="part", old_content is required`
+            }
+          };
+        }
+        if (instruction.old_content_hash !== undefined) {
+          return {
+            success: false,
+            error: {
+              message: `Replacement instruction ${i + 1} should not have old_content_hash when update_type="part". Use old_content instead`
+            }
+          };
+        }
+      }
+    }
+    
+    let updatedContent = currentContent;
+    const replacementResults = [];
+    
+    // Perform all replacements
+    for (let i = 0; i < replacementInstructions.length; i++) {
+      const instruction = replacementInstructions[i];
+      const { new_content, expected_count } = instruction;
+      
+        if (updateType === 'full') {
+          // Entire content replacement using hash
+          const providedHash = instruction.old_content_hash;
+        console.log(`AgentMode: Full replacement ${i + 1}: hash: ${providedHash}, new_content length: ${new_content.length}, expected_count: ${expected_count}`);
+        
+          // Verify that the provided hash matches the current content hash
+          if (providedHash !== currentContentHash) {
+            return {
+              success: false,
+              error: {
+                message: `Replacement ${i + 1} failed: Content hash mismatch. Expected: ${currentContentHash}, provided: ${providedHash}. The content may have been modified since it was last read.`,
+                suggestion: 'Use get_book_content or read_file_content to get the current content and hash, then retry the replacement',
+                isHashMismatch: true // Flag for HTML file error message mapping
+              }
+            };
+          }
+        
+        // For hash-based replacement, we replace the entire content
+        if (expected_count === 1) {
+          console.log(`AgentMode: Hash verification successful, replacing entire content`);
+          updatedContent = new_content;
+          replacementResults.push({
+            index: i + 1,
+            old_content_hash: instruction.old_content_hash,
+            new_content: new_content,
+            expected_count: expected_count,
+            actual_count: 1,
+            success: true
+          });
+        } else {
+          return {
+            success: false,
+            error: {
+              message: `Replacement ${i + 1} failed: Full replacement only supports expected_count of 1 (entire content replacement)`,
+              suggestion: 'Use expected_count: 1 for full content replacement'
+            }
+          };
+        }
+      } else if (updateType === 'part') {
+        // Partial content replacement using old_content
+        const { old_content } = instruction;
+        console.log(`AgentMode: Part replacement ${i + 1}: old_content length: ${old_content.length}, new_content length: ${new_content.length}, expected_count: ${expected_count}`);
+        
+        // Perform the replacement using the existing logic
+        const replacementResult = this.performDirectReplacement(
+          updatedContent,
+          old_content,
+          new_content,
+          true // exact_match = true for partial replacements
+        );
+        
+        if (replacementResult === null) {
+          return {
+            success: false,
+            error: {
+              message: `Replacement ${i + 1} failed: The old_content was not found in the content. No changes were made.`,
+              suggestion: 'Check that the old_content exactly matches the content. Use get_book_content or read_file_content to retrieve the exact current content.'
+            }
+          };
+        }
+        
+        // Check if the actual change count matches expected count
+        if (replacementResult.changeCount !== expected_count) {
+          return {
+            success: false,
+            error: {
+              message: `Replacement ${i + 1} failed: Expected ${expected_count} occurrences of old_content, but found ${replacementResult.changeCount}. No changes were made.`,
+              suggestion: 'Check the expected_count matches the actual number of occurrences in the content'
+            }
+          };
+        }
+        
+        updatedContent = replacementResult.content;
+        replacementResults.push({
+          index: i + 1,
+          old_content: old_content,
+          new_content: new_content,
+          expected_count: expected_count,
+          actual_count: replacementResult.changeCount,
+          success: true
+        });
+      }
+    }
+    
+    return {
+      success: true,
+      updatedContent,
+      replacementResults
+    };
   }
 
   // Perform direct replacement of old content with new content
@@ -9373,6 +10013,877 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
     }
   }
 
+  private async listBooks(userId: string, type?: string, status?: string): Promise<any> {
+    try {
+      console.log('AgentMode: Listing books for user:', userId);
+      
+      const { bookDb } = await import('./bookDb');
+      
+      const filters: {
+        type?: "book" | "whitepaper";
+        status?: "draft" | "published" | "archived";
+      } = {};
+      
+      if (type === "book" || type === "whitepaper") {
+        filters.type = type;
+      }
+      
+      if (status === "draft" || status === "published" || status === "archived") {
+        filters.status = status;
+      }
+      
+      const books = await bookDb.getBooksByUser(userId, filters);
+      
+      if (!books || books.length === 0) {
+        return {
+          success: true,
+          message: 'No books found',
+          books: [],
+          totalBooks: 0
+        };
+      }
+
+      // Format books for Agent Mode
+      const formattedBooks = books.map((book: any) => ({
+        book_id: book.bookId,
+        title: book.title,
+        description: book.description,
+        type: book.type,
+        author: book.author,
+        status: book.status,
+        published_at: book.publishedAt,
+        created_at: book.createdAt,
+        updated_at: book.updatedAt,
+        tags: book.tags || [],
+        has_sections: !!(book.sections && book.sections.length > 0)
+      }));
+
+      return {
+        success: true,
+        message: `Found ${formattedBooks.length} book(s)`,
+        books: formattedBooks,
+        totalBooks: formattedBooks.length
+      };
+    } catch (error) {
+      console.error('Error listing books:', error);
+      return {
+        success: false,
+        message: 'Failed to list books',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async getBookDetails(bookId: string, userId: string): Promise<any> {
+    try {
+      console.log('AgentMode: Getting book details for:', bookId);
+      
+      const { bookDb } = await import('./bookDb');
+      const { bookContentDb } = await import('./bookContentDb');
+      
+      const book = await bookDb.getBookById(bookId, userId);
+      
+      if (!book) {
+        return {
+          success: false,
+          message: 'Book not found',
+          error: 'Book not found or access denied'
+        };
+      }
+
+      // Load all contents for this book
+      const contents = await bookContentDb.getAllBookContents(bookId, userId);
+      
+      // Attach contents to sections and chapters
+      if (book.sections) {
+        for (const section of book.sections) {
+          const sectionContent = contents.find(
+            (c) => c.sectionId === section.sectionId && !c.chapterId
+          );
+          if (sectionContent) {
+            section.content = sectionContent.content;
+          }
+          
+          for (const chapter of section.chapters) {
+            const chapterContent = contents.find(
+              (c) => c.sectionId === section.sectionId && c.chapterId === chapter.chapterId
+            );
+            if (chapterContent) {
+              chapter.content = chapterContent.content;
+            }
+          }
+        }
+      }
+
+      // Format book details for Agent Mode
+      const formattedBook = {
+        book_id: book.bookId,
+        title: book.title,
+        description: book.description,
+        type: book.type,
+        author: book.author,
+        language: book.language,
+        genre: book.genre,
+        status: book.status,
+        published_at: book.publishedAt,
+        created_at: book.createdAt,
+        updated_at: book.updatedAt,
+        tags: book.tags || [],
+        cover_image_url: book.coverImageUrl,
+        characters: book.characters || [],
+        outline: book.sections ? book.sections.map((section: any) => ({
+          section_id: section.sectionId,
+          title: section.title,
+          description: section.description,
+          order: section.order,
+          has_content: !!section.content,
+          chapters: section.chapters.map((chapter: any) => ({
+            chapter_id: chapter.chapterId,
+            title: chapter.title,
+            description: chapter.description,
+            order: chapter.order,
+            has_content: !!chapter.content
+          }))
+        })) : []
+      };
+
+      return {
+        success: true,
+        message: 'Book details retrieved successfully',
+        book: formattedBook
+      };
+    } catch (error) {
+      console.error('Error getting book details:', error);
+      return {
+        success: false,
+        message: 'Failed to get book details',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async getBookContent(
+    bookId: string,
+    sectionId: string,
+    chapterId: string | undefined,
+    userId: string
+  ): Promise<any> {
+    try {
+      console.log('AgentMode: Getting book content for:', { bookId, sectionId, chapterId });
+      
+      const { bookDb } = await import('./bookDb');
+      const { bookContentDb } = await import('./bookContentDb');
+      
+      // Verify book exists and belongs to user
+      const book = await bookDb.getBookById(bookId, userId);
+      if (!book) {
+        return {
+          success: false,
+          message: 'Book not found',
+          error: 'Book not found or access denied'
+        };
+      }
+
+      // Verify section exists
+      const section = book.sections?.find((s) => s.sectionId === sectionId);
+      if (!section) {
+        return {
+          success: false,
+          message: 'Section not found',
+          error: 'Section not found in this book'
+        };
+      }
+
+      // If chapterId provided, verify chapter exists
+      if (chapterId) {
+        const chapter = section.chapters.find((c) => c.chapterId === chapterId);
+        if (!chapter) {
+          return {
+            success: false,
+            message: 'Chapter not found',
+            error: 'Chapter not found in this section'
+          };
+        }
+      }
+
+      // Get content from bookContentDb
+      const content = await bookContentDb.getContent(bookId, userId, sectionId, chapterId);
+      
+      if (!content) {
+        const emptyContentHash = createHash('sha256').update('').digest('hex');
+        return {
+          success: true,
+          message: chapterId ? 'Chapter content not found' : 'Section content not found',
+          content: '',
+          content_hash: emptyContentHash,
+          content_type: chapterId ? 'chapter' : 'section',
+          section_id: sectionId,
+          chapter_id: chapterId || null,
+          has_content: false
+        };
+      }
+
+      // Compute content hash for full replacement verification
+      const contentHash = createHash('sha256').update(content.content).digest('hex');
+
+      return {
+        success: true,
+        message: chapterId ? 'Chapter content retrieved successfully' : 'Section content retrieved successfully',
+        content: content.content,
+        content_hash: contentHash,
+        content_type: chapterId ? 'chapter' : 'section',
+        section_id: sectionId,
+        chapter_id: chapterId || null,
+        updated_at: content.updatedAt,
+        has_content: true
+      };
+    } catch (error) {
+      console.error('Error getting book content:', error);
+      return {
+        success: false,
+        message: 'Failed to get book content',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async updateBookContent(
+    bookId: string,
+    sectionId: string,
+    chapterId: string | undefined,
+    replacementInstructions: any[],
+    userId: string
+  ): Promise<any> {
+    try {
+      // Validate that replacementInstructions is an array
+      if (!Array.isArray(replacementInstructions)) {
+        return {
+          success: false,
+          message: 'replacement_json must be an array of replacement instructions'
+        };
+      }
+      
+      if (replacementInstructions.length === 0) {
+        return {
+          success: false,
+          message: 'At least one replacement instruction is required'
+        };
+      }
+      
+      // Validate each replacement instruction (always partial replacement)
+      for (let i = 0; i < replacementInstructions.length; i++) {
+        const instruction = replacementInstructions[i];
+        
+        if (instruction.new_content === undefined || instruction.expected_count === undefined) {
+          return {
+            success: false,
+            message: `Missing required fields in replacement instruction ${i + 1}: new_content and expected_count are required`
+          };
+        }
+        
+        // For partial replacement, require old_content
+        if (!instruction.old_content) {
+          return {
+            success: false,
+            message: `Replacement instruction ${i + 1} missing old_content. old_content is required for partial replacements`
+          };
+        }
+      }
+
+      // Get current content
+      const { bookDb } = await import('./bookDb');
+      const { bookContentDb } = await import('./bookContentDb');
+      
+      // Verify book exists and belongs to user
+      const book = await bookDb.getBookById(bookId, userId);
+      if (!book) {
+        return {
+          success: false,
+          message: 'Book not found',
+          error: 'Book not found or access denied'
+        };
+      }
+
+      // Verify section exists
+      const section = book.sections?.find((s) => s.sectionId === sectionId);
+      if (!section) {
+        return {
+          success: false,
+          message: 'Section not found',
+          error: 'Section not found in this book'
+        };
+      }
+
+      // If chapterId provided, verify chapter exists
+      if (chapterId) {
+        const chapter = section.chapters.find((c) => c.chapterId === chapterId);
+        if (!chapter) {
+          return {
+            success: false,
+            message: 'Chapter not found',
+            error: 'Chapter not found in this section'
+          };
+        }
+      }
+
+      // Get current content
+      const currentContentRecord = await bookContentDb.getContent(bookId, userId, sectionId, chapterId);
+      const currentContent = currentContentRecord?.content || '';
+      
+      console.log(`AgentMode: Current content length: ${currentContent.length} characters`);
+      
+      // Compute hash of current content for verification
+      const currentContentHash = createHash('sha256').update(currentContent).digest('hex');
+      console.log(`AgentMode: Computed current content hash: ${currentContentHash}`);
+      
+      // Use common replacement function (always "part" for partial replacements)
+      const replacementResult = this.performContentReplacements(
+        currentContent,
+        currentContentHash,
+        'part',
+        replacementInstructions
+      );
+      
+      if (!replacementResult.success) {
+        return {
+          success: false,
+          message: replacementResult.error?.message || 'Failed to perform replacements',
+          suggestion: replacementResult.error?.suggestion
+        };
+      }
+      
+      // Save the updated content
+      await bookContentDb.createOrUpdateContent(bookId, userId, {
+        sectionId: sectionId,
+        chapterId: chapterId,
+        content: replacementResult.updatedContent!
+      });
+      
+      return {
+        success: true,
+        message: `Content updated successfully with ${replacementResult.replacementResults!.length} replacement(s)`,
+        content_type: chapterId ? 'chapter' : 'section',
+        section_id: sectionId,
+        chapter_id: chapterId || null,
+        replacements: replacementResult.replacementResults,
+        updated_content_length: replacementResult.updatedContent!.length
+      };
+      
+    } catch (error) {
+      console.error('Error updating book content:', error);
+      return {
+        success: false,
+        message: 'Failed to update book content',
+        error: error instanceof Error ? error.message : 'Unknown error',
+        suggestion: 'Use get_book_content to retrieve the current content, then provide the exact old_content to replace. For generating full content, use generate_book_content instead.'
+      };
+    }
+  }
+
+  private async generateBookContent(
+    bookId: string,
+    sectionId: string,
+    chapterId: string | undefined,
+    contentDescription: string,
+    length: string,
+    imagine: boolean,
+    userId: string
+  ): Promise<any> {
+    try {
+      console.log('AgentMode: Generating book content for:', { bookId, sectionId, chapterId, length, imagine, userId });
+      
+      const { bookDb } = await import('./bookDb');
+      const { bookContentDb } = await import('./bookContentDb');
+      
+      // Verify book exists and belongs to user
+      const book = await bookDb.getBookById(bookId, userId);
+      if (!book) {
+        return {
+          success: false,
+          message: 'Book not found',
+          error: 'Book not found or access denied'
+        };
+      }
+
+      // Verify section exists
+      const section = book.sections?.find((s) => s.sectionId === sectionId);
+      if (!section) {
+        return {
+          success: false,
+          message: 'Section not found',
+          error: 'Section not found in this book'
+        };
+      }
+
+      // If chapterId provided, verify chapter exists
+      if (chapterId) {
+        const chapter = section.chapters.find((c) => c.chapterId === chapterId);
+        if (!chapter) {
+          return {
+            success: false,
+            message: 'Chapter not found',
+            error: 'Chapter not found in this section'
+          };
+        }
+      }
+
+      // Get existing content if it exists
+      const existingContent = await bookContentDb.getContent(bookId, userId, sectionId, chapterId);
+      const existingContentText = existingContent?.content || '';
+
+      // Check if imagine setting exists in content record and overwrite the parameter only when it's false
+      // (since the default is true, we only need to override when explicitly set to false)
+      let finalImagine = imagine;
+      let imagineOverridden = false;
+      if (existingContent?.imagine === false) {
+        finalImagine = false;
+        imagineOverridden = true;
+      }
+
+      // Map length to word count range
+      const wordCountRanges: Record<string, { min: number; max: number; target: number }> = {
+        short: { min: 1000, max: 2000, target: 1500 },
+        medium: { min: 2000, max: 3000, target: 2500 },
+        long: { min: 3000, max: 4000, target: 3500 }
+      };
+
+      const wordCount = wordCountRanges[length] || wordCountRanges.medium;
+
+      // Get section/chapter title for context
+      const sectionTitle = section.title;
+      const chapterTitle = chapterId ? section.chapters.find((c) => c.chapterId === chapterId)?.title : undefined;
+      const contentTitle = chapterTitle || sectionTitle;
+
+      // Build the prompt for content generation
+      let contentPrompt = `You are an expert content writer creating ${length} content for a ${book.type === 'book' ? 'book' : 'white paper'} chapter or section.
+
+Book Context:
+- Title: ${book.title}
+- Author: ${book.author}
+- Type: ${book.type}
+${book.description ? `- Description: ${book.description}` : ''}
+${book.language ? `- Language: ${book.language}` : ''}
+${book.type === 'book' && book.genre ? `- Genre: ${book.genre}` : ''}
+${book.type === 'book' && book.characters && book.characters.length > 0 ? `
+- Characters:
+${book.characters.map((char, idx) => `  ${idx + 1}. ${char.name}: ${char.description}`).join('\n')}
+
+IMPORTANT: Not all characters need to be mentioned in every chapter. Only include characters that are relevant to this specific ${chapterId ? 'chapter' : 'section'}. Use characters naturally when they fit the narrative or content, but do not force their inclusion if they are not relevant to this particular ${chapterId ? 'chapter' : 'section'}.` : ''}
+
+Content Context:
+- ${chapterId ? 'Chapter' : 'Section'} Title: ${contentTitle}
+${section.description ? `- Section Description: ${section.description}` : ''}
+${chapterId && section.chapters.find((c) => c.chapterId === chapterId)?.description ? `- Chapter Description: ${section.chapters.find((c) => c.chapterId === chapterId)?.description}` : ''}
+
+Content Requirements:
+- Content Description: ${contentDescription}
+- Target Length: ${wordCount.min}-${wordCount.max} words (aim for approximately ${wordCount.target} words)
+- Format: Markdown with proper headings (H2, H3), paragraphs, lists, and formatting
+- Style: Professional, engaging, and well-structured
+${book.language === '中文' ? '- Language: Write in Chinese (中文)' : '- Language: Write in English'}
+${book.type === 'book' && book.genre ? `- Genre: Write in the style appropriate for ${book.genre} genre` : ''}
+${!finalImagine ? `
+CRITICAL: Do NOT invent or imagine details that do not exist. Stick strictly to facts, information provided in the content description, and details that are explicitly mentioned in the book context (title, description, characters, etc.). Do not add creative embellishments, fictional scenarios, or details that are not directly supported by the provided information. Focus on factual, accurate content based only on what is explicitly provided.` : ''}
+
+${existingContentText ? `Existing Content (use as base and enhance/expand based on content description):
+${existingContentText}
+
+Instructions: Use the existing content above as a foundation, and enhance or expand it based on the content description. Maintain consistency with the existing style and structure while incorporating the new requirements.` : 'Instructions: Create comprehensive, well-structured content from scratch based on the content description.'}`;
+
+      // Get content model from settings
+      let contentModel: string | undefined;
+      try {
+        const setting = await settingsService.getSetting('agent_mode_content_model');
+        if (setting && setting.settingValue) {
+          contentModel = setting.settingValue;
+        }
+      } catch (error) {
+        console.error('Error getting content model setting:', error);
+      }
+
+      // Generate content using LangChain LLM service
+      const { createLLMService } = await import('../utils/llmService');
+      const modelName = contentModel || process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4';
+      
+      // Use XML format for Chinese content (more forgiving with quotes)
+      const useXMLFormat = book.language === '中文';
+      const format = useXMLFormat ? 'xml' : 'json';
+      console.log(`[generateBookContent] Using model: ${modelName}, output format: ${format.toUpperCase()}, language: ${book.language}`);
+      
+      const llmService = createLLMService(modelName, 0.8, 4000);
+      
+      const systemPrompt = `You are a seasoned content writer specializing in ${book.type === 'book' ? 'books' : 'white papers'}. Write naturally, avoid AI patterns, and focus on providing comprehensive, well-structured content. ${book.language === '中文' ? 'Write in Chinese (中文).' : 'Write in English.'}
+
+${useXMLFormat ? `CRITICAL: You MUST respond ONLY in XML format. Do NOT use JSON format.
+
+Format your response as XML with this structure:
+<response>
+  <content>Full content in markdown format. Do not include a title in the content (the title is already provided above). Start directly with the main content.</content>
+</response>
+
+IMPORTANT: 
+- Use XML format ONLY - do not use JSON
+- XML handles quotes and special characters naturally - you do NOT need to escape quotes
+- The content can contain any Chinese characters, quotes, or special characters without escaping
+- Return ONLY the XML structure above, nothing else` : `Format your response as JSON with this structure:
+{
+  "content": "Full content in markdown format. Do not include a title in the content (the title is already provided above). Start directly with the main content."
+}
+
+IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly.`}`;
+      
+      // Generate content using LangChain with appropriate format
+      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format);
+      
+      // Extract content from JSON
+      if (!contentData.content) {
+        throw new Error('JSON response missing "content" field');
+      }
+      let finalContent = contentData.content;
+      finalContent = finalContent.trim();
+      // Remove markdown code blocks if present
+      finalContent = finalContent.replace(/^```markdown\s*|\s*```$/g, '').trim();
+      finalContent = finalContent.replace(/^```\s*|\s*```$/g, '').trim();
+
+      // Save the generated content
+      await bookContentDb.createOrUpdateContent(
+        bookId,
+        userId,
+        {
+          sectionId,
+          chapterId,
+          content: finalContent
+        }
+      );
+
+      // Count words (approximate)
+      const wordCountActual = finalContent.split(/\s+/).filter((word: string) => word.length > 0).length;
+
+      let message = `${chapterId ? 'Chapter' : 'Section'} content generated successfully`;
+      if (imagineOverridden) {
+        message += ` (imagine setting from ${chapterId ? 'chapter' : 'section'} record: ${finalImagine ? 'enabled' : 'disabled'})`;
+      }
+
+      return {
+        success: true,
+        message,
+        content_type: chapterId ? 'chapter' : 'section',
+        section_id: sectionId,
+        chapter_id: chapterId || null,
+        content_length: finalContent.length,
+        word_count: wordCountActual,
+        target_word_range: `${wordCount.min}-${wordCount.max}`,
+        content_preview: finalContent.substring(0, 200) + (finalContent.length > 200 ? '...' : '')
+      };
+
+    } catch (error) {
+      console.error('Error generating book content:', error);
+      return {
+        success: false,
+        message: 'Failed to generate book content',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async createBook(
+    title: string,
+    description: string,
+    type: string,
+    author: string,
+    language: string,
+    genre: string | undefined,
+    tags: string[],
+    userId: string
+  ): Promise<any> {
+    try {
+      console.log('AgentMode: Creating book for user:', userId);
+
+      // Validate required parameters
+      if (!title || !title.trim()) {
+        return {
+          success: false,
+          message: 'Title is required',
+          error: 'Title cannot be empty'
+        };
+      }
+
+      if (!description || !description.trim()) {
+        return {
+          success: false,
+          message: 'Description is required',
+          error: 'Description cannot be empty'
+        };
+      }
+
+      if (!type || (type !== 'book' && type !== 'whitepaper')) {
+        return {
+          success: false,
+          message: 'Type must be "book" or "whitepaper"',
+          error: 'Invalid type specified'
+        };
+      }
+
+      if (!author || !author.trim()) {
+        return {
+          success: false,
+          message: 'Author is required',
+          error: 'Author cannot be empty'
+        };
+      }
+
+      const { bookDb } = await import('./bookDb');
+
+      // Set genre only for books, default to "Other" if not provided
+      const bookGenre = type === 'book' ? (genre?.trim() || 'Other') : undefined;
+
+      const bookData = {
+        userId,
+        title: title.trim(),
+        description: description.trim(),
+        content: '', // Empty content initially
+        type: type as 'book' | 'whitepaper',
+        author: author.trim(),
+        language: language || 'English',
+        genre: bookGenre,
+        tags: tags && Array.isArray(tags) ? tags : [],
+        status: 'draft' as const,
+        sections: []
+      };
+
+      const book = await bookDb.createBook(bookData);
+
+      return {
+        success: true,
+        message: 'Book created successfully',
+        book: {
+          book_id: book.bookId,
+          title: book.title,
+          description: book.description,
+          type: book.type,
+          author: book.author,
+          language: book.language,
+          genre: book.genre,
+          tags: book.tags || [],
+          status: book.status,
+          sections: book.sections || []
+        }
+      };
+    } catch (error) {
+      console.error('Error creating book:', error);
+      return {
+        success: false,
+        message: 'Failed to create book',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async createBookOutline(
+    bookId: string,
+    outlineJson: string,
+    userId: string
+  ): Promise<any> {
+    try {
+      console.log('AgentMode: Creating book outline for:', bookId);
+
+      // Validate book exists and belongs to user
+      const { bookDb } = await import('./bookDb');
+      const book = await bookDb.getBookById(bookId, userId);
+
+      if (!book) {
+        return {
+          success: false,
+          message: 'Book not found',
+          error: 'Book not found or access denied'
+        };
+      }
+
+      // Parse outline JSON
+      let outline: any[];
+      try {
+        outline = JSON.parse(outlineJson);
+      } catch (error) {
+        return {
+          success: false,
+          message: 'Invalid JSON in outline_json',
+          error: error instanceof Error ? error.message : 'Unknown error'
+        };
+      }
+
+      // Validate outline structure
+      if (!Array.isArray(outline)) {
+        return {
+          success: false,
+          message: 'Outline must be an array of sections',
+          error: 'Invalid outline structure'
+        };
+      }
+
+      // Build sections array with proper structure
+      const sections = outline.map((section: any, sectionIndex: number) => {
+        // Validate section has title
+        if (!section.title || !section.title.trim()) {
+          throw new Error(`Section at index ${sectionIndex} is missing required field: title`);
+        }
+
+        const sectionId = uuidv4();
+        const sectionOrder = section.order !== undefined ? section.order : sectionIndex + 1;
+
+        // Process chapters if provided
+        const chapters = (section.chapters || []).map((chapter: any, chapterIndex: number) => {
+          // Validate chapter has title
+          if (!chapter.title || !chapter.title.trim()) {
+            throw new Error(`Chapter at index ${chapterIndex} in section "${section.title}" is missing required field: title`);
+          }
+
+          return {
+            chapterId: uuidv4(),
+            title: chapter.title.trim(),
+            description: chapter.description?.trim() || '',
+            order: chapter.order !== undefined ? chapter.order : chapterIndex + 1
+          };
+        });
+
+        return {
+          sectionId,
+          title: section.title.trim(),
+          description: section.description?.trim() || '',
+          order: sectionOrder,
+          chapters
+        };
+      });
+
+      // Update book with new outline
+      const updatedBook = await bookDb.updateBook(bookId, userId, { sections });
+
+      if (!updatedBook) {
+        return {
+          success: false,
+          message: 'Failed to update book outline',
+          error: 'Book update failed'
+        };
+      }
+
+      const totalChapters = sections.reduce((sum, section) => sum + section.chapters.length, 0);
+
+      return {
+        success: true,
+        message: `Outline created successfully with ${sections.length} section(s) and ${totalChapters} chapter(s)`,
+        book_id: bookId,
+        sections_count: sections.length,
+        total_chapters: totalChapters
+      };
+    } catch (error) {
+      console.error('Error creating book outline:', error);
+      return {
+        success: false,
+        message: 'Failed to create book outline',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async addCharacters(
+    bookId: string,
+    charactersJson: string,
+    userId: string
+  ): Promise<any> {
+    try {
+      console.log('AgentMode: Adding characters to book:', bookId);
+
+      // Validate book exists and belongs to user
+      const { bookDb } = await import('./bookDb');
+      const book = await bookDb.getBookById(bookId, userId);
+
+      if (!book) {
+        return {
+          success: false,
+          message: 'Book not found',
+          error: 'Book not found or access denied'
+        };
+      }
+
+      // Parse characters JSON
+      let newCharacters: any[];
+      try {
+        newCharacters = JSON.parse(charactersJson);
+      } catch (error) {
+        return {
+          success: false,
+          message: 'Invalid JSON in characters_json',
+          error: error instanceof Error ? error.message : 'Unknown error'
+        };
+      }
+
+      // Validate characters structure
+      if (!Array.isArray(newCharacters)) {
+        return {
+          success: false,
+          message: 'Characters must be an array',
+          error: 'Invalid characters structure'
+        };
+      }
+
+      // Validate each character has name and description
+      for (let i = 0; i < newCharacters.length; i++) {
+        const char = newCharacters[i];
+        if (!char.name || !char.name.trim()) {
+          return {
+            success: false,
+            message: `Character at index ${i} is missing required field: name`,
+            error: 'Invalid character structure'
+          };
+        }
+        if (!char.description || !char.description.trim()) {
+          return {
+            success: false,
+            message: `Character at index ${i} is missing required field: description`,
+            error: 'Invalid character structure'
+          };
+        }
+      }
+
+      // Get existing characters or initialize empty array
+      const existingCharacters = book.characters || [];
+
+      // Add new characters to existing list
+      const updatedCharacters = [
+        ...existingCharacters,
+        ...newCharacters.map((char: any) => ({
+          name: char.name.trim(),
+          description: char.description.trim()
+        }))
+      ];
+
+      // Update book with new characters
+      const updatedBook = await bookDb.updateBook(bookId, userId, { characters: updatedCharacters });
+
+      if (!updatedBook) {
+        return {
+          success: false,
+          message: 'Failed to update book characters',
+          error: 'Book update failed'
+        };
+      }
+
+      return {
+        success: true,
+        message: `Added ${newCharacters.length} character(s) to book`,
+        book_id: bookId,
+        characters_added: newCharacters.length,
+        total_characters: updatedCharacters.length,
+        characters: updatedCharacters
+      };
+    } catch (error) {
+      console.error('Error adding characters:', error);
+      return {
+        success: false,
+        message: 'Failed to add characters',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
 }
 
 export const agentModeService = new AgentModeService();

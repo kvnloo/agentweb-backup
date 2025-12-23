@@ -113,7 +113,7 @@ describe('updateHtmlFile', () => {
       const result = await (agentModeService as any).updateHtmlFile(
         'https://s3.amazonaws.com/bucket/file.html',
         'full',
-        [{ old_file_hash: 'mock-hash-123', new_content: '<html>New</html>', expected_count: 1 }],
+        [{ old_content_hash: 'mock-hash-123', new_content: '<html>New</html>', expected_count: 1 }],
         'user123',
         'session123'
       );
@@ -135,7 +135,7 @@ describe('updateHtmlFile', () => {
       require('crypto').createHash = mockHash;
     });
 
-    it('should require old_file_hash for full replacement', async () => {
+    it('should require old_content_hash for full replacement', async () => {
       const result = await (agentModeService as any).updateHtmlFile(
         'https://s3.amazonaws.com/bucket/file.html',
         'full',
@@ -145,14 +145,14 @@ describe('updateHtmlFile', () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.message).toContain('old_file_hash is required');
+      expect(result.message).toContain('old_content_hash is required');
     });
 
     it('should reject old_content when update_type is full', async () => {
       const result = await (agentModeService as any).updateHtmlFile(
         'https://s3.amazonaws.com/bucket/file.html',
         'full',
-        [{ old_file_hash: 'hash123', old_content: '<h1>Old</h1>', new_content: '<html>New</html>', expected_count: 1 }],
+        [{ old_content_hash: 'hash123', old_content: '<h1>Old</h1>', new_content: '<html>New</html>', expected_count: 1 }],
         'user123',
         'session123'
       );
@@ -165,7 +165,7 @@ describe('updateHtmlFile', () => {
       const result = await (agentModeService as any).updateHtmlFile(
         'https://s3.amazonaws.com/bucket/file.html',
         'full',
-        [{ old_file_hash: 'wrong-hash', new_content: '<html>New</html>', expected_count: 1 }],
+        [{ old_content_hash: 'wrong-hash', new_content: '<html>New</html>', expected_count: 1 }],
         'user123',
         'session123'
       );
@@ -178,21 +178,21 @@ describe('updateHtmlFile', () => {
       const result = await (agentModeService as any).updateHtmlFile(
         'https://s3.amazonaws.com/bucket/file.html',
         'full',
-        [{ old_file_hash: 'test-hash-123', new_content: '<html>New</html>', expected_count: 1 }],
+        [{ old_content_hash: 'test-hash-123', new_content: '<html>New</html>', expected_count: 1 }],
         'user123',
         'session123'
       );
 
       expect(result.success).toBe(true);
       expect(result.method).toBe('mixed_replacement');
-      expect(result.replacements[0].old_file_hash).toBe('test-hash-123');
+      expect(result.replacements[0].old_content_hash).toBe('test-hash-123');
     });
 
     it('should reject expected_count other than 1 for full replacement', async () => {
       const result = await (agentModeService as any).updateHtmlFile(
         'https://s3.amazonaws.com/bucket/file.html',
         'full',
-        [{ old_file_hash: 'test-hash-123', new_content: '<html>New</html>', expected_count: 2 }],
+        [{ old_content_hash: 'test-hash-123', new_content: '<html>New</html>', expected_count: 2 }],
         'user123',
         'session123'
       );
@@ -227,17 +227,17 @@ describe('updateHtmlFile', () => {
       expect(result.message).toContain('old_content is required');
     });
 
-    it('should reject old_file_hash when update_type is part', async () => {
+    it('should reject old_content_hash when update_type is part', async () => {
       const result = await (agentModeService as any).updateHtmlFile(
         'https://s3.amazonaws.com/bucket/file.html',
         'part',
-        [{ old_content: '<h1>Old</h1>', old_file_hash: 'hash123', new_content: '<h1>New</h1>', expected_count: 1 }],
+        [{ old_content: '<h1>Old</h1>', old_content_hash: 'hash123', new_content: '<h1>New</h1>', expected_count: 1 }],
         'user123',
         'session123'
       );
 
       expect(result.success).toBe(false);
-      expect(result.message).toContain('should not have old_file_hash when update_type="part"');
+      expect(result.message).toContain('should not have old_content_hash when update_type="part"');
     });
 
     it('should succeed when old_content is found for part replacement', async () => {

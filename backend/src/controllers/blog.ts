@@ -7,10 +7,7 @@ import OpenAI from "openai";
 import axios from "axios";
 import AWS from "aws-sdk";
 import { v4 as uuidv4 } from "uuid";
-import { remark } from 'remark';
-import remarkHtml from 'remark-html';
-import remarkGfm from 'remark-gfm';
-import remarkBreaks from 'remark-breaks';
+// remark and its plugins are ES modules, will be imported dynamically
 
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
@@ -171,9 +168,37 @@ export async function generateBlogContent(
   imagePrompt: string;
 }> {
   // Map desired length to a concrete target word count
-  const targetWordCounts: Record<string, number> = { short: 600, medium: 1000, long: 1600 };
+  const targetWordCounts: Record<string, number> = { short: 600, medium: 1000, long: 3000 };
   const targetWords = targetWordCounts[length] ?? 1000;
   const isLongForm = length === 'medium' || length === 'long';
+  
+  // Check if requirements specify a different word count and adjust
+  let finalTargetWords = targetWords;
+  if (requirements) {
+    const wordCountMatch = requirements.match(/(\d+)\+?\s*words?/i);
+    if (wordCountMatch) {
+      const specifiedWords = parseInt(wordCountMatch[1], 10);
+      if (specifiedWords > targetWords) {
+        finalTargetWords = specifiedWords;
+        console.log(`Adjusted target word count from ${targetWords} to ${finalTargetWords} based on requirements`);
+      }
+    }
+  }
+  
+  // Calculate maxTokens based on target word count (1 word ≈ 1.4 tokens, plus buffer for prompt)
+  // Add extra buffer to ensure we can generate the full content
+  // For long articles, we need significantly more tokens
+  const maxTokensMap: Record<string, number> = { 
+    short: 2000,   // 600 words * 1.4 ≈ 840 tokens + buffer
+    medium: 3500,  // 1000 words * 1.4 ≈ 1400 tokens + buffer
+    long: 8000     // 3000 words * 1.4 ≈ 4200 tokens + large buffer for comprehensive content
+  };
+  // If requirements specify higher word count, increase maxTokens proportionally
+  let maxTokens = maxTokensMap[length] ?? 3500;
+  if (finalTargetWords > targetWords) {
+    maxTokens = Math.ceil((finalTargetWords / targetWords) * maxTokens);
+    console.log(`Adjusted maxTokens from ${maxTokensMap[length]} to ${maxTokens} for ${finalTargetWords} words`);
+  }
 
   // Substack-style writing guidelines
   const substackGuidelines = style === 'substack' ? `
@@ -197,7 +222,7 @@ Substack-Style Writing Guidelines:
 
 Requirements:
 - Tone: ${tone} (be conversational but professional, avoid overly formal language)
-- Target length: approximately ${targetWords} words (±10%)
+- Target length: approximately ${finalTargetWords} words (±10%). CRITICAL: The content must be comprehensive and meet this word count. Do not stop early.
 - Keywords to naturally include: ${keywords || "relevant industry keywords"}
 ${substackGuidelines}
 
@@ -216,12 +241,12 @@ Content Guidelines:
     - Focus on readable, professional content that provides real value` : ''}
 
 Format the response as JSON with this structure:
-{
+{{
   "title": "Compelling, SEO-optimized title",
   "description": "1-2 sentence meta description for SEO",
   "content": "Full blog content in markdown format",
   "imagePrompt": "Detailed visual description for hero image (avoid text, be conceptual)"
-}`;
+}}`;
 
   // Add custom requirements if provided
   if (requirements) {
@@ -240,54 +265,50 @@ ${researchContext}`;
   }
 
   try {
-    const completion = await openai.chat.completions.create({
-      model: process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4",
-      messages: [
-        {
-          role: "system",
-          content: "You are a seasoned marketing strategist and content writer. Write naturally, avoid AI patterns, and focus on providing real value to startup founders. Never create tables - use bullet points, numbered lists, or paragraphs instead. Always respond with valid JSON.",
-        },
-        { role: "user", content: blogPrompt },
-      ],
-      temperature: 0.8,
-      max_tokens: 3000,
-    });
-
-    const responseContent = completion.choices[0].message.content;
-    if (!responseContent) {
-      throw new Error("No content generated from LLM");
-    }
-
-    // Parse the JSON response
-    let blogData;
+    // Get content model from settings
+    const { settingsService } = await import('../services/settingsService');
+    let contentModel: string | undefined;
     try {
-      const cleanedContent = responseContent.replace(/```json\s*|\s*```/g, "").trim();
-      blogData = JSON.parse(cleanedContent);
-    } catch (parseError) {
-      // Fallback: create a structured response from the raw content
-      blogData = {
-        title: `Insights on ${topic}`,
-        description: `Key insights and strategies for ${topic}, providing valuable information for readers.`,
-        content: `# Insights on ${topic}
-
-This article provides practical insights on ${topic}.
-
-## Key Takeaways
-
-- Understanding the fundamentals of ${topic}
-- Practical strategies for implementation
-- Common pitfalls to avoid
-
-## Conclusion
-
-This guide covers the essential aspects of ${topic} to help you get started.`,
-        imagePrompt: `A modern, professional business illustration representing ${topic}. Clean design with relevant visual elements, suitable for a business blog. No text, conceptual representation.`,
-      };
+      const setting = await settingsService.getSetting('agent_mode_content_model');
+      if (setting && setting.settingValue) {
+        contentModel = setting.settingValue;
+      }
+    } catch (error) {
+      console.error('Error getting content model setting:', error);
     }
+
+    // Use LangChain LLM service with dynamic maxTokens based on article length
+    const { createLLMService } = await import('../utils/llmService');
+    const modelName = contentModel || process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4';
+    console.log(`[generateBlogContent] Using model: ${modelName}, output format: JSON`);
+    const llmService = createLLMService(modelName, 0.8, maxTokens);
+    
+    const systemPrompt = `You are a seasoned marketing strategist and content writer. Write naturally, avoid AI patterns, and focus on providing real value to startup founders. Never create tables - use bullet points, numbered lists, or paragraphs instead. Always respond with valid JSON. 
+
+CRITICAL REQUIREMENT: The article content must be approximately ${finalTargetWords} words in length. This is a hard requirement. The content field in your JSON response must contain at least ${Math.floor(finalTargetWords * 0.9)} words. Write comprehensive, detailed content with multiple sections, examples, and actionable insights to meet this word count. Do not stop writing until you have reached the target word count.`;
+    
+    // Generate JSON content using LangChain
+    const blogData = await llmService.generateJSONContent<{
+      title: string;
+      description: string;
+      content: string;
+      imagePrompt: string;
+    }>(systemPrompt, blogPrompt);
 
     // Validate the response structure
     if (!blogData.title || !blogData.content) {
       throw new Error("LLM response missing required fields (title, content)");
+    }
+
+    // Validate word count
+    const actualWordCount = blogData.content.split(/\s+/).filter((word: string) => word.length > 0).length;
+    const minExpectedWords = Math.floor(finalTargetWords * 0.9);
+    
+    if (actualWordCount < minExpectedWords) {
+      console.warn(`⚠️ Generated article has only ${actualWordCount} words, but target was ${finalTargetWords} words (minimum: ${minExpectedWords} words). The content may have been truncated.`);
+      // Still return the data, but log the warning
+    } else {
+      console.log(`✅ Generated article has ${actualWordCount} words (target: ${finalTargetWords} words)`);
     }
 
     return blogData;
@@ -522,14 +543,20 @@ export async function generateBlogImage(
 
 
 // Utility function to generate HTML from blog content
-export function generateBlogHtml(
+export async function generateBlogHtml(
   title: string,
   description: string,
   content: string,
   imageUrl: string,
   style: string = 'default'
-): string {
+): Promise<string> {
   // Convert markdown content to HTML using remark with enhanced plugins
+  // Use dynamic import for ES modules
+  const { remark } = await import('remark');
+  const remarkHtml = (await import('remark-html')).default;
+  const remarkGfm = (await import('remark-gfm')).default;
+  const remarkBreaks = (await import('remark-breaks')).default;
+  
   const processor = remark()
     .use(remarkGfm) // GitHub Flavored Markdown support (tables, strikethrough, etc.)
     .use(remarkBreaks) // Convert line breaks to <br> tags
@@ -1104,6 +1131,12 @@ async function publishToWebflow(
   const { apiToken, siteId, collectionId, fieldMappings } = await getWebflowConfig(userId);
 
   // Convert markdown content to HTML
+  // Use dynamic import for ES modules
+  const { remark } = await import('remark');
+  const remarkHtml = (await import('remark-html')).default;
+  const remarkGfm = (await import('remark-gfm')).default;
+  const remarkBreaks = (await import('remark-breaks')).default;
+  
   const processor = remark()
     .use(remarkGfm)
     .use(remarkBreaks)
