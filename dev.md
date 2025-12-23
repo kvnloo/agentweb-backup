@@ -399,3 +399,6 @@ cd backend && npm list react react-dom
 
 ## Dec 15, 2025
 to support pdf file uploads for Knowledge Base, add OCR Parser for PDF file formats so that Vertex AI Search will uses this parser to parse PDF files.
+
+## Dec 23, 2025
+After resolving conflicts, we need to use force push to remote. On Github Desktop, instead of clicking on the pull and push button, we should select force push from it because otherwise a pull will happen again which will get the conflicts happen again.
