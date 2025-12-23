@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-23',
+    changes: [
+      'Improved Knowledge Base creation and editing',
+      '- File uploads now auto-upload on select during edit, and after save during creation',
+      '- Save is enabled when the knowledge base name changes, even if content stays the same',
+    ],
+  },
+  {
     date: '2025-12-22',
     changes: [
       'Added post-login redirect to return users to their intended destination',
