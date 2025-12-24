@@ -2586,6 +2586,53 @@ Use the available tools to create tasks in the agent-engine when complex work is
           postsCount: args.posts?.length || 0
         };
 
+      case 'perform_deep_research':
+        const mockMarkdownContent = `# ${args.topic}
+
+## Executive Summary
+
+This is a comprehensive research report on "${args.topic}". The research was conducted with ${args.depth || 'detailed'} depth and ${args.tone || 'professional'} tone.
+
+## Key Findings
+
+- Finding 1: Important insight about ${args.topic}
+- Finding 2: Market trends and analysis
+- Finding 3: Implementation considerations
+- Finding 4: ROI and business impact
+- Finding 5: Future outlook and recommendations
+
+## Market Analysis
+
+The market for ${args.topic} is growing rapidly. Organizations are increasingly adopting these solutions to improve efficiency and competitive advantage.
+
+## Implementation Strategies
+
+Successful implementation requires careful planning, stakeholder alignment, and phased rollout approaches.
+
+## Conclusion
+
+${args.topic} represents a significant opportunity for organizations seeking to modernize their operations and drive growth.
+`;
+        return {
+          success: true,
+          message: `Deep research completed successfully. Generated ${mockMarkdownContent.split(/\s+/).length} words of content.`,
+          data: {
+            markdown_content: mockMarkdownContent,
+            title: args.topic,
+            summary: `Comprehensive research on "${args.topic}" covering market analysis, implementation strategies, and key recommendations.`,
+            key_findings: [
+              `Important insight about ${args.topic}`,
+              'Market trends and analysis',
+              'Implementation considerations',
+              'ROI and business impact',
+              'Future outlook and recommendations'
+            ],
+            word_count: mockMarkdownContent.split(/\s+/).length,
+            research_depth: args.depth || 'detailed',
+            topic: args.topic
+          }
+        };
+
       case 'save_file':
         return {
           success: true,
