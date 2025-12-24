@@ -140,6 +140,17 @@ describe('SSE Progress Utility', () => {
       // Progress should remain available for reconnecting clients
       expect(getLatestProgress(sessionId)).toBeDefined();
     });
+
+    it('should preserve progress after cleanup for later reads', () => {
+      const callback = jest.fn();
+      const cleanup = registerProgressCallback(sessionId, callback);
+
+      emitProgress(sessionId, mockProgress);
+      cleanup();
+
+      const stored = getLatestProgress(sessionId);
+      expect(stored).toEqual(mockProgress);
+    });
   });
 
   describe('getLatestProgress', () => {
