@@ -137,7 +137,8 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.status(200).json({ status: "healthy" });
+  const version = require('../package.json').version;
+  res.status(200).json({ status: "healthy", version });
 });
 
 export default app;
