@@ -360,85 +360,90 @@ async function createPdfBuffer(
           const coverTop = doc.page.margins.top;
           const coverWidth =
             doc.page.width - doc.page.margins.left - doc.page.margins.right;
-          let y = coverTop;
 
           if (coverImageBuffer) {
             try {
-              const bannerHeight = 160;
-              doc.image(coverImageBuffer, coverLeft, y, {
-                fit: [coverWidth, bannerHeight],
+              doc.image(coverImageBuffer, coverLeft, coverTop, {
+                fit: [
+                  doc.page.width - (doc.page.margins.left + doc.page.margins.right),
+                  doc.page.height - (doc.page.margins.top + doc.page.margins.bottom),
+                ],
                 align: "center",
                 valign: "center",
               });
-              y += bannerHeight + 20;
+              markPageUsed();
             } catch (err) {
-              console.warn("Failed to render cover image for whitepaper", err);
+              console.warn("Failed to render cover image for whitepaper, falling back to text", err);
+              doc.text(book.title || "Untitled", { align: "center", underline: true });
+              doc.moveDown(0.6);
+              doc.text(`Author: ${book.author || "Unknown"}`, { align: "center" });
             }
-          }
-
-          doc
-            .font(labelFont)
-            .fontSize(12)
-            .fillColor(theme.mutedColor)
-            .text(isChinese ? "白皮书" : "WHITE PAPER", coverLeft, y, {
-              width: coverWidth,
-            });
-          y = doc.y + 16;
-
-          doc
-            .font(headingFont)
-            .fontSize(Math.max(fontSize + 16, 26))
-            .fillColor(theme.textColor)
-            .text(book.title || "Untitled", coverLeft, y, {
-              width: coverWidth,
-            });
-          y = doc.y + 14;
-
-          if (book.description) {
+          } else {
+            let y = coverTop;
             doc
-              .font(bodyFont)
-              .fontSize(fontSize + 1)
+              .font(labelFont)
+              .fontSize(12)
               .fillColor(theme.mutedColor)
-              .text(book.description, coverLeft, y, {
+              .text(isChinese ? "白皮书" : "WHITE PAPER", coverLeft, y, {
                 width: coverWidth,
               });
-            y = doc.y + 18;
+            y = doc.y + 16;
+
+            doc
+              .font(headingFont)
+              .fontSize(Math.max(fontSize + 16, 26))
+              .fillColor(theme.textColor)
+              .text(book.title || "Untitled", coverLeft, y, {
+                width: coverWidth,
+              });
+            y = doc.y + 14;
+
+            if (book.description) {
+              doc
+                .font(bodyFont)
+                .fontSize(fontSize + 1)
+                .fillColor(theme.mutedColor)
+                .text(book.description, coverLeft, y, {
+                  width: coverWidth,
+                });
+              y = doc.y + 18;
+            }
+
+            doc
+              .font(bodyFont)
+              .fontSize(fontSize)
+              .fillColor(theme.textColor)
+              .text(isChinese ? `作者: ${book.author || "Unknown"}` : `Author: ${book.author || "Unknown"}`, coverLeft, y, {
+                width: coverWidth,
+              });
+            y = doc.y + 6;
+
+            const locale = isChinese ? "zh-CN" : "en-US";
+            const dateLabel = new Date().toLocaleDateString(locale, {
+              year: "numeric",
+              month: "long",
+              day: "numeric",
+            });
+            doc
+              .font(bodyFont)
+              .fontSize(fontSize)
+              .fillColor(theme.mutedColor)
+              .text(isChinese ? `日期: ${dateLabel}` : `Date: ${dateLabel}`, coverLeft, y, {
+                width: coverWidth,
+              });
+
+            doc.save();
+            const lineY = doc.page.height - doc.page.margins.bottom - 36;
+            doc
+              .moveTo(coverLeft, lineY)
+              .lineTo(coverLeft + coverWidth * 0.4, lineY)
+              .lineWidth(2)
+              .strokeColor(theme.accentColor)
+              .stroke();
+            doc.restore();
+            doc.fillColor(theme.textColor).font(bodyFont).fontSize(fontSize);
+            markPageUsed();
           }
-
-          doc
-            .font(bodyFont)
-            .fontSize(fontSize)
-            .fillColor(theme.textColor)
-            .text(isChinese ? `作者: ${book.author || "Unknown"}` : `Author: ${book.author || "Unknown"}`, coverLeft, y, {
-              width: coverWidth,
-            });
-          y = doc.y + 6;
-
-          const locale = isChinese ? "zh-CN" : "en-US";
-          const dateLabel = new Date().toLocaleDateString(locale, {
-            year: "numeric",
-            month: "long",
-            day: "numeric",
-          });
-          doc
-            .font(bodyFont)
-            .fontSize(fontSize)
-            .fillColor(theme.mutedColor)
-            .text(isChinese ? `日期: ${dateLabel}` : `Date: ${dateLabel}`, coverLeft, y, {
-              width: coverWidth,
-            });
-
-          doc.save();
-          const lineY = doc.page.height - doc.page.margins.bottom - 36;
-          doc
-            .moveTo(coverLeft, lineY)
-            .lineTo(coverLeft + coverWidth * 0.4, lineY)
-            .lineWidth(2)
-            .strokeColor(theme.accentColor)
-            .stroke();
-          doc.restore();
-          doc.fillColor(theme.textColor).font(bodyFont).fontSize(fontSize);
-          markPageUsed();
         } else if (coverImageBuffer) {
           try {
             doc.image(coverImageBuffer, {
@@ -449,6 +454,7 @@ async function createPdfBuffer(
               align: "center",
               valign: "center",
             });
+            markPageUsed();
           } catch (err) {
             console.warn("Failed to render cover image, falling back to text cover", err);
             doc.text(book.title || "Untitled", { align: "center", underline: true });
