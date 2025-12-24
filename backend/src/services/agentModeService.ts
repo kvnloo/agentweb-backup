@@ -8041,7 +8041,13 @@ ${emailDraftFormat === 'text'
       // COMMON: Build HTML and Upload to S3
       // ========================================
       console.log('AgentMode: Generating HTML file with style:', style);
-      const htmlContent = generateBlogHtml(blogData.title, blogData.description, finalContent, heroImageUrl, style);
+      const htmlContent = await generateBlogHtml(
+        blogData.title,
+        blogData.description,
+        finalContent,
+        heroImageUrl,
+        style
+      );
       console.log('AgentMode: Uploading HTML file to S3...');
       const htmlFilename = `blog-${Date.now()}.html`;
 
@@ -10526,9 +10532,9 @@ IMPORTANT:
 - XML handles quotes and special characters naturally - you do NOT need to escape quotes
 - The content can contain any Chinese characters, quotes, or special characters without escaping
 - Return ONLY the XML structure above, nothing else` : `Format your response as JSON with this structure:
-{
+{{
   "content": "Full content in markdown format. Do not include a title in the content (the title is already provided above). Start directly with the main content."
-}
+}}
 
 IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly.`}`;
       
