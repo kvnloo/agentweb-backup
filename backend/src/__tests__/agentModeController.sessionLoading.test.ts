@@ -1,5 +1,6 @@
 import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
+import { progressStore } from '../utils/sseProgress';
 
 // Mock dependencies
 jest.mock('../services/chatbotService', () => ({
@@ -48,6 +49,7 @@ describe('Agent Mode Controller - Session Loading', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    progressStore.clear();
   });
 
   describe('getSession', () => {
@@ -69,8 +71,25 @@ describe('Agent Mode Controller - Session Loading', () => {
           { role: 'assistant', content: 'Hi there!' }
         ],
         createdAt: '2024-01-01T00:00:00Z',
-        updatedAt: '2024-01-01T00:00:00Z'
+        updatedAt: '2024-01-01T00:00:00Z',
+        hasActiveProgress: false
       });
+    });
+
+    it('should mark session as active when progress exists', async () => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      progressStore.set('session-123', { iteration: 1, status: 'thinking' });
+
+      const req = mockRequest(mockUser, 'session-123');
+      const res = mockResponse();
+
+      await agentModeController.getSession(req, res);
+
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          hasActiveProgress: true
+        })
+      );
     });
 
     it('should return unfiltered session for admin user', async () => {
@@ -82,7 +101,10 @@ describe('Agent Mode Controller - Session Loading', () => {
       await agentModeController.getSession(req, res);
 
       expect(chatbotDb.getChatSession).toHaveBeenCalledWith('session-123');
-      expect(res.json).toHaveBeenCalledWith(mockSession);
+      expect(res.json).toHaveBeenCalledWith({
+        ...mockSession,
+        hasActiveProgress: false
+      });
     });
 
     it('should return 404 when session not found', async () => {
@@ -125,7 +147,10 @@ describe('Agent Mode Controller - Session Loading', () => {
 
       await agentModeController.getSession(req, res);
 
-      expect(res.json).toHaveBeenCalledWith(otherUserSession);
+      expect(res.json).toHaveBeenCalledWith({
+        ...otherUserSession,
+        hasActiveProgress: false
+      });
     });
 
     it('should filter out tool messages correctly', async () => {
@@ -159,7 +184,8 @@ describe('Agent Mode Controller - Session Loading', () => {
           { role: 'assistant', content: 'Clean response' }
         ],
         createdAt: '2024-01-01T00:00:00Z',
-        updatedAt: '2024-01-01T00:00:00Z'
+        updatedAt: '2024-01-01T00:00:00Z',
+        hasActiveProgress: false
       });
     });
 
@@ -193,7 +219,8 @@ describe('Agent Mode Controller - Session Loading', () => {
         title: 'Test Session',
         messages: [],
         createdAt: '2024-01-01T00:00:00Z',
-        updatedAt: '2024-01-01T00:00:00Z'
+        updatedAt: '2024-01-01T00:00:00Z',
+        hasActiveProgress: false
       });
     });
   });

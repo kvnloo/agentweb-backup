@@ -811,6 +811,12 @@ function setupSSEConnectionForSession(sessionId: string, res: Response, req: Req
   }
 }
 
+function hasActiveProgress(sessionId: string): boolean {
+  const latestProgress = getLatestProgress(sessionId);
+  if (!latestProgress) return false;
+  return latestProgress.status !== 'complete';
+}
+
 // Common function to generate AI response for a session
 // Always uses worker process to prevent blocking the main event loop
 async function generateSessionResponse(
@@ -1046,10 +1052,11 @@ export const agentModeController = {
       if (!session) {
         return res.status(404).json({ error: 'Session not found' });
       }
+      const progressActive = hasActiveProgress(session.sessionId);
 
       // Allow admin users to access any session for benchmark creation
       if (user && user.isAdmin) {
-        return res.json(session);
+        return res.json({ ...session, hasActiveProgress: progressActive });
       }
 
       // For non-admin users, check if they own the session
@@ -1062,7 +1069,8 @@ export const agentModeController = {
       // Filter out tool messages and assistant messages with tool calls for user display
       const filteredSession = {
         ...session,
-        messages: filterMessagesForClient(session.messages)
+        messages: filterMessagesForClient(session.messages),
+        hasActiveProgress: progressActive
       };
 
       res.json(filteredSession);
@@ -1453,7 +1461,8 @@ export const agentModeController = {
           interactiveShareMetadata: session.interactiveShareMetadata,
           workPlan: session.workPlan,
           llmModel: modelToUse,
-          isConversable: !!conversable
+          isConversable: !!conversable,
+          hasActiveProgress: hasActiveProgress(session.sessionId)
         }
       });
     } catch (error) {
