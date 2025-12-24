@@ -242,7 +242,8 @@ async function createPdfBuffer(
           ? exportConfig.lineHeight
           : 1.5;
       const includeCover = true; // always include cover page
-      const includeTableOfContents = exportConfig?.includeTableOfContents !== false;
+      const includeTableOfContents =
+        book.type === "whitepaper" ? false : exportConfig?.includeTableOfContents !== false;
 
       const doc = new PDFDocument({
         size: pageSize,
@@ -265,18 +266,82 @@ async function createPdfBuffer(
         }
       });
 
+      const isChinese = isChineseLanguage(book.language);
       const requestedFont = (exportConfig?.fontFamily as string) || "";
       const matchedFont = availableFonts.find((f) => f.name === requestedFont);
-      doc.font(matchedFont ? matchedFont.name : "Helvetica");
+      const bodyFont = matchedFont ? matchedFont.name : "Helvetica";
+      const headingFont =
+        !isChinese && !matchedFont ? "Helvetica-Bold" : bodyFont;
+      const labelFont = headingFont;
+
+      const isWhitepaper = book.type === "whitepaper";
+      const theme = isWhitepaper
+        ? {
+            textColor: "#111827",
+            mutedColor: "#6B7280",
+            accentColor: "#0F172A",
+          }
+        : {
+            textColor: "black",
+            mutedColor: "black",
+            accentColor: "black",
+          };
+
+      doc.font(bodyFont);
       doc.fontSize(fontSize);
+      doc.fillColor(theme.textColor);
 
-      const isChinese = isChineseLanguage(book.language);
+      let pageNumber = 0;
+      const headerTitle = book.title || "Untitled";
+      const applyPageDecorations = (options?: { skipHeader?: boolean }) => {
+        if (!isWhitepaper || options?.skipHeader) return;
+        pageNumber += 1;
+        const headerY = Math.max(16, doc.page.margins.top - 24);
+        const footerY = doc.page.height - doc.page.margins.bottom + 12;
+        const pageWidth =
+          doc.page.width - doc.page.margins.left - doc.page.margins.right;
+        const currentY = doc.y;
+        const currentX = doc.x;
 
-      const applyPageDecorations = () => {
-        // No headers/footers or page numbers per latest requirements
+        doc.save();
+        doc
+          .font(bodyFont)
+          .fontSize(9)
+          .fillColor(theme.mutedColor)
+          .text(headerTitle, doc.page.margins.left, headerY, {
+            width: pageWidth,
+            align: "left",
+          })
+          .text(String(pageNumber), doc.page.margins.left, headerY, {
+            width: pageWidth,
+            align: "right",
+          });
+        doc
+          .moveTo(doc.page.margins.left, headerY + 12)
+          .lineTo(doc.page.margins.left + pageWidth, headerY + 12)
+          .lineWidth(0.5)
+          .strokeColor("#E5E7EB")
+          .stroke();
+        doc
+          .font(bodyFont)
+          .fontSize(9)
+          .fillColor(theme.mutedColor)
+          .text(isChinese ? "白皮书" : "White Paper", doc.page.margins.left, footerY, {
+            width: pageWidth,
+            align: "left",
+          })
+          .text(headerTitle, doc.page.margins.left, footerY, {
+            width: pageWidth,
+            align: "right",
+          });
+        doc.restore();
+        doc.y = currentY;
+        doc.x = currentX;
+        doc.fillColor(theme.textColor);
+        doc.font(bodyFont).fontSize(fontSize);
       };
 
-      applyPageDecorations();
+      applyPageDecorations({ skipHeader: isWhitepaper && includeCover });
 
       const sortedSections =
         book.sections && book.sections.length > 0
@@ -286,7 +351,92 @@ async function createPdfBuffer(
       // Cover page (always included)
       if (includeCover) {
         const coverImageBuffer = await fetchImageBuffer(book.coverImageUrl);
-        if (coverImageBuffer) {
+        if (isWhitepaper) {
+          const coverLeft = doc.page.margins.left;
+          const coverTop = doc.page.margins.top;
+          const coverWidth =
+            doc.page.width - doc.page.margins.left - doc.page.margins.right;
+          let y = coverTop;
+
+          if (coverImageBuffer) {
+            try {
+              const bannerHeight = 160;
+              doc.image(coverImageBuffer, coverLeft, y, {
+                fit: [coverWidth, bannerHeight],
+                align: "center",
+                valign: "center",
+              });
+              y += bannerHeight + 20;
+            } catch (err) {
+              console.warn("Failed to render cover image for whitepaper", err);
+            }
+          }
+
+          doc
+            .font(labelFont)
+            .fontSize(12)
+            .fillColor(theme.mutedColor);
+          doc.characterSpacing(1.5);
+          doc.text(isChinese ? "白皮书" : "WHITE PAPER", coverLeft, y, {
+            width: coverWidth,
+          });
+          doc.characterSpacing(0);
+          y = doc.y + 16;
+
+          doc
+            .font(headingFont)
+            .fontSize(Math.max(fontSize + 16, 26))
+            .fillColor(theme.textColor)
+            .text(book.title || "Untitled", coverLeft, y, {
+              width: coverWidth,
+            });
+          y = doc.y + 14;
+
+          if (book.description) {
+            doc
+              .font(bodyFont)
+              .fontSize(fontSize + 1)
+              .fillColor(theme.mutedColor)
+              .text(book.description, coverLeft, y, {
+                width: coverWidth,
+              });
+            y = doc.y + 18;
+          }
+
+          doc
+            .font(bodyFont)
+            .fontSize(fontSize)
+            .fillColor(theme.textColor)
+            .text(isChinese ? `作者: ${book.author || "Unknown"}` : `Author: ${book.author || "Unknown"}`, coverLeft, y, {
+              width: coverWidth,
+            });
+          y = doc.y + 6;
+
+          const locale = isChinese ? "zh-CN" : "en-US";
+          const dateLabel = new Date().toLocaleDateString(locale, {
+            year: "numeric",
+            month: "long",
+            day: "numeric",
+          });
+          doc
+            .font(bodyFont)
+            .fontSize(fontSize)
+            .fillColor(theme.mutedColor)
+            .text(isChinese ? `日期: ${dateLabel}` : `Date: ${dateLabel}`, coverLeft, y, {
+              width: coverWidth,
+            });
+
+          doc.save();
+          const lineY = doc.page.height - doc.page.margins.bottom - 36;
+          doc
+            .moveTo(coverLeft, lineY)
+            .lineTo(coverLeft + coverWidth * 0.4, lineY)
+            .lineWidth(2)
+            .strokeColor(theme.accentColor)
+            .stroke();
+          doc.restore();
+          doc.fillColor(theme.textColor).font(bodyFont).fontSize(fontSize);
+        } else if (coverImageBuffer) {
           try {
             doc.image(coverImageBuffer, {
               fit: [
@@ -321,23 +471,37 @@ async function createPdfBuffer(
 
       // Table of Contents (optional)
       if (includeTableOfContents && sortedSections.length > 0) {
-        doc.fontSize(fontSize + 2).text(isChinese ? "目录" : "Table of Contents", {
-          align: "center",
-        });
+        doc
+          .font(headingFont)
+          .fontSize(isWhitepaper ? fontSize + 6 : fontSize + 2)
+          .fillColor(theme.textColor)
+          .text(isChinese ? "目录" : isWhitepaper ? "Contents" : "Table of Contents", {
+            align: isWhitepaper ? "left" : "center",
+          });
         doc.moveDown(0.8);
         sortedSections.forEach((section, sIdx) => {
           const label = isChinese
             ? sIdx === 0
               ? `${section.title}`
               : `第${toChineseNumeral(sIdx)}章 ${section.title}`
-            : `Section ${sIdx + 1}: ${section.title}`;
-          doc.fontSize(fontSize).text(label, { lineGap: (lineHeight - 1) * fontSize });
+            : isWhitepaper
+              ? `${section.title}`
+              : `Section ${sIdx + 1}: ${section.title}`;
+          doc
+            .font(bodyFont)
+            .fontSize(fontSize)
+            .fillColor(theme.textColor)
+            .text(label, { lineGap: (lineHeight - 1) * fontSize });
           doc.moveDown(0.2);
           if (section.description) {
-            doc.fontSize(Math.max(fontSize - 1, 8)).text(section.description, {
-              indent: 8,
-              lineGap: (lineHeight - 1) * (fontSize - 1),
-            });
+            doc
+              .font(bodyFont)
+              .fontSize(Math.max(fontSize - 1, 8))
+              .fillColor(theme.mutedColor)
+              .text(section.description, {
+                indent: 8,
+                lineGap: (lineHeight - 1) * (fontSize - 1),
+              });
             doc.moveDown(0.2);
           }
           if (section.chapters?.length) {
@@ -347,13 +511,19 @@ async function createPdfBuffer(
                 const chapterLabel = isChinese
                   ? `${chapter.title}`
                   : `- ${chapter.title}`;
-                doc.fontSize(fontSize - 1).text(chapterLabel, {
-                  indent: 12,
-                  lineGap: (lineHeight - 1) * (fontSize - 1),
-                });
+                doc
+                  .font(bodyFont)
+                  .fontSize(fontSize - 1)
+                  .fillColor(theme.mutedColor)
+                  .text(chapterLabel, {
+                    indent: 12,
+                    lineGap: (lineHeight - 1) * (fontSize - 1),
+                  });
                 if (chapter.description) {
                   doc
+                    .font(bodyFont)
                     .fontSize(Math.max(fontSize - 2, 8))
+                    .fillColor(theme.mutedColor)
                     .text(chapter.description, {
                       indent: 20,
                       lineGap: (lineHeight - 1) * (fontSize - 2),
@@ -378,73 +548,146 @@ async function createPdfBuffer(
 
       const renderContentText = async (text: string) => {
         if (!text) return;
-        await renderMarkdownToPdf(doc, text, fontSize, lineHeight);
+        await renderMarkdownToPdf(doc, text, fontSize, lineHeight, {
+          bodyFont,
+          headingFont,
+          strongFont: headingFont,
+          textColor: theme.textColor,
+          headingColor: theme.accentColor,
+        });
         doc.moveDown();
       };
 
       if (sortedSections.length > 0) {
-        let firstSectionPageReady = !(includeCover || includeTableOfContents);
-        for (let sIdx = 0; sIdx < sortedSections.length; sIdx++) {
-          const section = sortedSections[sIdx];
-          const sectionLabel = isChinese
-            ? sIdx === 0
-              ? `${section.title}`
-              : `第${toChineseNumeral(sIdx)}章 ${section.title}`
-            : `Section ${sIdx + 1}: ${section.title}`;
+        if (isWhitepaper) {
+          for (let sIdx = 0; sIdx < sortedSections.length; sIdx++) {
+            const section = sortedSections[sIdx];
+            if (sIdx > 0) {
+              doc.addPage();
+              applyPageDecorations();
+            }
+            const sectionLabel = isChinese
+              ? sIdx === 0
+                ? `${section.title}`
+                : `第${toChineseNumeral(sIdx)}章 ${section.title}`
+              : `${section.title}`;
 
-          const sectionTitleFontSize = Math.max(fontSize * 2, fontSize + 10);
+            doc
+              .font(headingFont)
+              .fontSize(fontSize + 6)
+              .fillColor(theme.accentColor)
+              .text(sectionLabel);
+            doc.moveDown(0.4);
+            doc.font(bodyFont).fontSize(fontSize).fillColor(theme.textColor);
 
-          // Section title page (dedicated)
-          if (!firstSectionPageReady) {
-            doc.addPage();
-            applyPageDecorations();
-            firstSectionPageReady = true;
-          } else {
-            doc.addPage();
-            applyPageDecorations();
-          }
-          // Center the section title vertically and horizontally
-          const titleY =
-            doc.page.height / 2 -
-            sectionTitleFontSize / 2 -
-            (lineHeight - 1) * sectionTitleFontSize;
-          const pageMarginLeft = doc.page.margins.left || 0;
-          const pageMarginRight = doc.page.margins.right || 0;
-          const usableWidth = doc.page.width - (pageMarginLeft + pageMarginRight);
-          doc.fontSize(sectionTitleFontSize).text(sectionLabel, pageMarginLeft, titleY, {
-            align: "center",
-            width: usableWidth,
-            underline: true,
-          });
-          doc.moveDown(2);
-
-          // Section body page
-          doc.addPage();
-          applyPageDecorations();
-
-          const sectionContent = contentLookup.get(`${section.sectionId}::`);
-          if (sectionContent) {
-            await renderContentText(sectionContent);
-          } else {
-            doc.moveDown();
-          }
-
-          if (section.chapters && section.chapters.length > 0) {
-            const sortedChapters = [...section.chapters].sort((a, b) => a.order - b.order);
-            for (let cIdx = 0; cIdx < sortedChapters.length; cIdx++) {
-              const chapter = sortedChapters[cIdx];
-              const chapterLabel = isChinese
-                ? `${chapter.title}`
-                : `Chapter ${cIdx + 1}: ${chapter.title}`;
-              doc.fontSize(fontSize + 1).text(chapterLabel);
+            if (section.description) {
+              doc
+                .font(bodyFont)
+                .fontSize(Math.max(fontSize - 1, 9))
+                .fillColor(theme.mutedColor)
+                .text(section.description, {
+                  lineGap: (lineHeight - 1) * (fontSize - 1),
+                });
               doc.moveDown(0.6);
-              const chapterContent = contentLookup.get(
-                `${section.sectionId}::${chapter.chapterId}`
-              );
-              if (chapterContent) {
-                await renderContentText(chapterContent);
-              } else {
-                doc.moveDown();
+              doc.fillColor(theme.textColor).fontSize(fontSize);
+            }
+
+            const sectionContent = contentLookup.get(`${section.sectionId}::`);
+            if (sectionContent) {
+              await renderContentText(sectionContent);
+            } else {
+              doc.moveDown();
+            }
+
+            if (section.chapters && section.chapters.length > 0) {
+              const sortedChapters = [...section.chapters].sort((a, b) => a.order - b.order);
+              for (let cIdx = 0; cIdx < sortedChapters.length; cIdx++) {
+                const chapter = sortedChapters[cIdx];
+                const chapterLabel = isChinese
+                  ? `${chapter.title}`
+                  : `${chapter.title}`;
+                doc
+                  .font(headingFont)
+                  .fontSize(fontSize + 2)
+                  .fillColor(theme.textColor)
+                  .text(chapterLabel);
+                doc.moveDown(0.4);
+                doc.font(bodyFont).fontSize(fontSize).fillColor(theme.textColor);
+                const chapterContent = contentLookup.get(
+                  `${section.sectionId}::${chapter.chapterId}`
+                );
+                if (chapterContent) {
+                  await renderContentText(chapterContent);
+                } else {
+                  doc.moveDown();
+                }
+              }
+            }
+          }
+        } else {
+          let firstSectionPageReady = !(includeCover || includeTableOfContents);
+          for (let sIdx = 0; sIdx < sortedSections.length; sIdx++) {
+            const section = sortedSections[sIdx];
+            const sectionLabel = isChinese
+              ? sIdx === 0
+                ? `${section.title}`
+                : `第${toChineseNumeral(sIdx)}章 ${section.title}`
+              : `Section ${sIdx + 1}: ${section.title}`;
+
+            const sectionTitleFontSize = Math.max(fontSize * 2, fontSize + 10);
+
+            // Section title page (dedicated)
+            if (!firstSectionPageReady) {
+              doc.addPage();
+              applyPageDecorations();
+              firstSectionPageReady = true;
+            } else {
+              doc.addPage();
+              applyPageDecorations();
+            }
+            // Center the section title vertically and horizontally
+            const titleY =
+              doc.page.height / 2 -
+              sectionTitleFontSize / 2 -
+              (lineHeight - 1) * sectionTitleFontSize;
+            const pageMarginLeft = doc.page.margins.left || 0;
+            const pageMarginRight = doc.page.margins.right || 0;
+            const usableWidth = doc.page.width - (pageMarginLeft + pageMarginRight);
+            doc.fontSize(sectionTitleFontSize).text(sectionLabel, pageMarginLeft, titleY, {
+              align: "center",
+              width: usableWidth,
+              underline: true,
+            });
+            doc.moveDown(2);
+
+            // Section body page
+            doc.addPage();
+            applyPageDecorations();
+
+            const sectionContent = contentLookup.get(`${section.sectionId}::`);
+            if (sectionContent) {
+              await renderContentText(sectionContent);
+            } else {
+              doc.moveDown();
+            }
+
+            if (section.chapters && section.chapters.length > 0) {
+              const sortedChapters = [...section.chapters].sort((a, b) => a.order - b.order);
+              for (let cIdx = 0; cIdx < sortedChapters.length; cIdx++) {
+                const chapter = sortedChapters[cIdx];
+                const chapterLabel = isChinese
+                  ? `${chapter.title}`
+                  : `Chapter ${cIdx + 1}: ${chapter.title}`;
+                doc.fontSize(fontSize + 1).text(chapterLabel);
+                doc.moveDown(0.6);
+                const chapterContent = contentLookup.get(
+                  `${section.sectionId}::${chapter.chapterId}`
+                );
+                if (chapterContent) {
+                  await renderContentText(chapterContent);
+                } else {
+                  doc.moveDown();
+                }
               }
             }
           }
@@ -572,17 +815,117 @@ async function renderMarkdownToPdf(
   doc: PDFKit.PDFDocument,
   markdown: string,
   baseFontSize: number,
-  lineHeight: number
+  lineHeight: number,
+  theme?: {
+    bodyFont?: string;
+    headingFont?: string;
+    strongFont?: string;
+    textColor?: string;
+    headingColor?: string;
+  }
 ) {
   const { marked } = await getMarked();
   const tokens = marked.lexer(markdown || "");
   const lineGap = (lineHeight - 1) * baseFontSize;
   const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+  const bodyFont = theme?.bodyFont;
+  const headingFont = theme?.headingFont || bodyFont;
+  const strongFont = theme?.strongFont || headingFont || bodyFont;
+  const textColor = theme?.textColor;
+  const headingColor = theme?.headingColor || textColor;
+
+  const renderInlineTokens = (
+    inlineTokens: any[],
+    finalizeLine: boolean = true,
+    layout?: { startX?: number; startY?: number; width?: number },
+    state?: { first: boolean }
+  ) => {
+    const renderState = state ?? { first: true };
+    const writeText = (text: string, continued: boolean) => {
+      const options: PDFKit.Mixins.TextOptions = { lineGap, continued };
+      if (layout?.width !== undefined) {
+        options.width = layout.width;
+      }
+      if (renderState.first && layout?.startX !== undefined && layout?.startY !== undefined) {
+        doc.text(text, layout.startX, layout.startY, options);
+        renderState.first = false;
+        return;
+      }
+      doc.text(text, options);
+      renderState.first = false;
+    };
+
+    inlineTokens.forEach((inlineToken, idx) => {
+      const isLast = idx === inlineTokens.length - 1;
+      const continued = !(finalizeLine && isLast);
+      switch (inlineToken.type) {
+        case "strong":
+          if (strongFont) {
+            doc.font(strongFont);
+          }
+          if (inlineToken.tokens && Array.isArray(inlineToken.tokens)) {
+            renderInlineTokens(inlineToken.tokens, false, layout, renderState);
+          } else if (inlineToken.text) {
+            writeText(inlineToken.text, continued);
+          }
+          if (bodyFont) {
+            doc.font(bodyFont);
+          }
+          break;
+        case "em":
+          if (bodyFont) {
+            doc.font(bodyFont);
+          }
+          if (inlineToken.tokens && Array.isArray(inlineToken.tokens)) {
+            renderInlineTokens(inlineToken.tokens, false, layout, renderState);
+          } else if (inlineToken.text) {
+            writeText(inlineToken.text, continued);
+          }
+          break;
+        case "link":
+          if (bodyFont) {
+            doc.font(bodyFont);
+          }
+          if (inlineToken.text) {
+            writeText(inlineToken.text, continued);
+          }
+          break;
+        case "codespan":
+          if (bodyFont) {
+            doc.font(bodyFont);
+          }
+          if (inlineToken.text) {
+            writeText(inlineToken.text, continued);
+          }
+          break;
+        case "br":
+          writeText("", continued);
+          break;
+        default:
+          if (bodyFont) {
+            doc.font(bodyFont);
+          }
+          if (inlineToken.text) {
+            writeText(inlineToken.text, continued);
+          }
+          break;
+      }
+      if (finalizeLine && isLast) {
+        doc.text("", { continued: false });
+      }
+    });
+  };
 
   // Debug: log token types to understand structure
   // console.log("Tokens:", tokens.map((t: any) => ({ type: t.type, hasTokens: !!t.tokens, text: t.text?.substring(0, 50) })));
 
   // Process tokens and handle images
+  if (bodyFont) {
+    doc.font(bodyFont);
+  }
+  if (textColor) {
+    doc.fillColor(textColor);
+  }
   for (const token of tokens) {
     switch (token.type) {
       case "heading": {
@@ -600,8 +943,20 @@ async function renderMarkdownToPdf(
           }
         }
         const size = baseFontSize + Math.max(0, 4 - (headingToken as any).depth);
+        if (headingFont) {
+          doc.font(headingFont);
+        }
+        if (headingColor) {
+          doc.fillColor(headingColor);
+        }
         doc.fontSize(size).text((headingToken as any).text, { lineGap });
         doc.moveDown(0.3);
+        if (bodyFont) {
+          doc.font(bodyFont);
+        }
+        if (textColor) {
+          doc.fillColor(textColor);
+        }
         doc.fontSize(baseFontSize);
         break;
       }
@@ -630,7 +985,22 @@ async function renderMarkdownToPdf(
                 const addSpacing = !(isImageOnly && i === 0);
                 await renderImageInPdf(doc, imageUrl, altText, pageWidth, baseFontSize, lineGap, addSpacing);
               }
+            } else if (subToken.tokens && Array.isArray(subToken.tokens)) {
+              if (bodyFont) {
+                doc.font(bodyFont);
+              }
+              if (textColor) {
+                doc.fillColor(textColor);
+              }
+              doc.fontSize(baseFontSize);
+              renderInlineTokens(subToken.tokens);
             } else if (subToken.text && subToken.text.trim()) {
+              if (bodyFont) {
+                doc.font(bodyFont);
+              }
+              if (textColor) {
+                doc.fillColor(textColor);
+              }
               doc.fontSize(baseFontSize).text(subToken.text, { lineGap });
             }
           }
@@ -642,8 +1012,24 @@ async function renderMarkdownToPdf(
               doc.moveDown(0.5);
             }
           }
+        } else if (paraToken.tokens && Array.isArray(paraToken.tokens)) {
+          if (bodyFont) {
+            doc.font(bodyFont);
+          }
+          if (textColor) {
+            doc.fillColor(textColor);
+          }
+          doc.fontSize(baseFontSize);
+          renderInlineTokens(paraToken.tokens);
+          doc.moveDown(0.5);
         } else if (paraToken.text && paraToken.text.trim()) {
           // Only render text if it's not empty
+          if (bodyFont) {
+            doc.font(bodyFont);
+          }
+          if (textColor) {
+            doc.fillColor(textColor);
+          }
           doc.fontSize(baseFontSize).text(paraToken.text, { lineGap });
           doc.moveDown(0.5);
         }
@@ -657,20 +1043,53 @@ async function renderMarkdownToPdf(
           // Check for images in list items
           if (item.tokens && Array.isArray(item.tokens)) {
             // Process tokens in order
-            doc.text(`${bullet} `, { lineGap });
-            for (const subToken of item.tokens) {
-              if (subToken.type === "image") {
-                const imageUrl = subToken.href || subToken.url || subToken.src;
-                const altText = subToken.text || subToken.alt || subToken.title || "";
-                if (imageUrl) {
-                  // Don't add spacing before for inline images in lists
-                  await renderImageInPdf(doc, imageUrl, altText, pageWidth, baseFontSize, lineGap, false);
-                }
-              } else if (subToken.text) {
-                doc.text(subToken.text, { lineGap });
-              }
+            if (bodyFont) {
+              doc.font(bodyFont);
             }
+            if (textColor) {
+              doc.fillColor(textColor);
+            }
+            const bulletX = doc.x;
+            const bulletY = doc.y;
+            doc.text(bullet, bulletX, bulletY, { lineGap });
+            const textStartX = bulletX + doc.widthOfString(`${bullet} `);
+            const textWidth =
+              pageWidth - (textStartX - doc.page.margins.left);
+
+            const inlineTokenGroups: any[][] = [];
+            item.tokens.forEach((subToken: any) => {
+              if (subToken.type === "image") return;
+              if (subToken.tokens && Array.isArray(subToken.tokens)) {
+                inlineTokenGroups.push(subToken.tokens);
+              } else if (subToken.text) {
+                inlineTokenGroups.push([{ type: "text", text: subToken.text }]);
+              }
+            });
+
+            if (inlineTokenGroups.length === 0 && item.text) {
+              inlineTokenGroups.push([{ type: "text", text: item.text }]);
+            }
+
+            inlineTokenGroups.forEach((group, groupIdx) => {
+              const startX =
+                groupIdx === 0 ? textStartX : bulletX + doc.widthOfString("  ");
+              const startY = groupIdx === 0 ? bulletY : doc.y;
+              renderInlineTokens(group, true, {
+                startX,
+                startY,
+                width: textWidth,
+              });
+              if (groupIdx < inlineTokenGroups.length - 1) {
+                doc.moveDown(0.2);
+              }
+            });
           } else {
+            if (bodyFont) {
+              doc.font(bodyFont);
+            }
+            if (textColor) {
+              doc.fillColor(textColor);
+            }
             doc.text(`${bullet} ${item.text}`, { lineGap });
           }
         }
@@ -678,6 +1097,12 @@ async function renderMarkdownToPdf(
         break;
       }
       case "code":
+        if (bodyFont) {
+          doc.font(bodyFont);
+        }
+        if (textColor) {
+          doc.fillColor(textColor);
+        }
         doc.fontSize(baseFontSize - 1).text((token as any).text, { lineGap });
         doc.moveDown(0.5);
         doc.fontSize(baseFontSize);
