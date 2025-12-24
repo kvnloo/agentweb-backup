@@ -262,6 +262,35 @@ router.put("/users/:userId/seo-aeo", async (req, res) => {
   }
 });
 
+// Update user - general endpoint for updating any user fields
+router.put("/users/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const updates = req.body;
+
+    // Check if user exists
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Prevent updating userId (primary key)
+    delete updates.userId;
+
+    // Handle password separately if provided (needs hashing)
+    if (updates.password) {
+      updates.password = await bcrypt.hash(updates.password, 10);
+    }
+
+    // Update the user
+    const updatedUser = await userDb.updateUser(userId, updates);
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error updating user:", error);
+    res.status(500).json({ message: "Error updating user" });
+  }
+});
+
 // Update user CMS Type
 router.put("/users/:userId/cms-type", async (req, res) => {
   try {
@@ -535,6 +564,31 @@ router.put("/waitlist/:email/status", async (req, res) => {
   } catch (error) {
     console.error("Error updating waitlist status:", error);
     res.status(500).json({ message: "Error updating waitlist status" });
+  }
+});
+
+// Update waitlist entry - general endpoint for updating any waitlist fields
+router.put("/waitlist/:email", async (req, res) => {
+  try {
+    const { email } = req.params;
+    const updates = req.body;
+
+    if (!email) {
+      return res.status(400).json({ message: "Email is required" });
+    }
+
+    // Check if waitlist entry exists
+    const entry = await waitlistDb.getByEmail(email);
+    if (!entry) {
+      return res.status(404).json({ message: "Waitlist entry not found" });
+    }
+
+    // Use the updateDetails method which handles partial updates
+    const updatedEntry = await waitlistDb.updateDetails(email, updates);
+    res.json(updatedEntry);
+  } catch (error) {
+    console.error("Error updating waitlist entry:", error);
+    res.status(500).json({ message: "Error updating waitlist entry" });
   }
 });
 

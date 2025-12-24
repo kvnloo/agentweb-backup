@@ -610,6 +610,17 @@ export default function AdminDashboard() {
   const [createUserLoading, setCreateUserLoading] = useState(false);
   const [gtmPlans, setGtmPlans] = useState<any[]>([]);
   const [gtmPlansLoading, setGtmPlansLoading] = useState(false);
+
+  // Edit User Dialog state
+  const [editUserDialogOpen, setEditUserDialogOpen] = useState(false);
+  const [editUserData, setEditUserData] = useState<User | null>(null);
+  const [editUserLoading, setEditUserLoading] = useState(false);
+
+  // Edit Waitlist Dialog state
+  const [editWaitlistDialogOpen, setEditWaitlistDialogOpen] = useState(false);
+  const [editWaitlistData, setEditWaitlistData] = useState<WaitlistEntry | null>(null);
+  const [editWaitlistLoading, setEditWaitlistLoading] = useState(false);
+
   const { token } = useAuth();
 
   const {
@@ -1652,6 +1663,86 @@ export default function AdminDashboard() {
     }
   };
 
+  // Edit User Dialog handlers
+  const handleEditUserOpen = (user: User) => {
+    setEditUserData({ ...user });
+    setEditUserDialogOpen(true);
+  };
+
+  const handleEditUserClose = () => {
+    setEditUserDialogOpen(false);
+    setEditUserData(null);
+  };
+
+  const handleEditUserSave = async () => {
+    if (!editUserData) return;
+
+    try {
+      setEditUserLoading(true);
+      setError("");
+
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/users/${editUserData.userId}`),
+        editUserData,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      if (response.status === 200) {
+        // Update the user in the local state
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((user: User) =>
+            user.userId === editUserData.userId ? response.data : user
+          )
+        );
+        setSuccess("User updated successfully!");
+        handleEditUserClose();
+      }
+    } catch (error: any) {
+      console.error("Error updating user:", error);
+      setError(error.response?.data?.message || "Failed to update user");
+    } finally {
+      setEditUserLoading(false);
+    }
+  };
+
+  // Edit Waitlist Dialog handlers
+  const handleEditWaitlistOpen = (entry: WaitlistEntry) => {
+    setEditWaitlistData({ ...entry });
+    setEditWaitlistDialogOpen(true);
+  };
+
+  const handleEditWaitlistClose = () => {
+    setEditWaitlistDialogOpen(false);
+    setEditWaitlistData(null);
+  };
+
+  const handleEditWaitlistSave = async () => {
+    if (!editWaitlistData) return;
+
+    try {
+      setEditWaitlistLoading(true);
+      setError("");
+
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/waitlist/${encodeURIComponent(editWaitlistData.email)}`),
+        editWaitlistData,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      if (response.status === 200) {
+        // Reload waitlist to get updated data
+        await loadWaitlist();
+        setSuccess("Waitlist entry updated successfully!");
+        handleEditWaitlistClose();
+      }
+    } catch (error: any) {
+      console.error("Error updating waitlist entry:", error);
+      setError(error.response?.data?.message || "Failed to update waitlist entry");
+    } finally {
+      setEditWaitlistLoading(false);
+    }
+  };
+
   const useCaseOptions = [
     "Content Marketing",
     "SEO",
@@ -2675,6 +2766,21 @@ export default function AdminDashboard() {
                         </TableCell>
                         <TableCell>
                           <Box sx={{ display: "flex", gap: 0.5, alignItems: "center", flexWrap: "nowrap" }}>
+                            <Tooltip title="Edit All Fields">
+                              <IconButton
+                                size="small"
+                                onClick={() => handleEditUserOpen(user)}
+                                color="info"
+                                sx={{
+                                  border: '1px solid',
+                                  borderColor: 'info.main',
+                                  '&:hover': { bgcolor: 'info.50' }
+                                }}
+                              >
+                                <EditIcon fontSize="small" />
+                              </IconButton>
+                            </Tooltip>
+
                             {user.roles && user.roles.includes("customer") && (
                               <Tooltip title="Access Customer Portal">
                                 <IconButton
@@ -2682,7 +2788,7 @@ export default function AdminDashboard() {
                                   onClick={() => handleAccessCustomerPortal(user.userId)}
                                   disabled={delegateAccessLoading === user.userId}
                                   color="primary"
-                                  sx={{ 
+                                  sx={{
                                     border: '1px solid',
                                     borderColor: 'primary.main',
                                     '&:hover': { bgcolor: 'primary.50' }
@@ -2696,7 +2802,7 @@ export default function AdminDashboard() {
                                 </IconButton>
                               </Tooltip>
                             )}
-                            
+
                             <Tooltip title="Manage Roles">
                               <IconButton
                                 size="small"
@@ -3063,6 +3169,20 @@ export default function AdminDashboard() {
                               gap: 0.5,
                             }}
                           >
+                            <Tooltip title="Edit All Fields">
+                              <IconButton
+                                size="small"
+                                onClick={() => handleEditWaitlistOpen(entry)}
+                                color="info"
+                                sx={{
+                                  border: '1px solid',
+                                  borderColor: 'info.main',
+                                  '&:hover': { bgcolor: 'info.50' }
+                                }}
+                              >
+                                <EditIcon fontSize="small" />
+                              </IconButton>
+                            </Tooltip>
                             {(!userExists || isFreeUserOnly) && entry.status !== "invited" && !isRegisteredUser && (
                               <Button
                                 variant="outlined"
@@ -4782,13 +4902,250 @@ export default function AdminDashboard() {
           >
             Cancel
           </Button>
-          <Button 
+          <Button
             onClick={handleCreateUser}
             variant="contained"
             disabled={createUserLoading}
             startIcon={createUserLoading ? <CircularProgress size={20} /> : <AddIcon />}
           >
             {createUserLoading ? 'Creating...' : 'Create User'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Edit User Dialog */}
+      <Dialog
+        open={editUserDialogOpen}
+        onClose={handleEditUserClose}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle>Edit User</DialogTitle>
+        <DialogContent>
+          {editUserData && (
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, mt: 1 }}>
+              <TextField
+                fullWidth
+                label="Email"
+                value={editUserData.email || ''}
+                onChange={(e) => setEditUserData({ ...editUserData, email: e.target.value })}
+                disabled={editUserLoading}
+              />
+              <TextField
+                fullWidth
+                label="Stripe Customer ID"
+                value={editUserData.stripe_customer_id || ''}
+                onChange={(e) => setEditUserData({ ...editUserData, stripe_customer_id: e.target.value })}
+                disabled={editUserLoading}
+              />
+              <TextField
+                fullWidth
+                label="Ad Account (Meta)"
+                value={editUserData.adAccount || ''}
+                onChange={(e) => setEditUserData({ ...editUserData, adAccount: e.target.value })}
+                disabled={editUserLoading}
+                helperText="Meta Ad Account ID from business.facebook.com"
+              />
+              <TextField
+                fullWidth
+                label="Email Domain"
+                value={editUserData.emailDomain || ''}
+                onChange={(e) => setEditUserData({ ...editUserData, emailDomain: e.target.value })}
+                disabled={editUserLoading}
+              />
+              <TextField
+                fullWidth
+                label="Default Sender Username"
+                value={editUserData.defaultSenderUsername || ''}
+                onChange={(e) => setEditUserData({ ...editUserData, defaultSenderUsername: e.target.value })}
+                disabled={editUserLoading}
+              />
+              <TextField
+                fullWidth
+                label="From Name"
+                value={editUserData.fromName || ''}
+                onChange={(e) => setEditUserData({ ...editUserData, fromName: e.target.value })}
+                disabled={editUserLoading}
+              />
+              <TextField
+                fullWidth
+                label="Slack Channel"
+                value={editUserData.slackChannel || ''}
+                onChange={(e) => setEditUserData({ ...editUserData, slackChannel: e.target.value })}
+                disabled={editUserLoading}
+              />
+              <TextField
+                fullWidth
+                label="Support Note"
+                value={editUserData.supportNote || ''}
+                onChange={(e) => setEditUserData({ ...editUserData, supportNote: e.target.value })}
+                multiline
+                rows={3}
+                disabled={editUserLoading}
+              />
+              <FormControl fullWidth>
+                <InputLabel>Roles</InputLabel>
+                <Select
+                  multiple
+                  value={editUserData.roles || []}
+                  onChange={(e) => setEditUserData({ ...editUserData, roles: e.target.value as ("partner" | "customer" | "free")[] })}
+                  renderValue={(selected) => (selected as string[]).join(', ')}
+                  label="Roles"
+                  disabled={editUserLoading}
+                >
+                  <MenuItem value="customer">Customer</MenuItem>
+                  <MenuItem value="partner">Partner</MenuItem>
+                  <MenuItem value="free">Free</MenuItem>
+                </Select>
+              </FormControl>
+            </Box>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleEditUserClose} disabled={editUserLoading}>
+            Cancel
+          </Button>
+          <Button
+            onClick={handleEditUserSave}
+            variant="contained"
+            disabled={editUserLoading}
+          >
+            {editUserLoading ? <CircularProgress size={24} /> : 'Save'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Edit Waitlist Entry Dialog */}
+      <Dialog
+        open={editWaitlistDialogOpen}
+        onClose={handleEditWaitlistClose}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle>Edit Waitlist Entry</DialogTitle>
+        <DialogContent>
+          {editWaitlistData && (
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, mt: 1 }}>
+              <TextField
+                fullWidth
+                label="Email"
+                value={editWaitlistData.email || ''}
+                disabled
+                helperText="Email cannot be changed (primary key)"
+              />
+              <TextField
+                fullWidth
+                label="Full Name"
+                value={editWaitlistData.fullName || ''}
+                onChange={(e) => setEditWaitlistData({ ...editWaitlistData, fullName: e.target.value })}
+                disabled={editWaitlistLoading}
+              />
+              <TextField
+                fullWidth
+                label="Company Name"
+                value={editWaitlistData.companyName || ''}
+                onChange={(e) => setEditWaitlistData({ ...editWaitlistData, companyName: e.target.value })}
+                disabled={editWaitlistLoading}
+              />
+              <TextField
+                fullWidth
+                label="Phone Number"
+                value={editWaitlistData.phoneNumber || ''}
+                onChange={(e) => setEditWaitlistData({ ...editWaitlistData, phoneNumber: e.target.value })}
+                disabled={editWaitlistLoading}
+              />
+              <TextField
+                fullWidth
+                label="Stripe Customer ID"
+                value={editWaitlistData.stripe_customer_id || ''}
+                onChange={(e) => setEditWaitlistData({ ...editWaitlistData, stripe_customer_id: e.target.value })}
+                disabled={editWaitlistLoading}
+              />
+              <TextField
+                fullWidth
+                label="Monthly Marketing Spend"
+                value={editWaitlistData.monthlyMarketingSpend || ''}
+                onChange={(e) => setEditWaitlistData({ ...editWaitlistData, monthlyMarketingSpend: e.target.value })}
+                disabled={editWaitlistLoading}
+              />
+              <TextField
+                fullWidth
+                label="Business Area"
+                value={editWaitlistData.businessArea || ''}
+                onChange={(e) => setEditWaitlistData({ ...editWaitlistData, businessArea: e.target.value })}
+                disabled={editWaitlistLoading}
+              />
+              <FormControl fullWidth>
+                <InputLabel>Marketing Channels</InputLabel>
+                <Select
+                  multiple
+                  value={editWaitlistData.marketingChannels || []}
+                  onChange={(e) => setEditWaitlistData({ ...editWaitlistData, marketingChannels: e.target.value as string[] })}
+                  renderValue={(selected) => (selected as string[]).join(', ')}
+                  label="Marketing Channels"
+                  disabled={editWaitlistLoading}
+                >
+                  {marketingChannelOptions.map((channel) => (
+                    <MenuItem key={channel} value={channel}>{channel}</MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+              <FormControl fullWidth>
+                <InputLabel>Use Case Categories</InputLabel>
+                <Select
+                  multiple
+                  value={editWaitlistData.useCaseCategories || []}
+                  onChange={(e) => setEditWaitlistData({ ...editWaitlistData, useCaseCategories: e.target.value as string[] })}
+                  renderValue={(selected) => (selected as string[]).join(', ')}
+                  label="Use Case Categories"
+                  disabled={editWaitlistLoading}
+                >
+                  {useCaseOptions.map((category) => (
+                    <MenuItem key={category} value={category}>{category}</MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+              <TextField
+                fullWidth
+                label="Use Case Description"
+                value={editWaitlistData.useCaseDescription || ''}
+                onChange={(e) => setEditWaitlistData({ ...editWaitlistData, useCaseDescription: e.target.value })}
+                multiline
+                rows={3}
+                disabled={editWaitlistLoading}
+              />
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={editWaitlistData.requestReport || false}
+                    onChange={(e) => setEditWaitlistData({ ...editWaitlistData, requestReport: e.target.checked })}
+                    disabled={editWaitlistLoading}
+                  />
+                }
+                label="Request Report"
+              />
+              <TextField
+                fullWidth
+                label="Support Note"
+                value={editWaitlistData.supportNote || ''}
+                onChange={(e) => setEditWaitlistData({ ...editWaitlistData, supportNote: e.target.value })}
+                multiline
+                rows={3}
+                disabled={editWaitlistLoading}
+              />
+            </Box>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleEditWaitlistClose} disabled={editWaitlistLoading}>
+            Cancel
+          </Button>
+          <Button
+            onClick={handleEditWaitlistSave}
+            variant="contained"
+            disabled={editWaitlistLoading}
+          >
+            {editWaitlistLoading ? <CircularProgress size={24} /> : 'Save'}
           </Button>
         </DialogActions>
       </Dialog>
