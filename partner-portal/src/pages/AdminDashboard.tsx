@@ -611,11 +611,6 @@ export default function AdminDashboard() {
   const [gtmPlans, setGtmPlans] = useState<any[]>([]);
   const [gtmPlansLoading, setGtmPlansLoading] = useState(false);
 
-  // Edit User Dialog state
-  const [editUserDialogOpen, setEditUserDialogOpen] = useState(false);
-  const [editUserData, setEditUserData] = useState<User | null>(null);
-  const [editUserLoading, setEditUserLoading] = useState(false);
-
   // Edit Waitlist Dialog state
   const [editWaitlistDialogOpen, setEditWaitlistDialogOpen] = useState(false);
   const [editWaitlistData, setEditWaitlistData] = useState<WaitlistEntry | null>(null);
@@ -1660,48 +1655,6 @@ export default function AdminDashboard() {
       setError(error.response?.data?.message || "Failed to update password");
     } finally {
       setPasswordResetLoading(false);
-    }
-  };
-
-  // Edit User Dialog handlers
-  const handleEditUserOpen = (user: User) => {
-    setEditUserData({ ...user });
-    setEditUserDialogOpen(true);
-  };
-
-  const handleEditUserClose = () => {
-    setEditUserDialogOpen(false);
-    setEditUserData(null);
-  };
-
-  const handleEditUserSave = async () => {
-    if (!editUserData) return;
-
-    try {
-      setEditUserLoading(true);
-      setError("");
-
-      const response = await axios.put(
-        buildApiUrl(`/api/admin/users/${editUserData.userId}`),
-        editUserData,
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-
-      if (response.status === 200) {
-        // Update the user in the local state
-        setUsers((prevUsers: User[]) =>
-          prevUsers.map((user: User) =>
-            user.userId === editUserData.userId ? response.data : user
-          )
-        );
-        setSuccess("User updated successfully!");
-        handleEditUserClose();
-      }
-    } catch (error: any) {
-      console.error("Error updating user:", error);
-      setError(error.response?.data?.message || "Failed to update user");
-    } finally {
-      setEditUserLoading(false);
     }
   };
 
@@ -2766,21 +2719,6 @@ export default function AdminDashboard() {
                         </TableCell>
                         <TableCell>
                           <Box sx={{ display: "flex", gap: 0.5, alignItems: "center", flexWrap: "nowrap" }}>
-                            <Tooltip title="Edit All Fields">
-                              <IconButton
-                                size="small"
-                                onClick={() => handleEditUserOpen(user)}
-                                color="info"
-                                sx={{
-                                  border: '1px solid',
-                                  borderColor: 'info.main',
-                                  '&:hover': { bgcolor: 'info.50' }
-                                }}
-                              >
-                                <EditIcon fontSize="small" />
-                              </IconButton>
-                            </Tooltip>
-
                             {user.roles && user.roles.includes("customer") && (
                               <Tooltip title="Access Customer Portal">
                                 <IconButton
@@ -4909,108 +4847,6 @@ export default function AdminDashboard() {
             startIcon={createUserLoading ? <CircularProgress size={20} /> : <AddIcon />}
           >
             {createUserLoading ? 'Creating...' : 'Create User'}
-          </Button>
-        </DialogActions>
-      </Dialog>
-
-      {/* Edit User Dialog */}
-      <Dialog
-        open={editUserDialogOpen}
-        onClose={handleEditUserClose}
-        maxWidth="md"
-        fullWidth
-      >
-        <DialogTitle>Edit User</DialogTitle>
-        <DialogContent>
-          {editUserData && (
-            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, mt: 1 }}>
-              <TextField
-                fullWidth
-                label="Email"
-                value={editUserData.email || ''}
-                onChange={(e) => setEditUserData({ ...editUserData, email: e.target.value })}
-                disabled={editUserLoading}
-              />
-              <TextField
-                fullWidth
-                label="Stripe Customer ID"
-                value={editUserData.stripe_customer_id || ''}
-                onChange={(e) => setEditUserData({ ...editUserData, stripe_customer_id: e.target.value })}
-                disabled={editUserLoading}
-              />
-              <TextField
-                fullWidth
-                label="Ad Account (Meta)"
-                value={editUserData.adAccount || ''}
-                onChange={(e) => setEditUserData({ ...editUserData, adAccount: e.target.value })}
-                disabled={editUserLoading}
-                helperText="Meta Ad Account ID from business.facebook.com"
-              />
-              <TextField
-                fullWidth
-                label="Email Domain"
-                value={editUserData.emailDomain || ''}
-                onChange={(e) => setEditUserData({ ...editUserData, emailDomain: e.target.value })}
-                disabled={editUserLoading}
-              />
-              <TextField
-                fullWidth
-                label="Default Sender Username"
-                value={editUserData.defaultSenderUsername || ''}
-                onChange={(e) => setEditUserData({ ...editUserData, defaultSenderUsername: e.target.value })}
-                disabled={editUserLoading}
-              />
-              <TextField
-                fullWidth
-                label="From Name"
-                value={editUserData.fromName || ''}
-                onChange={(e) => setEditUserData({ ...editUserData, fromName: e.target.value })}
-                disabled={editUserLoading}
-              />
-              <TextField
-                fullWidth
-                label="Slack Channel"
-                value={editUserData.slackChannel || ''}
-                onChange={(e) => setEditUserData({ ...editUserData, slackChannel: e.target.value })}
-                disabled={editUserLoading}
-              />
-              <TextField
-                fullWidth
-                label="Support Note"
-                value={editUserData.supportNote || ''}
-                onChange={(e) => setEditUserData({ ...editUserData, supportNote: e.target.value })}
-                multiline
-                rows={3}
-                disabled={editUserLoading}
-              />
-              <FormControl fullWidth>
-                <InputLabel>Roles</InputLabel>
-                <Select
-                  multiple
-                  value={editUserData.roles || []}
-                  onChange={(e) => setEditUserData({ ...editUserData, roles: e.target.value as ("partner" | "customer" | "free")[] })}
-                  renderValue={(selected) => (selected as string[]).join(', ')}
-                  label="Roles"
-                  disabled={editUserLoading}
-                >
-                  <MenuItem value="customer">Customer</MenuItem>
-                  <MenuItem value="partner">Partner</MenuItem>
-                  <MenuItem value="free">Free</MenuItem>
-                </Select>
-              </FormControl>
-            </Box>
-          )}
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={handleEditUserClose} disabled={editUserLoading}>
-            Cancel
-          </Button>
-          <Button
-            onClick={handleEditUserSave}
-            variant="contained"
-            disabled={editUserLoading}
-          >
-            {editUserLoading ? <CircularProgress size={24} /> : 'Save'}
           </Button>
         </DialogActions>
       </Dialog>

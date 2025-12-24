@@ -262,35 +262,6 @@ router.put("/users/:userId/seo-aeo", async (req, res) => {
   }
 });
 
-// Update user - general endpoint for updating any user fields
-router.put("/users/:userId", async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const updates = req.body;
-
-    // Check if user exists
-    const user = await userDb.getUserById(userId);
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-
-    // Prevent updating userId (primary key)
-    delete updates.userId;
-
-    // Handle password separately if provided (needs hashing)
-    if (updates.password) {
-      updates.password = await bcrypt.hash(updates.password, 10);
-    }
-
-    // Update the user
-    const updatedUser = await userDb.updateUser(userId, updates);
-    res.json(updatedUser);
-  } catch (error) {
-    console.error("Error updating user:", error);
-    res.status(500).json({ message: "Error updating user" });
-  }
-});
-
 // Update user CMS Type
 router.put("/users/:userId/cms-type", async (req, res) => {
   try {
