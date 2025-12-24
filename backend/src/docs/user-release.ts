@@ -12,6 +12,7 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Improved Knowledge Base creation and editing',
       '- File uploads now auto-upload on select during edit, and after save during creation',
       '- Save is enabled when the knowledge base name changes, even if content stays the same',
+      'Agent Mode now restores in-progress status after navigation and refreshes the session on completion',
     ],
   },
   {
