@@ -222,6 +222,46 @@ describe('Admin Waitlist Free User Management', () => {
     });
   });
 
+  describe('PUT /api/admin/waitlist/:email', () => {
+    it('should update waitlist entry details when entry exists', async () => {
+      const email = 'editwaitlist@example.com';
+      const existingEntry = createWaitlistItem(email, { fullName: 'Old Name' });
+      const updates = {
+        fullName: 'New Name',
+        supportNote: 'Updated note',
+      };
+      const updatedEntry = createWaitlistItem(email, {
+        fullName: 'New Name',
+        supportNote: 'Updated note',
+      });
+
+      mockWaitlistDb.getByEmail.mockResolvedValue(existingEntry);
+      (mockWaitlistDb as any).updateDetails.mockResolvedValue(updatedEntry);
+
+      const response = await request(app)
+        .put(`/api/admin/waitlist/${email}`)
+        .send(updates);
+
+      expect(response.status).toBe(200);
+      expect((mockWaitlistDb as any).updateDetails).toHaveBeenCalledWith(email, updates);
+      expect(response.body).toEqual(updatedEntry);
+    });
+
+    it('should return 404 when waitlist entry does not exist', async () => {
+      const email = 'missing@example.com';
+
+      mockWaitlistDb.getByEmail.mockResolvedValue(undefined);
+
+      const response = await request(app)
+        .put(`/api/admin/waitlist/${email}`)
+        .send({ fullName: 'Nope' });
+
+      expect(response.status).toBe(404);
+      expect(response.body.message).toBe('Waitlist entry not found');
+      expect((mockWaitlistDb as any).updateDetails).not.toHaveBeenCalled();
+    });
+  });
+
   describe('POST /api/admin/waitlist/:email/create-user', () => {
     it('should allow free users to be created (upgraded to customer)', async () => {
       const email = 'freeuser@example.com';

@@ -538,6 +538,31 @@ router.put("/waitlist/:email/status", async (req, res) => {
   }
 });
 
+// Update waitlist entry - general endpoint for updating any waitlist fields
+router.put("/waitlist/:email", async (req, res) => {
+  try {
+    const { email } = req.params;
+    const updates = req.body;
+
+    if (!email) {
+      return res.status(400).json({ message: "Email is required" });
+    }
+
+    // Check if waitlist entry exists
+    const entry = await waitlistDb.getByEmail(email);
+    if (!entry) {
+      return res.status(404).json({ message: "Waitlist entry not found" });
+    }
+
+    // Use the updateDetails method which handles partial updates
+    const updatedEntry = await waitlistDb.updateDetails(email, updates);
+    res.json(updatedEntry);
+  } catch (error) {
+    console.error("Error updating waitlist entry:", error);
+    res.status(500).json({ message: "Error updating waitlist entry" });
+  }
+});
+
 // Update waitlist entry support note
 router.put("/waitlist/:email/support-note", async (req, res) => {
   try {

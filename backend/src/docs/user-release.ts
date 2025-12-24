@@ -7,6 +7,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-24',
+    changes: [
+      'Admins can now edit waitlist entries from the admin dashboard',
+      '- Waitlist entries can be edited to update company name, use cases, stripe customer id, and other details',
+    ],
+  },
+  {
     date: '2025-12-23',
     changes: [
       'Improved Knowledge Base creation and editing',
