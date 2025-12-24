@@ -129,7 +129,7 @@ describe('SSE Progress Utility', () => {
       expect(callback2).toHaveBeenCalled();
     });
 
-    it('should clean up progress store when last callback is removed', () => {
+    it('should keep progress store when last callback is removed', () => {
       const callback = jest.fn();
       const cleanup = registerProgressCallback(sessionId, callback);
 
@@ -137,8 +137,8 @@ describe('SSE Progress Utility', () => {
       expect(getLatestProgress(sessionId)).toBeDefined();
 
       cleanup();
-      // Progress store should be cleared when no callbacks remain
-      expect(getLatestProgress(sessionId)).toBeUndefined();
+      // Progress should remain available for reconnecting clients
+      expect(getLatestProgress(sessionId)).toBeDefined();
     });
   });
 
@@ -216,4 +216,3 @@ describe('SSE Progress Utility', () => {
     });
   });
 });
-
