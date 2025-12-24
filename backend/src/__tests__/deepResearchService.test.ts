@@ -44,13 +44,37 @@ describe('DeepResearchService', () => {
         topic: 'Market trends in renewable energy',
         prompt: 'Focus on solar and wind',
         tone: 'professional',
-        style: 'substack'
+        style: 'substack',
+        depth: 'comprehensive',
+        focus_areas: ['solar power', 'wind energy', 'cost analysis']
       };
       
       expect(params.topic).toBe('Market trends in renewable energy');
       expect(params.prompt).toBe('Focus on solar and wind');
       expect(params.tone).toBe('professional');
       expect(params.style).toBe('substack');
+      expect(params.depth).toBe('comprehensive');
+      expect(params.focus_areas).toEqual(['solar power', 'wind energy', 'cost analysis']);
+    });
+
+    it('should accept depth parameter with valid values', () => {
+      const overviewParams = { topic: 'Test', depth: 'overview' };
+      const detailedParams = { topic: 'Test', depth: 'detailed' };
+      const comprehensiveParams = { topic: 'Test', depth: 'comprehensive' };
+      
+      expect(overviewParams.depth).toBe('overview');
+      expect(detailedParams.depth).toBe('detailed');
+      expect(comprehensiveParams.depth).toBe('comprehensive');
+    });
+
+    it('should accept focus_areas as array of strings', () => {
+      const params = {
+        topic: 'AI in healthcare',
+        focus_areas: ['diagnostics', 'treatment planning', 'patient monitoring']
+      };
+      
+      expect(Array.isArray(params.focus_areas)).toBe(true);
+      expect(params.focus_areas.length).toBe(3);
     });
   });
 

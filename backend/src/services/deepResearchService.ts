@@ -21,6 +21,8 @@ interface DeepResearchParams {
   prompt?: string;
   tone?: string;              // e.g., 'professional', 'casual', 'technical', 'executive'
   style?: string;             // e.g., 'default', 'substack'
+  depth?: string;             // e.g., 'overview', 'detailed', 'comprehensive'
+  focus_areas?: string[];     // Specific areas to focus on
 }
 
 /**
@@ -108,6 +110,22 @@ export class DeepResearchService {
           'Write in first-person perspective where appropriate.',
           'Include engaging section headers that feel conversational.'
         );
+      }
+      
+      // Add depth instructions
+      if (params.depth) {
+        const depthDescriptions: Record<string, string> = {
+          'overview': 'Provide a high-level summary with key points only (approximately 1-2 pages).',
+          'detailed': 'Provide comprehensive research with examples and analysis (approximately 3-5 pages).',
+          'comprehensive': 'Provide an in-depth deep dive with citations, detailed analysis, and thorough coverage (approximately 5-10 pages).',
+        };
+        const depthDesc = depthDescriptions[params.depth] || params.depth;
+        formatInstructions.push(depthDesc);
+      }
+      
+      // Add focus areas if specified
+      if (params.focus_areas && params.focus_areas.length > 0) {
+        formatInstructions.push(`Focus specifically on these areas: ${params.focus_areas.join(', ')}.`);
       }
       
       // Add format instructions to prompt

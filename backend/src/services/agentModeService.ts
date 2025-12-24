@@ -1855,6 +1855,44 @@ Use the available tools to create tasks in the agent-engine when complex work is
       {
         type: 'function' as const,
         function: {
+          name: 'perform_deep_research',
+          description: 'Perform comprehensive deep research on any topic using Gemini Deep Research. Returns detailed markdown content for whitepapers, reports, executive summaries, or research documents. Use this tool when the user specifically asks for research, whitepapers, or reports - NOT for blog articles. For blog articles, use create_blog_article with deep_research=true instead. Takes several minutes to complete.',
+          parameters: {
+            type: 'object',
+            properties: {
+              topic: {
+                type: 'string',
+                description: 'The main topic or subject to research'
+              },
+              prompt: {
+                type: 'string',
+                description: 'Additional instructions for the research (e.g., "Include executive summary", "Focus on competitive analysis", "Structure as a whitepaper")'
+              },
+              tone: {
+                type: 'string',
+                description: 'The tone of the research output',
+                enum: ['professional', 'casual', 'technical', 'executive'],
+                default: 'professional'
+              },
+              depth: {
+                type: 'string',
+                description: 'How thorough the research should be. "overview" for 1-2 pages, "detailed" for 3-5 pages, "comprehensive" for 5-10 pages with citations.',
+                enum: ['overview', 'detailed', 'comprehensive'],
+                default: 'detailed'
+              },
+              focus_areas: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Specific areas to focus on in the research (e.g., ["market trends", "competitor analysis", "implementation strategies"])'
+              }
+            },
+            required: ['topic']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
           name: 'publish_blog_article',
           description: 'Publish a blog article to CMS (Basehub or Webflow) based on the user\'s configured CMS type. Takes the title, description, hero image URL, and blog HTML URL from a previously created blog article (via create_blog_article), extracts the HTML body content, then publishes to the appropriate CMS.',
           parameters: {
@@ -3360,6 +3398,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.removeC2PAFromImage(args.image_url, args.filename, userId);
       case 'create_blog_article':
         return await this.createBlogArticle(args.topic, args.keywords || '', args.tone || 'professional', args.length || 'medium', args.researchContext || '', args.requirements || '', userId, sessionId, args.style || 'default', args.deep_research || false);
+      case 'perform_deep_research':
+        return await this.performDeepResearchTool(args.topic, args.prompt, args.tone || 'professional', args.depth || 'detailed', args.focus_areas);
       case 'publish_blog_article':
         return await this.publishBlogArticle(args.title, args.description, args.hero_image_url, args.blog_html_url, userId, sessionId);
       case 'create_social_media_posts':
@@ -7925,6 +7965,90 @@ ${emailDraftFormat === 'text'
       return {
         success: false,
         message: 'Failed to remove C2PA metadata from image',
+        error: error.message
+      };
+    }
+  }
+
+  /**
+   * Perform deep research on a topic and return structured research content
+   */
+  private async performDeepResearchTool(
+    topic: string,
+    prompt?: string,
+    tone: string = 'professional',
+    depth: string = 'detailed',
+    focus_areas?: string[]
+  ): Promise<any> {
+    try {
+      console.log('AgentMode: Performing deep research on topic:', topic, 'tone:', tone, 'depth:', depth, 'focus_areas:', focus_areas);
+
+      // Import the deep research service
+      const { deepResearchService } = await import('./deepResearchService');
+
+      // Check if the service is available
+      const isAvailable = await deepResearchService.isAvailable();
+      if (!isAvailable) {
+        return {
+          success: false,
+          message: 'Deep Research service is not available. Please check API key configuration.',
+          error: 'Service unavailable'
+        };
+      }
+
+      // Perform the deep research
+      const researchResult = await deepResearchService.performDeepResearch({
+        topic,
+        prompt,
+        tone,
+        depth,
+        focus_areas
+      });
+
+      if (!researchResult.success || !researchResult.markdownContent) {
+        return {
+          success: false,
+          message: researchResult.error || 'Deep research failed',
+          error: researchResult.error || 'Unknown error'
+        };
+      }
+
+      // Calculate word count for context
+      const wordCount = researchResult.markdownContent.split(/\s+/).length;
+
+      // Extract key findings (first 5 bullet points or headers)
+      const keyFindings: string[] = [];
+      const lines = researchResult.markdownContent.split('\n');
+      for (const line of lines) {
+        if (keyFindings.length >= 5) break;
+        const trimmed = line.trim();
+        // Match headers (## or ###) or bullet points
+        if (/^#{2,3}\s+/.test(trimmed)) {
+          keyFindings.push(trimmed.replace(/^#+\s*/, ''));
+        } else if (/^[-*]\s+/.test(trimmed) && trimmed.length > 20) {
+          keyFindings.push(trimmed.replace(/^[-*]\s*/, ''));
+        }
+      }
+
+      return {
+        success: true,
+        message: `Deep research completed successfully. Generated ${wordCount} words of content.`,
+        data: {
+          markdown_content: researchResult.markdownContent,
+          title: researchResult.title,
+          summary: researchResult.researchSummary,
+          key_findings: keyFindings,
+          word_count: wordCount,
+          research_depth: depth,
+          topic: topic
+        }
+      };
+
+    } catch (error: any) {
+      console.error('AgentMode: Error performing deep research:', error);
+      return {
+        success: false,
+        message: 'Failed to perform deep research',
         error: error.message
       };
     }
