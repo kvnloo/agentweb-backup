@@ -843,7 +843,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   public getAvailableTools() {
-    return [
+    const tools = [
       {
         type: 'function' as const,
         function: {
@@ -2237,6 +2237,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
         }
       }
     ];
+    
+    // Log all tool names for debugging
+    const toolNames = tools.map((t: any) => t.function?.name).filter(Boolean);
+    console.log('AgentMode: Available tools:', toolNames.length, 'tools:', toolNames);
+    
+    return tools;
   }
 
   // Get filtered tools based on user's subscription type
