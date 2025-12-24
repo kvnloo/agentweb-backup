@@ -487,6 +487,11 @@ When updating HTML files, follow this process:
  - **Video Generation**: Use 'generate_video' for creating videos. This provides real-time video generation using Veo 3.1. You can optionally provide start and end frames for interpolation between two images. The generated video will be saved and returned as an S3 URL.
  - **Blog Articles**: When creating blog articles, prefer using the 'create_blog_article' tool. It generates the article content, creates a high-quality hero image via imageService, formats the article into clean HTML, uploads it to S3, and returns the final HTML URL. Avoid ad-hoc content + image flows when this tool fits the request.
    - **When to use deep_research:true**: Set 'deep_research: true' when the user explicitly asks for "deep research", "comprehensive research", "well-researched article", or mentions topics that require authoritative sources (e.g., market trends, industry analysis, scientific topics, historical events). This performs Gemini Deep Research first (takes several minutes) and embeds research images. Default to 'deep_research: false' for standard blog articles.
+ - **Whitepapers, Reports & Research Documents**: For whitepapers, research reports, executive summaries, or when users ask for "research on X" (not a blog), use the 'perform_deep_research' tool. This returns markdown content that you can then:
+   1. Format and save as HTML using 'save_file'
+   2. Generate a cover image using 'generate_image'
+   3. Present directly to the user as research findings
+   - **Key distinction**: Use 'create_blog_article' for blog posts. Use 'perform_deep_research' + 'save_file' + 'generate_image' for whitepapers and research documents.
  - **Meta Ads Metrics**: Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data
 - When metrics data is loaded, provide contextual analysis based on the conversation history and user's business goals
 - Don't just repeat the numbers - provide meaningful insights, strategic recommendations, and actionable next steps
