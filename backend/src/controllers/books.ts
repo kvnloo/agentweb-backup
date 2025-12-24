@@ -244,6 +244,10 @@ async function createPdfBuffer(
       const includeCover = true; // always include cover page
       const includeTableOfContents =
         book.type === "whitepaper" ? false : exportConfig?.includeTableOfContents !== false;
+      const showSectionTitlePage =
+        book.type === "whitepaper"
+          ? false
+          : exportConfig?.showSectionTitlePage !== false;
 
       const doc = new PDFDocument({
         size: pageSize,
@@ -287,14 +291,11 @@ async function createPdfBuffer(
             accentColor: "black",
           };
 
-      doc.font(bodyFont);
-      doc.fontSize(fontSize);
-      doc.fillColor(theme.textColor);
-
+      // Header/footer decorator (disabled for whitepaper to avoid blank header-only pages)
       let pageNumber = 0;
       const headerTitle = book.title || "Untitled";
       const applyPageDecorations = (options?: { skipHeader?: boolean }) => {
-        if (!isWhitepaper || options?.skipHeader) return;
+        if (isWhitepaper || options?.skipHeader) return;
         pageNumber += 1;
         const headerY = Math.max(16, doc.page.margins.top - 24);
         const footerY = doc.page.height - doc.page.margins.bottom + 12;
@@ -341,7 +342,10 @@ async function createPdfBuffer(
         doc.font(bodyFont).fontSize(fontSize);
       };
 
-      applyPageDecorations({ skipHeader: isWhitepaper && includeCover });
+      doc.font(bodyFont);
+      doc.fontSize(fontSize);
+      doc.fillColor(theme.textColor);
+      const markPageUsed = () => {};
 
       const sortedSections =
         book.sections && book.sections.length > 0
@@ -375,12 +379,10 @@ async function createPdfBuffer(
           doc
             .font(labelFont)
             .fontSize(12)
-            .fillColor(theme.mutedColor);
-          doc.characterSpacing(1.5);
-          doc.text(isChinese ? "白皮书" : "WHITE PAPER", coverLeft, y, {
-            width: coverWidth,
-          });
-          doc.characterSpacing(0);
+            .fillColor(theme.mutedColor)
+            .text(isChinese ? "白皮书" : "WHITE PAPER", coverLeft, y, {
+              width: coverWidth,
+            });
           y = doc.y + 16;
 
           doc
@@ -436,6 +438,7 @@ async function createPdfBuffer(
             .stroke();
           doc.restore();
           doc.fillColor(theme.textColor).font(bodyFont).fontSize(fontSize);
+          markPageUsed();
         } else if (coverImageBuffer) {
           try {
             doc.image(coverImageBuffer, {
@@ -465,8 +468,10 @@ async function createPdfBuffer(
             doc.text(`Genre: ${book.genre}`, { align: "center" });
           }
         }
-        doc.addPage();
-        applyPageDecorations();
+        if (!isWhitepaper) {
+          doc.addPage();
+          applyPageDecorations();
+        }
       }
 
       // Table of Contents (optional)
@@ -546,37 +551,67 @@ async function createPdfBuffer(
         }
       });
 
-      const renderContentText = async (text: string) => {
-        if (!text) return;
-        await renderMarkdownToPdf(doc, text, fontSize, lineHeight, {
-          bodyFont,
-          headingFont,
-          strongFont: headingFont,
-          textColor: theme.textColor,
-          headingColor: theme.accentColor,
+      const hasRenderableSection = (section: Section) => {
+        const sectionContent = contentLookup.get(`${section.sectionId}::`);
+        const hasSectionContent = sectionContent && sectionContent.trim().length > 0;
+        const hasChapterContent = section.chapters?.some((chapter) => {
+          const chapterContent = contentLookup.get(
+            `${section.sectionId}::${chapter.chapterId}`
+          );
+          return Boolean(chapterContent && chapterContent.trim().length > 0);
         });
-        doc.moveDown();
+        return Boolean(hasSectionContent || hasChapterContent);
       };
 
-      if (sortedSections.length > 0) {
+      const renderableSections = isWhitepaper
+        ? sortedSections.filter((section) => hasRenderableSection(section))
+        : sortedSections;
+
+      const renderContentText = async (text: string) => {
+        if (!text) return;
+        await renderMarkdownToPdf(
+          doc,
+          text,
+          fontSize,
+          lineHeight,
+          {
+            bodyFont,
+            headingFont,
+            strongFont: headingFont,
+            textColor: theme.textColor,
+            headingColor: theme.accentColor,
+          },
+          markPageUsed
+        );
+        const bottomLimit = doc.page.height - doc.page.margins.bottom;
+        const spacing = fontSize * lineHeight;
+        if (doc.y + spacing < bottomLimit) {
+          doc.moveDown();
+        }
+      };
+
+      if (renderableSections.length > 0) {
         if (isWhitepaper) {
-          for (let sIdx = 0; sIdx < sortedSections.length; sIdx++) {
-            const section = sortedSections[sIdx];
-            if (sIdx > 0) {
-              doc.addPage();
-              applyPageDecorations();
-            }
+          for (let sIdx = 0; sIdx < renderableSections.length; sIdx++) {
+            const section = renderableSections[sIdx];
+            // Start each section on a fresh page
+            doc.addPage();
+            const safeSectionTitle =
+              section.title && section.title.trim().length > 0
+                ? section.title
+                : `Section ${sIdx + 1}`;
             const sectionLabel = isChinese
               ? sIdx === 0
-                ? `${section.title}`
-                : `第${toChineseNumeral(sIdx)}章 ${section.title}`
-              : `${section.title}`;
+                ? `${safeSectionTitle}`
+                : `第${toChineseNumeral(sIdx)}章 ${safeSectionTitle}`
+              : `${safeSectionTitle}`;
 
             doc
               .font(headingFont)
               .fontSize(fontSize + 6)
               .fillColor(theme.accentColor)
               .text(sectionLabel);
+            markPageUsed();
             doc.moveDown(0.4);
             doc.font(bodyFont).fontSize(fontSize).fillColor(theme.textColor);
 
@@ -588,6 +623,7 @@ async function createPdfBuffer(
                 .text(section.description, {
                   lineGap: (lineHeight - 1) * (fontSize - 1),
                 });
+              markPageUsed();
               doc.moveDown(0.6);
               doc.fillColor(theme.textColor).fontSize(fontSize);
             }
@@ -596,7 +632,7 @@ async function createPdfBuffer(
             if (sectionContent) {
               await renderContentText(sectionContent);
             } else {
-              doc.moveDown();
+              doc.moveDown(0.4);
             }
 
             if (section.chapters && section.chapters.length > 0) {
@@ -611,6 +647,9 @@ async function createPdfBuffer(
                   .fontSize(fontSize + 2)
                   .fillColor(theme.textColor)
                   .text(chapterLabel);
+                if (chapterLabel.trim().length > 0) {
+                  markPageUsed();
+                }
                 doc.moveDown(0.4);
                 doc.font(bodyFont).fontSize(fontSize).fillColor(theme.textColor);
                 const chapterContent = contentLookup.get(
@@ -626,43 +665,58 @@ async function createPdfBuffer(
           }
         } else {
           let firstSectionPageReady = !(includeCover || includeTableOfContents);
-          for (let sIdx = 0; sIdx < sortedSections.length; sIdx++) {
-            const section = sortedSections[sIdx];
+          for (let sIdx = 0; sIdx < renderableSections.length; sIdx++) {
+            const section = renderableSections[sIdx];
             const sectionLabel = isChinese
               ? sIdx === 0
                 ? `${section.title}`
                 : `第${toChineseNumeral(sIdx)}章 ${section.title}`
               : `Section ${sIdx + 1}: ${section.title}`;
 
-            const sectionTitleFontSize = Math.max(fontSize * 2, fontSize + 10);
+            if (showSectionTitlePage) {
+              const sectionTitleFontSize = Math.max(fontSize * 2, fontSize + 10);
 
-            // Section title page (dedicated)
-            if (!firstSectionPageReady) {
+              // Section title page (dedicated)
+              if (!firstSectionPageReady) {
+                doc.addPage();
+                applyPageDecorations();
+                firstSectionPageReady = true;
+              } else {
+                doc.addPage();
+                applyPageDecorations();
+              }
+              // Center the section title vertically and horizontally
+              const titleY =
+                doc.page.height / 2 -
+                sectionTitleFontSize / 2 -
+                (lineHeight - 1) * sectionTitleFontSize;
+              const pageMarginLeft = doc.page.margins.left || 0;
+              const pageMarginRight = doc.page.margins.right || 0;
+              const usableWidth = doc.page.width - (pageMarginLeft + pageMarginRight);
+              doc
+                .fontSize(sectionTitleFontSize)
+                .text(sectionLabel, pageMarginLeft, titleY, {
+                  align: "center",
+                  width: usableWidth,
+                  underline: true,
+                });
+              doc.moveDown(2);
+
+              // Section body page
               doc.addPage();
               applyPageDecorations();
-              firstSectionPageReady = true;
             } else {
-              doc.addPage();
-              applyPageDecorations();
+              if (!firstSectionPageReady) {
+                doc.addPage();
+                applyPageDecorations();
+                firstSectionPageReady = true;
+              } else {
+                doc.addPage();
+                applyPageDecorations();
+              }
+              doc.fontSize(fontSize + 2).text(sectionLabel);
+              doc.moveDown(0.6);
             }
-            // Center the section title vertically and horizontally
-            const titleY =
-              doc.page.height / 2 -
-              sectionTitleFontSize / 2 -
-              (lineHeight - 1) * sectionTitleFontSize;
-            const pageMarginLeft = doc.page.margins.left || 0;
-            const pageMarginRight = doc.page.margins.right || 0;
-            const usableWidth = doc.page.width - (pageMarginLeft + pageMarginRight);
-            doc.fontSize(sectionTitleFontSize).text(sectionLabel, pageMarginLeft, titleY, {
-              align: "center",
-              width: usableWidth,
-              underline: true,
-            });
-            doc.moveDown(2);
-
-            // Section body page
-            doc.addPage();
-            applyPageDecorations();
 
             const sectionContent = contentLookup.get(`${section.sectionId}::`);
             if (sectionContent) {
@@ -822,10 +876,17 @@ async function renderMarkdownToPdf(
     strongFont?: string;
     textColor?: string;
     headingColor?: string;
-  }
+  },
+  onWrite?: () => void
 ) {
+  const normalizedMarkdown = markdown
+    .replace(/<\s*(strong|b)\s*>([\s\S]*?)<\s*\/\s*\1\s*>/gi, '**$2**')
+    .replace(/<\s*(em|i)\s*>([\s\S]*?)<\s*\/\s*\1\s*>/gi, '*$2*')
+    .replace(/<\s*br\s*\/?\s*>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/__(.+?)__/g, '**$1**');
   const { marked } = await getMarked();
-  const tokens = marked.lexer(markdown || "");
+  const tokens = marked.lexer(normalizedMarkdown || "");
   const lineGap = (lineHeight - 1) * baseFontSize;
   const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
   const bodyFont = theme?.bodyFont;
@@ -833,6 +894,9 @@ async function renderMarkdownToPdf(
   const strongFont = theme?.strongFont || headingFont || bodyFont;
   const textColor = theme?.textColor;
   const headingColor = theme?.headingColor || textColor;
+  const notifyWrite = () => {
+    if (onWrite) onWrite();
+  };
 
   const renderInlineTokens = (
     inlineTokens: any[],
@@ -847,10 +911,12 @@ async function renderMarkdownToPdf(
         options.width = layout.width;
       }
       if (renderState.first && layout?.startX !== undefined && layout?.startY !== undefined) {
+        if (text.length > 0) notifyWrite();
         doc.text(text, layout.startX, layout.startY, options);
         renderState.first = false;
         return;
       }
+      if (text.length > 0) notifyWrite();
       doc.text(text, options);
       renderState.first = false;
     };
@@ -916,6 +982,19 @@ async function renderMarkdownToPdf(
     });
   };
 
+  const collectInlineTokens = (tokens: any[] = []) => {
+    const collected: any[] = [];
+    tokens.forEach((token) => {
+      if (token.type === "image") return;
+      if (token.tokens && Array.isArray(token.tokens)) {
+        collected.push(...token.tokens);
+      } else if (token.text) {
+        collected.push({ type: "text", text: token.text });
+      }
+    });
+    return collected;
+  };
+
   // Debug: log token types to understand structure
   // console.log("Tokens:", tokens.map((t: any) => ({ type: t.type, hasTokens: !!t.tokens, text: t.text?.substring(0, 50) })));
 
@@ -938,6 +1017,7 @@ async function renderMarkdownToPdf(
               const altText = subToken.text || subToken.alt || subToken.title || "";
               if (imageUrl) {
                 await renderImageInPdf(doc, imageUrl, altText, pageWidth, baseFontSize, lineGap, true);
+                notifyWrite();
               }
             }
           }
@@ -948,6 +1028,9 @@ async function renderMarkdownToPdf(
         }
         if (headingColor) {
           doc.fillColor(headingColor);
+        }
+        if ((headingToken as any).text) {
+          notifyWrite();
         }
         doc.fontSize(size).text((headingToken as any).text, { lineGap });
         doc.moveDown(0.3);
@@ -968,43 +1051,64 @@ async function renderMarkdownToPdf(
           const imageTokens = paraToken.tokens.filter((t: any) => t.type === "image");
           const textTokens = paraToken.tokens.filter((t: any) => t.type !== "image" && t.text && t.text.trim());
           const isImageOnly = imageTokens.length > 0 && textTokens.length === 0;
-          
+
           // For standalone image paragraphs, add spacing before
           if (isImageOnly) {
             doc.moveDown(0.5);
           }
-          
-          // Process tokens in order (text and images mixed)
+          const hasImages = imageTokens.length > 0;
+
+          if (!hasImages) {
+            if (bodyFont) {
+              doc.font(bodyFont);
+            }
+            if (textColor) {
+              doc.fillColor(textColor);
+            }
+            doc.fontSize(baseFontSize);
+            renderInlineTokens(paraToken.tokens);
+            doc.moveDown(0.5);
+            break;
+          }
+
+          // Process tokens in order (text and images mixed), render text as a single flow
+          let inlineBuffer: any[] = [];
+          const flushInlineBuffer = () => {
+            if (inlineBuffer.length === 0) return;
+            if (bodyFont) {
+              doc.font(bodyFont);
+            }
+            if (textColor) {
+              doc.fillColor(textColor);
+            }
+            doc.fontSize(baseFontSize);
+            renderInlineTokens(inlineBuffer);
+            inlineBuffer = [];
+          };
+
           for (let i = 0; i < paraToken.tokens.length; i++) {
             const subToken = paraToken.tokens[i];
             if (subToken.type === "image") {
+              flushInlineBuffer();
               const imageUrl = subToken.href || subToken.url || subToken.src;
               const altText = subToken.text || subToken.alt || subToken.title || "";
               if (imageUrl) {
                 // Don't add spacing before if it's the first token and we already added spacing for image-only paragraph
                 const addSpacing = !(isImageOnly && i === 0);
                 await renderImageInPdf(doc, imageUrl, altText, pageWidth, baseFontSize, lineGap, addSpacing);
+                notifyWrite();
               }
-            } else if (subToken.tokens && Array.isArray(subToken.tokens)) {
-              if (bodyFont) {
-                doc.font(bodyFont);
-              }
-              if (textColor) {
-                doc.fillColor(textColor);
-              }
-              doc.fontSize(baseFontSize);
-              renderInlineTokens(subToken.tokens);
+              continue;
+            }
+            if (subToken.tokens && Array.isArray(subToken.tokens)) {
+              inlineBuffer.push(...subToken.tokens);
             } else if (subToken.text && subToken.text.trim()) {
-              if (bodyFont) {
-                doc.font(bodyFont);
-              }
-              if (textColor) {
-                doc.fillColor(textColor);
-              }
-              doc.fontSize(baseFontSize).text(subToken.text, { lineGap });
+              inlineBuffer.push({ type: "text", text: subToken.text });
             }
           }
-          
+
+          flushInlineBuffer();
+
           // Add spacing after paragraph if it had content
           if (paraToken.tokens.length > 0) {
             // For image-only paragraphs, spacing is already handled by renderImageInPdf
@@ -1012,16 +1116,6 @@ async function renderMarkdownToPdf(
               doc.moveDown(0.5);
             }
           }
-        } else if (paraToken.tokens && Array.isArray(paraToken.tokens)) {
-          if (bodyFont) {
-            doc.font(bodyFont);
-          }
-          if (textColor) {
-            doc.fillColor(textColor);
-          }
-          doc.fontSize(baseFontSize);
-          renderInlineTokens(paraToken.tokens);
-          doc.moveDown(0.5);
         } else if (paraToken.text && paraToken.text.trim()) {
           // Only render text if it's not empty
           if (bodyFont) {
@@ -1030,6 +1124,7 @@ async function renderMarkdownToPdf(
           if (textColor) {
             doc.fillColor(textColor);
           }
+          notifyWrite();
           doc.fontSize(baseFontSize).text(paraToken.text, { lineGap });
           doc.moveDown(0.5);
         }
@@ -1049,40 +1144,13 @@ async function renderMarkdownToPdf(
             if (textColor) {
               doc.fillColor(textColor);
             }
-            const bulletX = doc.x;
-            const bulletY = doc.y;
-            doc.text(bullet, bulletX, bulletY, { lineGap });
-            const textStartX = bulletX + doc.widthOfString(`${bullet} `);
-            const textWidth =
-              pageWidth - (textStartX - doc.page.margins.left);
-
-            const inlineTokenGroups: any[][] = [];
-            item.tokens.forEach((subToken: any) => {
-              if (subToken.type === "image") return;
-              if (subToken.tokens && Array.isArray(subToken.tokens)) {
-                inlineTokenGroups.push(subToken.tokens);
-              } else if (subToken.text) {
-                inlineTokenGroups.push([{ type: "text", text: subToken.text }]);
-              }
-            });
-
-            if (inlineTokenGroups.length === 0 && item.text) {
-              inlineTokenGroups.push([{ type: "text", text: item.text }]);
+            const inlineTokens = collectInlineTokens(item.tokens);
+            if (inlineTokens.length === 0 && item.text) {
+              inlineTokens.push({ type: "text", text: item.text });
             }
-
-            inlineTokenGroups.forEach((group, groupIdx) => {
-              const startX =
-                groupIdx === 0 ? textStartX : bulletX + doc.widthOfString("  ");
-              const startY = groupIdx === 0 ? bulletY : doc.y;
-              renderInlineTokens(group, true, {
-                startX,
-                startY,
-                width: textWidth,
-              });
-              if (groupIdx < inlineTokenGroups.length - 1) {
-                doc.moveDown(0.2);
-              }
-            });
+            notifyWrite();
+            doc.text(`${bullet} `, { lineGap, width: pageWidth, continued: true });
+            renderInlineTokens(inlineTokens, true);
           } else {
             if (bodyFont) {
               doc.font(bodyFont);
@@ -1090,6 +1158,7 @@ async function renderMarkdownToPdf(
             if (textColor) {
               doc.fillColor(textColor);
             }
+            notifyWrite();
             doc.text(`${bullet} ${item.text}`, { lineGap });
           }
         }
@@ -1103,6 +1172,7 @@ async function renderMarkdownToPdf(
         if (textColor) {
           doc.fillColor(textColor);
         }
+        notifyWrite();
         doc.fontSize(baseFontSize - 1).text((token as any).text, { lineGap });
         doc.moveDown(0.5);
         doc.fontSize(baseFontSize);
@@ -1114,9 +1184,11 @@ async function renderMarkdownToPdf(
         const altText = imageToken.text || imageToken.alt || imageToken.title || "";
         if (imageUrl) {
           await renderImageInPdf(doc, imageUrl, altText, pageWidth, baseFontSize, lineGap, true);
+          notifyWrite();
         } else {
           console.warn("Image token found but no URL:", imageToken);
           doc.moveDown(0.5);
+          notifyWrite();
           doc.fontSize(baseFontSize).text(`[Image: ${altText || "Image"}]`, { lineGap });
           doc.moveDown(0.5);
         }
@@ -1395,8 +1467,8 @@ export async function createBook(req: AuthenticatedRequest, res: Response) {
     // Set genre only for books, default to "Other" if not provided
     const bookGenre = type === "book" ? (genre?.trim() || "Other") : undefined;
 
-    // Validate characters if provided
-    if (characters !== undefined) {
+    // Validate characters if provided (books only)
+    if (type === "book" && characters !== undefined) {
       if (!Array.isArray(characters)) {
         return res.status(400).json({ error: "Characters must be an array" });
       }
@@ -1422,10 +1494,15 @@ export async function createBook(req: AuthenticatedRequest, res: Response) {
       coverImageUrl: coverImageUrl || undefined,
       attachments: [],
       tags: tags && Array.isArray(tags) ? tags : [],
-      characters: characters && Array.isArray(characters) ? characters.map((c: any) => ({
-        name: c.name.trim(),
-        description: c.description.trim(),
-      })) : (type === "book" ? [] : undefined),
+      characters:
+        type === "book" && characters && Array.isArray(characters)
+          ? characters.map((c: any) => ({
+              name: c.name.trim(),
+              description: c.description.trim(),
+            }))
+          : type === "book"
+            ? []
+            : undefined,
       status: status || "draft",
       exports: [],
     };
@@ -1473,8 +1550,10 @@ export async function updateBook(req: AuthenticatedRequest, res: Response) {
       return res.status(404).json({ error: "Book not found" });
     }
 
-    // Validate characters if provided
-    if (characters !== undefined) {
+    const currentType = (type || existingBook.type) as "book" | "whitepaper";
+
+    // Validate characters if provided (books only)
+    if (currentType === "book" && characters !== undefined) {
       if (!Array.isArray(characters)) {
         return res.status(400).json({ error: "Characters must be an array" });
       }
@@ -1498,9 +1577,10 @@ export async function updateBook(req: AuthenticatedRequest, res: Response) {
         return res.status(400).json({ error: "Type must be 'book' or 'whitepaper'" });
       }
       updates.type = type;
-      // If type changes to whitepaper, remove genre; if changes to book and no genre provided, set to "Other"
+      // If type changes to whitepaper, remove genre and characters; if changes to book and no genre provided, set to "Other"
       if (type === "whitepaper") {
         updates.genre = undefined;
+        updates.characters = undefined;
       } else if (type === "book" && genre === undefined && !existingBook.genre) {
         // Only set default if genre wasn't explicitly provided and doesn't exist
         updates.genre = "Other";
@@ -1518,10 +1598,14 @@ export async function updateBook(req: AuthenticatedRequest, res: Response) {
       }
     }
     if (characters !== undefined) {
-      updates.characters = characters.map((c: any) => ({
-        name: c.name.trim(),
-        description: c.description.trim(),
-      }));
+      if (currentType === "book") {
+        updates.characters = characters.map((c: any) => ({
+          name: c.name.trim(),
+          description: c.description.trim(),
+        }));
+      } else {
+        updates.characters = undefined;
+      }
     }
     if (coverImageUrl !== undefined) updates.coverImageUrl = coverImageUrl || undefined;
     if (tags !== undefined) updates.tags = Array.isArray(tags) ? tags : [];
