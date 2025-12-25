@@ -1861,7 +1861,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'perform_deep_research',
-          description: 'Perform comprehensive deep research on any topic using Gemini Deep Research. Uploads the research content to S3 and returns a URL to the markdown file. Use this for whitepapers, reports, executive summaries, or research documents. NOT for blog articles - use create_blog_article with deep_research=true instead. Takes several minutes to complete. The response includes research_url (S3 URL), title, summary, key_findings, and word_count.',
+          description: 'Perform comprehensive deep research on any topic using Gemini Deep Research. Uploads the research content to S3 and returns a URL to the markdown file. Use this for whitepapers, reports, executive summaries, or research documents. NOT for blog articles - use create_blog_article with deep_research=true instead. Takes several minutes to complete. The response includes research_url (S3 URL), title, summary, and word_count.',
           parameters: {
             type: 'object',
             properties: {
@@ -1881,7 +1881,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
               },
               depth: {
                 type: 'string',
-                description: 'How thorough the research should be. "overview" for 1-2 pages, "detailed" for 3-5 pages, "comprehensive" for 5-10 pages with citations.',
+                description: 'How thorough the research should be. "overview" for 1-2 pages, "detailed" for 3-5 pages, "comprehensive" for 5-10 pages.',
                 enum: ['overview', 'detailed', 'comprehensive'],
                 default: 'detailed'
               },
