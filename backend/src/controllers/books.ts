@@ -187,6 +187,16 @@ function createTxtBuffer(
   return Buffer.from(text, "utf-8");
 }
 
+export function getPdfExportLayoutOptions(book: Book, exportConfig: any) {
+  return {
+    includeTableOfContents: book.type === "whitepaper" ? false : exportConfig?.includeTableOfContents !== false,
+    showSectionTitlePage:
+      book.type === "whitepaper"
+        ? false
+        : exportConfig?.showSectionTitlePage !== false,
+  };
+}
+
 async function createPdfBuffer(
   book: Book,
   contents: Awaited<ReturnType<typeof bookContentDb.getAllBookContents>>,
@@ -242,12 +252,10 @@ async function createPdfBuffer(
           ? exportConfig.lineHeight
           : 1.5;
       const includeCover = true; // always include cover page
-      const includeTableOfContents =
-        book.type === "whitepaper" ? false : exportConfig?.includeTableOfContents !== false;
-      const showSectionTitlePage =
-        book.type === "whitepaper"
-          ? false
-          : exportConfig?.showSectionTitlePage !== false;
+      const { includeTableOfContents, showSectionTitlePage } = getPdfExportLayoutOptions(
+        book,
+        exportConfig
+      );
 
       const doc = new PDFDocument({
         size: pageSize,
