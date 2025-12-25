@@ -8045,20 +8045,6 @@ ${emailDraftFormat === 'text'
       // Calculate word count for context
       const wordCount = researchResult.markdownContent.split(/\s+/).length;
 
-      // Extract key findings (first 5 bullet points or headers)
-      const keyFindings: string[] = [];
-      const lines = researchResult.markdownContent.split('\n');
-      for (const line of lines) {
-        if (keyFindings.length >= 5) break;
-        const trimmed = line.trim();
-        // Match headers (## or ###) or bullet points
-        if (/^#{2,3}\s+/.test(trimmed)) {
-          keyFindings.push(trimmed.replace(/^#+\s*/, ''));
-        } else if (/^[-*]\s+/.test(trimmed) && trimmed.length > 20) {
-          keyFindings.push(trimmed.replace(/^[-*]\s*/, ''));
-        }
-      }
-
       // Upload markdown content to S3
       const { uploadFileToS3 } = await import('../utils/s3Utils');
       const sanitizedTopic = topic.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase().substring(0, 50);
@@ -8088,7 +8074,6 @@ ${emailDraftFormat === 'text'
           research_url: uploadResult.url,
           title: researchResult.title,
           summary: researchResult.researchSummary,
-          key_findings: keyFindings,
           word_count: wordCount,
           research_depth: depth,
           topic: topic
