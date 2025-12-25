@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Response, Router } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import {
   getBooks,
@@ -25,6 +25,9 @@ import {
 import multer from "multer";
 
 const router = Router();
+const withAuth = (
+  handler: (req: AuthenticatedRequest, res: Response) => Promise<Response | void>
+) => (req: any, res: Response) => handler(req as AuthenticatedRequest, res);
 
 // Configure multer for file uploads
 const upload = multer({
@@ -39,51 +42,50 @@ router.get("/genres", getPredefinedGenres);
 router.get("/export-fonts", getExportFonts);
 
 // Get all books for authenticated user
-router.get("/", authenticateToken, getBooks);
+router.get("/", authenticateToken, withAuth(getBooks));
 
 // Get single book by ID
-router.get("/:bookId", authenticateToken, getBookById);
+router.get("/:bookId", authenticateToken, withAuth(getBookById));
 
 // Create new book
-router.post("/", authenticateToken, createBook);
+router.post("/", authenticateToken, withAuth(createBook));
 
 // Update book
-router.put("/:bookId", authenticateToken, updateBook);
+router.put("/:bookId", authenticateToken, withAuth(updateBook));
 
 // Delete book
-router.delete("/:bookId", authenticateToken, deleteBook);
+router.delete("/:bookId", authenticateToken, withAuth(deleteBook));
 
 // Publish/unpublish book
-router.put("/:bookId/publish", authenticateToken, publishBook);
-router.post("/:bookId/export", authenticateToken, exportBook);
+router.put("/:bookId/publish", authenticateToken, withAuth(publishBook));
+router.post("/:bookId/export", authenticateToken, withAuth(exportBook));
 
 // Upload file attachment (cover image or document)
 router.post(
   "/:bookId/upload",
   authenticateToken,
   upload.single("file"),
-  uploadBookFile
+  withAuth(uploadBookFile)
 );
 
 // Section management
-router.post("/:bookId/sections", authenticateToken, addSection);
-router.put("/:bookId/sections/:sectionId", authenticateToken, updateSection);
-router.delete("/:bookId/sections/:sectionId", authenticateToken, deleteSection);
+router.post("/:bookId/sections", authenticateToken, withAuth(addSection));
+router.put("/:bookId/sections/:sectionId", authenticateToken, withAuth(updateSection));
+router.delete("/:bookId/sections/:sectionId", authenticateToken, withAuth(deleteSection));
 
 // Chapter management
-router.post("/:bookId/sections/:sectionId/chapters", authenticateToken, addChapter);
-router.put("/:bookId/sections/:sectionId/chapters/:chapterId", authenticateToken, updateChapter);
-router.delete("/:bookId/sections/:sectionId/chapters/:chapterId", authenticateToken, deleteChapter);
+router.post("/:bookId/sections/:sectionId/chapters", authenticateToken, withAuth(addChapter));
+router.put("/:bookId/sections/:sectionId/chapters/:chapterId", authenticateToken, withAuth(updateChapter));
+router.delete("/:bookId/sections/:sectionId/chapters/:chapterId", authenticateToken, withAuth(deleteChapter));
 
 // Content management
-router.get("/:bookId/sections/:sectionId/content", authenticateToken, getSectionContent);
-router.get("/:bookId/sections/:sectionId/chapters/:chapterId/content", authenticateToken, getChapterContent);
+router.get("/:bookId/sections/:sectionId/content", authenticateToken, withAuth(getSectionContent));
+router.get("/:bookId/sections/:sectionId/chapters/:chapterId/content", authenticateToken, withAuth(getChapterContent));
 
 // Agent Mode session management
-router.get("/:bookId/sections/:sectionId/session", authenticateToken, getBookContentSession);
-router.get("/:bookId/sections/:sectionId/chapters/:chapterId/session", authenticateToken, getBookContentSession);
-router.put("/:bookId/sections/:sectionId/session", authenticateToken, updateBookContentSessionId);
-router.put("/:bookId/sections/:sectionId/chapters/:chapterId/session", authenticateToken, updateBookContentSessionId);
+router.get("/:bookId/sections/:sectionId/session", authenticateToken, withAuth(getBookContentSession));
+router.get("/:bookId/sections/:sectionId/chapters/:chapterId/session", authenticateToken, withAuth(getBookContentSession));
+router.put("/:bookId/sections/:sectionId/session", authenticateToken, withAuth(updateBookContentSessionId));
+router.put("/:bookId/sections/:sectionId/chapters/:chapterId/session", authenticateToken, withAuth(updateBookContentSessionId));
 
 export default router;
-

@@ -1,4 +1,5 @@
-import { Request, Response } from "express";
+import { Response } from "express";
+import { AuthenticatedRequest } from "../../middleware/auth";
 import { exportBook } from "../books";
 
 jest.mock("aws-sdk", () => {
@@ -35,10 +36,12 @@ const { bookDb } = jest.requireMock("../../services/bookDb");
 const { bookContentDb } = jest.requireMock("../../services/bookContentDb");
 const { __mockPutObject: mockPutObject } = jest.requireMock("aws-sdk");
 
-const mockRequest = (overrides: Partial<Request> = {}): Partial<Request> => ({
+const mockRequest = (
+  overrides: Partial<AuthenticatedRequest> = {}
+): Partial<AuthenticatedRequest> => ({
   params: {},
   body: {},
-  user: { userId: "user-1", email: "user@example.com" },
+  user: { userId: "user-1", email: "user@example.com", isAdmin: false },
   ...overrides,
 });
 
@@ -56,7 +59,7 @@ describe("exportBook", () => {
     const req = mockRequest({ user: undefined });
     const res = mockResponse();
 
-    await exportBook(req as Request, res as Response);
+    await exportBook(req as AuthenticatedRequest, res as Response);
 
     expect(res.status).toHaveBeenCalledWith(401);
     expect(res.json).toHaveBeenCalledWith({ error: "User ID not provided" });
@@ -66,7 +69,7 @@ describe("exportBook", () => {
     const req = mockRequest({ params: {} });
     const res = mockResponse();
 
-    await exportBook(req as Request, res as Response);
+    await exportBook(req as AuthenticatedRequest, res as Response);
 
     expect(res.status).toHaveBeenCalledWith(400);
     expect(res.json).toHaveBeenCalledWith({ error: "Book ID is required" });
@@ -78,7 +81,7 @@ describe("exportBook", () => {
     const req = mockRequest({ params: { bookId: "book-1" } });
     const res = mockResponse();
 
-    await exportBook(req as Request, res as Response);
+    await exportBook(req as AuthenticatedRequest, res as Response);
 
     expect(res.status).toHaveBeenCalledWith(404);
     expect(res.json).toHaveBeenCalledWith({ error: "Book not found" });
@@ -105,7 +108,7 @@ describe("exportBook", () => {
     });
     const res = mockResponse();
 
-    await exportBook(req as Request, res as Response);
+    await exportBook(req as AuthenticatedRequest, res as Response);
 
     expect(mockPutObject).toHaveBeenCalledWith(
       expect.objectContaining({
