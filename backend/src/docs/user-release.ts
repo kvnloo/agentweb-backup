@@ -11,6 +11,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
     changes: [
       'Admins can now edit waitlist entries from the admin dashboard',
       '- Waitlist entries can be edited to update company name, use cases, stripe customer id, and other details',
+      'Added Books page to Creative Hub',
+      '- Users can create books and white papers',
+      '- Added function calls to list books, create books, create characters, create outlines, and generate or update book content',
+      '- Books can be exported as PDF or TXT',
     ],
   },
   {
