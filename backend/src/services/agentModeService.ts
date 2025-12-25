@@ -488,11 +488,11 @@ When updating HTML files, follow this process:
  - **Video Generation**: Use 'generate_video' for creating videos. This provides real-time video generation using Veo 3.1. You can optionally provide start and end frames for interpolation between two images. The generated video will be saved and returned as an S3 URL.
  - **Blog Articles**: When creating blog articles, prefer using the 'create_blog_article' tool. It generates the article content, creates a high-quality hero image via imageService, formats the article into clean HTML, uploads it to S3, and returns the final HTML URL. Avoid ad-hoc content + image flows when this tool fits the request.
    - **When to use deep_research:true**: Set 'deep_research: true' when the user explicitly asks for "deep research", "comprehensive research", "well-researched article", or mentions topics that require authoritative sources (e.g., market trends, industry analysis, scientific topics, historical events). This performs Gemini Deep Research first (takes several minutes) and embeds research images. Default to 'deep_research: false' for standard blog articles.
- - **Whitepapers, Reports & Research Documents**: For whitepapers, research reports, executive summaries, or when users ask for "research on X" (not a blog), use the 'perform_deep_research' tool. This returns markdown content that you can then:
-   1. Format and save as HTML using 'save_file'
-   2. Generate a cover image using 'generate_image'
-   3. Present directly to the user as research findings
-   - **Key distinction**: Use 'create_blog_article' for blog posts. Use 'perform_deep_research' + 'save_file' + 'generate_image' for whitepapers and research documents.
+ - **Whitepapers, Reports & Research Documents**: For whitepapers, research reports, executive summaries, or when users ask for "research on X" (not a blog), use the 'perform_deep_research' tool. This returns an S3 URL to the markdown file (research_url) along with metadata (title, summary, key_findings). You can then:
+   1. Present the research_url directly to the user for download
+   2. Use 'read_file_content' to fetch the content if you need to process or format it
+   3. Generate a cover image using 'generate_image'
+   - **Key distinction**: Use 'create_blog_article' for blog posts. Use 'perform_deep_research' for whitepapers and research documents.
  - **Meta Ads Metrics**: Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data
 - When metrics data is loaded, provide contextual analysis based on the conversation history and user's business goals
 - Don't just repeat the numbers - provide meaningful insights, strategic recommendations, and actionable next steps
@@ -1861,7 +1861,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'perform_deep_research',
-          description: 'Perform comprehensive deep research on any topic using Gemini Deep Research. Returns detailed markdown content for whitepapers, reports, executive summaries, or research documents. Use this tool when the user specifically asks for research, whitepapers, or reports - NOT for blog articles. For blog articles, use create_blog_article with deep_research=true instead. Takes several minutes to complete.',
+          description: 'Perform comprehensive deep research on any topic using Gemini Deep Research. Uploads the research content to S3 and returns a URL to the markdown file. Use this for whitepapers, reports, executive summaries, or research documents. NOT for blog articles - use create_blog_article with deep_research=true instead. Takes several minutes to complete. The response includes research_url (S3 URL), title, summary, key_findings, and word_count.',
           parameters: {
             type: 'object',
             properties: {
@@ -3050,37 +3050,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
         };
 
       case 'perform_deep_research':
-        const mockMarkdownContent = `# ${args.topic}
-
-## Executive Summary
-
-This is a comprehensive research report on "${args.topic}". The research was conducted with ${args.depth || 'detailed'} depth and ${args.tone || 'professional'} tone.
-
-## Key Findings
-
-- Finding 1: Important insight about ${args.topic}
-- Finding 2: Market trends and analysis
-- Finding 3: Implementation considerations
-- Finding 4: ROI and business impact
-- Finding 5: Future outlook and recommendations
-
-## Market Analysis
-
-The market for ${args.topic} is growing rapidly. Organizations are increasingly adopting these solutions to improve efficiency and competitive advantage.
-
-## Implementation Strategies
-
-Successful implementation requires careful planning, stakeholder alignment, and phased rollout approaches.
-
-## Conclusion
-
-${args.topic} represents a significant opportunity for organizations seeking to modernize their operations and drive growth.
-`;
+        const mockMarkdownContent = `# ${args.topic}\n\n## Executive Summary\n\nThis is a comprehensive research report on "${args.topic}".`;
+        const mockS3Url = `https://agentweb-files.s3.us-east-1.amazonaws.com/files/${Date.now()}-research-${args.topic.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase()}.md`;
         return {
           success: true,
           message: `Deep research completed successfully. Generated ${mockMarkdownContent.split(/\s+/).length} words of content.`,
           data: {
-            markdown_content: mockMarkdownContent,
+            research_url: mockS3Url,
             title: args.topic,
             summary: `Comprehensive research on "${args.topic}" covering market analysis, implementation strategies, and key recommendations.`,
             key_findings: [
@@ -3457,7 +3433,7 @@ ${args.topic} represents a significant opportunity for organizations seeking to 
       case 'create_blog_article':
         return await this.createBlogArticle(args.topic, args.keywords || '', args.tone || 'professional', args.length || 'medium', args.researchContext || '', args.requirements || '', userId, sessionId, args.style || 'default', args.deep_research || false);
       case 'perform_deep_research':
-        return await this.performDeepResearchTool(args.topic, args.prompt, args.tone || 'professional', args.depth || 'detailed', args.focus_areas);
+        return await this.performDeepResearchTool(args.topic, args.prompt, args.tone || 'professional', args.depth || 'detailed', args.focus_areas, userId);
       case 'publish_blog_article':
         return await this.publishBlogArticle(args.title, args.description, args.hero_image_url, args.blog_html_url, userId, sessionId);
       case 'create_social_media_posts':
@@ -8029,14 +8005,15 @@ ${emailDraftFormat === 'text'
   }
 
   /**
-   * Perform deep research on a topic and return structured research content
+   * Perform deep research on a topic and upload to S3, returning the S3 URL
    */
   private async performDeepResearchTool(
     topic: string,
     prompt?: string,
     tone: string = 'professional',
     depth: string = 'detailed',
-    focus_areas?: string[]
+    focus_areas?: string[],
+    userId?: string
   ): Promise<any> {
     try {
       console.log('AgentMode: Performing deep research on topic:', topic, 'tone:', tone, 'depth:', depth, 'focus_areas:', focus_areas);
@@ -8088,11 +8065,33 @@ ${emailDraftFormat === 'text'
         }
       }
 
+      // Upload markdown content to S3
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const sanitizedTopic = topic.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase().substring(0, 50);
+      const filename = `research-${sanitizedTopic}-${Date.now()}.md`;
+      
+      const uploadResult = await uploadFileToS3(
+        researchResult.markdownContent,
+        filename,
+        userId || 'anonymous',
+        'text/markdown'
+      );
+
+      if (!uploadResult.success || !uploadResult.url) {
+        return {
+          success: false,
+          message: 'Failed to upload research content to S3',
+          error: 'S3 upload failed'
+        };
+      }
+
+      console.log('AgentMode: Deep research uploaded to S3:', uploadResult.url);
+
       return {
         success: true,
-        message: `Deep research completed successfully. Generated ${wordCount} words of content.`,
+        message: `Deep research completed successfully. Generated ${wordCount} words of content and saved to S3.`,
         data: {
-          markdown_content: researchResult.markdownContent,
+          research_url: uploadResult.url,
           title: researchResult.title,
           summary: researchResult.researchSummary,
           key_findings: keyFindings,
