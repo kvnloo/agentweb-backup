@@ -264,10 +264,10 @@ Research Context (use as foundation but rewrite naturally):
 ${researchContext}`;
   }
 
+  // Get content model from settings, but don't block content generation if settings are unavailable
+  let contentModel: string | undefined;
   try {
-    // Get content model from settings
     const { settingsService } = await import('../services/settingsService');
-    let contentModel: string | undefined;
     try {
       const setting = await settingsService.getSetting('agent_mode_content_model');
       if (setting && setting.settingValue) {
@@ -276,6 +276,11 @@ ${researchContext}`;
     } catch (error) {
       console.error('Error getting content model setting:', error);
     }
+  } catch (error) {
+    console.error('Error loading settings service:', error);
+  }
+
+  try {
 
     // Use LangChain LLM service with dynamic maxTokens based on article length
     const { createLLMService } = await import('../utils/llmService');
