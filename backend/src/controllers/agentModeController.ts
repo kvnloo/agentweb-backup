@@ -1102,9 +1102,6 @@ export const agentModeController = {
           description: tool.function.description
         }));
 
-      // Log the function call names for debugging
-      console.log('AgentMode API: Returning', functionCalls.length, 'function calls:', functionCalls.map(f => f.name));
-
       res.json({ functionCalls });
     } catch (error) {
       console.error('AgentMode: Get function calls error:', error);
