@@ -92,6 +92,11 @@ export const CUSTOMER_PORTAL_PAGES: CustomerPortalPage[] = [
     description: 'Video generation and management'
   },
   {
+    path: '/books',
+    label: 'Books',
+    description: 'Create and manage books'
+  },
+  {
     path: '/tasks',
     label: 'Tasks',
     description: 'View and manage tasks'

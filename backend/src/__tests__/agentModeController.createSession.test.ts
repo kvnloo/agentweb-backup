@@ -1,4 +1,12 @@
 import { Request, Response } from 'express';
+
+jest.mock('../services/agentModeService', () => ({
+  agentModeService: {
+    getDefaultModel: jest.fn().mockResolvedValue('gpt-5-chat-2'),
+  },
+  AgentModeService: jest.fn(),
+}));
+
 import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 
@@ -147,4 +155,3 @@ describe('AgentModeController - createSession', () => {
     expect(mockRes.json).toHaveBeenCalledWith({ error: 'Failed to create session' });
   });
 });
-

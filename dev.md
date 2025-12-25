@@ -332,6 +332,13 @@ There was two outages in recent three days. To debug, I downloaded the full log 
 November 24, 2025
 Added oncall alert on Agentweb-backend-env-prod-3 env as it is currently the prod backend and most risky outage.
 
+November 29, 2025
+## Azure Anthropic Foundry API Hanging Issue with Long Prompts
+
+The Azure Anthropic Foundry API (via `@anthropic-ai/foundry-sdk`) experiences hanging behavior when processing long prompts, particularly when combined with large `max_tokens` values. Testing revealed that prompts exceeding approximately 500 characters can cause the API to hang indefinitely, with requests timing out after 30-90 seconds or never completing. This issue appears to be a limitation of the Azure Anthropic Foundry service itself rather than a bug in the SDK libraries, as both `@anthropic-ai/foundry-sdk` (v0.2.0) and `@anthropic-ai/sdk` (v0.71.0) are at their latest versions.
+
+Because of this, it is hard to use Anthropic LLM via Azure.
+
 December 02, 2025
 VEO 3.1 integration doc: https://ai.google.dev/gemini-api/docs/video?example=dialogue#javascript_2
 

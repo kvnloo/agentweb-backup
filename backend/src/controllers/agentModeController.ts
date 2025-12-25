@@ -764,7 +764,6 @@ function setupSSEConnectionForSession(sessionId: string, res: Response, req: Req
     // Register callback for progress updates
     const cleanup = registerProgressCallback(sessionId, (progress) => {
       try {
-        console.log(`[SSE] Writing progress for session ${sessionId}:`, progress);
         res.write(`data: ${JSON.stringify(progress)}\n\n`);
         // Flush the response to ensure it's sent immediately
         if (typeof (res as any).flush === 'function') {
@@ -775,8 +774,6 @@ function setupSSEConnectionForSession(sessionId: string, res: Response, req: Req
         cleanup();
       }
     });
-
-    console.log(`[SSE] Progress callback registered for session ${sessionId}`);
 
     // Handle client disconnect
     req.on('close', () => {
@@ -1028,7 +1025,7 @@ export const agentModeController = {
         undefined, // workflowId
         undefined, // executionId
         undefined, // emailCampaignTaskId
-        finalSessionType as "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation"
+        finalSessionType as "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation"
       );
 
       // Set default model for new sessions
@@ -1132,12 +1129,15 @@ export const agentModeController = {
       // Don't call cleanupProgress here as it removes active SSE connections
       progressStore.delete(sessionId);
 
+      // Use llmModel from request, session, or default
+      const modelToUse = llmModel || session.llmModel || agentModeService.default_model;
+
       // Generate AI response using common function
       const response = await generateSessionResponse(
         sessionId,
         userMessage,
         user.userId,
-        llmModel,
+        modelToUse,
         attachments
       );
 
