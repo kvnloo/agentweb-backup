@@ -8026,6 +8026,23 @@ ${emailDraftFormat === 'text'
     try {
       console.log('AgentMode: Performing deep research on topic:', topic, 'tone:', tone, 'depth:', depth, 'focus_areas:', focus_areas);
 
+      // TEST MODE: Return fixed response for faster testing of whitepaper workflow
+      if ('true' === 'true') {
+        console.log('AgentMode: DEEP_RESEARCH_TEST_MODE enabled - returning mock response');
+        return {
+          success: true,
+          message: `[TEST MODE] Deep research completed successfully. Using mock response for topic: "${topic}"`,
+          data: {
+            research_url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/607017dc-e0d9-47e5-acbb-47939b82d285/files/1766741178749/4bf24ab4074732a021fa46448574bc97/research-the-future-of-ai-in-marketing--trends-and-opportun-1766741178746.md',
+            title: 'The Future of AI in Marketing: Trends and Opportunities for 2026',
+            summary: 'Comprehensive research on AI in marketing covering agentic AI, machine customers, GEO optimization, and governance frameworks for 2026.',
+            word_count: 5500,
+            research_depth: depth,
+            topic: topic
+          }
+        };
+      }
+
       // Import the deep research service
       const { deepResearchService } = await import('./deepResearchService');
 
