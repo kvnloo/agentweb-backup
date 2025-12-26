@@ -487,27 +487,8 @@ When updating HTML files, follow this process:
  - **Image Editing Tips**: When using 'generate_image' with inputImages, you can include multiple image URLs to create combined images. For example, to add a logo to an existing image, include both the current image URL and the logo image URL in the inputImages array. The AI will combine elements from all provided images based on your prompt. This is useful for tasks like adding logos, combining multiple images, or creating composite visuals.
  - **Video Generation**: Use 'generate_video' for creating videos. This provides real-time video generation using Veo 3.1. You can optionally provide start and end frames for interpolation between two images. The generated video will be saved and returned as an S3 URL.
  - **Blog Articles**: When creating blog articles, prefer using the 'create_blog_article' tool. It generates the article content, creates a high-quality hero image via imageService, formats the article into clean HTML, uploads it to S3, and returns the final HTML URL. Avoid ad-hoc content + image flows when this tool fits the request.
-   - **When to use deep_research:true**: Set 'deep_research: true' when the user explicitly asks for "deep research", "comprehensive research", "well-researched article", or mentions topics that require authoritative sources (e.g., market trends, industry analysis, scientific topics, historical events). This performs Gemini Deep Research first (takes several minutes) and embeds research images. Default to 'deep_research: false' for standard blog articles.
- - **Whitepapers, Reports & Research Documents**: For whitepapers (target: 8-12 pages total), follow this workflow:
-   1. **Step 1 - Deep Research**: Call 'perform_deep_research' with depth="detailed" (3-5 pages) or "comprehensive" (5-10 pages). Save the research_url from the response.
-   2. **Step 2 - Create White Paper**: Call 'create_book' with type="whitepaper", title, description, and author. This returns a book_id.
-   3. **Step 3 - Create Outline**: Call 'create_book_outline' with EXACTLY 5-6 sections maximum (NOT more):
-      - Section 1: Executive Summary
-      - Section 2: Introduction/Background  
-      - Section 3: Key Findings
-      - Section 4: Analysis/Discussion
-      - Section 5: Conclusion & Recommendations
-      - (Optional) Section 6: References/Appendix
-      Do NOT create chapters within sections. Do NOT create more than 6 sections.
-   4. **Step 4 - Generate Content**: For EACH section, call 'generate_book_content' with:
-      - book_id, section_id
-      - research_url: Pass the S3 URL from Step 1 (the function will fetch research content automatically)
-      - content_description: Brief section-specific instructions (e.g., "Write the Executive Summary focusing on key strategic implications")
-      - length: Use "short" for Executive Summary & Conclusion (~1 page), "medium" for Introduction & Key Findings (~2 pages), "long" for Analysis only (~3 pages)
-      - imagine: false (stick to research facts, don't invent details)
-- **CRITICAL for whitepapers**: Maximum 6 sections. No chapters. Use the length parameter correctly. Total should be 8-12 pages.
-- **Key distinction**: Use 'create_blog_article' for blog posts. Use deep research + book functions for whitepapers.
- - **Meta Ads Metrics**: Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data
+   - **When to use deep_research:true**: Set 'deep_research: true' when the user explicitly asks for "deep research", "comprehensive research", "well-researched article", or mentions topics that require authoritative sources (e.g., market trends, industry analysis, scientific topics, historical events). This performs Gemini Deep Research first (takes several minutes) and embeds research images. Default to 'deep_research: false' for standard blog articles. 
+- **Meta Ads Metrics**: Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data
 - When metrics data is loaded, provide contextual analysis based on the conversation history and user's business goals
 - Don't just repeat the numbers - provide meaningful insights, strategic recommendations, and actionable next steps
 - Consider the user's industry, business stage, and previous conversation context when analyzing performance
@@ -531,6 +512,36 @@ When updating HTML files, follow this process:
 - This includes the latest HTML results from previous completed tasks in the same conversation
 - Set attach_previous_task_results to false only if you don't want previous results included
 - **Revision Method**: [DEPRECATED: 'create_revision' is deprecated] For image revision, use 'generate_image' with the original image as an input image. For HTML report revision, use 'update_html_file' to update the HTML file content.
+
+## "whitepapers" / "research reports" / "executive summaries"
+
+For whitepapers, research reports, or executive summaries (target: 8-12 pages):
+
+**Step 1 - Deep Research**
+Call 'perform_deep_research' with depth="detailed" (3-5 pages) or "comprehensive" (5-10 pages). This returns research_url (S3 URL).
+
+**Step 2 - Generate Charts**: Call 'perform_data_analysis' with:
+      - file_urls: [research_url from Step 1]
+      - analysis_instruction: "Analyze the research data and generate 3-4 chart images using Python matplotlib or plotly. Output actual PNG/image files (not JavaScript or HTML code). Create bar charts, pie charts, line graphs, or diagrams that illustrate key statistics, trends, and comparisons mentioned in the research. Use plt.savefig() to output each chart as an image."
+      Save the chart image URLs from the response (embedded as ![Chart](url) in the analysis output).
+
+**Step 3 - Create White Paper**: Call 'create_book' with type="whitepaper", title, description, and author. This returns a book_id.
+
+**Step 4 - Create Outline**: Call 'create_book_outline' with EXACTLY 5-6 sections maximum (NOT more):
+      1. Executive Summary (length="short", ~1 page)
+      2. Introduction/Background (length="short", ~1 page)
+      3. Key Findings (length="medium", ~2 pages)
+      4. Analysis/Discussion (length="long", ~3 pages)
+      5. Conclusion & Recommendations (length="short", ~1 page)
+      6. References (length="short")
+
+      Do NOT create chapters within sections. Do NOT create more than 6 sections.
+ **Step 5 - Generate Content**: For EACH section, call 'generate_book_content' with:
+      - book_id, section_id
+      - research_url: Pass the S3 URL from Step 1 (the function will fetch research content automatically)
+      - content_description: Brief section-specific instructions. **IMPORTANT**: If this section should include charts from Step 2, add to content_description: "Include the following chart image: ![Chart Title](chart_url_from_step_2)" for each relevant chart.
+      - length: Use "short" for Executive Summary & Conclusion (~1 page), "medium" for Introduction & Key Findings (~2 pages), "long" for Analysis only (~3 pages)
+      - imagine: false (stick to research facts, don't invent details)
 
 ## Task Execution
 - When you create tasks, they will show execution status in the UI (pending, running, completed, failed)
@@ -8030,23 +8041,6 @@ ${emailDraftFormat === 'text'
   ): Promise<any> {
     try {
       console.log('AgentMode: Performing deep research on topic:', topic, 'tone:', tone, 'depth:', depth, 'focus_areas:', focus_areas);
-
-      // TEST MODE: Return fixed response for faster testing of whitepaper workflow
-      if ('true' === 'true') {
-        console.log('AgentMode: DEEP_RESEARCH_TEST_MODE enabled - returning mock response');
-        return {
-          success: true,
-          message: `[TEST MODE] Deep research completed successfully. Using mock response for topic: "${topic}"`,
-          data: {
-            research_url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/607017dc-e0d9-47e5-acbb-47939b82d285/files/1766741178749/4bf24ab4074732a021fa46448574bc97/research-the-future-of-ai-in-marketing--trends-and-opportun-1766741178746.md',
-            title: 'The Future of AI in Marketing: Trends and Opportunities for 2026',
-            summary: 'Comprehensive research on AI in marketing covering agentic AI, machine customers, GEO optimization, and governance frameworks for 2026.',
-            word_count: 5500,
-            research_depth: depth,
-            topic: topic
-          }
-        };
-      }
 
       // Import the deep research service
       const { deepResearchService } = await import('./deepResearchService');
