@@ -489,10 +489,9 @@ When updating HTML files, follow this process:
  - **Blog Articles**: When creating blog articles, prefer using the 'create_blog_article' tool. It generates the article content, creates a high-quality hero image via imageService, formats the article into clean HTML, uploads it to S3, and returns the final HTML URL. Avoid ad-hoc content + image flows when this tool fits the request.
    - **When to use deep_research:true**: Set 'deep_research: true' when the user explicitly asks for "deep research", "comprehensive research", "well-researched article", or mentions topics that require authoritative sources (e.g., market trends, industry analysis, scientific topics, historical events). This performs Gemini Deep Research first (takes several minutes) and embeds research images. Default to 'deep_research: false' for standard blog articles.
  - **Whitepapers, Reports & Research Documents**: For whitepapers (target: 8-12 pages total), follow this workflow:
-   1. **Step 1 - Deep Research**: Call 'perform_deep_research' with depth="detailed" (3-5 pages) or "comprehensive" (5-10 pages) based on user needs.
-   2. **Step 2 - Get Research Content**: Call 'read_file_content' with the research_url to get the full markdown research content.
-   3. **Step 3 - Create White Paper**: Call 'create_book' with type="whitepaper", title, description, and author. This returns a book_id.
-   4. **Step 4 - Create Outline**: Call 'create_book_outline' with EXACTLY 5-6 sections maximum (NOT more):
+   1. **Step 1 - Deep Research**: Call 'perform_deep_research' with depth="detailed" (3-5 pages) or "comprehensive" (5-10 pages). Save the research_url from the response.
+   2. **Step 2 - Create White Paper**: Call 'create_book' with type="whitepaper", title, description, and author. This returns a book_id.
+   3. **Step 3 - Create Outline**: Call 'create_book_outline' with EXACTLY 5-6 sections maximum (NOT more):
       - Section 1: Executive Summary
       - Section 2: Introduction/Background  
       - Section 3: Key Findings
@@ -500,9 +499,10 @@ When updating HTML files, follow this process:
       - Section 5: Conclusion & Recommendations
       - (Optional) Section 6: References/Appendix
       Do NOT create chapters within sections. Do NOT create more than 6 sections.
-   5. **Step 5 - Generate Content**: For EACH section, call 'generate_book_content' with:
+   4. **Step 4 - Generate Content**: For EACH section, call 'generate_book_content' with:
       - book_id, section_id
-      - content_description: Include the RELEVANT portion of deep research content for this section
+      - research_url: Pass the S3 URL from Step 1 (the function will fetch research content automatically)
+      - content_description: Brief section-specific instructions (e.g., "Write the Executive Summary focusing on key strategic implications")
       - length: Use "short" for Executive Summary & Conclusion (~1 page), "medium" for Introduction & Key Findings (~2 pages), "long" for Analysis only (~3 pages)
       - imagine: false (stick to research facts, don't invent details)
 - **CRITICAL for whitepapers**: Maximum 6 sections. No chapters. Use the length parameter correctly. Total should be 8-12 pages.
@@ -1368,6 +1368,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 type: 'boolean',
                 description: 'Whether to allow creative imagination and details that do not exist. Defaults to true. When false, the AI will stick strictly to facts and avoid inventing details.',
                 default: true
+              },
+              research_url: {
+                type: 'string',
+                description: 'Optional S3 URL to deep research content (from perform_deep_research). For WHITEPAPERS: pass the research_url here instead of copying full content into content_description. The function will fetch the research and use it as context. When using this, content_description should focus on section-specific instructions (e.g., "Write the Executive Summary focusing on key strategic implications").'
               }
             },
             required: ['book_id', 'section_id', 'content_description']
@@ -3393,7 +3397,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
           args.content_description,
           args.length || 'medium',
           args.imagine !== undefined ? args.imagine : true,
-          userId
+          userId,
+          args.research_url
         );
       case 'create_book':
         return await this.createBook(
@@ -10584,13 +10589,31 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
     contentDescription: string,
     length: string,
     imagine: boolean,
-    userId: string
+    userId: string,
+    researchUrl?: string
   ): Promise<any> {
     try {
-      console.log('AgentMode: Generating book content for:', { bookId, sectionId, chapterId, length, imagine, userId });
+      console.log('AgentMode: Generating book content for:', { bookId, sectionId, chapterId, length, imagine, userId, researchUrl: researchUrl ? 'provided' : 'not provided' });
       
       const { bookDb } = await import('./bookDb');
       const { bookContentDb } = await import('./bookContentDb');
+      
+      // Fetch research content from S3 URL if provided
+      let researchContent = '';
+      if (researchUrl) {
+        try {
+          console.log('AgentMode: Fetching research content from S3:', researchUrl);
+          const response = await fetch(researchUrl);
+          if (response.ok) {
+            researchContent = await response.text();
+            console.log(`AgentMode: Fetched ${researchContent.length} characters of research content`);
+          } else {
+            console.warn('AgentMode: Failed to fetch research content from S3:', response.status);
+          }
+        } catch (fetchError) {
+          console.error('AgentMode: Error fetching research content:', fetchError);
+        }
+      }
       
       // Verify book exists and belongs to user
       const book = await bookDb.getBookById(bookId, userId);
@@ -10693,16 +10716,37 @@ CRITICAL: Do NOT invent or imagine details that do not exist. Stick strictly to 
 ${existingContentText ? `Existing Content (use as base and enhance/expand based on content description):
 ${existingContentText}
 
-Instructions: Use the existing content above as a foundation, and enhance or expand it based on the content description. Maintain consistency with the existing style and structure while incorporating the new requirements.` : 'Instructions: Create comprehensive, well-structured content from scratch based on the content description.'}${book.type === 'whitepaper' ? `
+Instructions: Use the existing content above as a foundation, and enhance or expand it based on the content description. Maintain consistency with the existing style and structure while incorporating the new requirements.` : 'Instructions: Create comprehensive, well-structured content from scratch based on the content description.'}${researchContent ? `
+
+=== DEEP RESEARCH CONTENT (SOURCE MATERIAL) ===
+The following is comprehensive research content. Use this as your primary source material for creating this section.
+Extract the relevant information for the "${contentTitle}" section and reformat it appropriately.
+
+${researchContent}
+
+=== END OF RESEARCH CONTENT ===
+` : ''}${book.type === 'whitepaper' ? `
 
 IMPORTANT WHITEPAPER GUIDELINES:
 - This is a whitepaper, not a novel. Be concise and professional.
-- The content_description likely contains deep research content - your job is to REFORMAT and CONDENSE it for this section, not to generate entirely new content.
+${researchContent ? '- You have been provided with DEEP RESEARCH CONTENT above. Your job is to EXTRACT and REFORMAT the relevant portions for this specific section.' : '- The content_description likely contains deep research content - your job is to REFORMAT and CONDENSE it for this section, not to generate entirely new content.'}
 - Focus on key insights, actionable information, and data-driven conclusions.
-- Avoid repetition with other sections - assume the reader has context from previous sections.
 - Use bullet points, tables, and clear headings for improved readability and scannability.
 - Target exactly ${wordCount.target} words - do NOT exceed ${wordCount.max} words under any circumstances.
-- Remove verbose language and filler content. Every sentence should add value.` : ''}`;
+- Remove verbose language and filler content. Every sentence should add value.
+
+ANTI-REPETITION RULES (CRITICAL):
+- Do NOT repeat concepts, frameworks, or key points that belong in other sections of the whitepaper.
+- Governance/trust topics should ONLY appear in their dedicated section, not repeated in Analysis or Conclusion.
+- If a concept was covered in an earlier section, briefly reference it (e.g., "As noted in the Executive Summary...") instead of re-explaining.
+- Each section should contain UNIQUE insights - check what section you're writing and stay focused on its specific purpose.
+
+CITATION FORMATTING (REQUIRED):
+- Use numbered references in brackets: [1], [2], [3], etc.
+- When citing statistics, research findings, or expert opinions, always include the source.
+- Format example: "AI adoption will reach 80% by 2026 [1]" or "According to Gartner research [2]..."
+- If writing the Conclusion/References section, include a numbered reference list at the end.
+- Prefer specific, verifiable sources over vague attributions like "studies show" or "experts say".` : ''}`;
 
       // Get content model from settings
       let contentModel: string | undefined;
