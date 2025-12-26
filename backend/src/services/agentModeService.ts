@@ -488,12 +488,24 @@ When updating HTML files, follow this process:
  - **Video Generation**: Use 'generate_video' for creating videos. This provides real-time video generation using Veo 3.1. You can optionally provide start and end frames for interpolation between two images. The generated video will be saved and returned as an S3 URL.
  - **Blog Articles**: When creating blog articles, prefer using the 'create_blog_article' tool. It generates the article content, creates a high-quality hero image via imageService, formats the article into clean HTML, uploads it to S3, and returns the final HTML URL. Avoid ad-hoc content + image flows when this tool fits the request.
    - **When to use deep_research:true**: Set 'deep_research: true' when the user explicitly asks for "deep research", "comprehensive research", "well-researched article", or mentions topics that require authoritative sources (e.g., market trends, industry analysis, scientific topics, historical events). This performs Gemini Deep Research first (takes several minutes) and embeds research images. Default to 'deep_research: false' for standard blog articles.
- - **Whitepapers, Reports & Research Documents**: For whitepapers, research reports, executive summaries, or when users ask for "research on X" (not a blog), follow this workflow:
-   1. **Step 1 - Deep Research**: Call 'perform_deep_research' with the topic. This returns research_url (S3 URL to markdown), title, summary.
+ - **Whitepapers, Reports & Research Documents**: For whitepapers (target: 8-12 pages total), follow this workflow:
+   1. **Step 1 - Deep Research**: Call 'perform_deep_research' with depth="detailed" (3-5 pages) or "comprehensive" (5-10 pages) based on user needs.
    2. **Step 2 - Get Research Content**: Call 'read_file_content' with the research_url to get the full markdown research content.
    3. **Step 3 - Create White Paper**: Call 'create_book' with type="whitepaper", title, description, and author. This returns a book_id.
-   4. **Step 4 - Create Outline**: Call 'create_book_outline' with the book_id and outline_json defining sections like Executive Summary, Introduction, Key Findings, Analysis, Conclusion. Each section gets a unique section_id.
-   5. **Step 5 - Generate Content**: For each section, call 'generate_book_content' with book_id, section_id, and pass the relevant deep research content in the content_description parameter. The AI will format it appropriately for that section.
+   4. **Step 4 - Create Outline**: Call 'create_book_outline' with EXACTLY 5-6 sections maximum (NOT more):
+      - Section 1: Executive Summary
+      - Section 2: Introduction/Background  
+      - Section 3: Key Findings
+      - Section 4: Analysis/Discussion
+      - Section 5: Conclusion & Recommendations
+      - (Optional) Section 6: References/Appendix
+      Do NOT create chapters within sections. Do NOT create more than 6 sections.
+   5. **Step 5 - Generate Content**: For EACH section, call 'generate_book_content' with:
+      - book_id, section_id
+      - content_description: Include the RELEVANT portion of deep research content for this section
+      - length: Use "short" for Executive Summary & Conclusion (~1 page), "medium" for Introduction & Key Findings (~2 pages), "long" for Analysis only (~3 pages)
+      - imagine: false (stick to research facts, don't invent details)
+- **CRITICAL for whitepapers**: Maximum 6 sections. No chapters. Use the length parameter correctly. Total should be 8-12 pages.
 - **Key distinction**: Use 'create_blog_article' for blog posts. Use deep research + book functions for whitepapers.
  - **Meta Ads Metrics**: Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data
 - When metrics data is loaded, provide contextual analysis based on the conversation history and user's business goals
@@ -1326,7 +1338,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'generate_book_content',
-          description: 'Generate an entire chapter or section of content for a book. Creates comprehensive markdown content based on the content description and desired length. If existing content exists, it will be used as a base along with the content description to generate new content. Word counts: short (1000-2000 words), medium (2000-3000 words), long (3000-4000 words).',
+          description: 'Generate content for a book section/chapter. For BOOKS: short (1000-2000 words), medium (2000-3000 words), long (3000-4000 words). For WHITEPAPERS: short (300-600 words, ~1 page), medium (600-1000 words, ~2 pages), long (1000-1500 words, ~3 pages). IMPORTANT for whitepapers: Pass the relevant deep research content in content_description - the AI will reformat it for that section rather than generating new content. If existing content exists, it will be used as a base.',
           parameters: {
             type: 'object',
             properties: {
@@ -10608,13 +10620,21 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         imagineOverridden = true;
       }
 
-      // Map length to word count range
-      const wordCountRanges: Record<string, { min: number; max: number; target: number }> = {
+      // Map length to word count range - different ranges for books vs whitepapers
+      // Whitepapers need smaller word counts to produce concise 8-12 page documents
+      const bookWordCounts: Record<string, { min: number; max: number; target: number }> = {
         short: { min: 1000, max: 2000, target: 1500 },
         medium: { min: 2000, max: 3000, target: 2500 },
         long: { min: 3000, max: 4000, target: 3500 }
       };
 
+      const whitepaperWordCounts: Record<string, { min: number; max: number; target: number }> = {
+        short: { min: 300, max: 600, target: 450 },   // ~1 page (Executive Summary, Conclusion)
+        medium: { min: 600, max: 1000, target: 800 }, // ~2 pages (Introduction, Key Findings)
+        long: { min: 1000, max: 1500, target: 1250 }  // ~3 pages (Analysis sections)
+      };
+
+      const wordCountRanges = book.type === 'whitepaper' ? whitepaperWordCounts : bookWordCounts;
       const wordCount = wordCountRanges[length] || wordCountRanges.medium;
 
       // Get section/chapter title for context
@@ -10656,7 +10676,16 @@ CRITICAL: Do NOT invent or imagine details that do not exist. Stick strictly to 
 ${existingContentText ? `Existing Content (use as base and enhance/expand based on content description):
 ${existingContentText}
 
-Instructions: Use the existing content above as a foundation, and enhance or expand it based on the content description. Maintain consistency with the existing style and structure while incorporating the new requirements.` : 'Instructions: Create comprehensive, well-structured content from scratch based on the content description.'}`;
+Instructions: Use the existing content above as a foundation, and enhance or expand it based on the content description. Maintain consistency with the existing style and structure while incorporating the new requirements.` : 'Instructions: Create comprehensive, well-structured content from scratch based on the content description.'}${book.type === 'whitepaper' ? `
+
+IMPORTANT WHITEPAPER GUIDELINES:
+- This is a whitepaper, not a novel. Be concise and professional.
+- The content_description likely contains deep research content - your job is to REFORMAT and CONDENSE it for this section, not to generate entirely new content.
+- Focus on key insights, actionable information, and data-driven conclusions.
+- Avoid repetition with other sections - assume the reader has context from previous sections.
+- Use bullet points, tables, and clear headings for improved readability and scannability.
+- Target exactly ${wordCount.target} words - do NOT exceed ${wordCount.max} words under any circumstances.
+- Remove verbose language and filler content. Every sentence should add value.` : ''}`;
 
       // Get content model from settings
       let contentModel: string | undefined;
