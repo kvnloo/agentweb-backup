@@ -134,9 +134,56 @@ describe('CRM Routes', () => {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
-      expect(crmDb.createLeadList).toHaveBeenCalledWith('test-user-id', 'New List', 'Test description');
+      expect(crmDb.createLeadList).toHaveBeenCalledWith('test-user-id', 'New List', 'Test description', undefined);
       expect(mockResponse.status).toHaveBeenCalledWith(201);
       expect(mockResponse.json).toHaveBeenCalledWith(mockList);
+    });
+
+    it('should normalize alert events when creating a lead list', async () => {
+      const mockList = {
+        listId: 'list2',
+        name: 'Alerts List',
+        description: 'Alert description',
+        userId: 'test-user-id',
+        createdAt: new Date().toISOString(),
+      };
+
+      (crmDb.createLeadList as jest.Mock).mockResolvedValue(mockList);
+
+      mockRequest.method = 'POST';
+      mockRequest.url = '/lists';
+      mockRequest.body = {
+        name: 'Alerts List',
+        description: 'Alert description',
+        alertEvents: [' email.received ', 'EMAIL.CLICKED', 'email.received'],
+      };
+
+      const handler = router.stack.find((r: any) => r.route?.path === '/lists' && r.route?.methods?.post);
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.createLeadList).toHaveBeenCalledWith(
+        'test-user-id',
+        'Alerts List',
+        'Alert description',
+        ['email.received', 'email.clicked']
+      );
+      expect(mockResponse.status).toHaveBeenCalledWith(201);
+    });
+
+    it('should return 400 if alertEvents is not an array', async () => {
+      mockRequest.method = 'POST';
+      mockRequest.url = '/lists';
+      mockRequest.body = { name: 'Bad List', alertEvents: 'email.received' };
+
+      const handler = router.stack.find((r: any) => r.route?.path === '/lists' && r.route?.methods?.post);
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'alertEvents must be an array' });
     });
 
     it('should return 400 if name is missing', async () => {
@@ -239,6 +286,29 @@ describe('CRM Routes', () => {
       expect(crmDb.updateLeadList).toHaveBeenCalledWith('list1', {
         name: 'Updated List',
         displayFields: ['email', 'firstName'],
+      });
+    });
+
+    it('should normalize alert events when updating a lead list', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Updated List',
+        userId: 'test-user-id',
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.updateLeadList as jest.Mock).mockResolvedValue(mockList);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { alertEvents: [' Email.Received ', 'custom.linkedin', 'email.received'] };
+
+      const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.put);
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.updateLeadList).toHaveBeenCalledWith('list1', {
+        alertEvents: ['email.received', 'custom.linkedin'],
       });
     });
 

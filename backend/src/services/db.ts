@@ -295,6 +295,34 @@ class UserDB {
     }
   }
 
+  async getUsersByEmailDomain(emailDomain: string): Promise<User[]> {
+    try {
+      const normalizedDomain = emailDomain.trim().toLowerCase();
+      const results: User[] = [];
+      let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+
+      do {
+        const params: AWS.DynamoDB.DocumentClient.ScanInput = {
+          TableName: this.tableName,
+          FilterExpression: 'emailDomain = :emailDomain',
+          ExpressionAttributeValues: {
+            ':emailDomain': normalizedDomain,
+          },
+          ExclusiveStartKey: lastEvaluatedKey,
+        };
+
+        const result = await this.docClient.scan(params).promise();
+        results.push(...((result.Items || []) as User[]));
+        lastEvaluatedKey = result.LastEvaluatedKey;
+      } while (lastEvaluatedKey);
+
+      return results;
+    } catch (error) {
+      console.error("Error in getUsersByEmailDomain:", error);
+      throw error;
+    }
+  }
+
   async getAllUsers(): Promise<UserWithCounts[]> {
     try {
       const params = {
@@ -2572,9 +2600,12 @@ export const benchmarkTestDb = new BenchmarkTestDB();
 // CRM Database Service
 export const crmDb = {
   // Lead List operations
-  async createLeadList(userId: string, name: string, description?: string) {
+  async createLeadList(userId: string, name: string, description?: string, alertEvents?: string[]) {
     try {
       const listId = `list_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const normalizedAlertEvents = Array.isArray(alertEvents)
+        ? alertEvents
+        : ['email.received'];
       
       const params = {
         TableName: `${TABLE_PREFIX}AW-LeadLists`,
@@ -2589,6 +2620,7 @@ export const crmDb = {
           fieldNames: [], // Initialize with empty array
           displayFields: ['email', 'firstName', 'lastName', 'company', 'phone', 'title', 'linkedin', 'notes'], // Default visible fields
           sortConfig: null,
+          alertEvents: normalizedAlertEvents,
         },
       };
 
@@ -2602,29 +2634,47 @@ export const crmDb = {
 
   async getLeadListsByUserId(userId: string) {
     try {
-      const params = {
-        TableName: `${TABLE_PREFIX}AW-LeadLists`,
-        IndexName: 'userId-index', // Assuming GSI on userId
-        KeyConditionExpression: 'userId = :userId',
-        ExpressionAttributeValues: {
-          ':userId': userId,
-        },
-      };
+      const items: any[] = [];
+      let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
 
-      const result = await dynamodb.query(params).promise();
-      return result.Items || [];
-    } catch (error: any) {
-      // If index doesn't exist, use scan with filter
-      if (error.code === 'ResourceNotFoundException' || error.message?.includes('index')) {
-        const params = {
+      do {
+        const params: AWS.DynamoDB.DocumentClient.QueryInput = {
           TableName: `${TABLE_PREFIX}AW-LeadLists`,
-          FilterExpression: 'userId = :userId',
+          IndexName: 'userId-index', // Assuming GSI on userId
+          KeyConditionExpression: 'userId = :userId',
           ExpressionAttributeValues: {
             ':userId': userId,
           },
+          ExclusiveStartKey: lastEvaluatedKey,
         };
-        const result = await dynamodb.scan(params).promise();
-        return result.Items || [];
+
+        const result = await dynamodb.query(params).promise();
+        items.push(...(result.Items || []));
+        lastEvaluatedKey = result.LastEvaluatedKey;
+      } while (lastEvaluatedKey);
+
+      return items;
+    } catch (error: any) {
+      // If index doesn't exist, use scan with filter
+      if (error.code === 'ResourceNotFoundException' || error.message?.includes('index')) {
+        const items: any[] = [];
+        let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+
+        do {
+          const params: AWS.DynamoDB.DocumentClient.ScanInput = {
+            TableName: `${TABLE_PREFIX}AW-LeadLists`,
+            FilterExpression: 'userId = :userId',
+            ExpressionAttributeValues: {
+              ':userId': userId,
+            },
+            ExclusiveStartKey: lastEvaluatedKey,
+          };
+          const result = await dynamodb.scan(params).promise();
+          items.push(...(result.Items || []));
+          lastEvaluatedKey = result.LastEvaluatedKey;
+        } while (lastEvaluatedKey);
+
+        return items;
       }
       handleDynamoDbError(error, "getLeadListsByUserId");
       throw error;
@@ -2655,37 +2705,50 @@ export const crmDb = {
       description?: string;
       displayFields?: string[];
       sortConfig?: { column: string; direction: 'asc' | 'desc' } | null;
+      alertEvents?: string[];
     }
   ) {
     try {
       const updateExpressions: string[] = [];
       const expressionAttributeValues: any = {};
+      const expressionAttributeNames: Record<string, string> = {};
 
       if (updates.name !== undefined) {
-        updateExpressions.push('name = :name');
+        expressionAttributeNames['#name'] = 'name';
+        updateExpressions.push('#name = :name');
         expressionAttributeValues[':name'] = updates.name;
       }
 
       if (updates.description !== undefined) {
-        updateExpressions.push('description = :description');
+        expressionAttributeNames['#description'] = 'description';
+        updateExpressions.push('#description = :description');
         expressionAttributeValues[':description'] = updates.description;
       }
 
       if (updates.displayFields !== undefined) {
-        updateExpressions.push('displayFields = :displayFields');
+        expressionAttributeNames['#displayFields'] = 'displayFields';
+        updateExpressions.push('#displayFields = :displayFields');
         expressionAttributeValues[':displayFields'] = updates.displayFields;
       }
 
       if (updates.sortConfig !== undefined) {
-        updateExpressions.push('sortConfig = :sortConfig');
+        expressionAttributeNames['#sortConfig'] = 'sortConfig';
+        updateExpressions.push('#sortConfig = :sortConfig');
         expressionAttributeValues[':sortConfig'] = updates.sortConfig;
+      }
+
+      if (updates.alertEvents !== undefined) {
+        expressionAttributeNames['#alertEvents'] = 'alertEvents';
+        updateExpressions.push('#alertEvents = :alertEvents');
+        expressionAttributeValues[':alertEvents'] = updates.alertEvents;
       }
 
       if (updateExpressions.length === 0) {
         return await this.getLeadListById(listId);
       }
 
-      updateExpressions.push('updatedAt = :updatedAt');
+      expressionAttributeNames['#updatedAt'] = 'updatedAt';
+      updateExpressions.push('#updatedAt = :updatedAt');
       expressionAttributeValues[':updatedAt'] = new Date().toISOString();
 
       const params = {
@@ -2694,6 +2757,7 @@ export const crmDb = {
           listId,
         },
         UpdateExpression: `SET ${updateExpressions.join(', ')}`,
+        ExpressionAttributeNames: expressionAttributeNames,
         ExpressionAttributeValues: expressionAttributeValues,
         ReturnValues: 'ALL_NEW',
       };
@@ -2705,6 +2769,7 @@ export const crmDb = {
       throw error;
     }
   },
+
 
   async deleteLeadList(listId: string) {
     try {
@@ -3781,4 +3846,3 @@ export const crmDb = {
     }
   },
 };
-

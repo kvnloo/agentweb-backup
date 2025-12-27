@@ -3,6 +3,7 @@ import { IncomingMessage } from 'http';
 import { WebhookRequiredHeaders } from 'svix';
 import { webhookService, ResendWebhookEvent } from '../services/webhookService';
 import { emailEventsDb } from '../services/emailEventsDb';
+import { leadListAlertService } from '../services/leadListAlertService';
 
 const router = express.Router();
 
@@ -47,6 +48,11 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
 
     // Store the event in the database
     const emailEvent = await emailEventsDb.addEmailEvent(event, emailDomain, eventId);
+    try {
+      await leadListAlertService.notifyForEmailEvent(emailEvent);
+    } catch (alertError) {
+      console.error('Failed to send lead list alert email:', alertError);
+    }
 
     // Handle specific event types
     switch (event.type) {

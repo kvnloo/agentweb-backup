@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-27',
+    changes: [
+      'Added Event Alerts for CRM lead lists',
+      '- Configure alert events (email.received, email.clicked, email.opened, email.delivered, email.bounced, email.complained)',
+      '- Support custom event types (e.g., custom.linkedin) and select them from the same list',
+      '- Alert emails include a direct link to the CRM lead management page',
+    ],
+  },
+  {
     date: '2025-12-24',
     changes: [
       'Admins can now edit waitlist entries from the admin dashboard',
