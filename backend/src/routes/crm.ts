@@ -3,6 +3,7 @@ import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { crmDb, taskDb, subscriberDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
+import { leadListAlertService } from '../services/leadListAlertService';
 import multer from 'multer';
 import { parse } from 'csv-parse/sync';
 
@@ -16,6 +17,19 @@ const upload = multer({
 
 // Apply authentication middleware to all routes
 router.use(authenticateToken);
+
+const normalizeAlertEvents = (alertEvents: any) => {
+  if (alertEvents === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(alertEvents)) {
+    throw new Error('alertEvents must be an array');
+  }
+  const normalized = alertEvents
+    .map((event) => (typeof event === 'string' ? event.trim().toLowerCase() : ''))
+    .filter(Boolean);
+  return Array.from(new Set(normalized));
+};
 
 // Lead List Routes
 
@@ -55,13 +69,25 @@ router.post('/lists', async (req: Request, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const { name, description } = req.body;
+    const { name, description, alertEvents } = req.body;
 
     if (!name || typeof name !== 'string' || name.trim().length === 0) {
       return res.status(400).json({ message: 'List name is required' });
     }
 
-    const list = await crmDb.createLeadList(userId, name.trim(), description?.trim());
+    let normalizedAlertEvents: string[] | undefined;
+    try {
+      normalizedAlertEvents = normalizeAlertEvents(alertEvents);
+    } catch (error: any) {
+      return res.status(400).json({ message: error.message || 'Invalid alertEvents' });
+    }
+
+    const list = await crmDb.createLeadList(
+      userId,
+      name.trim(),
+      description?.trim(),
+      normalizedAlertEvents
+    );
     res.status(201).json(list);
   } catch (error: any) {
     console.error('Error creating lead list:', error);
@@ -112,7 +138,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { name, description, displayFields, sortConfig } = req.body;
+    const { name, description, displayFields, sortConfig, alertEvents } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -133,6 +159,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       description?: string;
       displayFields?: string[];
       sortConfig?: { column: string; direction: 'asc' | 'desc' } | null;
+      alertEvents?: string[];
     } = {};
     if (name !== undefined) {
       if (typeof name !== 'string' || name.trim().length === 0) {
@@ -168,6 +195,14 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
         updates.sortConfig = { column, direction: direction as 'asc' | 'desc' };
       } else {
         return res.status(400).json({ message: 'sortConfig must be an object or null' });
+      }
+    }
+
+    if (alertEvents !== undefined) {
+      try {
+        updates.alertEvents = normalizeAlertEvents(alertEvents) || [];
+      } catch (error: any) {
+        return res.status(400).json({ message: error.message || 'Invalid alertEvents' });
       }
     }
 
@@ -631,6 +666,17 @@ router.post('/lists/:listId/leads/:leadId/engagements', async (req: Request, res
     };
 
     const updatedLead = await crmDb.addLeadEngagement(listId, leadId, engagement);
+    try {
+      await leadListAlertService.notifyLeadListOwnerIfConfigured(
+        list,
+        updatedLead,
+        eventType,
+        eventData,
+        createdAt
+      );
+    } catch (alertError) {
+      console.error('Failed to send lead list alert email:', alertError);
+    }
     res.json({ success: true, lead: updatedLead });
   } catch (error: any) {
     console.error('Error adding lead engagement:', error);
